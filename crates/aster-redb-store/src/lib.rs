@@ -15,8 +15,10 @@
 //! same redb authority. Opaque IDs cannot collide with or promote into a semantic
 //! or control namespace. Semantic mutation requires a live strong capability from
 //! `aster-core`, while persisted decoded metadata is only structurally audited.
-//! [`StoreLimits`] bound aggregate redb rows and encoded bytes across the
-//! accounted logical namespaces. Permanent schema-v3 Event operations are
+//! [`StoreLimits`] bound aggregate redb rows and charged logical payload bytes
+//! across the accounted namespaces. Charged bytes are physical accounted bytes
+//! plus the exact future retirement-growth reserve for active Blob operations.
+//! Permanent schema-v3 Event operations are
 //! excluded from that ordinary quota and bounded by [`EventOperationLimits`],
 //! while legacy Event-operation rows remain ordinary-accounted until atomic
 //! migration makes v3 authoritative. Both quotas remain part of deployment's
@@ -32,8 +34,11 @@
 //! and exact manifest-authorized reclamation of already-unreferenced staging and
 //! completed variants. Charged physical accounting remains in force until
 //! deletion finalization, and durable manifests resume safely after restart.
-//! This is not live retirement, retention expiry, pressure eviction, or finite
-//! Blob TTL.
+//! Policy-invalidated live publications retire atomically with their operation
+//! and delivery aliases; permanent fences remain, and the retained retirement
+//! records expire after 45 days of accumulated conservative lower-bound age.
+//! This is not finite Blob TTL, pressure eviction, route-only custody, or a
+//! public protocol/API/CLI lifecycle surface.
 
 #![forbid(unsafe_code)]
 
@@ -367,7 +372,10 @@ const MAX_CONTROL_INTENT_TOPICS_PER_RECIPIENT: usize = 128;
 
 /// Default maximum number of accepted items in one store.
 pub const DEFAULT_MAX_ITEMS: u64 = 10_000;
-/// Default maximum aggregate retained bytes in one store (64 MiB).
+/// Default maximum charged logical payload bytes in one store (64 MiB).
+///
+/// Charged bytes equal physical accounted payload/source bytes plus the exact
+/// future retirement-growth reserve for active Blob operations.
 pub const DEFAULT_MAX_TOTAL_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Semantic class of one durable mutable-transfer scheduling cursor.
@@ -506,7 +514,10 @@ impl EventPageAttemptCursorUpdate {
 /// Blob, and not-yet-migrated legacy Event operation mappings, route-only cache
 /// entries, exact controls, canonical local control-publication intents, and
 /// opaque selected Event bridge authorizations, deduplicated sources, wrappers,
-/// and route metadata. Permanent schema-v3 Event operations are governed by
+/// and route metadata. The byte limit charges physical accounted payload and
+/// source bytes plus the exact future retirement-growth reserve for each active
+/// Blob operation; [`BlobStoreStats::operation_bytes`] remains physical.
+/// Permanent schema-v3 Event operations are governed by
 /// [`EventOperationLimits`] instead, but remain part of deployment's total state
 /// allocation. Physical Blob-depot files are governed by [`BlobDepotLimits`]
 /// instead of being double-counted here. Unmarked or hostile untracked filesystem
@@ -541,7 +552,10 @@ impl StoreLimits {
         self.max_items
     }
 
-    /// Returns the maximum aggregate retained payload/source-envelope bytes.
+    /// Returns the maximum charged logical payload bytes.
+    ///
+    /// This includes physical accounted payload/source bytes plus the exact
+    /// future retirement-growth reserve for active Blob operations.
     pub const fn max_total_payload_bytes(self) -> u64 {
         self.max_total_payload_bytes
     }
@@ -3118,11 +3132,14 @@ pub struct StoreStats {
 }
 
 /// Exact logical usage charged against the aggregate store limits.
+///
+/// Payload bytes are physical accounted payload/source bytes plus the exact
+/// future retirement-growth reserve for active Blob operations.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct AggregateStoreUsage {
     /// Number of logical rows charged against [`StoreLimits::max_items`].
     pub items: u64,
-    /// Encoded payload bytes charged against
+    /// Logical payload bytes charged against
     /// [`StoreLimits::max_total_payload_bytes`].
     pub payload_bytes: u64,
 }
@@ -3491,18 +3508,18 @@ pub enum StoreError {
         /// Configured maximum item count.
         limit: u64,
     },
-    /// Accepting the opaque bytes would exceed the configured payload-byte quota.
+    /// Accepting charged logical bytes would exceed the configured payload-byte quota.
     PayloadByteLimitExceeded {
-        /// Currently committed opaque payload bytes.
+        /// Currently charged logical payload bytes.
         current: u64,
-        /// Opaque bytes in the rejected item.
+        /// Logical bytes charged by the rejected item.
         incoming: u64,
-        /// Configured maximum aggregate retained payload/source-envelope bytes.
+        /// Configured maximum charged logical payload bytes.
         limit: u64,
     },
     /// The durable item count cannot be represented by the accounting type.
     ItemCountAccountingOverflow,
-    /// The durable opaque payload byte count cannot be represented by the accounting type.
+    /// A physical accounted byte count or charged logical payload-byte sum cannot be represented.
     PayloadByteAccountingOverflow,
     /// Durable accounting metadata disagrees with reconstructed item-table truth.
     AccountingMismatch {
@@ -3985,14 +4002,14 @@ impl fmt::Display for StoreError {
                 limit,
             } => write!(
                 formatter,
-                "accepting {incoming} retained bytes at current total {current} would exceed configured limit {limit}"
+                "accepting {incoming} charged logical payload bytes at current charged total {current} would exceed configured limit {limit}"
             ),
             Self::ItemCountAccountingOverflow => {
                 formatter.write_str("durable item-count accounting overflow")
             }
-            Self::PayloadByteAccountingOverflow => {
-                formatter.write_str("durable payload-byte accounting overflow")
-            }
+            Self::PayloadByteAccountingOverflow => formatter.write_str(
+                "physical accounted or charged logical payload-byte accounting overflow",
+            ),
             Self::AccountingMismatch {
                 field,
                 durable,
@@ -6153,7 +6170,7 @@ impl Store {
     pub fn aggregate_usage(&self) -> Result<AggregateStoreUsage, StoreError> {
         let read = self.database.begin_read()?;
         let metadata = read.open_table(METADATA)?;
-        let usage = aggregate_usage_from_metadata(&metadata)?;
+        let usage = aggregate_usage_read(&read, &metadata)?;
         Ok(AggregateStoreUsage {
             items: usage.items,
             payload_bytes: usage.bytes,
@@ -8378,7 +8395,7 @@ impl Store {
             if self.mission_authority.is_some() {
                 require_ordinary_aggregate_capacity(&write, &metadata, self.limits, 1, incoming)?;
             } else {
-                require_aggregate_capacity(&metadata, self.limits, 1, incoming)?;
+                require_aggregate_capacity(&write, &metadata, self.limits, 1, incoming)?;
             }
             let current_items = metadata.get(ITEM_COUNT)?.map_or(0, |value| value.value());
             let next_items = current_items
@@ -9226,7 +9243,7 @@ impl Store {
         {
             let mut metadata = write.open_table(METADATA)?;
             if prepared.header.tombstone {
-                require_aggregate_capacity(&metadata, self.limits, 1, incoming)?;
+                require_aggregate_capacity(&write, &metadata, self.limits, 1, incoming)?;
             } else {
                 require_ordinary_aggregate_capacity(&write, &metadata, self.limits, 1, incoming)?;
             }
@@ -11408,7 +11425,7 @@ impl Store {
         let marker = {
             let mut metadata = write.open_table(METADATA)?;
             if prepared.header.tombstone {
-                require_aggregate_capacity(&metadata, self.limits, 1, incoming)?;
+                require_aggregate_capacity(write, &metadata, self.limits, 1, incoming)?;
             } else {
                 require_ordinary_aggregate_capacity(write, &metadata, self.limits, 1, incoming)?;
             }
@@ -13632,7 +13649,7 @@ fn insert_control(
     )?;
     {
         let mut metadata = write.open_table(METADATA)?;
-        require_aggregate_capacity(&metadata, limits, 1, incoming)?;
+        require_aggregate_capacity(write, &metadata, limits, 1, incoming)?;
         let controls = metadata
             .get(CONTROL_ITEM_COUNT)?
             .map_or(0, |value| value.value());
@@ -13696,7 +13713,7 @@ fn admit_control_publication_intent(
     let incoming =
         u64::try_from(encoded_len).map_err(|_| StoreError::PayloadByteAccountingOverflow)?;
     let mut metadata = write.open_table(METADATA)?;
-    require_aggregate_capacity(&metadata, limits, 0, incoming)?;
+    require_aggregate_capacity(write, &metadata, limits, 0, incoming)?;
     let sealed_bytes = metadata
         .get(CONTROL_TOTAL_BYTES)?
         .map_or(0, |value| value.value());
@@ -14374,13 +14391,14 @@ fn update_causal_high_water(
 }
 
 fn require_aggregate_capacity(
+    write: &redb::WriteTransaction,
     metadata: &redb::Table<'_, &str, u64>,
     limits: StoreLimits,
     incoming_items: u64,
     incoming_bytes: u64,
 ) -> Result<(), StoreError> {
     require_aggregate_capacity_bounds(
-        metadata,
+        aggregate_usage_write(write, metadata)?,
         limits.max_items(),
         limits.max_total_payload_bytes(),
         incoming_items,
@@ -14389,13 +14407,12 @@ fn require_aggregate_capacity(
 }
 
 fn require_aggregate_capacity_bounds(
-    metadata: &redb::Table<'_, &str, u64>,
+    usage: CustodyUsage,
     max_items: u64,
     max_total_payload_bytes: u64,
     incoming_items: u64,
     incoming_bytes: u64,
 ) -> Result<(), StoreError> {
-    let usage = aggregate_usage_from_metadata(metadata)?;
     let next_items = usage
         .items
         .checked_add(incoming_items)
@@ -14513,6 +14530,44 @@ where
     Ok(CustodyUsage { items, bytes })
 }
 
+fn aggregate_usage_with_blob_retirement_reserve(
+    mut usage: CustodyUsage,
+    active_blob_operations: u64,
+) -> Result<CustodyUsage, StoreError> {
+    let reserve = active_blob_operations
+        .checked_mul(blob::MAX_BLOB_OPERATION_RETIREMENT_GROWTH_BYTES)
+        .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+    usage.bytes = usage
+        .bytes
+        .checked_add(reserve)
+        .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+    Ok(usage)
+}
+
+fn aggregate_usage_write(
+    write: &redb::WriteTransaction,
+    metadata: &redb::Table<'_, &str, u64>,
+) -> Result<CustodyUsage, StoreError> {
+    let physical = aggregate_usage_from_metadata(metadata)?;
+    let operation_count = metadata
+        .get(blob::BLOB_OPERATION_COUNT)?
+        .map_or(0, |value| value.value());
+    let active_operations = blob::lifecycle::active_operation_count_write(write, operation_count)?;
+    aggregate_usage_with_blob_retirement_reserve(physical, active_operations)
+}
+
+fn aggregate_usage_read(
+    read: &redb::ReadTransaction,
+    metadata: &redb::ReadOnlyTable<&str, u64>,
+) -> Result<CustodyUsage, StoreError> {
+    let physical = aggregate_usage_from_metadata(metadata)?;
+    let operation_count = metadata
+        .get(blob::BLOB_OPERATION_COUNT)?
+        .map_or(0, |value| value.value());
+    let active_operations = blob::lifecycle::active_operation_count_read(read, operation_count)?;
+    aggregate_usage_with_blob_retirement_reserve(physical, active_operations)
+}
+
 fn require_ordinary_aggregate_capacity(
     write: &redb::WriteTransaction,
     metadata: &redb::Table<'_, &str, u64>,
@@ -14520,9 +14575,9 @@ fn require_ordinary_aggregate_capacity(
     incoming_items: u64,
     incoming_bytes: u64,
 ) -> Result<(), StoreError> {
-    require_aggregate_capacity(metadata, limits, incoming_items, incoming_bytes)?;
+    require_aggregate_capacity(write, metadata, limits, incoming_items, incoming_bytes)?;
     let (item_reserve, byte_reserve) = custody::custody_emergency_reserve(limits);
-    let total = aggregate_usage_from_metadata(metadata)?;
+    let total = aggregate_usage_write(write, metadata)?;
     let control = CustodyUsage {
         items: metadata
             .get(CONTROL_ITEM_COUNT)?
@@ -17247,6 +17302,11 @@ struct StateAuditSnapshot {
     expected_dots: std::collections::BTreeMap<Vec<u8>, [u8; 32]>,
     expected_publisher_high: std::collections::BTreeMap<Vec<u8>, u64>,
     expected_frontier: std::collections::BTreeMap<Vec<u8>, u64>,
+    // Fixed commitments retained after a Blob publication record expires.
+    // The Blob lifecycle audit derives these only from a permanent replay dot
+    // and its matching causal-fence digest; the final shared audit then
+    // requires the exact surviving frontier row.
+    historical_frontier: std::collections::BTreeMap<[u8; 32], u64>,
     domain_publishers: std::collections::BTreeMap<Vec<u8>, std::collections::BTreeSet<NodeId>>,
 }
 
@@ -18200,6 +18260,7 @@ fn audit_semantic_tables(
     let mut expected_publisher_high = state_audit.expected_publisher_high;
     let mut expected_event_high = std::collections::BTreeMap::<Vec<u8>, u64>::new();
     let mut expected_frontier = state_audit.expected_frontier;
+    let historical_frontier = state_audit.historical_frontier;
     let mut domain_publishers = state_audit.domain_publishers;
 
     for row in events.iter()? {
@@ -18561,10 +18622,10 @@ fn audit_semantic_tables(
         &expected_event_high,
         "Event stream high-water contains an orphan, missing, or inflated row",
     )?;
-    audit_exact_u64_index(
+    audit_causal_frontier_with_expired_blob_evidence(
         &frontier,
         &expected_frontier,
-        "causal frontier contains an orphan, missing, or inflated row",
+        &historical_frontier,
     )?;
 
     let mut operation_count = 0u64;
@@ -19734,6 +19795,45 @@ fn audit_exact_u64_index(
         }
     }
     Ok(())
+}
+
+fn audit_causal_frontier_with_expired_blob_evidence<T: ReadableTable<&'static [u8], u64>>(
+    table: &T,
+    expected: &std::collections::BTreeMap<Vec<u8>, u64>,
+    historical: &std::collections::BTreeMap<[u8; 32], u64>,
+) -> Result<(), StoreError> {
+    let mut unmatched_expected = expected.clone();
+    let mut unmatched_historical = historical.clone();
+    for row in table.iter()? {
+        let (key, value) = row?;
+        let counter = value.value();
+        if counter == 0 {
+            return Err(StoreError::SemanticInvariant(
+                "causal frontier contains an orphan, missing, or inflated row",
+            ));
+        }
+        let digest: [u8; 32] = Sha256::digest(key.value()).into();
+        let live = unmatched_expected.remove(key.value());
+        let expired = unmatched_historical.remove(&digest);
+        let required = match (live, expired) {
+            (Some(live), Some(expired)) => Some(live.max(expired)),
+            (Some(live), None) => Some(live),
+            (None, Some(expired)) => Some(expired),
+            (None, None) => None,
+        };
+        if required != Some(counter) {
+            return Err(StoreError::SemanticInvariant(
+                "causal frontier contains an orphan, missing, or inflated row",
+            ));
+        }
+    }
+    if unmatched_expected.is_empty() && unmatched_historical.is_empty() {
+        Ok(())
+    } else {
+        Err(StoreError::SemanticInvariant(
+            "causal frontier is missing live or permanent expired Blob evidence",
+        ))
+    }
 }
 
 fn validate_event_header(header: &EnvelopeHeader) -> Result<(), StoreError> {
@@ -23330,6 +23430,7 @@ fn inspect_semantic_readable(
     let mut expected_publisher_high = state_audit.expected_publisher_high;
     let mut expected_event_high = std::collections::BTreeMap::<Vec<u8>, u64>::new();
     let mut expected_frontier = state_audit.expected_frontier;
+    let historical_frontier = state_audit.historical_frontier;
     let mut domain_publishers = state_audit.domain_publishers;
     for row in events.iter()? {
         let (key, value) = row?;
@@ -23644,22 +23745,11 @@ fn inspect_semantic_readable(
             ));
         }
     }
-    if frontier.len()?
-        != u64::try_from(expected_frontier.len())
-            .map_err(|_| StoreError::ItemCountAccountingOverflow)?
-    {
-        return Err(StoreError::SemanticInvariant(
-            "causal frontier contains an orphan, missing, or inflated row",
-        ));
-    }
-    for row in frontier.iter()? {
-        let (key, value) = row?;
-        if value.value() == 0 || expected_frontier.get(key.value()) != Some(&value.value()) {
-            return Err(StoreError::SemanticInvariant(
-                "causal frontier contains an orphan, missing, or inflated row",
-            ));
-        }
-    }
+    audit_causal_frontier_with_expired_blob_evidence(
+        &frontier,
+        &expected_frontier,
+        &historical_frontier,
+    )?;
     let mut operation_count = 0u64;
     let mut operation_bytes = 0u64;
     let mut tombstone_operation_count = 0u64;
@@ -24402,6 +24492,29 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.0);
         }
+    }
+
+    #[test]
+    fn causal_frontier_audit_merges_live_and_expired_blob_requirements() {
+        const TEST_FRONTIER: TableDefinition<&[u8], u64> =
+            TableDefinition::new("aster.test-causal-frontier.v1");
+
+        let file = TestFile::new("merged-causal-frontier-audit");
+        let database = Database::create(&file.0).expect("create causal audit database");
+        let write = database.begin_write().expect("begin causal audit write");
+        let key = b"shared-frontier".to_vec();
+        let mut frontier = write
+            .open_table(TEST_FRONTIER)
+            .expect("open causal frontier");
+        frontier
+            .insert(key.as_slice(), 5)
+            .expect("insert merged frontier high-water");
+        let expected = std::collections::BTreeMap::from([(key.clone(), 1)]);
+        let historical =
+            std::collections::BTreeMap::from([(Sha256::digest(key.as_slice()).into(), 5)]);
+
+        audit_causal_frontier_with_expired_blob_evidence(&frontier, &expected, &historical)
+            .expect("live and expired authorities merge to their maximum");
     }
 
     fn run_abrupt_store_child(file: &TestFile, mode: &str) {

@@ -27,6 +27,7 @@ use std::fmt;
 use aster_mesh::{
     BlobId, BlobRouteCommitment, BlobStore as CoreBlobStore, ContentVerifiedBlobEnvelope,
     CurrentBlobLineage, MAX_BLOB_CHUNK_SIZE, MAX_BLOB_CHUNKS, MAX_BLOB_MANIFEST_BYTES,
+    MAX_BLOB_MEDIA_TYPE_BYTES, MAX_BLOB_SCHEMA_ID_BYTES,
     SELECTED_BLOB_CHUNK_SIZE as CORE_SELECTED_BLOB_CHUNK_SIZE, VerifiedBlobContentCompletion,
     VerifiedBlobTransferPlan,
 };
@@ -118,12 +119,118 @@ pub const MAX_BLOB_OPERATION_KEY_BYTES: usize = 256;
 pub const MAX_BLOB_OPERATIONS: u64 = 4_096;
 /// Maximum aggregate operation-key plus operation-record bytes.
 pub const MAX_BLOB_OPERATION_BYTES: u64 = 512 * 1024;
+const BLOB_ACTIVE_OPERATION_RECORD_BYTES: u64 = 1 + 1 + 1 + 32 + 32;
+const BLOB_RETIRED_OPERATION_RECORD_BYTES: u64 = 1 + 2 + 8 + 32 + 32 + 43;
+pub(crate) const MAX_BLOB_OPERATION_RETIREMENT_GROWTH_BYTES: u64 =
+    BLOB_RETIRED_OPERATION_RECORD_BYTES - BLOB_ACTIVE_OPERATION_RECORD_BYTES;
+/// Maximum aggregate durable operation bytes after bounded active aliases are
+/// converted to their fixed-size retained retirement records.
+#[doc(hidden)]
+pub const MAX_BLOB_DURABLE_OPERATION_BYTES: u64 =
+    MAX_BLOB_OPERATION_BYTES + MAX_BLOB_OPERATIONS * MAX_BLOB_OPERATION_RETIREMENT_GROWTH_BYTES;
 /// Maximum signed publications retained for one `(topic, scope, BlobId)` read plan.
 pub const MAX_BLOB_PUBLICATIONS_PER_CONTENT: usize = 1_024;
 /// Maximum selected network Blob plaintext bytes (64 MiB).
 pub const MAX_NETWORK_BLOB_BYTES: u64 = 64 * 1024 * 1024;
 /// Maximum exact source-sealed manifest envelope admitted for networking (1 MiB).
 pub const MAX_BLOB_NETWORK_SOURCE_BYTES: usize = 1024 * 1024;
+/// Exact maximum row count for one atomic policy-invalidation retirement.
+///
+/// This private runtime integration bound covers one 12-row publication
+/// discovery, ten fixed retirement rows, two operation-accounting rows, every
+/// globally bounded operation plus owner/resolver/deadline, and every bounded
+/// live delivery plus inverse owner.
+#[doc(hidden)]
+pub const MAX_BLOB_POLICY_RETIREMENT_ROWS: u64 =
+    12 + 10 + 2 + 4 * MAX_BLOB_OPERATIONS + 2 * crate::MAX_BLOB_SUBSCRIPTIONS;
+
+const MAX_BLOB_LIVE_PUBLICATION_RECORD_BYTES: u64 = 2 // lifecycle wrapper
+    + 1 // metadata version
+    + 5 * 32 // transfer, semantic, Blob, variant, manifest IDs
+    + 1 + 2 * 32 // lineage flag and bindings
+    + 1 + 32 + 4 * 8 + 32 // priority, publisher, counters/lengths, route root
+    + 2 + aster_profile::MAX_TOPIC_BYTES as u64
+    + 2 + aster_profile::MAX_SCOPE_BYTES as u64
+    + 4 + aster_profile::MAX_CAUSAL_CONTEXT_ENTRIES as u64 * 40;
+const MAX_BLOB_IMPORT_RECORD_BYTES: u64 = 1
+    + 3 * 32
+    + 8
+    + 8
+    + 4
+    + 8
+    + 32
+    + 1
+    + 32
+    + 1
+    + 32
+    + 2
+    + MAX_BLOB_MEDIA_TYPE_BYTES as u64
+    + 2
+    + MAX_BLOB_SCHEMA_ID_BYTES as u64;
+// A selected source Blob has a bounded canonical envelope even when it was
+// committed locally rather than admitted through the narrower network cap.
+// The maximum is the 44-byte public envelope header, the 256-KiB protected
+// route limit, the selected Blob core (maximum encoded Blob header, u64
+// payload length, and one-MiB manifest), and the 16-byte content AEAD tag.
+const MAX_BLOB_SOURCE_HEADER_BYTES: u64 = 2
+    + (2 + aster_profile::MAX_TOPIC_BYTES as u64)
+    + (2 + aster_profile::MAX_SCOPE_BYTES as u64)
+    + 32
+    + 8
+    + 4
+    + aster_profile::MAX_CAUSAL_CONTEXT_ENTRIES as u64 * 40
+    + 1
+    + (4 + 32)
+    + (1 + 32 + 8 + 32)
+    + 1
+    + 8
+    + 1
+    + 8;
+const MAX_BLOB_SOURCE_SEALED_BYTES: u64 =
+    44 + 256 * 1024 + MAX_BLOB_SOURCE_HEADER_BYTES + 8 + MAX_BLOB_MANIFEST_BYTES + 16;
+const MAX_BLOB_POLICY_RETIREMENT_DISCOVERY_BYTES: u64 = 32 + MAX_BLOB_LIVE_PUBLICATION_RECORD_BYTES
+        + 32 + MAX_BLOB_IMPORT_RECORD_BYTES
+        + 32 + 65 // lineage fence
+        + 65 // publication reference
+        + 32 + MAX_BLOB_SOURCE_SEALED_BYTES
+        + 32 + 8 // acceptance marker
+        + 32 + 32 // semantic index
+        + (2 + aster_profile::MAX_TOPIC_BYTES as u64
+            + 2 + aster_profile::MAX_SCOPE_BYTES as u64
+            + 32 + 32) + 32 // content index
+        + 40 + 145 // replay fence
+        + 40 + 32 // accepted-dot authority
+        + 32 + 8 // publisher high-water
+        + (2 + aster_profile::MAX_TOPIC_BYTES as u64
+            + 2 + aster_profile::MAX_SCOPE_BYTES as u64
+            + 32) + 8; // causal frontier
+const MAX_BLOB_POLICY_RETIREMENT_ACCOUNTING_BYTES: u64 = ("next_retirement_generation".len() + 8)
+    as u64
+    + ("retired_publication_rows".len() + 8) as u64
+    + ("retirement_resolver_rows".len() + 8) as u64
+    + ("deadline_rows".len() + 8) as u64
+    + ("operation_owner_rows".len() + 8) as u64
+    + ("retired_operation_rows".len() + 8) as u64
+    + ("semantic_blob_item_count".len() + 8) as u64
+    + ("semantic_blob_total_bytes".len() + 8) as u64
+    + ("semantic_blob_operation_total_bytes".len() + 8) as u64;
+/// Proven encoded-byte upper bound paired with
+/// [`MAX_BLOB_POLICY_RETIREMENT_ROWS`].
+///
+/// `bytes_examined` charges each unique existing row once at its pre-mutation
+/// encoding and each newly inserted resolver/deadline at its canonical
+/// encoding. Repeated implementation reads do not multiply the charge.
+#[doc(hidden)]
+pub const MAX_BLOB_POLICY_RETIREMENT_BYTES: u64 = MAX_BLOB_POLICY_RETIREMENT_DISCOVERY_BYTES
+        + 8 + 32 // acceptance-order row
+        + 33 + 57 // publication resolver and deadline
+        + MAX_BLOB_POLICY_RETIREMENT_ACCOUNTING_BYTES
+        + MAX_BLOB_OPERATION_BYTES
+        + MAX_BLOB_OPERATIONS
+            * ((64 + MAX_BLOB_OPERATION_KEY_BYTES as u64)
+                + (33 + MAX_BLOB_OPERATION_KEY_BYTES as u64)
+                + 57)
+        + crate::MAX_BLOB_SUBSCRIPTIONS * ((40 + 49) + (64 + 40));
 /// Maximum selected 64-KiB chunks in one network Blob.
 pub const MAX_NETWORK_BLOB_CHUNKS: u64 = 1_024;
 /// Maximum aggregate pending-source and carrier-prefix rows.
@@ -235,6 +342,7 @@ pub enum BlobStoreError {
     InvalidPublication(&'static str),
     Verification(String),
     OperationConflict,
+    ExpiredOrRetired,
     PublisherRevoked(NodeId),
     KeyEpochStale {
         current: u64,
@@ -354,6 +462,7 @@ impl fmt::Display for BlobStoreError {
             Self::OperationConflict => {
                 formatter.write_str("Blob operation key is bound to another intent")
             }
+            Self::ExpiredOrRetired => formatter.write_str("Blob publication is expired or retired"),
             Self::PublisherRevoked(publisher) => {
                 write!(formatter, "Blob publisher {publisher:?} is revoked")
             }
@@ -1188,6 +1297,17 @@ pub struct BlobGcStatus {
     pub retry_attempts: u64,
     pub oldest_pending_age_ms: Option<u64>,
     pub oldest_pending_age_is_lower_bound: bool,
+    /// Number of bounded retained publication records awaiting conservative
+    /// expiry. This aggregate carries no source, identity, path, or key data.
+    pub retained_publication_records: u64,
+    /// Number of bounded retained operation records awaiting conservative
+    /// expiry. This aggregate carries no source, identity, path, or key data.
+    pub retained_operation_records: u64,
+    /// Greatest conservative lower-bound age among retained lifecycle rows.
+    pub oldest_retirement_age_ms: Option<u64>,
+    /// Whether `oldest_retirement_age_ms` is only a lower bound because the
+    /// current custody clock cannot extend one or more retained records.
+    pub oldest_retirement_age_is_lower_bound: bool,
     pub maintenance_turn: u64,
     pub next_retry_turn: Option<u64>,
     pub retry_state: BlobGcRetryState,
@@ -1213,6 +1333,18 @@ pub struct BlobCapacityGcProgress {
     pub bytes_examined: u64,
     pub manifests_admitted: u64,
     pub manifests_finalized: u64,
+}
+
+/// Internal resource partition selected for one admission-recovery pass.
+///
+/// This is implementation plumbing between the selected node and its local
+/// store. It is not a wire, CLI, or application-facing policy surface.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlobCapacityGcTarget {
+    Depot,
+    Operation,
+    PublicationLifecycle,
 }
 
 struct BlobCapacityPhysicalUnitProgress {
@@ -1350,6 +1482,19 @@ thread_local! {
     static TEST_BLOB_CAPACITY_ADMISSION_PAGES: std::cell::Cell<u64> = const {
         std::cell::Cell::new(0)
     };
+    static TEST_BLOB_OPERATION_EXPIRY_ROWS_VISITED: std::cell::Cell<u64> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[cfg(test)]
+fn reset_blob_operation_expiry_rows_visited_for_test() {
+    TEST_BLOB_OPERATION_EXPIRY_ROWS_VISITED.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn blob_operation_expiry_rows_visited_for_test() -> u64 {
+    TEST_BLOB_OPERATION_EXPIRY_ROWS_VISITED.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]
@@ -2052,16 +2197,34 @@ impl Store {
         let authority = self.require_bound_mission()?;
         let read = self.database.begin_read()?;
         require_control_policy_read(&read, authority, policy)?;
+        let existing_encoded = read
+            .open_table(BLOB_OPERATIONS)?
+            .get(request.operation.as_bytes())?
+            .map(|value| value.value().to_vec());
+        if let Some(encoded) = existing_encoded.as_deref()
+            && let Some((_, _, operation_digest, intent_digest, _)) =
+                lifecycle::operation_retirement(encoded).map_err(blob_error)?
+        {
+            if operation_digest != Sha256::digest(request.operation.as_bytes()).as_slice() {
+                return Err(blob_error(BlobStoreError::SchemaInvariant(
+                    "retired Blob operation digest differs from its key",
+                )));
+            }
+            return if intent_digest == request.intent.digest() {
+                Err(blob_error(BlobStoreError::ExpiredOrRetired))
+            } else {
+                Err(blob_error(BlobStoreError::OperationConflict))
+            };
+        }
         if control_principal_revoked_read(&read, request.intent.publisher)? {
             return Err(blob_error(BlobStoreError::PublisherRevoked(
                 request.intent.publisher,
             )));
         }
-        let existing = read
-            .open_table(BLOB_OPERATIONS)?
-            .get(request.operation.as_bytes())?
+        let existing = existing_encoded
+            .as_deref()
             .map(|value| {
-                decode_blob_operation_record(value.value()).map_err(|error| {
+                decode_blob_operation_record(value).map_err(|error| {
                     blob_preflight_decode_error(error, "Blob operation row is malformed")
                 })
             })
@@ -2096,13 +2259,20 @@ impl Store {
     ) -> Result<Option<StoredBlob>, StoreError> {
         self.require_bound_mission()?;
         let read = self.database.begin_read()?;
-        let transfer = read
+        let encoded = read
             .open_table(BLOB_OPERATIONS)?
             .get(operation.as_bytes())?
-            .map(|value| {
-                decode_blob_operation_record(value.value()).map(|record| record.transfer_id)
-            })
-            .transpose()?;
+            .map(|value| value.value().to_vec());
+        if let Some(encoded) = encoded.as_deref()
+            && lifecycle::operation_record_is_retired(encoded).map_err(blob_error)?
+        {
+            return Err(blob_error(BlobStoreError::ExpiredOrRetired));
+        }
+        let transfer = encoded
+            .as_deref()
+            .map(decode_blob_operation_record)
+            .transpose()?
+            .map(|record| record.transfer_id);
         transfer
             .map(|transfer| load_blob_from_read(&read, transfer))
             .transpose()
@@ -2215,7 +2385,10 @@ impl Store {
             usize::try_from(table.len()?).map_err(|_| StoreError::ItemCountAccountingOverflow)?,
         );
         for row in table.iter()? {
-            let (key, _) = row?;
+            let (key, value) = row?;
+            if lifecycle::publication_record_is_retired(value.value()).map_err(blob_error)? {
+                continue;
+            }
             inventory.push(parse_blob_transfer_id(
                 "Blob publication table",
                 key.value(),
@@ -2248,11 +2421,42 @@ impl Store {
         self.require_bound_mission()?;
         let read = self.database.begin_read()?;
         let stats = inspect_blob_tables_read(&read)?.stats;
+        let lifecycle_usage = lifecycle::inspect_blob_lifecycle_read(&read)?;
         let deletion =
             deletion::audit_blob_deletion_read(&read, Some(self.blob_depot_owner_binding))?;
         let mut retry_attempts = 0u64;
         let mut oldest_pending_age_ms = None;
         let mut oldest_pending_age_is_lower_bound = false;
+        let mut oldest_retirement_age_ms = None;
+        let mut oldest_retirement_age_is_lower_bound = false;
+        let mut observe_retirement_age = |age: lifecycle::RetirementAge| {
+            let projection = age.project(sample).map_err(blob_error)?;
+            oldest_retirement_age_is_lower_bound |= projection.is_lower_bound;
+            match oldest_retirement_age_ms {
+                None => oldest_retirement_age_ms = Some(projection.age.cumulative_age_ms()),
+                Some(oldest) if projection.age.cumulative_age_ms() > oldest => {
+                    oldest_retirement_age_ms = Some(projection.age.cumulative_age_ms());
+                }
+                Some(_) => {}
+            }
+            Ok::<(), StoreError>(())
+        };
+        for row in read.open_table(BLOB_PUBLICATIONS)?.iter()? {
+            let (_, value) = row?;
+            if let Some((_, _, age)) =
+                lifecycle::publication_retirement(value.value()).map_err(blob_error)?
+            {
+                observe_retirement_age(age)?;
+            }
+        }
+        for row in read.open_table(BLOB_OPERATIONS)?.iter()? {
+            let (_, value) = row?;
+            if let Some((_, _, _, _, age)) =
+                lifecycle::operation_retirement(value.value()).map_err(blob_error)?
+            {
+                observe_retirement_age(age)?;
+            }
+        }
         let mut next_retry_turn = None;
         let mut last_failure = None;
         let mut last_failure_order = None;
@@ -2316,6 +2520,10 @@ impl Store {
             retry_attempts,
             oldest_pending_age_ms,
             oldest_pending_age_is_lower_bound,
+            retained_publication_records: lifecycle_usage.retired_publication_rows,
+            retained_operation_records: lifecycle_usage.retired_operation_rows,
+            oldest_retirement_age_ms,
+            oldest_retirement_age_is_lower_bound,
             maintenance_turn: deletion.stats.maintenance_turn,
             next_retry_turn,
             retry_state,
@@ -2331,6 +2539,25 @@ impl Store {
             publication_lifecycle_rows: stats.publication_lifecycle_rows,
             publication_lifecycle_row_cap: limits.max_publication_rows(),
         })
+    }
+
+    /// Returns the nearest retained-record deadline in the supplied custody
+    /// clock domain for the node runtime's private wake scheduler.
+    ///
+    /// This is implementation-only coordination between the selected runtime
+    /// and its local store. It does not expose a caller-selected lifetime,
+    /// trigger maintenance, or alter Blob protocol semantics.
+    #[doc(hidden)]
+    pub fn nearest_blob_retention_deadline(
+        &self,
+        current: aster_mesh::CustodySample,
+    ) -> Result<Option<aster_mesh::CustodySample>, StoreError> {
+        self.require_live()?;
+        let read = self.database.begin_read()?;
+        Ok(
+            lifecycle::nearest_retention_deadline_read(&read, current.clock_id)?
+                .map(|(deadline, _)| deadline),
+        )
     }
 
     /// Atomically stages one complete source-authenticated manifest and its
@@ -2482,9 +2709,24 @@ impl Store {
         if lifecycle::check_replay_fence(&write, replay_fence)?
             == lifecycle::ReplayFenceStatus::Exact
         {
-            return Err(blob_error(BlobStoreError::SchemaInvariant(
-                "retained Blob replay fence is missing its live publication",
-            )));
+            if !lifecycle::expired_replay_causal_fence_matches(
+                &write,
+                pending.metadata.header.stamp.dot,
+                &causal_frontier_key(
+                    &pending.metadata.header.topic,
+                    &pending.metadata.header.scope,
+                    pending.metadata.header.stamp.dot.publisher,
+                )?,
+            )? {
+                return Err(blob_error(BlobStoreError::SchemaInvariant(
+                    "retained Blob replay fence is missing its live publication",
+                )));
+            }
+            // The bounded publication may have retired and expired while this
+            // permanent exact-source replay authority remains.  Preserve the
+            // existing wire duplicate outcome without recreating any source,
+            // pending, publication, or operation state.
+            return Ok(BlobSourceStageOutcome::Duplicate);
         }
         if transfer_id_exists_outside_blob(&write, transfer_id.as_bytes())? {
             return Err(StoreError::TransferNamespaceCollision {
@@ -2585,20 +2827,33 @@ impl Store {
         self.require_live()?;
         self.require_bound_mission()?;
         let read = self.database.begin_read()?;
-        let completed = read
+        let completed_record = read
             .open_table(BLOB_PUBLICATIONS)?
             .get(source.as_bytes().as_slice())?
-            .map(|value| decode_blob_metadata(value.value()))
+            .map(|value| value.value().to_vec());
+        let completed_is_retired = completed_record
+            .as_deref()
+            .map(lifecycle::publication_record_is_retired)
+            .transpose()
+            .map_err(blob_error)?
+            .unwrap_or(false);
+        let completed = completed_record
+            .as_deref()
+            .filter(|_| !completed_is_retired)
+            .map(decode_blob_metadata)
             .transpose()?;
         let pending = read
             .open_table(BLOB_PENDING_SOURCES)?
             .get(source.as_bytes().as_slice())?
             .map(|value| decode_pending_blob_source(value.value()))
             .transpose()?;
-        if completed.is_some() && pending.is_some() {
+        if completed_record.is_some() && pending.is_some() {
             return Err(blob_error(BlobStoreError::SchemaInvariant(
                 "Blob source is simultaneously pending and completed",
             )));
+        }
+        if completed_is_retired {
+            return Ok(None);
         }
         if let Some(metadata) = completed {
             let sealed_len = read
@@ -2661,6 +2916,10 @@ impl Store {
         for row in read.open_table(BLOB_PUBLICATIONS)?.iter()? {
             let (key, value) = row?;
             let source = parse_blob_transfer_id("Blob publication table", key.value())?;
+            if lifecycle::publication_record_is_retired(value.value()).map_err(blob_error)? {
+                seen.insert(source);
+                continue;
+            }
             let metadata = decode_blob_metadata(value.value())?;
             // Metadata-v1 remains valid for local reads but has no provider-owned
             // lineages and is therefore deliberately invisible to semantic-v5
@@ -4674,10 +4933,12 @@ struct MaintenanceImportEvidence {
 #[derive(Debug)]
 enum MaintenanceEvidence {
     Publication(MaintenancePublicationEvidence),
+    RetiredPublication,
     Pending(MaintenancePendingEvidence),
     Carrier(MaintenanceCarrierEvidence),
     Import(MaintenanceImportEvidence),
     Operation { publication: Vec<u8> },
+    RetiredOperation,
 }
 
 #[derive(Debug)]
@@ -4696,7 +4957,6 @@ struct MaintenancePage {
     complete: bool,
 }
 
-#[cfg(test)]
 fn maintenance_entry_bytes(key: &[u8], value: &[u8]) -> Result<u64, StoreError> {
     key.len()
         .checked_add(value.len())
@@ -4712,19 +4972,26 @@ enum MaintenanceRowKind {
     Operation,
 }
 
-struct MaintenanceCharge {
+pub(crate) struct MaintenanceCharge {
     budget: BlobMaintenanceBudget,
     rows: u64,
     bytes: u64,
 }
 
 impl MaintenanceCharge {
-    fn charge(&mut self, key: &[u8], value_len: usize) -> Result<bool, StoreError> {
+    pub(crate) fn has_capacity_for_row(&self) -> bool {
+        self.rows < self.budget.rows && self.bytes < self.budget.bytes
+    }
+
+    pub(crate) fn charge(&mut self, key: &[u8], value_len: usize) -> Result<bool, StoreError> {
+        self.charge_lengths(key.len(), value_len)
+    }
+
+    fn charge_lengths(&mut self, key_len: usize, value_len: usize) -> Result<bool, StoreError> {
         if self.rows >= self.budget.rows {
             return Ok(false);
         }
-        let encoded_bytes = key
-            .len()
+        let encoded_bytes = key_len
             .checked_add(value_len)
             .and_then(|length| u64::try_from(length).ok())
             .ok_or(StoreError::PayloadByteAccountingOverflow)?;
@@ -4862,6 +5129,9 @@ fn capture_maintenance_evidence(
 
     Ok(Some(match kind {
         MaintenanceRowKind::Publication => {
+            if lifecycle::publication_record_is_retired(value).map_err(blob_error)? {
+                return Ok(Some(MaintenanceEvidence::RetiredPublication));
+            }
             let transfer = parse_blob_transfer_id("Blob publication table", key)?;
             let publication = decode_blob_metadata(value)?;
             let conflicting_pending =
@@ -5043,6 +5313,9 @@ fn capture_maintenance_evidence(
             })
         }
         MaintenanceRowKind::Operation => {
+            if lifecycle::operation_record_is_retired(value).map_err(blob_error)? {
+                return Ok(Some(MaintenanceEvidence::RetiredOperation));
+            }
             let operation = decode_blob_operation_record(value)?;
             let publication = required_bytes!(
                 BLOB_PUBLICATIONS,
@@ -5052,6 +5325,613 @@ fn capture_maintenance_evidence(
             MaintenanceEvidence::Operation { publication }
         }
     }))
+}
+
+fn retired_operation_expiry_row_write(
+    write: &redb::WriteTransaction,
+    operation_digest: [u8; 32],
+    sample: aster_mesh::CustodySample,
+) -> Result<(Vec<u8>, Vec<u8>), StoreError> {
+    let key = lifecycle::retirement_operation_key_write(write, operation_digest)?;
+    let value = write
+        .open_table(BLOB_OPERATIONS)?
+        .get(key.as_slice())?
+        .map(|value| value.value().to_vec())
+        .ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "Blob operation retirement resolver points to a missing operation",
+            ))
+        })?;
+    #[cfg(test)]
+    TEST_BLOB_OPERATION_EXPIRY_ROWS_VISITED.with(|count| count.set(count.get().saturating_add(1)));
+    let Some((_, _, digest, _, age)) =
+        lifecycle::operation_retirement(&value).map_err(blob_error)?
+    else {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "Blob operation retirement resolver points to an active operation",
+        )));
+    };
+    if digest != operation_digest || Sha256::digest(&key).as_slice() != operation_digest {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "Blob operation retirement resolver names another operation",
+        )));
+    }
+    if !age
+        .project(Some(sample))
+        .map_err(blob_error)?
+        .retention_elapsed
+    {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "Blob retention deadline points to an unexpired operation",
+        )));
+    }
+    Ok((key, value))
+}
+
+fn expire_retired_operation_write(
+    write: &redb::WriteTransaction,
+    deadline: aster_mesh::CustodySample,
+    operation_digest: [u8; 32],
+    sample: aster_mesh::CustodySample,
+) -> Result<(u64, u64), StoreError> {
+    let (key, value) = retired_operation_expiry_row_write(write, operation_digest, sample)?;
+    let operation_count = write
+        .open_table(METADATA)?
+        .get(BLOB_OPERATION_COUNT)?
+        .map(|value| value.value())
+        .ok_or(StoreError::MissingAccountingMetadata {
+            field: BLOB_OPERATION_COUNT,
+        })?;
+    let operation_bytes = write
+        .open_table(METADATA)?
+        .get(BLOB_OPERATION_TOTAL_BYTES)?
+        .map(|value| value.value())
+        .ok_or(StoreError::MissingAccountingMetadata {
+            field: BLOB_OPERATION_TOTAL_BYTES,
+        })?;
+    let removed_bytes = maintenance_entry_bytes(&key, &value)?;
+    let remaining_bytes = operation_bytes.checked_sub(removed_bytes).ok_or_else(|| {
+        blob_error(BlobStoreError::SchemaInvariant(
+            "Blob operation bytes underflow on retirement expiry",
+        ))
+    })?;
+    write
+        .open_table(BLOB_OPERATIONS)?
+        .remove(key.as_slice())?
+        .ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "retired Blob operation disappeared during expiry",
+            ))
+        })?;
+    {
+        let mut metadata = write.open_table(METADATA)?;
+        metadata.insert(
+            BLOB_OPERATION_COUNT,
+            operation_count.checked_sub(1).ok_or_else(|| {
+                blob_error(BlobStoreError::SchemaInvariant(
+                    "Blob operation count underflows on retirement expiry",
+                ))
+            })?,
+        )?;
+        metadata.insert(BLOB_OPERATION_TOTAL_BYTES, remaining_bytes)?;
+    }
+    lifecycle::remove_operation_retirement(write)?;
+    lifecycle::remove_retention_deadline(
+        write,
+        deadline,
+        lifecycle::RetentionDeadlineOwner::Operation(operation_digest),
+    )?;
+    let resolver = lifecycle::remove_retirement_resolver(
+        write,
+        lifecycle::RetentionDeadlineOwner::Operation(operation_digest),
+    )?;
+    if resolver != key {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "Blob operation retirement resolver names another operation",
+        )));
+    }
+    Ok((
+        3,
+        removed_bytes
+            .checked_add(57)
+            .and_then(|bytes| bytes.checked_add(33 + u64::try_from(key.len()).ok()?))
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?,
+    ))
+}
+
+/// Computes one retired-operation expiry unit without changing any durable
+/// row.  Maintenance budget rejection must happen before the destructive
+/// expiry path is entered, not merely before its transaction is committed.
+fn retired_operation_expiry_charge_write(
+    write: &redb::WriteTransaction,
+    operation_digest: [u8; 32],
+    sample: aster_mesh::CustodySample,
+) -> Result<(u64, u64), StoreError> {
+    let (key, value) = retired_operation_expiry_row_write(write, operation_digest, sample)?;
+    Ok((
+        3,
+        maintenance_entry_bytes(&key, &value)?
+            .checked_add(57)
+            .and_then(|bytes| bytes.checked_add(33 + u64::try_from(key.len()).ok()?))
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?,
+    ))
+}
+
+/// Computes the complete publication expiry charge before its first
+/// destructive row removal, including bounded delivery/acknowledgement state.
+fn retired_publication_expiry_charge_write(
+    write: &redb::WriteTransaction,
+    transfer: BlobTransferId,
+    sample: aster_mesh::CustodySample,
+) -> Result<(u64, u64), StoreError> {
+    let encoded = write
+        .open_table(BLOB_PUBLICATIONS)?
+        .get(transfer.as_bytes().as_slice())?
+        .map(|value| value.value().to_vec())
+        .ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "Blob retention deadline points to a missing publication",
+            ))
+        })?;
+    let Some((_, _, age)) = lifecycle::publication_retirement(&encoded).map_err(blob_error)? else {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "Blob retention deadline points to a live publication",
+        )));
+    };
+    if !age
+        .project(Some(sample))
+        .map_err(blob_error)?
+        .retention_elapsed
+    {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "Blob retention deadline points to an unexpired publication",
+        )));
+    }
+    let (publication, _) = decode_retired_blob_metadata(&encoded)?.ok_or_else(|| {
+        blob_error(BlobStoreError::SchemaInvariant(
+            "retired Blob publication lacks lookup metadata during expiry",
+        ))
+    })?;
+    let semantic_key = publication.semantic_id.as_bytes().as_slice();
+    let content_key = blob_content_key(
+        &publication.header.topic,
+        &publication.header.scope,
+        publication.blob_id,
+        publication.semantic_id,
+    )?;
+    let semantic = write
+        .open_table(BLOB_SEMANTIC_ITEMS)?
+        .get(semantic_key)?
+        .map(|value| value.value().to_vec())
+        .ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "retired Blob publication lacks semantic index during expiry",
+            ))
+        })?;
+    let content = write
+        .open_table(BLOB_CONTENT_INDEX)?
+        .get(content_key.as_slice())?
+        .map(|value| value.value().to_vec())
+        .ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "retired Blob publication lacks content index during expiry",
+            ))
+        })?;
+    if parse_blob_transfer_id("Blob semantic item table", &semantic)? != transfer
+        || parse_blob_transfer_id("Blob content index", &content)? != transfer
+    {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "retired Blob publication expiry lookup index names another source",
+        )));
+    }
+    let (delivery_rows, delivery_bytes) =
+        crate::blob_subscription::blob_retirement_delivery_expiry_charge_write(
+            write,
+            transfer,
+            publication.semantic_id,
+        )?;
+    lifecycle::require_publication_retirement_resolver_write(write, transfer)?;
+    Ok((
+        6u64.checked_add(delivery_rows)
+            .ok_or(StoreError::ItemCountAccountingOverflow)?,
+        maintenance_entry_bytes(transfer.as_bytes(), &encoded)?
+            .checked_add(maintenance_entry_bytes(semantic_key, &semantic)?)
+            .and_then(|bytes| {
+                bytes.checked_add(maintenance_entry_bytes(content_key.as_slice(), &content).ok()?)
+            })
+            .and_then(|bytes| bytes.checked_add(delivery_bytes))
+            .and_then(|bytes| bytes.checked_add(57))
+            // Permanent expired-replay causal binding: 40-byte dot key plus
+            // one fixed 32-byte frontier-key digest.
+            .and_then(|bytes| bytes.checked_add(72))
+            .and_then(|bytes| bytes.checked_add(33))
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?,
+    ))
+}
+
+fn expire_retired_publication_write(
+    write: &redb::WriteTransaction,
+    deadline: aster_mesh::CustodySample,
+    transfer: BlobTransferId,
+    sample: aster_mesh::CustodySample,
+) -> Result<(u64, u64), StoreError> {
+    let encoded = write
+        .open_table(BLOB_PUBLICATIONS)?
+        .get(transfer.as_bytes().as_slice())?
+        .map(|value| value.value().to_vec())
+        .ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "Blob retention deadline points to a missing publication",
+            ))
+        })?;
+    let Some((_, _, age)) = lifecycle::publication_retirement(&encoded).map_err(blob_error)? else {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "Blob retention deadline points to a live publication",
+        )));
+    };
+    if !age
+        .project(Some(sample))
+        .map_err(blob_error)?
+        .retention_elapsed
+    {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "Blob retention deadline points to an unexpired publication",
+        )));
+    }
+    let (publication, _) = decode_retired_blob_metadata(&encoded)?.ok_or_else(|| {
+        blob_error(BlobStoreError::SchemaInvariant(
+            "retired Blob publication lacks lookup metadata during expiry",
+        ))
+    })?;
+    let semantic_key = publication.semantic_id.as_bytes().as_slice();
+    let content_key = blob_content_key(
+        &publication.header.topic,
+        &publication.header.scope,
+        publication.blob_id,
+        publication.semantic_id,
+    )?;
+    let semantic = write
+        .open_table(BLOB_SEMANTIC_ITEMS)?
+        .get(semantic_key)?
+        .map(|value| value.value().to_vec())
+        .ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "retired Blob publication lacks semantic index during expiry",
+            ))
+        })?;
+    let content = write
+        .open_table(BLOB_CONTENT_INDEX)?
+        .get(content_key.as_slice())?
+        .map(|value| value.value().to_vec())
+        .ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "retired Blob publication lacks content index during expiry",
+            ))
+        })?;
+    if parse_blob_transfer_id("Blob semantic item table", &semantic)? != transfer
+        || parse_blob_transfer_id("Blob content index", &content)? != transfer
+    {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "retired Blob publication expiry lookup index names another source",
+        )));
+    }
+    lifecycle::record_expired_replay_causal_fence(
+        write,
+        publication.header.stamp.dot,
+        &causal_frontier_key(
+            &publication.header.topic,
+            &publication.header.scope,
+            publication.header.stamp.dot.publisher,
+        )?,
+    )?;
+    let (delivery_rows, delivery_bytes) =
+        crate::blob_subscription::expire_blob_retirement_deliveries_write(
+            write,
+            transfer,
+            publication.semantic_id,
+        )?;
+    write
+        .open_table(BLOB_PUBLICATIONS)?
+        .remove(transfer.as_bytes().as_slice())?
+        .ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "retired Blob publication disappeared during expiry",
+            ))
+        })?;
+    write
+        .open_table(BLOB_SEMANTIC_ITEMS)?
+        .remove(semantic_key)?
+        .ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "retired Blob semantic index disappeared during expiry",
+            ))
+        })?;
+    write
+        .open_table(BLOB_CONTENT_INDEX)?
+        .remove(content_key.as_slice())?
+        .ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "retired Blob content index disappeared during expiry",
+            ))
+        })?;
+    lifecycle::remove_publication_retirement(write)?;
+    lifecycle::remove_retention_deadline(
+        write,
+        deadline,
+        lifecycle::RetentionDeadlineOwner::Publication(transfer),
+    )?;
+    let resolver = lifecycle::remove_retirement_resolver(
+        write,
+        lifecycle::RetentionDeadlineOwner::Publication(transfer),
+    )?;
+    if !resolver.is_empty() {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "Blob publication retirement resolver is not canonical",
+        )));
+    }
+    let bytes = maintenance_entry_bytes(transfer.as_bytes(), &encoded)?
+        .checked_add(maintenance_entry_bytes(semantic_key, &semantic)?)
+        .and_then(|bytes| {
+            bytes.checked_add(maintenance_entry_bytes(content_key.as_slice(), &content).ok()?)
+        })
+        .and_then(|bytes| bytes.checked_add(delivery_bytes))
+        .and_then(|bytes| bytes.checked_add(57))
+        .and_then(|bytes| bytes.checked_add(72))
+        .and_then(|bytes| bytes.checked_add(33))
+        .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+    Ok((
+        6u64.checked_add(delivery_rows)
+            .ok_or(StoreError::ItemCountAccountingOverflow)?,
+        bytes,
+    ))
+}
+
+/// Expires at most one deadline-ordered retirement unit without reading or
+/// advancing routine scheduler cursors. Capacity recovery uses this path so a
+/// pressure retry cannot steal, reset, or otherwise perturb fair maintenance.
+fn expire_one_retirement_record_capacity_write(
+    write: &redb::WriteTransaction,
+    budget: BlobMaintenanceBudget,
+    sample: aster_mesh::CustodySample,
+    target: Option<lifecycle::RetentionDeadlineKind>,
+) -> Result<Option<BlobMaintenanceProgress>, StoreError> {
+    let nearest = match target {
+        Some(kind) => {
+            lifecycle::nearest_retention_deadline_for_kind_write(write, sample.clock_id, kind)?
+        }
+        None => lifecycle::nearest_retention_deadline_write(write, sample.clock_id)?,
+    };
+    let Some((deadline, owner)) = nearest else {
+        return Ok(None);
+    };
+    if deadline.tick_ms > sample.tick_ms {
+        return Ok(None);
+    }
+    let (rows, bytes) = match owner {
+        lifecycle::RetentionDeadlineOwner::Publication(transfer) => {
+            retired_publication_expiry_charge_write(write, transfer, sample)?
+        }
+        lifecycle::RetentionDeadlineOwner::Operation(operation_digest) => {
+            retired_operation_expiry_charge_write(write, operation_digest, sample)?
+        }
+    };
+    if rows > budget.rows || bytes > budget.bytes {
+        return Err(blob_error(BlobStoreError::InvalidMaintenanceBudget));
+    }
+    let actual = match owner {
+        lifecycle::RetentionDeadlineOwner::Publication(transfer) => {
+            expire_retired_publication_write(write, deadline, transfer, sample)?
+        }
+        lifecycle::RetentionDeadlineOwner::Operation(operation_digest) => {
+            expire_retired_operation_write(write, deadline, operation_digest, sample)?
+        }
+    };
+    if actual != (rows, bytes) {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "Blob retirement expiry charge changed before mutation",
+        )));
+    }
+    Ok(Some(BlobMaintenanceProgress {
+        class: BlobMaintenanceClass::ExpiredRetirementRecords,
+        rows_examined: rows,
+        files_examined: 0,
+        bytes_examined: bytes,
+        candidates: Vec::new(),
+        class_has_more_work: true,
+        awaiting_later_handler: false,
+    }))
+}
+
+fn reanchor_one_retirement_record_write(
+    write: &redb::WriteTransaction,
+    cursor: &lifecycle::BlobMaintenanceCursor,
+    budget: BlobMaintenanceBudget,
+    sample: aster_mesh::CustodySample,
+) -> Result<Option<BlobMaintenanceProgress>, StoreError> {
+    let Some(lifecycle::RetirementResolver {
+        position,
+        owner,
+        value: resolver,
+    }) = lifecycle::next_retirement_resolver_write(write, cursor.position.as_deref())?
+    else {
+        return Ok(None);
+    };
+    let resolver_len = resolver.len();
+
+    let (record_key, encoded, age) = match owner {
+        lifecycle::RetentionDeadlineOwner::Publication(transfer) => {
+            if !resolver.is_empty() {
+                return Err(blob_error(BlobStoreError::SchemaInvariant(
+                    "Blob publication retirement resolver is not canonical",
+                )));
+            }
+            let encoded = write
+                .open_table(BLOB_PUBLICATIONS)?
+                .get(transfer.as_bytes().as_slice())?
+                .map(|value| value.value().to_vec())
+                .ok_or_else(|| {
+                    blob_error(BlobStoreError::SchemaInvariant(
+                        "Blob retention deadline points to a missing publication",
+                    ))
+                })?;
+            let (_, _, age) = lifecycle::publication_retirement(&encoded)
+                .map_err(blob_error)?
+                .ok_or_else(|| {
+                    blob_error(BlobStoreError::SchemaInvariant(
+                        "Blob retention deadline points to a live publication",
+                    ))
+                })?;
+            (transfer.as_bytes().to_vec(), encoded, age)
+        }
+        lifecycle::RetentionDeadlineOwner::Operation(operation_digest) => {
+            if Sha256::digest(&resolver).as_slice() != operation_digest {
+                return Err(blob_error(BlobStoreError::SchemaInvariant(
+                    "Blob operation retirement resolver digest differs",
+                )));
+            }
+            let encoded = write
+                .open_table(BLOB_OPERATIONS)?
+                .get(resolver.as_slice())?
+                .map(|value| value.value().to_vec())
+                .ok_or_else(|| {
+                    blob_error(BlobStoreError::SchemaInvariant(
+                        "Blob retention deadline points to a missing operation",
+                    ))
+                })?;
+            let Some((_, _, digest, _, age)) =
+                lifecycle::operation_retirement(&encoded).map_err(blob_error)?
+            else {
+                return Err(blob_error(BlobStoreError::SchemaInvariant(
+                    "Blob retirement resolver points to an active operation",
+                )));
+            };
+            if digest != operation_digest {
+                return Err(blob_error(BlobStoreError::SchemaInvariant(
+                    "Blob operation retirement resolver names another operation",
+                )));
+            }
+            (resolver, encoded, age)
+        }
+    };
+    let old_deadline = age
+        .project(age.checkpoint_sample())
+        .map_err(blob_error)?
+        .deadline;
+    let projection = age.project(Some(sample)).map_err(blob_error)?;
+    if projection.retention_elapsed {
+        let old_deadline = old_deadline.ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "elapsed Blob retirement lacks a durable deadline",
+            ))
+        })?;
+        let (rows, bytes) = match owner {
+            lifecycle::RetentionDeadlineOwner::Publication(transfer) => {
+                retired_publication_expiry_charge_write(write, transfer, sample)?
+            }
+            lifecycle::RetentionDeadlineOwner::Operation(operation_digest) => {
+                retired_operation_expiry_charge_write(write, operation_digest, sample)?
+            }
+        };
+        if rows > budget.rows || bytes > budget.bytes {
+            return Err(blob_error(BlobStoreError::InvalidMaintenanceBudget));
+        }
+        let actual = match owner {
+            lifecycle::RetentionDeadlineOwner::Publication(transfer) => {
+                expire_retired_publication_write(write, old_deadline, transfer, sample)?
+            }
+            lifecycle::RetentionDeadlineOwner::Operation(operation_digest) => {
+                expire_retired_operation_write(write, old_deadline, operation_digest, sample)?
+            }
+        };
+        if actual != (rows, bytes) {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "Blob retirement expiry charge changed before mutation",
+            )));
+        }
+        lifecycle::advance_maintenance_cursor(write, cursor.class, Some(&position))?;
+        return Ok(Some(BlobMaintenanceProgress {
+            class: BlobMaintenanceClass::ExpiredRetirementRecords,
+            rows_examined: rows,
+            files_examined: 0,
+            bytes_examined: bytes,
+            candidates: Vec::new(),
+            class_has_more_work: true,
+            awaiting_later_handler: false,
+        }));
+    }
+    let new_deadline = projection.deadline.ok_or_else(|| {
+        blob_error(BlobStoreError::SchemaInvariant(
+            "unexpired Blob retirement projection lacks a durable deadline",
+        ))
+    })?;
+    let reanchored = match owner {
+        lifecycle::RetentionDeadlineOwner::Publication(_) => {
+            lifecycle::reanchored_retired_publication_record(&encoded, projection.age)?
+        }
+        lifecycle::RetentionDeadlineOwner::Operation(_) => {
+            lifecycle::reanchored_retired_operation_record(&encoded, projection.age)?
+        }
+    };
+    if reanchored.len() != encoded.len() {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "Blob retirement reanchor changed its fixed record length",
+        )));
+    }
+    let deadline_changed = Some(new_deadline) != old_deadline;
+    let (rows, deadline_bytes) = match old_deadline {
+        None => (3, 57),
+        Some(_) if deadline_changed => (4, 2 * 57),
+        Some(_) => (3, 57),
+    };
+    let bytes = maintenance_entry_bytes(&record_key, &encoded)?
+        .checked_add(deadline_bytes)
+        .and_then(|bytes| bytes.checked_add(33 + u64::try_from(resolver_len).ok()?))
+        .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+    if rows > budget.rows || bytes > budget.bytes {
+        return Err(blob_error(BlobStoreError::InvalidMaintenanceBudget));
+    }
+    match owner {
+        lifecycle::RetentionDeadlineOwner::Publication(_) => {
+            write
+                .open_table(BLOB_PUBLICATIONS)?
+                .insert(record_key.as_slice(), reanchored.as_slice())?;
+        }
+        lifecycle::RetentionDeadlineOwner::Operation(_) => {
+            write
+                .open_table(BLOB_OPERATIONS)?
+                .insert(record_key.as_slice(), reanchored.as_slice())?;
+        }
+    }
+    if let Some(old_deadline) = old_deadline {
+        lifecycle::replace_retention_deadline(write, old_deadline, new_deadline, owner)?;
+    } else {
+        lifecycle::insert_reanchored_retention_deadline(write, new_deadline, owner)?;
+    }
+    lifecycle::advance_maintenance_cursor(write, cursor.class, Some(&position))?;
+    Ok(Some(BlobMaintenanceProgress {
+        class: BlobMaintenanceClass::ExpiredRetirementRecords,
+        rows_examined: rows,
+        files_examined: 0,
+        bytes_examined: bytes,
+        candidates: Vec::new(),
+        class_has_more_work: true,
+        awaiting_later_handler: false,
+    }))
+}
+
+fn expire_one_retirement_record_write(
+    write: &redb::WriteTransaction,
+    cursor: &lifecycle::BlobMaintenanceCursor,
+    budget: BlobMaintenanceBudget,
+    sample: aster_mesh::CustodySample,
+) -> Result<Option<BlobMaintenanceProgress>, StoreError> {
+    if let Some(progress) =
+        expire_one_retirement_record_capacity_write(write, budget, sample, None)?
+    {
+        lifecycle::advance_maintenance_cursor(write, cursor.class, None)?;
+        return Ok(Some(progress));
+    }
+    reanchor_one_retirement_record_write(write, cursor, budget, sample)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5163,11 +6043,35 @@ fn bounded_composite_maintenance_page(
     after: Option<&[u8]>,
     budget: BlobMaintenanceBudget,
 ) -> Result<MaintenancePage, StoreError> {
+    bounded_composite_maintenance_page_with_source_limit(
+        write,
+        primary,
+        primary_kind,
+        secondary,
+        secondary_kind,
+        after,
+        budget,
+        u64::MAX,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bounded_composite_maintenance_page_with_source_limit(
+    write: &redb::WriteTransaction,
+    primary: TableDefinition<&'static [u8], &'static [u8]>,
+    primary_kind: MaintenanceRowKind,
+    secondary: TableDefinition<&'static [u8], &'static [u8]>,
+    secondary_kind: MaintenanceRowKind,
+    after: Option<&[u8]>,
+    budget: BlobMaintenanceBudget,
+    source_row_limit: u64,
+) -> Result<MaintenancePage, StoreError> {
     let total_rows = write
         .open_table(primary)?
         .len()?
         .checked_add(write.open_table(secondary)?.len()?)
         .ok_or(StoreError::ItemCountAccountingOverflow)?;
+    let selected_rows = total_rows.min(source_row_limit);
     let mut rows = Vec::new();
     let mut charge = MaintenanceCharge {
         budget,
@@ -5182,7 +6086,7 @@ fn bounded_composite_maintenance_page(
             Some(tag),
             lower,
             upper,
-            total_rows,
+            selected_rows,
             &mut rows,
             &mut charge,
         )
@@ -6120,8 +7024,61 @@ impl Store {
         budget: BlobMaintenanceBudget,
         custody_sample: Option<aster_mesh::CustodySample>,
     ) -> Result<BlobCapacityGcProgress, StoreError> {
+        self.run_blob_capacity_gc_inner(None, budget, custody_sample)
+    }
+
+    /// Runs one cursor-neutral local recovery pass for the exact capacity
+    /// partition that rejected admission.
+    #[doc(hidden)]
+    pub fn run_blob_capacity_gc_for(
+        &self,
+        target: BlobCapacityGcTarget,
+        budget: BlobMaintenanceBudget,
+        custody_sample: Option<aster_mesh::CustodySample>,
+    ) -> Result<BlobCapacityGcProgress, StoreError> {
+        self.run_blob_capacity_gc_inner(Some(target), budget, custody_sample)
+    }
+
+    fn run_blob_capacity_gc_inner(
+        &self,
+        target: Option<BlobCapacityGcTarget>,
+        budget: BlobMaintenanceBudget,
+        custody_sample: Option<aster_mesh::CustodySample>,
+    ) -> Result<BlobCapacityGcProgress, StoreError> {
         self.require_live()?;
         let mut progress = BlobCapacityGcProgress::default();
+        // Admission pressure gets at most one deadline-ordered retained-record
+        // expiry pass.  It is deliberately cursor-neutral: the normal
+        // six-class routine remains the only owner of its durable scheduler.
+        // Continue with any remaining page budget so lifecycle-capacity work
+        // cannot intercept the pre-existing physical-capacity recovery path.
+        let retirement_target = match target {
+            Some(BlobCapacityGcTarget::Depot) => None,
+            Some(BlobCapacityGcTarget::Operation) => {
+                Some(lifecycle::RetentionDeadlineKind::Operation)
+            }
+            Some(BlobCapacityGcTarget::PublicationLifecycle) => {
+                Some(lifecycle::RetentionDeadlineKind::Publication)
+            }
+            None => None,
+        };
+        if target != Some(BlobCapacityGcTarget::Depot)
+            && let Some(sample) = custody_sample
+        {
+            let write = self.database.begin_write()?;
+            enforce_live_write(&write)?;
+            lifecycle::require_maintenance_accounting(&write)?;
+            if let Some(expiry) = expire_one_retirement_record_capacity_write(
+                &write,
+                budget,
+                sample,
+                retirement_target,
+            )? {
+                write.commit()?;
+                progress.rows_examined = expiry.rows_examined;
+                progress.bytes_examined = expiry.bytes_examined;
+            }
+        }
         let mut physical_position = None;
         let mut admission_position = None;
         while progress.rows_examined < budget.rows
@@ -6550,9 +7507,20 @@ impl Store {
         enforce_live_write(&write)?;
         lifecycle::require_maintenance_accounting(&write)?;
         let cursor = lifecycle::load_maintenance_cursor(&write)?;
+        if cursor.class == BlobMaintenanceClass::ExpiredRetirementRecords
+            && let Some(sample) = custody_sample
+            && let Some(progress) =
+                expire_one_retirement_record_write(&write, &cursor, budget, sample)?
+        {
+            write.commit()?;
+            return Ok(progress);
+        }
         let page = match cursor.class {
             BlobMaintenanceClass::ExpiredPublicationsAndPendingSources => {
-                bounded_composite_maintenance_page(
+                // Policy retirement is one bounded atomic source unit. Do not
+                // pre-read later source rows and consume the budget needed to
+                // retire the selected maximum-fanout publication.
+                bounded_composite_maintenance_page_with_source_limit(
                     &write,
                     BLOB_PUBLICATIONS,
                     MaintenanceRowKind::Publication,
@@ -6560,6 +7528,7 @@ impl Store {
                     MaintenanceRowKind::Pending,
                     cursor.position.as_deref(),
                     budget,
+                    1,
                 )?
             }
             BlobMaintenanceClass::InvalidPendingWork => bounded_composite_maintenance_page(
@@ -6588,23 +7557,58 @@ impl Store {
         };
 
         let mut candidates = Vec::new();
+        let mut retired_position = None;
+        let mut retirement_charge = None;
+        let mut retirement_blocked = None;
         for row in &page.rows {
             match cursor.class {
                 BlobMaintenanceClass::ExpiredPublicationsAndPendingSources => match row.position[0]
                 {
-                    MAINTENANCE_PRIMARY_SOURCE_TAG => {
-                        let MaintenanceEvidence::Publication(evidence) = &row.evidence else {
+                    MAINTENANCE_PRIMARY_SOURCE_TAG => match &row.evidence {
+                        MaintenanceEvidence::RetiredPublication => {}
+                        MaintenanceEvidence::Publication(evidence) => {
+                            validate_maintenance_publication(
+                                &row.key,
+                                &row.value,
+                                evidence,
+                                self.blob_depot_owner_binding,
+                            )?;
+                            let publication = decode_blob_metadata(&row.value)?;
+                            if !blob_header_is_current_write(&write, &publication.header)? {
+                                let transfer =
+                                    parse_blob_transfer_id("Blob retirement candidate", &row.key)?;
+                                let mut charge = MaintenanceCharge {
+                                    budget,
+                                    rows: page.rows_examined,
+                                    bytes: page.bytes,
+                                };
+                                if !invalidated_blob_publication_retirement_charge_write(
+                                    &write,
+                                    self.blob_lifecycle_limits,
+                                    transfer,
+                                    custody_sample,
+                                    &mut charge,
+                                )? {
+                                    retirement_blocked = Some((charge.rows, charge.bytes));
+                                    break;
+                                }
+                                retire_invalidated_blob_publication_write(
+                                    &write,
+                                    self.blob_lifecycle_limits,
+                                    transfer,
+                                    custody_sample,
+                                )?;
+                                retired_position = Some(row.position.clone());
+                                retirement_charge = Some((charge.rows, charge.bytes));
+                                break;
+                            }
+                        }
+                        _ => {
                             return Err(blob_error(BlobStoreError::SchemaInvariant(
                                 "Blob publication maintenance row has wrong evidence",
                             )));
-                        };
-                        validate_maintenance_publication(
-                            &row.key,
-                            &row.value,
-                            evidence,
-                            self.blob_depot_owner_binding,
-                        )?;
-                    }
+                        }
+                    },
                     MAINTENANCE_SECONDARY_SOURCE_TAG => {
                         let MaintenanceEvidence::Pending(evidence) = &row.evidence else {
                             return Err(blob_error(BlobStoreError::SchemaInvariant(
@@ -6691,20 +7695,36 @@ impl Store {
                         }
                     }
                 }
-                BlobMaintenanceClass::ExpiredRetirementRecords => {
-                    let MaintenanceEvidence::Operation { publication } = &row.evidence else {
+                BlobMaintenanceClass::ExpiredRetirementRecords => match &row.evidence {
+                    MaintenanceEvidence::Operation { publication } => {
+                        validate_maintenance_operation(&row.key, &row.value, publication)?;
+                    }
+                    MaintenanceEvidence::RetiredOperation => {}
+                    _ => {
                         return Err(blob_error(BlobStoreError::SchemaInvariant(
                             "Blob operation maintenance row has wrong evidence",
                         )));
-                    };
-                    validate_maintenance_operation(&row.key, &row.value, publication)?;
-                }
+                    }
+                },
                 BlobMaintenanceClass::ManifestBackedPhysicalDeletion => {}
             }
         }
 
         let awaiting_later_handler = !candidates.is_empty();
-        let next_position = if awaiting_later_handler {
+        if let Some((rows_examined, bytes_examined)) = retirement_blocked {
+            return Ok(BlobMaintenanceProgress {
+                class: cursor.class,
+                rows_examined,
+                files_examined: 0,
+                bytes_examined,
+                candidates,
+                class_has_more_work: true,
+                awaiting_later_handler: false,
+            });
+        }
+        let next_position = if let Some(position) = retired_position.as_deref() {
+            Some(position)
+        } else if awaiting_later_handler {
             cursor.position.as_deref()
         } else if let Some(last) = page.rows.last() {
             Some(last.position.as_slice())
@@ -6714,13 +7734,17 @@ impl Store {
             cursor.position.as_deref()
         };
         lifecycle::advance_maintenance_cursor(&write, cursor.class, next_position)?;
+        let (rows_examined, bytes_examined) =
+            retirement_charge.unwrap_or((page.rows_examined, page.bytes));
         let progress = BlobMaintenanceProgress {
             class: cursor.class,
-            rows_examined: page.rows_examined,
+            rows_examined,
             files_examined: 0,
-            bytes_examined: page.bytes,
+            bytes_examined,
             candidates,
-            class_has_more_work: !page.complete || awaiting_later_handler,
+            class_has_more_work: !page.complete
+                || awaiting_later_handler
+                || retired_position.is_some(),
             awaiting_later_handler,
         };
         write.commit()?;
@@ -6825,6 +7849,468 @@ fn enforce_blob_policy_read(
     Ok(())
 }
 
+fn blob_header_is_current_write(
+    write: &redb::WriteTransaction,
+    header: &EnvelopeHeader,
+) -> Result<bool, StoreError> {
+    let current_epoch = write
+        .open_table(CONTROL_SCOPE_EPOCHS)?
+        .get(header.scope.as_str())?
+        .map(|value| decode_scope_epoch_index(value.value()))
+        .transpose()?
+        .map_or(1, |(epoch, _)| epoch);
+    if header.key_epoch > current_epoch {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "live Blob publication has a future scope epoch",
+        )));
+    }
+    if control_principal_revoked_write(write, header.stamp.dot.publisher)? {
+        return Ok(false);
+    }
+    Ok(header.key_epoch == current_epoch)
+}
+
+/// Incrementally preflights the complete unique-row work unit for one
+/// policy-invalidation retirement. Rows already captured by the bounded
+/// publication page are supplied in `charge`; each additional logical row is
+/// admitted before it is validated. Returning `false` leaves the transaction
+/// uncommitted and reports every row admitted up to the caller's budget.
+fn invalidated_blob_publication_retirement_charge_write(
+    write: &redb::WriteTransaction,
+    limits: BlobLifecycleLimits,
+    transfer: BlobTransferId,
+    custody_sample: Option<aster_mesh::CustodySample>,
+    charge: &mut MaintenanceCharge,
+) -> Result<bool, StoreError> {
+    fn charged_metadata(
+        write: &redb::WriteTransaction,
+        field: &'static str,
+        charge: &mut MaintenanceCharge,
+    ) -> Result<Option<u64>, StoreError> {
+        if !charge.charge(field.as_bytes(), std::mem::size_of::<u64>())? {
+            return Ok(None);
+        }
+        write
+            .open_table(METADATA)?
+            .get(field)?
+            .map(|value| value.value())
+            .ok_or(StoreError::MissingAccountingMetadata { field })
+            .map(Some)
+    }
+
+    let live_record = write
+        .open_table(BLOB_PUBLICATIONS)?
+        .get(transfer.as_bytes().as_slice())?
+        .map(|value| value.value().to_vec())
+        .ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "Blob retirement candidate publication disappeared",
+            ))
+        })?;
+    if lifecycle::publication_record_is_retired(&live_record).map_err(blob_error)? {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "Blob retirement charge points to an already-retired publication",
+        )));
+    }
+    let publication = decode_blob_metadata(&live_record)?;
+    if publication.transfer_id != transfer
+        || blob_header_is_current_write(write, &publication.header)?
+    {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "Blob retirement charge no longer names an invalidated publication",
+        )));
+    }
+    let source_len = write
+        .open_table(BLOB_BYTES)?
+        .get(transfer.as_bytes().as_slice())?
+        .map(|value| u64::try_from(value.value().len()))
+        .transpose()
+        .map_err(|_| StoreError::PayloadByteAccountingOverflow)?
+        .ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "Blob retirement candidate is missing source bytes",
+            ))
+        })?;
+    let marker = write
+        .open_table(BLOB_ACCEPTANCE_MARKERS)?
+        .get(transfer.as_bytes().as_slice())?
+        .map(|value| value.value())
+        .ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "Blob retirement candidate is missing its acceptance marker",
+            ))
+        })?;
+    if !charge.charge_lengths(std::mem::size_of::<u64>(), std::mem::size_of::<[u8; 32]>())? {
+        return Ok(false);
+    }
+    let acceptance_order = write.open_table(crate::blob_subscription::BLOB_ACCEPTANCE_ORDER)?;
+    let ordered_transfer = acceptance_order.get(marker)?.ok_or_else(|| {
+        blob_error(BlobStoreError::SchemaInvariant(
+            "Blob retirement candidate is missing its acceptance-order row",
+        ))
+    })?;
+    if ordered_transfer.value() != transfer.as_bytes() {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "Blob retirement acceptance-order row names another publication",
+        )));
+    }
+
+    let age = match custody_sample {
+        Some(sample) => lifecycle::RetirementAge::new(0, sample, limits.retain_for_ms()),
+        None => lifecycle::RetirementAge::unknown(limits.retain_for_ms()),
+    }
+    .map_err(blob_error)?;
+    let deadline = age.project(custody_sample).map_err(blob_error)?.deadline;
+
+    if !lifecycle::policy_retirement_authority_charge_write(
+        write,
+        lifecycle::RetentionDeadlineOwner::Publication(transfer),
+        &[],
+        deadline,
+        charge,
+    )? {
+        return Ok(false);
+    }
+
+    let Some(item_count) = charged_metadata(write, BLOB_ITEM_COUNT, charge)? else {
+        return Ok(false);
+    };
+    let Some(total_bytes) = charged_metadata(write, BLOB_TOTAL_BYTES, charge)? else {
+        return Ok(false);
+    };
+    let Some(mut operation_bytes_after) =
+        charged_metadata(write, BLOB_OPERATION_TOTAL_BYTES, charge)?
+    else {
+        return Ok(false);
+    };
+    if item_count == 0 || total_bytes < source_len {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "Blob retirement aggregate accounting cannot cover its publication",
+        )));
+    }
+
+    let (start, end) = lifecycle::inverse_owner_bounds(transfer);
+    let owners = write.open_table(lifecycle::BLOB_OPERATION_OWNERS)?;
+    let operations = write.open_table(BLOB_OPERATIONS)?;
+    let mut operation_rows = 0u64;
+    for row in owners.range::<&[u8]>((
+        std::ops::Bound::Included(start.as_slice()),
+        std::ops::Bound::Included(end.as_slice()),
+    ))? {
+        let (owner_key, operation_key) = row?;
+        if !charge.charge(owner_key.value(), operation_key.value().len())? {
+            return Ok(false);
+        }
+        if lifecycle::inverse_owner_key(transfer, operation_key.value()).as_slice()
+            != owner_key.value()
+        {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "Blob operation inverse owner is not canonical",
+            )));
+        }
+        operation_rows = operation_rows
+            .checked_add(1)
+            .ok_or(StoreError::ItemCountAccountingOverflow)?;
+        if operation_rows > MAX_BLOB_OPERATIONS {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "Blob operation inverse-owner fan-out exceeds its structural bound",
+            )));
+        }
+        if !charge.has_capacity_for_row() {
+            return Ok(false);
+        }
+        if !charge.charge(
+            operation_key.value(),
+            usize::try_from(BLOB_ACTIVE_OPERATION_RECORD_BYTES)
+                .expect("active operation record length fits usize"),
+        )? {
+            return Ok(false);
+        }
+        let active = operations.get(operation_key.value())?.ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "Blob operation owner points to a missing operation",
+            ))
+        })?;
+        let operation = decode_blob_operation_record(active.value())?;
+        if operation.transfer_id != transfer {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "Blob operation owner points to another publication",
+            )));
+        }
+        let retired = lifecycle::retired_operation_record(
+            lifecycle::RetirementReason::Invalidated,
+            1,
+            Sha256::digest(operation_key.value()).into(),
+            operation.intent_digest,
+            age,
+        );
+        operation_bytes_after = operation_bytes_after
+            .checked_sub(
+                u64::try_from(active.value().len())
+                    .map_err(|_| StoreError::PayloadByteAccountingOverflow)?,
+            )
+            .and_then(|value| value.checked_add(u64::try_from(retired.len()).ok()?))
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+        let operation_digest = Sha256::digest(operation_key.value()).into();
+        if !lifecycle::policy_retirement_authority_charge_write(
+            write,
+            lifecycle::RetentionDeadlineOwner::Operation(operation_digest),
+            operation_key.value(),
+            deadline,
+            charge,
+        )? {
+            return Ok(false);
+        }
+    }
+    if operation_bytes_after > MAX_BLOB_DURABLE_OPERATION_BYTES {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "retired Blob operation usage exceeds its durable safety cap",
+        )));
+    }
+
+    if !lifecycle::policy_retirement_accounting_charge_write(
+        write,
+        limits,
+        operation_rows,
+        deadline.is_some(),
+        charge,
+    )? {
+        return Ok(false);
+    }
+    if !crate::blob_subscription::blob_delivery_retirement_charge_write(
+        write,
+        transfer,
+        publication.semantic_id,
+        charge,
+    )? {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn retire_invalidated_blob_publication_write(
+    write: &redb::WriteTransaction,
+    limits: BlobLifecycleLimits,
+    transfer: BlobTransferId,
+    custody_sample: Option<aster_mesh::CustodySample>,
+) -> Result<(), StoreError> {
+    let live_record = write
+        .open_table(BLOB_PUBLICATIONS)?
+        .get(transfer.as_bytes().as_slice())?
+        .map(|value| value.value().to_vec())
+        .ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "Blob retirement candidate publication disappeared",
+            ))
+        })?;
+    if lifecycle::publication_record_is_retired(&live_record).map_err(blob_error)? {
+        return Ok(());
+    }
+    let publication = decode_blob_metadata(&live_record)?;
+    if publication.transfer_id != transfer {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "Blob retirement candidate differs from its publication key",
+        )));
+    }
+    if blob_header_is_current_write(write, &publication.header)? {
+        return Ok(());
+    }
+    let source_len = write
+        .open_table(BLOB_BYTES)?
+        .get(transfer.as_bytes().as_slice())?
+        .map(|value| u64::try_from(value.value().len()))
+        .transpose()
+        .map_err(|_| StoreError::PayloadByteAccountingOverflow)?
+        .ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "Blob retirement candidate is missing source bytes",
+            ))
+        })?;
+    let marker = write
+        .open_table(BLOB_ACCEPTANCE_MARKERS)?
+        .get(transfer.as_bytes().as_slice())?
+        .map(|value| value.value())
+        .ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "Blob retirement candidate is missing its acceptance marker",
+            ))
+        })?;
+    lifecycle::require_variant_reference(
+        write,
+        publication.variant_id,
+        lifecycle::VariantReferenceOwner::Publication,
+        transfer,
+    )?;
+    let generation = lifecycle::allocate_retirement_generation(write)?;
+    let age = match custody_sample {
+        Some(sample) => lifecycle::RetirementAge::new(0, sample, limits.retain_for_ms()),
+        None => lifecycle::RetirementAge::unknown(limits.retain_for_ms()),
+    }
+    .map_err(blob_error)?;
+    let deadline = age.project(custody_sample).map_err(blob_error)?.deadline;
+    let operation_keys = lifecycle::operation_keys_for_owner(write, transfer)?;
+    let mut operation_updates = Vec::with_capacity(operation_keys.len());
+    for key in operation_keys {
+        let active = write
+            .open_table(BLOB_OPERATIONS)?
+            .get(key.as_slice())?
+            .map(|value| value.value().to_vec())
+            .ok_or_else(|| {
+                blob_error(BlobStoreError::SchemaInvariant(
+                    "Blob operation owner points to a missing operation",
+                ))
+            })?;
+        let operation = decode_blob_operation_record(&active)?;
+        if operation.transfer_id != transfer {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "Blob operation owner points to another publication",
+            )));
+        }
+        let key_digest: [u8; 32] = Sha256::digest(&key).into();
+        let retired = lifecycle::retired_operation_record(
+            lifecycle::RetirementReason::Invalidated,
+            generation,
+            key_digest,
+            operation.intent_digest,
+            age,
+        );
+        operation_updates.push((key, key_digest, active, retired));
+    }
+    crate::blob_subscription::retire_blob_deliveries_write(
+        write,
+        transfer,
+        publication.semantic_id,
+        generation,
+    )?;
+
+    let retired_publication = lifecycle::retired_publication_record(
+        &live_record,
+        marker,
+        lifecycle::RetirementReason::Invalidated,
+        generation,
+        age,
+    )?;
+    write.open_table(BLOB_PUBLICATIONS)?.insert(
+        transfer.as_bytes().as_slice(),
+        retired_publication.as_slice(),
+    )?;
+    write
+        .open_table(BLOB_BYTES)?
+        .remove(transfer.as_bytes().as_slice())?
+        .ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "Blob retirement lost exact source bytes",
+            ))
+        })?;
+    write
+        .open_table(BLOB_ACCEPTANCE_MARKERS)?
+        .remove(transfer.as_bytes().as_slice())?
+        .ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "Blob retirement lost its acceptance marker",
+            ))
+        })?;
+    write
+        .open_table(crate::blob_subscription::BLOB_ACCEPTANCE_ORDER)?
+        .remove(marker)?
+        .ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "Blob retirement lost its acceptance-order row",
+            ))
+        })?;
+    lifecycle::remove_variant_reference(
+        write,
+        publication.variant_id,
+        lifecycle::VariantReferenceOwner::Publication,
+        transfer,
+    )?;
+    lifecycle::record_publication_retirement(write)?;
+    lifecycle::insert_retirement_resolver(
+        write,
+        limits,
+        lifecycle::RetentionDeadlineOwner::Publication(transfer),
+        None,
+    )?;
+    if let Some(deadline) = deadline {
+        lifecycle::insert_retention_deadline(
+            write,
+            limits,
+            deadline,
+            lifecycle::RetentionDeadlineOwner::Publication(transfer),
+        )?;
+    }
+
+    let mut operation_bytes = write
+        .open_table(METADATA)?
+        .get(BLOB_OPERATION_TOTAL_BYTES)?
+        .ok_or(StoreError::MissingAccountingMetadata {
+            field: BLOB_OPERATION_TOTAL_BYTES,
+        })?
+        .value();
+    for (key, key_digest, active, retired) in operation_updates {
+        operation_bytes = operation_bytes
+            .checked_sub(
+                u64::try_from(active.len())
+                    .map_err(|_| StoreError::PayloadByteAccountingOverflow)?,
+            )
+            .and_then(|value| value.checked_add(u64::try_from(retired.len()).ok()?))
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+        write
+            .open_table(BLOB_OPERATIONS)?
+            .insert(key.as_slice(), retired.as_slice())?;
+        lifecycle::remove_operation_owner(write, transfer, &key)?;
+        lifecycle::record_operation_retirement(write)?;
+        lifecycle::insert_retirement_resolver(
+            write,
+            limits,
+            lifecycle::RetentionDeadlineOwner::Operation(key_digest),
+            Some(&key),
+        )?;
+        if let Some(deadline) = deadline {
+            lifecycle::insert_retention_deadline(
+                write,
+                limits,
+                deadline,
+                lifecycle::RetentionDeadlineOwner::Operation(key_digest),
+            )?;
+        }
+    }
+    if operation_bytes > MAX_BLOB_DURABLE_OPERATION_BYTES {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "retired Blob operation usage exceeds its durable safety cap",
+        )));
+    }
+    let mut metadata = write.open_table(METADATA)?;
+    let items = metadata
+        .get(BLOB_ITEM_COUNT)?
+        .ok_or(StoreError::MissingAccountingMetadata {
+            field: BLOB_ITEM_COUNT,
+        })?
+        .value()
+        .checked_sub(1)
+        .ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "Blob item count underflows on retirement",
+            ))
+        })?;
+    let bytes = metadata
+        .get(BLOB_TOTAL_BYTES)?
+        .ok_or(StoreError::MissingAccountingMetadata {
+            field: BLOB_TOTAL_BYTES,
+        })?
+        .value()
+        .checked_sub(source_len)
+        .ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "Blob byte count underflows on retirement",
+            ))
+        })?;
+    metadata.insert(BLOB_ITEM_COUNT, items)?;
+    metadata.insert(BLOB_TOTAL_BYTES, bytes)?;
+    metadata.insert(BLOB_OPERATION_TOTAL_BYTES, operation_bytes)?;
+    Ok(())
+}
+
 fn blob_header_is_current_read(
     read: &redb::ReadTransaction,
     header: &EnvelopeHeader,
@@ -6919,10 +8405,23 @@ fn require_blob_apply_capacity_read(
         std::ops::Bound::<&[u8]>::Included(content_prefix.as_slice()),
         std::ops::Bound::<&[u8]>::Excluded(content_upper.as_slice()),
     ))? {
-        let _ = row?;
+        let (_, value) = row?;
         #[cfg(test)]
         TEST_BLOB_CAPACITY_CONTENT_ROWS_VISITED
             .with(|count| count.set(count.get().saturating_add(1)));
+        let transfer = parse_blob_transfer_id("Blob content index", value.value())?;
+        let publication = read
+            .open_table(BLOB_PUBLICATIONS)?
+            .get(transfer.as_bytes().as_slice())?
+            .map(|value| value.value().to_vec())
+            .ok_or_else(|| {
+                blob_error(BlobStoreError::SchemaInvariant(
+                    "Blob content index points to a missing publication",
+                ))
+            })?;
+        if lifecycle::publication_record_is_retired(&publication).map_err(blob_error)? {
+            continue;
+        }
         publication_count = publication_count
             .checked_add(1)
             .ok_or(StoreError::ItemCountAccountingOverflow)?;
@@ -6938,7 +8437,7 @@ fn require_blob_apply_capacity_read(
     }
 
     let aggregate = read.open_table(METADATA)?;
-    let total = aggregate_usage_from_metadata(&aggregate)?;
+    let total = aggregate_usage_read(read, &aggregate)?;
     if total
         .items
         .checked_add(1)
@@ -7131,6 +8630,7 @@ fn insert_blob_operation(
         transfer_id,
         intent_digest: request.intent.digest(),
     });
+    let encoded = lifecycle::active_operation_record(write, &encoded)?;
     let incoming = request
         .operation
         .as_bytes()
@@ -7164,13 +8664,17 @@ fn insert_blob_operation(
             limit: MAX_BLOB_OPERATION_BYTES,
         }));
     }
-    require_ordinary_aggregate_capacity(write, &metadata, limits, 1, incoming)?;
+    let aggregate_incoming = incoming
+        .checked_add(MAX_BLOB_OPERATION_RETIREMENT_GROWTH_BYTES)
+        .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+    require_ordinary_aggregate_capacity(write, &metadata, limits, 1, aggregate_incoming)?;
     metadata.insert(BLOB_OPERATION_COUNT, next_count)?;
     metadata.insert(BLOB_OPERATION_TOTAL_BYTES, next_bytes)?;
     drop(metadata);
     write
         .open_table(BLOB_OPERATIONS)?
         .insert(request.operation.as_bytes(), encoded.as_slice())?;
+    lifecycle::insert_operation_owner(write, transfer_id, request.operation.as_bytes())?;
     Ok(())
 }
 
@@ -7185,6 +8689,7 @@ fn blob_read_plan_read(
     let upper = blob_content_prefix_upper_bound(&prefix)?;
     let content = read.open_table(BLOB_CONTENT_INDEX)?;
     let mut rows = Vec::new();
+    let mut saw_retired = false;
     for row in content.range::<&[u8]>((
         std::ops::Bound::<&[u8]>::Included(prefix.as_slice()),
         std::ops::Bound::<&[u8]>::Excluded(upper.as_slice()),
@@ -7199,11 +8704,44 @@ fn blob_read_plan_read(
             }));
         }
         let transfer = parse_blob_transfer_id("Blob content index", value.value())?;
+        let publication = read
+            .open_table(BLOB_PUBLICATIONS)?
+            .get(transfer.as_bytes().as_slice())?
+            .map(|value| value.value().to_vec())
+            .ok_or_else(|| {
+                blob_error(BlobStoreError::SchemaInvariant(
+                    "Blob content index points to a missing publication",
+                ))
+            })?;
+        if lifecycle::publication_record_is_retired(&publication).map_err(blob_error)? {
+            let (metadata, _) = decode_retired_blob_metadata(&publication)?.ok_or_else(|| {
+                blob_error(BlobStoreError::SchemaInvariant(
+                    "retired Blob publication is missing lookup metadata",
+                ))
+            })?;
+            if metadata.transfer_id != transfer
+                || blob_content_key(
+                    &metadata.header.topic,
+                    &metadata.header.scope,
+                    metadata.blob_id,
+                    metadata.semantic_id,
+                )? != key.value()
+            {
+                return Err(blob_error(BlobStoreError::SchemaInvariant(
+                    "retired Blob content lookup disagrees with its publication",
+                )));
+            }
+            saw_retired = true;
+            continue;
+        }
         rows.push(blob_read_candidate_projection_read(
             read,
             transfer,
             key.value(),
         )?);
+    }
+    if rows.is_empty() && saw_retired {
+        return Err(blob_error(BlobStoreError::ExpiredOrRetired));
     }
     rows.sort_by_key(|candidate| candidate.projection.semantic_id);
     let current_epoch = read
@@ -7353,11 +8891,19 @@ fn load_blob_from_read(
     read: &redb::ReadTransaction,
     transfer_id: BlobTransferId,
 ) -> Result<Option<StoredBlob>, StoreError> {
-    let metadata = read
+    let encoded = read
         .open_table(BLOB_PUBLICATIONS)?
         .get(transfer_id.as_bytes().as_slice())?
-        .map(|value| decode_blob_metadata(value.value()))
-        .transpose()?;
+        .map(|value| value.value().to_vec());
+    let metadata = match encoded {
+        Some(encoded)
+            if lifecycle::publication_record_is_retired(&encoded).map_err(blob_error)? =>
+        {
+            return Err(blob_error(BlobStoreError::ExpiredOrRetired));
+        }
+        Some(encoded) => Some(decode_blob_metadata(&encoded)?),
+        None => None,
+    };
     metadata
         .map(|metadata| {
             let sealed = read
@@ -7403,11 +8949,19 @@ fn load_blob_from_write(
     write: &redb::WriteTransaction,
     transfer_id: BlobTransferId,
 ) -> Result<Option<StoredBlob>, StoreError> {
-    let metadata = write
+    let encoded = write
         .open_table(BLOB_PUBLICATIONS)?
         .get(transfer_id.as_bytes().as_slice())?
-        .map(|value| decode_blob_metadata(value.value()))
-        .transpose()?;
+        .map(|value| value.value().to_vec());
+    let metadata = match encoded {
+        Some(encoded)
+            if lifecycle::publication_record_is_retired(&encoded).map_err(blob_error)? =>
+        {
+            return Err(blob_error(BlobStoreError::ExpiredOrRetired));
+        }
+        Some(encoded) => Some(decode_blob_metadata(&encoded)?),
+        None => None,
+    };
     let blob = metadata
         .map(|metadata| -> Result<StoredBlob, StoreError> {
             let sealed = write
@@ -7534,28 +9088,35 @@ pub(crate) fn blob_subscription_identity_for_transfer_write(
     write: &redb::WriteTransaction,
     transfer_id: BlobTransferId,
 ) -> Result<Option<BlobSubscriptionIdentity>, StoreError> {
-    let Some(metadata) = write
+    let Some(encoded) = write
         .open_table(BLOB_PUBLICATIONS)?
         .get(transfer_id.as_bytes().as_slice())?
-        .map(|value| decode_blob_metadata(value.value()))
-        .transpose()?
+        .map(|value| value.value().to_vec())
     else {
         return Ok(None);
+    };
+    let retired = decode_retired_blob_metadata(&encoded)?;
+    let (metadata, marker) = match retired {
+        Some(value) => value,
+        None => {
+            let metadata = decode_blob_metadata(&encoded)?;
+            let marker = write
+                .open_table(BLOB_ACCEPTANCE_MARKERS)?
+                .get(transfer_id.as_bytes().as_slice())?
+                .map(|value| value.value())
+                .ok_or_else(|| {
+                    blob_error(BlobStoreError::SchemaInvariant(
+                        "Blob subscription identity is missing its acceptance marker",
+                    ))
+                })?;
+            (metadata, marker)
+        }
     };
     if metadata.transfer_id != transfer_id {
         return Err(blob_error(BlobStoreError::SchemaInvariant(
             "Blob subscription identity differs from its publication key",
         )));
     }
-    let marker = write
-        .open_table(BLOB_ACCEPTANCE_MARKERS)?
-        .get(transfer_id.as_bytes().as_slice())?
-        .map(|value| value.value())
-        .ok_or_else(|| {
-            blob_error(BlobStoreError::SchemaInvariant(
-                "Blob subscription identity is missing its acceptance marker",
-            ))
-        })?;
     if write
         .open_table(BLOB_SEMANTIC_ITEMS)?
         .get(metadata.semantic_id.as_bytes().as_slice())?
@@ -7587,6 +9148,22 @@ pub(crate) fn blob_subscription_identity_write(
         .map(Option::flatten)
 }
 
+pub(crate) fn blob_subscription_retirement_generation_write(
+    write: &redb::WriteTransaction,
+    transfer_id: BlobTransferId,
+) -> Result<Option<u64>, StoreError> {
+    write
+        .open_table(BLOB_PUBLICATIONS)?
+        .get(transfer_id.as_bytes().as_slice())?
+        .map(|value| {
+            lifecycle::publication_retirement(value.value())
+                .map_err(blob_error)
+                .map(|retirement| retirement.map(|(_, generation, _)| generation))
+        })
+        .transpose()
+        .map(Option::flatten)
+}
+
 pub(crate) fn blob_subscription_identity_read(
     read: &redb::ReadTransaction,
     semantic_id: BlobSemanticId,
@@ -7599,47 +9176,72 @@ pub(crate) fn blob_subscription_identity_read(
     else {
         return Ok(None);
     };
-    let metadata = read
+    let encoded = read
         .open_table(BLOB_PUBLICATIONS)?
         .get(transfer.as_bytes().as_slice())?
-        .map(|value| decode_blob_metadata(value.value()))
-        .transpose()?
+        .map(|value| value.value().to_vec())
         .ok_or_else(|| {
             blob_error(BlobStoreError::SchemaInvariant(
                 "Blob semantic index points to a missing publication",
             ))
         })?;
+    let retired = decode_retired_blob_metadata(&encoded)?;
+    let (metadata, marker) = match retired {
+        Some(value) => value,
+        None => {
+            let metadata = decode_blob_metadata(&encoded)?;
+            let marker = read
+                .open_table(BLOB_ACCEPTANCE_MARKERS)?
+                .get(transfer.as_bytes().as_slice())?
+                .map(|value| value.value())
+                .ok_or_else(|| {
+                    blob_error(BlobStoreError::SchemaInvariant(
+                        "Blob subscription identity is missing its acceptance marker",
+                    ))
+                })?;
+            (metadata, marker)
+        }
+    };
     if metadata.transfer_id != transfer || metadata.semantic_id != semantic_id {
         return Err(blob_error(BlobStoreError::SchemaInvariant(
             "Blob semantic index differs from its publication",
         )));
     }
-    let marker = read
-        .open_table(BLOB_ACCEPTANCE_MARKERS)?
-        .get(transfer.as_bytes().as_slice())?
-        .map(|value| value.value())
-        .ok_or_else(|| {
-            blob_error(BlobStoreError::SchemaInvariant(
-                "Blob subscription identity is missing its acceptance marker",
-            ))
-        })?;
     Ok(Some(blob_subscription_identity_from_metadata(
         &metadata, marker,
     )?))
+}
+
+pub(crate) fn blob_subscription_retirement_generation_read(
+    read: &redb::ReadTransaction,
+    transfer_id: BlobTransferId,
+) -> Result<Option<u64>, StoreError> {
+    read.open_table(BLOB_PUBLICATIONS)?
+        .get(transfer_id.as_bytes().as_slice())?
+        .map(|value| {
+            lifecycle::publication_retirement(value.value())
+                .map_err(blob_error)
+                .map(|retirement| retirement.map(|(_, generation, _)| generation))
+        })
+        .transpose()
+        .map(Option::flatten)
 }
 
 pub(crate) fn blob_subscription_projection_read(
     read: &redb::ReadTransaction,
     transfer_id: BlobTransferId,
 ) -> Result<Option<(BlobSourceProjection, u64)>, StoreError> {
-    let Some(metadata) = read
+    let Some(encoded) = read
         .open_table(BLOB_PUBLICATIONS)?
         .get(transfer_id.as_bytes().as_slice())?
-        .map(|value| decode_blob_metadata(value.value()))
-        .transpose()?
+        .map(|value| value.value().to_vec())
     else {
         return Ok(None);
     };
+    if lifecycle::publication_record_is_retired(&encoded).map_err(blob_error)? {
+        return Ok(None);
+    }
+    let metadata = decode_blob_metadata(&encoded)?;
     if metadata.transfer_id != transfer_id {
         return Err(blob_error(BlobStoreError::SchemaInvariant(
             "Blob subscription projection differs from its publication key",
@@ -7801,6 +9403,104 @@ fn semantic_id_exists_outside_blob(
     Ok(false)
 }
 
+fn extend_shared_with_expired_blob_replay_authority<
+    R: ReadableTable<&'static [u8], &'static [u8]>,
+    A: ReadableTable<&'static [u8], &'static [u8]>,
+    H: ReadableTable<&'static [u8], u64>,
+>(
+    replays: &R,
+    accepted_dots: &A,
+    publisher_high: &H,
+    publication_transfers: &BTreeSet<Vec<u8>>,
+    mut causal_fences: BTreeMap<Vec<u8>, [u8; 32]>,
+    shared: &mut StateAuditSnapshot,
+) -> Result<(), StoreError> {
+    for row in replays.iter()? {
+        let (key, value) = row?;
+        let key = key.value().to_vec();
+        if key.len() != 40 {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "Blob replay fence has an invalid publisher-dot key",
+            )));
+        }
+        let fence = lifecycle::ReplayFence::decode(value.value()).map_err(blob_error)?;
+        let dot = fence.dot();
+        if accepted_dot_key(dot).as_slice() != key.as_slice() {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "Blob replay fence key differs from its publisher dot",
+            )));
+        }
+        if publication_transfers.contains(fence.transfer_id().as_bytes().as_slice()) {
+            if causal_fences.remove(&key).is_some() {
+                return Err(blob_error(BlobStoreError::SchemaInvariant(
+                    "live or retained Blob replay fence has expired causal evidence",
+                )));
+            }
+            continue;
+        }
+        let accepted = accepted_dots
+            .get(key.as_slice())?
+            .map(|value| parse_digest32("accepted dot table", value.value()))
+            .transpose()?;
+        let Some(causal_hash) = causal_fences.remove(&key) else {
+            // Pre-lifecycle standalone replay fences have never represented an
+            // accepted Blob publication, so they carry neither shared causal
+            // rows nor a retirement-expiry causal binding.  They remain valid
+            // permanent source authority.  An accepted dot without the
+            // binding, however, is a missing expiry record and fails closed.
+            if accepted.is_none() {
+                continue;
+            }
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "expired Blob replay fence is missing permanent causal evidence",
+            )));
+        };
+        if shared
+            .expected_dots
+            .insert(key.clone(), *fence.semantic_id().as_bytes())
+            .is_some()
+        {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "multiple semantic classes claim one accepted causal dot",
+            )));
+        }
+        let accepted = accepted.ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "expired Blob replay fence is missing its accepted-dot row",
+            ))
+        })?;
+        if accepted != *fence.semantic_id().as_bytes() {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "expired Blob replay fence accepted-dot authority conflicts",
+            )));
+        }
+        let durable_high = publisher_high
+            .get(dot.publisher.as_slice())?
+            .map_or(0, |value| value.value());
+        if durable_high < dot.counter {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "expired Blob replay fence is ahead of publisher high-water",
+            )));
+        }
+        shared
+            .expected_publisher_high
+            .entry(dot.publisher.to_vec())
+            .and_modify(|current| *current = (*current).max(dot.counter))
+            .or_insert(dot.counter);
+        shared
+            .historical_frontier
+            .entry(causal_hash)
+            .and_modify(|current| *current = (*current).max(dot.counter))
+            .or_insert(dot.counter);
+    }
+    if !causal_fences.is_empty() {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "Blob expired causal evidence has no matching permanent replay fence",
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn blob_schema_present_write(
     write: &redb::WriteTransaction,
 ) -> Result<bool, StoreError> {
@@ -7854,6 +9554,31 @@ pub(crate) fn blob_schema_present_write(
     Ok(true)
 }
 
+/// Blob acceptance markers are an allocation high-water, not a count of
+/// currently retained or permanent records.  Retiring a record deliberately
+/// leaves a gap, so strict audit accepts a durable value ahead of the largest
+/// still-retained marker but never behind it.
+fn audit_or_initialize_blob_marker_high_water(
+    metadata: &mut redb::Table<'_, &str, u64>,
+    reconstructed_minimum: u64,
+) -> Result<u64, StoreError> {
+    let durable = metadata
+        .get(LAST_BLOB_ACCEPTANCE_MARKER)?
+        .map(|value| value.value());
+    match durable {
+        Some(durable) if durable < reconstructed_minimum => Err(StoreError::AccountingMismatch {
+            field: LAST_BLOB_ACCEPTANCE_MARKER,
+            durable,
+            reconstructed: reconstructed_minimum,
+        }),
+        Some(durable) => Ok(durable),
+        None => {
+            metadata.insert(LAST_BLOB_ACCEPTANCE_MARKER, reconstructed_minimum)?;
+            Ok(reconstructed_minimum)
+        }
+    }
+}
+
 pub(crate) fn audit_blob_tables_write(
     write: &redb::WriteTransaction,
     shared: &mut StateAuditSnapshot,
@@ -7877,10 +9602,134 @@ pub(crate) fn audit_blob_tables_write(
     let mut marker_values = BTreeSet::new();
     let mut expected_content = BTreeMap::new();
     let mut content_counts = BTreeMap::<Vec<u8>, usize>::new();
+    let mut retired_publications = 0u64;
+    let mut publication_transfers = BTreeSet::new();
 
     for row in publications.iter()? {
         let (key, value) = row?;
         let transfer_id = parse_blob_transfer_id("Blob publication table", key.value())?;
+        publication_transfers.insert(transfer_id.as_bytes().to_vec());
+        if transfer_id_exists_outside_blob(write, transfer_id.as_bytes())? {
+            return Err(StoreError::TransferNamespaceCollision {
+                transfer_id: *transfer_id.as_bytes(),
+            });
+        }
+        if lifecycle::publication_record_is_retired(value.value()).map_err(blob_error)? {
+            let (publication, marker) =
+                decode_retired_blob_metadata(value.value())?.ok_or_else(|| {
+                    blob_error(BlobStoreError::SchemaInvariant(
+                        "retired Blob publication is missing lookup metadata",
+                    ))
+                })?;
+            if publication.transfer_id != transfer_id
+                || marker == 0
+                || !marker_values.insert(marker)
+            {
+                return Err(blob_error(BlobStoreError::SchemaInvariant(
+                    "retired Blob publication lookup metadata is inconsistent",
+                )));
+            }
+            if semantic_id_exists_outside_blob(write, publication.semantic_id.as_bytes())? {
+                return Err(StoreError::SemanticNamespaceCollision {
+                    semantic_id: *publication.semantic_id.as_bytes(),
+                });
+            }
+            let indexed = semantic_items
+                .get(publication.semantic_id.as_bytes().as_slice())?
+                .map(|value| parse_blob_transfer_id("Blob semantic item table", value.value()))
+                .transpose()?
+                .ok_or_else(|| {
+                    blob_error(BlobStoreError::SchemaInvariant(
+                        "retired Blob publication is missing its semantic lookup",
+                    ))
+                })?;
+            if indexed != transfer_id {
+                return Err(blob_error(BlobStoreError::SchemaInvariant(
+                    "retired Blob semantic lookup points to another publication",
+                )));
+            }
+            let content_key = blob_content_key(
+                &publication.header.topic,
+                &publication.header.scope,
+                publication.blob_id,
+                publication.semantic_id,
+            )?;
+            if expected_content.insert(content_key, transfer_id).is_some() {
+                return Err(blob_error(BlobStoreError::SchemaInvariant(
+                    "multiple Blob publications claim one content index key",
+                )));
+            }
+            let dot = publication.header.stamp.dot;
+            let dot_key = accepted_dot_key(dot).to_vec();
+            if shared
+                .expected_dots
+                .insert(dot_key.clone(), *publication.semantic_id.as_bytes())
+                .is_some()
+            {
+                return Err(blob_error(BlobStoreError::SchemaInvariant(
+                    "multiple semantic classes claim one accepted causal dot",
+                )));
+            }
+            let accepted = accepted_dots
+                .get(dot_key.as_slice())?
+                .map(|value| parse_digest32("accepted dot table", value.value()))
+                .transpose()?
+                .ok_or_else(|| {
+                    blob_error(BlobStoreError::SchemaInvariant(
+                        "retired Blob publication is missing its accepted-dot row",
+                    ))
+                })?;
+            if accepted != *publication.semantic_id.as_bytes() {
+                return Err(blob_error(BlobStoreError::SchemaInvariant(
+                    "accepted-dot ledger points to another semantic publication",
+                )));
+            }
+            let durable_high = publisher_high
+                .get(dot.publisher.as_slice())?
+                .map_or(0, |value| value.value());
+            if durable_high < dot.counter {
+                return Err(blob_error(BlobStoreError::SchemaInvariant(
+                    "publisher high-water is behind an accepted Blob dot",
+                )));
+            }
+            shared
+                .expected_publisher_high
+                .entry(dot.publisher.to_vec())
+                .and_modify(|current| *current = (*current).max(dot.counter))
+                .or_insert(dot.counter);
+            let frontier_key = causal_frontier_key(
+                &publication.header.topic,
+                &publication.header.scope,
+                dot.publisher,
+            )?;
+            if frontier
+                .get(frontier_key.as_slice())?
+                .map_or(0, |value| value.value())
+                < dot.counter
+            {
+                return Err(blob_error(BlobStoreError::SchemaInvariant(
+                    "causal frontier is behind an accepted Blob dot",
+                )));
+            }
+            shared
+                .expected_frontier
+                .entry(frontier_key)
+                .and_modify(|current| *current = (*current).max(dot.counter))
+                .or_insert(dot.counter);
+            shared
+                .domain_publishers
+                .entry(event_domain_prefix(
+                    &publication.header.topic,
+                    &publication.header.scope,
+                )?)
+                .or_default()
+                .insert(dot.publisher);
+            stats.last_acceptance_marker = stats.last_acceptance_marker.max(marker);
+            retired_publications = retired_publications
+                .checked_add(1)
+                .ok_or(StoreError::ItemCountAccountingOverflow)?;
+            continue;
+        }
         let publication = decode_blob_metadata(value.value())?;
         if publication.transfer_id != transfer_id {
             return Err(blob_error(BlobStoreError::SchemaInvariant(
@@ -7901,11 +9750,6 @@ pub(crate) fn audit_blob_tables_write(
             route.chunk_count(),
             publication.physical_lineage,
         )?;
-        if transfer_id_exists_outside_blob(write, transfer_id.as_bytes())? {
-            return Err(StoreError::TransferNamespaceCollision {
-                transfer_id: *transfer_id.as_bytes(),
-            });
-        }
         if semantic_id_exists_outside_blob(write, publication.semantic_id.as_bytes())? {
             return Err(StoreError::SemanticNamespaceCollision {
                 semantic_id: *publication.semantic_id.as_bytes(),
@@ -8051,18 +9895,59 @@ pub(crate) fn audit_blob_tables_write(
             .ok_or(StoreError::PayloadByteAccountingOverflow)?;
         stats.last_acceptance_marker = stats.last_acceptance_marker.max(marker);
     }
-    if stats.last_acceptance_marker != stats.publications
-        || marker_values.iter().copied().ne(1..=stats.publications)
+    let lifecycle_table_names = write
+        .list_tables()?
+        .map(|table| table.name().to_owned())
+        .collect::<BTreeSet<_>>();
+    if write
+        .list_multimap_tables()?
+        .any(|table| table.name() == lifecycle::BLOB_REPLAY_CAUSAL_FENCES.name())
     {
         return Err(blob_error(BlobStoreError::SchemaInvariant(
-            "Blob acceptance markers are not a contiguous allocation history",
+            "Blob replay causal-fence table has the wrong table kind",
         )));
     }
+    if lifecycle_table_names.contains(lifecycle::BLOB_REPLAY_FENCES.name()) {
+        let mut causal_fences = BTreeMap::new();
+        if lifecycle_table_names.contains(lifecycle::BLOB_REPLAY_CAUSAL_FENCES.name()) {
+            for row in write
+                .open_table(lifecycle::BLOB_REPLAY_CAUSAL_FENCES)?
+                .iter()?
+            {
+                let (key, value) = row?;
+                let digest: [u8; 32] = value.value().try_into().map_err(|_| {
+                    blob_error(BlobStoreError::SchemaInvariant(
+                        "Blob replay causal fence has an invalid digest length",
+                    ))
+                })?;
+                if key.value().len() != 40
+                    || causal_fences.insert(key.value().to_vec(), digest).is_some()
+                {
+                    return Err(blob_error(BlobStoreError::SchemaInvariant(
+                        "Blob replay causal fence key is not canonical",
+                    )));
+                }
+            }
+        }
+        let replays = write.open_table(lifecycle::BLOB_REPLAY_FENCES)?;
+        extend_shared_with_expired_blob_replay_authority(
+            &replays,
+            &accepted_dots,
+            &publisher_high,
+            &publication_transfers,
+            causal_fences,
+            shared,
+        )?;
+    }
+    let lifecycle_publications = stats
+        .publications
+        .checked_add(retired_publications)
+        .ok_or(StoreError::ItemCountAccountingOverflow)?;
     stats.acceptance_markers = markers.len()?;
     if bytes.len()? != stats.publications
         || markers.len()? != stats.publications
-        || semantic_items.len()? != stats.publications
-        || content.len()? != stats.publications
+        || semantic_items.len()? != lifecycle_publications
+        || content.len()? != lifecycle_publications
     {
         return Err(blob_error(BlobStoreError::SchemaInvariant(
             "Blob publication schema has missing or orphan rows",
@@ -8077,34 +9962,59 @@ pub(crate) fn audit_blob_tables_write(
             )));
         }
     }
+    let mut active_equivalent_operation_bytes = 0u64;
     for row in operations.iter()? {
         let (key, value) = row?;
         BlobOperationKey::new(key.value().to_vec())?;
-        let operation = decode_blob_operation_record(value.value())?;
-        if publications
-            .get(operation.transfer_id.as_bytes().as_slice())?
-            .is_none()
-        {
-            return Err(blob_error(BlobStoreError::SchemaInvariant(
-                "Blob operation points to a missing publication",
-            )));
+        let retired = lifecycle::operation_record_is_retired(value.value()).map_err(blob_error)?;
+        if !retired {
+            let operation = decode_blob_operation_record(value.value())?;
+            let publication = publications
+                .get(operation.transfer_id.as_bytes().as_slice())?
+                .ok_or_else(|| {
+                    blob_error(BlobStoreError::SchemaInvariant(
+                        "Blob operation points to a missing publication",
+                    ))
+                })?;
+            if lifecycle::publication_record_is_retired(publication.value()).map_err(blob_error)? {
+                return Err(blob_error(BlobStoreError::SchemaInvariant(
+                    "active Blob operation points to a retired publication",
+                )));
+            }
         }
         stats.operations = stats
             .operations
             .checked_add(1)
             .ok_or(StoreError::ItemCountAccountingOverflow)?;
+        let entry_bytes = key
+            .value()
+            .len()
+            .checked_add(value.value().len())
+            .and_then(|value| u64::try_from(value).ok())
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?;
         stats.operation_bytes = stats
             .operation_bytes
-            .checked_add(
-                key.value()
-                    .len()
-                    .checked_add(value.value().len())
-                    .and_then(|value| u64::try_from(value).ok())
-                    .ok_or(StoreError::PayloadByteAccountingOverflow)?,
-            )
+            .checked_add(entry_bytes)
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+        let active_equivalent_entry = if retired {
+            entry_bytes
+                .checked_sub(MAX_BLOB_OPERATION_RETIREMENT_GROWTH_BYTES)
+                .ok_or_else(|| {
+                    blob_error(BlobStoreError::SchemaInvariant(
+                        "retired Blob operation is shorter than its fixed growth",
+                    ))
+                })?
+        } else {
+            entry_bytes
+        };
+        active_equivalent_operation_bytes = active_equivalent_operation_bytes
+            .checked_add(active_equivalent_entry)
             .ok_or(StoreError::PayloadByteAccountingOverflow)?;
     }
-    if stats.operations > MAX_BLOB_OPERATIONS || stats.operation_bytes > MAX_BLOB_OPERATION_BYTES {
+    if stats.operations > MAX_BLOB_OPERATIONS
+        || active_equivalent_operation_bytes > MAX_BLOB_OPERATION_BYTES
+        || stats.operation_bytes > MAX_BLOB_DURABLE_OPERATION_BYTES
+    {
         return Err(blob_error(BlobStoreError::SchemaInvariant(
             "Blob operation usage exceeds its durable safety caps",
         )));
@@ -8127,11 +10037,8 @@ pub(crate) fn audit_blob_tables_write(
     let mut metadata = write.open_table(METADATA)?;
     audit_or_initialize_counter(&mut metadata, BLOB_ITEM_COUNT, stats.publications)?;
     audit_or_initialize_counter(&mut metadata, BLOB_TOTAL_BYTES, stats.total_sealed_bytes)?;
-    audit_or_initialize_counter(
-        &mut metadata,
-        LAST_BLOB_ACCEPTANCE_MARKER,
-        stats.last_acceptance_marker,
-    )?;
+    stats.last_acceptance_marker =
+        audit_or_initialize_blob_marker_high_water(&mut metadata, stats.last_acceptance_marker)?;
     audit_or_initialize_counter(&mut metadata, BLOB_OPERATION_COUNT, stats.operations)?;
     audit_or_initialize_counter(
         &mut metadata,
@@ -8207,9 +10114,51 @@ pub(crate) fn inspect_blob_tables_read(
     let mut marker_values = BTreeSet::new();
     let mut expected_content = BTreeMap::new();
     let mut content_counts = BTreeMap::<Vec<u8>, usize>::new();
+    let mut retired_publications = 0u64;
     for row in publications.iter()? {
         let (key, value) = row?;
         let transfer = parse_blob_transfer_id("Blob publication table", key.value())?;
+        if lifecycle::publication_record_is_retired(value.value()).map_err(blob_error)? {
+            let (publication, marker) =
+                decode_retired_blob_metadata(value.value())?.ok_or_else(|| {
+                    blob_error(BlobStoreError::SchemaInvariant(
+                        "retired Blob publication is missing lookup metadata",
+                    ))
+                })?;
+            if publication.transfer_id != transfer || !marker_values.insert(marker) {
+                return Err(blob_error(BlobStoreError::SchemaInvariant(
+                    "retired Blob publication lookup metadata is inconsistent",
+                )));
+            }
+            let indexed = semantic
+                .get(publication.semantic_id.as_bytes().as_slice())?
+                .map(|value| parse_blob_transfer_id("Blob semantic item table", value.value()))
+                .transpose()?
+                .ok_or_else(|| {
+                    blob_error(BlobStoreError::SchemaInvariant(
+                        "retired Blob publication is missing its semantic lookup",
+                    ))
+                })?;
+            if indexed != transfer {
+                return Err(blob_error(BlobStoreError::SchemaInvariant(
+                    "retired Blob semantic lookup points to another publication",
+                )));
+            }
+            expected_content.insert(
+                blob_content_key(
+                    &publication.header.topic,
+                    &publication.header.scope,
+                    publication.blob_id,
+                    publication.semantic_id,
+                )?,
+                transfer,
+            );
+            stats.last_acceptance_marker = stats.last_acceptance_marker.max(marker);
+            retired_publications = retired_publications
+                .checked_add(1)
+                .ok_or(StoreError::ItemCountAccountingOverflow)?;
+            continue;
+        }
         let publication = decode_blob_metadata(value.value())?;
         if publication.transfer_id != transfer {
             return Err(blob_error(BlobStoreError::SchemaInvariant(
@@ -8301,12 +10250,14 @@ pub(crate) fn inspect_blob_tables_read(
         stats.last_acceptance_marker = stats.last_acceptance_marker.max(marker);
     }
     stats.acceptance_markers = markers.len()?;
-    if stats.last_acceptance_marker != stats.publications
-        || marker_values.iter().copied().ne(1..=stats.publications)
-        || bytes.len()? != stats.publications
+    let lifecycle_publications = stats
+        .publications
+        .checked_add(retired_publications)
+        .ok_or(StoreError::ItemCountAccountingOverflow)?;
+    if bytes.len()? != stats.publications
         || markers.len()? != stats.publications
-        || semantic.len()? != stats.publications
-        || content.len()? != stats.publications
+        || semantic.len()? != lifecycle_publications
+        || content.len()? != lifecycle_publications
     {
         return Err(blob_error(BlobStoreError::SchemaInvariant(
             "Blob publication schema has missing, orphan, or noncontiguous rows",
@@ -8321,31 +10272,56 @@ pub(crate) fn inspect_blob_tables_read(
             )));
         }
     }
+    let mut active_equivalent_operation_bytes = 0u64;
     for row in operations.iter()? {
         let (key, value) = row?;
         BlobOperationKey::new(key.value().to_vec())?;
-        let operation = decode_blob_operation_record(value.value())?;
-        if publications
-            .get(operation.transfer_id.as_bytes().as_slice())?
-            .is_none()
-        {
-            return Err(blob_error(BlobStoreError::SchemaInvariant(
-                "Blob operation points to a missing publication",
-            )));
+        let retired = lifecycle::operation_record_is_retired(value.value()).map_err(blob_error)?;
+        if !retired {
+            let operation = decode_blob_operation_record(value.value())?;
+            let publication = publications
+                .get(operation.transfer_id.as_bytes().as_slice())?
+                .ok_or_else(|| {
+                    blob_error(BlobStoreError::SchemaInvariant(
+                        "Blob operation points to a missing publication",
+                    ))
+                })?;
+            if lifecycle::publication_record_is_retired(publication.value()).map_err(blob_error)? {
+                return Err(blob_error(BlobStoreError::SchemaInvariant(
+                    "active Blob operation points to a retired publication",
+                )));
+            }
         }
         stats.operations += 1;
+        let entry_bytes = key
+            .value()
+            .len()
+            .checked_add(value.value().len())
+            .and_then(|value| u64::try_from(value).ok())
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?;
         stats.operation_bytes = stats
             .operation_bytes
-            .checked_add(
-                key.value()
-                    .len()
-                    .checked_add(value.value().len())
-                    .and_then(|value| u64::try_from(value).ok())
-                    .ok_or(StoreError::PayloadByteAccountingOverflow)?,
-            )
+            .checked_add(entry_bytes)
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+        let active_equivalent_entry = if retired {
+            entry_bytes
+                .checked_sub(MAX_BLOB_OPERATION_RETIREMENT_GROWTH_BYTES)
+                .ok_or_else(|| {
+                    blob_error(BlobStoreError::SchemaInvariant(
+                        "retired Blob operation is shorter than its fixed growth",
+                    ))
+                })?
+        } else {
+            entry_bytes
+        };
+        active_equivalent_operation_bytes = active_equivalent_operation_bytes
+            .checked_add(active_equivalent_entry)
             .ok_or(StoreError::PayloadByteAccountingOverflow)?;
     }
-    if stats.operations > MAX_BLOB_OPERATIONS || stats.operation_bytes > MAX_BLOB_OPERATION_BYTES {
+    if stats.operations > MAX_BLOB_OPERATIONS
+        || active_equivalent_operation_bytes > MAX_BLOB_OPERATION_BYTES
+        || stats.operation_bytes > MAX_BLOB_DURABLE_OPERATION_BYTES
+    {
         return Err(blob_error(BlobStoreError::SchemaInvariant(
             "Blob operation usage exceeds its durable safety caps",
         )));
@@ -8363,11 +10339,25 @@ pub(crate) fn inspect_blob_tables_read(
         stats.network_staging_bytes = network.staging.bytes;
         stats.carrier_fetch_cursors = network.carrier_cursors;
     }
+    let lifecycle_usage = lifecycle::inspect_blob_lifecycle_read(read)?;
     let metadata = read.open_table(METADATA)?;
+    let durable_marker = metadata
+        .get(LAST_BLOB_ACCEPTANCE_MARKER)?
+        .ok_or(StoreError::MissingAccountingMetadata {
+            field: LAST_BLOB_ACCEPTANCE_MARKER,
+        })?
+        .value();
+    if durable_marker < stats.last_acceptance_marker {
+        return Err(StoreError::AccountingMismatch {
+            field: LAST_BLOB_ACCEPTANCE_MARKER,
+            durable: durable_marker,
+            reconstructed: stats.last_acceptance_marker,
+        });
+    }
+    stats.last_acceptance_marker = durable_marker;
     for (field, reconstructed) in [
         (BLOB_ITEM_COUNT, stats.publications),
         (BLOB_TOTAL_BYTES, stats.total_sealed_bytes),
-        (LAST_BLOB_ACCEPTANCE_MARKER, stats.last_acceptance_marker),
         (BLOB_OPERATION_COUNT, stats.operations),
         (BLOB_OPERATION_TOTAL_BYTES, stats.operation_bytes),
     ] {
@@ -8383,7 +10373,7 @@ pub(crate) fn inspect_blob_tables_read(
             });
         }
     }
-    lifecycle::inspect_blob_lifecycle_read(read)?.apply_to_stats(&mut stats);
+    lifecycle_usage.apply_to_stats(&mut stats);
     Ok(BlobAuditSnapshot {
         stats,
         deletion_schema_migrated: false,
@@ -8459,9 +10449,11 @@ pub(crate) fn inspect_blob_tables_read_with_shared(
     } else {
         BTreeSet::new()
     };
+    let mut publication_transfers = BTreeSet::new();
     for row in publications.iter()? {
         let (key, value) = row?;
-        let publication = decode_blob_metadata(value.value())?;
+        let transfer = parse_blob_transfer_id("Blob publication table", key.value())?;
+        publication_transfers.insert(transfer.as_bytes().to_vec());
         if events
             .as_ref()
             .map(|table| table.get(key.value()))
@@ -8494,9 +10486,21 @@ pub(crate) fn inspect_blob_tables_read_with_shared(
                 .is_some()
         {
             return Err(StoreError::TransferNamespaceCollision {
-                transfer_id: *publication.transfer_id.as_bytes(),
+                transfer_id: *transfer.as_bytes(),
             });
         }
+        let publication =
+            if lifecycle::publication_record_is_retired(value.value()).map_err(blob_error)? {
+                decode_retired_blob_metadata(value.value())?
+                    .map(|(publication, _)| publication)
+                    .ok_or_else(|| {
+                        blob_error(BlobStoreError::SchemaInvariant(
+                            "retired Blob publication is missing lookup metadata",
+                        ))
+                    })?
+            } else {
+                decode_blob_metadata(value.value())?
+            };
         let semantic = publication.semantic_id.as_bytes().as_slice();
         if event_semantic
             .as_ref()
@@ -8606,6 +10610,54 @@ pub(crate) fn inspect_blob_tables_read_with_shared(
             )?)
             .or_default()
             .insert(dot.publisher);
+    }
+    if read
+        .list_multimap_tables()?
+        .any(|table| table.name() == lifecycle::BLOB_REPLAY_CAUSAL_FENCES.name())
+    {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "Blob replay causal-fence table has the wrong table kind",
+        )));
+    }
+    if table_names.contains(lifecycle::BLOB_REPLAY_FENCES.name()) {
+        let mut causal_fences = BTreeMap::new();
+        if table_names.contains(lifecycle::BLOB_REPLAY_CAUSAL_FENCES.name()) {
+            for row in read
+                .open_table(lifecycle::BLOB_REPLAY_CAUSAL_FENCES)?
+                .iter()?
+            {
+                let (key, value) = row?;
+                let digest: [u8; 32] = value.value().try_into().map_err(|_| {
+                    blob_error(BlobStoreError::SchemaInvariant(
+                        "Blob replay causal fence has an invalid digest length",
+                    ))
+                })?;
+                if key.value().len() != 40
+                    || causal_fences.insert(key.value().to_vec(), digest).is_some()
+                {
+                    return Err(blob_error(BlobStoreError::SchemaInvariant(
+                        "Blob replay causal fence key is not canonical",
+                    )));
+                }
+            }
+        }
+        let replays = read.open_table(lifecycle::BLOB_REPLAY_FENCES)?;
+        extend_shared_with_expired_blob_replay_authority(
+            &replays,
+            accepted_dots.as_ref().ok_or_else(|| {
+                blob_error(BlobStoreError::SchemaInvariant(
+                    "Blob replay fences exist without the shared accepted-dot ledger",
+                ))
+            })?,
+            publisher_high.as_ref().ok_or_else(|| {
+                blob_error(BlobStoreError::SchemaInvariant(
+                    "Blob replay fences exist without the shared publisher high-water ledger",
+                ))
+            })?,
+            &publication_transfers,
+            causal_fences,
+            shared,
+        )?;
     }
     Ok(snapshot)
 }
@@ -9252,6 +11304,13 @@ pub(crate) fn decode_blob_metadata(bytes: &[u8]) -> Result<BlobMetadata, StoreEr
         physical_lineage,
         header,
     })
+}
+
+fn decode_retired_blob_metadata(bytes: &[u8]) -> Result<Option<(BlobMetadata, u64)>, StoreError> {
+    lifecycle::retired_publication_payload(bytes)
+        .map_err(blob_error)?
+        .map(|(marker, payload)| decode_blob_metadata(payload).map(|metadata| (metadata, marker)))
+        .transpose()
 }
 
 fn encode_pending_blob_source(record: &PendingBlobSourceRecord) -> Result<Vec<u8>, StoreError> {
@@ -11995,7 +14054,7 @@ mod tests {
             .expect("legacy metadata row")
             .value()
             .to_vec();
-        assert_eq!(&encoded[..2], &[3, 1]);
+        assert_eq!(&encoded[..2], &[4, 1]);
         assert_eq!(encoded[2], BLOB_METADATA_VERSION);
         assert_eq!(encoded[163], 1, "current metadata must carry both lineages");
         let mut legacy = Vec::with_capacity(encoded.len() - 65);
@@ -12956,6 +15015,10 @@ mod tests {
                     lifecycle::BLOB_LINEAGE_FENCES.name(),
                     lifecycle::BLOB_REPLAY_FENCES.name(),
                     lifecycle::BLOB_MAINTENANCE_CURSORS.name(),
+                    lifecycle::BLOB_OPERATION_OWNERS.name(),
+                    lifecycle::BLOB_DELIVERY_OWNERS.name(),
+                    lifecycle::BLOB_RETENTION_DEADLINES.name(),
+                    lifecycle::BLOB_RETIREMENT_RESOLVERS.name(),
                 ]
                 .contains(&name.as_str())
             })
@@ -13004,6 +15067,26 @@ mod tests {
                 .delete_table(lifecycle::BLOB_MAINTENANCE_CURSORS)
                 .expect("delete lifecycle cursors");
         }
+        if existing.contains(lifecycle::BLOB_OPERATION_OWNERS.name()) {
+            write
+                .delete_table(lifecycle::BLOB_OPERATION_OWNERS)
+                .expect("delete lifecycle operation owners");
+        }
+        if existing.contains(lifecycle::BLOB_DELIVERY_OWNERS.name()) {
+            write
+                .delete_table(lifecycle::BLOB_DELIVERY_OWNERS)
+                .expect("delete lifecycle delivery owners");
+        }
+        if existing.contains(lifecycle::BLOB_RETENTION_DEADLINES.name()) {
+            write
+                .delete_table(lifecycle::BLOB_RETENTION_DEADLINES)
+                .expect("delete lifecycle retention deadlines");
+        }
+        if existing.contains(lifecycle::BLOB_RETIREMENT_RESOLVERS.name()) {
+            write
+                .delete_table(lifecycle::BLOB_RETIREMENT_RESOLVERS)
+                .expect("delete lifecycle retirement resolvers");
+        }
 
         let publications = write
             .open_table(BLOB_PUBLICATIONS)
@@ -13021,7 +15104,11 @@ mod tests {
             .open_table(BLOB_PUBLICATIONS)
             .expect("rewrite predecessor publications");
         for (key, value) in publication_rows {
-            if value.len() >= 3 && value[0] == 3 && value[1] == 1 && matches!(value[2], 1 | 2) {
+            if value.len() >= 3
+                && matches!(value[0], 3 | 4)
+                && value[1] == 1
+                && matches!(value[2], 1 | 2)
+            {
                 publications
                     .insert(key.as_slice(), &value[2..])
                     .expect("unwrap predecessor publication");
@@ -13055,6 +15142,146 @@ mod tests {
         write.commit().expect("commit lifecycle predecessor");
     }
 
+    fn downgrade_blob_lifecycle_to_v1_for_test(path: &Path) {
+        let database = Database::open(path).expect("raw lifecycle-v1 database");
+        let write = database.begin_write().expect("raw lifecycle-v1 write");
+        write
+            .delete_table(lifecycle::BLOB_OPERATION_OWNERS)
+            .expect("delete operation-owner index");
+        write
+            .delete_table(lifecycle::BLOB_DELIVERY_OWNERS)
+            .expect("delete delivery-owner index");
+        write
+            .delete_table(lifecycle::BLOB_RETENTION_DEADLINES)
+            .expect("delete deadline index");
+        write
+            .delete_table(lifecycle::BLOB_RETIREMENT_RESOLVERS)
+            .expect("delete retirement-resolver index");
+        {
+            let mut metadata = write
+                .open_table(lifecycle::BLOB_LIFECYCLE_METADATA)
+                .expect("lifecycle-v1 metadata");
+            metadata
+                .insert("schema_version", 1)
+                .expect("lifecycle-v1 version");
+            for field in [
+                "operation_owner_rows",
+                "delivery_owner_rows",
+                "deadline_rows",
+                "retirement_resolver_rows",
+                "retired_publication_rows",
+                "retired_operation_rows",
+                "next_retirement_generation",
+            ] {
+                metadata.remove(field).expect("remove lifecycle-v2 field");
+            }
+        }
+        let publications = write
+            .open_table(BLOB_PUBLICATIONS)
+            .expect("lifecycle-v2 publications")
+            .iter()
+            .expect("publication rows")
+            .map(|row| {
+                let (key, value) = row.expect("publication row");
+                (key.value().to_vec(), value.value().to_vec())
+            })
+            .collect::<Vec<_>>();
+        let mut publication_table = write
+            .open_table(BLOB_PUBLICATIONS)
+            .expect("rewrite lifecycle-v1 publications");
+        for (key, mut value) in publications {
+            value[0] = 3;
+            publication_table
+                .insert(key.as_slice(), value.as_slice())
+                .expect("write lifecycle-v1 publication");
+        }
+        drop(publication_table);
+        let operations = write
+            .open_table(BLOB_OPERATIONS)
+            .expect("lifecycle-v2 operations")
+            .iter()
+            .expect("operation rows")
+            .map(|row| {
+                let (key, value) = row.expect("operation row");
+                (key.value().to_vec(), value.value().to_vec())
+            })
+            .collect::<Vec<_>>();
+        let mut operation_table = write
+            .open_table(BLOB_OPERATIONS)
+            .expect("rewrite lifecycle-v1 operations");
+        for (key, value) in &operations {
+            operation_table
+                .insert(key.as_slice(), &value[2..])
+                .expect("write lifecycle-v1 operation");
+        }
+        drop(operation_table);
+        let mut metadata = write.open_table(METADATA).expect("Blob metadata");
+        let operation_bytes = metadata
+            .get(BLOB_OPERATION_TOTAL_BYTES)
+            .expect("operation byte count")
+            .expect("operation byte metadata")
+            .value();
+        metadata
+            .insert(
+                BLOB_OPERATION_TOTAL_BYTES,
+                operation_bytes - 2 * u64::try_from(operations.len()).expect("operation count"),
+            )
+            .expect("lifecycle-v1 operation bytes");
+        drop(metadata);
+        write.commit().expect("commit lifecycle-v1 predecessor");
+    }
+
+    fn downgrade_blob_lifecycle_to_v2_for_test(path: &Path) {
+        let database = Database::open(path).expect("raw lifecycle-v2 database");
+        let write = database.begin_write().expect("raw lifecycle-v2 write");
+        let deadline_rows = write
+            .open_table(lifecycle::BLOB_RETENTION_DEADLINES)
+            .expect("lifecycle-v3 deadlines")
+            .iter()
+            .expect("lifecycle-v3 deadline rows")
+            .map(|row| {
+                let (key, value) = row.expect("lifecycle-v3 deadline row");
+                let key: [u8; 57] = key.value().try_into().expect("lifecycle-v3 deadline key");
+                assert!(matches!(key[16], 1 | 2));
+                assert!(value.value().is_empty());
+                let mut predecessor = [0u8; 57];
+                predecessor[..16].copy_from_slice(&key[..16]);
+                predecessor[16..24].copy_from_slice(&key[17..25]);
+                predecessor[24] = key[16];
+                predecessor[25..].copy_from_slice(&key[25..]);
+                (key, predecessor)
+            })
+            .collect::<Vec<_>>();
+        {
+            let mut deadlines = write
+                .open_table(lifecycle::BLOB_RETENTION_DEADLINES)
+                .expect("rewrite lifecycle-v2 deadlines");
+            for (current, predecessor) in deadline_rows {
+                deadlines
+                    .remove(current.as_slice())
+                    .expect("remove lifecycle-v3 deadline");
+                deadlines
+                    .insert(predecessor.as_slice(), &[][..])
+                    .expect("insert lifecycle-v2 deadline");
+            }
+        }
+        write
+            .delete_table(lifecycle::BLOB_RETIREMENT_RESOLVERS)
+            .expect("delete lifecycle-v3 retirement resolvers");
+        {
+            let mut metadata = write
+                .open_table(lifecycle::BLOB_LIFECYCLE_METADATA)
+                .expect("lifecycle-v2 metadata");
+            metadata
+                .insert("schema_version", 2)
+                .expect("lifecycle-v2 version");
+            metadata
+                .remove("retirement_resolver_rows")
+                .expect("remove lifecycle-v3 resolver counter");
+        }
+        write.commit().expect("commit lifecycle-v2 predecessor");
+    }
+
     fn assert_blob_lifecycle_current_shape(
         path: &Path,
         lineage_rows: u64,
@@ -13069,6 +15296,10 @@ mod tests {
             lifecycle::BLOB_LINEAGE_FENCES.name(),
             lifecycle::BLOB_REPLAY_FENCES.name(),
             lifecycle::BLOB_MAINTENANCE_CURSORS.name(),
+            lifecycle::BLOB_OPERATION_OWNERS.name(),
+            lifecycle::BLOB_DELIVERY_OWNERS.name(),
+            lifecycle::BLOB_RETENTION_DEADLINES.name(),
+            lifecycle::BLOB_RETIREMENT_RESOLVERS.name(),
         ]
         .into_iter()
         .map(str::to_owned)
@@ -13115,7 +15346,7 @@ mod tests {
         );
         for row in publications.iter().expect("publication rows") {
             let (_, value) = row.expect("publication row");
-            assert_eq!(&value.value()[..2], &[3, 1]);
+            assert_eq!(&value.value()[..2], &[4, 1]);
         }
         let operations = read
             .open_table(BLOB_OPERATIONS)
@@ -13124,7 +15355,7 @@ mod tests {
         for row in operations.iter().expect("operation rows") {
             let (_, value) = row.expect("operation row");
             assert_eq!(
-                lifecycle::OperationState::decode(&value.value()[..1])
+                lifecycle::OperationState::decode(&value.value()[1..2])
                     .expect("active operation wrapper"),
                 lifecycle::OperationState::Active
             );
@@ -13151,6 +15382,9 @@ mod tests {
             lifecycle::BLOB_VARIANT_REFERENCES,
             lifecycle::BLOB_LINEAGE_FENCES,
             lifecycle::BLOB_REPLAY_FENCES,
+            lifecycle::BLOB_OPERATION_OWNERS,
+            lifecycle::BLOB_DELIVERY_OWNERS,
+            lifecycle::BLOB_RETENTION_DEADLINES,
         ] {
             digest.update(table.name().as_bytes());
             for row in read
@@ -14963,6 +17197,724 @@ mod tests {
     }
 
     #[test]
+    fn blob_retention_schema_migrates_lifecycle_v1_without_read_only_mutation() {
+        // Break caught: the deployed live-only lifecycle group remains safely
+        // inspectable, then upgrades atomically on the first writable open.
+        let root = BlobTestRoot::new("retention-schema-lifecycle-v1");
+        let mut services = blob_services(0xc0);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("current retention schema");
+        let plaintext = b"lifecycle v1 live publication";
+        let prepared = prepared_blob(plaintext);
+        publish_blob(
+            &store,
+            &mut services,
+            &prepared,
+            plaintext,
+            1,
+            b"lifecycle-v1-operation",
+        );
+        drop(store);
+        {
+            // A v1 database can legitimately retain a finalized orphan fence
+            // after physical reclamation. The v2 migration must carry that
+            // permanent authority and its exact accounting forward.
+            let database = Database::open(&root.database).expect("raw current database");
+            let write = database.begin_write().expect("orphan fence write");
+            let encoded = {
+                let fences = write
+                    .open_table(lifecycle::BLOB_LINEAGE_FENCES)
+                    .expect("current lineage fences");
+                let (_, value) = fences
+                    .iter()
+                    .expect("lineage rows")
+                    .next()
+                    .expect("one lineage fence")
+                    .expect("lineage row");
+                let mut encoded = value.value().to_vec();
+                encoded[0] = 2;
+                encoded
+            };
+            write
+                .open_table(lifecycle::BLOB_LINEAGE_FENCES)
+                .expect("current lineage fences")
+                .insert([0xee; 32].as_slice(), encoded.as_slice())
+                .expect("reclaimed orphan fence");
+            let mut metadata = write
+                .open_table(lifecycle::BLOB_LIFECYCLE_METADATA)
+                .expect("current lifecycle metadata");
+            let lineage_rows = metadata
+                .get("lineage_rows")
+                .expect("lineage rows")
+                .expect("lineage row counter")
+                .value();
+            let lineage_bytes = metadata
+                .get("lineage_bytes")
+                .expect("lineage bytes")
+                .expect("lineage byte counter")
+                .value();
+            metadata
+                .insert("lineage_rows", lineage_rows + 1)
+                .expect("increment lineage rows");
+            metadata
+                .insert(
+                    "lineage_bytes",
+                    lineage_bytes
+                        + u64::try_from(32 + encoded.len()).expect("fixed lineage entry bytes"),
+                )
+                .expect("increment lineage bytes");
+            drop(metadata);
+            write.commit().expect("commit reclaimed orphan fence");
+        }
+        downgrade_blob_lifecycle_to_v1_for_test(&root.database);
+        let before = blob_database_digest(&root.database);
+        let inspected =
+            Store::inspect_existing(&root.database).expect("read-only lifecycle-v1 inspection");
+        assert_eq!(inspected.blob_stats.publications, 1);
+        assert_eq!(inspected.blob_stats.lineage_fences, 2);
+        assert_eq!(blob_database_digest(&root.database), before);
+
+        drop(
+            Store::open_for_mission(&root.database, services.authority)
+                .expect("writable lifecycle-v1 migration"),
+        );
+        let database = redb::Builder::new()
+            .open_read_only(&root.database)
+            .expect("read migrated lifecycle-v2");
+        assert_eq!(
+            database
+                .begin_read()
+                .expect("lifecycle-v2 read")
+                .open_table(lifecycle::BLOB_OPERATION_OWNERS)
+                .expect("operation-owner index")
+                .len()
+                .expect("operation-owner rows"),
+            1
+        );
+        assert_eq!(
+            database
+                .begin_read()
+                .expect("lifecycle-v2 read")
+                .open_table(lifecycle::BLOB_LINEAGE_FENCES)
+                .expect("lineage fences")
+                .len()
+                .expect("lineage fence rows"),
+            2
+        );
+    }
+
+    #[test]
+    fn blob_retention_schema_migrates_live_predecessor_with_reverse_indexes() {
+        // Break caught: upgrading a live-only predecessor must atomically add
+        // both ownership inverses and the unified deadline authority.
+        let root = BlobTestRoot::new("retention-schema-live-predecessor");
+        let mut services = blob_services(0xc1);
+        with_blob_lifecycle_predecessor_setup(|| {
+            let store = Store::open_for_mission(&root.database, services.authority)
+                .expect("live predecessor store");
+            let plaintext = b"live predecessor retirement schema";
+            let prepared = prepared_blob(plaintext);
+            publish_blob(
+                &store,
+                &mut services,
+                &prepared,
+                plaintext,
+                1,
+                b"retention-schema-operation",
+            );
+        });
+        strip_blob_lifecycle_schema_for_test(&root.database);
+        Store::open_for_mission(&root.database, services.authority)
+            .expect("migrate retirement schema");
+
+        let tables = blob_lifecycle_tables_present(&root.database);
+        for expected in [
+            "aster.blob-operation-owners.v1",
+            "aster.blob-delivery-owners.v1",
+            "aster.blob-retention-deadlines.v1",
+        ] {
+            assert!(tables.contains(expected), "missing {expected}");
+        }
+        let database = redb::Builder::new()
+            .open_read_only(&root.database)
+            .expect("read migrated retention schema");
+        let read = database.begin_read().expect("retention schema read");
+        assert_eq!(
+            read.open_table(redb::TableDefinition::<&[u8], &[u8]>::new(
+                "aster.blob-operation-owners.v1",
+            ))
+            .expect("operation owner index")
+            .len()
+            .expect("operation owner count"),
+            1
+        );
+        assert_eq!(
+            read.open_table(redb::TableDefinition::<&[u8], &[u8]>::new(
+                "aster.blob-delivery-owners.v1",
+            ))
+            .expect("delivery owner index")
+            .len()
+            .expect("delivery owner count"),
+            0
+        );
+        assert_eq!(
+            read.open_table(redb::TableDefinition::<&[u8], &[u8]>::new(
+                "aster.blob-retention-deadlines.v1",
+            ))
+            .expect("retention deadline index")
+            .len()
+            .expect("deadline count"),
+            0
+        );
+    }
+
+    struct RetiredStoreFixture {
+        transfer: BlobTransferId,
+        operation: BlobOperationKey,
+        operation_digest: [u8; 32],
+        publication_deadline: CustodySample,
+        operation_deadline: CustodySample,
+        replay_key: [u8; 40],
+    }
+
+    fn seed_retired_store_fixture(
+        root: &BlobTestRoot,
+        services: &mut BlobServices,
+    ) -> RetiredStoreFixture {
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("initialize retired-row store");
+        let plaintext = b"canonical production retired-row fixture".to_vec();
+        let prepared = prepared_blob(&plaintext);
+        let (stored, operation, _) = publish_blob(
+            &store,
+            services,
+            &prepared,
+            &plaintext,
+            1,
+            b"retired-store-operation",
+        );
+        let transfer = stored.transfer_id;
+        let operation_digest: [u8; 32] = Sha256::digest(operation.as_bytes()).into();
+        let clock_id = [0x82; 16];
+        let sample = CustodySample {
+            clock_id,
+            tick_ms: 100,
+        };
+        let write = store
+            .database
+            .begin_write()
+            .expect("fixture revocation write");
+        let encoded =
+            encode_revocation_index(services.authority, 1, ControlTransferId::new([0x81; 32]));
+        write
+            .open_table(CONTROL_REVOCATIONS)
+            .expect("fixture revocations")
+            .insert(services.publisher.identity().as_slice(), encoded.as_slice())
+            .expect("revoke fixture publisher");
+        write.commit().expect("commit fixture revocation");
+        set_maintenance_next_class(
+            &store,
+            lifecycle::BlobMaintenanceClass::ExpiredPublicationsAndPendingSources,
+        );
+        store
+            .run_blob_maintenance_turn_with_sample(maintenance_budget(64), Some(sample))
+            .expect("retire canonical fixture publication");
+        let read = store.database.begin_read().expect("retired fixture read");
+        let publication = read
+            .open_table(BLOB_PUBLICATIONS)
+            .expect("fixture publications")
+            .get(transfer.as_bytes().as_slice())
+            .expect("read fixture publication")
+            .expect("fixture publication exists")
+            .value()
+            .to_vec();
+        let operation_record = read
+            .open_table(BLOB_OPERATIONS)
+            .expect("fixture operations")
+            .get(operation.as_bytes())
+            .expect("read fixture operation")
+            .expect("fixture operation exists")
+            .value()
+            .to_vec();
+        drop(read);
+        let (_, _, publication_age) = lifecycle::publication_retirement(&publication)
+            .expect("decode publication retirement")
+            .expect("publication is retired");
+        let (_, _, _, _, operation_age) = lifecycle::operation_retirement(&operation_record)
+            .expect("decode operation retirement")
+            .expect("operation is retired");
+        let publication_deadline = publication_age
+            .project(Some(sample))
+            .expect("project publication deadline")
+            .deadline
+            .expect("publication deadline");
+        let operation_deadline = operation_age
+            .project(Some(sample))
+            .expect("project operation deadline")
+            .deadline
+            .expect("operation deadline");
+        let write = store
+            .database
+            .begin_write()
+            .expect("remove fixture revocation");
+        write
+            .open_table(CONTROL_REVOCATIONS)
+            .expect("fixture revocations")
+            .remove(services.publisher.identity().as_slice())
+            .expect("remove fixture revocation");
+        write.commit().expect("commit fixture revocation removal");
+        drop(store);
+
+        RetiredStoreFixture {
+            transfer,
+            operation,
+            operation_digest,
+            publication_deadline,
+            operation_deadline,
+            replay_key: accepted_dot_key(stored.header.stamp.dot),
+        }
+    }
+
+    #[test]
+    fn blob_retired_rows_pass_store_reopen_and_inspection_but_contradictions_fail_closed() {
+        // Break caught: the outer Store audits must dispatch lifecycle state
+        // before requiring live publication bytes/indexes or an active
+        // operation payload; direct lifecycle audit coverage is insufficient.
+        let root = BlobTestRoot::new("retired-store-entrypoints");
+        let mut services = blob_services(0xc2);
+        let fixture = seed_retired_store_fixture(&root, &mut services);
+
+        downgrade_blob_lifecycle_to_v2_for_test(&root.database);
+        let before_inspection = blob_database_digest(&root.database);
+
+        let inspected = Store::inspect_existing(&root.database)
+            .expect("read-only inspection accepts canonical lifecycle-v2 retired rows");
+        assert_eq!(
+            blob_database_digest(&root.database),
+            before_inspection,
+            "read-only lifecycle-v2 audit must not rewrite deadline keys"
+        );
+        assert_eq!(inspected.blob_stats.publications, 0);
+        assert_eq!(inspected.blob_stats.operations, 1);
+        let reopened = Store::open_for_mission(&root.database, services.authority)
+            .expect("writable reopen migrates canonical lifecycle-v2 retired rows");
+        assert_eq!(
+            reopened.blob_stats().expect("reopened stats").publications,
+            0
+        );
+        let read = reopened
+            .database
+            .begin_read()
+            .expect("migrated deadline read");
+        assert_eq!(
+            lifecycle::nearest_retention_deadline_read(
+                &read,
+                fixture.publication_deadline.clock_id,
+            )
+            .expect("migrated nearest deadline"),
+            Some((
+                fixture.publication_deadline,
+                lifecycle::RetentionDeadlineOwner::Publication(fixture.transfer),
+            )),
+            "schema-v3 owner partition preserves the exact earliest deadline"
+        );
+        drop(read);
+        drop(reopened);
+
+        let database = Database::open(&root.database).expect("contradiction database");
+        let write = database.begin_write().expect("contradiction write");
+        lifecycle::remove_retention_deadline(
+            &write,
+            fixture.publication_deadline,
+            lifecycle::RetentionDeadlineOwner::Publication(fixture.transfer),
+        )
+        .expect("remove one deadline");
+        write
+            .open_table(lifecycle::BLOB_LIFECYCLE_METADATA)
+            .expect("lifecycle metadata")
+            .insert("deadline_rows", 2)
+            .expect("retain contradictory deadline count");
+        write.commit().expect("commit deadline contradiction");
+        drop(database);
+        assert!(Store::inspect_existing(&root.database).is_err());
+        assert!(Store::open_for_mission(&root.database, services.authority).is_err());
+    }
+
+    #[test]
+    fn blob_retired_publications_require_one_bound_replay_fence_at_store_entrypoints() {
+        for case in ["missing", "mismatched", "duplicate", "orphan"] {
+            let root = BlobTestRoot::new(case);
+            let mut services = blob_services(0xc3);
+            let fixture = seed_retired_store_fixture(&root, &mut services);
+            let database = Database::open(&root.database).expect("replay contradiction database");
+            let write = database.begin_write().expect("replay contradiction write");
+            if matches!(case, "missing" | "mismatched" | "orphan") {
+                let mut replays = write
+                    .open_table(lifecycle::BLOB_REPLAY_FENCES)
+                    .expect("replay fences");
+                assert!(
+                    replays
+                        .remove(fixture.replay_key.as_slice())
+                        .expect("remove replay fence")
+                        .is_some(),
+                    "canonical replay fence"
+                );
+                drop(replays);
+                let mut metadata = write
+                    .open_table(lifecycle::BLOB_LIFECYCLE_METADATA)
+                    .expect("lifecycle metadata");
+                metadata.insert("replay_rows", 0).expect("zero replay rows");
+                metadata
+                    .insert("replay_bytes", 0)
+                    .expect("zero replay bytes");
+            }
+            if case != "missing" {
+                let (publisher, counter, transfer) = match case {
+                    "mismatched" => ([0x83; 32], 7, BlobTransferId::new([0x87; 32])),
+                    "duplicate" => ([0x88; 32], 9, fixture.transfer),
+                    "orphan" => ([0x89; 32], 10, BlobTransferId::new([0x8a; 32])),
+                    _ => unreachable!(),
+                };
+                lifecycle::ensure_replay_fence(
+                    &write,
+                    BlobLifecycleLimits::default(),
+                    lifecycle::ReplayFence::new(
+                        publisher,
+                        counter,
+                        BlobSemanticId::new([publisher[0].wrapping_add(1); 32]),
+                        transfer,
+                        654,
+                        [publisher[0].wrapping_add(2); 32],
+                    ),
+                )
+                .expect("contradictory replay fence");
+            }
+            write.commit().expect("commit replay contradiction");
+            drop(database);
+
+            assert!(
+                Store::inspect_existing(&root.database).is_err(),
+                "read-only inspection accepted {case} retired replay relation"
+            );
+            assert!(
+                Store::open_for_mission(&root.database, services.authority).is_err(),
+                "writable reopen accepted {case} retired replay relation"
+            );
+        }
+    }
+
+    #[test]
+    fn blob_historical_replay_fence_remains_valid_without_a_publication_row() {
+        let root = BlobTestRoot::new("historical-replay-without-publication");
+        let services = blob_services(0xc4);
+        let initialized = Store::open_for_mission(&root.database, services.authority)
+            .expect("initialize historical-replay store");
+        drop(
+            initialized
+                .blob_depot()
+                .expect("initialize the bound depot root"),
+        );
+        drop(initialized);
+        let database = Database::open(&root.database).expect("historical-replay database");
+        let write = database.begin_write().expect("historical-replay write");
+        lifecycle::ensure_replay_fence(
+            &write,
+            BlobLifecycleLimits::default(),
+            lifecycle::ReplayFence::new(
+                [0x8c; 32],
+                11,
+                BlobSemanticId::new([0x8d; 32]),
+                BlobTransferId::new([0x8e; 32]),
+                987,
+                [0x8f; 32],
+            ),
+        )
+        .expect("historical permanent replay fence");
+        write.commit().expect("commit historical replay fence");
+        drop(database);
+
+        Store::inspect_existing(&root.database)
+            .expect("read-only inspection retains historical replay authority");
+        drop(
+            Store::open_for_mission(&root.database, services.authority)
+                .expect("writable reopen retains historical replay authority"),
+        );
+    }
+
+    #[test]
+    fn blob_live_publication_rejects_a_second_replay_fence_at_store_entrypoints() {
+        // Break caught: Live replay authority must be exact by both canonical
+        // dot and transfer; another canonical dot cannot target the same
+        // surviving publication transfer.
+        let root = BlobTestRoot::new("live-publication-duplicate-replay");
+        let mut services = blob_services(0xc5);
+        let plaintext = b"one live publication has one replay fence".to_vec();
+        let prepared = prepared_blob(&plaintext);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("live duplicate-replay store");
+        let (stored, _, _) = publish_blob(
+            &store,
+            &mut services,
+            &prepared,
+            &plaintext,
+            1,
+            b"live-duplicate-replay-operation",
+        );
+        drop(store);
+
+        let database = Database::open(&root.database).expect("live duplicate-replay database");
+        let write = database.begin_write().expect("live duplicate-replay write");
+        lifecycle::ensure_replay_fence(
+            &write,
+            BlobLifecycleLimits::default(),
+            lifecycle::ReplayFence::new(
+                [0x90; 32],
+                12,
+                BlobSemanticId::new([0x91; 32]),
+                stored.transfer_id,
+                1_234,
+                [0x92; 32],
+            ),
+        )
+        .expect("second canonical replay fence for live transfer");
+        write.commit().expect("commit second live replay fence");
+        drop(database);
+
+        let inspected = Store::inspect_existing(&root.database);
+        let reopened = Store::open_for_mission(&root.database, services.authority);
+        assert!(inspected.is_err());
+        assert!(reopened.is_err());
+    }
+
+    #[test]
+    fn blob_active_operation_cannot_target_retired_publication_at_store_entrypoints() {
+        let root = BlobTestRoot::new("active-operation-retired-publication");
+        let mut services = blob_services(0xc6);
+        let fixture = seed_retired_store_fixture(&root, &mut services);
+        let database = Database::open(&root.database).expect("cross-state database");
+        let write = database.begin_write().expect("cross-state write");
+        let active = lifecycle::active_operation_record(
+            &write,
+            &encode_blob_operation_record(BlobOperationRecord {
+                transfer_id: fixture.transfer,
+                intent_digest: [0x8b; 32],
+            }),
+        )
+        .expect("active operation wrapper");
+        write
+            .open_table(BLOB_OPERATIONS)
+            .expect("operations")
+            .insert(fixture.operation.as_bytes(), active.as_slice())
+            .expect("replace retired operation");
+        lifecycle::remove_retention_deadline(
+            &write,
+            fixture.operation_deadline,
+            lifecycle::RetentionDeadlineOwner::Operation(fixture.operation_digest),
+        )
+        .expect("remove retired operation deadline");
+        lifecycle::insert_operation_owner(&write, fixture.transfer, fixture.operation.as_bytes())
+            .expect("active operation owner");
+        write
+            .open_table(lifecycle::BLOB_LIFECYCLE_METADATA)
+            .expect("lifecycle metadata")
+            .insert("retired_operation_rows", 0)
+            .expect("zero retired operations");
+        write
+            .open_table(METADATA)
+            .expect("store metadata")
+            .insert(
+                BLOB_OPERATION_TOTAL_BYTES,
+                u64::try_from(fixture.operation.as_bytes().len() + active.len())
+                    .expect("active operation bytes"),
+            )
+            .expect("active operation byte count");
+        write.commit().expect("commit cross-state fixture");
+        drop(database);
+
+        assert!(Store::inspect_existing(&root.database).is_err());
+        assert!(Store::open_for_mission(&root.database, services.authority).is_err());
+    }
+
+    #[test]
+    fn blob_retention_schema_read_only_does_not_migrate_and_partial_current_is_rejected() {
+        // Break caught: inspection may validate an old complete schema but may
+        // neither create the new group nor accept only one of its tables.
+        let root = BlobTestRoot::new("retention-schema-read-only");
+        let services = blob_services(0xc2);
+        drop(
+            Store::open_for_mission(&root.database, services.authority)
+                .expect("retention predecessor base"),
+        );
+        let before = blob_database_digest(&root.database);
+        Store::inspect_existing(&root.database).expect("inspect complete predecessor");
+        assert_eq!(blob_database_digest(&root.database), before);
+
+        let database = Database::open(&root.database).expect("partial retention database");
+        let write = database.begin_write().expect("partial retention write");
+        write
+            .open_table(redb::TableDefinition::<&[u8], &[u8]>::new(
+                "aster.blob-operation-owners.v1",
+            ))
+            .expect("one partial retention table");
+        write
+            .delete_table(lifecycle::BLOB_DELIVERY_OWNERS)
+            .expect("remove second retention table");
+        write
+            .delete_table(lifecycle::BLOB_RETENTION_DEADLINES)
+            .expect("remove third retention table");
+        write.commit().expect("commit partial retention group");
+        assert!(Store::inspect_existing(&root.database).is_err());
+        assert!(Store::open_for_mission(&root.database, services.authority).is_err());
+    }
+
+    #[test]
+    fn blob_retention_schema_rejects_reverse_index_contradictions_and_counter_underflow() {
+        // Break caught: a reverse owner without its forward operation and a
+        // zero counter that cannot cover a retained owner must fail closed.
+        let root = BlobTestRoot::new("retention-schema-reverse-contradiction");
+        let services = blob_services(0xc3);
+        drop(
+            Store::open_for_mission(&root.database, services.authority)
+                .expect("retention contradiction base"),
+        );
+        let database = Database::open(&root.database).expect("retention contradiction database");
+        let write = database
+            .begin_write()
+            .expect("retention contradiction write");
+        let mut owners = write
+            .open_table(redb::TableDefinition::<&[u8], &[u8]>::new(
+                "aster.blob-operation-owners.v1",
+            ))
+            .expect("operation owners");
+        owners
+            .insert([0x44; 64].as_slice(), b"missing-operation".as_slice())
+            .expect("orphan owner");
+        drop(owners);
+        write
+            .open_table(redb::TableDefinition::<&[u8], &[u8]>::new(
+                "aster.blob-delivery-owners.v1",
+            ))
+            .expect("delivery owners");
+        write
+            .open_table(redb::TableDefinition::<&[u8], &[u8]>::new(
+                "aster.blob-retention-deadlines.v1",
+            ))
+            .expect("deadlines");
+        write
+            .open_table(lifecycle::BLOB_LIFECYCLE_METADATA)
+            .expect("lifecycle metadata")
+            .insert("operation_owner_rows", 0)
+            .expect("underflowing owner counter");
+        write.commit().expect("commit owner contradiction");
+        assert!(Store::inspect_existing(&root.database).is_err());
+        assert!(Store::open_for_mission(&root.database, services.authority).is_err());
+    }
+
+    #[test]
+    fn blob_retention_deadline_index_returns_nearest_same_domain_and_rejects_underflow() {
+        // Break caught: maintenance must not select another clock domain or a
+        // later retained record while an earlier known deadline exists.
+        let root = BlobTestRoot::new("retention-deadline-index");
+        let services = blob_services(0xc4);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("retention deadline store");
+        let clock_id = [0x61; 16];
+        let first_owner =
+            lifecycle::RetentionDeadlineOwner::Publication(BlobTransferId::new([0x11; 32]));
+        let second_owner = lifecycle::RetentionDeadlineOwner::Operation([0x22; 32]);
+        let write = store.database.begin_write().expect("deadline insert write");
+        lifecycle::insert_retention_deadline(
+            &write,
+            BlobLifecycleLimits::default(),
+            CustodySample {
+                clock_id,
+                tick_ms: 20,
+            },
+            second_owner,
+        )
+        .expect("later deadline");
+        lifecycle::insert_retention_deadline(
+            &write,
+            BlobLifecycleLimits::default(),
+            CustodySample {
+                clock_id,
+                tick_ms: 10,
+            },
+            first_owner,
+        )
+        .expect("earlier deadline");
+        lifecycle::insert_retention_deadline(
+            &write,
+            BlobLifecycleLimits::default(),
+            CustodySample {
+                clock_id: [0x62; 16],
+                tick_ms: 1,
+            },
+            lifecycle::RetentionDeadlineOwner::Operation([0x33; 32]),
+        )
+        .expect("other-domain deadline");
+        write.commit().expect("commit deadlines");
+
+        let read = store.database.begin_read().expect("deadline read");
+        assert_eq!(
+            lifecycle::nearest_retention_deadline_read(&read, clock_id).expect("nearest deadline"),
+            Some((
+                CustodySample {
+                    clock_id,
+                    tick_ms: 10,
+                },
+                first_owner,
+            ))
+        );
+        drop(read);
+
+        let write = store
+            .database
+            .begin_write()
+            .expect("deadline removal write");
+        lifecycle::remove_retention_deadline(
+            &write,
+            CustodySample {
+                clock_id,
+                tick_ms: 10,
+            },
+            first_owner,
+        )
+        .expect("remove nearest deadline");
+        write.commit().expect("commit deadline removal");
+
+        let write = store
+            .database
+            .begin_write()
+            .expect("deadline underflow write");
+        write
+            .open_table(lifecycle::BLOB_LIFECYCLE_METADATA)
+            .expect("deadline metadata")
+            .insert("deadline_rows", 0)
+            .expect("force deadline counter underflow");
+        assert!(
+            lifecycle::remove_retention_deadline(
+                &write,
+                CustodySample {
+                    clock_id,
+                    tick_ms: 20,
+                },
+                second_owner,
+            )
+            .is_err()
+        );
+        assert!(
+            write
+                .open_table(lifecycle::BLOB_RETENTION_DEADLINES)
+                .expect("retained deadline table")
+                .len()
+                .expect("retained deadline rows")
+                == 2,
+            "counter underflow must fail before mutating the deadline index",
+        );
+    }
+
+    #[test]
     fn blob_lifecycle_migration_empty_predecessor_is_atomic_and_idempotent() {
         let root = BlobTestRoot::new("lifecycle-empty-predecessor");
         let services = blob_services(0xd0);
@@ -15098,9 +18050,11 @@ mod tests {
 
         let migrated = Store::open_for_mission(&root.database, services.authority)
             .expect("migrate populated lifecycle predecessor");
+        let mut expected_migrated = predecessor;
+        expected_migrated.operation_bytes += 2 * predecessor.operations;
         assert_eq!(
             migrated.blob_stats().expect("migrated Blob stats"),
-            predecessor
+            expected_migrated
         );
         assert_eq!(
             migrated
@@ -15674,6 +18628,18 @@ mod tests {
             write
                 .delete_table(lifecycle::BLOB_MAINTENANCE_CURSORS)
                 .expect("delete orphan maintenance cursors");
+            write
+                .delete_table(lifecycle::BLOB_OPERATION_OWNERS)
+                .expect("delete orphan operation owners");
+            write
+                .delete_table(lifecycle::BLOB_DELIVERY_OWNERS)
+                .expect("delete orphan delivery owners");
+            write
+                .delete_table(lifecycle::BLOB_RETENTION_DEADLINES)
+                .expect("delete orphan retention deadlines");
+            write
+                .delete_table(lifecycle::BLOB_RETIREMENT_RESOLVERS)
+                .expect("delete orphan retirement resolvers");
             write.commit().expect("commit absent lifecycle schema");
         }
         assert!(matches!(
@@ -16144,7 +19110,7 @@ mod tests {
         let prepared = prepared_blob(&plaintext);
         let store = Store::open_with_limits_for_mission(&root.database, limits, services.authority)
             .expect("quota store");
-        let (stored, _, _) = publish_blob(
+        let (stored, _, intent) = publish_blob(
             &store,
             &mut services,
             &prepared,
@@ -16152,6 +19118,14 @@ mod tests {
             1,
             b"quota-blob",
         );
+        lifecycle::reset_lifecycle_schema_enumerations_for_test();
+        let expected_usage = store.aggregate_usage().expect("aggregate usage");
+        for _ in 0..3 {
+            assert_eq!(
+                store.aggregate_usage().expect("aggregate usage"),
+                expected_usage
+            );
+        }
         let policy = store.control_policy_snapshot().expect("quota policy");
         let (reservation, event, sealed) =
             reserved_event(&store, &mut services, &policy, b"must roll back");
@@ -16174,6 +19148,11 @@ mod tests {
         assert_eq!(
             store.blob_inventory().expect("Blob inventory"),
             vec![stored.transfer_id]
+        );
+        assert_eq!(
+            lifecycle::take_lifecycle_schema_enumerations_for_test(),
+            0,
+            "aggregate usage and ordinary non-Blob admission must not enumerate the schema"
         );
         drop(store);
 
@@ -16202,6 +19181,89 @@ mod tests {
                 .expect("reopened Blob stats")
                 .publications,
             1
+        );
+        let usage_before_operation = reopened
+            .aggregate_usage()
+            .expect("aggregate usage before reserved operation admission");
+        let physical_operation_bytes = 1u64 + BLOB_ACTIVE_OPERATION_RECORD_BYTES;
+        let effective_operation_bytes = physical_operation_bytes
+            .checked_add(MAX_BLOB_OPERATION_RETIREMENT_GROWTH_BYTES)
+            .expect("bounded effective operation bytes");
+        let (_, byte_reserve) = custody::custody_emergency_reserve(StoreLimits::default());
+        drop(reopened);
+
+        let operation = BlobOperationKey::new(vec![0x7a]).expect("reserved operation key");
+        let request = BlobOperationRequest::new(&operation, &intent);
+        let ordinary_one_short_limit = usage_before_operation
+            .payload_bytes
+            .checked_add(effective_operation_bytes)
+            .and_then(|value| value.checked_sub(1))
+            .expect("one-short ordinary limit fits u64");
+        let one_short_limit = ordinary_one_short_limit
+            .checked_add(byte_reserve)
+            .expect("one-short aggregate limit fits u64");
+        let one_short_limits = StoreLimits::new(u64::MAX, one_short_limit)
+            .expect("one-short operation aggregate limits");
+        let one_short = Store::open_with_limits_for_mission(
+            &root.database,
+            one_short_limits,
+            services.authority,
+        )
+        .expect("one-short operation aggregate reopen");
+        let write = one_short
+            .database
+            .begin_write()
+            .expect("one-short operation write");
+        assert!(matches!(
+            insert_blob_operation(&write, one_short.limits, &request, stored.transfer_id),
+            Err(StoreError::PayloadByteLimitExceeded {
+                current,
+                incoming,
+                limit,
+            }) if current == usage_before_operation.payload_bytes
+                && incoming == effective_operation_bytes
+                && limit == ordinary_one_short_limit
+        ));
+        drop(write);
+        drop(one_short);
+
+        let exact_limits = StoreLimits::new(
+            u64::MAX,
+            one_short_limit
+                .checked_add(1)
+                .expect("exact aggregate limit fits u64"),
+        )
+        .expect("exact operation aggregate limits");
+        let exact =
+            Store::open_with_limits_for_mission(&root.database, exact_limits, services.authority)
+                .expect("exact operation aggregate reopen");
+        let physical_before = exact
+            .blob_stats()
+            .expect("physical stats before exact operation");
+        lifecycle::reset_lifecycle_schema_enumerations_for_test();
+        let write = exact.database.begin_write().expect("exact operation write");
+        insert_blob_operation(&write, exact.limits, &request, stored.transfer_id)
+            .expect("exact aggregate operation admission");
+        write.commit().expect("commit exact operation admission");
+        assert_eq!(
+            exact
+                .aggregate_usage()
+                .expect("aggregate usage after exact operation")
+                .payload_bytes,
+            usage_before_operation.payload_bytes + effective_operation_bytes
+        );
+        assert_eq!(
+            lifecycle::take_lifecycle_schema_enumerations_for_test(),
+            0,
+            "Blob capacity admission and aggregate status must not enumerate the schema"
+        );
+        assert_eq!(
+            exact
+                .blob_stats()
+                .expect("physical stats after exact operation")
+                .operation_bytes,
+            physical_before.operation_bytes + physical_operation_bytes,
+            "BlobStats remains physical while aggregate usage includes retirement reserve"
         );
     }
 
@@ -17088,10 +20150,15 @@ mod tests {
                     loop {
                         let mut key = vec![b'b'; 200];
                         key[..4].copy_from_slice(&index.to_be_bytes());
-                        let encoded = encode_blob_operation_record(BlobOperationRecord {
-                            transfer_id: stored.transfer_id,
-                            intent_digest: [u8::try_from(index % 251).expect("intent byte"); 32],
-                        });
+                        let encoded = lifecycle::active_operation_record(
+                            &write,
+                            &encode_blob_operation_record(BlobOperationRecord {
+                                transfer_id: stored.transfer_id,
+                                intent_digest: [u8::try_from(index % 251).expect("intent byte");
+                                    32],
+                            }),
+                        )
+                        .expect("wrap byte-cap operation");
                         let current_bytes = operations
                             .iter()
                             .expect("operation rows")
@@ -17111,18 +20178,35 @@ mod tests {
                         operations
                             .insert(key.as_slice(), encoded.as_slice())
                             .expect("seed byte-cap operation");
+                        lifecycle::insert_operation_owner(
+                            &write,
+                            stored.transfer_id,
+                            key.as_slice(),
+                        )
+                        .expect("index byte-cap operation owner");
                         index = index.checked_add(1).expect("operation index");
                     }
                 } else {
                     for index in 1..MAX_BLOB_OPERATIONS {
                         let key = format!("r{index:04}").into_bytes();
-                        let encoded = encode_blob_operation_record(BlobOperationRecord {
-                            transfer_id: stored.transfer_id,
-                            intent_digest: [u8::try_from(index % 251).expect("intent byte"); 32],
-                        });
+                        let encoded = lifecycle::active_operation_record(
+                            &write,
+                            &encode_blob_operation_record(BlobOperationRecord {
+                                transfer_id: stored.transfer_id,
+                                intent_digest: [u8::try_from(index % 251).expect("intent byte");
+                                    32],
+                            }),
+                        )
+                        .expect("wrap row-cap operation");
                         operations
                             .insert(key.as_slice(), encoded.as_slice())
                             .expect("seed row-cap operation");
+                        lifecycle::insert_operation_owner(
+                            &write,
+                            stored.transfer_id,
+                            key.as_slice(),
+                        )
+                        .expect("index row-cap operation owner");
                     }
                 }
             }
@@ -17876,6 +20960,2546 @@ mod tests {
                 .expect("policy rejection stats")
                 .publications,
             1
+        );
+    }
+
+    #[test]
+    fn blob_policy_invalidation_retires_live_publication_and_reopens() {
+        // Break caught: omitting the policy-invalid retirement branch leaves
+        // revoked source bytes readable and the operation bound to live state.
+        let root = BlobTestRoot::new("policy-invalidation-retirement");
+        let mut services = blob_services(0xe1);
+        let plaintext = b"revoked durable Blob becomes semantically retired".to_vec();
+        let prepared = prepared_blob(&plaintext);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("policy retirement store");
+        let (stored, operation, intent) = publish_blob(
+            &store,
+            &mut services,
+            &prepared,
+            &plaintext,
+            1,
+            b"policy-retirement-operation",
+        );
+        let policy = store.control_policy_snapshot().expect("retirement policy");
+
+        let effect_id = ControlTransferId::new([0xe1; 32]);
+        let write = store.database.begin_write().expect("revocation write");
+        let encoded = encode_revocation_index(services.authority, 1, effect_id);
+        write
+            .open_table(CONTROL_REVOCATIONS)
+            .expect("revocations")
+            .insert(services.publisher.identity().as_slice(), encoded.as_slice())
+            .expect("revoke publisher");
+        write.commit().expect("commit revocation");
+
+        set_maintenance_next_class(
+            &store,
+            lifecycle::BlobMaintenanceClass::ExpiredPublicationsAndPendingSources,
+        );
+        store
+            .run_blob_maintenance_turn_with_sample(
+                maintenance_budget(64),
+                Some(CustodySample {
+                    clock_id: [0xe2; 16],
+                    tick_ms: 100,
+                }),
+            )
+            .expect("retire revoked publication");
+
+        assert!(matches!(
+            store.get_blob(stored.transfer_id),
+            Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+        ));
+        assert!(matches!(
+            store.blob_by_semantic_id(stored.semantic_id),
+            Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+        ));
+        assert!(matches!(
+            store.prepare_blob_read_with_policy(
+                &policy,
+                &blob_topic(),
+                &blob_scope(),
+                stored.blob_id,
+            ),
+            Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+        ));
+        assert!(matches!(
+            store.blob_for_operation_with_policy(
+                &policy,
+                &BlobOperationRequest::new(&operation, &intent),
+            ),
+            Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+        ));
+        let changed = BlobPublicationIntent::new(
+            services.publisher.identity(),
+            blob_topic(),
+            blob_scope(),
+            Priority::Routine,
+            prepared.id(),
+        )
+        .expect("changed retired intent");
+        assert!(matches!(
+            store.blob_for_operation_with_policy(
+                &policy,
+                &BlobOperationRequest::new(&operation, &changed),
+            ),
+            Err(StoreError::Blob(BlobStoreError::OperationConflict))
+        ));
+        assert!(
+            store
+                .blob_inventory()
+                .expect("retired inventory")
+                .is_empty()
+        );
+        // Production mutation caught: decoding retired publication rows in
+        // the exact live-source projection instead of withholding them.
+        assert_eq!(
+            store
+                .blob_source_projection(stored.transfer_id)
+                .expect("retired exact source projection"),
+            None
+        );
+        let write = store
+            .database
+            .begin_write()
+            .expect("remove synthetic revocation before reopen");
+        write
+            .open_table(CONTROL_REVOCATIONS)
+            .expect("revocations")
+            .remove(services.publisher.identity().as_slice())
+            .expect("remove synthetic revocation");
+        write.commit().expect("commit synthetic revocation removal");
+        drop(store);
+
+        let reopened = Store::open_for_mission(&root.database, services.authority)
+            .expect("reopen retired publication");
+        assert!(matches!(
+            reopened.get_blob(stored.transfer_id),
+            Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+        ));
+        assert!(matches!(
+            reopened.blob_by_semantic_id(BlobSemanticId::new([0xff; 32])),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn blob_retirement_maintenance_expires_records_at_the_exact_lower_bound_deadline() {
+        // Production mutation caught: treating a retained operation as an
+        // ordinary active row, or deleting it before its conservative deadline,
+        // leaves the retirement fence unusable or erases it too early.
+        let root = BlobTestRoot::new("retirement-expiry-exact-lower-bound");
+        let mut services = blob_services(0xe2);
+        let plaintext = b"retained Blob expiry keeps the lower-bound fence".to_vec();
+        let prepared = prepared_blob(&plaintext);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("retirement expiry store");
+        let (stored, operation, _) = publish_blob(
+            &store,
+            &mut services,
+            &prepared,
+            &plaintext,
+            1,
+            b"retirement-expiry-operation",
+        );
+
+        let write = store
+            .database
+            .begin_write()
+            .expect("retirement revocation write");
+        let encoded =
+            encode_revocation_index(services.authority, 1, ControlTransferId::new([0xe2; 32]));
+        write
+            .open_table(CONTROL_REVOCATIONS)
+            .expect("retirement revocations")
+            .insert(services.publisher.identity().as_slice(), encoded.as_slice())
+            .expect("revoke retirement publisher");
+        write.commit().expect("commit retirement revocation");
+
+        let clock_id = [0xe3; 16];
+        let retired_at = CustodySample {
+            clock_id,
+            tick_ms: 100,
+        };
+        set_maintenance_next_class(
+            &store,
+            lifecycle::BlobMaintenanceClass::ExpiredPublicationsAndPendingSources,
+        );
+        store
+            .run_blob_maintenance_turn_with_sample(maintenance_budget(64), Some(retired_at))
+            .expect("retire revoked publication");
+
+        let retain_for_ms = 3_888_000_000;
+        set_maintenance_next_class(
+            &store,
+            lifecycle::BlobMaintenanceClass::ExpiredRetirementRecords,
+        );
+        store
+            .run_blob_maintenance_turn_with_sample(
+                maintenance_budget(64),
+                Some(CustodySample {
+                    clock_id,
+                    tick_ms: retired_at.tick_ms + retain_for_ms - 1,
+                }),
+            )
+            .expect("retirement remains before its exact deadline");
+        assert!(matches!(
+            store.get_blob(stored.transfer_id),
+            Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+        ));
+        assert!(matches!(
+            store.blob_for_operation(&operation),
+            Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+        ));
+
+        set_maintenance_next_class(
+            &store,
+            lifecycle::BlobMaintenanceClass::ExpiredRetirementRecords,
+        );
+        store
+            .run_blob_maintenance_turn_with_sample(
+                maintenance_budget(64),
+                Some(CustodySample {
+                    clock_id,
+                    tick_ms: retired_at.tick_ms + retain_for_ms,
+                }),
+            )
+            .expect("expire retirement records at their exact deadline");
+        assert_eq!(
+            store
+                .get_blob(stored.transfer_id)
+                .expect("expired source lookup"),
+            None
+        );
+        assert_eq!(
+            store
+                .blob_by_semantic_id(stored.semantic_id)
+                .expect("expired semantic lookup"),
+            None
+        );
+        assert!(matches!(
+            store.blob_for_operation(&operation),
+            Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+        ));
+        set_maintenance_next_class(
+            &store,
+            lifecycle::BlobMaintenanceClass::ExpiredRetirementRecords,
+        );
+        store
+            .run_blob_maintenance_turn_with_sample(
+                maintenance_budget(64),
+                Some(CustodySample {
+                    clock_id,
+                    tick_ms: retired_at.tick_ms + retain_for_ms,
+                }),
+            )
+            .expect("expire the independent operation record");
+        assert_eq!(
+            store
+                .blob_for_operation(&operation)
+                .expect("expired operation lookup"),
+            None
+        );
+    }
+
+    #[test]
+    fn blob_retirement_expiry_preflights_one_operation_unit_before_mutating() {
+        // Production mutation caught: a short maintenance budget used to
+        // remove an operation and only then report that the unit did not fit.
+        // The in-transaction assertion proves that no caller can observe a
+        // partial expiry unit even before the outer transaction is dropped.
+        let root = BlobTestRoot::new("retirement-expiry-budget-preflight");
+        let mut services = blob_services(0xe3);
+        let fixture = seed_retired_store_fixture(&root, &mut services);
+        let database = Database::open(&root.database).expect("budget preflight database");
+        let write = database.begin_write().expect("budget preflight write");
+        lifecycle::remove_retention_deadline(
+            &write,
+            fixture.publication_deadline,
+            lifecycle::RetentionDeadlineOwner::Publication(fixture.transfer),
+        )
+        .expect("hide publication deadline while isolating operation unit");
+        let padding_record = lifecycle::active_operation_record(
+            &write,
+            &encode_blob_operation_record(BlobOperationRecord {
+                transfer_id: fixture.transfer,
+                intent_digest: [0x55; 32],
+            }),
+        )
+        .expect("active operation padding record");
+        let padding_rows = MAX_BLOB_OPERATIONS - 1;
+        let mut padding_bytes = 0u64;
+        {
+            let mut operations = write
+                .open_table(BLOB_OPERATIONS)
+                .expect("operation padding table");
+            for index in 0..padding_rows {
+                let key = format!("operation-expiry-padding-{index:04}").into_bytes();
+                padding_bytes = padding_bytes
+                    .checked_add(
+                        maintenance_entry_bytes(&key, &padding_record).expect("padding bytes"),
+                    )
+                    .expect("padding byte total");
+                operations
+                    .insert(key.as_slice(), padding_record.as_slice())
+                    .expect("operation padding row");
+            }
+        }
+        {
+            let mut metadata = write
+                .open_table(METADATA)
+                .expect("operation padding metadata");
+            let count = metadata
+                .get(BLOB_OPERATION_COUNT)
+                .expect("operation count")
+                .expect("operation count metadata")
+                .value();
+            let bytes = metadata
+                .get(BLOB_OPERATION_TOTAL_BYTES)
+                .expect("operation bytes")
+                .expect("operation byte metadata")
+                .value();
+            metadata
+                .insert(BLOB_OPERATION_COUNT, count + padding_rows)
+                .expect("padded operation count");
+            metadata
+                .insert(BLOB_OPERATION_TOTAL_BYTES, bytes + padding_bytes)
+                .expect("padded operation bytes");
+        }
+        let cursor = lifecycle::BlobMaintenanceCursor {
+            class: lifecycle::BlobMaintenanceClass::ExpiredRetirementRecords,
+            position: None,
+        };
+        let before = write
+            .open_table(BLOB_OPERATIONS)
+            .expect("operations before short budget")
+            .get(fixture.operation.as_bytes())
+            .expect("operation before short budget")
+            .map(|value| value.value().to_vec());
+        let exact_bytes = u64::try_from(
+            fixture.operation.as_bytes().len()
+                + before.as_ref().expect("retired operation bytes").len()
+                + 57
+                + 33
+                + fixture.operation.as_bytes().len(),
+        )
+        .expect("operation expiry charge fits u64");
+        reset_blob_operation_expiry_rows_visited_for_test();
+        assert!(matches!(
+            expire_one_retirement_record_write(
+                &write,
+                &cursor,
+                lifecycle::BlobMaintenanceBudget::new(3, 1, exact_bytes - 1)
+                    .expect("short byte budget"),
+                fixture.operation_deadline,
+            ),
+            Err(StoreError::Blob(BlobStoreError::InvalidMaintenanceBudget))
+        ));
+        assert_eq!(
+            blob_operation_expiry_rows_visited_for_test(),
+            1,
+            "the audited digest resolver must point-read the worst-placed operation"
+        );
+        assert_eq!(
+            write
+                .open_table(BLOB_OPERATIONS)
+                .expect("operations after short byte budget")
+                .get(fixture.operation.as_bytes())
+                .expect("operation after short byte budget")
+                .map(|value| value.value().to_vec()),
+            before,
+            "short byte budget must not partially remove the expiry unit"
+        );
+        assert!(matches!(
+            expire_one_retirement_record_write(
+                &write,
+                &cursor,
+                lifecycle::BlobMaintenanceBudget::new(2, 1, u64::MAX).expect("short row budget"),
+                fixture.operation_deadline,
+            ),
+            Err(StoreError::Blob(BlobStoreError::InvalidMaintenanceBudget))
+        ));
+        assert_eq!(
+            write
+                .open_table(BLOB_OPERATIONS)
+                .expect("operations after short budget")
+                .get(fixture.operation.as_bytes())
+                .expect("operation after short budget")
+                .map(|value| value.value().to_vec()),
+            before,
+            "short budget must not partially remove the expiry unit"
+        );
+
+        assert!(
+            expire_one_retirement_record_write(
+                &write,
+                &cursor,
+                lifecycle::BlobMaintenanceBudget::new(3, 1, exact_bytes)
+                    .expect("exact row-and-byte budget"),
+                fixture.operation_deadline,
+            )
+            .expect("exact budget expiry")
+            .is_some(),
+            "an exact row budget commits the complete operation unit"
+        );
+        assert!(
+            write
+                .open_table(BLOB_OPERATIONS)
+                .expect("operations after exact budget")
+                .get(fixture.operation.as_bytes())
+                .expect("operation after exact budget")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn blob_gc_status_reports_sanitized_retained_expiry_counts_and_oldest_age() {
+        // Production mutation caught: retained lifecycle rows were invisible
+        // to the existing local-only status snapshot, leaving no safe signal
+        // for overdue expiry work after a reopen.
+        let root = BlobTestRoot::new("retirement-expiry-sanitized-status");
+        let mut services = blob_services(0xe4);
+        let fixture = seed_retired_store_fixture(&root, &mut services);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("reopen retained status fixture");
+        let status = store
+            .blob_gc_status(Some(fixture.publication_deadline))
+            .expect("retained lifecycle status");
+        assert_eq!(status.retained_publication_records, 1);
+        assert_eq!(status.retained_operation_records, 1);
+        assert_eq!(status.oldest_retirement_age_ms, Some(3_888_000_000));
+        assert!(!status.oldest_retirement_age_is_lower_bound);
+    }
+
+    #[test]
+    fn blob_capacity_gc_expires_one_due_retirement_without_advancing_routine_cursors() {
+        // Capacity recovery may make exactly one due expiry unit available to
+        // the immediate retry, but its fast path must not borrow fairness
+        // state from the normal maintenance scheduler.
+        let root = BlobTestRoot::new("retirement-capacity-cursor-neutral");
+        let mut services = blob_services(0xe5);
+        let fixture = seed_retired_store_fixture(&root, &mut services);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("reopen capacity expiry fixture");
+        let cursors = blob_maintenance_cursor_rows(&store);
+        let first = store
+            .run_blob_capacity_gc(maintenance_budget(64), Some(fixture.publication_deadline))
+            .expect("first cursor-neutral expiry pass");
+        assert!(first.rows_examined > 0);
+        assert_eq!(
+            first.files_examined, 1,
+            "retirement expiry must not intercept the remaining bounded physical-capacity pass"
+        );
+        assert_eq!(blob_maintenance_cursor_rows(&store), cursors);
+        let after_first = store
+            .blob_gc_status(Some(fixture.publication_deadline))
+            .expect("status after first capacity pass");
+        assert_eq!(
+            after_first.retained_publication_records + after_first.retained_operation_records,
+            1,
+            "one capacity retry pass expires exactly one independent record"
+        );
+        drop(store);
+
+        let reopened = Store::open_for_mission(&root.database, services.authority)
+            .expect("reopen capacity expiry fixture");
+        assert_eq!(blob_maintenance_cursor_rows(&reopened), cursors);
+        reopened
+            .run_blob_capacity_gc(maintenance_budget(64), Some(fixture.operation_deadline))
+            .expect("second independent expiry pass");
+        let after_second = reopened
+            .blob_gc_status(Some(fixture.operation_deadline))
+            .expect("status after second capacity pass");
+        assert_eq!(after_second.retained_publication_records, 0);
+        assert_eq!(after_second.retained_operation_records, 0);
+        assert_eq!(blob_maintenance_cursor_rows(&reopened), cursors);
+    }
+
+    #[test]
+    fn blob_capacity_gc_targets_the_due_record_that_releases_the_failed_resource() {
+        // Break caught: publication sorts before operation at an equal
+        // deadline. Operation pressure must not spend its sole lifecycle pass
+        // on that unrelated publication and waste the caller's single retry.
+        let root = BlobTestRoot::new("retirement-capacity-resource-target");
+        let mut services = blob_services(0xea);
+        let fixture = seed_retired_store_fixture(&root, &mut services);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("reopen targeted capacity fixture");
+
+        store
+            .run_blob_capacity_gc_for(
+                BlobCapacityGcTarget::Operation,
+                maintenance_budget(64),
+                Some(fixture.operation_deadline),
+            )
+            .expect("targeted operation-capacity expiry");
+
+        let status = store
+            .blob_gc_status(Some(fixture.operation_deadline))
+            .expect("targeted capacity status");
+        assert_eq!(status.retained_publication_records, 1);
+        assert_eq!(status.retained_operation_records, 0);
+        assert!(
+            store
+                .database
+                .begin_read()
+                .expect("targeted capacity read")
+                .open_table(BLOB_PUBLICATIONS)
+                .expect("targeted capacity publications")
+                .get(fixture.transfer.as_bytes().as_slice())
+                .expect("retained publication row")
+                .is_some(),
+            "operation pressure must retain unrelated publication evidence"
+        );
+
+        store
+            .run_blob_capacity_gc_for(
+                BlobCapacityGcTarget::Depot,
+                maintenance_budget(64),
+                Some(fixture.publication_deadline),
+            )
+            .expect("depot-targeted physical recovery");
+        let after_depot = store
+            .blob_gc_status(Some(fixture.publication_deadline))
+            .expect("post-depot-target status");
+        assert_eq!(
+            after_depot.retained_publication_records, 1,
+            "depot pressure must not spend its sole retry on unrelated lifecycle expiry"
+        );
+    }
+
+    #[test]
+    fn blob_retirement_expiry_reanchors_a_changed_clock_and_accumulates_after_reopen() {
+        // A restart in a different monotonic-clock domain adds no age, but it
+        // must durably install the new zero-delta anchor so later measurable
+        // time in that domain can satisfy the original retained-record TTL.
+        let root = BlobTestRoot::new("retirement-expiry-clock-reanchor");
+        let mut services = blob_services(0xe6);
+        let fixture = seed_retired_store_fixture(&root, &mut services);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("reopen changed-clock retirement fixture");
+        let changed = CustodySample {
+            clock_id: [0xe7; 16],
+            tick_ms: 500,
+        };
+        set_maintenance_next_class(
+            &store,
+            lifecycle::BlobMaintenanceClass::ExpiredRetirementRecords,
+        );
+        let reanchored = store
+            .run_blob_maintenance_turn_with_sample(maintenance_budget(64), Some(changed))
+            .expect("durably reanchor one retirement record");
+        assert_eq!(
+            reanchored.class,
+            lifecycle::BlobMaintenanceClass::ExpiredRetirementRecords
+        );
+        assert!(reanchored.rows_examined > 0);
+        assert_eq!(
+            store
+                .blob_gc_status(Some(changed))
+                .expect("changed-clock retained status")
+                .retained_publication_records,
+            1,
+            "clock changes never age or expire the record immediately"
+        );
+        drop(store);
+
+        let reopened = Store::open_for_mission(&root.database, services.authority)
+            .expect("reopen durably reanchored retirement fixture");
+        set_maintenance_next_class(
+            &reopened,
+            lifecycle::BlobMaintenanceClass::ExpiredRetirementRecords,
+        );
+        reopened
+            .run_blob_maintenance_turn_with_sample(
+                maintenance_budget(64),
+                Some(CustodySample {
+                    clock_id: changed.clock_id,
+                    tick_ms: changed.tick_ms + 3_888_000_000,
+                }),
+            )
+            .expect("expire reanchored publication after a full new-domain interval");
+        assert_eq!(
+            reopened
+                .blob_gc_status(Some(CustodySample {
+                    clock_id: changed.clock_id,
+                    tick_ms: changed.tick_ms + 3_888_000_000,
+                }))
+                .expect("post-reanchor expiry status")
+                .retained_publication_records,
+            0
+        );
+        assert!(matches!(reopened.get_blob(fixture.transfer), Ok(None)));
+    }
+
+    #[test]
+    fn blob_retirement_without_initial_clock_reanchors_after_reopen_and_expires_conservatively() {
+        // A missing retirement sample must remain discoverable.  The first
+        // later valid clock only installs a zero-age anchor; a complete
+        // retained interval in that clock is still required before expiry.
+        let root = BlobTestRoot::new("retirement-expiry-unknown-clock");
+        let mut services = blob_services(0xe8);
+        let plaintext = b"unknown retirement clock remains discoverable".to_vec();
+        let prepared = prepared_blob(&plaintext);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("unknown-clock retirement store");
+        let (stored, operation, _) = publish_blob(
+            &store,
+            &mut services,
+            &prepared,
+            &plaintext,
+            1,
+            b"unknown-clock-retirement-operation",
+        );
+        let write = store
+            .database
+            .begin_write()
+            .expect("unknown-clock revocation write");
+        let encoded =
+            encode_revocation_index(services.authority, 1, ControlTransferId::new([0xe8; 32]));
+        write
+            .open_table(CONTROL_REVOCATIONS)
+            .expect("unknown-clock revocations")
+            .insert(services.publisher.identity().as_slice(), encoded.as_slice())
+            .expect("revoke unknown-clock publisher");
+        write.commit().expect("commit unknown-clock revocation");
+        set_maintenance_next_class(
+            &store,
+            lifecycle::BlobMaintenanceClass::ExpiredPublicationsAndPendingSources,
+        );
+        store
+            .run_blob_maintenance_turn_with_sample(maintenance_budget(64), None)
+            .expect("retire publication without a clock sample");
+        let write = store
+            .database
+            .begin_write()
+            .expect("remove unknown-clock revocation before reopen");
+        write
+            .open_table(CONTROL_REVOCATIONS)
+            .expect("unknown-clock revocations")
+            .remove(services.publisher.identity().as_slice())
+            .expect("remove unknown-clock revocation");
+        write
+            .commit()
+            .expect("commit unknown-clock revocation removal");
+        drop(store);
+
+        // Recreate the exact schema-v2 predecessor to prove read-only audit is
+        // non-mutating and writable migration builds resolver authority for
+        // already-retired records, including records with no initial clock.
+        downgrade_blob_lifecycle_to_v2_for_test(&root.database);
+        let before_inspection = blob_database_digest(&root.database);
+        Store::inspect_existing(&root.database).expect("inspect lifecycle-v2 predecessor");
+        assert_eq!(
+            blob_database_digest(&root.database),
+            before_inspection,
+            "read-only lifecycle-v2 inspection must not migrate"
+        );
+
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("reopen unknown-clock retirement store");
+        let anchor = CustodySample {
+            clock_id: [0xe9; 16],
+            tick_ms: 700,
+        };
+        for _ in 0..2 {
+            set_maintenance_next_class(
+                &store,
+                lifecycle::BlobMaintenanceClass::ExpiredRetirementRecords,
+            );
+            store
+                .run_blob_maintenance_turn_with_sample(maintenance_budget(64), Some(anchor))
+                .expect("anchor one unknown-clock retirement record");
+        }
+        assert_eq!(
+            store
+                .blob_gc_status(Some(anchor))
+                .expect("anchored unknown-clock status")
+                .retained_publication_records,
+            1,
+            "the first valid sample cannot immediately expire an unknown-age record"
+        );
+        drop(store);
+
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("reopen anchored unknown-clock retirement store");
+        let elapsed = CustodySample {
+            clock_id: anchor.clock_id,
+            tick_ms: anchor.tick_ms + 3_888_000_000,
+        };
+        for _ in 0..2 {
+            set_maintenance_next_class(
+                &store,
+                lifecycle::BlobMaintenanceClass::ExpiredRetirementRecords,
+            );
+            store
+                .run_blob_maintenance_turn_with_sample(maintenance_budget(64), Some(elapsed))
+                .expect("expire one anchored retirement record");
+        }
+        let status = store
+            .blob_gc_status(Some(elapsed))
+            .expect("expired unknown-clock status");
+        assert_eq!(status.retained_publication_records, 0);
+        assert_eq!(status.retained_operation_records, 0);
+        assert_eq!(
+            store.get_blob(stored.transfer_id).expect("expired lookup"),
+            None
+        );
+        assert_eq!(
+            store
+                .blob_for_operation(&operation)
+                .expect("expired operation lookup"),
+            None
+        );
+    }
+
+    #[test]
+    fn blob_operation_key_reuse_after_retirement_expiry_allocates_a_new_publication() {
+        // Production mutation caught: operation expiry must release only the
+        // bounded operation mapping; it must not retire permanent replay
+        // authority or reuse its publisher-dot/publication identity.
+        let root = BlobTestRoot::new("retired-operation-reuse-new-identity");
+        let mut services = blob_services(0xe3);
+        let plaintext = b"operation reuse retains the old replay fence".to_vec();
+        let prepared = prepared_blob(&plaintext);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("operation reuse store");
+        let original = prepare_blob_proof(&store, &mut services, &prepared, &plaintext, 1);
+        let (first_outcome, operation, intent) =
+            commit_blob_proof(&store, &services, &original, b"reusable-retired-operation");
+        let first = first_outcome.blob().clone();
+
+        let write = store
+            .database
+            .begin_write()
+            .expect("operation reuse revocation write");
+        let encoded =
+            encode_revocation_index(services.authority, 1, ControlTransferId::new([0xe3; 32]));
+        write
+            .open_table(CONTROL_REVOCATIONS)
+            .expect("operation reuse revocations")
+            .insert(services.publisher.identity().as_slice(), encoded.as_slice())
+            .expect("revoke reusable publisher");
+        write.commit().expect("commit operation reuse revocation");
+
+        let clock_id = [0xe4; 16];
+        let retired_at = CustodySample {
+            clock_id,
+            tick_ms: 100,
+        };
+        let retention_deadline = retired_at.tick_ms + 3_888_000_000;
+        set_maintenance_next_class(
+            &store,
+            lifecycle::BlobMaintenanceClass::ExpiredPublicationsAndPendingSources,
+        );
+        store
+            .run_blob_maintenance_turn_with_sample(maintenance_budget(64), Some(retired_at))
+            .expect("retire reusable publication");
+        set_maintenance_next_class(
+            &store,
+            lifecycle::BlobMaintenanceClass::ExpiredRetirementRecords,
+        );
+        store
+            .run_blob_maintenance_turn_with_sample(
+                maintenance_budget(64),
+                Some(CustodySample {
+                    clock_id,
+                    tick_ms: retention_deadline,
+                }),
+            )
+            .expect("expire reusable publication");
+        set_maintenance_next_class(
+            &store,
+            lifecycle::BlobMaintenanceClass::ExpiredRetirementRecords,
+        );
+        store
+            .run_blob_maintenance_turn_with_sample(
+                maintenance_budget(64),
+                Some(CustodySample {
+                    clock_id,
+                    tick_ms: retention_deadline,
+                }),
+            )
+            .expect("expire reusable operation");
+        let write = store
+            .database
+            .begin_write()
+            .expect("restore reusable publisher write");
+        write
+            .open_table(CONTROL_REVOCATIONS)
+            .expect("operation reuse revocations")
+            .remove(services.publisher.identity().as_slice())
+            .expect("restore reusable publisher");
+        write.commit().expect("commit publisher restoration");
+
+        assert_eq!(
+            store
+                .blob_for_operation_with_policy(
+                    &store.control_policy_snapshot().expect("restored policy"),
+                    &BlobOperationRequest::new(&operation, &intent),
+                )
+                .expect("expired operation is reusable"),
+            None
+        );
+
+        let replacement = prepare_blob_proof(&store, &mut services, &prepared, &plaintext, 1);
+        let replacement_request = BlobOperationRequest::new(&operation, &intent);
+        let replacement_outcome = store
+            .commit_reserved_blob_once_with_policy(
+                &replacement.policy,
+                &replacement_request,
+                &replacement.reservation,
+                &replacement.blob,
+                &replacement.sealed,
+                &replacement.completion,
+            )
+            .expect("reuse operation after retirement expiry");
+        let replacement_blob = replacement_outcome.blob();
+        assert!(replacement_outcome.inserted());
+        assert!(replacement_blob.header.stamp.dot.counter > first.header.stamp.dot.counter);
+        assert_ne!(replacement_blob.semantic_id, first.semantic_id);
+        assert_ne!(replacement_blob.transfer_id, first.transfer_id);
+
+        let old_plan = original
+            .blob
+            .transfer_plan(&original.manifest_bytes)
+            .expect("old transfer plan");
+        assert_eq!(
+            store
+                .stage_verified_blob_source_with_policy(
+                    &replacement.policy,
+                    &original.blob,
+                    &original.sealed,
+                    &old_plan,
+                )
+                .expect("old exact source remains a duplicate"),
+            BlobSourceStageOutcome::Duplicate
+        );
+    }
+
+    #[test]
+    fn blob_policy_invalidation_retires_pending_delivery_but_preserves_completed_ack() {
+        // Break caught: removing or leaving an outstanding content delivery
+        // during retirement either loses the typed result or exposes bytes.
+        let root = BlobTestRoot::new("policy-retirement-delivery");
+        let mut services = blob_services(0xe3);
+        let plaintext = b"delivery retirement is metadata only".to_vec();
+        let prepared = prepared_blob(&plaintext);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("delivery retirement store");
+        let stored = publish_blob(
+            &store,
+            &mut services,
+            &prepared,
+            &plaintext,
+            1,
+            b"delivery-retirement-operation",
+        )
+        .0;
+        let policy = store.control_policy_snapshot().expect("delivery policy");
+        let spec = BlobSubscriptionSpec {
+            topic: blob_topic(),
+            scope: blob_scope(),
+            include_descendant_scopes: false,
+        };
+        let pending_subscription = store
+            .create_blob_subscription_with_policy(
+                &policy,
+                &BlobSubscriptionKey::new(b"pending-retirement".to_vec()).expect("pending key"),
+                spec.clone(),
+            )
+            .expect("pending subscription");
+        let pending_plan = store
+            .prepare_blob_subscription_poll_with_policy(&policy, pending_subscription.id, 1, 8)
+            .expect("pending plan");
+        let pending_page = store
+            .commit_blob_subscription_poll_with_policy(
+                &policy,
+                &pending_plan,
+                &all_blob_subscription_candidates_deliverable(&pending_plan),
+            )
+            .expect("pending page");
+        let pending = pending_page.deliveries[0].clone();
+
+        let acknowledged_subscription = store
+            .create_blob_subscription_with_policy(
+                &policy,
+                &BlobSubscriptionKey::new(b"acknowledged-retirement".to_vec())
+                    .expect("acknowledged key"),
+                spec,
+            )
+            .expect("acknowledged subscription");
+        let acknowledged_plan = store
+            .prepare_blob_subscription_poll_with_policy(&policy, acknowledged_subscription.id, 1, 8)
+            .expect("acknowledged plan");
+        let acknowledged_page = store
+            .commit_blob_subscription_poll_with_policy(
+                &policy,
+                &acknowledged_plan,
+                &all_blob_subscription_candidates_deliverable(&acknowledged_plan),
+            )
+            .expect("acknowledged page");
+        let acknowledged = acknowledged_page.deliveries[0].clone();
+        assert_eq!(
+            store
+                .acknowledge_blob_delivery_with_policy(
+                    &policy,
+                    acknowledged_subscription.id,
+                    stored.semantic_id,
+                    acknowledged.token,
+                )
+                .expect("complete acknowledgement"),
+            BlobDeliveryAck::Acknowledged
+        );
+
+        let write = store
+            .database
+            .begin_write()
+            .expect("delivery revocation write");
+        let encoded =
+            encode_revocation_index(services.authority, 1, ControlTransferId::new([0xe3; 32]));
+        write
+            .open_table(CONTROL_REVOCATIONS)
+            .expect("delivery revocations")
+            .insert(services.publisher.identity().as_slice(), encoded.as_slice())
+            .expect("revoke delivery publisher");
+        write.commit().expect("commit delivery revocation");
+        set_maintenance_next_class(
+            &store,
+            lifecycle::BlobMaintenanceClass::ExpiredPublicationsAndPendingSources,
+        );
+        store
+            .run_blob_maintenance_turn_with_sample(
+                maintenance_budget(64),
+                Some(CustodySample {
+                    clock_id: [0xe4; 16],
+                    tick_ms: 100,
+                }),
+            )
+            .expect("retire delivered publication");
+
+        let poll = store
+            .prepare_blob_subscription_poll_with_policy(&policy, pending_subscription.id, 1, 8)
+            .expect("post-retirement poll");
+        assert!(poll.candidates().is_empty());
+        assert!(matches!(
+            store.acknowledge_blob_delivery_with_policy(
+                &policy,
+                pending_subscription.id,
+                stored.semantic_id,
+                pending.token,
+            ),
+            Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+        ));
+        assert_eq!(
+            store
+                .acknowledge_blob_delivery_with_policy(
+                    &policy,
+                    acknowledged_subscription.id,
+                    stored.semantic_id,
+                    acknowledged.token,
+                )
+                .expect("completed acknowledgement survives"),
+            BlobDeliveryAck::AlreadyAcknowledged
+        );
+        let write = store
+            .database
+            .begin_write()
+            .expect("remove synthetic delivery revocation before reopen");
+        write
+            .open_table(CONTROL_REVOCATIONS)
+            .expect("delivery revocations")
+            .remove(services.publisher.identity().as_slice())
+            .expect("remove synthetic delivery revocation");
+        write
+            .commit()
+            .expect("commit synthetic delivery revocation removal");
+        drop(store);
+
+        let reopened = Store::open_for_mission(&root.database, services.authority)
+            .expect("reopen retired delivery state");
+        assert!(matches!(
+            reopened.acknowledge_blob_delivery_with_policy(
+                &policy,
+                pending_subscription.id,
+                stored.semantic_id,
+                pending.token,
+            ),
+            Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+        ));
+        assert_eq!(
+            reopened
+                .acknowledge_blob_delivery_with_policy(
+                    &policy,
+                    acknowledged_subscription.id,
+                    stored.semantic_id,
+                    acknowledged.token,
+                )
+                .expect("completed acknowledgement survives reopen"),
+            BlobDeliveryAck::AlreadyAcknowledged
+        );
+    }
+
+    #[test]
+    fn blob_publication_retirement_expiry_removes_delivery_and_acknowledgement_state() {
+        // Production mutation caught: deleting only a retired publication
+        // leaves delivery-ledger rows pointing at an identity that is now
+        // correctly NotFound.
+        let root = BlobTestRoot::new("retirement-expiry-delivery-ledger");
+        let mut services = blob_services(0xe4);
+        let plaintext = b"retirement expiry clears delivery ledger state".to_vec();
+        let prepared = prepared_blob(&plaintext);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("retirement delivery expiry store");
+        let stored = publish_blob(
+            &store,
+            &mut services,
+            &prepared,
+            &plaintext,
+            1,
+            b"retirement-expiry-delivery-operation",
+        )
+        .0;
+        let policy = store
+            .control_policy_snapshot()
+            .expect("retirement delivery policy");
+        let spec = BlobSubscriptionSpec {
+            topic: blob_topic(),
+            scope: blob_scope(),
+            include_descendant_scopes: false,
+        };
+        let pending_subscription = store
+            .create_blob_subscription_with_policy(
+                &policy,
+                &BlobSubscriptionKey::new(b"expiry-pending-delivery".to_vec())
+                    .expect("pending subscription key"),
+                spec.clone(),
+            )
+            .expect("pending subscription");
+        let pending_plan = store
+            .prepare_blob_subscription_poll_with_policy(&policy, pending_subscription.id, 1, 8)
+            .expect("pending poll plan");
+        let pending = store
+            .commit_blob_subscription_poll_with_policy(
+                &policy,
+                &pending_plan,
+                &all_blob_subscription_candidates_deliverable(&pending_plan),
+            )
+            .expect("pending delivery")
+            .deliveries
+            .remove(0);
+
+        let acknowledged_subscription = store
+            .create_blob_subscription_with_policy(
+                &policy,
+                &BlobSubscriptionKey::new(b"expiry-acknowledged-delivery".to_vec())
+                    .expect("acknowledged subscription key"),
+                spec,
+            )
+            .expect("acknowledged subscription");
+        let acknowledged_plan = store
+            .prepare_blob_subscription_poll_with_policy(&policy, acknowledged_subscription.id, 1, 8)
+            .expect("acknowledged poll plan");
+        let acknowledged = store
+            .commit_blob_subscription_poll_with_policy(
+                &policy,
+                &acknowledged_plan,
+                &all_blob_subscription_candidates_deliverable(&acknowledged_plan),
+            )
+            .expect("acknowledged delivery")
+            .deliveries
+            .remove(0);
+        assert_eq!(
+            store
+                .acknowledge_blob_delivery_with_policy(
+                    &policy,
+                    acknowledged_subscription.id,
+                    stored.semantic_id,
+                    acknowledged.token,
+                )
+                .expect("acknowledge delivery"),
+            BlobDeliveryAck::Acknowledged
+        );
+
+        let write = store
+            .database
+            .begin_write()
+            .expect("delivery expiry revocation write");
+        let encoded =
+            encode_revocation_index(services.authority, 1, ControlTransferId::new([0xe4; 32]));
+        write
+            .open_table(CONTROL_REVOCATIONS)
+            .expect("delivery expiry revocations")
+            .insert(services.publisher.identity().as_slice(), encoded.as_slice())
+            .expect("revoke delivery expiry publisher");
+        write.commit().expect("commit delivery expiry revocation");
+
+        let clock_id = [0xe5; 16];
+        let retired_at = CustodySample {
+            clock_id,
+            tick_ms: 100,
+        };
+        set_maintenance_next_class(
+            &store,
+            lifecycle::BlobMaintenanceClass::ExpiredPublicationsAndPendingSources,
+        );
+        store
+            .run_blob_maintenance_turn_with_sample(maintenance_budget(64), Some(retired_at))
+            .expect("retire delivery publication");
+        // This fixture has one pending delivery plus its inverse owner row,
+        // one acknowledgement, and one cursor per subscription. Together
+        // with the compact publication/index/deadline rows, a short budget
+        // must reject the entire expiry unit before the first removal.
+        let write = store
+            .database
+            .begin_write()
+            .expect("delivery-ledger budget write");
+        let cursor = lifecycle::BlobMaintenanceCursor {
+            class: lifecycle::BlobMaintenanceClass::ExpiredRetirementRecords,
+            position: None,
+        };
+        assert!(matches!(
+            expire_one_retirement_record_write(
+                &write,
+                &cursor,
+                BlobMaintenanceBudget::new(8, 1, u64::MAX)
+                    .expect("short delivery-ledger expiry budget"),
+                CustodySample {
+                    clock_id,
+                    tick_ms: retired_at.tick_ms + 3_888_000_000,
+                },
+            ),
+            Err(StoreError::Blob(BlobStoreError::InvalidMaintenanceBudget))
+        ));
+        assert!(
+            write
+                .open_table(BLOB_PUBLICATIONS)
+                .expect("publication after short delivery-ledger budget")
+                .get(stored.transfer_id.as_bytes().as_slice())
+                .expect("publication lookup after short delivery-ledger budget")
+                .is_some()
+        );
+        assert_eq!(
+            write
+                .open_table(crate::blob_subscription::BLOB_SUBSCRIPTION_PENDING)
+                .expect("pending deliveries after short budget")
+                .len()
+                .expect("pending delivery count after short budget"),
+            1
+        );
+        drop(write);
+        set_maintenance_next_class(
+            &store,
+            lifecycle::BlobMaintenanceClass::ExpiredRetirementRecords,
+        );
+        let expiry = store
+            .run_blob_maintenance_turn_with_sample(
+                maintenance_budget(64),
+                Some(CustodySample {
+                    clock_id,
+                    tick_ms: retired_at.tick_ms + 3_888_000_000,
+                }),
+            )
+            .expect("expire retired publication");
+        assert_eq!(
+            expiry.rows_examined, 13,
+            "publication expiry charges bounded subscription examination, its causal-fence insertion, and every removed row"
+        );
+
+        assert_eq!(
+            store.get_blob(stored.transfer_id).expect("expired lookup"),
+            None
+        );
+        // Expiry removes the bounded publication and delivery state, never its
+        // permanent replay/causal authority.  These direct durable checks make
+        // the following reopen failure distinguish an audit reconstruction
+        // defect from a missing-evidence mutation.
+        let read = store.database.begin_read().expect("expiry evidence read");
+        let dot = stored.header.stamp.dot;
+        let dot_key = accepted_dot_key(dot);
+        assert_eq!(
+            read.open_table(ACCEPTED_DOTS)
+                .expect("accepted dots")
+                .get(dot_key.as_slice())
+                .expect("accepted dot lookup")
+                .map(|value| value.value().to_vec()),
+            Some(stored.semantic_id.as_bytes().to_vec())
+        );
+        assert!(
+            read.open_table(lifecycle::BLOB_REPLAY_FENCES)
+                .expect("replay fences")
+                .get(dot_key.as_slice())
+                .expect("replay fence lookup")
+                .is_some()
+        );
+        assert!(
+            read.open_table(PUBLISHER_HIGH_WATER)
+                .expect("publisher high water")
+                .get(dot.publisher.as_slice())
+                .expect("publisher high-water lookup")
+                .map_or(0, |value| value.value())
+                >= dot.counter
+        );
+        let frontier_key =
+            causal_frontier_key(&stored.header.topic, &stored.header.scope, dot.publisher)
+                .expect("frontier key");
+        assert!(
+            read.open_table(CAUSAL_FRONTIER)
+                .expect("causal frontier")
+                .get(frontier_key.as_slice())
+                .expect("causal frontier lookup")
+                .map_or(0, |value| value.value())
+                >= dot.counter
+        );
+        drop(read);
+        assert_eq!(
+            store
+                .blob_subscription_stats()
+                .expect("delivery ledger after retirement expiry"),
+            BlobSubscriptionStats {
+                subscriptions: 2,
+                pending_deliveries: 0,
+                acknowledged_deliveries: 0,
+                delivery_cursors: 0,
+                selector_generation: 2,
+            }
+        );
+        for (subscription, token) in [
+            (pending_subscription.id, pending.token),
+            (acknowledged_subscription.id, acknowledged.token),
+        ] {
+            assert!(matches!(
+                store.acknowledge_blob_delivery_with_policy(
+                    &policy,
+                    subscription,
+                    stored.semantic_id,
+                    token,
+                ),
+                Err(StoreError::BlobDeliveryNotFound)
+            ));
+        }
+        let write = store
+            .database
+            .begin_write()
+            .expect("remove synthetic expiry revocation");
+        write
+            .open_table(CONTROL_REVOCATIONS)
+            .expect("delivery expiry revocations")
+            .remove(services.publisher.identity().as_slice())
+            .expect("remove delivery expiry revocation");
+        write
+            .commit()
+            .expect("commit synthetic expiry revocation removal");
+        drop(store);
+        let reopened = Store::open_for_mission(&root.database, services.authority)
+            .expect("reopen after retirement expiry");
+        assert_eq!(
+            reopened
+                .get_blob(stored.transfer_id)
+                .expect("reopened expired lookup"),
+            None
+        );
+        assert_eq!(
+            reopened
+                .blob_subscription_stats()
+                .expect("reopened delivery ledger"),
+            BlobSubscriptionStats {
+                subscriptions: 2,
+                pending_deliveries: 0,
+                acknowledged_deliveries: 0,
+                delivery_cursors: 0,
+                selector_generation: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn blob_scope_epoch_invalidation_retires_live_publication() {
+        // Break caught: checking only publisher revocation leaves a publication
+        // from an obsolete scope epoch live and application-readable.
+        let root = BlobTestRoot::new("scope-epoch-retirement");
+        let mut services = blob_services(0xe5);
+        let plaintext = b"stale scope epoch retirement".to_vec();
+        let prepared = prepared_blob(&plaintext);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("scope epoch retirement store");
+        let stored = publish_blob(
+            &store,
+            &mut services,
+            &prepared,
+            &plaintext,
+            1,
+            b"scope-epoch-retirement-operation",
+        )
+        .0;
+
+        let write = store.database.begin_write().expect("scope epoch write");
+        let encoded = encode_scope_epoch_index(2, ControlTransferId::new([0xe5; 32]));
+        write
+            .open_table(CONTROL_SCOPE_EPOCHS)
+            .expect("scope epochs")
+            .insert(blob_scope().as_str(), encoded.as_slice())
+            .expect("advance scope epoch");
+        write.commit().expect("commit scope epoch advance");
+        set_maintenance_next_class(
+            &store,
+            lifecycle::BlobMaintenanceClass::ExpiredPublicationsAndPendingSources,
+        );
+        store
+            .run_blob_maintenance_turn(maintenance_budget(64))
+            .expect("retire stale-epoch publication");
+
+        assert!(matches!(
+            store.get_blob(stored.transfer_id),
+            Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+        ));
+    }
+
+    #[test]
+    fn blob_future_epoch_contradiction_rolls_back_retirement_turn() {
+        // Production mutation caught: treating every non-current epoch as
+        // stale retires a future-epoch structural contradiction.
+        let root = BlobTestRoot::new("future-epoch-retirement-rollback");
+        let mut services = blob_services(0xe6);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("future epoch store");
+        let registry = services
+            .provisioner
+            .export_rekey_registry()
+            .expect("future epoch registry");
+        let (control, _) = services
+            .publisher
+            .seal_chained_scope_rekey_control_from_registry(
+                &registry,
+                0,
+                blob_scope(),
+                2,
+                vec![
+                    ScopeRekeyRecipient::member(services.publisher.identity(), vec![blob_topic()])
+                        .expect("future epoch publisher recipient"),
+                    ScopeRekeyRecipient::member(services.reader.identity(), vec![blob_topic()])
+                        .expect("future epoch reader recipient"),
+                ],
+                1,
+                None,
+            )
+            .expect("future epoch control");
+        let verified = services
+            .reader
+            .verify_control(&control)
+            .expect("verify future epoch control");
+        store
+            .ingest_verified_control(&verified, &control)
+            .expect("commit future epoch control");
+        for provider in [&mut services.publisher, &mut services.reader] {
+            let verified = provider
+                .verify_control(&control)
+                .expect("verify committed future epoch control");
+            let ready = provider
+                .prepare_committed_control_activation(&verified, &control)
+                .expect("prepare future epoch control");
+            provider
+                .activate_committed_control(ready, false)
+                .expect("activate future epoch control");
+        }
+        let plaintext = b"future epoch contradictions are never cleanup".to_vec();
+        let prepared = prepared_blob(&plaintext);
+        let stored = publish_blob(
+            &store,
+            &mut services,
+            &prepared,
+            &plaintext,
+            2,
+            b"future-epoch-retirement-operation",
+        )
+        .0;
+
+        let write = store
+            .database
+            .begin_write()
+            .expect("rollback scope epoch write");
+        let encoded = encode_scope_epoch_index(1, ControlTransferId::new([0xe7; 32]));
+        write
+            .open_table(CONTROL_SCOPE_EPOCHS)
+            .expect("rollback scope epochs")
+            .insert(blob_scope().as_str(), encoded.as_slice())
+            .expect("install impossible lower scope epoch");
+        write.commit().expect("commit impossible lower scope epoch");
+        set_maintenance_next_class(
+            &store,
+            lifecycle::BlobMaintenanceClass::ExpiredPublicationsAndPendingSources,
+        );
+        let before = blob_complete_logical_digest(&store);
+        let stats_before = store.blob_stats().expect("future epoch stats before");
+
+        let error = store
+            .run_blob_maintenance_turn(maintenance_budget(64))
+            .expect_err("future epoch publication must fail maintenance closed");
+        assert_blob_schema_invariant(&error);
+        assert_eq!(blob_complete_logical_digest(&store), before);
+        assert_eq!(
+            store.blob_stats().expect("future epoch stats after"),
+            stats_before
+        );
+        assert_eq!(
+            store
+                .get_blob(stored.transfer_id)
+                .expect("future epoch publication remains live")
+                .expect("future epoch publication remains present"),
+            stored
+        );
+    }
+
+    #[test]
+    fn blob_acknowledgement_rejects_coexisting_retired_delivery() {
+        // Production mutation caught: returning the retired lifecycle outcome
+        // before checking a completed receipt masks contradictory ledger state.
+        let root = BlobTestRoot::new("acknowledgement-retired-contradiction");
+        let mut services = blob_services(0xe8);
+        let plaintext = b"completed receipt cannot coexist with retired delivery".to_vec();
+        let prepared = prepared_blob(&plaintext);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("acknowledgement contradiction store");
+        let stored = publish_blob(
+            &store,
+            &mut services,
+            &prepared,
+            &plaintext,
+            1,
+            b"acknowledgement-contradiction-operation",
+        )
+        .0;
+        let policy = store
+            .control_policy_snapshot()
+            .expect("acknowledgement contradiction policy");
+        let subscription = store
+            .create_blob_subscription_with_policy(
+                &policy,
+                &BlobSubscriptionKey::new(b"acknowledgement-contradiction".to_vec())
+                    .expect("acknowledgement contradiction key"),
+                BlobSubscriptionSpec {
+                    topic: blob_topic(),
+                    scope: blob_scope(),
+                    include_descendant_scopes: false,
+                },
+            )
+            .expect("acknowledgement contradiction subscription");
+        let plan = store
+            .prepare_blob_subscription_poll_with_policy(&policy, subscription.id, 1, 8)
+            .expect("acknowledgement contradiction plan");
+        let page = store
+            .commit_blob_subscription_poll_with_policy(
+                &policy,
+                &plan,
+                &all_blob_subscription_candidates_deliverable(&plan),
+            )
+            .expect("acknowledgement contradiction page");
+        let delivery = page.deliveries[0].clone();
+        assert_eq!(
+            store
+                .acknowledge_blob_delivery_with_policy(
+                    &policy,
+                    subscription.id,
+                    stored.semantic_id,
+                    delivery.token,
+                )
+                .expect("complete contradiction receipt"),
+            BlobDeliveryAck::Acknowledged
+        );
+
+        let write = store
+            .database
+            .begin_write()
+            .expect("acknowledgement contradiction revocation");
+        let encoded =
+            encode_revocation_index(services.authority, 1, ControlTransferId::new([0xe8; 32]));
+        write
+            .open_table(CONTROL_REVOCATIONS)
+            .expect("acknowledgement contradiction revocations")
+            .insert(services.publisher.identity().as_slice(), encoded.as_slice())
+            .expect("revoke acknowledgement contradiction publisher");
+        write
+            .commit()
+            .expect("commit acknowledgement contradiction revocation");
+        set_maintenance_next_class(
+            &store,
+            lifecycle::BlobMaintenanceClass::ExpiredPublicationsAndPendingSources,
+        );
+        store
+            .run_blob_maintenance_turn(maintenance_budget(64))
+            .expect("retire acknowledgement contradiction publication");
+
+        let write = store
+            .database
+            .begin_write()
+            .expect("insert retired delivery contradiction");
+        let retirement_generation = write
+            .open_table(BLOB_PUBLICATIONS)
+            .expect("retired publications")
+            .get(stored.transfer_id.as_bytes().as_slice())
+            .expect("retired publication lookup")
+            .map(|record| lifecycle::publication_retirement(record.value()))
+            .transpose()
+            .expect("decode retired publication")
+            .flatten()
+            .expect("retired publication state")
+            .1;
+        let marker = stored.acceptance_marker;
+        let mut key = [0u8; 40];
+        key[..32].copy_from_slice(subscription.id.as_bytes());
+        key[32..].copy_from_slice(&marker.to_be_bytes());
+        let mut retired = Vec::with_capacity(41);
+        retired.push(2);
+        retired.extend_from_slice(stored.semantic_id.as_bytes());
+        retired.extend_from_slice(&retirement_generation.to_be_bytes());
+        write
+            .open_table(BLOB_SUBSCRIPTION_PENDING)
+            .expect("pending deliveries")
+            .insert(key.as_slice(), retired.as_slice())
+            .expect("insert retired delivery beside receipt");
+        lifecycle::insert_delivery_owner(&write, stored.transfer_id, key.as_slice())
+            .expect("index contradictory retired delivery canonically");
+        let mut metadata = write.open_table(METADATA).expect("delivery accounting");
+        let pending = metadata
+            .get(crate::blob_subscription::BLOB_PENDING_DELIVERY_COUNT)
+            .expect("pending delivery accounting lookup")
+            .expect("pending delivery accounting")
+            .value();
+        metadata
+            .insert(
+                crate::blob_subscription::BLOB_PENDING_DELIVERY_COUNT,
+                pending.checked_add(1).expect("pending delivery count"),
+            )
+            .expect("increment contradictory pending delivery accounting");
+        drop(metadata);
+        write
+            .commit()
+            .expect("commit retired delivery contradiction");
+
+        assert!(matches!(
+            store.acknowledge_blob_delivery_with_policy(
+                &policy,
+                subscription.id,
+                stored.semantic_id,
+                delivery.token,
+            ),
+            Err(StoreError::BlobInvariant(
+                "Blob delivery is both retired and acknowledged"
+            ))
+        ));
+    }
+
+    #[test]
+    fn blob_policy_retirement_preserves_shared_root_and_leases_gate_final_manifest() {
+        // Break caught: removing the physical root unconditionally during
+        // retirement deletes shared content or fences an active bounded read.
+        let root = BlobTestRoot::new("policy-retirement-shared-root");
+        let mut services = blob_services(0xe6);
+        let access = ProvisioningAccess::member(blob_scope(), vec![1, 2, 3], vec![blob_topic()])
+            .expect("second publisher access");
+        let second_publisher = services
+            .provisioner
+            .issue_node(3, &[access])
+            .and_then(ReferenceEnvelopeSealer::open)
+            .expect("second publisher");
+        let plaintext = b"shared content survives one policy retirement".to_vec();
+        let prepared = prepared_blob(&plaintext);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("shared retirement store");
+        let first_publisher = services.publisher.identity();
+        let first = publish_blob(
+            &store,
+            &mut services,
+            &prepared,
+            &plaintext,
+            1,
+            b"shared-retirement-first",
+        )
+        .0;
+        let original_publisher = std::mem::replace(&mut services.publisher, second_publisher);
+        let second = publish_blob(
+            &store,
+            &mut services,
+            &prepared,
+            &plaintext,
+            1,
+            b"shared-retirement-second",
+        )
+        .0;
+        let second_publisher = services.publisher.identity();
+        services.publisher = original_publisher;
+        assert_eq!(first.variant_id, second.variant_id);
+
+        let retire_within_two_bounded_pages = |transfer: BlobTransferId, label: &str| {
+            for _ in 0..2 {
+                if matches!(
+                    store.get_blob(transfer),
+                    Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+                ) {
+                    return;
+                }
+                set_maintenance_next_class(
+                    &store,
+                    lifecycle::BlobMaintenanceClass::ExpiredPublicationsAndPendingSources,
+                );
+                store
+                    .run_blob_maintenance_turn(maintenance_budget(64))
+                    .unwrap_or_else(|error| panic!("retire {label}: {error:?}"));
+            }
+            assert!(matches!(
+                store.get_blob(transfer),
+                Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+            ));
+        };
+
+        let write = store
+            .database
+            .begin_write()
+            .expect("first revocation write");
+        let encoded =
+            encode_revocation_index(services.authority, 1, ControlTransferId::new([0xe6; 32]));
+        write
+            .open_table(CONTROL_REVOCATIONS)
+            .expect("revocations")
+            .insert(first_publisher.as_slice(), encoded.as_slice())
+            .expect("revoke first publisher");
+        write.commit().expect("commit first revocation");
+        retire_within_two_bounded_pages(first.transfer_id, "first shared publication");
+        assert_eq!(
+            store
+                .get_blob(second.transfer_id)
+                .expect("read surviving publication")
+                .expect("surviving publication exists")
+                .sealed,
+            second.sealed
+        );
+        let read = store.database.begin_read().expect("shared manifest read");
+        assert!(
+            !deletion::variant_has_deletion_manifest_read(&read, first.variant_id)
+                .expect("shared manifest state")
+        );
+        drop(read);
+
+        let lease = store
+            .test_acquire_blob_lease(first.variant_id, lease::BlobLeaseKind::ApplicationPageRead)
+            .expect("active bounded application read lease");
+        let write = store
+            .database
+            .begin_write()
+            .expect("second revocation write");
+        let encoded =
+            encode_revocation_index(services.authority, 1, ControlTransferId::new([0xe7; 32]));
+        write
+            .open_table(CONTROL_REVOCATIONS)
+            .expect("revocations")
+            .insert(second_publisher.as_slice(), encoded.as_slice())
+            .expect("revoke second publisher");
+        write.commit().expect("commit second revocation");
+        retire_within_two_bounded_pages(second.transfer_id, "final shared publication");
+
+        set_maintenance_next_class(
+            &store,
+            lifecycle::BlobMaintenanceClass::UnreferencedCompletedVariants,
+        );
+        let blocked = store
+            .run_blob_maintenance_turn(maintenance_budget(64))
+            .expect("lease-blocked manifest turn");
+        assert!(blocked.awaiting_later_handler);
+        let read = store.database.begin_read().expect("blocked manifest read");
+        assert!(
+            !deletion::variant_has_deletion_manifest_read(&read, first.variant_id)
+                .expect("blocked manifest state")
+        );
+        drop(read);
+        drop(lease);
+
+        store
+            .run_blob_maintenance_turn(maintenance_budget(64))
+            .expect("admit final-root deletion manifest after lease release");
+        deletion_manifest_for_test(&store, first.variant_id);
+    }
+
+    #[test]
+    fn blob_policy_retirement_maximum_delivery_fanout_is_atomic_and_bounded() {
+        // Break caught: mutating delivery rows before the bounded publication
+        // candidate is admitted allows a short turn to retire only part of the
+        // maximum subscription fan-out.
+        let root = BlobTestRoot::new("policy-retirement-maximum-fanout");
+        let mut services = blob_services(0xe8);
+        let plaintext = b"maximum bounded retirement delivery fanout".to_vec();
+        let prepared = prepared_blob(&plaintext);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("maximum fanout store");
+        let stored = publish_blob(
+            &store,
+            &mut services,
+            &prepared,
+            &plaintext,
+            1,
+            b"maximum-fanout-operation",
+        )
+        .0;
+        let policy = store
+            .control_policy_snapshot()
+            .expect("maximum fanout policy");
+        let spec = BlobSubscriptionSpec {
+            topic: blob_topic(),
+            scope: blob_scope(),
+            include_descendant_scopes: false,
+        };
+        let mut deliveries = Vec::new();
+        for index in 0..crate::blob_subscription::MAX_BLOB_SUBSCRIPTIONS {
+            let subscription = store
+                .create_blob_subscription_with_policy(
+                    &policy,
+                    &BlobSubscriptionKey::new(format!("fanout-{index}").into_bytes())
+                        .expect("fanout key"),
+                    spec.clone(),
+                )
+                .expect("fanout subscription");
+            let plan = store
+                .prepare_blob_subscription_poll_with_policy(&policy, subscription.id, 1, 1)
+                .expect("fanout poll plan");
+            let page = store
+                .commit_blob_subscription_poll_with_policy(
+                    &policy,
+                    &plan,
+                    &all_blob_subscription_candidates_deliverable(&plan),
+                )
+                .expect("fanout pending delivery");
+            deliveries.push((subscription.id, page.deliveries[0].token));
+        }
+        let write = store
+            .database
+            .begin_write()
+            .expect("fanout revocation write");
+        let encoded =
+            encode_revocation_index(services.authority, 1, ControlTransferId::new([0xe8; 32]));
+        write
+            .open_table(CONTROL_REVOCATIONS)
+            .expect("revocations")
+            .insert(services.publisher.identity().as_slice(), encoded.as_slice())
+            .expect("revoke fanout publisher");
+        write.commit().expect("commit fanout revocation");
+
+        set_maintenance_next_class(
+            &store,
+            lifecycle::BlobMaintenanceClass::ExpiredPublicationsAndPendingSources,
+        );
+        store
+            .run_blob_maintenance_turn(
+                lifecycle::BlobMaintenanceBudget::new(1, 1, 1)
+                    .expect("short nonzero maintenance budget"),
+            )
+            .expect("short fanout turn");
+        assert!(
+            store
+                .get_blob(stored.transfer_id)
+                .expect("short turn lookup")
+                .is_some(),
+            "short budget must not partially retire the publication"
+        );
+
+        set_maintenance_next_class(
+            &store,
+            lifecycle::BlobMaintenanceClass::ExpiredPublicationsAndPendingSources,
+        );
+        let retired_at = CustodySample {
+            clock_id: [0xe9; 16],
+            tick_ms: 100,
+        };
+        {
+            let write = store
+                .database
+                .begin_write()
+                .expect("prime maximum-fanout custody checkpoint");
+            deletion::checkpoint_blob_deletion_ages_write(&write, retired_at, u64::MAX, u64::MAX)
+                .expect("prime maximum-fanout custody checkpoint");
+            write
+                .commit()
+                .expect("commit maximum-fanout custody checkpoint");
+        }
+        let (corrupt_delivery_key, corrupt_delivery) = {
+            let write = store
+                .database
+                .begin_write()
+                .expect("late-delivery corruption write");
+            let delivery_key =
+                lifecycle::delivery_owner_entries_for_owner(&write, stored.transfer_id)
+                    .expect("maximum-fanout delivery owners")
+                    .last()
+                    .expect("maximum-fanout late delivery owner")
+                    .1
+                    .clone();
+            let delivery = write
+                .open_table(crate::blob_subscription::BLOB_SUBSCRIPTION_PENDING)
+                .expect("maximum-fanout pending deliveries")
+                .remove(delivery_key.as_slice())
+                .expect("remove late delivery")
+                .expect("late delivery exists")
+                .value()
+                .to_vec();
+            write.commit().expect("commit late-delivery corruption");
+            (delivery_key, delivery)
+        };
+        let before_small = blob_complete_logical_digest(&store);
+        let small = store
+            .run_blob_maintenance_turn_with_sample(
+                lifecycle::BlobMaintenanceBudget::new(32, 1, 2 * 1024 * 1024)
+                    .expect("materially small delivery budget"),
+                Some(retired_at),
+            )
+            .expect("small retirement does not reach late delivery corruption");
+        assert_eq!(small.rows_examined, 32);
+        assert!(small.bytes_examined <= 2 * 1024 * 1024);
+        assert_eq!(blob_complete_logical_digest(&store), before_small);
+        {
+            let write = store
+                .database
+                .begin_write()
+                .expect("restore late delivery write");
+            write
+                .open_table(crate::blob_subscription::BLOB_SUBSCRIPTION_PENDING)
+                .expect("maximum-fanout pending deliveries")
+                .insert(corrupt_delivery_key.as_slice(), corrupt_delivery.as_slice())
+                .expect("restore late delivery");
+            write.commit().expect("commit restored late delivery");
+        }
+        let (exact_retirement_rows, exact_retirement_bytes) = {
+            let write = store
+                .database
+                .begin_write()
+                .expect("maximum-fanout retirement charge write");
+            let page = bounded_composite_maintenance_page(
+                &write,
+                BLOB_PUBLICATIONS,
+                MaintenanceRowKind::Publication,
+                BLOB_PENDING_SOURCES,
+                MaintenanceRowKind::Pending,
+                None,
+                lifecycle::BlobMaintenanceBudget::new(u64::MAX, 1, u64::MAX)
+                    .expect("unbounded test charge"),
+            )
+            .expect("maximum-fanout publication page");
+            assert_eq!(page.rows.len(), 1, "fixture has one publication source row");
+            let mut charge = MaintenanceCharge {
+                budget: lifecycle::BlobMaintenanceBudget::new(u64::MAX, 1, u64::MAX)
+                    .expect("unbounded test charge"),
+                rows: page.rows_examined,
+                bytes: page.bytes,
+            };
+            assert!(
+                invalidated_blob_publication_retirement_charge_write(
+                    &write,
+                    store.blob_lifecycle_limits,
+                    stored.transfer_id,
+                    Some(retired_at),
+                    &mut charge,
+                )
+                .expect("exact maximum-fanout retirement charge")
+            );
+            (charge.rows, charge.bytes)
+        };
+        assert_eq!(
+            exact_retirement_rows,
+            12 + 10 + 2 + 4 + 2 * crate::blob_subscription::MAX_BLOB_SUBSCRIPTIONS,
+            "one-operation maximum-fanout retirement charges every unique durable row"
+        );
+        let before_short = blob_complete_logical_digest(&store);
+        let short = store
+            .run_blob_maintenance_turn_with_sample(
+                lifecycle::BlobMaintenanceBudget::new(
+                    exact_retirement_rows - 1,
+                    1,
+                    exact_retirement_bytes,
+                )
+                .expect("one-row-short retirement budget"),
+                Some(retired_at),
+            )
+            .expect("one-row-short retirement is ordinary bounded progress");
+        assert!(short.rows_examined < exact_retirement_rows);
+        assert_eq!(
+            blob_complete_logical_digest(&store),
+            before_short,
+            "one-row-short budget must not mutate any retirement authority"
+        );
+        let short = store
+            .run_blob_maintenance_turn_with_sample(
+                lifecycle::BlobMaintenanceBudget::new(
+                    exact_retirement_rows,
+                    1,
+                    exact_retirement_bytes - 1,
+                )
+                .expect("one-byte-short retirement budget"),
+                Some(retired_at),
+            )
+            .expect("one-byte-short retirement is ordinary bounded progress");
+        assert!(short.bytes_examined < exact_retirement_bytes);
+        assert_eq!(
+            blob_complete_logical_digest(&store),
+            before_short,
+            "one-byte-short budget must not mutate any retirement authority"
+        );
+
+        set_maintenance_next_class(
+            &store,
+            lifecycle::BlobMaintenanceClass::ExpiredPublicationsAndPendingSources,
+        );
+        let retired = store
+            .run_blob_maintenance_turn_with_sample(
+                lifecycle::BlobMaintenanceBudget::new(
+                    exact_retirement_rows,
+                    1,
+                    exact_retirement_bytes,
+                )
+                .expect("exact maximum-fanout retirement budget"),
+                Some(retired_at),
+            )
+            .expect("atomic maximum-fanout retirement");
+        assert_eq!(retired.rows_examined, exact_retirement_rows);
+        assert_eq!(retired.bytes_examined, exact_retirement_bytes);
+        assert_eq!(
+            crate::blob_subscription::lifecycle_delivery_owners_read(
+                &store.database.begin_read().expect("fanout owner read")
+            )
+            .expect("retired fanout owners")
+            .len(),
+            usize::try_from(crate::blob_subscription::MAX_BLOB_SUBSCRIPTIONS)
+                .expect("bounded fanout fits usize")
+        );
+        let write = store
+            .database
+            .begin_write()
+            .expect("remove maximum-fanout revocation");
+        write
+            .open_table(CONTROL_REVOCATIONS)
+            .expect("maximum-fanout revocations")
+            .remove(services.publisher.identity().as_slice())
+            .expect("remove maximum-fanout revocation");
+        write
+            .commit()
+            .expect("commit maximum-fanout revocation removal");
+        let unrelated_plaintext = b"unrelated ledger rows must not be globally scanned".to_vec();
+        let unrelated_prepared = prepared_blob(&unrelated_plaintext);
+        let unrelated = publish_blob(
+            &store,
+            &mut services,
+            &unrelated_prepared,
+            &unrelated_plaintext,
+            1,
+            b"maximum-fanout-unrelated-operation",
+        )
+        .0;
+        for (subscription, token) in deliveries.iter().copied() {
+            assert!(matches!(
+                store.acknowledge_blob_delivery_with_policy(
+                    &policy,
+                    subscription,
+                    stored.semantic_id,
+                    token,
+                ),
+                Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+            ));
+            let plan = store
+                .prepare_blob_subscription_poll_with_policy(&policy, subscription, 1, 2)
+                .expect("unrelated fanout poll plan");
+            let delivery = store
+                .commit_blob_subscription_poll_with_policy(
+                    &policy,
+                    &plan,
+                    &all_blob_subscription_candidates_deliverable(&plan),
+                )
+                .expect("unrelated fanout delivery")
+                .deliveries
+                .remove(0);
+            assert_eq!(delivery.semantic_id, unrelated.semantic_id);
+            assert_eq!(
+                store
+                    .acknowledge_blob_delivery_with_policy(
+                        &policy,
+                        subscription,
+                        unrelated.semantic_id,
+                        delivery.token,
+                    )
+                    .expect("acknowledge unrelated fanout delivery"),
+                BlobDeliveryAck::Acknowledged
+            );
+        }
+        set_maintenance_next_class(
+            &store,
+            lifecycle::BlobMaintenanceClass::ExpiredRetirementRecords,
+        );
+        let maximum_expiry_rows = 6 + 4 * crate::blob_subscription::MAX_BLOB_SUBSCRIPTIONS;
+        let expired = store
+            .run_blob_maintenance_turn_with_sample(
+                lifecycle::BlobMaintenanceBudget::new(maximum_expiry_rows, 1, 2 * 1024 * 1024)
+                    .expect("maximum-fanout expiry budget"),
+                Some(CustodySample {
+                    clock_id: retired_at.clock_id,
+                    tick_ms: retired_at.tick_ms + 3_888_000_000,
+                }),
+            )
+            .expect("expire maximum bounded delivery fanout atomically");
+        assert_eq!(
+            expired.rows_examined, maximum_expiry_rows,
+            "maximum expiry charges six core rows plus each bounded subscription examination and its three dependent rows"
+        );
+        assert_eq!(
+            store
+                .blob_gc_status(Some(CustodySample {
+                    clock_id: retired_at.clock_id,
+                    tick_ms: retired_at.tick_ms + 3_888_000_000,
+                }))
+                .expect("maximum-fanout expiry status")
+                .retained_publication_records,
+            0
+        );
+        let unrelated_ledger = store
+            .blob_subscription_stats()
+            .expect("unrelated fanout ledger status");
+        assert_eq!(
+            unrelated_ledger.acknowledged_deliveries,
+            crate::blob_subscription::MAX_BLOB_SUBSCRIPTIONS
+        );
+        assert_eq!(
+            unrelated_ledger.delivery_cursors,
+            crate::blob_subscription::MAX_BLOB_SUBSCRIPTIONS
+        );
+    }
+
+    #[test]
+    fn blob_policy_retirement_maximum_operation_aliases_is_atomic_and_bounded() {
+        // One publication may own every globally bounded operation alias. A
+        // one-row-short turn must leave that entire retirement unit unchanged.
+        let root = BlobTestRoot::new("policy-retirement-maximum-operation-aliases");
+        let mut services = blob_services(0xea);
+        let plaintext = b"maximum bounded retirement operation aliases".to_vec();
+        let prepared = prepared_blob(&plaintext);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("maximum operation-alias store");
+        let operation_key = |index: u16| {
+            let mut key = vec![0xea; 59];
+            key.extend_from_slice(&index.to_be_bytes());
+            key
+        };
+        let stored = publish_blob(
+            &store,
+            &mut services,
+            &prepared,
+            &plaintext,
+            1,
+            &operation_key(0),
+        )
+        .0;
+        let write = store
+            .database
+            .begin_write()
+            .expect("seed maximum operation aliases");
+        for index in 1..MAX_BLOB_OPERATIONS {
+            let key = operation_key(
+                u16::try_from(index).expect("operation bound fits canonical fixture key"),
+            );
+            let encoded = lifecycle::active_operation_record(
+                &write,
+                &encode_blob_operation_record(BlobOperationRecord {
+                    transfer_id: stored.transfer_id,
+                    intent_digest: [u8::try_from(index % 251).expect("intent byte"); 32],
+                }),
+            )
+            .expect("encode maximum operation alias");
+            write
+                .open_table(BLOB_OPERATIONS)
+                .expect("maximum operation table")
+                .insert(key.as_slice(), encoded.as_slice())
+                .expect("insert maximum operation alias");
+            lifecycle::insert_operation_owner(&write, stored.transfer_id, key.as_slice())
+                .expect("index maximum operation alias");
+        }
+        let operation_bytes = write
+            .open_table(BLOB_OPERATIONS)
+            .expect("maximum operation table")
+            .iter()
+            .expect("maximum operation rows")
+            .map(|row| {
+                row.map(|(key, value)| {
+                    u64::try_from(key.value().len() + value.value().len())
+                        .expect("operation bytes fit u64")
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .expect("maximum operation row bytes")
+            .into_iter()
+            .sum::<u64>();
+        assert_eq!(
+            operation_bytes, MAX_BLOB_OPERATION_BYTES,
+            "fixture exactly fills the unchanged active-admission byte cap"
+        );
+        {
+            let mut metadata = write
+                .open_table(METADATA)
+                .expect("maximum operation metadata");
+            metadata
+                .insert(BLOB_OPERATION_COUNT, MAX_BLOB_OPERATIONS)
+                .expect("maximum operation count");
+            metadata
+                .insert(BLOB_OPERATION_TOTAL_BYTES, operation_bytes)
+                .expect("maximum operation bytes");
+        }
+        write.commit().expect("commit maximum operation aliases");
+
+        let revocation = services
+            .publisher
+            .seal_chained_revocation_control(services.publisher.identity(), 1, 1, None)
+            .expect("seal maximum-operation revocation");
+        let verified_revocation = services
+            .reader
+            .verify_control(&revocation)
+            .expect("verify maximum-operation revocation");
+        store
+            .ingest_verified_control(&verified_revocation, &revocation)
+            .expect("apply maximum-operation revocation");
+
+        let (tight_limits, active_effective_usage, source_bytes) = {
+            let read = store
+                .database
+                .begin_read()
+                .expect("maximum-operation capacity read");
+            let metadata = read
+                .open_table(METADATA)
+                .expect("maximum-operation capacity metadata");
+            let physical = aggregate_usage_from_metadata(&metadata)
+                .expect("maximum-operation physical aggregate usage");
+            let control = CustodyUsage {
+                items: metadata
+                    .get(CONTROL_ITEM_COUNT)
+                    .expect("maximum-operation control item count")
+                    .map_or(0, |value| value.value()),
+                bytes: metadata
+                    .get(CONTROL_TOTAL_BYTES)
+                    .expect("maximum-operation control bytes")
+                    .map_or(0, |value| value.value())
+                    .checked_add(
+                        metadata
+                            .get(CONTROL_PUBLICATION_INTENT_TOTAL_BYTES)
+                            .expect("maximum-operation control intent bytes")
+                            .map_or(0, |value| value.value()),
+                    )
+                    .expect("maximum-operation control usage fits u64"),
+            };
+            assert!(control.items > 0 && control.bytes > 0);
+            let active_reserve = MAX_BLOB_OPERATIONS
+                .checked_mul(MAX_BLOB_OPERATION_RETIREMENT_GROWTH_BYTES)
+                .expect("bounded active-operation reserve");
+            let effective = CustodyUsage {
+                items: physical.items,
+                bytes: physical
+                    .bytes
+                    .checked_add(active_reserve)
+                    .expect("maximum-operation effective usage fits u64"),
+            };
+            let (reserved_items, reserved_bytes) =
+                custody::custody_emergency_reserve(StoreLimits::default());
+            assert!(control.items <= reserved_items && control.bytes <= reserved_bytes);
+            let ordinary_items = effective
+                .items
+                .checked_sub(control.items)
+                .expect("control items are included in total usage");
+            let ordinary_bytes = effective
+                .bytes
+                .checked_sub(control.bytes)
+                .expect("control bytes are included in total usage");
+            let limits = StoreLimits::new(
+                ordinary_items
+                    .checked_add(reserved_items)
+                    .expect("tight item limit fits u64"),
+                ordinary_bytes
+                    .checked_add(reserved_bytes)
+                    .expect("tight byte limit fits u64"),
+            )
+            .expect("maximum-operation tight aggregate limits");
+            let source_bytes = metadata
+                .get(BLOB_TOTAL_BYTES)
+                .expect("maximum-operation source byte lookup")
+                .expect("maximum-operation source bytes")
+                .value();
+            (limits, effective, source_bytes)
+        };
+        drop(store);
+        let store =
+            Store::open_with_limits_for_mission(&root.database, tight_limits, services.authority)
+                .expect("maximum-operation tight-capacity reopen");
+        let retired_at = CustodySample {
+            clock_id: [0xeb; 16],
+            tick_ms: 100,
+        };
+        {
+            let write = store
+                .database
+                .begin_write()
+                .expect("prime maximum-operation custody checkpoint");
+            deletion::checkpoint_blob_deletion_ages_write(&write, retired_at, u64::MAX, u64::MAX)
+                .expect("prime maximum-operation custody checkpoint");
+            write
+                .commit()
+                .expect("commit maximum-operation custody checkpoint");
+        }
+        set_maintenance_next_class(
+            &store,
+            lifecycle::BlobMaintenanceClass::ExpiredPublicationsAndPendingSources,
+        );
+        let acceptance_marker = store
+            .database
+            .begin_read()
+            .expect("maximum-operation acceptance-marker read")
+            .open_table(BLOB_ACCEPTANCE_MARKERS)
+            .expect("maximum-operation acceptance markers")
+            .get(stored.transfer_id.as_bytes().as_slice())
+            .expect("maximum-operation acceptance-marker lookup")
+            .expect("maximum-operation acceptance marker")
+            .value();
+        let missing_acceptance_order = {
+            let write = store
+                .database
+                .begin_write()
+                .expect("remove maximum-operation acceptance order");
+            let value = write
+                .open_table(crate::blob_subscription::BLOB_ACCEPTANCE_ORDER)
+                .expect("maximum-operation acceptance order")
+                .remove(acceptance_marker)
+                .expect("remove maximum-operation acceptance order")
+                .expect("maximum-operation acceptance order exists")
+                .value()
+                .to_vec();
+            write
+                .commit()
+                .expect("commit missing maximum-operation acceptance order");
+            value
+        };
+        let discovery_bytes = {
+            let write = store
+                .database
+                .begin_write()
+                .expect("maximum-operation discovery charge write");
+            bounded_composite_maintenance_page_with_source_limit(
+                &write,
+                BLOB_PUBLICATIONS,
+                MaintenanceRowKind::Publication,
+                BLOB_PENDING_SOURCES,
+                MaintenanceRowKind::Pending,
+                None,
+                lifecycle::BlobMaintenanceBudget::new(u64::MAX, 1, u64::MAX)
+                    .expect("maximum-operation discovery charge budget"),
+                1,
+            )
+            .expect("maximum-operation discovery charge page")
+            .bytes
+        };
+        let before_acceptance_short = blob_complete_logical_digest(&store);
+        {
+            let write = store
+                .database
+                .begin_write()
+                .expect("byte-short acceptance-order charge write");
+            let mut charge = MaintenanceCharge {
+                budget: lifecycle::BlobMaintenanceBudget::new(13, 1, discovery_bytes)
+                    .expect("byte-short acceptance-order budget"),
+                rows: 12,
+                bytes: discovery_bytes,
+            };
+            assert!(
+                !invalidated_blob_publication_retirement_charge_write(
+                    &write,
+                    store.blob_lifecycle_limits,
+                    stored.transfer_id,
+                    Some(retired_at),
+                    &mut charge,
+                )
+                .expect("byte-short budget must not inspect acceptance order")
+            );
+            assert_eq!(charge.rows, 12);
+            assert_eq!(charge.bytes, discovery_bytes);
+        }
+        assert_eq!(
+            blob_complete_logical_digest(&store),
+            before_acceptance_short,
+            "discovery-only retirement preflight must not mutate state"
+        );
+        {
+            let write = store
+                .database
+                .begin_write()
+                .expect("acceptance-order-admitting charge write");
+            let mut charge = MaintenanceCharge {
+                budget: lifecycle::BlobMaintenanceBudget::new(13, 1, u64::MAX)
+                    .expect("acceptance-order-admitting budget"),
+                rows: 12,
+                bytes: discovery_bytes,
+            };
+            assert!(matches!(
+                invalidated_blob_publication_retirement_charge_write(
+                    &write,
+                    store.blob_lifecycle_limits,
+                    stored.transfer_id,
+                    Some(retired_at),
+                    &mut charge,
+                ),
+                Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
+                    "Blob retirement candidate is missing its acceptance-order row"
+                )))
+            ));
+        }
+        {
+            let write = store
+                .database
+                .begin_write()
+                .expect("restore maximum-operation acceptance order");
+            write
+                .open_table(crate::blob_subscription::BLOB_ACCEPTANCE_ORDER)
+                .expect("maximum-operation acceptance order")
+                .insert(acceptance_marker, missing_acceptance_order.as_slice())
+                .expect("restore maximum-operation acceptance order");
+            write
+                .commit()
+                .expect("commit restored maximum-operation acceptance order");
+        }
+        assert_eq!(
+            store
+                .aggregate_usage()
+                .expect("maximum-operation public aggregate usage")
+                .payload_bytes,
+            active_effective_usage.bytes,
+            "active Blob operations reserve their deterministic retirement growth"
+        );
+        let (corrupt_operation_key, corrupt_operation) = {
+            let write = store
+                .database
+                .begin_write()
+                .expect("late-operation corruption write");
+            let operation_key =
+                lifecycle::operation_owner_entries_for_owner(&write, stored.transfer_id)
+                    .expect("maximum operation owners")
+                    .last()
+                    .expect("maximum late operation owner")
+                    .1
+                    .clone();
+            let operation = write
+                .open_table(BLOB_OPERATIONS)
+                .expect("maximum operation table")
+                .remove(operation_key.as_slice())
+                .expect("remove late operation")
+                .expect("late operation exists")
+                .value()
+                .to_vec();
+            write.commit().expect("commit late-operation corruption");
+            (operation_key, operation)
+        };
+        let before_small = blob_complete_logical_digest(&store);
+        let small = store
+            .run_blob_maintenance_turn_with_sample(
+                lifecycle::BlobMaintenanceBudget::new(32, 1, 2 * 1024 * 1024)
+                    .expect("materially small operation budget"),
+                Some(retired_at),
+            )
+            .expect("small retirement does not reach late operation corruption");
+        assert_eq!(small.rows_examined, 32);
+        assert!(small.bytes_examined <= 2 * 1024 * 1024);
+        assert_eq!(blob_complete_logical_digest(&store), before_small);
+        {
+            let write = store
+                .database
+                .begin_write()
+                .expect("restore late operation write");
+            write
+                .open_table(BLOB_OPERATIONS)
+                .expect("maximum operation table")
+                .insert(
+                    corrupt_operation_key.as_slice(),
+                    corrupt_operation.as_slice(),
+                )
+                .expect("restore late operation");
+            write.commit().expect("commit restored late operation");
+        }
+        let (exact_rows, exact_bytes) = {
+            let write = store
+                .database
+                .begin_write()
+                .expect("maximum-operation charge write");
+            let page = bounded_composite_maintenance_page_with_source_limit(
+                &write,
+                BLOB_PUBLICATIONS,
+                MaintenanceRowKind::Publication,
+                BLOB_PENDING_SOURCES,
+                MaintenanceRowKind::Pending,
+                None,
+                lifecycle::BlobMaintenanceBudget::new(u64::MAX, 1, u64::MAX)
+                    .expect("unbounded test charge"),
+                1,
+            )
+            .expect("maximum-operation publication page");
+            let mut charge = MaintenanceCharge {
+                budget: lifecycle::BlobMaintenanceBudget::new(u64::MAX, 1, u64::MAX)
+                    .expect("unbounded test charge"),
+                rows: page.rows_examined,
+                bytes: page.bytes,
+            };
+            assert!(
+                invalidated_blob_publication_retirement_charge_write(
+                    &write,
+                    store.blob_lifecycle_limits,
+                    stored.transfer_id,
+                    Some(retired_at),
+                    &mut charge,
+                )
+                .expect("exact maximum-operation retirement charge")
+            );
+            (charge.rows, charge.bytes)
+        };
+        assert_eq!(
+            exact_rows,
+            12 + 10 + 2 + 4 * MAX_BLOB_OPERATIONS,
+            "maximum aliases charge each operation, owner, resolver, and deadline"
+        );
+        let before = blob_complete_logical_digest(&store);
+        let before_usage = store
+            .aggregate_usage()
+            .expect("maximum-operation pre-short aggregate usage");
+        let short = store
+            .run_blob_maintenance_turn_with_sample(
+                lifecycle::BlobMaintenanceBudget::new(exact_rows - 1, 1, exact_bytes)
+                    .expect("one-row-short maximum-operation budget"),
+                Some(retired_at),
+            )
+            .expect("one-row-short maximum-operation progress");
+        assert!(short.rows_examined < exact_rows);
+        assert_eq!(blob_complete_logical_digest(&store), before);
+        assert_eq!(
+            store
+                .aggregate_usage()
+                .expect("maximum-operation post-short aggregate usage"),
+            before_usage,
+            "rolled-back short retirement preserves physical usage and active reserve"
+        );
+        let short = store
+            .run_blob_maintenance_turn_with_sample(
+                lifecycle::BlobMaintenanceBudget::new(exact_rows, 1, exact_bytes - 1)
+                    .expect("one-byte-short maximum-operation budget"),
+                Some(retired_at),
+            )
+            .expect("one-byte-short maximum-operation progress");
+        assert!(short.bytes_examined < exact_bytes);
+        assert_eq!(blob_complete_logical_digest(&store), before);
+
+        let retired = store
+            .run_blob_maintenance_turn_with_sample(
+                lifecycle::BlobMaintenanceBudget::new(exact_rows, 1, exact_bytes)
+                    .expect("exact maximum-operation budget"),
+                Some(retired_at),
+            )
+            .expect("retire maximum operation aliases");
+        assert_eq!(retired.rows_examined, exact_rows);
+        assert_eq!(retired.bytes_examined, exact_bytes);
+        assert_eq!(
+            store
+                .aggregate_usage()
+                .expect("retired maximum-operation aggregate usage")
+                .payload_bytes,
+            active_effective_usage
+                .bytes
+                .checked_sub(source_bytes)
+                .expect("retirement removes only the live source charge"),
+            "retirement swaps active reserve into physical retained bytes"
+        );
+        let read = store
+            .database
+            .begin_read()
+            .expect("maximum-operation retirement read");
+        assert_eq!(
+            read.open_table(BLOB_OPERATIONS)
+                .expect("retired maximum operation table")
+                .iter()
+                .expect("retired maximum operation rows")
+                .filter(|row| {
+                    row.as_ref().is_ok_and(|(_, value)| {
+                        matches!(
+                            lifecycle::operation_record_is_retired(value.value()),
+                            Ok(true)
+                        )
+                    })
+                })
+                .count(),
+            usize::try_from(MAX_BLOB_OPERATIONS).expect("operation bound fits usize")
+        );
+        assert_eq!(
+            read.open_table(METADATA)
+                .expect("retired maximum operation metadata")
+                .get(BLOB_OPERATION_TOTAL_BYTES)
+                .expect("retired maximum operation byte lookup")
+                .expect("retired maximum operation bytes")
+                .value(),
+            MAX_BLOB_OPERATION_BYTES + 51 * MAX_BLOB_OPERATIONS,
+            "retirement growth is bounded independently from active admission"
+        );
+        drop(read);
+        drop(store);
+        let inspected = Store::inspect_existing(&root.database)
+            .expect("read-only audit accepts proven retained-operation headroom");
+        assert_eq!(
+            inspected.blob_stats.operation_bytes,
+            MAX_BLOB_DURABLE_OPERATION_BYTES
+        );
+        let reopened =
+            Store::open_with_limits_for_mission(&root.database, tight_limits, services.authority)
+                .expect("writable reopen accepts proven retained-operation headroom");
+        assert_eq!(
+            reopened
+                .blob_stats()
+                .expect("reopened retained-operation stats")
+                .operation_bytes,
+            MAX_BLOB_DURABLE_OPERATION_BYTES
+        );
+        let retained_usage = reopened
+            .aggregate_usage()
+            .expect("retained maximum-operation aggregate usage");
+        let retained_operation_count = reopened
+            .blob_stats()
+            .expect("retained maximum-operation stats")
+            .operations;
+        for _ in 0..2 {
+            set_maintenance_next_class(
+                &reopened,
+                lifecycle::BlobMaintenanceClass::ExpiredRetirementRecords,
+            );
+            reopened
+                .run_blob_maintenance_turn_with_sample(
+                    maintenance_budget(64),
+                    Some(CustodySample {
+                        clock_id: retired_at.clock_id,
+                        tick_ms: retired_at.tick_ms + 3_888_000_000,
+                    }),
+                )
+                .expect("expire a bounded maximum-operation retirement row");
+        }
+        let after_expiry = reopened
+            .aggregate_usage()
+            .expect("post-expiry maximum-operation aggregate usage");
+        let after_expiry_operations = reopened
+            .blob_stats()
+            .expect("post-expiry maximum-operation stats")
+            .operations;
+        let expired_operations = retained_operation_count
+            .checked_sub(after_expiry_operations)
+            .expect("expiry cannot add operations");
+        assert_eq!(expired_operations, 1);
+        assert_eq!(
+            retained_usage
+                .payload_bytes
+                .checked_sub(after_expiry.payload_bytes)
+                .expect("expiry releases aggregate bytes"),
+            expired_operations
+                * (u64::try_from(operation_key(0).len()).expect("operation key length fits u64")
+                    + BLOB_RETIRED_OPERATION_RECORD_BYTES),
+            "retained-operation expiry releases its exact physical aggregate charge"
         );
     }
 

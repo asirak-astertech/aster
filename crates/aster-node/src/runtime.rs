@@ -90,7 +90,7 @@ use tokio::{
 use tokio::{
     sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock, mpsc, oneshot, watch},
     task::{AbortHandle, Id as TaskId, JoinHandle, JoinSet},
-    time::{MissedTickBehavior, sleep, timeout},
+    time::{MissedTickBehavior, Sleep, sleep, timeout},
 };
 use zeroize::Zeroize as _;
 
@@ -316,9 +316,12 @@ fn node_blob_lease_limits() -> Result<BlobLeaseLimits, NodeError> {
     )
     .map_err(|_| NodeError::Configuration("Blob lease bounds are invalid".into()))
 }
-const BLOB_MAINTENANCE_ROWS_PER_TURN: u64 = 16;
+// The largest atomic initial retirement dominates retained-record expiry: it
+// includes every globally bounded operation alias and application delivery.
+// Keep node scheduling exactly coupled to the store's checked row/byte proof.
+const BLOB_MAINTENANCE_ROWS_PER_TURN: u64 = aster_redb_store::MAX_BLOB_POLICY_RETIREMENT_ROWS;
 const BLOB_MAINTENANCE_FILES_PER_TURN: u64 = 1;
-const BLOB_MAINTENANCE_BYTES_PER_TURN: u64 = 2 * 1024 * 1024;
+const BLOB_MAINTENANCE_BYTES_PER_TURN: u64 = aster_redb_store::MAX_BLOB_POLICY_RETIREMENT_BYTES;
 const CONTROL_COMMAND_CAPACITY: usize = 1;
 const CONTROL_COMMAND_BUDGET: usize = 4;
 const APPLICATION_COMMAND_BUDGET: usize = 8;
@@ -13081,6 +13084,7 @@ fn execute_selected_record_command(
 #[derive(Clone, Default)]
 struct BlobOperationalPriorityGate {
     outstanding: Arc<AtomicUsize>,
+    idle: Arc<tokio::sync::Notify>,
 }
 
 impl BlobOperationalPriorityGate {
@@ -13088,22 +13092,31 @@ impl BlobOperationalPriorityGate {
         self.outstanding.fetch_add(1, Ordering::AcqRel);
         BlobWorkerPermit {
             outstanding: self.outstanding.clone(),
+            idle: self.idle.clone(),
         }
     }
 
     fn outstanding(&self) -> usize {
         self.outstanding.load(Ordering::Acquire)
     }
+
+    async fn notified(&self) {
+        self.idle.notified().await;
+    }
 }
 
 struct BlobWorkerPermit {
     outstanding: Arc<AtomicUsize>,
+    idle: Arc<tokio::sync::Notify>,
 }
 
 impl Drop for BlobWorkerPermit {
     fn drop(&mut self) {
         let previous = self.outstanding.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(previous > 0, "Blob worker permit count underflowed");
+        if previous == 1 {
+            self.idle.notify_one();
+        }
     }
 }
 
@@ -13147,6 +13160,54 @@ fn blob_maintenance_runtime_budget() -> BlobMaintenanceBudget {
         BLOB_MAINTENANCE_BYTES_PER_TURN,
     )
     .expect("selected Blob maintenance bounds are nonzero")
+}
+
+#[derive(Default)]
+struct BlobRetirementWake {
+    timer: Option<Pin<Box<Sleep>>>,
+}
+
+impl BlobRetirementWake {
+    fn reset(&mut self, delay: Option<Duration>) {
+        self.timer = delay.map(|delay| Box::pin(sleep(delay)));
+    }
+
+    fn clear(&mut self) {
+        self.timer = None;
+    }
+
+    fn is_armed(&self) -> bool {
+        self.timer.is_some()
+    }
+
+    async fn elapsed(&mut self) {
+        self.timer
+            .as_mut()
+            .expect("guarded Blob retirement wake")
+            .as_mut()
+            .await;
+    }
+}
+
+fn blob_retirement_wake_delay(
+    deadline: Option<CustodySample>,
+    current: CustodySample,
+) -> Option<Duration> {
+    deadline.and_then(|deadline| {
+        (deadline.clock_id == current.clock_id)
+            .then(|| Duration::from_millis(deadline.tick_ms.saturating_sub(current.tick_ms)))
+    })
+}
+
+fn reset_blob_retirement_wake(
+    wake: &mut BlobRetirementWake,
+    store: &Store,
+    custody_clock: &NodeCustodyClock,
+) -> Result<(), NodeError> {
+    let current = custody_clock.sample()?;
+    let deadline = store.nearest_blob_retention_deadline(current)?;
+    wake.reset(blob_retirement_wake_delay(deadline, current));
+    Ok(())
 }
 
 fn spawn_blob_maintenance_turn_background(
@@ -13754,6 +13815,7 @@ struct BlobMaintenanceTestGate {
     first_reached: Arc<std::sync::Barrier>,
     first_release: Arc<std::sync::Barrier>,
     schedule_observations: Option<mpsc::UnboundedSender<BlobMaintenanceScheduleObservation>>,
+    completed_progress: Option<mpsc::UnboundedSender<BlobMaintenanceProgress>>,
     block_periodic: bool,
     startup_page_entries: Arc<std::sync::atomic::AtomicUsize>,
     startup_pages: Arc<std::sync::atomic::AtomicUsize>,
@@ -13782,6 +13844,12 @@ impl BlobMaintenanceTestGate {
     fn observe_schedule(&self, observation: BlobMaintenanceScheduleObservation) {
         if let Some(sender) = self.schedule_observations.as_ref() {
             let _ = sender.send(observation);
+        }
+    }
+
+    fn observe_completed_progress(&self, progress: BlobMaintenanceProgress) {
+        if let Some(sender) = self.completed_progress.as_ref() {
+            let _ = sender.send(progress);
         }
     }
 
@@ -14762,6 +14830,8 @@ async fn run_node_actor_inner(
     };
     let mut blob_worker_completion_open = true;
     let mut blob_maintenance_task = None::<JoinHandle<Result<BlobMaintenanceProgress, NodeError>>>;
+    let mut blob_retirement_wake = BlobRetirementWake::default();
+    reset_blob_retirement_wake(&mut blob_retirement_wake, &store, &custody_clock)?;
 
     let mut ticker = tokio::time::interval(config.sync_interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -14802,6 +14872,7 @@ async fn run_node_actor_inner(
     let mut emission_policy_yield_required = false;
     let mut application_tick_pending = false;
     let mut blob_maintenance_priority_deferred = false;
+    let mut blob_retirement_deadline_retry_pending = false;
     #[cfg(all(test, unix))]
     let mut application_receive_held_for_maintenance_test = blob_maintenance_gate
         .as_ref()
@@ -14959,6 +15030,17 @@ async fn run_node_actor_inner(
                     }
                 }
             }
+            if blob_retirement_deadline_retry_pending
+                && !application_tick_pending
+                && pending_application_command.is_none()
+                && application_receiver.is_empty()
+                && pending_control_command.is_none()
+                && control_receiver.is_empty()
+                && blob_operational_priority.outstanding() == 0
+                && blob_maintenance_task.is_none()
+            {
+                application_tick_pending = true;
+            }
             tokio::select! {
             biased;
             zeroization = zeroization_receiver.recv() => {
@@ -15038,7 +15120,22 @@ async fn run_node_actor_inner(
                     .await
             }, if blob_maintenance_task.is_some() => {
                 blob_maintenance_task.take();
-                if let Err(error) = finish_blob_maintenance_turn_background(completed) {
+                let _progress = match finish_blob_maintenance_turn_background(completed) {
+                    Ok(progress) => progress,
+                    Err(error) => {
+                        fatal_error = Some(error);
+                        break;
+                    }
+                };
+                #[cfg(all(test, unix))]
+                if let Some(gate) = blob_maintenance_gate.as_ref() {
+                    gate.observe_completed_progress(_progress);
+                }
+                if let Err(error) = reset_blob_retirement_wake(
+                    &mut blob_retirement_wake,
+                    &store,
+                    &custody_clock,
+                ) {
                     fatal_error = Some(error);
                     break;
                 }
@@ -15259,6 +15356,36 @@ async fn run_node_actor_inner(
                     control_yield_required = true;
                 }
             }
+            _ = blob_retirement_wake.elapsed(),
+                if blob_retirement_wake.is_armed() && !application_tick_pending => {
+                blob_retirement_wake.clear();
+                blob_retirement_deadline_retry_pending = true;
+                control_yield_required = false;
+                discovery_yield_required = false;
+                let queued_application = pending_application_command.is_some()
+                    || !application_receiver.is_empty();
+                let blob_outstanding = blob_operational_priority.outstanding();
+                blob_maintenance_priority_deferred = queued_application
+                    || blob_outstanding != 0
+                    || pending_control_command.is_some()
+                    || !control_receiver.is_empty();
+                #[cfg(all(test, unix))]
+                if blob_maintenance_priority_deferred
+                    && let Some(gate) = blob_maintenance_gate.as_ref()
+                {
+                    gate.observe_schedule(BlobMaintenanceScheduleObservation::Deferred {
+                        queued_application,
+                        blob_outstanding,
+                    });
+                }
+                application_tick_pending = true;
+            }
+            _ = blob_operational_priority.notified(),
+                if blob_retirement_deadline_retry_pending && !application_tick_pending => {
+                // Permit release is the completion signal for a Blob request
+                // that received operational priority over an exact deadline
+                // wake. The loop head rechecks every queue before retrying.
+            }
             _ = ticker.tick(), if !application_tick_pending => {
                 control_yield_required = false;
                 discovery_yield_required = false;
@@ -15347,6 +15474,12 @@ async fn run_node_actor_inner(
                     application_receive_held_for_maintenance_test = false;
                 }
                 if start_blob_maintenance {
+                    // A periodic tick and the exact deadline wake feed the
+                    // same bounded worker. Disarm the stale wake until that
+                    // turn completes and the store's nearest head is read
+                    // again.
+                    blob_retirement_wake.clear();
+                    blob_retirement_deadline_retry_pending = false;
                     let custody_sample = match custody_clock.sample() {
                         Ok(sample) => sample,
                         Err(error) => {
@@ -28473,6 +28606,353 @@ mod tests {
         assert_eq!(gate.outstanding(), 0);
     }
 
+    #[test]
+    fn blob_runtime_maintenance_budget_covers_one_atomic_maximum_fanout_expiry() {
+        let maximum_expiry_rows = 6 + 4 * aster_redb_store::MAX_BLOB_SUBSCRIPTIONS;
+        assert!(
+            blob_maintenance_runtime_budget().rows() >= maximum_expiry_rows,
+            "the production maintenance budget must fit one bounded publication expiry unit"
+        );
+        assert_eq!(
+            blob_maintenance_runtime_budget().rows(),
+            aster_redb_store::MAX_BLOB_POLICY_RETIREMENT_ROWS,
+            "the production row budget is the exact maximum initial-retirement unit"
+        );
+        assert_eq!(
+            blob_maintenance_runtime_budget().bytes(),
+            aster_redb_store::MAX_BLOB_POLICY_RETIREMENT_BYTES,
+            "the production byte budget is the proven maximum initial-retirement bound"
+        );
+    }
+
+    #[test]
+    fn blob_retirement_wake_delay_is_clock_safe_and_conservative() {
+        let clock_id = [0xd7; 16];
+        let deadline = CustodySample {
+            clock_id,
+            tick_ms: 100,
+        };
+        assert_eq!(
+            blob_retirement_wake_delay(
+                Some(deadline),
+                CustodySample {
+                    clock_id,
+                    tick_ms: 90,
+                },
+            ),
+            Some(Duration::from_millis(10)),
+            "a lower current tick waits out the full remaining lower-bound interval"
+        );
+        assert_eq!(
+            blob_retirement_wake_delay(
+                Some(deadline),
+                CustodySample {
+                    clock_id,
+                    tick_ms: 101,
+                },
+            ),
+            Some(Duration::ZERO),
+            "an elapsed same-domain deadline is immediately eligible"
+        );
+        assert_eq!(
+            blob_retirement_wake_delay(
+                Some(deadline),
+                CustodySample {
+                    clock_id: [0xd6; 16],
+                    tick_ms: 101,
+                },
+            ),
+            None,
+            "a different continuity domain cannot authorize an expiry wake"
+        );
+        assert_eq!(
+            blob_retirement_wake_delay(
+                None,
+                CustodySample {
+                    clock_id,
+                    tick_ms: 101,
+                },
+            ),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blob_retirement_deadline_wakes_before_sync_and_reschedules_after_reopen() {
+        // Break caught: periodic-only maintenance performs its immediate first
+        // turn, then leaves due retained evidence stranded until the much
+        // longer synchronization interval elapses.
+        let state = root("blob-retirement-deadline-wake");
+        fs::create_dir_all(&state).expect("retirement deadline state");
+        let services = control_test_services([0xd8; 32]);
+        let mut member = open_test_sealer(&services.member);
+        let store = Store::open_for_mission(
+            state.join(STORE_FILE),
+            services.member.mission_authority_id(),
+        )
+        .expect("retirement deadline store");
+        let source = publish_test_blob(
+            &store,
+            &mut member,
+            &services.topic,
+            &services.scope,
+            1,
+            b"retirement deadline source",
+        );
+
+        let recipients = vec![
+            ScopeRekeyRecipient::member(
+                services.authority.identity(),
+                vec![services.topic.clone()],
+            )
+            .expect("deadline authority recipient"),
+            ScopeRekeyRecipient::member(services.member.identity(), vec![services.topic.clone()])
+                .expect("deadline member recipient"),
+        ];
+        let mut authority = open_test_sealer(&services.authority);
+        let (sealed_rekey, _) = authority
+            .seal_chained_scope_rekey_control_from_registry(
+                &services.registry,
+                0,
+                services.scope.clone(),
+                2,
+                recipients,
+                1,
+                None,
+            )
+            .expect("seal deadline epoch-two rekey");
+        let verified_rekey = member
+            .verify_control(&sealed_rekey)
+            .expect("verify deadline epoch-two rekey");
+        let outcome = store
+            .ingest_verified_control(&verified_rekey, &sealed_rekey)
+            .expect("commit deadline epoch-two rekey");
+        activate_committed_controls(&store, &mut member, outcome.activated(), None)
+            .expect("activate deadline epoch-two rekey");
+
+        let clock_id = [0xd9; 16];
+        let retired_at = CustodySample {
+            clock_id,
+            tick_ms: 100,
+        };
+        let retirement = store
+            .run_blob_maintenance_turn_with_sample(
+                blob_maintenance_runtime_budget(),
+                Some(retired_at),
+            )
+            .expect("retire deadline Blob");
+        assert_eq!(
+            retirement.class,
+            aster_redb_store::BlobMaintenanceClass::ExpiredPublicationsAndPendingSources
+        );
+        assert!(matches!(
+            store.get_blob(source),
+            Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+        ));
+        let retention_deadline = retired_at.tick_ms + 3_888_000_000;
+        drop(store);
+
+        let (application_sender, application_receiver) =
+            mpsc::channel(APPLICATION_COMMAND_CAPACITY);
+        let application_admission = Arc::new(AtomicBool::new(true));
+        let selected = SelectedBlobHandle::new(
+            application_sender,
+            application_admission.clone(),
+            services.member.identity(),
+            services.member.mission_authority_id(),
+        );
+        let (_control_sender, control_receiver) = mpsc::channel(CONTROL_COMMAND_CAPACITY);
+        let (shutdown_sender, shutdown_receiver) = mpsc::channel(1);
+        let (ready_sender, ready_receiver) = oneshot::channel();
+        let (before_loop_ready, before_loop_reached) = oneshot::channel();
+        let (before_loop_release, release_loop) = oneshot::channel();
+        let (zeroization_queued, _zeroization_observer) = oneshot::channel();
+        let starts = Arc::new(AtomicUsize::new(0));
+        let (progress_sender, mut progress_receiver) = mpsc::unbounded_channel();
+        let (schedule_sender, mut schedule_receiver) = mpsc::unbounded_channel();
+        let (worker_reached_sender, mut worker_reached_receiver) = mpsc::unbounded_channel();
+        let worker_release = Arc::new(tokio::sync::Notify::new());
+        let actor = tokio::spawn(run_node_actor_inner(
+            NodeConfig {
+                state: state.clone(),
+                bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+                mission: services.member.clone(),
+                peers: Vec::new(),
+                mutable_interests: Default::default(),
+                sync_interval: Duration::from_secs(60),
+                run_for: None,
+                application: NodeApplication::Relay,
+            },
+            SelectedForwardingConfig::default(),
+            Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+            NodeActorChannels {
+                handle_sigint: false,
+                application_receiver,
+                application_admission,
+                control_receiver,
+                shutdown_receiver,
+                ready: ready_sender,
+                contact_activity: Arc::new(ContactActivityProbe::default()),
+                test_control: Some(RunNodeActorTestControl {
+                    event_operation_audit: Some(EventOperationAuditTestControl {
+                        page_size: 1_024,
+                        on_progress: Box::new(|_| {}),
+                        completion_error: None,
+                        custody_clock: Some(NodeCustodyClock::injected(
+                            clock_id,
+                            retention_deadline - 40,
+                            10,
+                        )),
+                        terminal_publication_gate: None,
+                    }),
+                    before_loop_ready,
+                    before_loop_release: release_loop,
+                    zeroization_queued,
+                    blob_worker_fatal_on_shutdown: false,
+                    blob_maintenance_gate: Some(BlobMaintenanceTestGate {
+                        starts: starts.clone(),
+                        first_reached: Arc::new(Barrier::new(1)),
+                        first_release: Arc::new(Barrier::new(1)),
+                        schedule_observations: Some(schedule_sender),
+                        completed_progress: Some(progress_sender),
+                        block_periodic: false,
+                        startup_page_entries: Arc::new(AtomicUsize::new(0)),
+                        startup_pages: Arc::new(AtomicUsize::new(0)),
+                        startup_before_worker: Arc::new(AtomicBool::new(false)),
+                        worker_constructed: Arc::new(AtomicBool::new(false)),
+                        worker_reached: Some(worker_reached_sender),
+                        worker_release: Some(worker_release.clone()),
+                    }),
+                    blob_final_read_gate: None,
+                    event_group_execution_gate: None,
+                    outbound_contact: None,
+                    contact_lifecycle: None,
+                    initial_peer_contact_activity: Vec::new(),
+                }),
+            },
+        ));
+        match timeout(Duration::from_secs(10), ready_receiver)
+            .await
+            .expect("deadline actor readiness deadline")
+        {
+            Ok(_) => {}
+            Err(error) => panic!(
+                "deadline actor readiness failed ({error}); actor={:?}",
+                actor.await
+            ),
+        }
+        before_loop_reached.await.expect("deadline actor loop gate");
+        before_loop_release
+            .send(())
+            .expect("release deadline actor loop");
+
+        let operation_topic = services.topic.clone();
+        let operation_scope = services.scope.clone();
+        let mut blob_operation = tokio::spawn(async move {
+            selected
+                .subscribe(BlobSubscriptionRequest {
+                    operation_key: b"deadline-operational-priority".to_vec(),
+                    topic: operation_topic,
+                    scope: operation_scope,
+                    include_descendant_scopes: false,
+                })
+                .await
+        });
+        timeout(Duration::from_secs(10), worker_reached_receiver.recv())
+            .await
+            .expect("deadline Blob worker permit deadline")
+            .expect("deadline Blob worker permit observation");
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let observation = schedule_receiver
+                    .recv()
+                    .await
+                    .expect("deadline maintenance schedule observation");
+                if matches!(
+                    observation,
+                    BlobMaintenanceScheduleObservation::Deferred {
+                        blob_outstanding: 1,
+                        ..
+                    }
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("deadline wake must defer to the queued Blob request");
+        assert_eq!(starts.load(Ordering::Acquire), 0);
+        worker_release.notify_one();
+        timeout(Duration::from_secs(10), &mut blob_operation)
+            .await
+            .expect("deadline Blob operation response deadline")
+            .expect("deadline Blob operation task")
+            .expect("deadline Blob operation succeeds");
+
+        timeout(Duration::from_secs(2), async {
+            let mut expired_units = 0usize;
+            while expired_units < 2 {
+                let progress = progress_receiver
+                    .recv()
+                    .await
+                    .expect("deadline progress channel remains open");
+                if progress.class
+                    == aster_redb_store::BlobMaintenanceClass::ExpiredRetirementRecords
+                    && progress.rows_examined != 0
+                {
+                    expired_units += 1;
+                }
+            }
+        })
+        .await
+        .expect("deadline wake must finish both retained records before the sync interval");
+        assert!(
+            starts.load(Ordering::Acquire) >= 2,
+            "publication and operation expiry require distinct bounded turns"
+        );
+        shutdown_sender
+            .try_send(())
+            .expect("deadline actor shutdown");
+        timeout(Duration::from_secs(10), actor)
+            .await
+            .expect("deadline actor shutdown deadline")
+            .expect("deadline actor task")
+            .expect("deadline actor shutdown");
+
+        let reopened = Store::open_for_mission(
+            state.join(STORE_FILE),
+            services.member.mission_authority_id(),
+        )
+        .expect("reopen deadline store after actor");
+        assert_eq!(
+            reopened
+                .blob_gc_status(Some(CustodySample {
+                    clock_id,
+                    tick_ms: retention_deadline,
+                }))
+                .expect("deadline status")
+                .retained_publication_records,
+            0
+        );
+        assert_eq!(
+            reopened
+                .blob_gc_status(Some(CustodySample {
+                    clock_id,
+                    tick_ms: retention_deadline,
+                }))
+                .expect("deadline status")
+                .retained_operation_records,
+            0
+        );
+        assert_eq!(
+            reopened.get_blob(source).expect("expired source lookup"),
+            None
+        );
+        drop(reopened);
+        fs::remove_dir_all(state).expect("deadline maintenance cleanup");
+    }
+
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn blob_gc_startup_runs_at_most_one_bounded_page() {
@@ -28498,6 +28978,7 @@ mod tests {
             first_reached: Arc::new(Barrier::new(1)),
             first_release: Arc::new(Barrier::new(1)),
             schedule_observations: None,
+            completed_progress: None,
             block_periodic: false,
             startup_page_entries: startup_page_entries.clone(),
             startup_pages: startup_pages.clone(),
@@ -28630,6 +29111,7 @@ mod tests {
                         first_reached: first_reached.clone(),
                         first_release: first_release.clone(),
                         schedule_observations: Some(schedule_sender),
+                        completed_progress: None,
                         block_periodic: true,
                         startup_page_entries: Arc::new(AtomicUsize::new(0)),
                         startup_pages: Arc::new(AtomicUsize::new(0)),
@@ -38135,12 +38617,22 @@ mod tests {
         }
 
         fn tamper_header(mut encoded: Vec<u8>, tamper: HeaderTamper) -> Vec<u8> {
-            // Current publication lifecycle wrapper, then v2 metadata: version
-            // + five 32-byte identities + lineage flag + two 32-byte lineages,
-            // followed by the complete authenticated header projection. Walk
-            // every variable-width field so this test fails if the durable
-            // schema changes under these adversaries.
-            assert_eq!(&encoded[..2], &[3, 1], "fixture has one live wrapper");
+            // The store owns the private lifecycle-wrapper version and tests
+            // its predecessor migration. This cross-crate adversarial test
+            // needs only the canonical live wrapper and metadata payload
+            // shape; keeping another version literal here would make a valid
+            // store migration fail before any authenticated header tamper is
+            // exercised.
+            assert_eq!(encoded.get(1), Some(&1), "fixture has one live wrapper");
+            assert!(
+                matches!(encoded.get(2).copied(), Some(1 | 2)),
+                "fixture has one canonical metadata payload"
+            );
+            // Metadata: version + five 32-byte identities + lineage flag +
+            // two 32-byte lineages, followed by the complete authenticated
+            // header projection. Walk every variable-width field so this test
+            // fails if the durable payload schema changes under these
+            // adversaries.
             let payload = 2;
             let variant_id = payload + 1 + 3 * 32;
             let mut cursor = payload + 1 + 5 * 32;
@@ -42427,6 +42919,84 @@ mod tests {
         };
         blob.transfer_plan(&manifest_bytes)
             .expect("completed test Blob plan")
+    }
+
+    #[test]
+    fn startup_blob_rebuild_skips_retired_publications_after_reopen() {
+        // Production mutation caught: passing a retired publication row to
+        // the live metadata decoder makes startup source reconstruction fail.
+        let state = root("startup-retired-blob-rebuild");
+        fs::create_dir_all(&state).expect("startup retired Blob state");
+        let services = control_test_services([0xd7; 32]);
+        let mut member = open_test_sealer(&services.member);
+        let store = Store::open_for_mission(state.join(STORE_FILE), member.mission_authority_id())
+            .expect("startup retired Blob store");
+        let source = publish_test_blob(
+            &store,
+            &mut member,
+            &services.topic,
+            &services.scope,
+            1,
+            b"startup retired Blob source",
+        );
+
+        let recipients = vec![
+            ScopeRekeyRecipient::member(
+                services.authority.identity(),
+                vec![services.topic.clone()],
+            )
+            .expect("startup authority recipient"),
+            ScopeRekeyRecipient::member(services.member.identity(), vec![services.topic.clone()])
+                .expect("startup member recipient"),
+        ];
+        let mut authority = open_test_sealer(&services.authority);
+        let (sealed_rekey, _) = authority
+            .seal_chained_scope_rekey_control_from_registry(
+                &services.registry,
+                0,
+                services.scope.clone(),
+                2,
+                recipients,
+                1,
+                None,
+            )
+            .expect("seal startup epoch-two rekey");
+        let verified_rekey = member
+            .verify_control(&sealed_rekey)
+            .expect("verify startup epoch-two rekey");
+        let outcome = store
+            .ingest_verified_control(&verified_rekey, &sealed_rekey)
+            .expect("commit startup epoch-two rekey");
+        activate_committed_controls(&store, &mut member, outcome.activated(), None)
+            .expect("activate startup epoch-two rekey");
+        let progress = store
+            .run_blob_maintenance_turn(blob_maintenance_runtime_budget())
+            .expect("retire startup epoch-one Blob");
+        assert_eq!(
+            progress.class,
+            aster_redb_store::BlobMaintenanceClass::ExpiredPublicationsAndPendingSources
+        );
+        assert!(matches!(
+            store.get_blob(source),
+            Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+        ));
+        drop(store);
+
+        let reopened = Store::open_for_mission(
+            state.join(STORE_FILE),
+            services.member.mission_authority_id(),
+        )
+        .expect("reopen retired Blob store");
+        open_startup_event_verifier_and_cache(&reopened, &services.member)
+            .expect("rebuild startup cache around retired Blob");
+        assert_eq!(
+            reopened
+                .blob_source_projection(source)
+                .expect("retired exact source projection after rebuild"),
+            None
+        );
+        drop(reopened);
+        fs::remove_dir_all(state).expect("cleanup startup retired Blob state");
     }
 
     fn stage_test_pending_blob(

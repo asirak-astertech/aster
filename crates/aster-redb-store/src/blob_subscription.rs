@@ -22,7 +22,8 @@ use super::{
     ControlPolicySnapshot, METADATA, MetadataCursor, Store, StoreError,
     blob_subscription_exact_source_matches_write, blob_subscription_identity_read,
     blob_subscription_identity_write, blob_subscription_projection_matches_write,
-    blob_subscription_projection_read, enforce_live_write, read_mission_binding,
+    blob_subscription_projection_read, blob_subscription_retirement_generation_read,
+    blob_subscription_retirement_generation_write, enforce_live_write, read_mission_binding,
     read_mission_binding_read, require_control_policy_read, require_control_policy_write,
 };
 
@@ -47,12 +48,14 @@ pub(crate) const BLOB_SELECTOR_GENERATION: &str = "semantic_blob_selector_genera
 
 const BLOB_SUBSCRIPTION_VERSION: u8 = 1;
 const BLOB_PENDING_DELIVERY_VERSION: u8 = 1;
+const BLOB_RETIRED_DELIVERY_VERSION: u8 = 2;
 const BLOB_ACKNOWLEDGEMENT_VERSION: u8 = 1;
 const BLOB_DELIVERY_CURSOR_VERSION: u8 = 1;
 const BLOB_DELIVERY_TOKEN_VERSION: u8 = 1;
 const BLOB_SUBSCRIPTION_ID_DOMAIN: &[u8] = b"aster/blob-subscription-id/v1";
 const BLOB_DELIVERY_TOKEN_DOMAIN: &[u8] = b"aster/blob-delivery-token/v1";
 const BLOB_DELIVERY_TOKEN_COUNTER_BYTES: usize = 1 + (3 * 8);
+const BLOB_PENDING_DELIVERY_RECORD_BYTES: usize = 1 + 32 + (2 * 8);
 
 /// Maximum byte length of one durable Blob subscription operation key.
 pub const MAX_BLOB_SUBSCRIPTION_KEY_BYTES: usize = 256;
@@ -371,6 +374,18 @@ struct BlobPendingDeliveryRecord {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BlobRetiredDeliveryRecord {
+    semantic_id: BlobSemanticId,
+    retirement_generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BlobDeliveryRecord {
+    Pending(BlobPendingDeliveryRecord),
+    Retired(BlobRetiredDeliveryRecord),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct BlobAcknowledgementRecord {
     acceptance_marker: u64,
     tenure: u64,
@@ -521,8 +536,17 @@ impl Store {
             let (key, value) = row?;
             let (row_subscription, _) = parse_blob_pending_delivery_key(key.value())?;
             if row_subscription == id {
-                decode_blob_pending_delivery_record(value.value())?;
-                pending_removals.push(key.value().to_vec());
+                let delivery = decode_blob_delivery_record(value.value())?;
+                let semantic_id = match delivery {
+                    BlobDeliveryRecord::Pending(record) => record.semantic_id,
+                    BlobDeliveryRecord::Retired(record) => record.semantic_id,
+                };
+                let owner = blob_subscription_identity_write(&write, semantic_id)?
+                    .ok_or(StoreError::BlobInvariant(
+                        "pending Blob delivery references a missing Blob",
+                    ))?
+                    .transfer_id;
+                pending_removals.push((key.value().to_vec(), owner));
             }
         }
         let mut acknowledgement_removals = Vec::new();
@@ -545,9 +569,12 @@ impl Store {
         }
         {
             let mut pending = write.open_table(BLOB_SUBSCRIPTION_PENDING)?;
-            for key in &pending_removals {
+            for (key, _) in &pending_removals {
                 pending.remove(key.as_slice())?;
             }
+        }
+        for (key, owner) in &pending_removals {
+            super::blob::lifecycle::remove_delivery_owner(&write, *owner, key)?;
         }
         {
             let mut acknowledgements = write.open_table(BLOB_DELIVERY_ACKNOWLEDGEMENTS)?;
@@ -866,6 +893,25 @@ impl Store {
                 pending.insert(key.as_slice(), encoded.as_slice())?;
             }
         }
+        for candidate in &retire_pending {
+            let key = blob_pending_delivery_key(plan.subscription, candidate.acceptance_marker);
+            super::blob::lifecycle::remove_delivery_owner(
+                &write,
+                candidate.projection.transfer_id,
+                &key,
+            )?;
+        }
+        for candidate in chosen
+            .iter()
+            .filter(|candidate| candidate.pending_attempt.is_none())
+        {
+            let key = blob_pending_delivery_key(plan.subscription, candidate.acceptance_marker);
+            super::blob::lifecycle::insert_delivery_owner(
+                &write,
+                candidate.projection.transfer_id,
+                &key,
+            )?;
+        }
         {
             let mut acknowledgements = write.open_table(BLOB_DELIVERY_ACKNOWLEDGEMENTS)?;
             for candidate in &retire_acknowledgements {
@@ -975,11 +1021,23 @@ impl Store {
             .map(|value| decode_blob_acknowledgement_record(value.value()))
             .transpose()?;
         let pending_key = blob_pending_delivery_key(subscription, blob.acceptance_marker);
-        let pending = write
+        let delivery_state = write
             .open_table(BLOB_SUBSCRIPTION_PENDING)?
             .get(pending_key.as_slice())?
-            .map(|value| decode_blob_pending_delivery_record(value.value()))
+            .map(|value| decode_blob_delivery_record(value.value()))
             .transpose()?;
+        if receipt.is_some() && matches!(delivery_state, Some(BlobDeliveryRecord::Retired(_))) {
+            return Err(StoreError::BlobInvariant(
+                "Blob delivery is both retired and acknowledged",
+            ));
+        }
+        if matches!(delivery_state, Some(BlobDeliveryRecord::Retired(_))) {
+            return Err(StoreError::Blob(super::BlobStoreError::ExpiredOrRetired));
+        }
+        let pending = delivery_state.map(|state| match state {
+            BlobDeliveryRecord::Pending(record) => record,
+            BlobDeliveryRecord::Retired(_) => unreachable!("retired delivery returned above"),
+        });
         if receipt.is_some() && pending.is_some() {
             return Err(StoreError::BlobInvariant(
                 "Blob delivery is both pending and acknowledged",
@@ -1060,6 +1118,7 @@ impl Store {
         {
             return Err(StoreError::BlobSubscriptionPlanChanged);
         }
+        super::blob::lifecycle::remove_delivery_owner(&write, blob.transfer_id, &pending_key)?;
         {
             cursor.last_acknowledged_tenure = pending.tenure;
             cursor.last_acknowledged_attempt = pending.attempts;
@@ -1167,9 +1226,9 @@ fn blob_subscription_candidates_read(
     for row in order.iter()? {
         let (marker, transfer) = row?;
         let marker = marker.value();
-        if marker != expected_marker {
+        if marker < expected_marker {
             return Err(StoreError::BlobInvariant(
-                "Blob acceptance-order snapshot is not consecutive",
+                "Blob acceptance-order snapshot is not strictly increasing",
             ));
         }
         expected_marker = marker
@@ -1250,9 +1309,9 @@ fn blob_subscription_candidates_write(
     for row in order.iter()? {
         let (marker, transfer) = row?;
         let marker = marker.value();
-        if marker != expected_marker {
+        if marker < expected_marker {
             return Err(StoreError::BlobInvariant(
-                "Blob acceptance-order snapshot is not consecutive",
+                "Blob acceptance-order snapshot is not strictly increasing",
             ));
         }
         expected_marker = marker
@@ -1386,7 +1445,10 @@ fn require_complete_blob_acceptance_snapshot_read(
             field: LAST_BLOB_ACCEPTANCE_MARKER,
         })?
         .value();
-    if next_marker.checked_sub(1) != Some(high_water) {
+    if next_marker
+        .checked_sub(1)
+        .is_none_or(|last| last > high_water)
+    {
         return Err(StoreError::BlobInvariant(
             "Blob acceptance-order snapshot ended before durable acceptance high-water",
         ));
@@ -1405,7 +1467,10 @@ fn require_complete_blob_acceptance_snapshot_write(
             field: LAST_BLOB_ACCEPTANCE_MARKER,
         })?
         .value();
-    if next_marker.checked_sub(1) != Some(high_water) {
+    if next_marker
+        .checked_sub(1)
+        .is_none_or(|last| last > high_water)
+    {
         return Err(StoreError::BlobInvariant(
             "Blob acceptance-order snapshot ended before durable acceptance high-water",
         ));
@@ -1575,7 +1640,7 @@ fn parse_blob_pending_delivery_key(bytes: &[u8]) -> Result<(BlobSubscriptionId, 
 }
 
 fn encode_blob_pending_delivery_record(record: BlobPendingDeliveryRecord) -> Vec<u8> {
-    let mut encoded = Vec::with_capacity(49);
+    let mut encoded = Vec::with_capacity(BLOB_PENDING_DELIVERY_RECORD_BYTES);
     encoded.push(BLOB_PENDING_DELIVERY_VERSION);
     encoded.extend_from_slice(record.semantic_id.as_bytes());
     encoded.extend_from_slice(&record.tenure.to_be_bytes());
@@ -1586,26 +1651,378 @@ fn encode_blob_pending_delivery_record(record: BlobPendingDeliveryRecord) -> Vec
 fn decode_blob_pending_delivery_record(
     bytes: &[u8],
 ) -> Result<BlobPendingDeliveryRecord, StoreError> {
+    match decode_blob_delivery_record(bytes)? {
+        BlobDeliveryRecord::Pending(record) => Ok(record),
+        BlobDeliveryRecord::Retired(_) => Err(StoreError::BlobInvariant(
+            "retired Blob delivery has no live pending attempt",
+        )),
+    }
+}
+
+fn decode_blob_delivery_record(bytes: &[u8]) -> Result<BlobDeliveryRecord, StoreError> {
     let mut cursor = MetadataCursor::new(bytes);
-    if cursor.u8()? != BLOB_PENDING_DELIVERY_VERSION {
-        return Err(StoreError::BlobInvariant(
-            "unknown Blob pending-delivery encoding version",
-        ));
-    }
+    let version = cursor.u8()?;
     let semantic_id = BlobSemanticId::new(cursor.array()?);
-    let tenure = cursor.u64()?;
-    let attempts = cursor.u64()?;
-    cursor.finish()?;
-    if tenure == 0 || attempts == 0 {
+    match version {
+        BLOB_PENDING_DELIVERY_VERSION => {
+            let tenure = cursor.u64()?;
+            let attempts = cursor.u64()?;
+            cursor.finish()?;
+            if tenure == 0 || attempts == 0 {
+                return Err(StoreError::BlobInvariant(
+                    "Blob pending-delivery tenure or attempt count is zero",
+                ));
+            }
+            Ok(BlobDeliveryRecord::Pending(BlobPendingDeliveryRecord {
+                semantic_id,
+                tenure,
+                attempts,
+            }))
+        }
+        BLOB_RETIRED_DELIVERY_VERSION => {
+            let retirement_generation = cursor.u64()?;
+            cursor.finish()?;
+            if retirement_generation == 0 {
+                return Err(StoreError::BlobInvariant(
+                    "Blob retirement delivery generation is zero",
+                ));
+            }
+            Ok(BlobDeliveryRecord::Retired(BlobRetiredDeliveryRecord {
+                semantic_id,
+                retirement_generation,
+            }))
+        }
+        _ => Err(StoreError::BlobInvariant(
+            "unknown Blob pending-delivery encoding version",
+        )),
+    }
+}
+
+fn encode_blob_retired_delivery_record(record: BlobRetiredDeliveryRecord) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(41);
+    encoded.push(BLOB_RETIRED_DELIVERY_VERSION);
+    encoded.extend_from_slice(record.semantic_id.as_bytes());
+    encoded.extend_from_slice(&record.retirement_generation.to_be_bytes());
+    encoded
+}
+
+pub(crate) fn retire_blob_deliveries_write(
+    write: &redb::WriteTransaction,
+    transfer: BlobTransferId,
+    semantic_id: BlobSemanticId,
+    retirement_generation: u64,
+) -> Result<(), StoreError> {
+    let keys = super::blob::lifecycle::delivery_keys_for_owner(write, transfer)?;
+    for key in keys {
+        let encoded = write
+            .open_table(BLOB_SUBSCRIPTION_PENDING)?
+            .get(key.as_slice())?
+            .map(|value| value.value().to_vec())
+            .ok_or(StoreError::BlobInvariant(
+                "Blob delivery owner points to a missing pending row",
+            ))?;
+        let BlobDeliveryRecord::Pending(pending) = decode_blob_delivery_record(&encoded)? else {
+            return Err(StoreError::BlobInvariant(
+                "live Blob delivery owner points to retired delivery state",
+            ));
+        };
+        if pending.semantic_id != semantic_id {
+            return Err(StoreError::BlobInvariant(
+                "Blob delivery owner points to another semantic publication",
+            ));
+        }
+        let retired = encode_blob_retired_delivery_record(BlobRetiredDeliveryRecord {
+            semantic_id,
+            retirement_generation,
+        });
+        write
+            .open_table(BLOB_SUBSCRIPTION_PENDING)?
+            .insert(key.as_slice(), retired.as_slice())?;
+    }
+    Ok(())
+}
+
+/// Incrementally computes the unique-row charge for converting every live
+/// delivery owned by one publication into retained retirement state. The
+/// forward delivery and its audited inverse owner are each admitted and
+/// charged once; unrelated acknowledgement and cursor rows are neither read
+/// nor mutated here.
+pub(crate) fn blob_delivery_retirement_charge_write(
+    write: &redb::WriteTransaction,
+    transfer: BlobTransferId,
+    semantic_id: BlobSemanticId,
+    charge: &mut super::blob::MaintenanceCharge,
+) -> Result<bool, StoreError> {
+    let (start, end) = super::blob::lifecycle::inverse_owner_bounds(transfer);
+    let owners = write.open_table(super::blob::lifecycle::BLOB_DELIVERY_OWNERS)?;
+    let pending_rows = write.open_table(BLOB_SUBSCRIPTION_PENDING)?;
+    let mut owner_rows = 0u64;
+    for row in owners.range::<&[u8]>((
+        std::ops::Bound::Included(start.as_slice()),
+        std::ops::Bound::Included(end.as_slice()),
+    ))? {
+        let (owner_key, delivery_key) = row?;
+        if !charge.charge(owner_key.value(), delivery_key.value().len())? {
+            return Ok(false);
+        }
+        if super::blob::lifecycle::inverse_owner_key(transfer, delivery_key.value()).as_slice()
+            != owner_key.value()
+        {
+            return Err(StoreError::BlobInvariant(
+                "Blob delivery inverse owner is not canonical",
+            ));
+        }
+        owner_rows = owner_rows
+            .checked_add(1)
+            .ok_or(StoreError::ItemCountAccountingOverflow)?;
+        if owner_rows > MAX_BLOB_SUBSCRIPTIONS {
+            return Err(StoreError::BlobInvariant(
+                "Blob delivery inverse-owner fan-out exceeds its structural bound",
+            ));
+        }
+        if !charge.has_capacity_for_row() {
+            return Ok(false);
+        }
+        if !charge.charge(delivery_key.value(), BLOB_PENDING_DELIVERY_RECORD_BYTES)? {
+            return Ok(false);
+        }
+        let encoded = pending_rows
+            .get(delivery_key.value())?
+            .ok_or(StoreError::BlobInvariant(
+                "Blob delivery owner points to a missing pending row",
+            ))?;
+        let BlobDeliveryRecord::Pending(pending) = decode_blob_delivery_record(encoded.value())?
+        else {
+            return Err(StoreError::BlobInvariant(
+                "live Blob delivery owner points to retired delivery state",
+            ));
+        };
+        if pending.semantic_id != semantic_id {
+            return Err(StoreError::BlobInvariant(
+                "Blob delivery owner points to another semantic publication",
+            ));
+        }
+    }
+    Ok(true)
+}
+
+fn charge_retirement_delivery_expiry_entry(
+    charge: &mut (u64, u64),
+    key: &[u8],
+    value: &[u8],
+) -> Result<(), StoreError> {
+    charge.0 = charge
+        .0
+        .checked_add(1)
+        .ok_or(StoreError::ItemCountAccountingOverflow)?;
+    charge.1 = charge
+        .1
+        .checked_add(
+            u64::try_from(key.len())
+                .ok()
+                .and_then(|bytes| bytes.checked_add(u64::try_from(value.len()).ok()?))
+                .ok_or(StoreError::PayloadByteAccountingOverflow)?,
+        )
+        .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+    Ok(())
+}
+
+/// Computes the exact bounded delivery-ledger rows that publication retirement
+/// expiry must remove.  Its result is used before the first destructive
+/// removal so a short maintenance budget cannot split a publication unit.
+struct BlobRetirementDeliveryExpiryPlan {
+    charge: (u64, u64),
+    pending_removals: Vec<Vec<u8>>,
+    acknowledgement_removals: Vec<Vec<u8>>,
+    cursor_removals: Vec<Vec<u8>>,
+}
+
+fn blob_retirement_delivery_expiry_plan_write(
+    write: &redb::WriteTransaction,
+    transfer: BlobTransferId,
+    semantic_id: BlobSemanticId,
+) -> Result<BlobRetirementDeliveryExpiryPlan, StoreError> {
+    let pending_count = write.open_table(BLOB_SUBSCRIPTION_PENDING)?.len()?;
+    let acknowledgement_count = write.open_table(BLOB_DELIVERY_ACKNOWLEDGEMENTS)?.len()?;
+    let cursor_count = write.open_table(BLOB_DELIVERY_CURSORS)?.len()?;
+    let subscription_count = write.open_table(BLOB_SUBSCRIPTIONS)?.len()?;
+    if subscription_count > MAX_BLOB_SUBSCRIPTIONS {
         return Err(StoreError::BlobInvariant(
-            "Blob pending-delivery tenure or attempt count is zero",
+            "Blob subscription rows exceed the bounded selected profile",
         ));
     }
-    Ok(BlobPendingDeliveryRecord {
-        semantic_id,
-        tenure,
-        attempts,
+    require_blob_subscription_accounting(
+        write,
+        subscription_count,
+        pending_count,
+        acknowledgement_count,
+        cursor_count,
+    )?;
+
+    let mut charge = (0u64, 0u64);
+    let mut pending_removals = Vec::new();
+    for key in super::blob::lifecycle::delivery_keys_for_owner(write, transfer)? {
+        let value = write
+            .open_table(BLOB_SUBSCRIPTION_PENDING)?
+            .get(key.as_slice())?
+            .map(|value| value.value().to_vec())
+            .ok_or(StoreError::BlobInvariant(
+                "Blob delivery owner points to a missing expiry row",
+            ))?;
+        let BlobDeliveryRecord::Retired(retired) = decode_blob_delivery_record(&value)? else {
+            return Err(StoreError::BlobInvariant(
+                "Blob delivery owner remains live during retirement expiry",
+            ));
+        };
+        if retired.semantic_id != semantic_id {
+            return Err(StoreError::BlobInvariant(
+                "Blob retirement delivery belongs to another publication",
+            ));
+        }
+        charge_retirement_delivery_expiry_entry(&mut charge, &key, &value)?;
+        // The inverse owner key is transfer-id plus a SHA-256 digest, while
+        // its value is the exact forward pending-delivery key.
+        charge_retirement_delivery_expiry_entry(&mut charge, &[0; 64], &key)?;
+        pending_removals.push(key);
+    }
+
+    let acknowledgements = write.open_table(BLOB_DELIVERY_ACKNOWLEDGEMENTS)?;
+    let cursors = write.open_table(BLOB_DELIVERY_CURSORS)?;
+    let mut acknowledgement_removals = Vec::new();
+    let mut cursor_removals = Vec::new();
+    for row in write.open_table(BLOB_SUBSCRIPTIONS)?.iter()? {
+        let (key, value) = row?;
+        let subscription = parse_blob_subscription_id(key.value())?;
+        decode_blob_subscription_record(value.value())?;
+        charge_retirement_delivery_expiry_entry(&mut charge, key.value(), value.value())?;
+
+        let acknowledgement_key = blob_acknowledgement_key(subscription, semantic_id);
+        if let Some(value) = acknowledgements.get(acknowledgement_key.as_slice())? {
+            decode_blob_acknowledgement_record(value.value())?;
+            charge_retirement_delivery_expiry_entry(
+                &mut charge,
+                acknowledgement_key.as_slice(),
+                value.value(),
+            )?;
+            acknowledgement_removals.push(acknowledgement_key.to_vec());
+        }
+
+        let cursor_key = blob_delivery_cursor_key(subscription, semantic_id);
+        if let Some(value) = cursors.get(cursor_key.as_slice())? {
+            decode_blob_delivery_cursor_record(value.value())?;
+            charge_retirement_delivery_expiry_entry(
+                &mut charge,
+                cursor_key.as_slice(),
+                value.value(),
+            )?;
+            cursor_removals.push(cursor_key.to_vec());
+        }
+    }
+    Ok(BlobRetirementDeliveryExpiryPlan {
+        charge,
+        pending_removals,
+        acknowledgement_removals,
+        cursor_removals,
     })
+}
+
+pub(crate) fn blob_retirement_delivery_expiry_charge_write(
+    write: &redb::WriteTransaction,
+    transfer: BlobTransferId,
+    semantic_id: BlobSemanticId,
+) -> Result<(u64, u64), StoreError> {
+    Ok(blob_retirement_delivery_expiry_plan_write(write, transfer, semantic_id)?.charge)
+}
+
+/// Removes the delivery ledger that is meaningful only while one compact
+/// publication-retirement row remains addressable.  The caller keeps the
+/// publication row available until this transaction has validated and removed
+/// every dependent row.
+pub(crate) fn expire_blob_retirement_deliveries_write(
+    write: &redb::WriteTransaction,
+    transfer: BlobTransferId,
+    semantic_id: BlobSemanticId,
+) -> Result<(u64, u64), StoreError> {
+    let plan = blob_retirement_delivery_expiry_plan_write(write, transfer, semantic_id)?;
+    let charge = plan.charge;
+    let pending_count = write.open_table(BLOB_SUBSCRIPTION_PENDING)?.len()?;
+    let acknowledgement_count = write.open_table(BLOB_DELIVERY_ACKNOWLEDGEMENTS)?.len()?;
+    let cursor_count = write.open_table(BLOB_DELIVERY_CURSORS)?.len()?;
+    let subscription_count = write.open_table(BLOB_SUBSCRIPTIONS)?.len()?;
+    require_blob_subscription_accounting(
+        write,
+        subscription_count,
+        pending_count,
+        acknowledgement_count,
+        cursor_count,
+    )?;
+
+    {
+        let mut pending = write.open_table(BLOB_SUBSCRIPTION_PENDING)?;
+        for key in &plan.pending_removals {
+            if pending.remove(key.as_slice())?.is_none() {
+                return Err(StoreError::BlobInvariant(
+                    "Blob retirement delivery disappeared during expiry",
+                ));
+            }
+        }
+    }
+    for key in &plan.pending_removals {
+        super::blob::lifecycle::remove_delivery_owner(write, transfer, key)?;
+    }
+    {
+        let mut acknowledgements = write.open_table(BLOB_DELIVERY_ACKNOWLEDGEMENTS)?;
+        for key in &plan.acknowledgement_removals {
+            if acknowledgements.remove(key.as_slice())?.is_none() {
+                return Err(StoreError::BlobInvariant(
+                    "Blob acknowledgement disappeared during retirement expiry",
+                ));
+            }
+        }
+    }
+    {
+        let mut cursors = write.open_table(BLOB_DELIVERY_CURSORS)?;
+        for key in &plan.cursor_removals {
+            if cursors.remove(key.as_slice())?.is_none() {
+                return Err(StoreError::BlobInvariant(
+                    "Blob delivery cursor disappeared during retirement expiry",
+                ));
+            }
+        }
+    }
+
+    let removed_pending = u64::try_from(plan.pending_removals.len())
+        .map_err(|_| StoreError::ItemCountAccountingOverflow)?;
+    let removed_acknowledgements = u64::try_from(plan.acknowledgement_removals.len())
+        .map_err(|_| StoreError::ItemCountAccountingOverflow)?;
+    let removed_cursors = u64::try_from(plan.cursor_removals.len())
+        .map_err(|_| StoreError::ItemCountAccountingOverflow)?;
+    let mut metadata = write.open_table(METADATA)?;
+    metadata.insert(
+        BLOB_PENDING_DELIVERY_COUNT,
+        pending_count
+            .checked_sub(removed_pending)
+            .ok_or(StoreError::BlobInvariant(
+                "Blob pending-delivery accounting underflows on retirement expiry",
+            ))?,
+    )?;
+    metadata.insert(
+        BLOB_ACKNOWLEDGEMENT_COUNT,
+        acknowledgement_count
+            .checked_sub(removed_acknowledgements)
+            .ok_or(StoreError::BlobInvariant(
+                "Blob acknowledgement accounting underflows on retirement expiry",
+            ))?,
+    )?;
+    metadata.insert(
+        BLOB_DELIVERY_CURSOR_COUNT,
+        cursor_count
+            .checked_sub(removed_cursors)
+            .ok_or(StoreError::BlobInvariant(
+                "Blob delivery-cursor accounting underflows on retirement expiry",
+            ))?,
+    )?;
+    Ok(charge)
 }
 
 fn blob_acknowledgement_key(
@@ -1892,22 +2309,71 @@ fn backfill_blob_acceptance_order(write: &redb::WriteTransaction) -> Result<(), 
     Ok(())
 }
 
+fn live_blob_publication_rows(
+    publications: &impl ReadableTable<&'static [u8], &'static [u8]>,
+) -> Result<u64, StoreError> {
+    let mut live = 0u64;
+    for row in publications.iter()? {
+        let (_, value) = row?;
+        if !crate::blob::lifecycle::publication_record_is_retired(value.value())
+            .map_err(StoreError::Blob)?
+        {
+            live = live
+                .checked_add(1)
+                .ok_or(StoreError::ItemCountAccountingOverflow)?;
+        }
+    }
+    Ok(live)
+}
+
+fn publication_is_live(
+    publications: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    transfer: BlobTransferId,
+) -> Result<bool, StoreError> {
+    let Some(publication) = publications.get(transfer.as_bytes().as_slice())? else {
+        return Ok(false);
+    };
+    crate::blob::lifecycle::publication_record_is_retired(publication.value())
+        .map(|retired| !retired)
+        .map_err(StoreError::Blob)
+}
+
+fn retired_acceptance_markers(
+    publications: &impl ReadableTable<&'static [u8], &'static [u8]>,
+) -> Result<BTreeSet<u64>, StoreError> {
+    let mut markers = BTreeSet::new();
+    for row in publications.iter()? {
+        let (_, value) = row?;
+        if let Some((marker, _)) =
+            crate::blob::lifecycle::retired_publication_payload(value.value())
+                .map_err(StoreError::Blob)?
+            && !markers.insert(marker)
+        {
+            return Err(StoreError::BlobInvariant(
+                "retired Blob acceptance marker is reused",
+            ));
+        }
+    }
+    Ok(markers)
+}
+
 fn audit_blob_acceptance_order_write(write: &redb::WriteTransaction) -> Result<(), StoreError> {
     let order = write.open_table(BLOB_ACCEPTANCE_ORDER)?;
     let markers = write.open_table(BLOB_ACCEPTANCE_MARKERS)?;
     let publications = write.open_table(BLOB_PUBLICATIONS)?;
-    if order.len()? != markers.len()? || order.len()? != publications.len()? {
+    if order.len()? != markers.len()? || order.len()? != live_blob_publication_rows(&publications)?
+    {
         return Err(StoreError::BlobInvariant(
             "Blob acceptance-order index has missing or orphan rows",
         ));
     }
-    let mut expected = 1u64;
+    let mut all_markers = retired_acceptance_markers(&publications)?;
     for row in order.iter()? {
         let (marker, transfer) = row?;
         let marker = marker.value();
         let transfer = parse_blob_subscription_transfer_id(transfer.value())?;
-        if marker != expected
-            || publications.get(transfer.as_bytes().as_slice())?.is_none()
+        if !all_markers.insert(marker)
+            || !publication_is_live(&publications, transfer)?
             || markers
                 .get(transfer.as_bytes().as_slice())?
                 .map(|value| value.value())
@@ -1917,11 +2383,23 @@ fn audit_blob_acceptance_order_write(write: &redb::WriteTransaction) -> Result<(
                 "Blob acceptance-order index differs from its forward authority",
             ));
         }
-        expected = expected
-            .checked_add(1)
-            .ok_or(StoreError::AcceptanceMarkerExhausted)?;
     }
-    require_complete_blob_acceptance_snapshot_write(write, expected)
+    let high_water = write
+        .open_table(METADATA)?
+        .get(LAST_BLOB_ACCEPTANCE_MARKER)?
+        .ok_or(StoreError::MissingAccountingMetadata {
+            field: LAST_BLOB_ACCEPTANCE_MARKER,
+        })?
+        .value();
+    if all_markers
+        .iter()
+        .any(|marker| *marker == 0 || *marker > high_water)
+    {
+        return Err(StoreError::BlobInvariant(
+            "Blob acceptance history exceeds its durable high-water",
+        ));
+    }
+    Ok(())
 }
 
 fn audit_blob_subscription_rows_write(
@@ -1985,17 +2463,22 @@ fn audit_blob_subscription_ledgers_write(
     subscriptions: &BTreeMap<BlobSubscriptionId, BlobSubscriptionRecord>,
 ) -> Result<(), StoreError> {
     let mut pending_records = BTreeMap::new();
+    let mut retired_records = BTreeMap::new();
     for row in write.open_table(BLOB_SUBSCRIPTION_PENDING)?.iter()? {
         let (key, value) = row?;
         let (subscription, marker) = parse_blob_pending_delivery_key(key.value())?;
-        let record = decode_blob_pending_delivery_record(value.value())?;
+        let record = decode_blob_delivery_record(value.value())?;
+        let semantic_id = match record {
+            BlobDeliveryRecord::Pending(record) => record.semantic_id,
+            BlobDeliveryRecord::Retired(record) => record.semantic_id,
+        };
         let spec = &subscriptions
             .get(&subscription)
             .ok_or(StoreError::BlobInvariant(
                 "pending Blob delivery references a missing subscription",
             ))?
             .spec;
-        let blob = load_blob_by_semantic_from_write(write, record.semantic_id)?.ok_or(
+        let blob = load_blob_by_semantic_from_write(write, semantic_id)?.ok_or(
             StoreError::BlobInvariant("pending Blob delivery references a missing Blob"),
         )?;
         if blob.acceptance_marker != marker || !spec.matches_identity(&blob) {
@@ -2003,13 +2486,25 @@ fn audit_blob_subscription_ledgers_write(
                 "pending Blob delivery differs from its subscription ledger",
             ));
         }
-        if pending_records
-            .insert((subscription, record.semantic_id), record)
-            .is_some()
-        {
-            return Err(StoreError::BlobInvariant(
-                "duplicate pending Blob semantic delivery",
-            ));
+        let id = (subscription, semantic_id);
+        match record {
+            BlobDeliveryRecord::Pending(record) => {
+                if pending_records.insert(id, record).is_some() {
+                    return Err(StoreError::BlobInvariant(
+                        "duplicate pending Blob semantic delivery",
+                    ));
+                }
+            }
+            BlobDeliveryRecord::Retired(record) => {
+                if blob_subscription_retirement_generation_write(write, blob.transfer_id)?
+                    != Some(record.retirement_generation)
+                    || retired_records.insert(id, record).is_some()
+                {
+                    return Err(StoreError::BlobInvariant(
+                        "Blob retirement delivery differs from its publication retirement",
+                    ));
+                }
+            }
         }
     }
     let mut acknowledgement_records = BTreeMap::new();
@@ -2058,17 +2553,28 @@ fn audit_blob_subscription_ledgers_write(
             ));
         }
         let id = (subscription, semantic_id);
-        validate_blob_candidate_delivery_ledger(
-            semantic_id,
-            blob.acceptance_marker,
-            pending_records.get(&id).copied(),
-            acknowledgement_records.get(&id).copied(),
-            Some(cursor),
-        )?;
+        if retired_records.contains_key(&id) {
+            if acknowledgement_records.contains_key(&id)
+                || cursor.acceptance_marker != blob.acceptance_marker
+            {
+                return Err(StoreError::BlobInvariant(
+                    "Blob retirement delivery differs from its monotonic cursor",
+                ));
+            }
+        } else {
+            validate_blob_candidate_delivery_ledger(
+                semantic_id,
+                blob.acceptance_marker,
+                pending_records.get(&id).copied(),
+                acknowledgement_records.get(&id).copied(),
+                Some(cursor),
+            )?;
+        }
         cursor_ids.insert(id);
     }
     if pending_records
         .keys()
+        .chain(retired_records.keys())
         .chain(acknowledgement_records.keys())
         .any(|id| !cursor_ids.contains(id))
     {
@@ -2105,6 +2611,57 @@ fn validate_blob_subscription_stats(
         stats.delivery_cursors,
     )?;
     Ok(())
+}
+
+pub(crate) fn lifecycle_delivery_owners_write(
+    write: &redb::WriteTransaction,
+) -> Result<Vec<(BlobTransferId, Vec<u8>)>, StoreError> {
+    let mut owners = Vec::new();
+    for row in write.open_table(BLOB_SUBSCRIPTION_PENDING)?.iter()? {
+        let (key, value) = row?;
+        parse_blob_pending_delivery_key(key.value())?;
+        let delivery = decode_blob_delivery_record(value.value())?;
+        let semantic_id = match delivery {
+            BlobDeliveryRecord::Pending(record) => record.semantic_id,
+            BlobDeliveryRecord::Retired(record) => record.semantic_id,
+        };
+        let owner = blob_subscription_identity_write(write, semantic_id)?
+            .ok_or(StoreError::BlobInvariant(
+                "pending Blob delivery references a missing Blob",
+            ))?
+            .transfer_id;
+        owners.push((owner, key.value().to_vec()));
+    }
+    Ok(owners)
+}
+
+pub(crate) fn lifecycle_delivery_owners_read(
+    read: &redb::ReadTransaction,
+) -> Result<Vec<(BlobTransferId, Vec<u8>)>, StoreError> {
+    let table_names = read
+        .list_tables()?
+        .map(|table| table.name().to_owned())
+        .collect::<BTreeSet<_>>();
+    if !table_names.contains(BLOB_SUBSCRIPTION_PENDING.name()) {
+        return Ok(Vec::new());
+    }
+    let mut owners = Vec::new();
+    for row in read.open_table(BLOB_SUBSCRIPTION_PENDING)?.iter()? {
+        let (key, value) = row?;
+        parse_blob_pending_delivery_key(key.value())?;
+        let delivery = decode_blob_delivery_record(value.value())?;
+        let semantic_id = match delivery {
+            BlobDeliveryRecord::Pending(record) => record.semantic_id,
+            BlobDeliveryRecord::Retired(record) => record.semantic_id,
+        };
+        let owner = blob_subscription_identity_read(read, semantic_id)?
+            .ok_or(StoreError::BlobInvariant(
+                "pending Blob delivery references a missing Blob",
+            ))?
+            .transfer_id;
+        owners.push((owner, key.value().to_vec()));
+    }
+    Ok(owners)
 }
 
 pub(crate) fn inspect_blob_subscription_tables(
@@ -2170,17 +2727,22 @@ pub(crate) fn inspect_blob_subscription_tables(
         subscriptions.insert(id, record);
     }
     let mut pending_records = BTreeMap::new();
+    let mut retired_records = BTreeMap::new();
     for row in read.open_table(BLOB_SUBSCRIPTION_PENDING)?.iter()? {
         let (key, value) = row?;
         let (subscription, marker) = parse_blob_pending_delivery_key(key.value())?;
-        let record = decode_blob_pending_delivery_record(value.value())?;
+        let record = decode_blob_delivery_record(value.value())?;
+        let semantic_id = match record {
+            BlobDeliveryRecord::Pending(record) => record.semantic_id,
+            BlobDeliveryRecord::Retired(record) => record.semantic_id,
+        };
         let spec = &subscriptions
             .get(&subscription)
             .ok_or(StoreError::BlobInvariant(
                 "pending Blob delivery references a missing subscription",
             ))?
             .spec;
-        let blob = load_blob_by_semantic_from_read(read, record.semantic_id)?.ok_or(
+        let blob = load_blob_by_semantic_from_read(read, semantic_id)?.ok_or(
             StoreError::BlobInvariant("pending Blob delivery references a missing Blob"),
         )?;
         if blob.acceptance_marker != marker || !spec.matches_identity(&blob) {
@@ -2188,13 +2750,25 @@ pub(crate) fn inspect_blob_subscription_tables(
                 "pending Blob delivery differs from its subscription ledger",
             ));
         }
-        if pending_records
-            .insert((subscription, record.semantic_id), record)
-            .is_some()
-        {
-            return Err(StoreError::BlobInvariant(
-                "duplicate pending Blob semantic delivery",
-            ));
+        let id = (subscription, semantic_id);
+        match record {
+            BlobDeliveryRecord::Pending(record) => {
+                if pending_records.insert(id, record).is_some() {
+                    return Err(StoreError::BlobInvariant(
+                        "duplicate pending Blob semantic delivery",
+                    ));
+                }
+            }
+            BlobDeliveryRecord::Retired(record) => {
+                if blob_subscription_retirement_generation_read(read, blob.transfer_id)?
+                    != Some(record.retirement_generation)
+                    || retired_records.insert(id, record).is_some()
+                {
+                    return Err(StoreError::BlobInvariant(
+                        "Blob retirement delivery differs from its publication retirement",
+                    ));
+                }
+            }
         }
     }
     let mut acknowledgement_records = BTreeMap::new();
@@ -2243,17 +2817,28 @@ pub(crate) fn inspect_blob_subscription_tables(
             ));
         }
         let id = (subscription, semantic_id);
-        validate_blob_candidate_delivery_ledger(
-            semantic_id,
-            blob.acceptance_marker,
-            pending_records.get(&id).copied(),
-            acknowledgement_records.get(&id).copied(),
-            Some(cursor),
-        )?;
+        if retired_records.contains_key(&id) {
+            if acknowledgement_records.contains_key(&id)
+                || cursor.acceptance_marker != blob.acceptance_marker
+            {
+                return Err(StoreError::BlobInvariant(
+                    "Blob retirement delivery differs from its monotonic cursor",
+                ));
+            }
+        } else {
+            validate_blob_candidate_delivery_ledger(
+                semantic_id,
+                blob.acceptance_marker,
+                pending_records.get(&id).copied(),
+                acknowledgement_records.get(&id).copied(),
+                Some(cursor),
+            )?;
+        }
         cursor_ids.insert(id);
     }
     if pending_records
         .keys()
+        .chain(retired_records.keys())
         .chain(acknowledgement_records.keys())
         .any(|id| !cursor_ids.contains(id))
     {
@@ -2314,18 +2899,19 @@ fn audit_blob_acceptance_order_read(read: &redb::ReadTransaction) -> Result<(), 
     let order = read.open_table(BLOB_ACCEPTANCE_ORDER)?;
     let markers = read.open_table(BLOB_ACCEPTANCE_MARKERS)?;
     let publications = read.open_table(BLOB_PUBLICATIONS)?;
-    if order.len()? != markers.len()? || order.len()? != publications.len()? {
+    if order.len()? != markers.len()? || order.len()? != live_blob_publication_rows(&publications)?
+    {
         return Err(StoreError::BlobInvariant(
             "Blob acceptance-order index has missing or orphan rows",
         ));
     }
-    let mut expected = 1u64;
+    let mut all_markers = retired_acceptance_markers(&publications)?;
     for row in order.iter()? {
         let (marker, transfer) = row?;
         let marker = marker.value();
         let transfer = parse_blob_subscription_transfer_id(transfer.value())?;
-        if marker != expected
-            || publications.get(transfer.as_bytes().as_slice())?.is_none()
+        if !all_markers.insert(marker)
+            || !publication_is_live(&publications, transfer)?
             || markers
                 .get(transfer.as_bytes().as_slice())?
                 .map(|value| value.value())
@@ -2335,11 +2921,23 @@ fn audit_blob_acceptance_order_read(read: &redb::ReadTransaction) -> Result<(), 
                 "Blob acceptance-order index differs from its forward authority",
             ));
         }
-        expected = expected
-            .checked_add(1)
-            .ok_or(StoreError::AcceptanceMarkerExhausted)?;
     }
-    require_complete_blob_acceptance_snapshot_read(read, expected)
+    let high_water = read
+        .open_table(METADATA)?
+        .get(LAST_BLOB_ACCEPTANCE_MARKER)?
+        .ok_or(StoreError::MissingAccountingMetadata {
+            field: LAST_BLOB_ACCEPTANCE_MARKER,
+        })?
+        .value();
+    if all_markers
+        .iter()
+        .any(|marker| *marker == 0 || *marker > high_water)
+    {
+        return Err(StoreError::BlobInvariant(
+            "Blob acceptance history exceeds its durable high-water",
+        ));
+    }
+    Ok(())
 }
 
 fn parse_blob_subscription_id(bytes: &[u8]) -> Result<BlobSubscriptionId, StoreError> {

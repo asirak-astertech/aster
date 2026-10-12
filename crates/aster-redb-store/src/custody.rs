@@ -2563,7 +2563,7 @@ fn initialize_custody_schema(
     // performs the exact classified ordinary/control/tombstone check after its
     // reconstructed custody counters are staged in this same atomic writer.
     if mission_authority.is_none() {
-        require_aggregate_capacity(&write.open_table(METADATA)?, limits, 0, 0)?;
+        require_aggregate_capacity(write, &write.open_table(METADATA)?, limits, 0, 0)?;
     }
     let mut backfill = Vec::<(CustodyObjectKey, CustodyItemRecord)>::new();
     let mut total_bytes = 0u64;
@@ -4088,7 +4088,13 @@ pub(crate) fn make_aggregate_capacity_write(
     let fits = |write: &redb::WriteTransaction| -> Result<(), StoreError> {
         let metadata = write.open_table(METADATA)?;
         if request.emergency {
-            require_aggregate_capacity(&metadata, limits, request.usage.items, request.usage.bytes)
+            require_aggregate_capacity(
+                write,
+                &metadata,
+                limits,
+                request.usage.items,
+                request.usage.bytes,
+            )
         } else {
             require_ordinary_aggregate_capacity(
                 write,

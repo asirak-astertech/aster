@@ -435,8 +435,11 @@ then schedules background pages behind operational priority and yields between
 bounded filesystem units. An exact depot byte, chunk, or variant capacity
 failure may run one separately bounded, cursor-neutral pass over exact
 already-unreferenced work and retry the admission once. Other resource limits
-do not trigger that pass. It does not select live content. Live retirement,
-retention/retirement expiry, pressure eviction, and finite Blob TTL are not
+do not trigger that pass. Policy-invalidated live publications are retired as
+one bounded atomic unit with their operation and delivery aliases; permanent
+fences remain, and retained retirement records expire after 45 days of
+accumulated conservative lower-bound age. Finite Blob TTL, pressure eviction,
+route-only custody, and public protocol/API/CLI lifecycle controls are not
 implemented.
 
 ## Live application command and status flow

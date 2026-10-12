@@ -86,15 +86,18 @@ running.shutdown().await?;
 # }
 ```
 
-`StoreLimits` bounds logical retained rows and encoded bytes in the selected
-store's accounted aggregate namespaces. It does not measure redb allocation,
-filesystem blocks, snapshots, swap, backups, Blob-depot files, or the separate
-selector, delivery, custody-ledger, and causal/frontier tables. Those tables use
-their stated independent hard caps where defined; accepted-dot/frontier
-accounting remains a separately documented open boundary. The store preserves a
-separate bounded authority reserve;
-ordinary data cannot consume the capacity promised to retained controls and
-selected Event tombstones. An exact-scope `CustodyQuota` further limits ordinary
+`StoreLimits` bounds logical retained rows and charged logical payload bytes in
+the selected store's accounted aggregate namespaces. Charged bytes equal
+physical accounted payload/source bytes plus the exact future retirement-growth
+reserve for active Blob operations; `BlobStoreStats::operation_bytes` remains
+physical. The limit does not measure redb allocation, filesystem blocks,
+snapshots, swap, backups, Blob-depot files, or the separate selector, delivery,
+custody-ledger, and causal/frontier tables. Those tables use their stated
+independent hard caps where defined; accepted-dot/frontier accounting remains a
+separately documented open boundary. The store preserves a separate bounded
+authority reserve; ordinary data cannot consume the capacity promised to
+retained controls and selected Event tombstones. An exact-scope `CustodyQuota`
+further limits ordinary
 accepted and route-only Event custody for that scope.
 
 Configuration is installed before readiness. Invalid, duplicate-conflicting,

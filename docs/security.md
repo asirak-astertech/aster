@@ -753,8 +753,12 @@ Physical deletion then uses descriptor-relative bounded units, records retryable
 failures without exposing paths, reconciles ambiguous restart state, and keeps
 all captured accounting charged until finalization. Operational work retains
 priority over periodic pages, while the capacity-only pass is cursor-neutral and
-never chooses live content. Live retirement, retention/retirement expiry,
-pressure eviction, and finite Blob TTL are not implemented.
+never chooses live content. Policy-invalidated live publications are retired
+as one bounded atomic unit with their operation and delivery aliases; permanent
+fences remain, and retained retirement records expire after 45 days of
+accumulated conservative lower-bound age. Finite Blob TTL, pressure eviction,
+route-only custody, and public protocol/API/CLI lifecycle controls are not
+implemented.
 
 ### Selected semantic-v6 Event-bridge isolation
 

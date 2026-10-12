@@ -136,10 +136,13 @@ Configure tombstone and superseded-version retention through
 [`ApplicationNodeOptions`](../crates/aster-core/src/api.rs) and align it with
 the deployment’s actual offline tolerance.
 
-The selected runtime does not provide retention-driven State, Record, or Blob
-collection. Blob maintenance only reclaims exact already-unreferenced staging
-and completed variants; it does not implement live retirement, retention
-expiry, pressure eviction, or finite Blob TTL. See the
+The selected runtime does not provide retention-driven State or Record
+collection. Blob maintenance reclaims exact already-unreferenced staging and
+completed variants, atomically retires current-policy-invalidated publications
+and their aliases, and expires those retained retirement records after 45 days
+of accumulated conservative lower-bound age. It does not implement finite Blob
+TTL, pressure eviction, route-only custody, or public protocol/API/CLI lifecycle
+controls. See the
 [current implementation boundary](../README.md#current-implementation-boundary).
 
 ### Priority and TTL

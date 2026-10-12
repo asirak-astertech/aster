@@ -28,10 +28,10 @@ use aster_mesh::{
     prepare_blob,
 };
 use aster_redb_store::{
-    BlobDeliveryAck as StoreBlobDeliveryAck, BlobDeliveryToken as StoreBlobDeliveryToken,
-    BlobDepotCompletion, BlobMaintenanceBudget, BlobOperationKey, BlobOperationRequest,
-    BlobPublicationDisposition, BlobPublicationIntent, BlobReadPlan, BlobSemanticId,
-    BlobSourceProjection, BlobSourceRetention, BlobStoreError,
+    BlobCapacityGcTarget, BlobDeliveryAck as StoreBlobDeliveryAck,
+    BlobDeliveryToken as StoreBlobDeliveryToken, BlobDepotCompletion, BlobMaintenanceBudget,
+    BlobOperationKey, BlobOperationRequest, BlobPublicationDisposition, BlobPublicationIntent,
+    BlobReadPlan, BlobSemanticId, BlobSourceProjection, BlobSourceRetention, BlobStoreError,
     BlobSubscriptionId as StoreBlobSubscriptionId, BlobSubscriptionKey,
     BlobSubscriptionPollSelection, BlobSubscriptionRemoveOutcome, BlobSubscriptionSpec,
     BlobTransferStatusSnapshot as StoreBlobTransferStatusSnapshot, BlobVariantId,
@@ -1165,6 +1165,10 @@ pub struct SelectedBlobNode {
     #[cfg(test)]
     capacity_gc_attempts: u64,
     #[cfg(test)]
+    capacity_gc_targets: Vec<BlobCapacityGcTarget>,
+    #[cfg(test)]
+    injected_capacity_failures: std::collections::VecDeque<BlobStoreError>,
+    #[cfg(test)]
     publish_attempts: u64,
     #[cfg(test)]
     last_live_publish_source_bytes_read: u64,
@@ -1249,6 +1253,10 @@ impl SelectedBlobNode {
             #[cfg(test)]
             capacity_gc_attempts: 0,
             #[cfg(test)]
+            capacity_gc_targets: Vec::new(),
+            #[cfg(test)]
+            injected_capacity_failures: std::collections::VecDeque::new(),
+            #[cfg(test)]
             publish_attempts: 0,
             #[cfg(test)]
             last_live_publish_source_bytes_read: 0,
@@ -1288,6 +1296,10 @@ impl SelectedBlobNode {
             live_poll_postcommit_completion_fault: false,
             #[cfg(test)]
             capacity_gc_attempts: 0,
+            #[cfg(test)]
+            capacity_gc_targets: Vec::new(),
+            #[cfg(test)]
+            injected_capacity_failures: std::collections::VecDeque::new(),
             #[cfg(test)]
             publish_attempts: 0,
             #[cfg(test)]
@@ -1472,8 +1484,12 @@ impl SelectedBlobNode {
     ) -> Result<BlobPublishResult, ApplicationError> {
         let retry_request = request.clone();
         match self.publish_inner(request, source, None) {
-            Err(error) if error.is_recoverable_blob_depot_capacity() => {
-                self.run_capacity_gc_before_retry()?;
+            Err(error) if error.is_recoverable_blob_capacity() => {
+                self.run_capacity_gc_before_retry(
+                    error
+                        .recoverable_blob_capacity_target()
+                        .expect("recoverable capacity error has an internal target"),
+                )?;
                 source
                     .seek(std::io::SeekFrom::Start(0))
                     .map_err(|error| application_error("blob publish", error.into()))?;
@@ -1558,9 +1574,13 @@ impl SelectedBlobNode {
         };
         let retry_request = request.clone();
         let result = match self.publish_inner(request, &mut source, Some(&mut context)) {
-            Err(error) if error.is_recoverable_blob_depot_capacity() => {
+            Err(error) if error.is_recoverable_blob_capacity() => {
                 context.require_admission()?;
-                self.run_capacity_gc_before_retry()?;
+                self.run_capacity_gc_before_retry(
+                    error
+                        .recoverable_blob_capacity_target()
+                        .expect("recoverable capacity error has an internal target"),
+                )?;
                 context.require_admission()?;
                 source
                     .seek(std::io::SeekFrom::Start(0))
@@ -1576,19 +1596,27 @@ impl SelectedBlobNode {
         result
     }
 
-    fn run_capacity_gc_before_retry(&mut self) -> Result<(), ApplicationError> {
+    fn run_capacity_gc_before_retry(
+        &mut self,
+        target: BlobCapacityGcTarget,
+    ) -> Result<(), ApplicationError> {
         #[cfg(test)]
         {
             self.capacity_gc_attempts = self.capacity_gc_attempts.saturating_add(1);
+            self.capacity_gc_targets.push(target);
         }
-        let budget = BlobMaintenanceBudget::new(64, 16, 128 * 1024 * 1024)
-            .expect("selected capacity GC bounds are nonzero");
+        let budget = BlobMaintenanceBudget::new(
+            6 + 4 * aster_redb_store::MAX_BLOB_SUBSCRIPTIONS,
+            16,
+            128 * 1024 * 1024,
+        )
+        .expect("selected capacity GC bounds are nonzero");
         let sample = self
             .custody_clock
             .sample()
             .map_err(|error| application_error("blob publish", error))?;
         self.store
-            .run_blob_capacity_gc(budget, Some(sample))
+            .run_blob_capacity_gc_for(target, budget, Some(sample))
             .map(|_| ())
             .map_err(|error| application_error("blob publish", error.into()))
     }
@@ -1602,6 +1630,12 @@ impl SelectedBlobNode {
         #[cfg(test)]
         {
             self.publish_attempts = self.publish_attempts.saturating_add(1);
+            if let Some(error) = self.injected_capacity_failures.pop_front() {
+                return Err(blob_store_application_error(
+                    "blob publish",
+                    StoreError::Blob(error),
+                ));
+            }
         }
         let BlobPublishRequest {
             operation_key,
@@ -1883,7 +1917,7 @@ impl SelectedBlobNode {
                         "blob publish",
                     ));
                 }
-                return Err(application_error("blob publish", error.into()));
+                return Err(blob_store_application_error("blob publish", error));
             }
         };
         drop(local_import_lease);
@@ -3513,22 +3547,41 @@ fn blob_prepare_error(error: BlobError) -> ApplicationError {
     }
 }
 
-fn blob_store_error_recoverable_capacity(error: &BlobStoreError) -> bool {
-    matches!(
-        error,
+fn blob_store_error_recoverable_capacity(error: &BlobStoreError) -> Option<BlobCapacityGcTarget> {
+    match error {
         BlobStoreError::DepotByteLimitExceeded { .. }
-            | BlobStoreError::DepotChunkLimitExceeded { .. }
-            | BlobStoreError::DepotVariantLimitExceeded { .. }
-    )
+        | BlobStoreError::DepotChunkLimitExceeded { .. }
+        | BlobStoreError::DepotVariantLimitExceeded { .. } => Some(BlobCapacityGcTarget::Depot),
+        BlobStoreError::OperationLimitExceeded { .. }
+        | BlobStoreError::OperationByteLimitExceeded { .. } => {
+            Some(BlobCapacityGcTarget::Operation)
+        }
+        BlobStoreError::PublicationLifecycleCapacity { .. } => {
+            Some(BlobCapacityGcTarget::PublicationLifecycle)
+        }
+        _ => None,
+    }
 }
 
-fn blob_error_recoverable_capacity(error: &BlobError) -> bool {
+fn blob_store_application_error(operation: &'static str, error: StoreError) -> ApplicationError {
+    if let StoreError::Blob(blob_error) = &error
+        && let Some(target) = blob_store_error_recoverable_capacity(blob_error)
+    {
+        return ApplicationError::recoverable_blob_capacity(operation, target);
+    }
+    application_error(operation, error.into())
+}
+
+fn blob_error_recoverable_capacity(error: &BlobError) -> Option<BlobCapacityGcTarget> {
     let BlobError::Store(adapter) = error else {
-        return false;
+        return None;
     };
     adapter
         .downcast_ref::<StoreError>()
-        .is_some_and(|error| matches!(error, StoreError::Blob(error) if blob_store_error_recoverable_capacity(error)))
+        .and_then(|error| match error {
+            StoreError::Blob(error) => blob_store_error_recoverable_capacity(error),
+            _ => None,
+        })
 }
 
 fn live_blob_core_error(
@@ -3550,8 +3603,8 @@ fn live_blob_core_error(
                 ));
                 return ApplicationError::new(ApplicationErrorKind::Integrity, "blob publish");
             }
-            if blob_error_recoverable_capacity(&error) {
-                return ApplicationError::recoverable_blob_depot_capacity("blob publish");
+            if let Some(target) = blob_error_recoverable_capacity(&error) {
+                return ApplicationError::recoverable_blob_capacity("blob publish", target);
             }
             return ApplicationError::new(store_error_kind(store_error), "blob publish");
         }
@@ -3801,6 +3854,52 @@ mod tests {
         }
         SelectedBlobNode::open_unprotected_reference(root.path(), root.mission_path())
             .expect("open selected Blob node")
+    }
+
+    fn selected_node_with_lifecycle_limits_and_clock(
+        root: &TestRoot,
+        limits: aster_redb_store::BlobLifecycleLimits,
+        custody_clock: NodeCustodyClock,
+    ) -> SelectedBlobNode {
+        let mission = UnprotectedReferenceMission::load(root.mission_path())
+            .expect("load selected Blob test mission");
+        let store = Store::open_with_all_limits_for_mission(
+            root.path().join(STORE_FILE),
+            StoreLimits::default(),
+            BlobDepotLimits::default(),
+            aster_redb_store::EventOperationLimits::DEFAULT,
+            limits,
+            mission.mission_authority_id(),
+        )
+        .expect("open selected Blob test store with lifecycle limits");
+        store
+            .require_process_exclusive_lock()
+            .expect("lock selected Blob test store");
+        let StartupEventVerification {
+            verifier,
+            historical_verifier,
+            cache,
+            policy: _,
+        } = open_startup_event_verifier_and_cache(&store, &mission)
+            .expect("open selected Blob test verifier");
+        drop(historical_verifier);
+        ensure_principal_active(&store, verifier.identity())
+            .expect("selected Blob test principal is active");
+        let verifier_head = store
+            .control_head()
+            .expect("selected Blob test control head");
+        let mut selected = SelectedBlobNode::from_runtime(
+            mission,
+            Arc::new(store),
+            verifier,
+            verifier_head,
+            cache,
+            custody_clock,
+        );
+        selected
+            .current_policy("blob test open")
+            .expect("load selected Blob test policy");
+        selected
     }
 
     fn request(operation: &[u8]) -> BlobPublishRequest {
@@ -4838,6 +4937,7 @@ mod tests {
                 );
             }
             assert_eq!(node.capacity_gc_attempts, 1);
+            assert_eq!(node.capacity_gc_targets, [BlobCapacityGcTarget::Depot]);
             assert_eq!(node.publish_attempts, 2);
             let stats = node.store.blob_stats().expect("post-retry Blob stats");
             assert_eq!(stats.publications, 1);
@@ -4898,6 +4998,194 @@ mod tests {
             };
             assert_eq!(error.kind(), ApplicationErrorKind::ResourceLimit);
             assert_eq!(node.capacity_gc_attempts, 1);
+            assert_eq!(node.capacity_gc_targets, [BlobCapacityGcTarget::Depot]);
+            assert_eq!(node.publish_attempts, 2);
+        }
+    }
+
+    #[test]
+    fn blob_lifecycle_capacity_control_flow_expires_once_retries_once_and_never_loops() {
+        // Publication-lifecycle pressure is retryable only when one due,
+        // cursor-neutral expiry unit can release the exact bounded authority.
+        let reclaimable_root = TestRoot::new("lifecycle-capacity-reclaimable");
+        let mut rekey = persist_rekey_mission(&reclaimable_root);
+        let publication_cap =
+            aster_redb_store::BlobLifecycleLimits::new(4, 4 * 1024, 4, 4 * 1024, 1)
+                .expect("one-row publication lifecycle cap");
+        let clock_id = [0xc1; 16];
+        let retirement_tick = 100;
+        let retention_deadline = retirement_tick + 45 * 24 * 60 * 60 * 1_000;
+        {
+            let mut node = selected_node_with_lifecycle_limits_and_clock(
+                &reclaimable_root,
+                publication_cap,
+                NodeCustodyClock::injected(clock_id, retirement_tick, 0),
+            );
+            node.publish(
+                request(b"blob/lifecycle-capacity/retired"),
+                &mut Cursor::new(b"retired lifecycle capacity source".to_vec()),
+            )
+            .expect("publish lifecycle-capacity fixture");
+        }
+        apply_epoch_two_rekey(&reclaimable_root, &mut rekey);
+
+        let mut node = selected_node_with_lifecycle_limits_and_clock(
+            &reclaimable_root,
+            publication_cap,
+            NodeCustodyClock::injected(clock_id, retention_deadline, 0),
+        );
+        let retired_at = aster_mesh::CustodySample {
+            clock_id,
+            tick_ms: retirement_tick,
+        };
+        for _ in 0..8 {
+            node.store
+                .run_blob_maintenance_turn_with_sample(
+                    BlobMaintenanceBudget::new(64, 16, 128 * 1024 * 1024)
+                        .expect("lifecycle retirement budget"),
+                    Some(retired_at),
+                )
+                .expect("retire stale lifecycle-capacity publication");
+            if node
+                .store
+                .blob_gc_status(Some(retired_at))
+                .expect("retired lifecycle-capacity status")
+                .retained_publication_records
+                == 1
+            {
+                break;
+            }
+        }
+        assert_eq!(
+            node.store
+                .blob_gc_status(Some(retired_at))
+                .expect("retained lifecycle-capacity status")
+                .retained_publication_records,
+            1,
+            "the publication cap is occupied by one due retired record"
+        );
+        node.publish(
+            request(b"blob/lifecycle-capacity/replacement"),
+            &mut Cursor::new(b"replacement lifecycle capacity source".to_vec()),
+        )
+        .expect("one due expiry pass releases the publication cap for one retry");
+        assert_eq!(node.capacity_gc_attempts, 1);
+        assert_eq!(
+            node.capacity_gc_targets,
+            [BlobCapacityGcTarget::PublicationLifecycle]
+        );
+        assert_eq!(node.publish_attempts, 2);
+        let after_recovery = node
+            .store
+            .blob_gc_status(Some(aster_mesh::CustodySample {
+                clock_id,
+                tick_ms: retention_deadline,
+            }))
+            .expect("post-retry lifecycle status");
+        assert_eq!(after_recovery.retained_publication_records, 0);
+        assert_eq!(after_recovery.retained_operation_records, 1);
+        assert_eq!(
+            node.store
+                .blob_stats()
+                .expect("post-retry lifecycle stats")
+                .publications,
+            1
+        );
+
+        // An eligible capacity failure that remains unsatisfied gets exactly
+        // one GC attempt and one retry; the second failure is returned.
+        let unsatisfied_root = TestRoot::new("lifecycle-capacity-unsatisfied");
+        persist_member_mission(&unsatisfied_root);
+        let mut unsatisfied = selected_node_with_lifecycle_limits_and_clock(
+            &unsatisfied_root,
+            publication_cap,
+            NodeCustodyClock::injected([0xc2; 16], 100, 0),
+        );
+        unsatisfied
+            .publish(
+                request(b"blob/lifecycle-capacity/full"),
+                &mut Cursor::new(b"live lifecycle capacity source".to_vec()),
+            )
+            .expect("fill live publication lifecycle cap");
+        let error = unsatisfied
+            .publish(
+                request(b"blob/lifecycle-capacity/still-full"),
+                &mut Cursor::new(b"second live lifecycle capacity source".to_vec()),
+            )
+            .expect_err("live publication cap remains exhausted after one retry");
+        assert_eq!(error.kind(), ApplicationErrorKind::ResourceLimit);
+        assert_eq!(unsatisfied.capacity_gc_attempts, 1);
+        assert_eq!(
+            unsatisfied.capacity_gc_targets,
+            [BlobCapacityGcTarget::PublicationLifecycle]
+        );
+        assert_eq!(unsatisfied.publish_attempts, 3);
+
+        // Permanent replay authority is not reclaimable and therefore must
+        // not enter the capacity-GC retry path at all.
+        let ineligible_root = TestRoot::new("lifecycle-capacity-ineligible");
+        persist_member_mission(&ineligible_root);
+        let replay_cap = aster_redb_store::BlobLifecycleLimits::new(4, 4 * 1024, 1, 4 * 1024, 4)
+            .expect("one-row replay fence cap");
+        let mut ineligible = selected_node_with_lifecycle_limits_and_clock(
+            &ineligible_root,
+            replay_cap,
+            NodeCustodyClock::injected([0xc3; 16], 100, 0),
+        );
+        ineligible
+            .publish(
+                request(b"blob/replay-capacity/full"),
+                &mut Cursor::new(b"first permanent replay fence".to_vec()),
+            )
+            .expect("fill permanent replay fence cap");
+        let error = ineligible
+            .publish(
+                request(b"blob/replay-capacity/ineligible"),
+                &mut Cursor::new(b"second permanent replay fence".to_vec()),
+            )
+            .expect_err("permanent replay capacity is not reclaimable");
+        assert_eq!(error.kind(), ApplicationErrorKind::ResourceLimit);
+        assert_eq!(ineligible.capacity_gc_attempts, 0);
+        assert!(ineligible.capacity_gc_targets.is_empty());
+        assert_eq!(ineligible.publish_attempts, 2);
+    }
+
+    #[test]
+    fn blob_operation_capacity_classes_each_drive_one_targeted_pass_and_one_retry() {
+        // The fixed production limits are intentionally large, so inject the
+        // typed store boundary immediately before preparation. The ordinary
+        // publish loop, classifier, capacity call, rewind, and second attempt
+        // remain the real control flow under test.
+        for (case, failure) in [
+            (
+                "operation-count",
+                BlobStoreError::OperationLimitExceeded {
+                    current: 4_096,
+                    limit: 4_096,
+                },
+            ),
+            (
+                "operation-bytes",
+                BlobStoreError::OperationByteLimitExceeded {
+                    current: 512 * 1024,
+                    incoming: 64,
+                    limit: 512 * 1024,
+                },
+            ),
+        ] {
+            let root = TestRoot::new(case);
+            persist_member_mission(&root);
+            let mut node = selected_node(&root);
+            node.injected_capacity_failures.push_back(failure);
+
+            node.publish(
+                request(format!("blob/{case}").as_bytes()),
+                &mut Cursor::new(format!("{case} source").into_bytes()),
+            )
+            .expect("one operation-targeted retry succeeds");
+
+            assert_eq!(node.capacity_gc_attempts, 1);
+            assert_eq!(node.capacity_gc_targets, [BlobCapacityGcTarget::Operation]);
             assert_eq!(node.publish_attempts, 2);
         }
     }
@@ -5478,25 +5766,56 @@ mod tests {
     }
 
     #[test]
-    fn blob_capacity_gc_classifier_accepts_only_recoverable_depot_limits() {
-        // Break caught: sanitized ResourceLimit is broader than physical depot
-        // exhaustion and must never authorize targeted GC by itself.
-        for error in [
-            BlobStoreError::DepotByteLimitExceeded {
-                current: 10,
-                incoming: 1,
-                limit: 10,
-            },
-            BlobStoreError::DepotChunkLimitExceeded {
-                current: 10,
-                limit: 10,
-            },
-            BlobStoreError::DepotVariantLimitExceeded {
-                current: 10,
-                limit: 10,
-            },
+    fn blob_capacity_gc_classifier_accepts_only_reclaimable_local_limits() {
+        // Break caught: only local limits that one cursor-neutral reclamation
+        // pass can relieve may authorize the single admission retry.
+        for (error, target) in [
+            (
+                BlobStoreError::DepotByteLimitExceeded {
+                    current: 10,
+                    incoming: 1,
+                    limit: 10,
+                },
+                BlobCapacityGcTarget::Depot,
+            ),
+            (
+                BlobStoreError::DepotChunkLimitExceeded {
+                    current: 10,
+                    limit: 10,
+                },
+                BlobCapacityGcTarget::Depot,
+            ),
+            (
+                BlobStoreError::DepotVariantLimitExceeded {
+                    current: 10,
+                    limit: 10,
+                },
+                BlobCapacityGcTarget::Depot,
+            ),
+            (
+                BlobStoreError::OperationLimitExceeded {
+                    current: 1,
+                    limit: 1,
+                },
+                BlobCapacityGcTarget::Operation,
+            ),
+            (
+                BlobStoreError::OperationByteLimitExceeded {
+                    current: 1,
+                    incoming: 1,
+                    limit: 1,
+                },
+                BlobCapacityGcTarget::Operation,
+            ),
+            (
+                BlobStoreError::PublicationLifecycleCapacity {
+                    required_rows: 2,
+                    max_rows: 1,
+                },
+                BlobCapacityGcTarget::PublicationLifecycle,
+            ),
         ] {
-            assert!(blob_store_error_recoverable_capacity(&error));
+            assert_eq!(blob_store_error_recoverable_capacity(&error), Some(target));
         }
 
         for error in [
@@ -5506,15 +5825,6 @@ mod tests {
             },
             BlobStoreError::CausalFrontierLimitExceeded {
                 current: 1,
-                limit: 1,
-            },
-            BlobStoreError::OperationLimitExceeded {
-                current: 1,
-                limit: 1,
-            },
-            BlobStoreError::OperationByteLimitExceeded {
-                current: 1,
-                incoming: 1,
                 limit: 1,
             },
             BlobStoreError::LineageFenceCapacity {
@@ -5528,10 +5838,6 @@ mod tests {
                 required_bytes: 2,
                 max_rows: 1,
                 max_bytes: 1,
-            },
-            BlobStoreError::PublicationLifecycleCapacity {
-                required_rows: 2,
-                max_rows: 1,
             },
             BlobStoreError::NetworkBlobTooLarge {
                 total_len: 2,
@@ -5553,7 +5859,7 @@ mod tests {
             },
             BlobStoreError::LeaseCapacity,
         ] {
-            assert!(!blob_store_error_recoverable_capacity(&error));
+            assert!(blob_store_error_recoverable_capacity(&error).is_none());
         }
 
         for error in [
@@ -5570,15 +5876,18 @@ mod tests {
                 },
             ))),
         ] {
-            assert!(!blob_error_recoverable_capacity(&error));
+            assert!(blob_error_recoverable_capacity(&error).is_none());
         }
-        assert!(blob_error_recoverable_capacity(&BlobError::Store(
-            Box::new(StoreError::Blob(BlobStoreError::DepotByteLimitExceeded {
-                current: 10,
-                incoming: 1,
-                limit: 10,
-            }))
-        )));
+        assert!(
+            blob_error_recoverable_capacity(&BlobError::Store(Box::new(StoreError::Blob(
+                BlobStoreError::DepotByteLimitExceeded {
+                    current: 10,
+                    incoming: 1,
+                    limit: 10,
+                }
+            ))))
+            .is_some()
+        );
     }
 
     #[test]

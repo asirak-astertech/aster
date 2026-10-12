@@ -166,7 +166,7 @@ impl Eq for ApplicationError {}
 enum ApplicationErrorCause {
     #[default]
     None,
-    RecoverableBlobDepotCapacity,
+    RecoverableBlobCapacity(aster_redb_store::BlobCapacityGcTarget),
 }
 
 impl ApplicationError {
@@ -188,19 +188,31 @@ impl ApplicationError {
         }
     }
 
-    pub(crate) const fn recoverable_blob_depot_capacity(operation: &'static str) -> Self {
+    pub(crate) const fn recoverable_blob_capacity(
+        operation: &'static str,
+        target: aster_redb_store::BlobCapacityGcTarget,
+    ) -> Self {
         Self {
             kind: ApplicationErrorKind::ResourceLimit,
             operation,
-            cause: ApplicationErrorCause::RecoverableBlobDepotCapacity,
+            cause: ApplicationErrorCause::RecoverableBlobCapacity(target),
         }
     }
 
-    pub(crate) const fn is_recoverable_blob_depot_capacity(&self) -> bool {
+    pub(crate) const fn is_recoverable_blob_capacity(&self) -> bool {
         matches!(
             self.cause,
-            ApplicationErrorCause::RecoverableBlobDepotCapacity
+            ApplicationErrorCause::RecoverableBlobCapacity(_)
         )
+    }
+
+    pub(crate) const fn recoverable_blob_capacity_target(
+        &self,
+    ) -> Option<aster_redb_store::BlobCapacityGcTarget> {
+        match self.cause {
+            ApplicationErrorCause::RecoverableBlobCapacity(target) => Some(target),
+            ApplicationErrorCause::None => None,
+        }
     }
 }
 
@@ -2877,6 +2889,7 @@ fn blob_store_error_kind(error: &BlobStoreError) -> ApplicationErrorKind {
         BlobStoreError::PublisherRevoked(_)
         | BlobStoreError::KeyEpochStale { .. }
         | BlobStoreError::KeyEpochNotActive { .. } => ApplicationErrorKind::UnauthorizedOrRevoked,
+        BlobStoreError::ExpiredOrRetired => ApplicationErrorKind::ExpiredOrRetired,
         BlobStoreError::ReservationChanged
         | BlobStoreError::ReadPlanChanged
         | BlobStoreError::PhysicalLineageMigrationRequired => ApplicationErrorKind::PolicyUnsettled,
@@ -2933,21 +2946,29 @@ mod tests {
             ApplicationErrorKind::ResourceLimit,
             "Blob publication admission",
         );
-        let recoverable =
-            ApplicationError::recoverable_blob_depot_capacity("Blob publication admission");
-
         assert_eq!(ordinary.kind(), ApplicationErrorKind::ResourceLimit);
-        assert_eq!(recoverable.kind(), ApplicationErrorKind::ResourceLimit);
         assert_eq!(ordinary.operation(), "Blob publication admission");
-        assert_eq!(recoverable.operation(), "Blob publication admission");
-        assert_eq!(ordinary, recoverable);
-        assert_eq!(format!("{ordinary:?}"), format!("{recoverable:?}"));
-        assert_eq!(ordinary.to_string(), recoverable.to_string());
-        assert!(std::error::Error::source(&recoverable).is_none());
-        assert!(!format!("{recoverable:?}").contains("RecoverableBlobDepotCapacity"));
-        assert!(!format!("{recoverable:?}").contains("cause"));
-        assert!(!ordinary.is_recoverable_blob_depot_capacity());
-        assert!(recoverable.is_recoverable_blob_depot_capacity());
+        assert!(!ordinary.is_recoverable_blob_capacity());
+
+        for target in [
+            aster_redb_store::BlobCapacityGcTarget::Depot,
+            aster_redb_store::BlobCapacityGcTarget::Operation,
+            aster_redb_store::BlobCapacityGcTarget::PublicationLifecycle,
+        ] {
+            let recoverable =
+                ApplicationError::recoverable_blob_capacity("Blob publication admission", target);
+
+            assert_eq!(recoverable.kind(), ApplicationErrorKind::ResourceLimit);
+            assert_eq!(recoverable.operation(), "Blob publication admission");
+            assert_eq!(ordinary, recoverable);
+            assert_eq!(format!("{ordinary:?}"), format!("{recoverable:?}"));
+            assert_eq!(ordinary.to_string(), recoverable.to_string());
+            assert!(std::error::Error::source(&recoverable).is_none());
+            assert!(!format!("{recoverable:?}").contains("RecoverableBlobCapacity"));
+            assert!(!format!("{recoverable:?}").contains("cause"));
+            assert!(recoverable.is_recoverable_blob_capacity());
+            assert_eq!(recoverable.recoverable_blob_capacity_target(), Some(target));
+        }
     }
 
     #[test]
@@ -3023,6 +3044,10 @@ mod tests {
         assert_eq!(
             blob_store_error_kind(&BlobStoreError::SourceRepresentationConflict),
             ApplicationErrorKind::Conflict
+        );
+        assert_eq!(
+            blob_store_error_kind(&BlobStoreError::ExpiredOrRetired),
+            ApplicationErrorKind::ExpiredOrRetired
         );
         assert_eq!(
             blob_store_error_kind(&BlobStoreError::LeaseCapacity),
