@@ -528,11 +528,12 @@ finite to durable, or one TTL value to another is an intent conflict, even when
 all other fields and content are identical. Once the retirement record ages out,
 reuse is a new operation and publication as described below.
 
-Retirement records use a configurable 45-day default: the existing 30-day
-offline-tolerance baseline plus a 15-day margin. Retention uses conservative
-lower-bound aging. After the record expires, its operation key may be reused;
-reuse creates a new publisher counter and publication identity. Publisher
-replay/high-water state still prevents the old publication from returning.
+Retirement records use a fixed internal 45-day retention period: the existing
+30-day offline-tolerance baseline plus a 15-day margin. This is conservative
+lower-bound aging, not a caller lifetime, public API option, or CLI setting.
+After the record expires, its operation key may be reused; reuse creates a new
+publisher counter and publication identity. Publisher replay/high-water state
+still prevents the old publication from returning.
 
 Existing operation record and byte limits remain. Reaching a limit before
 eligible record expiry returns an explicit operation-capacity failure rather
@@ -540,10 +541,9 @@ than deleting an unexpired retry fence.
 
 ## Negotiated protocol behavior
 
-Finite Blob exchange is enabled only in the next available semantic version,
-provisionally v8 after PR #33 assigns semantic v7 to receipt-free Event pages.
-The design and implementation must use "next available semantic version" until
-that allocation is final.
+Finite Blob exchange is enabled only in the next negotiated Blob semantic
+version. The design and implementation must use that description until the
+allocation is final.
 
 The signed stable source envelope and `ItemCore` format are unchanged. The
 outer protected Blob source-offer grammar changes under the new semantic
@@ -608,19 +608,96 @@ transfer cannot be downgraded mid-lifecycle.
 
 ## Application and status behavior
 
-The public publication request adds an optional TTL equivalent to:
+Blob exposes the common durable-or-finite lifetime without changing the durable
+`BlobPublishRequest`. `BlobPublishOptions` mirrors `EventPublishOptions`:
 
 ```rust
-pub ttl_ms: Option<u64>
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BlobPublishOptions {
+    ttl_ms: Option<u64>,
+}
+
+impl BlobPublishOptions {
+    pub const fn durable() -> Self;
+    pub const fn finite_ttl_ms(ttl_ms: u64) -> Result<Self, ApplicationError>;
+    pub const fn ttl_ms(self) -> Option<u64>;
+}
 ```
 
-`None` is durable and `Some(0)` is rejected locally. The exact Rust, ConnectRPC,
-and CLI spelling is coordinated with the concurrently owned public Blob API
-work, but this storage contract is authoritative.
+`Default` and `durable()` select `None`; `finite_ttl_ms(0)` returns the existing
+invalid-request error. The current `publish(request, source)` remains the
+durable compatibility entry point. TTL is not added directly to the Rust
+request type. Both facades preserve the request/options/source order:
 
-Publication results, delivery metadata, and authenticated read metadata expose
-the signed original TTL. Dynamic remaining lifetime is local status, not signed
-metadata.
+```rust
+impl SelectedBlobHandle {
+    pub async fn publish_with_options(
+        &self,
+        request: BlobPublishRequest,
+        options: BlobPublishOptions,
+        source: fs::File,
+    ) -> Result<BlobPublishResult, ApplicationError>;
+}
+
+impl SelectedBlobNode {
+    pub fn publish_with_options<R: Read + Seek>(
+        &mut self,
+        request: BlobPublishRequest,
+        options: BlobPublishOptions,
+        source: &mut R,
+    ) -> Result<BlobPublishResult, ApplicationError>;
+}
+```
+
+The source-form `pub async fn` on `SelectedBlobHandle` has the public future
+shape `(&self, BlobPublishRequest, BlobPublishOptions, fs::File) -> impl
+Future<Output = Result<BlobPublishResult, ApplicationError>>`. Existing durable
+`publish(request, source)` overloads remain unchanged.
+
+The first released `PublishBlob` RPC contract MUST carry presence-aware
+`optional uint64 ttl_ms` in `PublishBlobRequest` (or its first publish metadata
+frame). The API owner assigns the numeric protobuf tag to avoid collision with
+its in-flight branch. Omission is durable; a present zero is rejected. If any
+Blob publish endpoint is released without this field, finite publication first
+requires a concrete capability/version preflight before the mutation request;
+a response echo is defense-in-depth, not that preflight.
+
+The client verifies that a `PublishBlobResponse` echoes exactly the requested
+TTL presence and value. A mismatch is an integrity/unknown outcome, never
+permission to retry the operation as durable.
+
+| Surface | Original signed TTL representation |
+| --- | --- |
+| ConnectRPC publish | `PublishBlobRequest` or its first publish metadata frame carries `optional uint64 ttl_ms`; `PublishBlobResponse` echoes it. |
+| ConnectRPC reads and deliveries | Each `ReadBlobResponse` metadata/page, `BlobDelivery`, and `BlobRetirementDelivery` carries the same optional original TTL. |
+| Rust | `BlobPublishResult`, `BlobReadPage`, `BlobReadResult`, `BlobDelivery`, and the `BlobRetirementDelivery` retirement notice carry the same optional original TTL. |
+
+On every surface, omission means durable. The field is the signed original TTL,
+never a remaining lifetime or deletion timestamp.
+
+| Input or conflict | Connect status | Public reason | Retry |
+| --- | --- | --- | --- |
+| Present `ttl_ms = 0` | `InvalidArgument` | `PUBLIC_ERROR_REASON_MALFORMED_INPUT` | Nonretryable |
+| Finite TTL before end-to-end activation | `InvalidArgument` | `PUBLIC_ERROR_REASON_UNSUPPORTED_VALUE` | Nonretryable |
+| Same operation key with missing/different TTL | `Aborted` | `PUBLIC_ERROR_REASON_OPERATION_KEY_CONFLICT` | Nonretryable |
+
+The CLI spelling is `--ttl-ms MILLISECONDS`. Omission is durable and the flag
+accepts only positive `u64` values. Finite JSON is exactly
+`"ttlMs": "<unsigned decimal string>"`, including `u64::MAX`; durable JSON
+omits `ttlMs`. Text is exactly `TTL: durable` or
+`TTL: <unsigned decimal> ms`.
+
+The source-authenticated TTL is part of canonical operation intent. Retrying an
+operation key with missing versus present TTL, or with a different TTL, is an
+intent conflict; finite publications must never silently downgrade to durable.
+The fixed internal 45-day retirement-record retention is separate from this
+publication TTL and is neither public nor configurable.
+
+The public shape may be implemented now, but it does not activate finite Blob
+publication by itself. Until end-to-end finite Blob storage and wire support is
+active, a finite API request fails explicitly as unsupported before mutation;
+it is never partially accepted or silently ignored. If an endpoint ships before
+that increment, it must capability-gate the finite request before mutation.
 
 After retirement:
 
@@ -796,18 +873,20 @@ requirements, and it does not advance excluded release or platform claims.
    lineage and replay fences, publication and operation retirement, staging
    recovery, fair automatic maintenance, pressure eviction, and crash-resumable
    descriptor-relative physical deletion for durable Blob state.
-3. **End-to-end finite Blob TTL.** After semantic-v7 allocation settles, add
-   the next negotiated version, protected source custody claims, durable
-   provenance, monotone duplicate-age merging, pending/live expiry,
-   mixed-version filtering, and the coordinated application TTL field.
+3. **End-to-end finite Blob TTL.** Under the next negotiated Blob semantic
+   version, add protected source custody claims,
+   durable provenance, monotone duplicate-age merging, pending/live expiry,
+   mixed-version filtering, and activate the already-defined application TTL
+   contract. API and CLI may adopt that contract earlier only with the explicit
+   pre-mutation unsupported/capability gate above.
 4. **Retained acceptance evidence.** Exercise process/crash recovery,
    interrupted and different-peer transfer, expiry, reclamation, quota reuse,
    and mixed-version fallback. Move requirement evidence only for the exact
    retained behavior.
 
 Each PR names its capability outcome and exclusions. Storage-only PR 2 does not
-claim finite Blob TTL; protocol PR 3 does not claim route-only custody,
-large-target resource fitness, or release acceptance.
+claim finite Blob TTL and remains wire/API/CLI neutral; protocol PR 3 does not
+claim route-only custody, large-target resource fitness, or release acceptance.
 
 ## Security and compatibility invariants
 
