@@ -24510,7 +24510,7 @@ async fn serve_transfer_profiles(
     let mut initiator = None;
     let mut request_bytes = None;
     let mut response_bytes = None;
-    let complete = connection
+    let carrier_result = connection
         .respond_once_with_total_limit(wire_budget, |protected_request| {
             require_contact_policy_current()
                 .map_err(|_| CarrierError::Transport("live emission policy changed".into()))?;
@@ -24534,10 +24534,11 @@ async fn serve_transfer_profiles(
                 }
             }
         })
-        .await?;
+        .await;
     if let Some(error) = application_error {
         return Err(error);
     }
+    let complete = carrier_result?;
     let request_bytes = request_bytes.ok_or_else(|| {
         NodeError::Protocol("profile response completed without a protected request".into())
     })?;
@@ -33946,6 +33947,90 @@ mod tests {
 
         drop(application_sender);
         fs::remove_dir_all(state).expect("cleanup actor state");
+    }
+
+    #[tokio::test]
+    async fn profile_offer_server_preserves_application_error_over_carrier_wrapper() {
+        // Mutation caught: applying `?` to the carrier result before returning
+        // the captured mission error masks malformed/authentication failures as
+        // a generic carrier transport error.
+        let mut issued = issue_missions(2);
+        let client_mission = issued.remove(0);
+        let server_mission = issued.remove(0);
+        let server = Endpoint::bind(
+            aster_iroh::SecretKey::generate(),
+            EndpointConfig::direct("127.0.0.1:0".parse().expect("server address")),
+        )
+        .await
+        .expect("server endpoint");
+        let client = Endpoint::bind(
+            aster_iroh::SecretKey::generate(),
+            EndpointConfig::direct("127.0.0.1:0".parse().expect("client address")),
+        )
+        .await
+        .expect("client endpoint");
+        let client_id = client.id();
+        let expected_client = MissionPeerBinding::new(client_id, client_mission.identity);
+        let expected_server = MissionPeerBinding::new(server.id(), server_mission.identity);
+
+        let server_task = tokio::spawn({
+            let server = server.clone();
+            let credentials = server_mission.credentials.clone();
+            async move {
+                let connection = server
+                    .accept(&BTreeSet::from([client_id]))
+                    .await
+                    .expect("accept carrier");
+                let (mut mission, handshake) = respond_over_iroh_metered(
+                    &connection,
+                    credentials.fresh_bundle().expect("server bundle"),
+                    expected_client,
+                )
+                .await
+                .expect("server handshake");
+                let mut receipt = authenticated_receipt(&connection, &mission, handshake)
+                    .expect("server receipt");
+                serve_transfer_profiles(&connection, &mut mission, &mut receipt)
+                    .await
+                    .expect_err("malformed protected profile offer must fail closed")
+            }
+        });
+
+        let connection = client
+            .connect(ExpectedPeer {
+                id: server.id(),
+                address: loopback(&server),
+            })
+            .await
+            .expect("connect carrier");
+        let (mut mission, _) = initiate_over_iroh_metered(
+            &connection,
+            client_mission
+                .credentials
+                .fresh_bundle()
+                .expect("client bundle"),
+            expected_server,
+        )
+        .await
+        .expect("client handshake");
+        let malformed = mission
+            .seal_application_frame(b"not a canonical transfer-profile offer")
+            .expect("seal malformed protected profile offer");
+        assert!(
+            connection.request(&malformed).await.is_err(),
+            "the malformed exchange must remain fail-closed on the requester"
+        );
+        let error = server_task.await.expect("server task");
+        assert!(
+            matches!(
+                error,
+                NodeError::Mission(MissionSessionError::Authentication(_))
+            ),
+            "the specific mission authentication error must survive the carrier rejection: {error}"
+        );
+
+        client.close().await;
+        server.close().await;
     }
 
     #[tokio::test]
