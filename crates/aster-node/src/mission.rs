@@ -2323,6 +2323,26 @@ impl MissionSession {
         self.inner.open_frame(frame).map_err(Into::into)
     }
 
+    /// Protects and records this endpoint's one canonical transfer-profile offer.
+    pub(crate) fn seal_transfer_profile_offer(
+        &mut self,
+        offer: &aster_mesh::TransferProfileOfferV1,
+    ) -> Result<Vec<u8>, MissionSessionError> {
+        self.inner
+            .seal_transfer_profile_offer(offer)
+            .map_err(Into::into)
+    }
+
+    /// Opens and records the peer's exact authenticated transfer-profile offer.
+    pub(crate) fn open_transfer_profile_offer(
+        &mut self,
+        frame: &[u8],
+    ) -> Result<aster_mesh::TransferProfileOfferV1, MissionSessionError> {
+        self.inner
+            .open_transfer_profile_offer(frame)
+            .map_err(Into::into)
+    }
+
     /// Protects one semantic-v7-or-v8 record with exact negotiated profile, lane,
     /// and direction context as authenticated associated data.
     pub(crate) fn seal_profiled_application_frame(

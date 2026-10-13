@@ -118,6 +118,8 @@ mod store;
 pub mod sync;
 #[cfg(all(feature = "sqlite-store", not(feature = "adapter-sdk")))]
 mod sync;
+#[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
+mod transfer_profile;
 #[cfg(all(feature = "sqlite-store", feature = "adapter-sdk"))]
 pub mod wire;
 #[cfg(all(feature = "sqlite-store", not(feature = "adapter-sdk")))]
@@ -243,6 +245,12 @@ pub use source_state::{
 };
 #[cfg(feature = "sqlite-store")]
 pub use store::{BridgeFilter, EventGap, PeerSnapshot, QuotaUsage, SubscriptionId};
+#[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
+pub use transfer_profile::{
+    NegotiatedTransferProfiles, TransferLaneId, TransferProfileError, TransferProfileId,
+    TransferProfileOfferV1, negotiate_transfer_profiles,
+    negotiate_transfer_profiles_for_semantic_version, transfer_profile_digest,
+};
 
 /// Stable replication-wire, credential, and cryptographic-profile version.
 pub const REPLICATION_WIRE_VERSION: u16 = 1;

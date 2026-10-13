@@ -20,7 +20,8 @@ use crate::blob::{
     ReferenceBlobService,
 };
 use crate::blob_custody::{
-    AuthenticatedBlobCustodyContactV1, BlobCustodyDirectionV1, blob_custody_lane_record_context,
+    AuthenticatedBlobCustodyContactV1, BlobCustodyClaimV1, BlobCustodyDirectionV1,
+    blob_custody_lane_record_context,
 };
 use crate::bridge::{
     self, AuthorizationEnvelope, BridgeAuthorization, BridgeOuterKind, BridgeRoute,
@@ -49,6 +50,10 @@ use crate::provisioning::{
 #[cfg(feature = "sqlite-store")]
 use crate::store::SqliteStore;
 use crate::store::{ControlPrincipal, Revocation, ScopeEpoch};
+use crate::transfer_profile::{
+    NegotiatedTransferProfiles, TransferLaneId, TransferProfileId, TransferProfileOfferV1,
+    negotiate_transfer_profiles_for_semantic_version, transfer_profile_digest,
+};
 use aes_gcm::{
     Aes256Gcm,
     aead::{AeadInOut, KeyInit, array::Array},
@@ -96,9 +101,9 @@ const SEMANTIC_PROTOCOL_V4: u16 = super::SEMANTIC_PROTOCOL_V4;
 const SEMANTIC_PROTOCOL_V5: u16 = super::SEMANTIC_PROTOCOL_V5;
 #[cfg(test)]
 const SEMANTIC_PROTOCOL_V6: u16 = super::SEMANTIC_PROTOCOL_V6;
-#[cfg(test)]
 const SEMANTIC_PROTOCOL_V7: u16 = super::SEMANTIC_PROTOCOL_V7;
 const SEMANTIC_PROTOCOL_V8: u16 = super::SEMANTIC_PROTOCOL_V8;
+const TRANSFER_PROFILE_OFFER_FRAME_PREFIX: &[u8; 5] = b"ASM\x01\xd1";
 const SUITE_ID: u16 = super::HYBRID_SUITE_ID;
 const PUBLIC_HEADER_LEN: usize = 44;
 const SELECTOR_LEN: usize = 16;
@@ -4643,6 +4648,7 @@ impl ReferenceSessionAwaitingFinished {
             session_id,
             role: SessionRole::Initiator,
             channel: keys.into_channel(),
+            transfer_profiles: TransferProfileNegotiationState::default(),
         })
     }
 }
@@ -4812,6 +4818,7 @@ impl ReferenceSessionResponderPending {
                 session_id,
                 role: SessionRole::Responder,
                 channel: keys.into_channel(),
+                transfer_profiles: TransferProfileNegotiationState::default(),
             },
             finished_flight,
         ))
@@ -4824,6 +4831,19 @@ enum SessionRole {
     Responder,
 }
 
+#[derive(Debug, Default)]
+struct TransferProfileNegotiationState {
+    local_offer: Option<TransferProfileOfferV1>,
+    authenticated_peer_offer: Option<TransferProfileOfferV1>,
+    authenticated: Option<AuthenticatedTransferProfiles>,
+}
+
+#[derive(Debug)]
+struct AuthenticatedTransferProfiles {
+    negotiated: NegotiatedTransferProfiles,
+    digest: [u8; 32],
+}
+
 /// Completed mutually authenticated adjacency with ordered, encrypted, replay-protected frames.
 pub struct ReferenceAuthenticatedSession {
     provider: RustCryptoProvider<SysRng>,
@@ -4833,6 +4853,7 @@ pub struct ReferenceAuthenticatedSession {
     session_id: [u8; 32],
     role: SessionRole,
     channel: SecureChannel,
+    transfer_profiles: TransferProfileNegotiationState,
 }
 
 impl fmt::Debug for ReferenceAuthenticatedSession {
@@ -4929,6 +4950,88 @@ impl ReferenceAuthenticatedSession {
             .map_err(handshake_error)
     }
 
+    /// Seals this endpoint's canonical transfer-profile offer and records it
+    /// as the local half of the one authenticated negotiation for this session.
+    pub fn seal_transfer_profile_offer(
+        &mut self,
+        offer: &TransferProfileOfferV1,
+    ) -> Result<Vec<u8>, EnvelopeError> {
+        if self.semantic_version < SEMANTIC_PROTOCOL_V7
+            || self.transfer_profiles.local_offer.is_some()
+        {
+            return Err(transfer_profile_negotiation_failed());
+        }
+        let body = offer
+            .encode()
+            .map_err(|_| transfer_profile_negotiation_failed())?;
+        let authenticated = self.profile_binding_after(
+            Some(offer),
+            self.transfer_profiles.authenticated_peer_offer.as_ref(),
+        )?;
+        let mut plaintext =
+            Vec::with_capacity(TRANSFER_PROFILE_OFFER_FRAME_PREFIX.len() + body.len());
+        plaintext.extend_from_slice(TRANSFER_PROFILE_OFFER_FRAME_PREFIX);
+        plaintext.extend_from_slice(&body);
+        let frame = self.seal_frame(&plaintext)?;
+        self.transfer_profiles.local_offer = Some(offer.clone());
+        self.transfer_profiles.authenticated = authenticated;
+        Ok(frame)
+    }
+
+    /// Opens, decodes, and records the peer's exact protected transfer-profile
+    /// offer. Only this path can install peer negotiation state.
+    pub fn open_transfer_profile_offer(
+        &mut self,
+        frame: &[u8],
+    ) -> Result<TransferProfileOfferV1, EnvelopeError> {
+        if self.semantic_version < SEMANTIC_PROTOCOL_V7
+            || self.transfer_profiles.authenticated_peer_offer.is_some()
+        {
+            return Err(transfer_profile_negotiation_failed());
+        }
+        let plaintext = self.open_frame(frame)?;
+        let body = plaintext
+            .strip_prefix(TRANSFER_PROFILE_OFFER_FRAME_PREFIX)
+            .ok_or_else(transfer_profile_negotiation_failed)?;
+        let offer = TransferProfileOfferV1::decode(body)
+            .map_err(|_| transfer_profile_negotiation_failed())?;
+        let authenticated =
+            self.profile_binding_after(self.transfer_profiles.local_offer.as_ref(), Some(&offer))?;
+        self.transfer_profiles.authenticated_peer_offer = Some(offer.clone());
+        self.transfer_profiles.authenticated = authenticated;
+        Ok(offer)
+    }
+
+    /// Selected profile from the authenticated, completed offer exchange.
+    pub fn negotiated_transfer_profile(&self, lane: TransferLaneId) -> Option<TransferProfileId> {
+        self.transfer_profiles
+            .authenticated
+            .as_ref()
+            .and_then(|profiles| profiles.negotiated.profile(lane))
+    }
+
+    fn profile_binding_after(
+        &self,
+        local: Option<&TransferProfileOfferV1>,
+        peer: Option<&TransferProfileOfferV1>,
+    ) -> Result<Option<AuthenticatedTransferProfiles>, EnvelopeError> {
+        let (Some(local), Some(peer)) = (local, peer) else {
+            return Ok(None);
+        };
+        let (initiator, responder) = match self.role {
+            SessionRole::Initiator => (local, peer),
+            SessionRole::Responder => (peer, local),
+        };
+        let negotiated = negotiate_transfer_profiles_for_semantic_version(
+            self.semantic_version,
+            initiator,
+            responder,
+        )
+        .map_err(|_| transfer_profile_negotiation_failed())?;
+        let digest = transfer_profile_digest(initiator, responder, &negotiated);
+        Ok(Some(AuthenticatedTransferProfiles { negotiated, digest }))
+    }
+
     /// Protects one frame in the fixed semantic-v8 Blob lane/profile-3 domain.
     ///
     /// This allocates no finite Blob lifecycle behavior; it only ensures that a
@@ -4936,55 +5039,80 @@ impl ReferenceAuthenticatedSession {
     /// record rather than caller-selected claim fields.
     pub fn seal_blob_custody_frame(
         &mut self,
-        transfer_profile_digest: [u8; 32],
         direction: BlobCustodyDirectionV1,
-        plaintext: &[u8],
+        claim: &BlobCustodyClaimV1,
     ) -> Result<Vec<u8>, EnvelopeError> {
         let expected_direction = match self.role {
             SessionRole::Initiator => BlobCustodyDirectionV1::ToSessionResponder,
             SessionRole::Responder => BlobCustodyDirectionV1::ToSessionInitiator,
         };
-        if self.semantic_version != SEMANTIC_PROTOCOL_V8 || direction != expected_direction {
+        let profiles = self
+            .transfer_profiles
+            .authenticated
+            .as_ref()
+            .ok_or_else(blob_custody_contact_unavailable)?;
+        if self.semantic_version != SEMANTIC_PROTOCOL_V8
+            || direction != expected_direction
+            || profiles.negotiated.profile(TransferLaneId::Blob)
+                != Some(TransferProfileId::BlobCustodyV1)
+            || claim.session_transcript() != self.session_id
+            || claim.direction() != direction
+        {
             return Err(blob_custody_contact_unavailable());
         }
-        let context = blob_custody_lane_record_context(transfer_profile_digest, direction);
-        self.seal_frame_with_context(plaintext, &context)
+        let context = blob_custody_lane_record_context(profiles.digest, direction);
+        self.seal_frame_with_context(&claim.encode(), &context)
     }
 
-    /// Authenticates and replay-checks one fixed semantic-v8 Blob/profile-3
-    /// lane record and returns its opaque contact authority.
+    /// Authenticates, replay-checks, and canonically decodes one fixed
+    /// semantic-v8 Blob/profile-3 claim record with its opaque contact authority.
     ///
     /// The returned capability is bound to this completed session transcript,
     /// exact negotiated-profile digest, Blob profile/direction AAD, and accepted
-    /// record sequence. Raw application values cannot construct it.
+    /// record sequence and exact 208-byte claim digest. Raw application values
+    /// cannot construct it.
     pub fn open_blob_custody_frame(
         &mut self,
-        transfer_profile_digest: [u8; 32],
         direction: BlobCustodyDirectionV1,
         frame: &[u8],
-    ) -> Result<(Vec<u8>, AuthenticatedBlobCustodyContactV1), EnvelopeError> {
+    ) -> Result<(BlobCustodyClaimV1, AuthenticatedBlobCustodyContactV1), EnvelopeError> {
         let expected_direction = match self.role {
             SessionRole::Initiator => BlobCustodyDirectionV1::ToSessionInitiator,
             SessionRole::Responder => BlobCustodyDirectionV1::ToSessionResponder,
         };
-        if self.semantic_version != SEMANTIC_PROTOCOL_V8 || direction != expected_direction {
+        let profiles = self
+            .transfer_profiles
+            .authenticated
+            .as_ref()
+            .ok_or_else(blob_custody_contact_unavailable)?;
+        if self.semantic_version != SEMANTIC_PROTOCOL_V8
+            || direction != expected_direction
+            || profiles.negotiated.profile(TransferLaneId::Blob)
+                != Some(TransferProfileId::BlobCustodyV1)
+        {
             return Err(blob_custody_contact_unavailable());
         }
         let record = decode_transport_frame(frame)?;
         let record_sequence = record.sequence;
-        let context = blob_custody_lane_record_context(transfer_profile_digest, direction);
+        let context = blob_custody_lane_record_context(profiles.digest, direction);
         let aad = transport_frame_context_aad(&context)?;
         let plaintext = self
             .channel
             .open_contextual(&self.provider, &record, &aad)
             .map_err(handshake_error)?;
+        let claim = BlobCustodyClaimV1::decode(&plaintext)
+            .map_err(|_| blob_custody_contact_unavailable())?;
+        if claim.session_transcript() != self.session_id || claim.direction() != direction {
+            return Err(blob_custody_contact_unavailable());
+        }
         let authority = AuthenticatedBlobCustodyContactV1::from_opened_record(
             self.session_id,
-            transfer_profile_digest,
+            profiles.digest,
             direction,
             record_sequence,
+            claim.digest(),
         );
-        Ok((plaintext, authority))
+        Ok((claim, authority))
     }
 
     /// Encrypts and authenticates one fixed, transfer-bound semantic-v3 custody claim.
@@ -5108,6 +5236,10 @@ fn custody_version_unavailable() -> EnvelopeError {
 
 fn blob_custody_contact_unavailable() -> EnvelopeError {
     EnvelopeError("semantic-v8 Blob custody contact is unavailable".into())
+}
+
+fn transfer_profile_negotiation_failed() -> EnvelopeError {
+    EnvelopeError("authenticated transfer-profile negotiation failed".into())
 }
 
 fn handshake_prefix(kind: u8) -> Vec<u8> {
@@ -10328,11 +10460,11 @@ mod tests {
     }
 
     #[test]
-    fn v8_blob_custody_authority_requires_profiled_replay_checked_record_open() {
-        // Mutation caught: minting Blob admission authority without a
-        // semantic-v8, profile-3, direction-bound authenticated record open,
-        // or reusing one protected record across a replay/contact boundary.
-        let mut provisioner = ReferenceProvisioner::from_seed([0x83; 32])
+    fn v8_blob_custody_requires_the_authenticated_negotiated_blob_profile() {
+        // Mutations caught: accepting a caller-supplied transfer-profile
+        // digest, treating a Legacy-selected Blob lane as profile 3, or
+        // deriving negotiation state from an unauthenticated offer.
+        let mut provisioner = ReferenceProvisioner::from_seed([0x84; 32])
             .unwrap_or_else(|error| panic!("provisioner failed: {error}"));
         let initiator_bytes = provisioner
             .issue_node(1, &[member_access(vec![0])])
@@ -10342,152 +10474,136 @@ mod tests {
             .issue_node(2, &[member_access(vec![0])])
             .and_then(|bundle| bundle.to_bytes())
             .unwrap_or_else(|error| panic!("responder fixture failed: {error}"));
-        let pair = |version| {
+        let pair = || {
             complete_sessions_with_versions(
                 ProvisioningBundle::from_bytes(&initiator_bytes)
                     .unwrap_or_else(|error| panic!("initiator parse failed: {error}")),
                 ProvisioningBundle::from_bytes(&responder_bytes)
                     .unwrap_or_else(|error| panic!("responder parse failed: {error}")),
-                vec![version],
+                vec![SEMANTIC_PROTOCOL_V8],
             )
         };
-        let (mut sender, mut receiver) = pair(SEMANTIC_PROTOCOL_V8);
-        let (_other_sender, mut other_receiver) = pair(SEMANTIC_PROTOCOL_V8);
-        let profile_digest = [0x91; 32];
+
+        let authenticate_offers =
+            |initiator: &mut ReferenceAuthenticatedSession,
+             responder: &mut ReferenceAuthenticatedSession,
+             initiator_offer: &crate::TransferProfileOfferV1,
+             responder_offer: &crate::TransferProfileOfferV1| {
+                let request = initiator
+                    .seal_transfer_profile_offer(initiator_offer)
+                    .unwrap_or_else(|error| panic!("offer request seal failed: {error}"));
+                assert_eq!(
+                    responder
+                        .open_transfer_profile_offer(&request)
+                        .unwrap_or_else(|error| panic!("offer request open failed: {error}")),
+                    *initiator_offer
+                );
+                let response = responder
+                    .seal_transfer_profile_offer(responder_offer)
+                    .unwrap_or_else(|error| panic!("offer response seal failed: {error}"));
+                assert_eq!(
+                    initiator
+                        .open_transfer_profile_offer(&response)
+                        .unwrap_or_else(|error| panic!("offer response open failed: {error}")),
+                    *responder_offer
+                );
+            };
+
+        let current = crate::TransferProfileOfferV1::for_semantic_version(SEMANTIC_PROTOCOL_V8)
+            .expect("semantic-v8 offer");
+        let legacy = crate::TransferProfileOfferV1::legacy_only();
         let direction = crate::BlobCustodyDirectionV1::ToSessionResponder;
+        let mut literal = literal_blob_custody_claim();
 
+        let (mut legacy_sender, mut legacy_receiver) = pair();
+        authenticate_offers(&mut legacy_sender, &mut legacy_receiver, &current, &legacy);
+        literal[14..46].copy_from_slice(&legacy_sender.session_id);
+        literal[54] = direction as u8;
+        let legacy_claim = crate::BlobCustodyClaimV1::decode(&literal).expect("literal claim");
         assert!(
-            sender
-                .seal_blob_custody_frame(
-                    profile_digest,
-                    crate::BlobCustodyDirectionV1::ToSessionInitiator,
-                    b"mislabeled sender role",
-                )
+            legacy_sender
+                .seal_blob_custody_frame(direction, &legacy_claim)
                 .is_err(),
-            "an initiator may seal only a transfer received by the responder"
+            "a Legacy-selected Blob lane must not mint profile-3 records"
         );
-        let mut wrong_receiver_context = b"ASTER/v8-lane-record/v1\0".to_vec();
-        wrong_receiver_context.extend_from_slice(&8u16.to_be_bytes());
-        wrong_receiver_context.extend_from_slice(&profile_digest);
-        wrong_receiver_context.extend_from_slice(&4u16.to_be_bytes());
-        wrong_receiver_context.extend_from_slice(&3u16.to_be_bytes());
-        wrong_receiver_context.push(1);
-        let wrong_receiver = sender
-            .seal_frame_with_context(b"mislabeled receiver role", &wrong_receiver_context)
-            .unwrap_or_else(|error| panic!("wrong-receiver frame seal failed: {error}"));
+        let legacy_negotiated = negotiate_transfer_profiles_for_semantic_version(
+            SEMANTIC_PROTOCOL_V8,
+            &current,
+            &legacy,
+        )
+        .expect("Legacy-selected semantic-v8 profiles");
+        let legacy_digest = transfer_profile_digest(&current, &legacy, &legacy_negotiated);
+        let legacy_context = blob_custody_lane_record_context(legacy_digest, direction);
+        let forged_profile_three = legacy_sender
+            .seal_frame_with_context(&legacy_claim.encode(), &legacy_context)
+            .expect("generic frame in a caller-selected profile-3 context");
         assert!(
-            receiver
-                .open_blob_custody_frame(
-                    profile_digest,
-                    crate::BlobCustodyDirectionV1::ToSessionInitiator,
-                    &wrong_receiver,
-                )
+            legacy_receiver
+                .open_blob_custody_frame(direction, &forged_profile_three)
                 .is_err(),
-            "a responder may open only a transfer received by the responder"
-        );
-
-        let mut legacy_profile_context = b"ASTER/v8-lane-record/v1\0".to_vec();
-        legacy_profile_context.extend_from_slice(&8u16.to_be_bytes());
-        legacy_profile_context.extend_from_slice(&profile_digest);
-        legacy_profile_context.extend_from_slice(&4u16.to_be_bytes());
-        legacy_profile_context.extend_from_slice(&1u16.to_be_bytes());
-        legacy_profile_context.push(2);
-        let legacy_profile = sender
-            .seal_frame_with_context(b"legacy profile substitution", &legacy_profile_context)
-            .unwrap_or_else(|error| panic!("legacy-profile frame seal failed: {error}"));
-        assert!(
-            receiver
-                .open_blob_custody_frame(profile_digest, direction, &legacy_profile)
-                .is_err(),
-            "a protected Blob record from profile 1 must not mint profile-3 authority"
+            "a Legacy-selected Blob lane must not open or mint profile-3 authority"
         );
 
-        let first = sender
-            .seal_blob_custody_frame(profile_digest, direction, b"finite source frame")
-            .unwrap_or_else(|error| panic!("Blob custody frame seal failed: {error}"));
+        let (mut sender, mut receiver) = pair();
+        authenticate_offers(&mut sender, &mut receiver, &current, &current);
+        literal[14..46].copy_from_slice(&sender.session_id);
+        let claim = crate::BlobCustodyClaimV1::decode(&literal).expect("session-bound claim");
+        let substituted_context = blob_custody_lane_record_context([0xa5; 32], direction);
+        let substituted = sender
+            .seal_frame_with_context(&claim.encode(), &substituted_context)
+            .expect("caller-selected digest frame");
         assert!(
             receiver
-                .open_blob_custody_frame([0x92; 32], direction, &first)
-                .is_err()
+                .open_blob_custody_frame(direction, &substituted)
+                .is_err(),
+            "a caller-selected profile digest must not mint Blob authority"
         );
+        let negotiated = negotiate_transfer_profiles_for_semantic_version(
+            SEMANTIC_PROTOCOL_V8,
+            &current,
+            &current,
+        )
+        .expect("BlobCustodyV1-selected semantic-v8 profiles");
+        let digest = transfer_profile_digest(&current, &current, &negotiated);
+        let mut substituted_profile = blob_custody_lane_record_context(digest, direction);
+        let profile_offset = substituted_profile.len() - 3;
+        substituted_profile[profile_offset..profile_offset + 2]
+            .copy_from_slice(&(TransferProfileId::LegacyV6 as u16).to_be_bytes());
+        let substituted = sender
+            .seal_frame_with_context(&claim.encode(), &substituted_profile)
+            .expect("caller-selected profile frame");
+        assert!(
+            receiver
+                .open_blob_custody_frame(direction, &substituted)
+                .is_err(),
+            "a caller-selected profile ID must not mint Blob authority"
+        );
+        let frame = sender
+            .seal_blob_custody_frame(direction, &claim)
+            .unwrap_or_else(|error| panic!("Blob custody seal failed: {error}"));
         let (opened, authority) = receiver
-            .open_blob_custody_frame(profile_digest, direction, &first)
-            .unwrap_or_else(|error| panic!("Blob custody frame open failed: {error}"));
-        assert_eq!(opened, b"finite source frame");
-        assert_eq!(authority.semantic_version(), SEMANTIC_PROTOCOL_V8);
-        assert_eq!(authority.profile_id(), 3);
-        assert_eq!(authority.direction(), direction);
-        assert_eq!(authority.transfer_profile_digest(), profile_digest);
-        assert_ne!(authority.session_transcript(), [0; 32]);
-        assert_ne!(authority.contact_identity(), [0; 32]);
+            .open_blob_custody_frame(direction, &frame)
+            .unwrap_or_else(|error| panic!("Blob custody open failed: {error}"));
+        assert_eq!(opened, claim);
+        assert_eq!(authority.claim_digest(), claim.digest());
         assert!(
-            receiver
-                .open_blob_custody_frame(profile_digest, direction, &first)
-                .is_err()
+            receiver.open_blob_custody_frame(direction, &frame).is_err(),
+            "one protected claim record must mint authority at most once"
         );
-
-        let mut literal_profile_context = b"ASTER/v8-lane-record/v1\0".to_vec();
-        literal_profile_context.extend_from_slice(&8u16.to_be_bytes());
-        literal_profile_context.extend_from_slice(&profile_digest);
-        literal_profile_context.extend_from_slice(&4u16.to_be_bytes());
-        literal_profile_context.extend_from_slice(&3u16.to_be_bytes());
-        literal_profile_context.push(2);
-        let literal_profile = sender
-            .seal_frame_with_context(b"literal profile-3 context", &literal_profile_context)
-            .unwrap_or_else(|error| panic!("literal profile-3 frame seal failed: {error}"));
         assert_eq!(
-            receiver
-                .open_blob_custody_frame(profile_digest, direction, &literal_profile)
-                .unwrap_or_else(|error| panic!("literal profile-3 frame open failed: {error}"))
-                .0,
-            b"literal profile-3 context"
+            sender.negotiated_transfer_profile(crate::TransferLaneId::Blob),
+            Some(crate::TransferProfileId::BlobCustodyV1)
         );
+    }
 
-        let second = sender
-            .seal_blob_custody_frame(profile_digest, direction, b"second finite source frame")
-            .unwrap_or_else(|error| panic!("second Blob custody seal failed: {error}"));
-        assert!(
-            receiver
-                .open_blob_custody_frame(
-                    profile_digest,
-                    crate::BlobCustodyDirectionV1::ToSessionInitiator,
-                    &second,
-                )
-                .is_err()
-        );
-        let (_, second_authority) = receiver
-            .open_blob_custody_frame(profile_digest, direction, &second)
-            .unwrap_or_else(|error| panic!("second Blob custody open failed: {error}"));
-        assert_ne!(
-            second_authority.contact_identity(),
-            authority.contact_identity()
-        );
-
-        let cross_session = sender
-            .seal_blob_custody_frame(profile_digest, direction, b"cross-session frame")
-            .unwrap_or_else(|error| panic!("cross-session frame seal failed: {error}"));
-        assert!(
-            other_receiver
-                .open_blob_custody_frame(profile_digest, direction, &cross_session)
-                .is_err()
-        );
-        assert!(
-            receiver
-                .open_blob_custody_frame(profile_digest, direction, &cross_session)
-                .is_ok()
-        );
-
-        let (mut v7_sender, mut v7_receiver) = pair(SEMANTIC_PROTOCOL_V7);
-        assert!(
-            v7_sender
-                .seal_blob_custody_frame(profile_digest, direction, b"wrong semantic")
-                .is_err()
-        );
-        assert!(
-            v7_receiver
-                .open_blob_custody_frame(profile_digest, direction, &first)
-                .is_err()
-        );
+    fn literal_blob_custody_claim() -> [u8; crate::BLOB_CUSTODY_CLAIM_V1_BYTES] {
+        const HEX: &str = "41535452424c30380001000800031111111111111111111111111111111111111111111111111111111111111111000000000000000001222222222222222222222222222222222222222222222222222222222222222200000000000000013333333333333333333333333333333333333333333333333333333333333333444444444444444444444444444444444444444444444444444444444444444400000000000000000100000000000000005555555555555555555555555555555500000000000000000000000000000000";
+        let mut output = [0u8; crate::BLOB_CUSTODY_CLAIM_V1_BYTES];
+        for (index, byte) in output.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&HEX[index * 2..index * 2 + 2], 16)
+                .expect("literal hexadecimal byte");
+        }
+        output
     }
 
     #[test]

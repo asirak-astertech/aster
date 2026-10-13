@@ -24473,18 +24473,16 @@ async fn sync_transfer_profiles(
         return Ok(None);
     }
     let initiator = local_transfer_profile_offer(mission.semantic_version())?;
-    let response = request_mission_frame(
-        connection,
-        mission,
-        Frame::TransferProfileOffer(initiator.clone()),
-        receipt,
-    )
-    .await?;
-    let Frame::TransferProfileOffer(responder) = response else {
-        return Err(NodeError::Protocol(
-            "semantic-v7 contact did not begin with the responder transfer-profile offer".into(),
-        ));
-    };
+    require_contact_frame_initiation()?;
+    let wire_budget = exchange_wire_budget(receipt)?;
+    let protected_request = mission.seal_transfer_profile_offer(&initiator)?;
+    let (protected_response, _checked) = connection
+        .request_with_total_limit_checked(&protected_request, wire_budget, || {
+            require_contact_frame_initiation()
+        })
+        .await?;
+    let responder = mission.open_transfer_profile_offer(&protected_response)?;
+    account(receipt, protected_request.len(), protected_response.len())?;
     let negotiated = negotiate_transfer_profiles_for_semantic_version(
         mission.semantic_version(),
         &initiator,
@@ -24507,23 +24505,45 @@ async fn serve_transfer_profiles(
     }
     let responder = TransferProfileOfferV1::for_semantic_version(mission.semantic_version())
         .map_err(|error| NodeError::Protocol(error.to_string()))?;
-    let mut initiator = None;
     let wire_budget = exchange_wire_budget(receipt)?;
-    let (complete, request_bytes, response_bytes) = respond_mission_frame(
-        connection,
-        mission,
-        wire_budget,
-        |frame, _request_wire_len, _mission| match frame {
-            Frame::TransferProfileOffer(offer) => {
+    let mut application_error = None;
+    let mut initiator = None;
+    let mut request_bytes = None;
+    let mut response_bytes = None;
+    let complete = connection
+        .respond_once_with_total_limit(wire_budget, |protected_request| {
+            require_contact_policy_current()
+                .map_err(|_| CarrierError::Transport("live emission policy changed".into()))?;
+            request_bytes = Some(protected_request.len());
+            let handled = (|| -> Result<Vec<u8>, NodeError> {
+                let offer = mission.open_transfer_profile_offer(protected_request)?;
+                require_contact_frame_response(&Frame::TransferProfileOffer(responder.clone()))?;
+                let protected_response = mission.seal_transfer_profile_offer(&responder)?;
+                require_contact_policy_current()?;
+                response_bytes = Some(protected_response.len());
                 initiator = Some(offer);
-                Ok((Frame::TransferProfileOffer(responder.clone()), true))
+                Ok(protected_response)
+            })();
+            match handled {
+                Ok(response) => Ok((response, true)),
+                Err(error) => {
+                    application_error = Some(error);
+                    Err(CarrierError::Transport(
+                        "mission-protected transfer-profile offer rejected".into(),
+                    ))
+                }
             }
-            _ => Err(NodeError::Protocol(
-                "semantic-v7 contact must begin with the initiator transfer-profile offer".into(),
-            )),
-        },
-    )
-    .await?;
+        })
+        .await?;
+    if let Some(error) = application_error {
+        return Err(error);
+    }
+    let request_bytes = request_bytes.ok_or_else(|| {
+        NodeError::Protocol("profile response completed without a protected request".into())
+    })?;
+    let response_bytes = response_bytes.ok_or_else(|| {
+        NodeError::Protocol("profile response completed without a protected response".into())
+    })?;
     account(receipt, request_bytes, response_bytes)?;
     if !complete {
         return Err(NodeError::Protocol(

@@ -1585,8 +1585,9 @@ mod tests {
 
     #[test]
     fn blob_custody_capability_binds_every_authenticated_source_and_contact_field() {
-        // Mutation caught: minting a verified capability from raw frame fields,
-        // or omitting any session, transfer, source-header, sample, or age bind.
+        // Mutations caught: omitting the exact opened-claim digest from the
+        // contact authority, or omitting any exchange, source, source-header,
+        // sample, hop, age, session, or direction comparison at verification.
         use crate::CustodySample;
         use crate::blob_custody::{
             AuthenticatedBlobCustodyContactV1, BlobCustodyClaimV1, BlobCustodyDirectionV1,
@@ -1619,12 +1620,6 @@ mod tests {
             clock_id: [0x71; 16],
             tick_ms: 1_500,
         };
-        let authenticated_contact = AuthenticatedBlobCustodyContactV1::from_opened_record(
-            [0x61; 32],
-            [0x62; 32],
-            BlobCustodyDirectionV1::ToSessionResponder,
-            9,
-        );
         let claim = BlobCustodyClaimV1::from_authenticated_source(
             [0x61; 32],
             41,
@@ -1638,9 +1633,20 @@ mod tests {
         )
         .expect("build authenticated finite claim");
         let decoded = BlobCustodyClaimV1::decode(&claim.encode()).expect("decode raw frame claim");
+        let contact = || {
+            AuthenticatedBlobCustodyContactV1::from_opened_record(
+                [0x61; 32],
+                [0x62; 32],
+                BlobCustodyDirectionV1::ToSessionResponder,
+                9,
+                claim.digest(),
+            )
+        };
+        let authenticated_contact = contact();
+        let contact_identity = authenticated_contact.contact_identity();
         let verified = decoded
             .verify_authenticated_source(
-                &authenticated_contact,
+                authenticated_contact,
                 41,
                 transfer_id,
                 &blob,
@@ -1657,20 +1663,18 @@ mod tests {
         assert_eq!(verified.priority(), Priority::Priority);
         assert_eq!(verified.ttl_ms(), 9_000);
         assert_eq!(verified.forwarding_age_ms(), 725);
-        assert_eq!(
-            verified.contact_identity(),
-            authenticated_contact.contact_identity()
-        );
+        assert_eq!(verified.contact_identity(), contact_identity);
 
         let other_contact = AuthenticatedBlobCustodyContactV1::from_opened_record(
             [0x63; 32],
             [0x62; 32],
             BlobCustodyDirectionV1::ToSessionResponder,
             9,
+            claim.digest(),
         );
         assert_eq!(
             decoded.verify_authenticated_source(
-                &other_contact,
+                other_contact,
                 41,
                 transfer_id,
                 &blob,
@@ -1681,6 +1685,50 @@ mod tests {
             ),
             Err(BlobCustodyError::ContextMismatch),
             "a capability from another authenticated session must not authorize the claim"
+        );
+
+        for (exchange_id, prior_age, changed_sample, hop_delta) in [
+            (42, 700, sample, 25),
+            (41, 701, sample, 25),
+            (
+                41,
+                700,
+                CustodySample {
+                    clock_id: [0x72; 16],
+                    tick_ms: 1_500,
+                },
+                25,
+            ),
+            (41, 700, sample, 26),
+        ] {
+            assert_eq!(
+                decoded.verify_authenticated_source(
+                    contact(),
+                    exchange_id,
+                    transfer_id,
+                    &blob,
+                    &sealed.bytes,
+                    prior_age,
+                    changed_sample,
+                    hop_delta,
+                ),
+                Err(BlobCustodyError::ContextMismatch),
+                "one exact opened claim must not authorize different caller context"
+            );
+        }
+        assert_eq!(
+            decoded.verify_authenticated_source(
+                contact(),
+                41,
+                BlobCustodyTransferId::from_exact_hash([0x99; 32]),
+                &blob,
+                &sealed.bytes,
+                700,
+                sample,
+                25,
+            ),
+            Err(BlobCustodyError::ContextMismatch),
+            "one exact opened claim must not authorize another source"
         );
 
         for offset in [
@@ -1696,7 +1744,7 @@ mod tests {
                 .expect("substitution remains structurally canonical");
             assert_eq!(
                 substituted.verify_authenticated_source(
-                    &authenticated_contact,
+                    contact(),
                     41,
                     transfer_id,
                     &blob,

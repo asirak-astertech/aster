@@ -65,7 +65,7 @@ impl BlobCustodyDirectionV1 {
 /// Construction is core-private. Public callers can receive this value only
 /// from `ReferenceAuthenticatedSession::open_blob_custody_frame` after an
 /// authenticated profile-3 Blob-lane record open succeeds.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct AuthenticatedBlobCustodyContactV1 {
     semantic_version: u16,
     profile_id: u16,
@@ -73,6 +73,7 @@ pub struct AuthenticatedBlobCustodyContactV1 {
     transfer_profile_digest: [u8; 32],
     direction: BlobCustodyDirectionV1,
     record_sequence: u64,
+    claim_digest: [u8; 32],
     contact_identity: [u8; 32],
 }
 
@@ -82,6 +83,7 @@ impl AuthenticatedBlobCustodyContactV1 {
         transfer_profile_digest: [u8; 32],
         direction: BlobCustodyDirectionV1,
         record_sequence: u64,
+        claim_digest: [u8; 32],
     ) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(CONTACT_ID_DOMAIN);
@@ -91,6 +93,7 @@ impl AuthenticatedBlobCustodyContactV1 {
         hasher.update(transfer_profile_digest);
         hasher.update([direction as u8]);
         hasher.update(record_sequence.to_be_bytes());
+        hasher.update(claim_digest);
         Self {
             semantic_version: SEMANTIC_VERSION,
             profile_id: PROFILE_ID,
@@ -98,6 +101,7 @@ impl AuthenticatedBlobCustodyContactV1 {
             transfer_profile_digest,
             direction,
             record_sequence,
+            claim_digest,
             contact_identity: hasher.finalize().into(),
         }
     }
@@ -130,6 +134,11 @@ impl AuthenticatedBlobCustodyContactV1 {
     /// Returns the replay-checked record sequence for this contact.
     pub const fn record_sequence(&self) -> u64 {
         self.record_sequence
+    }
+
+    /// Digest of the exact canonical claim plaintext opened by this contact.
+    pub const fn claim_digest(&self) -> [u8; 32] {
+        self.claim_digest
     }
 
     /// Returns a non-secret identity of this exact authenticated contact.
@@ -242,7 +251,7 @@ impl BlobCustodyClaimV1 {
     #[allow(clippy::too_many_arguments)]
     pub fn verify_authenticated_source(
         &self,
-        authenticated_contact: &AuthenticatedBlobCustodyContactV1,
+        authenticated_contact: AuthenticatedBlobCustodyContactV1,
         exchange_id: u64,
         source_transfer_id: BlobCustodyTransferId,
         source: &ContentVerifiedBlobEnvelope,
@@ -262,12 +271,12 @@ impl BlobCustodyClaimV1 {
             sender_sample,
             hop_delta_ms,
         )?;
-        if *self != expected {
+        if self.digest() != authenticated_contact.claim_digest || *self != expected {
             return Err(BlobCustodyError::ContextMismatch);
         }
         Ok(VerifiedBlobCustodyClaimV1::from_verified(
             *self,
-            authenticated_contact.clone(),
+            authenticated_contact,
         ))
     }
 
@@ -461,10 +470,23 @@ impl BlobCustodyClaimV1 {
 ///     transfer_profile_digest: [0x22; 32],
 ///     direction: BlobCustodyDirectionV1::ToSessionResponder,
 ///     record_sequence: 0,
+///     claim_digest: [0x44; 32],
 ///     contact_identity: [0x33; 32],
 /// };
 /// ```
-#[derive(Clone, Debug, Eq, PartialEq)]
+///
+/// The exact-open authority is linear rather than cloneable:
+///
+/// ```compile_fail
+/// use aster_mesh::AuthenticatedBlobCustodyContactV1;
+///
+/// fn duplicate(
+///     contact: AuthenticatedBlobCustodyContactV1,
+/// ) -> (AuthenticatedBlobCustodyContactV1, AuthenticatedBlobCustodyContactV1) {
+///     (contact, contact)
+/// }
+/// ```
+#[derive(Debug, Eq, PartialEq)]
 pub struct VerifiedBlobCustodyClaimV1 {
     claim: BlobCustodyClaimV1,
     digest: [u8; 32],
