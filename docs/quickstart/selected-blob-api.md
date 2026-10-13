@@ -352,8 +352,10 @@ ID, not the last manifest record.
 Normal and `AtLeast` run the v5 lane because `AtLeast` filters Event only.
 `ReceiveOnly` advertises, requests, stages, promotes, and counts zero Blob work.
 The live handle does not change those contact rules and reports no Blob peer or
-convergence status. Route-only Blob relay/custody, Blob TTL/expiry/GC, and a
-metadata-independent whole-byte identity are not implemented.
+convergence status. Route-only Blob relay/custody, finite Blob TTL/expiry, and
+a metadata-independent whole-byte identity are not implemented. Pressure
+recovery is a local durable-storage behavior only; it adds no Blob wire,
+supported public Blob API, or CLI control surface.
 
 `publish` requires a seekable source because it makes two bounded passes. The
 first computes the whole-content and per-chunk digests with one bounded,
@@ -418,6 +420,51 @@ do not account for redb allocation, directory blocks, snapshots, backups, swap,
 an attacker-created population of unrelated directory entries, or every host
 filesystem overhead; they are not a complete physical-storage or sanitization
 claim.
+
+### Pressure recovery is narrow and deterministic
+
+Before returning an eligible Blob capacity error, admission runs its existing
+bounded routine cleanup. If the exact rejected partition remains full, it can
+recover capacity only from the matching Blob kind:
+
+- aggregate item/byte and per-content-publication pressure select live
+  publications;
+- network-staging row/byte pressure selects pending sources; and
+- depot byte/chunk/variant pressure selects whole physical variants.
+
+Operation, publication-lifecycle, causal-frontier, lease, lineage-fence, and
+replay-fence capacity are cleanup-only: pressure recovery never evicts them.
+The candidate must have an effective priority *strictly* lower than the incoming
+work, so equal- and higher-priority live Blob work remains protected.
+
+Within an eligible partition, selection is deterministic: lower effective
+priority first; incomplete transfers before completed content; then expired
+finite work, live finite work by nearest final-reference deadline, and durable
+work last; followed by exact completion fraction, acceptance order, and exact
+identity. Current
+Blob TTL remains inactive, so present Blob work is durable; the complete order
+is encoded for future finite records without inventing expiry today.
+Completion compares the durable carrier-prefix or committed-plaintext fraction
+exactly, rather than using floating point.
+
+One selected candidate is a whole atomic work unit. The store preflights its
+roots, delivery and operation edges, indexes, lease generations, retirement
+records, and any deletion-manifest work within explicit bounds. If it cannot
+prove the first candidate or that complete unit exceeds the remaining recovery
+budget, it changes nothing and does not skip to a later candidate. A final
+physical root is retired with a durable deletion manifest; filesystem unlink is
+then idempotent and resumable across interruption or restart while the retired
+content stays unavailable and every variant, chunk, and byte remains charged
+until deletion finalizes. Depot pressure authorizes the single retry only after
+that physical finalization measurably releases the rejected partition.
+
+After a successful bounded recovery, the node removes every returned evicted
+transfer from its authenticated route and pending-completion caches while it
+holds the Blob lifecycle lock, then retries the original admission once. It
+preserves the original capacity result when recovery is ineligible or
+insufficient, and never turns pressure recovery into an unbounded retry loop.
+If the retry fails with anything other than the equivalent capacity rejection,
+that second policy, schema, integrity, or coherence result is propagated.
 
 On Unix, depot directories are opened relative to owner-controlled directory
 descriptors with no-follow checks and private modes. Non-Unix uses a narrower

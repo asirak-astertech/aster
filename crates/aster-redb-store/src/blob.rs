@@ -14,11 +14,15 @@ pub(crate) mod depot;
 pub(crate) mod lease;
 #[allow(dead_code)] // Lifecycle authority becomes active in Tasks 2-4.
 pub(crate) mod lifecycle;
+#[allow(dead_code)] // Canonical selection helpers become active in Task 3.
+pub(crate) mod pressure;
 
 pub use lifecycle::{
     BlobLifecycleLimits, BlobMaintenanceBudget, BlobMaintenanceCandidate, BlobMaintenanceClass,
     BlobMaintenanceProgress,
 };
+#[doc(hidden)]
+pub use pressure::BlobCapacityRecoveryResult;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -102,7 +106,8 @@ const BLOB_NETWORK_SCHEMA_VERSION: u64 = 1;
 const BLOB_METADATA_VERSION_V1: u8 = 1;
 const BLOB_METADATA_VERSION: u8 = 2;
 const BLOB_OPERATION_VERSION: u8 = 1;
-const PENDING_BLOB_SOURCE_VERSION: u8 = 1;
+const LEGACY_PENDING_BLOB_SOURCE_VERSION: u8 = 1;
+const PENDING_BLOB_SOURCE_VERSION: u8 = 2;
 const BLOB_CARRIER_PREFIX_VERSION: u8 = 1;
 const BLOB_PUBLICATION_INTENT_DOMAIN: &[u8] = b"aster/blob-publication-intent/v1";
 const BLOB_VARIANT_DOMAIN: &[u8] = b"aster/blob-depot-variant/v1";
@@ -231,6 +236,18 @@ pub const MAX_BLOB_POLICY_RETIREMENT_BYTES: u64 = MAX_BLOB_POLICY_RETIREMENT_DIS
                 + (33 + MAX_BLOB_OPERATION_KEY_BYTES as u64)
                 + 57)
         + crate::MAX_BLOB_SUBSCRIPTIONS * ((40 + 49) + (64 + 40));
+/// Conservative complete-unit row ceiling for retiring a maximum-fanout final
+/// root and atomically replacing its maximum chunk set with deletion authority.
+#[cfg(test)]
+const MAX_BLOB_PRESSURE_FINAL_ROOT_ROWS: u64 =
+    MAX_BLOB_POLICY_RETIREMENT_ROWS + 2 * MAX_SELECTED_BLOB_CHUNKS + 32;
+/// Proven encoded-byte ceiling paired with
+/// [`MAX_BLOB_PRESSURE_FINAL_ROOT_ROWS`].
+#[cfg(test)]
+const MAX_BLOB_PRESSURE_FINAL_ROOT_BYTES: u64 = MAX_BLOB_POLICY_RETIREMENT_BYTES
+    + 4 * MAX_BLOB_SOURCE_SEALED_BYTES
+    + 2 * MAX_SELECTED_BLOB_CHUNKS * 1024
+    + 16 * 1024;
 /// Maximum selected 64-KiB chunks in one network Blob.
 pub const MAX_NETWORK_BLOB_CHUNKS: u64 = 1_024;
 /// Maximum aggregate pending-source and carrier-prefix rows.
@@ -253,27 +270,28 @@ pub const BLOB_CARRIER_OBJECT_ID_BYTES: usize = 33;
 pub const BLOB_CARRIER_PREFIX_KEY_BYTES: usize = 32 + BLOB_CARRIER_OBJECT_ID_BYTES;
 /// Fixed carrier cursor length (`source transfer || typed ObjectID`).
 pub const BLOB_CARRIER_FETCH_CURSOR_BYTES: usize = 32 + BLOB_CARRIER_OBJECT_ID_BYTES;
-/// Default aggregate expected chunk-file byte reservation cap (512 MiB).
+/// Default aggregate active and deletion-owned chunk-file reservation cap (512 MiB).
 pub const DEFAULT_MAX_BLOB_DEPOT_BYTES: u64 = 512 * 1024 * 1024;
 /// Default aggregate durable chunk-metadata row cap.
 ///
-/// Plaintext-digest or expected-record staging consumes this cap before a file
-/// becomes committed.
+/// Active plaintext-digest or expected-record staging and deletion-owned chunk
+/// rows consume this cap even when no file has become committed.
 pub const DEFAULT_MAX_BLOB_DEPOT_CHUNKS: u64 = 100_000;
 /// Default aggregate durable epoch-specific import-row cap.
 ///
-/// Every durable import row, public or unpublished, consumes this cap.
+/// Every active or deletion-manifest-owned variant consumes this cap.
 pub const DEFAULT_MAX_BLOB_DEPOT_VARIANTS: u64 = 4_096;
 
 /// Dedicated durable-admission limits for one mission-bound Blob depot.
 ///
 /// `max_bytes` reserves the canonical chunk-file bytes, including each fixed
-/// file header, for every durable expected chunk record; committed files are a
-/// subset. `max_chunks` counts all durable chunk metadata rows, including
-/// digest/expected-record staging. `max_variants` counts every durable import
-/// row, public or unpublished. Exact already-unreferenced staging and completed
-/// variants remain fully charged while a durable deletion manifest authorizes
-/// bounded physical reclamation; only finalization releases that accounting.
+/// file header, for active and deletion-manifest-owned expected chunk records;
+/// committed files are a subset. `max_chunks` counts active and
+/// deletion-manifest-owned durable chunk rows, including digest/expected-record
+/// staging with no committed file. `max_variants` counts every active or
+/// deletion-manifest-owned variant, public or unpublished. Logical retirement
+/// transfers these charges to deletion authority; only successful physical
+/// finalization releases them for subsequent admission.
 /// These limits intentionally do not bound unmarked, temporary, or hostile
 /// untracked filesystem allocation, and reclamation does not provide live
 /// retirement, retention expiry, pressure eviction, or finite-TTL semantics.
@@ -308,17 +326,17 @@ impl BlobDepotLimits {
         })
     }
 
-    /// Maximum aggregate bytes reserved by durable expected chunk records.
+    /// Maximum bytes reserved by active plus deletion-owned expected records.
     pub const fn max_bytes(self) -> u64 {
         self.max_bytes
     }
 
-    /// Maximum durable chunk metadata rows, including unfinished staging.
+    /// Maximum active plus deletion-owned chunk rows, including unfinished staging.
     pub const fn max_chunks(self) -> u64 {
         self.max_chunks
     }
 
-    /// Maximum durable import rows, public or unpublished.
+    /// Maximum active plus deletion-owned variants, public or unpublished.
     pub const fn max_variants(self) -> u64 {
         self.max_variants
     }
@@ -1416,6 +1434,7 @@ struct BlobOperationRecord {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PendingBlobSourceRecord {
+    pending_acceptance_order: u64,
     metadata: BlobMetadata,
     route_lineage: [u8; 32],
     physical_lineage: [u8; 32],
@@ -2647,21 +2666,21 @@ impl Store {
             physical_lineage: Some(*blob.physical_lineage().binding()),
             header,
         };
-        let pending = PendingBlobSourceRecord {
+        let mut pending = PendingBlobSourceRecord {
+            pending_acceptance_order: 0,
             metadata,
             route_lineage: *blob.route_lineage().binding(),
             physical_lineage: *blob.physical_lineage().binding(),
             carriers,
             sealed: sealed.to_vec(),
         };
-        let encoded = encode_pending_blob_source(&pending)?;
-
         // Ensure the mission-bound depot root/owner marker exists before the
         // redb import becomes durable, while retaining the single-owner lock.
         let _depot_guard = BlobDepot::open_network_mutation(self, true)?;
         self.require_live()?;
         let write = self.database.begin_write()?;
         enforce_live_write(&write)?;
+        pressure::require_variant_write(&write, pending.metadata.variant_id)?;
         enforce_blob_policy_write(&write, authority, policy, &pending.metadata.header)?;
         let staging = blob_network_staging_usage_write(&write, authority)?;
         let owner_binding = depot::require_depot_owner_binding_write(
@@ -2734,12 +2753,19 @@ impl Store {
             });
         }
 
-        let existing = write
+        let existing_bytes = write
             .open_table(BLOB_PENDING_SOURCES)?
             .get(transfer_id.as_bytes().as_slice())?
             .map(|value| value.value().to_vec());
-        if existing.as_deref().is_some_and(|value| value != encoded) {
-            return Err(blob_error(BlobStoreError::PendingSourceConflict));
+        let existing = existing_bytes
+            .as_deref()
+            .map(decode_pending_blob_source)
+            .transpose()?;
+        if let Some(existing) = existing.as_ref() {
+            pending.pending_acceptance_order = existing.pending_acceptance_order;
+            if existing != &pending {
+                return Err(blob_error(BlobStoreError::PendingSourceConflict));
+            }
         }
         if existing.is_some() {
             lifecycle::require_lineage_fence(
@@ -2765,7 +2791,9 @@ impl Store {
         }
         let incoming_rows = u64::from(existing.is_none());
         let incoming_bytes = if existing.is_none() {
-            staging_entry_bytes(32, encoded.len())?
+            let mut sized = pending.clone();
+            sized.pending_acceptance_order = 1;
+            staging_entry_bytes(32, encode_pending_blob_source(&sized)?.len())?
         } else {
             0
         };
@@ -2773,6 +2801,10 @@ impl Store {
 
         depot::stage_verified_plan_write(&write, self.blob_depot_limits, plan)?;
         if existing.is_none() {
+            let pending_acceptance_order =
+                pressure::allocate_pending_acceptance_order_write(&write)?;
+            pending.pending_acceptance_order = pending_acceptance_order;
+            let encoded = encode_pending_blob_source(&pending)?;
             write
                 .open_table(BLOB_PENDING_SOURCES)?
                 .insert(transfer_id.as_bytes().as_slice(), encoded.as_slice())?;
@@ -2795,6 +2827,9 @@ impl Store {
                         .ok_or(StoreError::PayloadByteAccountingOverflow)?,
                 },
             )?;
+            pressure::insert_pending_source_write(&write, transfer_id, &pending)?;
+        } else {
+            pressure::require_pending_source_write(&write, transfer_id, &pending)?;
         }
         write.commit()?;
         Ok(if existing.is_some() {
@@ -3373,6 +3408,8 @@ impl Store {
             .map(|value| decode_pending_blob_source(value.value()))
             .transpose()?
             .ok_or_else(|| blob_error(BlobStoreError::PendingSourceMissing))?;
+        pressure::require_pending_source_write(&write, source, &pending)?;
+        pressure::require_variant_write(&write, pending.metadata.variant_id)?;
         if pending.metadata.transfer_id != source
             || write
                 .open_table(BLOB_PUBLICATIONS)?
@@ -3472,6 +3509,7 @@ impl Store {
                     .ok_or(StoreError::PayloadByteAccountingOverflow)?,
             },
         )?;
+        pressure::reconcile_variant_write(&write, pending.metadata.variant_id)?;
         write.commit()?;
         Ok(BlobCarrierAppendOutcome::Appended(carrier_prefix_status(
             object, &next,
@@ -3540,6 +3578,8 @@ impl Store {
                     "Blob carrier prefix is orphaned from its pending source",
                 ))
             })?;
+        pressure::require_pending_source_write(&write, source, &pending)?;
+        pressure::require_variant_write(&write, pending.metadata.variant_id)?;
         if pending.metadata.transfer_id != source
             || pending_blob_carrier(&pending, object)
                 .is_none_or(|expected| expected.total_len != record.total_len)
@@ -3567,6 +3607,7 @@ impl Store {
                 })?,
             },
         )?;
+        pressure::reconcile_variant_write(&write, pending.metadata.variant_id)?;
         write.commit()?;
         Ok(true)
     }
@@ -3604,6 +3645,8 @@ impl Store {
                 "pending Blob source key differs from its authenticated identity",
             )));
         }
+        pressure::require_pending_source_write(&write, source, &pending)?;
+        pressure::require_variant_write(&write, pending.metadata.variant_id)?;
         let owner_binding = depot::require_depot_owner_binding_write(
             &write,
             &self.path,
@@ -3623,6 +3666,7 @@ impl Store {
             source,
         )?;
         remove_pending_source_rows_write(&write, staging, source, &pending)?;
+        pressure::remove_pending_source_write(&write, source, pending.metadata.variant_id)?;
         write.commit()?;
         Ok(true)
     }
@@ -3756,6 +3800,8 @@ impl Store {
                 .map(|value| decode_pending_blob_source(value.value()))
                 .transpose()?
                 .ok_or_else(|| blob_error(BlobStoreError::PendingSourceMissing))?;
+            pressure::require_pending_source_write(&write, source, &current_pending)?;
+            pressure::require_variant_write(&write, current_pending.metadata.variant_id)?;
             enforce_blob_policy_write(&write, authority, policy, &current_pending.metadata.header)?;
             require_pending_blob_plan(&current_pending, plan)?;
             let key = blob_carrier_prefix_key(source, object);
@@ -3786,6 +3832,7 @@ impl Store {
                     })?,
                 },
             )?;
+            pressure::reconcile_variant_write(&write, current_pending.metadata.variant_id)?;
             write.commit()?;
         }
         Ok(if already_committed {
@@ -4100,6 +4147,18 @@ impl Store {
         if pending.is_none() && accepted.is_none() {
             return Err(blob_error(BlobStoreError::PendingSourceMissing));
         }
+        if let Some(pending) = pending.as_ref() {
+            pressure::require_pending_source_write(&write, source, pending)?;
+        } else {
+            pressure::require_publication_write(&write, source)?;
+        }
+        pressure::require_variant_write(
+            &write,
+            pending.as_ref().map_or_else(
+                || accepted.as_ref().expect("accepted branch").variant_id,
+                |value| value.metadata.variant_id,
+            ),
+        )?;
 
         let (metadata, sealed) = if let Some(pending) = pending.as_ref() {
             require_pending_blob_plan(pending, plan)?;
@@ -4221,6 +4280,7 @@ impl Store {
                 source,
                 pending.as_ref().expect("pending branch"),
             )?;
+            pressure::promote_pending_source_write(&write, source, metadata.variant_id)?;
             write.commit()?;
             return Ok(ApplyOutcome::Duplicate {
                 acceptance_marker: accepted.acceptance_marker,
@@ -4396,6 +4456,7 @@ impl Store {
             source,
             pending.as_ref().expect("pending branch"),
         )?;
+        pressure::promote_pending_source_write(&write, source, metadata.variant_id)?;
         write.commit()?;
         Ok(ApplyOutcome::Inserted {
             acceptance_marker: marker,
@@ -4645,6 +4706,7 @@ impl Store {
         } else {
             None
         };
+        pressure::require_variant_write(&write, prepared.variant_id)?;
 
         let content_prefix = blob_content_prefix(
             &prepared.header.topic,
@@ -4777,6 +4839,15 @@ impl Store {
                 prepared.transfer_id,
                 pending,
             )?;
+        }
+        if pending.is_some() {
+            pressure::promote_pending_source_write(
+                &write,
+                prepared.transfer_id,
+                prepared.variant_id,
+            )?;
+        } else {
+            pressure::insert_publication_write(&write, prepared.transfer_id)?;
         }
         #[cfg(test)]
         if TEST_BLOB_ADMISSION_PRE_COMMIT_FAULT.get() {
@@ -5009,6 +5080,65 @@ impl MaintenanceCharge {
         self.bytes = next_bytes;
         Ok(true)
     }
+}
+
+fn pressure_charge_u64_rows(
+    charge: &mut MaintenanceCharge,
+    fields: &[&str],
+) -> Result<bool, StoreError> {
+    for field in fields {
+        if !charge.charge(field.as_bytes(), std::mem::size_of::<u64>())? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+type PressureDeletionEvidence = (Vec<u8>, Vec<u8>);
+
+fn pressure_deletion_evidence_write(
+    write: &redb::WriteTransaction,
+    variant: BlobVariantId,
+    charge: &mut MaintenanceCharge,
+) -> Result<Option<PressureDeletionEvidence>, StoreError> {
+    let imports = write.open_table(BLOB_IMPORTS)?;
+    let import = imports.get(variant.as_bytes().as_slice())?.ok_or_else(|| {
+        blob_error(BlobStoreError::SchemaInvariant(
+            "final Blob pressure root lacks its depot import",
+        ))
+    })?;
+    if !charge.charge(variant.as_bytes(), import.value().len())? {
+        return Ok(None);
+    }
+    let import_bytes = import.value().to_vec();
+    drop(import);
+    drop(imports);
+
+    let lineages = write.open_table(lifecycle::BLOB_LINEAGE_FENCES)?;
+    let lineage = lineages
+        .get(variant.as_bytes().as_slice())?
+        .ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "final Blob pressure root lacks its lineage fence",
+            ))
+        })?;
+    if !charge.charge(variant.as_bytes(), lineage.value().len())? {
+        return Ok(None);
+    }
+    let lineage_bytes = lineage.value().to_vec();
+    Ok(Some((import_bytes, lineage_bytes)))
+}
+
+fn pressure_charge_depot_owner_binding(charge: &mut MaintenanceCharge) -> Result<bool, StoreError> {
+    pressure_charge_u64_rows(
+        charge,
+        &[
+            DEPOT_OWNER_BINDING_0,
+            DEPOT_OWNER_BINDING_1,
+            DEPOT_OWNER_BINDING_2,
+            DEPOT_OWNER_BINDING_3,
+        ],
+    )
 }
 
 fn capture_required_maintenance_bytes(
@@ -7016,6 +7146,1140 @@ impl Store {
         ))
     }
 
+    /// Selects and atomically retires lower-priority work only from the exact
+    /// rejected capacity partition. Routine maintenance cursors are untouched.
+    pub(crate) fn run_blob_pressure_recovery(
+        &self,
+        demand: pressure::BlobCapacityRecoveryDemand,
+        budget: pressure::BlobPressureRecoveryBudget,
+        custody_sample: Option<aster_mesh::CustodySample>,
+    ) -> Result<pressure::BlobCapacityRecoveryResult, StoreError> {
+        self.require_live()?;
+        let _depot_guard = self
+            .blob_depot_lock
+            .lock()
+            .map_err(|_| blob_error(BlobStoreError::DepotIntegrity("depot lock is poisoned")))?;
+        self.require_live()?;
+
+        let read = self.database.begin_read()?;
+        let selection = pressure::select_pressure_candidate_read(&read, demand, budget)?;
+        drop(read);
+        if !selection.proven() {
+            return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                selection.rows_examined(),
+                selection.bytes_examined(),
+            ));
+        }
+        let Some(candidate) = selection.candidate() else {
+            return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                selection.rows_examined(),
+                selection.bytes_examined(),
+            ));
+        };
+        let transfer = match candidate {
+            pressure::PressureCandidate::Publication(transfer) => transfer,
+            pressure::PressureCandidate::PendingSource(transfer) => {
+                return self.run_blob_pending_pressure_recovery(
+                    transfer,
+                    demand,
+                    budget,
+                    selection,
+                    custody_sample,
+                );
+            }
+            pressure::PressureCandidate::Variant(variant) => {
+                return self.run_blob_variant_pressure_recovery(
+                    variant,
+                    demand,
+                    budget,
+                    selection,
+                    custody_sample,
+                );
+            }
+        };
+
+        let write = self.database.begin_write()?;
+        enforce_live_write(&write)?;
+        let maintenance_budget =
+            lifecycle::BlobMaintenanceBudget::new(budget.rows, 1, budget.bytes)?;
+        let mut charge = MaintenanceCharge {
+            budget: maintenance_budget,
+            rows: selection.rows_examined(),
+            bytes: selection.bytes_examined(),
+        };
+        let publications = write.open_table(BLOB_PUBLICATIONS)?;
+        let publication_record = publications
+            .get(transfer.as_bytes().as_slice())?
+            .ok_or_else(|| {
+                blob_error(BlobStoreError::SchemaInvariant(
+                    "Blob pressure candidate publication disappeared",
+                ))
+            })?;
+        if !charge.charge(transfer.as_bytes(), publication_record.value().len())? {
+            return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                charge.rows,
+                charge.bytes,
+            ));
+        }
+        let encoded_publication = publication_record.value().to_vec();
+        drop(publication_record);
+        drop(publications);
+        let publication_record = encoded_publication;
+        if lifecycle::publication_record_is_retired(&publication_record).map_err(blob_error)? {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "Blob pressure candidate is already retired",
+            )));
+        }
+        let publication = decode_blob_metadata(&publication_record)?;
+        if publication.transfer_id != transfer
+            || publication.header.priority >= demand.incoming_priority()
+        {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "Blob pressure candidate changed after ordered selection",
+            )));
+        }
+        let Some(references) = pressure::bounded_variant_references_write(
+            &write,
+            publication.variant_id,
+            budget.roots,
+            &mut charge,
+        )?
+        else {
+            return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                charge.rows,
+                charge.bytes,
+            ));
+        };
+        if !pressure::require_variant_with_references_bounded_write(
+            &write,
+            publication.variant_id,
+            &references,
+            &mut charge,
+        )? {
+            return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                charge.rows,
+                charge.bytes,
+            ));
+        }
+        let final_root = references.len() == 1;
+        if final_root
+            && (references[0] != (lifecycle::VariantReferenceOwner::Publication, transfer)
+                || budget.deletion_manifests < 1)
+        {
+            return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                charge.rows,
+                charge.bytes,
+            ));
+        }
+        let mut remaining_operations = budget.operations;
+        let Some(retirement_plan) = plan_blob_publication_retirement_write(
+            &write,
+            self.blob_lifecycle_limits,
+            transfer,
+            lifecycle::RetirementReason::Evicted,
+            custody_sample,
+            &mut charge,
+            &mut remaining_operations,
+        )?
+        else {
+            return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                charge.rows,
+                charge.bytes,
+            ));
+        };
+        let deletion_evidence = if final_root {
+            match deletion::bounded_variant_has_deletion_manifest_write(
+                &write,
+                publication.variant_id,
+                &mut charge,
+            )? {
+                Some(false) => {}
+                Some(true) => {
+                    return Err(blob_error(BlobStoreError::SchemaInvariant(
+                        "live Blob pressure root already has deletion authority",
+                    )));
+                }
+                None => {
+                    return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                        charge.rows,
+                        charge.bytes,
+                    ));
+                }
+            }
+            let Some((import, lineage)) =
+                pressure_deletion_evidence_write(&write, publication.variant_id, &mut charge)?
+            else {
+                return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                    charge.rows,
+                    charge.bytes,
+                ));
+            };
+            if !pressure_charge_depot_owner_binding(&mut charge)? {
+                return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                    charge.rows,
+                    charge.bytes,
+                ));
+            }
+            let owner = depot::require_depot_owner_binding_write(
+                &write,
+                &self.path,
+                self.backing_identity,
+                self.blob_depot_owner_token,
+            )?;
+            let snapshot = self
+                .blob_lease_registry
+                .snapshot(
+                    self.blob_depot_owner_binding,
+                    lease::BlobLeaseTarget::Variant(publication.variant_id),
+                )
+                .map_err(lease::store_error)?;
+            #[cfg(test)]
+            if TEST_BLOB_MANIFEST_ADMISSION_GENERATION_CHURN.get() {
+                drop(
+                    self.blob_lease_registry
+                        .acquire(
+                            self.blob_depot_owner_binding,
+                            lease::BlobLeaseTarget::Variant(publication.variant_id),
+                            lease::BlobLeaseKind::InternalChunkWork,
+                        )
+                        .map_err(lease::store_error)?,
+                );
+            }
+            Some((import, lineage, owner, snapshot))
+        } else {
+            None
+        };
+        let source_len = write
+            .open_table(BLOB_BYTES)?
+            .get(transfer.as_bytes().as_slice())?
+            .map(|value| u64::try_from(value.value().len()))
+            .transpose()
+            .map_err(|_| StoreError::PayloadByteAccountingOverflow)?
+            .ok_or_else(|| {
+                blob_error(BlobStoreError::SchemaInvariant(
+                    "Blob pressure candidate is missing source bytes",
+                ))
+            })?;
+        let before_items = write
+            .open_table(METADATA)?
+            .get(BLOB_ITEM_COUNT)?
+            .ok_or(StoreError::MissingAccountingMetadata {
+                field: BLOB_ITEM_COUNT,
+            })?
+            .value();
+        let before_bytes = write
+            .open_table(METADATA)?
+            .get(BLOB_TOTAL_BYTES)?
+            .ok_or(StoreError::MissingAccountingMetadata {
+                field: BLOB_TOTAL_BYTES,
+            })?
+            .value();
+        let deletion_evidence = if let Some((import, lineage, owner, snapshot)) = deletion_evidence
+        {
+            match self.blob_lease_registry.try_mark_delete_pending(snapshot) {
+                Ok(admission) => Some((import, lineage, owner, admission)),
+                Err(
+                    lease::BlobLeaseAcquireError::ActiveLeases
+                    | lease::BlobLeaseAcquireError::GenerationChanged
+                    | lease::BlobLeaseAcquireError::DeletePending,
+                ) => {
+                    return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                        charge.rows,
+                        charge.bytes,
+                    ));
+                }
+                Err(error) => return Err(lease::store_error(error)),
+            }
+        } else {
+            None
+        };
+        let deletion_plan = if let Some((import, lineage, owner, _)) = &deletion_evidence {
+            let Some(plan) = deletion::plan_variant_admission_write(
+                &write,
+                publication.variant_id,
+                import,
+                lineage,
+                *owner,
+                custody_sample,
+                Some(&mut charge),
+            )?
+            else {
+                return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                    charge.rows,
+                    charge.bytes,
+                ));
+            };
+            Some(plan)
+        } else {
+            None
+        };
+        if !pressure_charge_u64_rows(&mut charge, &[BLOB_ITEM_COUNT, BLOB_TOTAL_BYTES])? {
+            return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                charge.rows,
+                charge.bytes,
+            ));
+        }
+        apply_blob_publication_retirement_plan_write(
+            &write,
+            self.blob_lifecycle_limits,
+            retirement_plan,
+            true,
+            final_root,
+        )?;
+        if final_root {
+            pressure::remove_drained_variant_write(&write, publication.variant_id)?;
+        }
+        if let Some(plan) = deletion_plan {
+            deletion::apply_variant_admission_plan_write(&write, plan)?;
+        }
+        let after_items = write
+            .open_table(METADATA)?
+            .get(BLOB_ITEM_COUNT)?
+            .ok_or(StoreError::MissingAccountingMetadata {
+                field: BLOB_ITEM_COUNT,
+            })?
+            .value();
+        let after_bytes = write
+            .open_table(METADATA)?
+            .get(BLOB_TOTAL_BYTES)?
+            .ok_or(StoreError::MissingAccountingMetadata {
+                field: BLOB_TOTAL_BYTES,
+            })?
+            .value();
+        if before_items.checked_sub(after_items) != Some(1)
+            || before_bytes.checked_sub(after_bytes) != Some(source_len)
+        {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "Blob pressure recovery disagrees with committed accounting delta",
+            )));
+        }
+        let recovered_units = match demand.partition() {
+            pressure::BlobCapacityPartition::AggregateItems
+            | pressure::BlobCapacityPartition::ContentPublications(_) => 1,
+            pressure::BlobCapacityPartition::AggregateBytes => source_len,
+            _ => {
+                return Err(blob_error(BlobStoreError::SchemaInvariant(
+                    "publication pressure selected for another partition",
+                )));
+            }
+        };
+        let deletion_admission = deletion_evidence.map(|(_, _, _, admission)| admission);
+        write.commit()?;
+        if let Some(admission) = deletion_admission {
+            admission.durable_committed().map_err(lease::store_error)?;
+        }
+        Ok(pressure::BlobCapacityRecoveryResult::recovered(
+            vec![transfer],
+            recovered_units,
+            demand.deficit(),
+            charge.rows,
+            charge.bytes,
+        ))
+    }
+
+    /// Internal node bridge used after the caller has exhausted the ordinary
+    /// cleanup turn for one typed Blob admission failure. This is deliberately
+    /// doc-hidden: partitions, ranking state, and pressure budgets remain store
+    /// implementation details.
+    #[doc(hidden)]
+    pub fn run_blob_pressure_recovery_after_cleanup(
+        &self,
+        error: &StoreError,
+        incoming_priority: Priority,
+        content: Option<(&Topic, &Scope, BlobId)>,
+        incoming_depot_units: (u64, u64),
+        budget: BlobMaintenanceBudget,
+        custody_sample: Option<aster_mesh::CustodySample>,
+    ) -> Result<Option<BlobCapacityRecoveryResult>, StoreError> {
+        let (incoming_depot_chunks, incoming_depot_variants) = incoming_depot_units;
+        let mut context = pressure::BlobCapacityRecoveryContext::new(incoming_priority)
+            .with_depot_units(incoming_depot_chunks, incoming_depot_variants);
+        if let Some((topic, scope, blob_id)) = content {
+            context = context.with_content(pressure::PressureContentIdentity::new(
+                topic, scope, blob_id,
+            )?);
+        }
+        let Some(demand) = pressure::capacity_recovery_demand(error, context)? else {
+            return Ok(None);
+        };
+        let pressure_budget = pressure::BlobPressureRecoveryBudget::new(
+            budget.rows(),
+            budget.bytes(),
+            budget.rows(),
+            budget.rows().min(MAX_BLOB_OPERATIONS),
+            budget.files(),
+        )
+        .map_err(blob_error)?;
+        let recovery = self.run_blob_pressure_recovery(demand, pressure_budget, custody_sample)?;
+        if recovery.deficit_met()
+            || recovery.evicted_transfer_ids().is_empty()
+            || !matches!(
+                demand.partition(),
+                pressure::BlobCapacityPartition::DepotBytes
+                    | pressure::BlobCapacityPartition::DepotChunks
+                    | pressure::BlobCapacityPartition::DepotVariants
+            )
+        {
+            return Ok(Some(recovery));
+        }
+        let Some(rows) = budget.rows().checked_sub(recovery.rows_examined()) else {
+            return Ok(Some(recovery));
+        };
+        let Some(bytes) = budget.bytes().checked_sub(recovery.bytes_examined()) else {
+            return Ok(Some(recovery));
+        };
+        if rows == 0 || bytes == 0 {
+            return Ok(Some(recovery));
+        }
+        let baseline = match error {
+            StoreError::Blob(BlobStoreError::DepotByteLimitExceeded { current, .. })
+                if demand.partition() == pressure::BlobCapacityPartition::DepotBytes =>
+            {
+                *current
+            }
+            StoreError::Blob(BlobStoreError::DepotChunkLimitExceeded { current, .. })
+                if demand.partition() == pressure::BlobCapacityPartition::DepotChunks =>
+            {
+                *current
+            }
+            StoreError::Blob(BlobStoreError::DepotVariantLimitExceeded { current, .. })
+                if demand.partition() == pressure::BlobCapacityPartition::DepotVariants =>
+            {
+                *current
+            }
+            _ => {
+                return Err(blob_error(BlobStoreError::SchemaInvariant(
+                    "Blob depot pressure demand lost its typed capacity baseline",
+                )));
+            }
+        };
+        let physical_budget =
+            BlobMaintenanceBudget::new(rows, budget.files(), bytes).map_err(blob_error)?;
+        let progress = self.run_blob_capacity_gc_for(
+            BlobCapacityGcTarget::Depot,
+            physical_budget,
+            custody_sample,
+        )?;
+        let read = self.database.begin_read()?;
+        let usage = depot::depot_admission_usage_read(&read)?;
+        let current = match demand.partition() {
+            pressure::BlobCapacityPartition::DepotBytes => usage.reserved_bytes,
+            pressure::BlobCapacityPartition::DepotChunks => usage.chunks,
+            pressure::BlobCapacityPartition::DepotVariants => usage.variants,
+            _ => unreachable!("depot partitions were checked above"),
+        };
+        let released = baseline.checked_sub(current).ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "Blob pressure physical recovery increased depot usage",
+            ))
+        })?;
+        recovery
+            .with_physical_recovery(released, demand.deficit(), progress)
+            .map(Some)
+    }
+
+    fn run_blob_pending_pressure_recovery(
+        &self,
+        transfer: BlobTransferId,
+        demand: pressure::BlobCapacityRecoveryDemand,
+        budget: pressure::BlobPressureRecoveryBudget,
+        selection: pressure::PressureSelection,
+        custody_sample: Option<aster_mesh::CustodySample>,
+    ) -> Result<pressure::BlobCapacityRecoveryResult, StoreError> {
+        let authority = self.require_bound_mission()?;
+        let write = self.database.begin_write()?;
+        enforce_live_write(&write)?;
+        let maintenance_budget =
+            lifecycle::BlobMaintenanceBudget::new(budget.rows, 1, budget.bytes)?;
+        let mut charge = MaintenanceCharge {
+            budget: maintenance_budget,
+            rows: selection.rows_examined(),
+            bytes: selection.bytes_examined(),
+        };
+        for field in [BLOB_NETWORK_STAGING_ROWS, BLOB_NETWORK_STAGING_BYTES] {
+            if !charge.charge(field.as_bytes(), std::mem::size_of::<u64>())? {
+                return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                    charge.rows,
+                    charge.bytes,
+                ));
+            }
+        }
+        let staging = blob_network_staging_usage_write(&write, authority)?;
+        let pending_sources = write.open_table(BLOB_PENDING_SOURCES)?;
+        let encoded_pending = pending_sources
+            .get(transfer.as_bytes().as_slice())?
+            .ok_or_else(|| {
+                blob_error(BlobStoreError::SchemaInvariant(
+                    "Blob pressure pending candidate disappeared",
+                ))
+            })?;
+        if !charge.charge(transfer.as_bytes(), encoded_pending.value().len())? {
+            return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                charge.rows,
+                charge.bytes,
+            ));
+        }
+        let pending_bytes = encoded_pending.value().to_vec();
+        drop(encoded_pending);
+        drop(pending_sources);
+        let encoded_pending = pending_bytes;
+        let pending = decode_pending_blob_source(&encoded_pending)?;
+        if pending.metadata.transfer_id != transfer
+            || pending.metadata.header.priority >= demand.incoming_priority()
+        {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "Blob pressure pending candidate changed after ordered selection",
+            )));
+        }
+        let Some(references) = pressure::bounded_variant_references_write(
+            &write,
+            pending.metadata.variant_id,
+            budget.roots,
+            &mut charge,
+        )?
+        else {
+            return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                charge.rows,
+                charge.bytes,
+            ));
+        };
+        if !pressure::require_variant_with_references_bounded_write(
+            &write,
+            pending.metadata.variant_id,
+            &references,
+            &mut charge,
+        )? {
+            return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                charge.rows,
+                charge.bytes,
+            ));
+        }
+        let final_root = references.len() == 1;
+        if final_root
+            && (references[0] != (lifecycle::VariantReferenceOwner::PendingSource, transfer)
+                || budget.deletion_manifests < 1)
+        {
+            return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                charge.rows,
+                charge.bytes,
+            ));
+        }
+        let mut removed_rows = 1u64;
+        let mut removed_bytes = staging_entry_bytes(32, encoded_pending.len())?;
+        for carrier in &pending.carriers {
+            let key = blob_carrier_prefix_key(transfer, carrier.object);
+            let prefixes = write.open_table(BLOB_CARRIER_PREFIXES)?;
+            if let Some(encoded_guard) = prefixes.get(key.as_slice())? {
+                if !charge.charge(key.as_slice(), encoded_guard.value().len())? {
+                    return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                        charge.rows,
+                        charge.bytes,
+                    ));
+                }
+                let encoded = encoded_guard.value().to_vec();
+                let record = decode_blob_carrier_prefix(&encoded)?;
+                if record.source != transfer || record.total_len != carrier.total_len {
+                    return Err(blob_error(BlobStoreError::SchemaInvariant(
+                        "Blob pressure carrier prefix contradicts its pending source",
+                    )));
+                }
+                removed_rows = removed_rows
+                    .checked_add(1)
+                    .ok_or(StoreError::ItemCountAccountingOverflow)?;
+                removed_bytes = removed_bytes
+                    .checked_add(staging_entry_bytes(key.len(), encoded.len())?)
+                    .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+            }
+        }
+        for field in [BLOB_NETWORK_STAGING_ROWS, BLOB_NETWORK_STAGING_BYTES] {
+            if !charge.charge(field.as_bytes(), std::mem::size_of::<u64>())? {
+                return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                    charge.rows,
+                    charge.bytes,
+                ));
+            }
+        }
+        let reference_key = variant_reference_key(
+            pending.metadata.variant_id,
+            lifecycle::VariantReferenceOwner::PendingSource,
+            transfer,
+        );
+        let references_table = write.open_table(lifecycle::BLOB_VARIANT_REFERENCES)?;
+        let reference = references_table
+            .get(reference_key.as_slice())?
+            .ok_or_else(|| {
+                blob_error(BlobStoreError::SchemaInvariant(
+                    "Blob pressure pending candidate lacks its variant reference",
+                ))
+            })?;
+        if !charge.charge(reference_key.as_slice(), 0)? {
+            return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                charge.rows,
+                charge.bytes,
+            ));
+        }
+        if !reference.value().is_empty() {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "Blob pressure pending candidate has a malformed variant reference",
+            )));
+        }
+        drop(reference);
+        drop(references_table);
+
+        let deletion_evidence = if final_root {
+            match deletion::bounded_variant_has_deletion_manifest_write(
+                &write,
+                pending.metadata.variant_id,
+                &mut charge,
+            )? {
+                Some(false) => {}
+                Some(true) => {
+                    return Err(blob_error(BlobStoreError::SchemaInvariant(
+                        "live pending Blob pressure root already has deletion authority",
+                    )));
+                }
+                None => {
+                    return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                        charge.rows,
+                        charge.bytes,
+                    ));
+                }
+            }
+            let Some((import, lineage)) =
+                pressure_deletion_evidence_write(&write, pending.metadata.variant_id, &mut charge)?
+            else {
+                return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                    charge.rows,
+                    charge.bytes,
+                ));
+            };
+            if !pressure_charge_depot_owner_binding(&mut charge)? {
+                return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                    charge.rows,
+                    charge.bytes,
+                ));
+            }
+            let owner = depot::require_depot_owner_binding_write(
+                &write,
+                &self.path,
+                self.backing_identity,
+                self.blob_depot_owner_token,
+            )?;
+            let snapshot = self
+                .blob_lease_registry
+                .snapshot(
+                    self.blob_depot_owner_binding,
+                    lease::BlobLeaseTarget::Variant(pending.metadata.variant_id),
+                )
+                .map_err(lease::store_error)?;
+            #[cfg(test)]
+            if TEST_BLOB_MANIFEST_ADMISSION_GENERATION_CHURN.get() {
+                drop(
+                    self.blob_lease_registry
+                        .acquire(
+                            self.blob_depot_owner_binding,
+                            lease::BlobLeaseTarget::Variant(pending.metadata.variant_id),
+                            lease::BlobLeaseKind::InternalChunkWork,
+                        )
+                        .map_err(lease::store_error)?,
+                );
+            }
+            match self.blob_lease_registry.try_mark_delete_pending(snapshot) {
+                Ok(admission) => Some((import, lineage, owner, admission)),
+                Err(
+                    lease::BlobLeaseAcquireError::ActiveLeases
+                    | lease::BlobLeaseAcquireError::GenerationChanged
+                    | lease::BlobLeaseAcquireError::DeletePending,
+                ) => {
+                    return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                        charge.rows,
+                        charge.bytes,
+                    ));
+                }
+                Err(error) => return Err(lease::store_error(error)),
+            }
+        } else {
+            None
+        };
+
+        let deletion_plan = if let Some((import, lineage, owner, _)) = &deletion_evidence {
+            let Some(plan) = deletion::plan_variant_admission_write(
+                &write,
+                pending.metadata.variant_id,
+                import,
+                lineage,
+                *owner,
+                custody_sample,
+                Some(&mut charge),
+            )?
+            else {
+                return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                    charge.rows,
+                    charge.bytes,
+                ));
+            };
+            Some(plan)
+        } else {
+            None
+        };
+        lifecycle::remove_variant_reference(
+            &write,
+            pending.metadata.variant_id,
+            lifecycle::VariantReferenceOwner::PendingSource,
+            transfer,
+        )?;
+        remove_pending_source_rows_write(&write, staging, transfer, &pending)?;
+        if final_root {
+            pressure::remove_pending_source_root_write(
+                &write,
+                transfer,
+                pending.metadata.variant_id,
+            )?;
+            pressure::remove_drained_variant_write(&write, pending.metadata.variant_id)?;
+        } else {
+            pressure::remove_pending_source_write(&write, transfer, pending.metadata.variant_id)?;
+        }
+        if let Some(plan) = deletion_plan {
+            deletion::apply_variant_admission_plan_write(&write, plan)?;
+        }
+        let after = blob_network_staging_usage_write(&write, authority)?;
+        if staging.rows.checked_sub(after.rows) != Some(removed_rows)
+            || staging.bytes.checked_sub(after.bytes) != Some(removed_bytes)
+        {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "Blob pending pressure recovery disagrees with committed accounting delta",
+            )));
+        }
+        let recovered_units = match demand.partition() {
+            pressure::BlobCapacityPartition::NetworkStagingRows => removed_rows,
+            pressure::BlobCapacityPartition::NetworkStagingBytes => removed_bytes,
+            _ => {
+                return Err(blob_error(BlobStoreError::SchemaInvariant(
+                    "pending Blob pressure selected for another partition",
+                )));
+            }
+        };
+        let deletion_admission = deletion_evidence.map(|(_, _, _, admission)| admission);
+        write.commit()?;
+        if let Some(admission) = deletion_admission {
+            admission.durable_committed().map_err(lease::store_error)?;
+        }
+        Ok(pressure::BlobCapacityRecoveryResult::recovered(
+            vec![transfer],
+            recovered_units,
+            demand.deficit(),
+            charge.rows,
+            charge.bytes,
+        ))
+    }
+
+    fn run_blob_variant_pressure_recovery(
+        &self,
+        variant: BlobVariantId,
+        demand: pressure::BlobCapacityRecoveryDemand,
+        budget: pressure::BlobPressureRecoveryBudget,
+        selection: pressure::PressureSelection,
+        custody_sample: Option<aster_mesh::CustodySample>,
+    ) -> Result<pressure::BlobCapacityRecoveryResult, StoreError> {
+        let authority = self.require_bound_mission()?;
+        let write = self.database.begin_write()?;
+        enforce_live_write(&write)?;
+        let maintenance_budget =
+            lifecycle::BlobMaintenanceBudget::new(budget.rows, 1, budget.bytes)?;
+        let mut charge = MaintenanceCharge {
+            budget: maintenance_budget,
+            rows: selection.rows_examined(),
+            bytes: selection.bytes_examined(),
+        };
+        let accounting_rows = [
+            DEPOT_RESERVED_FILE_BYTES,
+            deletion::BLOB_DELETION_CHARGED_VARIANTS,
+            deletion::BLOB_DELETION_CHARGED_RESERVED_BYTES,
+            BLOB_NETWORK_SCHEMA_VERSION_FIELD,
+            BLOB_NETWORK_STAGING_ROWS,
+            BLOB_NETWORK_STAGING_BYTES,
+            BLOB_ITEM_COUNT,
+            BLOB_TOTAL_BYTES,
+        ];
+        // Reserve both sides of the store-owned accounting delta audit before
+        // discovering or allocating the candidate's fan-out.
+        if !pressure_charge_u64_rows(&mut charge, &accounting_rows)?
+            || !pressure_charge_u64_rows(&mut charge, &accounting_rows)?
+        {
+            return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                charge.rows,
+                charge.bytes,
+            ));
+        }
+        let before_depot = depot::depot_admission_usage_write(&write)?;
+        let before_staging = blob_network_staging_usage_write(&write, authority)?;
+        let before_items = write
+            .open_table(METADATA)?
+            .get(BLOB_ITEM_COUNT)?
+            .ok_or(StoreError::MissingAccountingMetadata {
+                field: BLOB_ITEM_COUNT,
+            })?
+            .value();
+        let before_bytes = write
+            .open_table(METADATA)?
+            .get(BLOB_TOTAL_BYTES)?
+            .ok_or(StoreError::MissingAccountingMetadata {
+                field: BLOB_TOTAL_BYTES,
+            })?
+            .value();
+
+        let Some(references) =
+            pressure::bounded_variant_references_write(&write, variant, budget.roots, &mut charge)?
+        else {
+            return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                charge.rows,
+                charge.bytes,
+            ));
+        };
+        if references.is_empty() {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "Blob pressure selected an unrooted variant",
+            )));
+        }
+        if !pressure::require_variant_with_references_bounded_write(
+            &write,
+            variant,
+            &references,
+            &mut charge,
+        )? {
+            return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                charge.rows,
+                charge.bytes,
+            ));
+        }
+        if budget.deletion_manifests < 1 {
+            return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                charge.rows,
+                charge.bytes,
+            ));
+        }
+        let mut publication_roots = Vec::new();
+        let mut pending_roots = Vec::new();
+        let mut remaining_operations = budget.operations;
+        let mut publication_bytes = 0u64;
+        let mut staging_rows = 0u64;
+        let mut staging_bytes = 0u64;
+        for (owner, transfer) in references {
+            let reference_key = variant_reference_key(variant, owner, transfer);
+            if !charge.charge(reference_key.as_slice(), 0)? {
+                return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                    charge.rows,
+                    charge.bytes,
+                ));
+            }
+            match owner {
+                lifecycle::VariantReferenceOwner::Publication => {
+                    let publications = write.open_table(BLOB_PUBLICATIONS)?;
+                    let encoded = publications
+                        .get(transfer.as_bytes().as_slice())?
+                        .ok_or_else(|| {
+                            blob_error(BlobStoreError::SchemaInvariant(
+                                "Blob variant pressure publication disappeared",
+                            ))
+                        })?;
+                    if !charge.charge(transfer.as_bytes(), encoded.value().len())? {
+                        return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                            charge.rows,
+                            charge.bytes,
+                        ));
+                    };
+                    let publication = decode_blob_metadata(encoded.value())?;
+                    drop(encoded);
+                    drop(publications);
+                    if publication.variant_id != variant
+                        || publication.header.priority >= demand.incoming_priority()
+                    {
+                        return Err(blob_error(BlobStoreError::SchemaInvariant(
+                            "Blob variant pressure publication contradicts its summary",
+                        )));
+                    }
+                    let Some(retirement_plan) = plan_blob_publication_retirement_write(
+                        &write,
+                        self.blob_lifecycle_limits,
+                        transfer,
+                        lifecycle::RetirementReason::Evicted,
+                        custody_sample,
+                        &mut charge,
+                        &mut remaining_operations,
+                    )?
+                    else {
+                        return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                            charge.rows,
+                            charge.bytes,
+                        ));
+                    };
+                    let source_len = write
+                        .open_table(BLOB_BYTES)?
+                        .get(transfer.as_bytes().as_slice())?
+                        .map(|value| u64::try_from(value.value().len()))
+                        .transpose()
+                        .map_err(|_| StoreError::PayloadByteAccountingOverflow)?
+                        .ok_or_else(|| {
+                            blob_error(BlobStoreError::SchemaInvariant(
+                                "Blob variant pressure publication lacks source bytes",
+                            ))
+                        })?;
+                    publication_bytes = publication_bytes
+                        .checked_add(source_len)
+                        .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+                    publication_roots.push((transfer, retirement_plan));
+                }
+                lifecycle::VariantReferenceOwner::PendingSource => {
+                    let pending_sources = write.open_table(BLOB_PENDING_SOURCES)?;
+                    let encoded_guard = pending_sources
+                        .get(transfer.as_bytes().as_slice())?
+                        .ok_or_else(|| {
+                            blob_error(BlobStoreError::SchemaInvariant(
+                                "Blob variant pressure pending source disappeared",
+                            ))
+                        })?;
+                    if !charge.charge(transfer.as_bytes(), encoded_guard.value().len())? {
+                        return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                            charge.rows,
+                            charge.bytes,
+                        ));
+                    }
+                    let encoded = encoded_guard.value().to_vec();
+                    drop(encoded_guard);
+                    drop(pending_sources);
+                    let pending = decode_pending_blob_source(&encoded)?;
+                    if pending.metadata.variant_id != variant
+                        || pending.metadata.header.priority >= demand.incoming_priority()
+                    {
+                        return Err(blob_error(BlobStoreError::SchemaInvariant(
+                            "Blob variant pressure pending source contradicts its summary",
+                        )));
+                    }
+                    staging_rows = staging_rows
+                        .checked_add(1)
+                        .ok_or(StoreError::ItemCountAccountingOverflow)?;
+                    staging_bytes = staging_bytes
+                        .checked_add(staging_entry_bytes(32, encoded.len())?)
+                        .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+                    for carrier in &pending.carriers {
+                        let key = blob_carrier_prefix_key(transfer, carrier.object);
+                        let prefixes = write.open_table(BLOB_CARRIER_PREFIXES)?;
+                        if let Some(encoded_guard) = prefixes.get(key.as_slice())? {
+                            if !charge.charge(key.as_slice(), encoded_guard.value().len())? {
+                                return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                                    charge.rows,
+                                    charge.bytes,
+                                ));
+                            }
+                            let encoded_prefix = encoded_guard.value().to_vec();
+                            let prefix = decode_blob_carrier_prefix(&encoded_prefix)?;
+                            if prefix.source != transfer || prefix.total_len != carrier.total_len {
+                                return Err(blob_error(BlobStoreError::SchemaInvariant(
+                                    "Blob variant pressure carrier prefix contradicts its source",
+                                )));
+                            }
+                            staging_rows = staging_rows
+                                .checked_add(1)
+                                .ok_or(StoreError::ItemCountAccountingOverflow)?;
+                            staging_bytes = staging_bytes
+                                .checked_add(staging_entry_bytes(key.len(), encoded_prefix.len())?)
+                                .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+                        }
+                    }
+                    pending_roots.push((transfer, pending));
+                }
+            }
+        }
+
+        if charge.rows > budget.rows || charge.bytes > budget.bytes {
+            return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                charge.rows,
+                charge.bytes,
+            ));
+        }
+        match deletion::bounded_variant_has_deletion_manifest_write(&write, variant, &mut charge)? {
+            Some(false) => {}
+            Some(true) => {
+                return Err(blob_error(BlobStoreError::SchemaInvariant(
+                    "live Blob pressure variant already has deletion authority",
+                )));
+            }
+            None => {
+                return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                    charge.rows,
+                    charge.bytes,
+                ));
+            }
+        }
+        let Some((import, lineage)) =
+            pressure_deletion_evidence_write(&write, variant, &mut charge)?
+        else {
+            return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                charge.rows,
+                charge.bytes,
+            ));
+        };
+        if !pressure_charge_depot_owner_binding(&mut charge)? {
+            return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                charge.rows,
+                charge.bytes,
+            ));
+        }
+        let owner = depot::require_depot_owner_binding_write(
+            &write,
+            &self.path,
+            self.backing_identity,
+            self.blob_depot_owner_token,
+        )?;
+        let snapshot = self
+            .blob_lease_registry
+            .snapshot(
+                self.blob_depot_owner_binding,
+                lease::BlobLeaseTarget::Variant(variant),
+            )
+            .map_err(lease::store_error)?;
+        #[cfg(test)]
+        if TEST_BLOB_MANIFEST_ADMISSION_GENERATION_CHURN.get() {
+            drop(
+                self.blob_lease_registry
+                    .acquire(
+                        self.blob_depot_owner_binding,
+                        lease::BlobLeaseTarget::Variant(variant),
+                        lease::BlobLeaseKind::InternalChunkWork,
+                    )
+                    .map_err(lease::store_error)?,
+            );
+        }
+        let deletion_admission = match self.blob_lease_registry.try_mark_delete_pending(snapshot) {
+            Ok(admission) => admission,
+            Err(
+                lease::BlobLeaseAcquireError::ActiveLeases
+                | lease::BlobLeaseAcquireError::GenerationChanged
+                | lease::BlobLeaseAcquireError::DeletePending,
+            ) => {
+                return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                    charge.rows,
+                    charge.bytes,
+                ));
+            }
+            Err(error) => return Err(lease::store_error(error)),
+        };
+
+        let Some(deletion_plan) = deletion::plan_variant_admission_write(
+            &write,
+            variant,
+            &import,
+            &lineage,
+            owner,
+            custody_sample,
+            Some(&mut charge),
+        )?
+        else {
+            return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                charge.rows,
+                charge.bytes,
+            ));
+        };
+
+        let publication_count = u64::try_from(publication_roots.len())
+            .map_err(|_| StoreError::ItemCountAccountingOverflow)?;
+        let mut evicted = publication_roots
+            .iter()
+            .map(|(transfer, _)| *transfer)
+            .collect::<Vec<_>>();
+        for (_, retirement_plan) in publication_roots {
+            apply_blob_publication_retirement_plan_write(
+                &write,
+                self.blob_lifecycle_limits,
+                retirement_plan,
+                true,
+                true,
+            )?;
+        }
+        for (transfer, pending) in &pending_roots {
+            lifecycle::remove_variant_reference(
+                &write,
+                variant,
+                lifecycle::VariantReferenceOwner::PendingSource,
+                *transfer,
+            )?;
+            let staging = blob_network_staging_usage_write(&write, authority)?;
+            remove_pending_source_rows_write(&write, staging, *transfer, pending)?;
+            pressure::remove_pending_source_root_write(&write, *transfer, variant)?;
+        }
+        pressure::remove_drained_variant_write(&write, variant)?;
+        deletion::apply_variant_admission_plan_write(&write, deletion_plan)?;
+        let after_depot = depot::depot_admission_usage_write(&write)?;
+        let after_staging = blob_network_staging_usage_write(&write, authority)?;
+        let after_items = write
+            .open_table(METADATA)?
+            .get(BLOB_ITEM_COUNT)?
+            .ok_or(StoreError::MissingAccountingMetadata {
+                field: BLOB_ITEM_COUNT,
+            })?
+            .value();
+        let after_bytes = write
+            .open_table(METADATA)?
+            .get(BLOB_TOTAL_BYTES)?
+            .ok_or(StoreError::MissingAccountingMetadata {
+                field: BLOB_TOTAL_BYTES,
+            })?
+            .value();
+        if before_items.checked_sub(after_items) != Some(publication_count)
+            || before_bytes.checked_sub(after_bytes) != Some(publication_bytes)
+            || before_staging.rows.checked_sub(after_staging.rows) != Some(staging_rows)
+            || before_staging.bytes.checked_sub(after_staging.bytes) != Some(staging_bytes)
+        {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "whole-variant pressure recovery disagrees with logical accounting delta",
+            )));
+        }
+        let recovered_units = match demand.partition() {
+            pressure::BlobCapacityPartition::DepotBytes => before_depot
+                .reserved_bytes
+                .checked_sub(after_depot.reserved_bytes)
+                .ok_or_else(|| {
+                    blob_error(BlobStoreError::SchemaInvariant(
+                        "Blob pressure increased depot admission bytes",
+                    ))
+                })?,
+            pressure::BlobCapacityPartition::DepotChunks => before_depot
+                .chunks
+                .checked_sub(after_depot.chunks)
+                .ok_or_else(|| {
+                    blob_error(BlobStoreError::SchemaInvariant(
+                        "Blob pressure increased depot admission chunks",
+                    ))
+                })?,
+            pressure::BlobCapacityPartition::DepotVariants => before_depot
+                .variants
+                .checked_sub(after_depot.variants)
+                .ok_or_else(|| {
+                    blob_error(BlobStoreError::SchemaInvariant(
+                        "Blob pressure increased depot admission variants",
+                    ))
+                })?,
+            _ => {
+                return Err(blob_error(BlobStoreError::SchemaInvariant(
+                    "whole-variant pressure selected for another partition",
+                )));
+            }
+        };
+        evicted.extend(pending_roots.into_iter().map(|(transfer, _)| transfer));
+        evicted.sort_unstable();
+        write.commit()?;
+        deletion_admission
+            .durable_committed()
+            .map_err(lease::store_error)?;
+        Ok(pressure::BlobCapacityRecoveryResult::recovered(
+            evicted,
+            recovered_units,
+            demand.deficit(),
+            charge.rows,
+            charge.bytes,
+        ))
+    }
+
     /// Reclaims only already-unreferenced exact variants under independent
     /// bounds. This path never opens the routine maintenance-cursor table.
     #[doc(hidden)]
@@ -7582,21 +8846,24 @@ impl Store {
                                     rows: page.rows_examined,
                                     bytes: page.bytes,
                                 };
-                                if !invalidated_blob_publication_retirement_charge_write(
-                                    &write,
-                                    self.blob_lifecycle_limits,
-                                    transfer,
-                                    custody_sample,
-                                    &mut charge,
-                                )? {
+                                let Some(retirement_plan) =
+                                    invalidated_blob_publication_retirement_plan_write(
+                                        &write,
+                                        self.blob_lifecycle_limits,
+                                        transfer,
+                                        custody_sample,
+                                        &mut charge,
+                                    )?
+                                else {
                                     retirement_blocked = Some((charge.rows, charge.bytes));
                                     break;
-                                }
-                                retire_invalidated_blob_publication_write(
+                                };
+                                apply_blob_publication_retirement_plan_write(
                                     &write,
                                     self.blob_lifecycle_limits,
-                                    transfer,
-                                    custody_sample,
+                                    retirement_plan,
+                                    false,
+                                    false,
                                 )?;
                                 retired_position = Some(row.position.clone());
                                 retirement_charge = Some((charge.rows, charge.bytes));
@@ -7873,15 +9140,40 @@ fn blob_header_is_current_write(
 /// Incrementally preflights the complete unique-row work unit for one
 /// policy-invalidation retirement. Rows already captured by the bounded
 /// publication page are supplied in `charge`; each additional logical row is
-/// admitted before it is validated. Returning `false` leaves the transaction
+/// admitted before it is validated. Returning `None` leaves the transaction
 /// uncommitted and reports every row admitted up to the caller's budget.
-fn invalidated_blob_publication_retirement_charge_write(
+struct BlobOperationRetirementPlan {
+    key: Vec<u8>,
+    key_digest: [u8; 32],
+    live: Vec<u8>,
+    intent_digest: [u8; 32],
+}
+
+struct BlobPublicationRetirementPlan {
+    transfer: BlobTransferId,
+    live_record: Vec<u8>,
+    variant_id: BlobVariantId,
+    semantic_id: BlobSemanticId,
+    source_len: u64,
+    marker: u64,
+    reason: lifecycle::RetirementReason,
+    age: lifecycle::RetirementAge,
+    deadline: Option<aster_mesh::CustodySample>,
+    operation_bytes_removed: u64,
+    operation_bytes_added: u64,
+    operations: Vec<BlobOperationRetirementPlan>,
+    deliveries: crate::blob_subscription::BlobDeliveryRetirementPlan,
+}
+
+fn plan_blob_publication_retirement_write(
     write: &redb::WriteTransaction,
     limits: BlobLifecycleLimits,
     transfer: BlobTransferId,
+    reason: lifecycle::RetirementReason,
     custody_sample: Option<aster_mesh::CustodySample>,
     charge: &mut MaintenanceCharge,
-) -> Result<bool, StoreError> {
+    remaining_operations: &mut u64,
+) -> Result<Option<BlobPublicationRetirementPlan>, StoreError> {
     fn charged_metadata(
         write: &redb::WriteTransaction,
         field: &'static str,
@@ -7913,24 +9205,39 @@ fn invalidated_blob_publication_retirement_charge_write(
         )));
     }
     let publication = decode_blob_metadata(&live_record)?;
-    if publication.transfer_id != transfer
-        || blob_header_is_current_write(write, &publication.header)?
-    {
+    if publication.transfer_id != transfer {
         return Err(blob_error(BlobStoreError::SchemaInvariant(
-            "Blob retirement charge no longer names an invalidated publication",
+            "Blob retirement charge differs from its publication key",
         )));
     }
-    let source_len = write
-        .open_table(BLOB_BYTES)?
+    match reason {
+        lifecycle::RetirementReason::Invalidated
+            if blob_header_is_current_write(write, &publication.header)? =>
+        {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "Blob retirement charge no longer names an invalidated publication",
+            )));
+        }
+        lifecycle::RetirementReason::Invalidated | lifecycle::RetirementReason::Evicted => {}
+        lifecycle::RetirementReason::Expired => {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "Blob retirement helper received an unsupported expiry reason",
+            )));
+        }
+    }
+    let source_bytes = write.open_table(BLOB_BYTES)?;
+    let source = source_bytes
         .get(transfer.as_bytes().as_slice())?
-        .map(|value| u64::try_from(value.value().len()))
-        .transpose()
-        .map_err(|_| StoreError::PayloadByteAccountingOverflow)?
         .ok_or_else(|| {
             blob_error(BlobStoreError::SchemaInvariant(
                 "Blob retirement candidate is missing source bytes",
             ))
         })?;
+    if !charge.charge(transfer.as_bytes(), source.value().len())? {
+        return Ok(None);
+    }
+    let source_len = u64::try_from(source.value().len())
+        .map_err(|_| StoreError::PayloadByteAccountingOverflow)?;
     let marker = write
         .open_table(BLOB_ACCEPTANCE_MARKERS)?
         .get(transfer.as_bytes().as_slice())?
@@ -7941,7 +9248,7 @@ fn invalidated_blob_publication_retirement_charge_write(
             ))
         })?;
     if !charge.charge_lengths(std::mem::size_of::<u64>(), std::mem::size_of::<[u8; 32]>())? {
-        return Ok(false);
+        return Ok(None);
     }
     let acceptance_order = write.open_table(crate::blob_subscription::BLOB_ACCEPTANCE_ORDER)?;
     let ordered_transfer = acceptance_order.get(marker)?.ok_or_else(|| {
@@ -7969,20 +9276,22 @@ fn invalidated_blob_publication_retirement_charge_write(
         deadline,
         charge,
     )? {
-        return Ok(false);
+        return Ok(None);
     }
 
     let Some(item_count) = charged_metadata(write, BLOB_ITEM_COUNT, charge)? else {
-        return Ok(false);
+        return Ok(None);
     };
     let Some(total_bytes) = charged_metadata(write, BLOB_TOTAL_BYTES, charge)? else {
-        return Ok(false);
+        return Ok(None);
     };
-    let Some(mut operation_bytes_after) =
-        charged_metadata(write, BLOB_OPERATION_TOTAL_BYTES, charge)?
+    let Some(operation_bytes_before) = charged_metadata(write, BLOB_OPERATION_TOTAL_BYTES, charge)?
     else {
-        return Ok(false);
+        return Ok(None);
     };
+    let mut operation_bytes_after = operation_bytes_before;
+    let mut operation_bytes_removed = 0u64;
+    let mut operation_bytes_added = 0u64;
     if item_count == 0 || total_bytes < source_len {
         return Err(blob_error(BlobStoreError::SchemaInvariant(
             "Blob retirement aggregate accounting cannot cover its publication",
@@ -7993,13 +9302,14 @@ fn invalidated_blob_publication_retirement_charge_write(
     let owners = write.open_table(lifecycle::BLOB_OPERATION_OWNERS)?;
     let operations = write.open_table(BLOB_OPERATIONS)?;
     let mut operation_rows = 0u64;
+    let mut operation_plans = Vec::new();
     for row in owners.range::<&[u8]>((
         std::ops::Bound::Included(start.as_slice()),
         std::ops::Bound::Included(end.as_slice()),
     ))? {
         let (owner_key, operation_key) = row?;
         if !charge.charge(owner_key.value(), operation_key.value().len())? {
-            return Ok(false);
+            return Ok(None);
         }
         if lifecycle::inverse_owner_key(transfer, operation_key.value()).as_slice()
             != owner_key.value()
@@ -8011,26 +9321,25 @@ fn invalidated_blob_publication_retirement_charge_write(
         operation_rows = operation_rows
             .checked_add(1)
             .ok_or(StoreError::ItemCountAccountingOverflow)?;
+        let Some(next_remaining) = remaining_operations.checked_sub(1) else {
+            // The charged plus-one inverse row proves this atomic candidate
+            // exceeds the operation dimension without collecting the fan-out.
+            return Ok(None);
+        };
+        *remaining_operations = next_remaining;
         if operation_rows > MAX_BLOB_OPERATIONS {
             return Err(blob_error(BlobStoreError::SchemaInvariant(
                 "Blob operation inverse-owner fan-out exceeds its structural bound",
             )));
-        }
-        if !charge.has_capacity_for_row() {
-            return Ok(false);
-        }
-        if !charge.charge(
-            operation_key.value(),
-            usize::try_from(BLOB_ACTIVE_OPERATION_RECORD_BYTES)
-                .expect("active operation record length fits usize"),
-        )? {
-            return Ok(false);
         }
         let active = operations.get(operation_key.value())?.ok_or_else(|| {
             blob_error(BlobStoreError::SchemaInvariant(
                 "Blob operation owner points to a missing operation",
             ))
         })?;
+        if !charge.charge(operation_key.value(), active.value().len())? {
+            return Ok(None);
+        }
         let operation = decode_blob_operation_record(active.value())?;
         if operation.transfer_id != transfer {
             return Err(blob_error(BlobStoreError::SchemaInvariant(
@@ -8038,7 +9347,7 @@ fn invalidated_blob_publication_retirement_charge_write(
             )));
         }
         let retired = lifecycle::retired_operation_record(
-            lifecycle::RetirementReason::Invalidated,
+            reason,
             1,
             Sha256::digest(operation_key.value()).into(),
             operation.intent_digest,
@@ -8051,6 +9360,18 @@ fn invalidated_blob_publication_retirement_charge_write(
             )
             .and_then(|value| value.checked_add(u64::try_from(retired.len()).ok()?))
             .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+        operation_bytes_removed = operation_bytes_removed
+            .checked_add(
+                u64::try_from(active.value().len())
+                    .map_err(|_| StoreError::PayloadByteAccountingOverflow)?,
+            )
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+        operation_bytes_added = operation_bytes_added
+            .checked_add(
+                u64::try_from(retired.len())
+                    .map_err(|_| StoreError::PayloadByteAccountingOverflow)?,
+            )
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?;
         let operation_digest = Sha256::digest(operation_key.value()).into();
         if !lifecycle::policy_retirement_authority_charge_write(
             write,
@@ -8059,8 +9380,14 @@ fn invalidated_blob_publication_retirement_charge_write(
             deadline,
             charge,
         )? {
-            return Ok(false);
+            return Ok(None);
         }
+        operation_plans.push(BlobOperationRetirementPlan {
+            key: operation_key.value().to_vec(),
+            key_digest: operation_digest,
+            live: active.value().to_vec(),
+            intent_digest: operation.intent_digest,
+        });
     }
     if operation_bytes_after > MAX_BLOB_DURABLE_OPERATION_BYTES {
         return Err(blob_error(BlobStoreError::SchemaInvariant(
@@ -8075,26 +9402,94 @@ fn invalidated_blob_publication_retirement_charge_write(
         deadline.is_some(),
         charge,
     )? {
-        return Ok(false);
+        return Ok(None);
     }
-    if !crate::blob_subscription::blob_delivery_retirement_charge_write(
+    let Some(deliveries) = crate::blob_subscription::plan_blob_delivery_retirement_write(
         write,
         transfer,
         publication.semantic_id,
         charge,
-    )? {
-        return Ok(false);
-    }
-    Ok(true)
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(BlobPublicationRetirementPlan {
+        transfer,
+        live_record,
+        variant_id: publication.variant_id,
+        semantic_id: publication.semantic_id,
+        source_len,
+        marker,
+        reason,
+        age,
+        deadline,
+        operation_bytes_removed,
+        operation_bytes_added,
+        operations: operation_plans,
+        deliveries,
+    }))
 }
 
-fn retire_invalidated_blob_publication_write(
+fn invalidated_blob_publication_retirement_plan_write(
     write: &redb::WriteTransaction,
     limits: BlobLifecycleLimits,
     transfer: BlobTransferId,
     custody_sample: Option<aster_mesh::CustodySample>,
+    charge: &mut MaintenanceCharge,
+) -> Result<Option<BlobPublicationRetirementPlan>, StoreError> {
+    let mut remaining_operations = MAX_BLOB_OPERATIONS;
+    plan_blob_publication_retirement_write(
+        write,
+        limits,
+        transfer,
+        lifecycle::RetirementReason::Invalidated,
+        custody_sample,
+        charge,
+        &mut remaining_operations,
+    )
+}
+
+#[cfg(test)]
+fn invalidated_blob_publication_retirement_charge_write(
+    write: &redb::WriteTransaction,
+    limits: BlobLifecycleLimits,
+    transfer: BlobTransferId,
+    custody_sample: Option<aster_mesh::CustodySample>,
+    charge: &mut MaintenanceCharge,
+) -> Result<bool, StoreError> {
+    invalidated_blob_publication_retirement_plan_write(
+        write,
+        limits,
+        transfer,
+        custody_sample,
+        charge,
+    )
+    .map(|plan| plan.is_some())
+}
+
+fn apply_blob_publication_retirement_plan_write(
+    write: &redb::WriteTransaction,
+    limits: BlobLifecycleLimits,
+    plan: BlobPublicationRetirementPlan,
+    variant_prevalidated: bool,
+    defer_variant_summary: bool,
 ) -> Result<(), StoreError> {
-    let live_record = write
+    let BlobPublicationRetirementPlan {
+        transfer,
+        live_record,
+        variant_id,
+        semantic_id,
+        source_len,
+        marker,
+        reason,
+        age,
+        deadline,
+        operation_bytes_removed,
+        operation_bytes_added,
+        operations,
+        deliveries,
+    } = plan;
+    let current_publication = write
         .open_table(BLOB_PUBLICATIONS)?
         .get(transfer.as_bytes().as_slice())?
         .map(|value| value.value().to_vec())
@@ -8103,124 +9498,87 @@ fn retire_invalidated_blob_publication_write(
                 "Blob retirement candidate publication disappeared",
             ))
         })?;
-    if lifecycle::publication_record_is_retired(&live_record).map_err(blob_error)? {
-        return Ok(());
-    }
-    let publication = decode_blob_metadata(&live_record)?;
-    if publication.transfer_id != transfer {
+    if current_publication != live_record {
         return Err(blob_error(BlobStoreError::SchemaInvariant(
-            "Blob retirement candidate differs from its publication key",
+            "planned Blob retirement publication changed before apply",
         )));
     }
-    if blob_header_is_current_write(write, &publication.header)? {
-        return Ok(());
+    pressure::require_publication_write(write, transfer)?;
+    if !variant_prevalidated {
+        pressure::require_variant_write(write, variant_id)?;
     }
-    let source_len = write
-        .open_table(BLOB_BYTES)?
-        .get(transfer.as_bytes().as_slice())?
-        .map(|value| u64::try_from(value.value().len()))
-        .transpose()
-        .map_err(|_| StoreError::PayloadByteAccountingOverflow)?
-        .ok_or_else(|| {
-            blob_error(BlobStoreError::SchemaInvariant(
-                "Blob retirement candidate is missing source bytes",
-            ))
-        })?;
-    let marker = write
-        .open_table(BLOB_ACCEPTANCE_MARKERS)?
-        .get(transfer.as_bytes().as_slice())?
-        .map(|value| value.value())
-        .ok_or_else(|| {
-            blob_error(BlobStoreError::SchemaInvariant(
-                "Blob retirement candidate is missing its acceptance marker",
-            ))
-        })?;
     lifecycle::require_variant_reference(
         write,
-        publication.variant_id,
+        variant_id,
         lifecycle::VariantReferenceOwner::Publication,
         transfer,
     )?;
     let generation = lifecycle::allocate_retirement_generation(write)?;
-    let age = match custody_sample {
-        Some(sample) => lifecycle::RetirementAge::new(0, sample, limits.retain_for_ms()),
-        None => lifecycle::RetirementAge::unknown(limits.retain_for_ms()),
-    }
-    .map_err(blob_error)?;
-    let deadline = age.project(custody_sample).map_err(blob_error)?.deadline;
-    let operation_keys = lifecycle::operation_keys_for_owner(write, transfer)?;
-    let mut operation_updates = Vec::with_capacity(operation_keys.len());
-    for key in operation_keys {
-        let active = write
-            .open_table(BLOB_OPERATIONS)?
-            .get(key.as_slice())?
-            .map(|value| value.value().to_vec())
-            .ok_or_else(|| {
-                blob_error(BlobStoreError::SchemaInvariant(
-                    "Blob operation owner points to a missing operation",
-                ))
-            })?;
-        let operation = decode_blob_operation_record(&active)?;
-        if operation.transfer_id != transfer {
-            return Err(blob_error(BlobStoreError::SchemaInvariant(
-                "Blob operation owner points to another publication",
-            )));
-        }
-        let key_digest: [u8; 32] = Sha256::digest(&key).into();
-        let retired = lifecycle::retired_operation_record(
-            lifecycle::RetirementReason::Invalidated,
-            generation,
-            key_digest,
-            operation.intent_digest,
-            age,
-        );
-        operation_updates.push((key, key_digest, active, retired));
-    }
-    crate::blob_subscription::retire_blob_deliveries_write(
+    crate::blob_subscription::apply_blob_delivery_retirement_plan_write(
         write,
-        transfer,
-        publication.semantic_id,
+        deliveries,
+        semantic_id,
         generation,
     )?;
 
-    let retired_publication = lifecycle::retired_publication_record(
-        &live_record,
-        marker,
-        lifecycle::RetirementReason::Invalidated,
-        generation,
-        age,
-    )?;
+    let retired_publication =
+        lifecycle::retired_publication_record(&live_record, marker, reason, generation, age)?;
     write.open_table(BLOB_PUBLICATIONS)?.insert(
         transfer.as_bytes().as_slice(),
         retired_publication.as_slice(),
     )?;
-    write
-        .open_table(BLOB_BYTES)?
-        .remove(transfer.as_bytes().as_slice())?
-        .ok_or_else(|| {
-            blob_error(BlobStoreError::SchemaInvariant(
-                "Blob retirement lost exact source bytes",
-            ))
-        })?;
-    write
-        .open_table(BLOB_ACCEPTANCE_MARKERS)?
-        .remove(transfer.as_bytes().as_slice())?
-        .ok_or_else(|| {
-            blob_error(BlobStoreError::SchemaInvariant(
-                "Blob retirement lost its acceptance marker",
-            ))
-        })?;
-    write
-        .open_table(crate::blob_subscription::BLOB_ACCEPTANCE_ORDER)?
-        .remove(marker)?
-        .ok_or_else(|| {
-            blob_error(BlobStoreError::SchemaInvariant(
-                "Blob retirement lost its acceptance-order row",
-            ))
-        })?;
+    let removed_source_len = {
+        let mut sources = write.open_table(BLOB_BYTES)?;
+        let removed = sources
+            .remove(transfer.as_bytes().as_slice())?
+            .ok_or_else(|| {
+                blob_error(BlobStoreError::SchemaInvariant(
+                    "Blob retirement lost exact source bytes",
+                ))
+            })?;
+        u64::try_from(removed.value().len())
+            .map_err(|_| StoreError::PayloadByteAccountingOverflow)?
+    };
+    if removed_source_len != source_len {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "planned Blob retirement source bytes changed before apply",
+        )));
+    }
+    let removed_marker = {
+        let mut markers = write.open_table(BLOB_ACCEPTANCE_MARKERS)?;
+        markers
+            .remove(transfer.as_bytes().as_slice())?
+            .map(|value| value.value())
+            .ok_or_else(|| {
+                blob_error(BlobStoreError::SchemaInvariant(
+                    "Blob retirement lost its acceptance marker",
+                ))
+            })?
+    };
+    if removed_marker != marker {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "planned Blob retirement marker changed before apply",
+        )));
+    }
+    let removed_order = {
+        let mut order = write.open_table(crate::blob_subscription::BLOB_ACCEPTANCE_ORDER)?;
+        order
+            .remove(marker)?
+            .map(|value| value.value().to_vec())
+            .ok_or_else(|| {
+                blob_error(BlobStoreError::SchemaInvariant(
+                    "Blob retirement lost its acceptance-order row",
+                ))
+            })?
+    };
+    if removed_order.as_slice() != transfer.as_bytes() {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "planned Blob retirement acceptance order changed before apply",
+        )));
+    }
     lifecycle::remove_variant_reference(
         write,
-        publication.variant_id,
+        variant_id,
         lifecycle::VariantReferenceOwner::Publication,
         transfer,
     )?;
@@ -8240,74 +9598,99 @@ fn retire_invalidated_blob_publication_write(
         )?;
     }
 
-    let mut operation_bytes = write
-        .open_table(METADATA)?
-        .get(BLOB_OPERATION_TOTAL_BYTES)?
-        .ok_or(StoreError::MissingAccountingMetadata {
-            field: BLOB_OPERATION_TOTAL_BYTES,
-        })?
-        .value();
-    for (key, key_digest, active, retired) in operation_updates {
-        operation_bytes = operation_bytes
-            .checked_sub(
-                u64::try_from(active.len())
-                    .map_err(|_| StoreError::PayloadByteAccountingOverflow)?,
-            )
-            .and_then(|value| value.checked_add(u64::try_from(retired.len()).ok()?))
-            .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+    for operation in operations {
+        let current = write
+            .open_table(BLOB_OPERATIONS)?
+            .get(operation.key.as_slice())?
+            .map(|value| value.value().to_vec())
+            .ok_or_else(|| {
+                blob_error(BlobStoreError::SchemaInvariant(
+                    "planned Blob operation disappeared before retirement",
+                ))
+            })?;
+        if current != operation.live {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "planned Blob operation changed before retirement",
+            )));
+        }
+        let retired = lifecycle::retired_operation_record(
+            reason,
+            generation,
+            operation.key_digest,
+            operation.intent_digest,
+            age,
+        );
         write
             .open_table(BLOB_OPERATIONS)?
-            .insert(key.as_slice(), retired.as_slice())?;
-        lifecycle::remove_operation_owner(write, transfer, &key)?;
+            .insert(operation.key.as_slice(), retired.as_slice())?;
+        lifecycle::remove_operation_owner(write, transfer, &operation.key)?;
         lifecycle::record_operation_retirement(write)?;
         lifecycle::insert_retirement_resolver(
             write,
             limits,
-            lifecycle::RetentionDeadlineOwner::Operation(key_digest),
-            Some(&key),
+            lifecycle::RetentionDeadlineOwner::Operation(operation.key_digest),
+            Some(&operation.key),
         )?;
         if let Some(deadline) = deadline {
             lifecycle::insert_retention_deadline(
                 write,
                 limits,
                 deadline,
-                lifecycle::RetentionDeadlineOwner::Operation(key_digest),
+                lifecycle::RetentionDeadlineOwner::Operation(operation.key_digest),
             )?;
         }
     }
-    if operation_bytes > MAX_BLOB_DURABLE_OPERATION_BYTES {
-        return Err(blob_error(BlobStoreError::SchemaInvariant(
-            "retired Blob operation usage exceeds its durable safety cap",
-        )));
-    }
     let mut metadata = write.open_table(METADATA)?;
-    let items = metadata
+    let current_items = metadata
         .get(BLOB_ITEM_COUNT)?
         .ok_or(StoreError::MissingAccountingMetadata {
             field: BLOB_ITEM_COUNT,
         })?
-        .value()
-        .checked_sub(1)
-        .ok_or_else(|| {
-            blob_error(BlobStoreError::SchemaInvariant(
-                "Blob item count underflows on retirement",
-            ))
-        })?;
-    let bytes = metadata
+        .value();
+    let current_bytes = metadata
         .get(BLOB_TOTAL_BYTES)?
         .ok_or(StoreError::MissingAccountingMetadata {
             field: BLOB_TOTAL_BYTES,
         })?
-        .value()
-        .checked_sub(source_len)
-        .ok_or_else(|| {
+        .value();
+    let current_operation_bytes = metadata
+        .get(BLOB_OPERATION_TOTAL_BYTES)?
+        .ok_or(StoreError::MissingAccountingMetadata {
+            field: BLOB_OPERATION_TOTAL_BYTES,
+        })?
+        .value();
+    let operation_bytes_after = current_operation_bytes
+        .checked_sub(operation_bytes_removed)
+        .and_then(|bytes| bytes.checked_add(operation_bytes_added))
+        .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+    if operation_bytes_after > MAX_BLOB_DURABLE_OPERATION_BYTES {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "retired Blob operation usage exceeds its durable safety cap",
+        )));
+    }
+    metadata.insert(
+        BLOB_ITEM_COUNT,
+        current_items.checked_sub(1).ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "Blob item count underflows on retirement",
+            ))
+        })?,
+    )?;
+    metadata.insert(
+        BLOB_TOTAL_BYTES,
+        current_bytes.checked_sub(source_len).ok_or_else(|| {
             blob_error(BlobStoreError::SchemaInvariant(
                 "Blob byte count underflows on retirement",
             ))
-        })?;
-    metadata.insert(BLOB_ITEM_COUNT, items)?;
-    metadata.insert(BLOB_TOTAL_BYTES, bytes)?;
-    metadata.insert(BLOB_OPERATION_TOTAL_BYTES, operation_bytes)?;
+        })?,
+    )?;
+    metadata.insert(BLOB_OPERATION_TOTAL_BYTES, operation_bytes_after)?;
+    drop(metadata);
+    if defer_variant_summary {
+        pressure::remove_publication_root_write(write, transfer, variant_id)?;
+    } else {
+        pressure::remove_publication_write(write, transfer, variant_id)?;
+    }
     Ok(())
 }
 
@@ -10045,6 +11428,10 @@ pub(crate) fn audit_blob_tables_write(
         BLOB_OPERATION_TOTAL_BYTES,
         stats.operation_bytes,
     )?;
+    drop(metadata);
+    drop(publications);
+    drop(markers);
+    pressure::audit_or_migrate_pressure_write(write)?;
     Ok(BlobAuditSnapshot {
         stats,
         deletion_schema_migrated,
@@ -10374,6 +11761,9 @@ pub(crate) fn inspect_blob_tables_read(
         }
     }
     lifecycle_usage.apply_to_stats(&mut stats);
+    drop(publications);
+    drop(markers);
+    pressure::inspect_pressure_read(read)?;
     Ok(BlobAuditSnapshot {
         stats,
         deletion_schema_migrated: false,
@@ -11314,7 +12704,8 @@ fn decode_retired_blob_metadata(bytes: &[u8]) -> Result<Option<(BlobMetadata, u6
 }
 
 fn encode_pending_blob_source(record: &PendingBlobSourceRecord) -> Result<Vec<u8>, StoreError> {
-    if record.route_lineage == [0; 32]
+    if record.pending_acceptance_order == 0
+        || record.route_lineage == [0; 32]
         || record.physical_lineage == [0; 32]
         || record.metadata.route_lineage != Some(record.route_lineage)
         || record.metadata.physical_lineage != Some(record.physical_lineage)
@@ -11359,7 +12750,7 @@ fn encode_pending_blob_source(record: &PendingBlobSourceRecord) -> Result<Vec<u8
     })?;
     let mut encoded = Vec::with_capacity(
         1usize
-            .checked_add(64)
+            .checked_add(72)
             .and_then(|value| value.checked_add(4))
             .and_then(|value| value.checked_add(metadata.len()))
             .and_then(|value| value.checked_add(4))
@@ -11375,6 +12766,7 @@ fn encode_pending_blob_source(record: &PendingBlobSourceRecord) -> Result<Vec<u8
             .ok_or(StoreError::PayloadByteAccountingOverflow)?,
     );
     encoded.push(PENDING_BLOB_SOURCE_VERSION);
+    encoded.extend_from_slice(&record.pending_acceptance_order.to_be_bytes());
     encoded.extend_from_slice(&record.route_lineage);
     encoded.extend_from_slice(&record.physical_lineage);
     encoded.extend_from_slice(&metadata_len.to_be_bytes());
@@ -11391,11 +12783,24 @@ fn encode_pending_blob_source(record: &PendingBlobSourceRecord) -> Result<Vec<u8
 
 fn decode_pending_blob_source(bytes: &[u8]) -> Result<PendingBlobSourceRecord, StoreError> {
     let mut cursor = MetadataCursor::new(bytes);
-    if cursor.u8()? != PENDING_BLOB_SOURCE_VERSION {
-        return Err(blob_error(BlobStoreError::SchemaInvariant(
-            "unknown pending Blob source encoding version",
-        )));
-    }
+    let version = cursor.u8()?;
+    let pending_acceptance_order = match version {
+        LEGACY_PENDING_BLOB_SOURCE_VERSION => 0,
+        PENDING_BLOB_SOURCE_VERSION => {
+            let order = cursor.u64()?;
+            if order == 0 {
+                return Err(blob_error(BlobStoreError::SchemaInvariant(
+                    "pending Blob source has a zero acceptance order",
+                )));
+            }
+            order
+        }
+        _ => {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "unknown pending Blob source encoding version",
+            )));
+        }
+    };
     let route_lineage = cursor.array()?;
     let physical_lineage = cursor.array()?;
     if route_lineage == [0; 32] || physical_lineage == [0; 32] {
@@ -11478,6 +12883,7 @@ fn decode_pending_blob_source(bytes: &[u8]) -> Result<PendingBlobSourceRecord, S
         )));
     }
     Ok(PendingBlobSourceRecord {
+        pending_acceptance_order,
         metadata,
         route_lineage,
         physical_lineage,
@@ -12076,6 +13482,24 @@ mod tests {
         plaintext: &[u8],
         epoch: u64,
     ) -> BlobProof {
+        prepare_blob_proof_with_priority(
+            store,
+            services,
+            prepared,
+            plaintext,
+            epoch,
+            Priority::Immediate,
+        )
+    }
+
+    fn prepare_blob_proof_with_priority(
+        store: &Store,
+        services: &mut BlobServices,
+        prepared: &aster_mesh::PreparedBlob,
+        plaintext: &[u8],
+        epoch: u64,
+        priority: Priority,
+    ) -> BlobProof {
         let policy = store.control_policy_snapshot().expect("Blob policy");
         let reservation = store
             .reserve_blob_with_policy(
@@ -12089,7 +13513,7 @@ mod tests {
             .expect("finish Blob depot variant");
         let header = reservation
             .header(
-                Priority::Immediate,
+                priority,
                 finished.route_commitment(),
                 u64::try_from(finished.manifest_bytes().len()).expect("manifest length"),
                 epoch,
@@ -13170,6 +14594,7 @@ mod tests {
             .expect("typed first carrier");
         let total_len = u64::try_from(carrier.bytes().len()).expect("first carrier length");
         let first_range_len = carrier.bytes().len().min(MAX_BLOB_NETWORK_RANGE_BYTES);
+        pressure::reset_transition_full_scan_rows_for_test();
         target
             .append_blob_carrier_prefix_with_policy(
                 &policy,
@@ -13180,6 +14605,11 @@ mod tests {
                 &carrier.bytes()[..first_range_len],
             )
             .expect("append first transfer range");
+        assert_eq!(
+            pressure::transition_full_scan_rows_for_test(),
+            0,
+            "carrier-prefix transition must not enumerate unrelated Blob state",
+        );
 
         let partial = target
             .pending_blob_transfer_progress_with_policy(&policy)
@@ -14953,6 +16383,11 @@ mod tests {
             lifecycle::BLOB_VARIANT_REFERENCES,
             lifecycle::BLOB_LINEAGE_FENCES,
             lifecycle::BLOB_REPLAY_FENCES,
+            pressure::BLOB_PRESSURE_PUBLICATION_ROOTS,
+            pressure::BLOB_PRESSURE_PENDING_ROOTS,
+            pressure::BLOB_PRESSURE_VARIANT_SUMMARIES,
+            pressure::BLOB_PRESSURE_PUBLICATIONS,
+            pressure::BLOB_PRESSURE_CONTENT_PUBLICATIONS,
         ] {
             for row in read
                 .open_table(definition)
@@ -14976,12 +16411,42 @@ mod tests {
             }
         }
         for row in read
+            .open_table(pressure::BLOB_PRESSURE_PENDING_SOURCES)
+            .expect("Blob pressure pending index")
+            .iter()
+            .expect("Blob pressure pending rows")
+        {
+            let (key, value) = row.expect("Blob pressure pending row");
+            digest.update(key.value());
+            digest.update(value.value());
+        }
+        for row in read
+            .open_table(pressure::BLOB_PRESSURE_VARIANTS)
+            .expect("Blob pressure variant index")
+            .iter()
+            .expect("Blob pressure variant rows")
+        {
+            let (key, value) = row.expect("Blob pressure variant row");
+            digest.update(key.value());
+            digest.update(value.value());
+        }
+        for row in read
             .open_table(lifecycle::BLOB_LIFECYCLE_METADATA)
             .expect("Blob lifecycle metadata table")
             .iter()
             .expect("Blob lifecycle metadata rows")
         {
             let (key, value) = row.expect("Blob lifecycle metadata row");
+            digest.update(key.value().as_bytes());
+            digest.update(value.value().to_be_bytes());
+        }
+        for row in read
+            .open_table(pressure::BLOB_PRESSURE_METADATA)
+            .expect("Blob pressure metadata table")
+            .iter()
+            .expect("Blob pressure metadata rows")
+        {
+            let (key, value) = row.expect("Blob pressure metadata row");
             digest.update(key.value().as_bytes());
             digest.update(value.value().to_be_bytes());
         }
@@ -15422,7 +16887,7 @@ mod tests {
             services.publisher.identity(),
             blob_topic(),
             blob_scope(),
-            Priority::Immediate,
+            proof.blob.header().priority,
             proof.blob.blob_id(),
         )
         .expect("Blob intent");
@@ -18780,7 +20245,7 @@ mod tests {
     }
 
     #[test]
-    fn predecessor_nine_table_blob_schema_migrates_network_additively_with_owner_tokens() {
+    fn predecessor_blob_schema_requires_writable_network_and_pressure_migration() {
         let mut services = blob_services(0xc1);
         let remove_network_tables = |path: &Path| {
             let database = Database::open(path).expect("raw predecessor database");
@@ -18797,6 +20262,26 @@ mod tests {
             write
                 .delete_table(BLOB_CARRIER_FETCH_CURSORS)
                 .expect("delete predecessor cursor table");
+            write
+                .delete_table(pressure::BLOB_PRESSURE_METADATA)
+                .expect("delete predecessor pressure metadata");
+            for table in [
+                pressure::BLOB_PRESSURE_PUBLICATION_ROOTS,
+                pressure::BLOB_PRESSURE_PENDING_ROOTS,
+                pressure::BLOB_PRESSURE_VARIANT_SUMMARIES,
+                pressure::BLOB_PRESSURE_PUBLICATIONS,
+                pressure::BLOB_PRESSURE_CONTENT_PUBLICATIONS,
+            ] {
+                write
+                    .delete_table(table)
+                    .expect("delete predecessor pressure table");
+            }
+            write
+                .delete_table(pressure::BLOB_PRESSURE_PENDING_SOURCES)
+                .expect("delete predecessor pending pressure table");
+            write
+                .delete_table(pressure::BLOB_PRESSURE_VARIANTS)
+                .expect("delete predecessor variant pressure table");
             write.commit().expect("commit predecessor schema");
         };
         let table_names = |path: &Path| {
@@ -18818,11 +20303,9 @@ mod tests {
                 .expect("empty predecessor base"),
         );
         remove_network_tables(&empty.database);
-        assert_eq!(
-            Store::inspect_existing(&empty.database)
-                .expect("read-only predecessor inspection")
-                .blob_stats,
-            BlobStoreStats::default()
+        assert_blob_schema_invariant(
+            &Store::inspect_existing(&empty.database)
+                .expect_err("read-only predecessor requires writable pressure migration"),
         );
         let inspected_names = table_names(&empty.database);
         assert!(
@@ -18861,11 +20344,9 @@ mod tests {
             .expect("populated predecessor stats");
         drop(populated_store);
         remove_network_tables(&populated.database);
-        assert_eq!(
-            Store::inspect_existing(&populated.database)
-                .expect("inspect populated predecessor")
-                .blob_stats,
-            populated_stats
+        assert_blob_schema_invariant(
+            &Store::inspect_existing(&populated.database)
+                .expect_err("populated predecessor requires writable pressure migration"),
         );
         let reopened = Store::open_for_mission(&populated.database, services.authority)
             .expect("migrate populated attributed predecessor");
@@ -22803,8 +24284,8 @@ mod tests {
         };
         assert_eq!(
             exact_retirement_rows,
-            12 + 10 + 2 + 4 + 2 * crate::blob_subscription::MAX_BLOB_SUBSCRIPTIONS,
-            "one-operation maximum-fanout retirement charges every unique durable row"
+            12 + 1 + 10 + 2 + 4 + 2 * crate::blob_subscription::MAX_BLOB_SUBSCRIPTIONS,
+            "one-operation maximum-fanout retirement charges the source bytes and every other unique durable row"
         );
         let before_short = blob_complete_logical_digest(&store);
         let short = store
@@ -23231,7 +24712,7 @@ mod tests {
                 .begin_write()
                 .expect("acceptance-order-admitting charge write");
             let mut charge = MaintenanceCharge {
-                budget: lifecycle::BlobMaintenanceBudget::new(13, 1, u64::MAX)
+                budget: lifecycle::BlobMaintenanceBudget::new(14, 1, u64::MAX)
                     .expect("acceptance-order-admitting budget"),
                 rows: 12,
                 bytes: discovery_bytes,
@@ -23357,8 +24838,8 @@ mod tests {
         };
         assert_eq!(
             exact_rows,
-            12 + 10 + 2 + 4 * MAX_BLOB_OPERATIONS,
-            "maximum aliases charge each operation, owner, resolver, and deadline"
+            12 + 1 + 10 + 2 + 4 * MAX_BLOB_OPERATIONS,
+            "maximum aliases charge source bytes plus each operation, owner, resolver, and deadline"
         );
         let before = blob_complete_logical_digest(&store);
         let before_usage = store
@@ -27132,6 +28613,217 @@ mod tests {
     }
 
     #[test]
+    fn blob_manifest_admission_preflight_is_byte_stable_including_continuity() {
+        // Break caught: planning used to call the mutating continuity observer
+        // before deciding whether the full admission fit its budget.
+        let root = BlobTestRoot::new("manifest-admission-plan-byte-stable");
+        let services = blob_services(0xd3);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("plan byte-stability store");
+        let variant = install_unreferenced_variant(
+            &store,
+            &services,
+            b"manifest admission retained plan byte stability",
+            1,
+            true,
+        );
+        let first_sample = CustodySample {
+            clock_id: [0xd3; 16],
+            tick_ms: 10,
+        };
+        let write = store.database.begin_write().expect("seed continuity");
+        deletion::observe_blob_deletion_continuity_write(&write, first_sample)
+            .expect("seed continuity sample");
+        write.commit().expect("commit seeded continuity");
+        let before = blob_manifest_admission_digest(&store);
+
+        let write = store.database.begin_write().expect("plan-only transaction");
+        let expected_import = write
+            .open_table(BLOB_IMPORTS)
+            .unwrap()
+            .get(variant.as_bytes().as_slice())
+            .unwrap()
+            .unwrap()
+            .value()
+            .to_vec();
+        let expected_lineage = write
+            .open_table(lifecycle::BLOB_LINEAGE_FENCES)
+            .unwrap()
+            .get(variant.as_bytes().as_slice())
+            .unwrap()
+            .unwrap()
+            .value()
+            .to_vec();
+        let mut charge = MaintenanceCharge {
+            budget: lifecycle::BlobMaintenanceBudget::new(u64::MAX, 1, u64::MAX).unwrap(),
+            rows: 0,
+            bytes: 0,
+        };
+        let plan = deletion::plan_variant_admission_write(
+            &write,
+            variant,
+            &expected_import,
+            &expected_lineage,
+            store.blob_depot_owner_binding,
+            Some(CustodySample {
+                clock_id: [0xd3; 16],
+                tick_ms: 20,
+            }),
+            Some(&mut charge),
+        )
+        .expect("build retained admission plan")
+        .expect("variant admits a deletion manifest");
+        assert!(charge.rows > 0);
+        drop(plan);
+        write.commit().expect("commit plan-only transaction");
+        assert_eq!(blob_manifest_admission_digest(&store), before);
+    }
+
+    #[test]
+    fn blob_manifest_admission_apply_uses_only_retained_exact_mutations() {
+        // Break caught: applying pressure admission used to perform a second
+        // uncharged manifest/chunk discovery pass.
+        let root = BlobTestRoot::new("manifest-admission-retained-apply");
+        let services = blob_services(0xd4);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("retained apply store");
+        let variant = install_unreferenced_variant(
+            &store,
+            &services,
+            &vec![0xd4; SELECTED_BLOB_CHUNK_SIZE as usize + 17],
+            1,
+            true,
+        );
+        let write = store
+            .database
+            .begin_write()
+            .expect("retained apply transaction");
+        let expected_import = write
+            .open_table(BLOB_IMPORTS)
+            .unwrap()
+            .get(variant.as_bytes().as_slice())
+            .unwrap()
+            .unwrap()
+            .value()
+            .to_vec();
+        let expected_lineage = write
+            .open_table(lifecycle::BLOB_LINEAGE_FENCES)
+            .unwrap()
+            .get(variant.as_bytes().as_slice())
+            .unwrap()
+            .unwrap()
+            .value()
+            .to_vec();
+        let mut charge = MaintenanceCharge {
+            budget: lifecycle::BlobMaintenanceBudget::new(u64::MAX, 1, u64::MAX).unwrap(),
+            rows: 0,
+            bytes: 0,
+        };
+        let plan = deletion::plan_variant_admission_write(
+            &write,
+            variant,
+            &expected_import,
+            &expected_lineage,
+            store.blob_depot_owner_binding,
+            Some(CustodySample {
+                clock_id: [0xd4; 16],
+                tick_ms: 11,
+            }),
+            Some(&mut charge),
+        )
+        .expect("build retained exact plan")
+        .expect("variant admits exact plan");
+        deletion::set_manifest_admission_discovery_forbidden_for_test(true);
+        deletion::apply_variant_admission_plan_write(&write, plan)
+            .expect("apply retained plan without discovery");
+        deletion::set_manifest_admission_discovery_forbidden_for_test(false);
+        write.commit().expect("commit retained exact plan");
+
+        let committed = deletion_manifest_for_test(&store, variant);
+        assert_eq!(committed.totals.chunks, 2);
+        drop(store);
+        let reopened = Store::open_for_mission(&root.database, services.authority)
+            .expect("reopen retained-plan manifest");
+        assert_eq!(deletion_manifest_for_test(&reopened, variant), committed);
+    }
+
+    #[test]
+    fn blob_manifest_admission_over_budget_plan_does_not_advance_continuity() {
+        // Hand-derived one-chunk bound: 22 charged rows reach the existing
+        // continuity row but cannot also retain the manifest insertion.
+        let root = BlobTestRoot::new("manifest-admission-plan-over-budget");
+        let services = blob_services(0xd5);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("over-budget plan store");
+        let variant = install_unreferenced_variant(
+            &store,
+            &services,
+            b"one chunk over-budget retained admission plan",
+            1,
+            true,
+        );
+        let write = store
+            .database
+            .begin_write()
+            .expect("seed budget continuity");
+        deletion::observe_blob_deletion_continuity_write(
+            &write,
+            CustodySample {
+                clock_id: [0xd5; 16],
+                tick_ms: 10,
+            },
+        )
+        .unwrap();
+        write.commit().unwrap();
+        let before = blob_manifest_admission_digest(&store);
+
+        let write = store
+            .database
+            .begin_write()
+            .expect("bounded plan transaction");
+        let expected_import = write
+            .open_table(BLOB_IMPORTS)
+            .unwrap()
+            .get(variant.as_bytes().as_slice())
+            .unwrap()
+            .unwrap()
+            .value()
+            .to_vec();
+        let expected_lineage = write
+            .open_table(lifecycle::BLOB_LINEAGE_FENCES)
+            .unwrap()
+            .get(variant.as_bytes().as_slice())
+            .unwrap()
+            .unwrap()
+            .value()
+            .to_vec();
+        let mut charge = MaintenanceCharge {
+            budget: lifecycle::BlobMaintenanceBudget::new(22, 1, u64::MAX).unwrap(),
+            rows: 0,
+            bytes: 0,
+        };
+        assert!(
+            deletion::plan_variant_admission_write(
+                &write,
+                variant,
+                &expected_import,
+                &expected_lineage,
+                store.blob_depot_owner_binding,
+                Some(CustodySample {
+                    clock_id: [0xd5; 16],
+                    tick_ms: 20,
+                }),
+                Some(&mut charge),
+            )
+            .expect("bounded plan refusal")
+            .is_none()
+        );
+        assert_eq!(charge.rows, 22);
+        write.commit().expect("commit refused plan transaction");
+        assert_eq!(blob_manifest_admission_digest(&store), before);
+    }
+
+    #[test]
     fn blob_manifest_admission_moves_only_one_same_class_variant_per_turn() {
         let root = BlobTestRoot::new("manifest-admission-one-per-turn");
         let services = blob_services(0xcf);
@@ -30477,5 +32169,2002 @@ mod tests {
             Ok(_) => panic!("unmarked orphan lineage fence must fail closed"),
             Err(error) => assert_blob_schema_invariant(&error),
         }
+    }
+
+    fn pressure_database_digest(path: &Path) -> [u8; 32] {
+        let database = redb::Builder::new()
+            .open_read_only(path)
+            .expect("read pressure database");
+        let read = database.begin_read().expect("pressure digest read");
+        let mut digest = Sha256::new();
+        for table in [
+            pressure::BLOB_PRESSURE_PUBLICATION_ROOTS,
+            pressure::BLOB_PRESSURE_PENDING_ROOTS,
+            pressure::BLOB_PRESSURE_VARIANT_SUMMARIES,
+            pressure::BLOB_PRESSURE_PUBLICATIONS,
+            pressure::BLOB_PRESSURE_CONTENT_PUBLICATIONS,
+        ] {
+            for row in read
+                .open_table(table)
+                .expect("pressure digest table")
+                .iter()
+                .expect("pressure digest rows")
+            {
+                let (key, value) = row.expect("pressure digest row");
+                digest.update(key.value());
+                digest.update(value.value());
+            }
+        }
+        for row in read
+            .open_table(pressure::BLOB_PRESSURE_PENDING_SOURCES)
+            .expect("pending pressure digest table")
+            .iter()
+            .expect("pending pressure digest rows")
+        {
+            let (key, value) = row.expect("pending pressure digest row");
+            digest.update(key.value());
+            digest.update(value.value());
+        }
+        for row in read
+            .open_table(pressure::BLOB_PRESSURE_VARIANTS)
+            .expect("variant pressure digest table")
+            .iter()
+            .expect("variant pressure digest rows")
+        {
+            let (key, value) = row.expect("variant pressure digest row");
+            digest.update(key.value());
+            digest.update(value.value());
+        }
+        for row in read
+            .open_table(pressure::BLOB_PRESSURE_METADATA)
+            .expect("pressure metadata")
+            .iter()
+            .expect("pressure metadata rows")
+        {
+            let (key, value) = row.expect("pressure metadata row");
+            digest.update(key.value().as_bytes());
+            digest.update(value.value().to_be_bytes());
+        }
+        digest.finalize().into()
+    }
+
+    fn strip_blob_pressure_schema_for_test(path: &Path) {
+        let database = Database::open(path).expect("raw pressure predecessor database");
+        let write = database.begin_write().expect("pressure predecessor write");
+        write
+            .delete_table(pressure::BLOB_PRESSURE_METADATA)
+            .expect("delete pressure metadata");
+        for table in [
+            pressure::BLOB_PRESSURE_PUBLICATION_ROOTS,
+            pressure::BLOB_PRESSURE_PENDING_ROOTS,
+            pressure::BLOB_PRESSURE_VARIANT_SUMMARIES,
+            pressure::BLOB_PRESSURE_PUBLICATIONS,
+            pressure::BLOB_PRESSURE_CONTENT_PUBLICATIONS,
+        ] {
+            write.delete_table(table).expect("delete pressure table");
+        }
+        write
+            .delete_table(pressure::BLOB_PRESSURE_PENDING_SOURCES)
+            .expect("delete pending pressure table");
+        write
+            .delete_table(pressure::BLOB_PRESSURE_VARIANTS)
+            .expect("delete variant pressure table");
+        write.commit().expect("commit pressure predecessor");
+    }
+
+    #[test]
+    fn blob_pressure_schema_requires_writable_atomic_idempotent_migration() {
+        let root = BlobTestRoot::new("pressure-schema-migration");
+        drop(Store::open(&root.database).expect("current pressure schema"));
+        strip_blob_pressure_schema_for_test(&root.database);
+
+        assert_blob_schema_invariant(
+            &Store::inspect_existing(&root.database)
+                .expect_err("read-only predecessor must not migrate"),
+        );
+        pressure::TEST_PRESSURE_MIGRATION_FAULT.set(true);
+        let interrupted = match Store::open(&root.database) {
+            Ok(_) => panic!("interrupted migration must roll back"),
+            Err(error) => error,
+        };
+        assert_blob_schema_invariant(&interrupted);
+        pressure::TEST_PRESSURE_MIGRATION_FAULT.set(false);
+        let database = redb::Builder::new()
+            .open_read_only(&root.database)
+            .expect("read rolled-back predecessor");
+        let tables = database
+            .begin_read()
+            .expect("rolled-back predecessor read")
+            .list_tables()
+            .expect("rolled-back predecessor tables")
+            .map(|table| table.name().to_owned())
+            .collect::<BTreeSet<_>>();
+        assert!(!tables.contains(pressure::BLOB_PRESSURE_METADATA.name()));
+
+        drop(database);
+        drop(Store::open(&root.database).expect("writable pressure migration"));
+        let first = pressure_database_digest(&root.database);
+        Store::inspect_existing(&root.database).expect("inspect migrated pressure schema");
+        drop(Store::open(&root.database).expect("idempotent pressure reopen"));
+        assert_eq!(pressure_database_digest(&root.database), first);
+    }
+
+    #[test]
+    fn blob_pressure_writable_migration_rebuilds_previous_expiry_order() {
+        let root = BlobTestRoot::new("pressure-expiry-order-migration");
+        let mut services = blob_services(0xd7);
+        let plaintext = b"previous pressure expiry order".to_vec();
+        let prepared = prepared_blob(&plaintext);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("previous expiry-order store");
+        publish_blob(
+            &store,
+            &mut services,
+            &prepared,
+            &plaintext,
+            1,
+            b"previous-expiry-order",
+        );
+        drop(store);
+        let database = Database::open(&root.database).unwrap();
+        let write = database.begin_write().unwrap();
+        write
+            .open_table(pressure::BLOB_PRESSURE_METADATA)
+            .unwrap()
+            .insert("schema_version", 2)
+            .unwrap();
+        write.commit().unwrap();
+        drop(database);
+        assert_blob_schema_invariant(
+            &Store::inspect_existing(&root.database)
+                .expect_err("read-only previous order requires migration"),
+        );
+        drop(
+            Store::open_for_mission(&root.database, services.authority)
+                .expect("writable previous order rebuild"),
+        );
+        Store::inspect_existing(&root.database).expect("inspect rebuilt expiry order");
+        let database = Database::open(&root.database).unwrap();
+        let read = database.begin_read().unwrap();
+        assert_eq!(
+            read.open_table(pressure::BLOB_PRESSURE_METADATA)
+                .unwrap()
+                .get("schema_version")
+                .unwrap()
+                .unwrap()
+                .value(),
+            3
+        );
+    }
+
+    #[test]
+    fn blob_pressure_schema_rejects_partial_current_without_repair() {
+        let root = BlobTestRoot::new("pressure-schema-partial");
+        drop(Store::open(&root.database).expect("current pressure schema"));
+        let database = Database::open(&root.database).expect("partial pressure database");
+        let write = database.begin_write().expect("partial pressure write");
+        write
+            .delete_table(pressure::BLOB_PRESSURE_VARIANTS)
+            .expect("delete one pressure table");
+        write.commit().expect("commit partial pressure schema");
+        drop(database);
+        assert_blob_schema_invariant(
+            &Store::inspect_existing(&root.database)
+                .expect_err("read-only partial pressure schema must fail"),
+        );
+        let writable = match Store::open(&root.database) {
+            Ok(_) => panic!("writable partial pressure schema must fail"),
+            Err(error) => error,
+        };
+        assert_blob_schema_invariant(&writable);
+    }
+
+    #[test]
+    fn blob_pressure_audit_rejects_orphaned_index_rows_without_repair() {
+        let root = BlobTestRoot::new("pressure-orphan-index");
+        drop(Store::open(&root.database).expect("current pressure schema"));
+        let database = Database::open(&root.database).expect("pressure corruption database");
+        let write = database.begin_write().expect("pressure corruption write");
+        write
+            .open_table(pressure::BLOB_PRESSURE_PENDING_SOURCES)
+            .expect("pending pressure index")
+            .insert(&[1u8; 68], &[] as &[u8])
+            .expect("insert orphan pressure index");
+        write.commit().expect("commit pressure corruption");
+        drop(database);
+        assert_blob_schema_invariant(
+            &Store::inspect_existing(&root.database)
+                .expect_err("read-only pressure audit must reject orphan index"),
+        );
+        let writable = match Store::open(&root.database) {
+            Ok(_) => panic!("writable pressure audit must not repair orphan index"),
+            Err(error) => error,
+        };
+        assert_blob_schema_invariant(&writable);
+    }
+
+    #[test]
+    fn blob_pressure_equivalent_fraction_index_substitution_fails_closed_without_repair() {
+        let source_root = BlobTestRoot::new("pressure-equivalent-fraction-source");
+        let target_root = BlobTestRoot::new("pressure-equivalent-fraction-target");
+        let mut services = blob_services(0xd5);
+        let source = Store::open_for_mission(&source_root.database, services.authority)
+            .expect("equivalent-fraction source store");
+        let target = Store::open_for_mission(&target_root.database, services.authority)
+            .expect("equivalent-fraction target store");
+        let policy = target
+            .control_policy_snapshot()
+            .expect("equivalent-fraction policy");
+        let plaintext = vec![0x51; SELECTED_BLOB_CHUNK_SIZE as usize + 13];
+        let prepared = prepared_blob(&plaintext);
+        let proof = prepare_blob_proof(&source, &mut services, &prepared, &plaintext, 1);
+        let plan = proof
+            .blob
+            .transfer_plan(&proof.manifest_bytes)
+            .expect("equivalent-fraction plan");
+        let transfer = BlobTransferId::new(proof.blob.envelope_id());
+        target
+            .stage_verified_blob_source_with_policy(&policy, &proof.blob, &proof.sealed, &plan)
+            .expect("stage equivalent-fraction source");
+
+        let read = target
+            .database
+            .begin_read()
+            .expect("read canonical pressure root");
+        let encoded_root = read
+            .open_table(pressure::BLOB_PRESSURE_PENDING_ROOTS)
+            .expect("pending pressure roots")
+            .get(transfer.as_bytes().as_slice())
+            .expect("read pending pressure root")
+            .expect("pending pressure root exists")
+            .value()
+            .to_vec();
+        drop(read);
+        let root = pressure::decode_pending_root(&encoded_root).expect("decode pending root");
+        let canonical = pressure::encode_pending_index_key(root.clone(), transfer);
+        let equivalent = pressure::encode_pending_index_key(
+            pressure::PressurePendingRoot {
+                completion: pressure::PressureFraction::new(
+                    root.completion
+                        .numerator()
+                        .checked_mul(2)
+                        .expect("small numerator"),
+                    root.completion
+                        .denominator()
+                        .checked_mul(2)
+                        .expect("small denominator"),
+                )
+                .expect("equivalent completion"),
+                ..root
+            },
+            transfer,
+        );
+        assert_ne!(canonical, equivalent);
+        let write = target
+            .database
+            .begin_write()
+            .expect("substitute equivalent pressure key");
+        let mut pending = write
+            .open_table(pressure::BLOB_PRESSURE_PENDING_SOURCES)
+            .expect("pending pressure index");
+        pending
+            .remove(&canonical)
+            .expect("remove canonical pressure key")
+            .expect("canonical pressure key exists");
+        pending
+            .insert(&equivalent, &[] as &[u8])
+            .expect("insert equivalent pressure key");
+        drop(pending);
+        write.commit().expect("commit equivalent key substitution");
+
+        let mut source_depot = source.blob_depot().expect("source transfer depot");
+        CoreBlobStore::begin_blob_with_lineage(
+            &mut source_depot,
+            plan.manifest(),
+            plan.physical_lineage(),
+        )
+        .expect("activate source transfer plan");
+        let carrier = plan
+            .build_carrier(&mut source_depot, 0)
+            .expect("build first transfer carrier");
+        let object = BlobCarrierObjectId::new(carrier.object_id().wire_bytes())
+            .expect("typed first carrier");
+        let total_len = u64::try_from(carrier.bytes().len()).expect("carrier length");
+        assert_blob_schema_invariant(
+            &target
+                .append_blob_carrier_prefix_with_policy(
+                    &policy,
+                    transfer,
+                    object,
+                    total_len,
+                    0,
+                    &carrier.bytes()[..carrier.bytes().len().min(MAX_BLOB_NETWORK_RANGE_BYTES)],
+                )
+                .expect_err("equivalent fraction substitution must fail before mutation"),
+        );
+        let read = target
+            .database
+            .begin_read()
+            .expect("read rejected equivalent key");
+        let stored = read
+            .open_table(pressure::BLOB_PRESSURE_PENDING_SOURCES)
+            .expect("pending pressure index")
+            .iter()
+            .expect("pending pressure keys")
+            .map(|row| row.expect("pending pressure row").0.value())
+            .collect::<Vec<_>>();
+        assert!(stored.contains(&equivalent));
+        assert!(!stored.contains(&canonical));
+        drop(read);
+        drop(target);
+
+        assert_blob_schema_invariant(
+            &Store::inspect_existing(&target_root.database)
+                .expect_err("read-only audit must reject equivalent fraction substitution"),
+        );
+        let writable = match Store::open_for_mission(&target_root.database, services.authority) {
+            Ok(_) => panic!("writable audit must not repair equivalent fraction substitution"),
+            Err(error) => error,
+        };
+        assert_blob_schema_invariant(&writable);
+        let database = redb::Builder::new()
+            .open_read_only(&target_root.database)
+            .expect("read unrepaired equivalent key");
+        let read = database.begin_read().expect("unrepaired pressure read");
+        let stored = read
+            .open_table(pressure::BLOB_PRESSURE_PENDING_SOURCES)
+            .expect("unrepaired pending pressure index")
+            .iter()
+            .expect("unrepaired pending pressure keys")
+            .map(|row| row.expect("unrepaired pending pressure row").0.value())
+            .collect::<Vec<_>>();
+        assert!(stored.contains(&equivalent));
+        assert!(!stored.contains(&canonical));
+    }
+
+    #[test]
+    fn blob_pressure_migration_preflights_pending_order_growth_against_staging_cap() {
+        let source_root = BlobTestRoot::new("pressure-cap-source");
+        let target_root = BlobTestRoot::new("pressure-cap-target");
+        let mut services = blob_services(0xd6);
+        let source = Store::open_for_mission(&source_root.database, services.authority)
+            .expect("pressure-cap source store");
+        let target = Store::open_for_mission(&target_root.database, services.authority)
+            .expect("pressure-cap target store");
+        let plaintext = vec![0x61; 4_103];
+        let prepared = prepared_blob(&plaintext);
+        let proof = prepare_blob_proof(&source, &mut services, &prepared, &plaintext, 1);
+        let plan = proof
+            .blob
+            .transfer_plan(&proof.manifest_bytes)
+            .expect("pressure-cap plan");
+        let policy = target
+            .control_policy_snapshot()
+            .expect("pressure-cap policy");
+        target
+            .stage_verified_blob_source_with_policy(&policy, &proof.blob, &proof.sealed, &plan)
+            .expect("stage pressure-cap source");
+        let transfer = BlobTransferId::new(proof.blob.envelope_id());
+        drop(target);
+
+        let exact_legacy_bytes = {
+            let database = Database::open(&target_root.database).expect("pressure-cap database");
+            let write = database
+                .begin_write()
+                .expect("pressure-cap predecessor write");
+            let mut pending = write
+                .open_table(BLOB_PENDING_SOURCES)
+                .expect("pressure-cap pending sources");
+            let current = pending
+                .get(transfer.as_bytes().as_slice())
+                .expect("read pressure-cap pending source")
+                .expect("pressure-cap pending source exists")
+                .value()
+                .to_vec();
+            let mut legacy = Vec::with_capacity(current.len() - 8);
+            legacy.push(LEGACY_PENDING_BLOB_SOURCE_VERSION);
+            legacy.extend_from_slice(&current[9..]);
+            pending
+                .insert(transfer.as_bytes().as_slice(), legacy.as_slice())
+                .expect("write pressure-cap legacy source");
+            drop(pending);
+            let mut metadata = write
+                .open_table(BLOB_NETWORK_METADATA)
+                .expect("pressure-cap network metadata");
+            let exact = metadata
+                .get(BLOB_NETWORK_STAGING_BYTES)
+                .expect("read pressure-cap staging bytes")
+                .expect("pressure-cap staging bytes exist")
+                .value()
+                .checked_sub(8)
+                .expect("legacy pending source is eight bytes smaller");
+            metadata
+                .insert(BLOB_NETWORK_STAGING_BYTES, exact)
+                .expect("store exact pressure-cap legacy bytes");
+            drop(metadata);
+            write.commit().expect("commit pressure-cap predecessor");
+            exact
+        };
+        strip_blob_pressure_schema_for_test(&target_root.database);
+
+        let database = Database::open(&target_root.database).expect("open pressure-cap boundary");
+        let boundary = MAX_BLOB_NETWORK_STAGING_BYTES - 7;
+        let write = database.begin_write().expect("set pressure-cap boundary");
+        write
+            .open_table(BLOB_NETWORK_METADATA)
+            .expect("pressure-cap metadata")
+            .insert(BLOB_NETWORK_STAGING_BYTES, boundary)
+            .expect("store pressure-cap boundary");
+        write.commit().expect("commit pressure-cap boundary");
+
+        let write = database
+            .begin_write()
+            .expect("attempt pressure-cap migration");
+        let error = pressure::audit_or_migrate_pressure_write(&write)
+            .expect_err("pending-order growth beyond staging cap must fail before mutation");
+        assert!(matches!(
+            error,
+            StoreError::Blob(BlobStoreError::NetworkStagingByteLimitExceeded {
+                current,
+                incoming: 8,
+                limit: MAX_BLOB_NETWORK_STAGING_BYTES,
+            }) if current == boundary
+        ));
+        drop(write);
+
+        let read = database
+            .begin_read()
+            .expect("read rolled-back pressure-cap state");
+        assert_eq!(
+            read.open_table(BLOB_NETWORK_METADATA)
+                .expect("rolled-back pressure-cap metadata")
+                .get(BLOB_NETWORK_STAGING_BYTES)
+                .expect("read rolled-back pressure-cap bytes")
+                .expect("rolled-back pressure-cap bytes exist")
+                .value(),
+            boundary
+        );
+        let legacy = read
+            .open_table(BLOB_PENDING_SOURCES)
+            .expect("rolled-back pressure-cap pending sources")
+            .get(transfer.as_bytes().as_slice())
+            .expect("read rolled-back pending source")
+            .expect("rolled-back pending source exists")
+            .value()
+            .to_vec();
+        assert_eq!(legacy[0], LEGACY_PENDING_BLOB_SOURCE_VERSION);
+        assert!(
+            !read
+                .list_tables()
+                .expect("rolled-back pressure-cap tables")
+                .any(|table| table.name() == pressure::BLOB_PRESSURE_METADATA.name())
+        );
+        drop(read);
+
+        let write = database
+            .begin_write()
+            .expect("restore exact legacy byte count");
+        write
+            .open_table(BLOB_NETWORK_METADATA)
+            .expect("restore pressure-cap metadata")
+            .insert(BLOB_NETWORK_STAGING_BYTES, exact_legacy_bytes)
+            .expect("restore exact legacy bytes");
+        write.commit().expect("commit exact legacy bytes");
+        drop(database);
+
+        drop(
+            Store::open_for_mission(&target_root.database, services.authority)
+                .expect("retry pressure migration after restoring capacity"),
+        );
+        Store::inspect_existing(&target_root.database)
+            .expect("reopen successfully migrated pressure-cap store");
+    }
+
+    #[test]
+    fn blob_pressure_migration_orders_legacy_pending_sources_by_transfer_identity() {
+        let source_root = BlobTestRoot::new("pressure-order-source");
+        let target_root = BlobTestRoot::new("pressure-order-target");
+        let mut services = blob_services(0xd4);
+        let source = Store::open_for_mission(&source_root.database, services.authority)
+            .expect("pressure order source");
+        let target = Store::open_for_mission(&target_root.database, services.authority)
+            .expect("pressure order target");
+        let first_plaintext = vec![0x41; 4_097];
+        let second_plaintext = vec![0x42; 4_099];
+        let first_prepared = prepared_blob(&first_plaintext);
+        let second_prepared = prepared_blob(&second_plaintext);
+        let first =
+            prepare_blob_proof(&source, &mut services, &first_prepared, &first_plaintext, 1);
+        let second = prepare_blob_proof(
+            &source,
+            &mut services,
+            &second_prepared,
+            &second_plaintext,
+            1,
+        );
+        let first_plan = first
+            .blob
+            .transfer_plan(&first.manifest_bytes)
+            .expect("first pressure plan");
+        let second_plan = second
+            .blob
+            .transfer_plan(&second.manifest_bytes)
+            .expect("second pressure plan");
+        let policy = target.control_policy_snapshot().expect("pressure policy");
+        let mut sources = [
+            (
+                BlobTransferId::new(first.blob.envelope_id()),
+                &first,
+                &first_plan,
+            ),
+            (
+                BlobTransferId::new(second.blob.envelope_id()),
+                &second,
+                &second_plan,
+            ),
+        ];
+        sources.sort_unstable_by_key(|(transfer, _, _)| *transfer);
+        for (_, proof, plan) in sources.iter().rev() {
+            assert_eq!(
+                target
+                    .stage_verified_blob_source_with_policy(
+                        &policy,
+                        &proof.blob,
+                        &proof.sealed,
+                        plan,
+                    )
+                    .expect("stage pressure source"),
+                BlobSourceStageOutcome::Inserted
+            );
+        }
+        drop(target);
+        {
+            let database = Database::open(&target_root.database).expect("legacy pending database");
+            let write = database.begin_write().expect("legacy pending write");
+            let mut table = write
+                .open_table(BLOB_PENDING_SOURCES)
+                .expect("legacy pending sources");
+            for (transfer, _, _) in &sources {
+                let current = table
+                    .get(transfer.as_bytes().as_slice())
+                    .expect("read current pending source")
+                    .expect("current pending source exists")
+                    .value()
+                    .to_vec();
+                let mut legacy = Vec::with_capacity(current.len() - 8);
+                legacy.push(LEGACY_PENDING_BLOB_SOURCE_VERSION);
+                legacy.extend_from_slice(&current[9..]);
+                table
+                    .insert(transfer.as_bytes().as_slice(), legacy.as_slice())
+                    .expect("write legacy pending source");
+            }
+            drop(table);
+            let mut metadata = write
+                .open_table(BLOB_NETWORK_METADATA)
+                .expect("legacy network metadata");
+            let staging_bytes = metadata
+                .get(BLOB_NETWORK_STAGING_BYTES)
+                .expect("read legacy staging bytes")
+                .expect("legacy staging bytes exist")
+                .value();
+            metadata
+                .insert(
+                    BLOB_NETWORK_STAGING_BYTES,
+                    staging_bytes
+                        .checked_sub(8 * u64::try_from(sources.len()).expect("small source count"))
+                        .expect("legacy encoding shrinks staging rows"),
+                )
+                .expect("adjust legacy staging bytes");
+            drop(metadata);
+            write.commit().expect("commit legacy pending sources");
+        }
+        strip_blob_pressure_schema_for_test(&target_root.database);
+        assert_blob_schema_invariant(
+            &Store::inspect_existing(&target_root.database)
+                .expect_err("legacy pending pressure state needs writable migration"),
+        );
+        let target = Store::open_for_mission(&target_root.database, services.authority)
+            .expect("migrate pending pressure orders");
+        let read = target.database.begin_read().expect("read pending orders");
+        let roots = read
+            .open_table(pressure::BLOB_PRESSURE_PENDING_ROOTS)
+            .expect("pending pressure roots");
+        let authoritative = read
+            .open_table(BLOB_PENDING_SOURCES)
+            .expect("authoritative pending sources");
+        for (index, (transfer, _, _)) in sources.iter().enumerate() {
+            let expected_order = u64::try_from(index + 1).expect("small order");
+            let encoded = roots
+                .get(transfer.as_bytes().as_slice())
+                .expect("read pending pressure root")
+                .expect("pending pressure root exists");
+            assert_eq!(
+                pressure::decode_pending_root(encoded.value())
+                    .expect("decode pending pressure root")
+                    .acceptance_order,
+                expected_order
+            );
+            assert_eq!(
+                decode_pending_blob_source(
+                    authoritative
+                        .get(transfer.as_bytes().as_slice())
+                        .expect("read authoritative pending source")
+                        .expect("authoritative pending source exists")
+                        .value(),
+                )
+                .expect("decode authoritative pending source")
+                .pending_acceptance_order,
+                expected_order,
+            );
+        }
+        let metadata = read
+            .open_table(pressure::BLOB_PRESSURE_METADATA)
+            .expect("pressure metadata");
+        assert_eq!(
+            metadata
+                .get(pressure::NEXT_PENDING_ACCEPTANCE_ORDER)
+                .expect("read next pending order")
+                .expect("next pending order exists")
+                .value(),
+            3
+        );
+        drop(metadata);
+        drop(authoritative);
+        drop(roots);
+        drop(read);
+
+        let (_, proof, plan) = &sources[0];
+        assert_eq!(
+            target
+                .stage_verified_blob_source_with_policy(&policy, &proof.blob, &proof.sealed, plan,)
+                .expect("retry migrated pending source"),
+            BlobSourceStageOutcome::Duplicate
+        );
+
+        let migrated_eviction = target
+            .run_blob_pressure_recovery(
+                pressure::BlobCapacityRecoveryDemand::new(
+                    pressure::BlobCapacityPartition::NetworkStagingRows,
+                    Priority::Flash,
+                    1,
+                )
+                .unwrap(),
+                pressure::BlobPressureRecoveryBudget::new(
+                    MAX_BLOB_PRESSURE_FINAL_ROOT_ROWS,
+                    MAX_BLOB_PRESSURE_FINAL_ROOT_BYTES,
+                    1,
+                    1,
+                    1,
+                )
+                .unwrap(),
+                None,
+            )
+            .expect("evict oldest migrated pending source");
+        assert_eq!(migrated_eviction.evicted_transfer_ids(), &[sources[0].0]);
+        assert!(target.pending_blob_source(sources[0].0).unwrap().is_none());
+        assert!(target.pending_blob_source(sources[1].0).unwrap().is_some());
+
+        let write = target
+            .database
+            .begin_write()
+            .expect("seed pending-order overflow");
+        write
+            .open_table(pressure::BLOB_PRESSURE_METADATA)
+            .expect("pressure metadata")
+            .insert(pressure::NEXT_PENDING_ACCEPTANCE_ORDER, u64::MAX)
+            .expect("set pending-order overflow");
+        write.commit().expect("commit pending-order overflow");
+        let overflow_plaintext = vec![0x43; 4_101];
+        let overflow_prepared = prepared_blob(&overflow_plaintext);
+        let overflow = prepare_blob_proof(
+            &source,
+            &mut services,
+            &overflow_prepared,
+            &overflow_plaintext,
+            1,
+        );
+        let overflow_plan = overflow
+            .blob
+            .transfer_plan(&overflow.manifest_bytes)
+            .expect("overflow pressure plan");
+        let overflow_transfer = BlobTransferId::new(overflow.blob.envelope_id());
+        assert_blob_schema_invariant(
+            &target
+                .stage_verified_blob_source_with_policy(
+                    &policy,
+                    &overflow.blob,
+                    &overflow.sealed,
+                    &overflow_plan,
+                )
+                .expect_err("pending-order overflow must reject before commit"),
+        );
+        assert!(
+            target
+                .pending_blob_source(overflow_transfer)
+                .expect("overflow source lookup")
+                .is_none()
+        );
+        drop(target);
+        Store::inspect_existing(&target_root.database)
+            .expect("retry retains migrated pressure order");
+    }
+
+    #[test]
+    fn blob_pressure_shared_publications_have_hand_derived_summary_and_reopen() {
+        let root = BlobTestRoot::new("pressure-shared-publications");
+        let mut services = blob_services(0xe4);
+        let plaintext = vec![0x64; SELECTED_BLOB_CHUNK_SIZE as usize + 17];
+        let prepared = prepared_blob(&plaintext);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("pressure shared store");
+        let first_proof = prepare_blob_proof_with_priority(
+            &store,
+            &mut services,
+            &prepared,
+            &plaintext,
+            1,
+            Priority::Routine,
+        );
+        let first = commit_blob_proof(&store, &services, &first_proof, b"pressure-shared-first")
+            .0
+            .blob()
+            .clone();
+        let second_proof = prepare_blob_proof_with_priority(
+            &store,
+            &mut services,
+            &prepared,
+            &plaintext,
+            1,
+            Priority::Immediate,
+        );
+        let second = commit_blob_proof(&store, &services, &second_proof, b"pressure-shared-second")
+            .0
+            .blob()
+            .clone();
+        assert_eq!(first.variant_id, second.variant_id);
+        assert_ne!(first.transfer_id, second.transfer_id);
+        let expected_order = first.acceptance_marker.min(second.acceptance_marker);
+        let read = store.database.begin_read().expect("pressure summary read");
+        let summaries = read
+            .open_table(pressure::BLOB_PRESSURE_VARIANT_SUMMARIES)
+            .expect("pressure summaries");
+        assert_eq!(summaries.len().expect("pressure summary count"), 1);
+        let encoded = summaries
+            .get(first.variant_id.as_bytes().as_slice())
+            .expect("read pressure summary")
+            .expect("shared pressure summary");
+        let summary = pressure::decode_variant_summary(encoded.value())
+            .expect("decode shared pressure summary");
+        assert_eq!(summary.effective_priority, Priority::Immediate);
+        assert_eq!(summary.minimum_root_acceptance_order, expected_order);
+        assert_eq!(summary.publication_roots, 2);
+        assert_eq!(summary.pending_roots, 0);
+        assert!(summary.finalized);
+        assert_eq!(
+            summary.committed_progress.numerator(),
+            plaintext.len() as u64
+        );
+        assert_eq!(
+            summary.committed_progress.denominator(),
+            plaintext.len() as u64
+        );
+        drop(encoded);
+        drop(summaries);
+        drop(read);
+        drop(store);
+
+        let reopened = Store::open_for_mission(&root.database, services.authority)
+            .expect("reopen shared pressure store");
+        assert_eq!(
+            reopened.blob_inventory().expect("reopened inventory").len(),
+            2
+        );
+    }
+
+    #[test]
+    fn blob_pressure_evicts_lower_priority_shared_publication_metadata_only() {
+        // Break caught: pressure retirement used to require policy invalidity
+        // and could either spare the best candidate or delete shared content.
+        let root = BlobTestRoot::new("pressure-shared-metadata-only");
+        let mut services = blob_services(0xb1);
+        let plaintext = b"shared pressure content remains for the protected root".to_vec();
+        let prepared = prepared_blob(&plaintext);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("pressure shared metadata store");
+        let low_proof = prepare_blob_proof_with_priority(
+            &store,
+            &mut services,
+            &prepared,
+            &plaintext,
+            1,
+            Priority::Routine,
+        );
+        let (low_outcome, low_operation, low_intent) =
+            commit_blob_proof(&store, &services, &low_proof, b"pressure-low-shared");
+        let low = low_outcome.blob().clone();
+        let high_proof = prepare_blob_proof_with_priority(
+            &store,
+            &mut services,
+            &prepared,
+            &plaintext,
+            1,
+            Priority::Immediate,
+        );
+        let high = commit_blob_proof(&store, &services, &high_proof, b"pressure-high-shared")
+            .0
+            .blob()
+            .clone();
+        assert_eq!(low.variant_id, high.variant_id);
+        store
+            .run_blob_maintenance_turn(maintenance_budget(1))
+            .expect("ordinary cleanup precedes pressure");
+        let before_cursors = blob_maintenance_cursor_rows(&store);
+        let before_stats = store.blob_stats().expect("before pressure stats");
+
+        let recovery = store
+            .run_blob_pressure_recovery(
+                pressure::BlobCapacityRecoveryDemand::new(
+                    pressure::BlobCapacityPartition::AggregateItems,
+                    Priority::Immediate,
+                    2,
+                )
+                .unwrap(),
+                pressure::BlobPressureRecoveryBudget::new(
+                    MAX_BLOB_POLICY_RETIREMENT_ROWS,
+                    MAX_BLOB_POLICY_RETIREMENT_BYTES,
+                    2,
+                    4,
+                    1,
+                )
+                .unwrap(),
+                None,
+            )
+            .expect("shared pressure recovery");
+        assert_eq!(recovery.evicted_transfer_ids(), &[low.transfer_id]);
+        assert_eq!(recovery.recovered_units(), 1);
+        assert!(!recovery.deficit_met());
+        assert_eq!(blob_maintenance_cursor_rows(&store), before_cursors);
+        assert!(matches!(
+            store.get_blob(low.transfer_id),
+            Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+        ));
+        assert_eq!(
+            store
+                .get_blob(high.transfer_id)
+                .expect("protected shared publication read")
+                .expect("protected shared publication exists")
+                .sealed,
+            high.sealed
+        );
+        assert!(matches!(
+            store.blob_for_operation_with_policy(
+                &store.control_policy_snapshot().expect("pressure policy"),
+                &BlobOperationRequest::new(&low_operation, &low_intent),
+            ),
+            Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+        ));
+        let read = store
+            .database
+            .begin_read()
+            .expect("pressure retirement read");
+        let encoded = read
+            .open_table(BLOB_PUBLICATIONS)
+            .expect("pressure publication table")
+            .get(low.transfer_id.as_bytes().as_slice())
+            .expect("pressure publication lookup")
+            .expect("retired pressure publication");
+        assert_eq!(
+            lifecycle::publication_retirement(encoded.value())
+                .expect("decode pressure retirement")
+                .expect("pressure retirement state")
+                .0,
+            lifecycle::RetirementReason::Evicted
+        );
+        assert!(
+            !deletion::variant_has_deletion_manifest_read(&read, low.variant_id)
+                .expect("shared pressure manifest state")
+        );
+        let dot = low.header.stamp.dot;
+        let dot_key = accepted_dot_key(dot);
+        assert!(
+            read.open_table(ACCEPTED_DOTS)
+                .unwrap()
+                .get(dot_key.as_slice())
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            read.open_table(lifecycle::BLOB_REPLAY_FENCES)
+                .unwrap()
+                .get(dot_key.as_slice())
+                .unwrap()
+                .is_some()
+        );
+        let frontier_key = causal_frontier_key(&low.header.topic, &low.header.scope, dot.publisher)
+            .expect("pressure causal-frontier key");
+        assert!(
+            read.open_table(CAUSAL_FRONTIER)
+                .unwrap()
+                .get(frontier_key.as_slice())
+                .unwrap()
+                .is_some()
+        );
+        drop(encoded);
+        drop(read);
+        let after_stats = store.blob_stats().expect("after pressure stats");
+        assert_eq!(after_stats.lineage_fences, before_stats.lineage_fences);
+        assert_eq!(after_stats.replay_fences, before_stats.replay_fences);
+        assert_eq!(
+            before_stats
+                .publications
+                .checked_sub(after_stats.publications),
+            Some(1)
+        );
+        assert_eq!(
+            after_stats.publication_lifecycle_rows,
+            before_stats.publication_lifecycle_rows
+        );
+    }
+
+    #[test]
+    fn blob_pressure_final_root_is_lease_fenced_and_commits_deletion_manifest() {
+        // Break caught: retiring a final root before fencing readers leaves a
+        // live lease over deleting files, while retiring without a manifest
+        // falsely claims physical recovery.
+        let root = BlobTestRoot::new("pressure-final-root-manifest");
+        let mut services = blob_services(0xb2);
+        let plaintext = b"one final pressure root enters resumable deletion".to_vec();
+        let prepared = prepared_blob(&plaintext);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("pressure final-root store");
+        let proof = prepare_blob_proof_with_priority(
+            &store,
+            &mut services,
+            &prepared,
+            &plaintext,
+            1,
+            Priority::Routine,
+        );
+        let stored = commit_blob_proof(&store, &services, &proof, b"pressure-final-root-operation")
+            .0
+            .blob()
+            .clone();
+        let demand = pressure::BlobCapacityRecoveryDemand::new(
+            pressure::BlobCapacityPartition::AggregateItems,
+            Priority::Immediate,
+            1,
+        )
+        .unwrap();
+        let budget = pressure::BlobPressureRecoveryBudget::new(
+            MAX_BLOB_PRESSURE_FINAL_ROOT_ROWS,
+            MAX_BLOB_PRESSURE_FINAL_ROOT_BYTES,
+            1,
+            2,
+            1,
+        )
+        .unwrap();
+        let no_manifest_budget = pressure::BlobPressureRecoveryBudget::new(
+            MAX_BLOB_PRESSURE_FINAL_ROOT_ROWS,
+            MAX_BLOB_PRESSURE_FINAL_ROOT_BYTES,
+            1,
+            2,
+            0,
+        )
+        .unwrap();
+        let before_no_manifest = blob_complete_logical_digest(&store);
+        let no_manifest = store
+            .run_blob_pressure_recovery(demand, no_manifest_budget, None)
+            .expect("manifest-budget refusal");
+        assert!(no_manifest.evicted_transfer_ids().is_empty());
+        assert_eq!(blob_complete_logical_digest(&store), before_no_manifest);
+        TEST_BLOB_MANIFEST_ADMISSION_GENERATION_CHURN.set(true);
+        let generation_race = store
+            .run_blob_pressure_recovery(demand, budget, None)
+            .expect("lease-generation race defers pressure");
+        TEST_BLOB_MANIFEST_ADMISSION_GENERATION_CHURN.set(false);
+        assert!(generation_race.evicted_transfer_ids().is_empty());
+        assert_eq!(blob_complete_logical_digest(&store), before_no_manifest);
+        let lease = store
+            .test_acquire_blob_lease(stored.variant_id, lease::BlobLeaseKind::ApplicationPageRead)
+            .expect("pressure active read lease");
+        let before = blob_complete_logical_digest(&store);
+        let blocked = store
+            .run_blob_pressure_recovery(demand, budget, None)
+            .expect("lease-blocked pressure recovery");
+        assert!(blocked.evicted_transfer_ids().is_empty());
+        assert_eq!(blob_complete_logical_digest(&store), before);
+        assert!(store.get_blob(stored.transfer_id).unwrap().is_some());
+        drop(lease);
+
+        let recovered = store
+            .run_blob_pressure_recovery(demand, budget, None)
+            .expect("final-root pressure recovery");
+        assert_eq!(recovered.evicted_transfer_ids(), &[stored.transfer_id]);
+        assert_eq!(recovered.recovered_units(), 1);
+        assert!(recovered.deficit_met());
+        let read = store.database.begin_read().expect("pressure manifest read");
+        assert!(
+            deletion::variant_has_deletion_manifest_read(&read, stored.variant_id)
+                .expect("pressure manifest state")
+        );
+        drop(read);
+        assert!(matches!(
+            store.get_blob(stored.transfer_id),
+            Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+        ));
+        depot::inject_test_fault(
+            &root.path,
+            depot::DepotFaultPoint::ManifestChunkBeforeUnlink,
+        );
+        run_physical_deletion_turn_result(&store)
+            .expect("pressure manifest records retryable deletion failure");
+        assert_eq!(
+            deletion_manifest_for_test(&store, stored.variant_id)
+                .retry
+                .attempts,
+            1
+        );
+        drop(store);
+
+        let reopened = Store::open_for_mission(&root.database, services.authority)
+            .expect("reopen pressure final-root store");
+        assert_eq!(
+            deletion_manifest_for_test(&reopened, stored.variant_id)
+                .retry
+                .attempts,
+            1
+        );
+        assert!(matches!(
+            reopened.get_blob(stored.transfer_id),
+            Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+        ));
+        for _ in 0..4 {
+            run_physical_deletion_turn_result(&reopened)
+                .expect("resume pressure deletion after reopen");
+        }
+        let read = reopened.database.begin_read().unwrap();
+        assert!(!deletion::variant_has_deletion_manifest_read(&read, stored.variant_id).unwrap());
+    }
+
+    #[test]
+    fn blob_pressure_staging_evicts_pending_source_and_exact_prefix_units() {
+        // Break caught: publication or variant scans cannot prove how many
+        // staging rows/bytes one pending-source retirement actually releases.
+        let source_root = BlobTestRoot::new("pressure-staging-source");
+        let target_root = BlobTestRoot::new("pressure-staging-target");
+        let mut services = blob_services(0xb3);
+        let source = Store::open_for_mission(&source_root.database, services.authority)
+            .expect("pressure staging source");
+        let target = Store::open_for_mission(&target_root.database, services.authority)
+            .expect("pressure staging target");
+        let plaintext = b"pending pressure source with one durable carrier prefix".to_vec();
+        let prepared = prepared_blob(&plaintext);
+        let proof = prepare_blob_proof_with_priority(
+            &source,
+            &mut services,
+            &prepared,
+            &plaintext,
+            1,
+            Priority::Routine,
+        );
+        let plan = proof
+            .blob
+            .transfer_plan(&proof.manifest_bytes)
+            .expect("pressure staging plan");
+        let policy = target
+            .control_policy_snapshot()
+            .expect("target pressure policy");
+        let transfer = BlobTransferId::new(proof.blob.envelope_id());
+        target
+            .stage_verified_blob_source_with_policy(&policy, &proof.blob, &proof.sealed, &plan)
+            .expect("stage pressure pending source");
+        let carrier = {
+            let mut depot = source.blob_depot().expect("pressure source depot");
+            CoreBlobStore::begin_blob_with_lineage(
+                &mut depot,
+                plan.manifest(),
+                plan.physical_lineage(),
+            )
+            .expect("activate pressure source plan");
+            plan.build_carrier(&mut depot, 0)
+                .expect("build pressure carrier")
+        };
+        let object = BlobCarrierObjectId::new(carrier.object_id().wire_bytes())
+            .expect("pressure carrier identity");
+        target
+            .append_blob_carrier_prefix_with_policy(
+                &policy,
+                transfer,
+                object,
+                u64::try_from(carrier.bytes().len()).unwrap(),
+                0,
+                &carrier.bytes()[..carrier.bytes().len().min(MAX_BLOB_NETWORK_RANGE_BYTES)],
+            )
+            .expect("append pressure carrier prefix");
+        let before = target.blob_stats().expect("before staging pressure stats");
+        assert_eq!(before.pending_sources, 1);
+        assert_eq!(before.carrier_prefixes, 1);
+
+        let recovered = target
+            .run_blob_pressure_recovery(
+                pressure::BlobCapacityRecoveryDemand::new(
+                    pressure::BlobCapacityPartition::NetworkStagingRows,
+                    Priority::Immediate,
+                    2,
+                )
+                .unwrap(),
+                pressure::BlobPressureRecoveryBudget::new(
+                    MAX_BLOB_PRESSURE_FINAL_ROOT_ROWS,
+                    MAX_BLOB_PRESSURE_FINAL_ROOT_BYTES,
+                    1,
+                    1,
+                    1,
+                )
+                .unwrap(),
+                None,
+            )
+            .expect("pending staging pressure recovery");
+        assert_eq!(recovered.evicted_transfer_ids(), &[transfer]);
+        assert_eq!(recovered.recovered_units(), 2);
+        assert!(recovered.deficit_met());
+        assert!(target.pending_blob_source(transfer).unwrap().is_none());
+        let after = target.blob_stats().expect("after staging pressure stats");
+        assert_eq!(after.pending_sources, 0);
+        assert_eq!(after.carrier_prefixes, 0);
+        assert_eq!(after.lineage_fences, before.lineage_fences);
+        let read = target.database.begin_read().expect("staging manifest read");
+        assert!(
+            deletion::variant_has_deletion_manifest_read(&read, proof.completion.variant_id())
+                .expect("staging pressure manifest")
+        );
+    }
+
+    #[test]
+    fn blob_pressure_depot_evicts_every_shared_root_as_one_atomic_variant() {
+        // Break caught: depot pressure used to return no candidate after the
+        // ordered whole-variant index had selected an eligible shared variant.
+        let root = BlobTestRoot::new("pressure-depot-whole-variant");
+        let mut services = blob_services(0xb4);
+        let plaintext = vec![0xb4; SELECTED_BLOB_CHUNK_SIZE as usize + 37];
+        let prepared = prepared_blob(&plaintext);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("whole-variant pressure store");
+        let routine_proof = prepare_blob_proof_with_priority(
+            &store,
+            &mut services,
+            &prepared,
+            &plaintext,
+            1,
+            Priority::Routine,
+        );
+        let routine = commit_blob_proof(
+            &store,
+            &services,
+            &routine_proof,
+            b"pressure-variant-routine",
+        )
+        .0
+        .blob()
+        .clone();
+        let priority_proof = prepare_blob_proof_with_priority(
+            &store,
+            &mut services,
+            &prepared,
+            &plaintext,
+            1,
+            Priority::Priority,
+        );
+        let priority = commit_blob_proof(
+            &store,
+            &services,
+            &priority_proof,
+            b"pressure-variant-priority",
+        )
+        .0
+        .blob()
+        .clone();
+        assert_eq!(routine.variant_id, priority.variant_id);
+        let before = store.blob_stats().expect("before whole-variant pressure");
+
+        let equal_priority = store
+            .run_blob_pressure_recovery(
+                pressure::BlobCapacityRecoveryDemand::new(
+                    pressure::BlobCapacityPartition::DepotVariants,
+                    Priority::Priority,
+                    1,
+                )
+                .unwrap(),
+                pressure::BlobPressureRecoveryBudget::new(
+                    MAX_BLOB_PRESSURE_FINAL_ROOT_ROWS * 2,
+                    MAX_BLOB_PRESSURE_FINAL_ROOT_BYTES * 2,
+                    2,
+                    4,
+                    1,
+                )
+                .unwrap(),
+                None,
+            )
+            .expect("equal-priority depot pressure");
+        assert!(equal_priority.evicted_transfer_ids().is_empty());
+        assert_eq!(store.blob_stats().unwrap(), before);
+
+        let recovered = store
+            .run_blob_pressure_recovery(
+                pressure::BlobCapacityRecoveryDemand::new(
+                    pressure::BlobCapacityPartition::DepotVariants,
+                    Priority::Immediate,
+                    1,
+                )
+                .unwrap(),
+                pressure::BlobPressureRecoveryBudget::new(
+                    MAX_BLOB_PRESSURE_FINAL_ROOT_ROWS * 2,
+                    MAX_BLOB_PRESSURE_FINAL_ROOT_BYTES * 2,
+                    2,
+                    4,
+                    1,
+                )
+                .unwrap(),
+                None,
+            )
+            .expect("eligible whole-variant pressure");
+        let mut evicted = recovered.evicted_transfer_ids().to_vec();
+        evicted.sort_unstable();
+        let mut expected = vec![routine.transfer_id, priority.transfer_id];
+        expected.sort_unstable();
+        assert_eq!(evicted, expected);
+        assert_eq!(recovered.recovered_units(), 0);
+        assert!(!recovered.deficit_met());
+        assert!(matches!(
+            store.get_blob(routine.transfer_id),
+            Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+        ));
+        assert!(matches!(
+            store.get_blob(priority.transfer_id),
+            Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+        ));
+        let read = store
+            .database
+            .begin_read()
+            .expect("whole-variant manifest read");
+        assert!(
+            deletion::variant_has_deletion_manifest_read(&read, routine.variant_id)
+                .expect("whole-variant pressure manifest")
+        );
+        drop(read);
+        let committed_manifest = deletion_manifest_for_test(&store, routine.variant_id);
+        assert_eq!(committed_manifest.totals.chunks, 2);
+        let after = store.blob_stats().expect("after whole-variant pressure");
+        assert_eq!(after.lineage_fences, before.lineage_fences);
+        assert_eq!(after.replay_fences, before.replay_fences);
+        assert_eq!(before.publications.checked_sub(after.publications), Some(2));
+        drop(store);
+        let reopened = Store::open_for_mission(&root.database, services.authority)
+            .expect("reopen whole-variant pressure manifest");
+        assert_eq!(
+            deletion_manifest_for_test(&reopened, routine.variant_id),
+            committed_manifest
+        );
+    }
+
+    #[test]
+    fn blob_pressure_manifest_remains_charged_until_physical_finalization() {
+        // Break caught: logical retirement and durable deletion authority must
+        // not release depot admission capacity before physical finalization.
+        let root = BlobTestRoot::new("pressure-depot-admission-recovery");
+        let mut services = blob_services(0xb6);
+        let first_plaintext = vec![0xb6; 512];
+        let first_prepared = prepared_blob(&first_plaintext);
+        let reserved_limit = 153 + 16 + u64::try_from(first_plaintext.len()).unwrap();
+        let store = Store::open_with_limits_and_blob_depot_limits_for_mission(
+            &root.database,
+            StoreLimits::default(),
+            BlobDepotLimits::new(reserved_limit, 1, 1)
+                .expect("one active variant, chunk, and file reservation"),
+            services.authority,
+        )
+        .expect("pressure admission-recovery store");
+        let first_proof = prepare_blob_proof_with_priority(
+            &store,
+            &mut services,
+            &first_prepared,
+            &first_plaintext,
+            1,
+            Priority::Routine,
+        );
+        let first = commit_blob_proof(&store, &services, &first_proof, b"pressure-admission-first")
+            .0
+            .blob()
+            .clone();
+        let recovered = store
+            .run_blob_pressure_recovery(
+                pressure::BlobCapacityRecoveryDemand::new(
+                    pressure::BlobCapacityPartition::DepotVariants,
+                    Priority::Immediate,
+                    1,
+                )
+                .unwrap(),
+                pressure::BlobPressureRecoveryBudget::new(
+                    MAX_BLOB_PRESSURE_FINAL_ROOT_ROWS,
+                    MAX_BLOB_PRESSURE_FINAL_ROOT_BYTES,
+                    1,
+                    2,
+                    1,
+                )
+                .unwrap(),
+                None,
+            )
+            .expect("recover one depot variant");
+        assert!(!recovered.deficit_met());
+        assert_eq!(recovered.recovered_units(), 0);
+        deletion_manifest_for_test(&store, first.variant_id);
+
+        let second_plaintext = vec![0xb7; 512];
+        let second_prepared = prepared_blob(&second_plaintext);
+        let error = finish_variant(
+            &store,
+            &services.publisher,
+            &second_prepared,
+            &second_plaintext,
+            2,
+        )
+        .expect_err("pending physical deletion retains depot capacity charge");
+        assert!(
+            error.contains("durable import rows"),
+            "unexpected retained-charge error: {error}"
+        );
+        let progress = store
+            .run_blob_capacity_gc_for(
+                BlobCapacityGcTarget::Depot,
+                BlobMaintenanceBudget::new(64, 16, 128 * 1024 * 1024)
+                    .expect("physical finalization budget"),
+                None,
+            )
+            .expect("physically finalize pressure deletion");
+        assert_eq!(progress.manifests_finalized, 1);
+        let second = finish_variant(
+            &store,
+            &services.publisher,
+            &second_prepared,
+            &second_plaintext,
+            2,
+        )
+        .expect("physical finalization releases admission capacity");
+        assert_ne!(second.id(), first.blob_id);
+        let read = store
+            .database
+            .begin_read()
+            .expect("finalized manifest read");
+        assert!(
+            !deletion::variant_has_deletion_manifest_read(&read, first.variant_id)
+                .expect("finalized deletion authority")
+        );
+    }
+
+    #[test]
+    fn blob_pressure_expected_only_chunks_release_exactly_at_finalization() {
+        // Break caught: deletion-owned expected rows have no committed files,
+        // but each still occupies one depot chunk slot through finalization.
+        let source_root = BlobTestRoot::new("pressure-expected-only-release-source");
+        let target_root = BlobTestRoot::new("pressure-expected-only-release-target");
+        let mut services = blob_services(0xb8);
+        let source = Store::open_for_mission(&source_root.database, services.authority)
+            .expect("expected-only release source");
+        let plaintext = vec![0xb8; SELECTED_BLOB_CHUNK_SIZE as usize + 1];
+        let prepared = prepared_blob(&plaintext);
+        let proof = prepare_blob_proof_with_priority(
+            &source,
+            &mut services,
+            &prepared,
+            &plaintext,
+            1,
+            Priority::Routine,
+        );
+        let plan = proof
+            .blob
+            .transfer_plan(&proof.manifest_bytes)
+            .expect("expected-only release plan");
+        let chunk_rows = plan.manifest().chunk_count();
+        assert_eq!(chunk_rows, 2);
+        let target = Store::open_with_limits_and_blob_depot_limits_for_mission(
+            &target_root.database,
+            StoreLimits::default(),
+            BlobDepotLimits::new(DEFAULT_MAX_BLOB_DEPOT_BYTES, chunk_rows, 2)
+                .expect("expected-only release depot limits"),
+            services.authority,
+        )
+        .expect("expected-only release target");
+        let policy = target
+            .control_policy_snapshot()
+            .expect("expected-only release policy");
+        let transfer = BlobTransferId::new(proof.blob.envelope_id());
+        target
+            .stage_verified_blob_source_with_policy(&policy, &proof.blob, &proof.sealed, &plan)
+            .expect("stage expected-only release source");
+        let variant = proof.completion.variant_id();
+        for index in 0..chunk_rows {
+            assert!(!target_root.chunk_path(variant, index).exists());
+        }
+        let before = {
+            let read = target
+                .database
+                .begin_read()
+                .expect("read active chunk usage");
+            depot::depot_admission_usage_read(&read).expect("active chunk usage")
+        };
+        assert_eq!(before.chunks, chunk_rows);
+
+        let recovered = target
+            .run_blob_pressure_recovery(
+                pressure::BlobCapacityRecoveryDemand::new(
+                    pressure::BlobCapacityPartition::DepotChunks,
+                    Priority::Immediate,
+                    chunk_rows,
+                )
+                .expect("expected-only chunk demand"),
+                pressure::BlobPressureRecoveryBudget::new(
+                    MAX_BLOB_PRESSURE_FINAL_ROOT_ROWS,
+                    MAX_BLOB_PRESSURE_FINAL_ROOT_BYTES,
+                    1,
+                    1,
+                    1,
+                )
+                .expect("expected-only pressure budget"),
+                None,
+            )
+            .expect("retire expected-only source");
+        assert_eq!(recovered.evicted_transfer_ids(), &[transfer]);
+        assert_eq!(recovered.recovered_units(), 0);
+        assert!(!recovered.deficit_met());
+        let during = {
+            let read = target
+                .database
+                .begin_read()
+                .expect("read deletion-owned chunk usage");
+            depot::depot_admission_usage_read(&read).expect("deletion-owned chunk usage")
+        };
+        assert_eq!(during.chunks, chunk_rows);
+        let manifest = deletion_manifest_for_test(&target, variant);
+        assert_eq!(manifest.totals.chunks, chunk_rows);
+        assert_eq!(manifest.totals.charged_files, 0);
+
+        for _ in 0..chunk_rows + 2 {
+            run_physical_deletion_turn(&target);
+        }
+        let after = {
+            let read = target
+                .database
+                .begin_read()
+                .expect("read finalized chunk usage");
+            depot::depot_admission_usage_read(&read).expect("finalized chunk usage")
+        };
+        assert_eq!(before.chunks.checked_sub(after.chunks), Some(chunk_rows));
+        let read = target
+            .database
+            .begin_read()
+            .expect("read finalized expected-only manifest");
+        assert!(
+            !deletion::variant_has_deletion_manifest_read(&read, variant)
+                .expect("expected-only manifest finalized")
+        );
+    }
+
+    #[test]
+    fn blob_pressure_expected_only_finalization_failure_retains_chunk_charge() {
+        // Break caught: an atomic finalization failure must not make an
+        // expected-only deletion row disappear from depot admission usage.
+        let source_root = BlobTestRoot::new("pressure-expected-only-fault-source");
+        let target_root = BlobTestRoot::new("pressure-expected-only-fault-target");
+        let mut services = blob_services(0xb9);
+        let source = Store::open_for_mission(&source_root.database, services.authority)
+            .expect("expected-only fault source");
+        let first_plaintext = b"expected-only finalization fault".to_vec();
+        let first_prepared = prepared_blob(&first_plaintext);
+        let first = prepare_blob_proof_with_priority(
+            &source,
+            &mut services,
+            &first_prepared,
+            &first_plaintext,
+            1,
+            Priority::Routine,
+        );
+        let first_plan = first
+            .blob
+            .transfer_plan(&first.manifest_bytes)
+            .expect("expected-only fault plan");
+        assert_eq!(first_plan.manifest().chunk_count(), 1);
+        let target = Store::open_with_limits_and_blob_depot_limits_for_mission(
+            &target_root.database,
+            StoreLimits::default(),
+            BlobDepotLimits::new(DEFAULT_MAX_BLOB_DEPOT_BYTES, 1, 2)
+                .expect("expected-only fault depot limits"),
+            services.authority,
+        )
+        .expect("expected-only fault target");
+        let policy = target
+            .control_policy_snapshot()
+            .expect("expected-only fault policy");
+        target
+            .stage_verified_blob_source_with_policy(
+                &policy,
+                &first.blob,
+                &first.sealed,
+                &first_plan,
+            )
+            .expect("stage expected-only fault source");
+        let first_variant = first.completion.variant_id();
+        let retired = target
+            .run_blob_pressure_recovery(
+                pressure::BlobCapacityRecoveryDemand::new(
+                    pressure::BlobCapacityPartition::DepotChunks,
+                    Priority::Immediate,
+                    1,
+                )
+                .expect("expected-only fault demand"),
+                pressure::BlobPressureRecoveryBudget::new(
+                    MAX_BLOB_PRESSURE_FINAL_ROOT_ROWS,
+                    MAX_BLOB_PRESSURE_FINAL_ROOT_BYTES,
+                    1,
+                    1,
+                    1,
+                )
+                .expect("expected-only fault pressure budget"),
+                None,
+            )
+            .expect("retire expected-only fault source");
+        assert_eq!(retired.recovered_units(), 0);
+        assert!(!retired.deficit_met());
+
+        run_physical_deletion_turn(&target);
+        run_physical_deletion_turn(&target);
+        let variant_directory = target_root
+            .depot()
+            .join(test_hex32(first_variant.as_bytes()));
+        assert!(
+            !variant_directory.exists(),
+            "expected-only directory is durably absent before finalization"
+        );
+        deletion::set_manifest_finalization_fault_ordinal_for_test(Some(1));
+        let failure = run_physical_deletion_turn_result(&target);
+        deletion::set_manifest_finalization_fault_ordinal_for_test(None);
+        assert!(matches!(
+            failure,
+            Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
+                "injected Blob manifest finalization mutation failure"
+            )))
+        ));
+        deletion_manifest_for_test(&target, first_variant);
+        let retained = {
+            let read = target
+                .database
+                .begin_read()
+                .expect("read failed-finalization chunk usage");
+            depot::depot_admission_usage_read(&read).expect("failed-finalization chunk usage")
+        };
+        assert_eq!(retained.chunks, 1);
+
+        let second_plaintext = b"second expected-only source".to_vec();
+        let second_prepared = prepared_blob(&second_plaintext);
+        let second = prepare_blob_proof_with_priority(
+            &source,
+            &mut services,
+            &second_prepared,
+            &second_plaintext,
+            1,
+            Priority::Immediate,
+        );
+        let second_plan = second
+            .blob
+            .transfer_plan(&second.manifest_bytes)
+            .expect("second expected-only plan");
+        let error = target
+            .stage_verified_blob_source_with_policy(
+                &policy,
+                &second.blob,
+                &second.sealed,
+                &second_plan,
+            )
+            .expect_err("failed finalization retains the only chunk slot");
+        assert!(
+            matches!(
+                error,
+                StoreError::Blob(BlobStoreError::DepotChunkLimitExceeded {
+                    current: 1,
+                    limit: 1,
+                })
+            ),
+            "unexpected retained-charge error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn blob_pressure_does_not_skip_an_over_budget_highest_ranked_unit() {
+        // Break caught: substituting a cheaper lower-ranked publication would
+        // violate deterministic global-first selection under bounded work.
+        let root = BlobTestRoot::new("pressure-no-skip-over-budget");
+        let mut services = blob_services(0xb5);
+        let shared_plaintext = b"oldest shared publication needs two root inspections".to_vec();
+        let shared_prepared = prepared_blob(&shared_plaintext);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("pressure no-skip store");
+        let oldest_proof = prepare_blob_proof_with_priority(
+            &store,
+            &mut services,
+            &shared_prepared,
+            &shared_plaintext,
+            1,
+            Priority::Routine,
+        );
+        let oldest =
+            commit_blob_proof(&store, &services, &oldest_proof, b"pressure-no-skip-oldest")
+                .0
+                .blob()
+                .clone();
+        let protected_proof = prepare_blob_proof_with_priority(
+            &store,
+            &mut services,
+            &shared_prepared,
+            &shared_plaintext,
+            1,
+            Priority::Immediate,
+        );
+        let protected = commit_blob_proof(
+            &store,
+            &services,
+            &protected_proof,
+            b"pressure-no-skip-shared",
+        )
+        .0
+        .blob()
+        .clone();
+        assert_eq!(oldest.variant_id, protected.variant_id);
+        let lower_plaintext = b"later standalone publication would fit the root budget".to_vec();
+        let lower_prepared = prepared_blob(&lower_plaintext);
+        let lower_proof = prepare_blob_proof_with_priority(
+            &store,
+            &mut services,
+            &lower_prepared,
+            &lower_plaintext,
+            1,
+            Priority::Routine,
+        );
+        let lower = commit_blob_proof(&store, &services, &lower_proof, b"pressure-no-skip-lower")
+            .0
+            .blob()
+            .clone();
+        let before = blob_complete_logical_digest(&store);
+
+        let recovery = store
+            .run_blob_pressure_recovery(
+                pressure::BlobCapacityRecoveryDemand::new(
+                    pressure::BlobCapacityPartition::AggregateItems,
+                    Priority::Immediate,
+                    1,
+                )
+                .unwrap(),
+                pressure::BlobPressureRecoveryBudget::new(
+                    MAX_BLOB_PRESSURE_FINAL_ROOT_ROWS,
+                    MAX_BLOB_PRESSURE_FINAL_ROOT_BYTES,
+                    1,
+                    4,
+                    1,
+                )
+                .unwrap(),
+                None,
+            )
+            .expect("bounded no-skip pressure attempt");
+        assert!(recovery.evicted_transfer_ids().is_empty());
+        assert_eq!(
+            recovery.rows_examined(),
+            5,
+            "two selection rows, the selected publication, and root plus-one proof"
+        );
+        assert_eq!(blob_complete_logical_digest(&store), before);
+        assert!(store.get_blob(oldest.transfer_id).unwrap().is_some());
+        assert!(store.get_blob(lower.transfer_id).unwrap().is_some());
+    }
+
+    #[test]
+    fn blob_pressure_whole_variant_rolls_back_when_manifest_rows_do_not_fit() {
+        // Hand-derived lower bound: the selected two-chunk final variant needs
+        // two active-chunk reads, two removals, two deletion-row inserts, one
+        // manifest insert, and twelve accounting-row updates in addition to
+        // selection and the publication-retirement unit.
+        let root = BlobTestRoot::new("pressure-manifest-row-bound");
+        let mut services = blob_services(0xc1);
+        let plaintext = vec![0xc1; SELECTED_BLOB_CHUNK_SIZE as usize + 1];
+        let prepared = prepared_blob(&plaintext);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("manifest row-bound store");
+        let proof = prepare_blob_proof_with_priority(
+            &store,
+            &mut services,
+            &prepared,
+            &plaintext,
+            1,
+            Priority::Routine,
+        );
+        let stored = commit_blob_proof(&store, &services, &proof, b"manifest-row-bound")
+            .0
+            .blob()
+            .clone();
+        let before = blob_complete_logical_digest(&store);
+
+        let byte_limited = store
+            .run_blob_pressure_recovery(
+                pressure::BlobCapacityRecoveryDemand::new(
+                    pressure::BlobCapacityPartition::DepotVariants,
+                    Priority::Immediate,
+                    1,
+                )
+                .unwrap(),
+                pressure::BlobPressureRecoveryBudget::new(u64::MAX, 200, 1, 1, 1).unwrap(),
+                None,
+            )
+            .expect("bounded byte refusal");
+        assert!(byte_limited.evicted_transfer_ids().is_empty());
+        assert!(byte_limited.bytes_examined() <= 200);
+        assert_eq!(blob_complete_logical_digest(&store), before);
+
+        let recovery = store
+            .run_blob_pressure_recovery(
+                pressure::BlobCapacityRecoveryDemand::new(
+                    pressure::BlobCapacityPartition::DepotVariants,
+                    Priority::Immediate,
+                    1,
+                )
+                .unwrap(),
+                pressure::BlobPressureRecoveryBudget::new(45, u64::MAX, 1, 1, 1).unwrap(),
+                None,
+            )
+            .expect("bounded manifest refusal");
+        assert!(recovery.evicted_transfer_ids().is_empty());
+        assert!(recovery.rows_examined() <= 45);
+        assert_eq!(blob_complete_logical_digest(&store), before);
+        assert!(store.get_blob(stored.transfer_id).unwrap().is_some());
+        let read = store.database.begin_read().unwrap();
+        assert!(!deletion::variant_has_deletion_manifest_read(&read, stored.variant_id).unwrap());
+    }
+
+    #[test]
+    fn blob_pressure_operation_plus_one_is_charged_before_atomic_refusal() {
+        let root = BlobTestRoot::new("pressure-operation-plus-one");
+        let mut services = blob_services(0xc2);
+        let plaintext = b"one publication with two operation aliases".to_vec();
+        let prepared = prepared_blob(&plaintext);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("operation-bound store");
+        let proof = prepare_blob_proof_with_priority(
+            &store,
+            &mut services,
+            &prepared,
+            &plaintext,
+            1,
+            Priority::Routine,
+        );
+        let stored = commit_blob_proof(&store, &services, &proof, b"pressure-operation-first")
+            .0
+            .blob()
+            .clone();
+        let second_key = b"pressure-operation-second";
+        let write = store.database.begin_write().unwrap();
+        let encoded = lifecycle::active_operation_record(
+            &write,
+            &encode_blob_operation_record(BlobOperationRecord {
+                transfer_id: stored.transfer_id,
+                intent_digest: [0xc2; 32],
+            }),
+        )
+        .unwrap();
+        write
+            .open_table(BLOB_OPERATIONS)
+            .unwrap()
+            .insert(second_key.as_slice(), encoded.as_slice())
+            .unwrap();
+        lifecycle::insert_operation_owner(&write, stored.transfer_id, second_key).unwrap();
+        let mut metadata = write.open_table(METADATA).unwrap();
+        let operation_count = metadata.get(BLOB_OPERATION_COUNT).unwrap().unwrap().value();
+        let operation_bytes = metadata
+            .get(BLOB_OPERATION_TOTAL_BYTES)
+            .unwrap()
+            .unwrap()
+            .value();
+        metadata
+            .insert(BLOB_OPERATION_COUNT, operation_count + 1)
+            .unwrap();
+        metadata
+            .insert(
+                BLOB_OPERATION_TOTAL_BYTES,
+                operation_bytes + u64::try_from(second_key.len() + encoded.len()).unwrap(),
+            )
+            .unwrap();
+        drop(metadata);
+        write.commit().unwrap();
+        let before = blob_complete_logical_digest(&store);
+
+        let recovery = store
+            .run_blob_pressure_recovery(
+                pressure::BlobCapacityRecoveryDemand::new(
+                    pressure::BlobCapacityPartition::AggregateItems,
+                    Priority::Immediate,
+                    1,
+                )
+                .unwrap(),
+                pressure::BlobPressureRecoveryBudget::new(
+                    MAX_BLOB_PRESSURE_FINAL_ROOT_ROWS,
+                    MAX_BLOB_PRESSURE_FINAL_ROOT_BYTES,
+                    1,
+                    1,
+                    1,
+                )
+                .unwrap(),
+                None,
+            )
+            .expect("operation-budget refusal");
+        assert!(recovery.evicted_transfer_ids().is_empty());
+        assert!(recovery.rows_examined() > 3);
+        assert!(recovery.rows_examined() <= MAX_BLOB_PRESSURE_FINAL_ROOT_ROWS);
+        assert_eq!(blob_complete_logical_digest(&store), before);
+        assert!(store.get_blob(stored.transfer_id).unwrap().is_some());
+    }
+
+    #[test]
+    fn blob_pressure_revalidates_new_root_after_ordered_selection() {
+        let root = BlobTestRoot::new("pressure-root-race");
+        let mut services = blob_services(0xc4);
+        let plaintext = b"shared variant gains a protected root after selection".to_vec();
+        let prepared = prepared_blob(&plaintext);
+        let store =
+            Store::open_for_mission(&root.database, services.authority).expect("root-race store");
+        let low_proof = prepare_blob_proof_with_priority(
+            &store,
+            &mut services,
+            &prepared,
+            &plaintext,
+            1,
+            Priority::Routine,
+        );
+        let low = commit_blob_proof(&store, &services, &low_proof, b"pressure-root-race-low")
+            .0
+            .blob()
+            .clone();
+        let demand = pressure::BlobCapacityRecoveryDemand::new(
+            pressure::BlobCapacityPartition::DepotVariants,
+            Priority::Immediate,
+            1,
+        )
+        .unwrap();
+        let budget = pressure::BlobPressureRecoveryBudget::new(
+            MAX_BLOB_PRESSURE_FINAL_ROOT_ROWS * 2,
+            MAX_BLOB_PRESSURE_FINAL_ROOT_BYTES * 2,
+            2,
+            4,
+            1,
+        )
+        .unwrap();
+        let read = store.database.begin_read().unwrap();
+        let selection = pressure::select_pressure_candidate_read(&read, demand, budget).unwrap();
+        drop(read);
+        assert_eq!(
+            selection.candidate(),
+            Some(pressure::PressureCandidate::Variant(low.variant_id))
+        );
+
+        let protected_proof = prepare_blob_proof_with_priority(
+            &store,
+            &mut services,
+            &prepared,
+            &plaintext,
+            1,
+            Priority::Immediate,
+        );
+        let protected = commit_blob_proof(
+            &store,
+            &services,
+            &protected_proof,
+            b"pressure-root-race-protected",
+        )
+        .0
+        .blob()
+        .clone();
+        assert_eq!(protected.variant_id, low.variant_id);
+        let before = blob_complete_logical_digest(&store);
+        assert_blob_schema_invariant(
+            &store
+                .run_blob_variant_pressure_recovery(low.variant_id, demand, budget, selection, None)
+                .expect_err("new protected root invalidates stale selection"),
+        );
+        assert_eq!(blob_complete_logical_digest(&store), before);
+        assert!(store.get_blob(low.transfer_id).unwrap().is_some());
+        assert!(store.get_blob(protected.transfer_id).unwrap().is_some());
+    }
+
+    #[test]
+    fn blob_real_admission_reports_item_before_byte_and_preserves_acceptance_order() {
+        let root = BlobTestRoot::new("pressure-real-first-partition");
+        let mut services = blob_services(0xc3);
+        let first_plaintext = b"first valid admission fills both tight dimensions".to_vec();
+        let first_prepared = prepared_blob(&first_plaintext);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("first-partition seed store");
+        publish_blob(
+            &store,
+            &mut services,
+            &first_prepared,
+            &first_plaintext,
+            1,
+            b"pressure-first-partition-seed",
+        );
+        let second_plaintext = b"second valid admission exceeds items and bytes".to_vec();
+        let second_prepared = prepared_blob(&second_plaintext);
+        let second = prepare_blob_proof_with_priority(
+            &store,
+            &mut services,
+            &second_prepared,
+            &second_plaintext,
+            1,
+            Priority::Immediate,
+        );
+        let usage = store.aggregate_usage().unwrap();
+        let (_, byte_reserve) = custody::custody_emergency_reserve(StoreLimits::default());
+        let marker_before = store.blob_stats().unwrap().last_acceptance_marker;
+        drop(store);
+
+        let limits = StoreLimits::new(
+            MAX_CONTROL_ITEMS + CUSTODY_EMERGENCY_ITEM_RESERVE + 2,
+            usage.payload_bytes.checked_add(byte_reserve).unwrap(),
+        )
+        .unwrap();
+        let tight = Store::open_with_limits_for_mission(&root.database, limits, services.authority)
+            .expect("simultaneously tight admission store");
+        let second_completion = tight
+            .blob_depot()
+            .and_then(|mut depot| depot.completed_blob(&second.blob, &second.manifest_bytes))
+            .expect("rebind rejected completion to reopened store");
+        let operation = BlobOperationKey::new(b"pressure-first-partition-rejected".to_vec())
+            .expect("rejected operation key");
+        let intent = BlobPublicationIntent::new(
+            services.publisher.identity(),
+            blob_topic(),
+            blob_scope(),
+            second.blob.header().priority,
+            second.blob.blob_id(),
+        )
+        .expect("rejected publication intent");
+        let request = BlobOperationRequest::new(&operation, &intent);
+        let rejected = tight
+            .commit_reserved_blob_once_with_policy(
+                &second.policy,
+                &request,
+                &second.reservation,
+                &second.blob,
+                &second.sealed,
+                &second_completion,
+            )
+            .expect_err("simultaneous item/byte rejection");
+        assert!(
+            matches!(
+                rejected,
+                StoreError::ItemLimitExceeded {
+                    current: 2,
+                    limit: 2,
+                }
+            ),
+            "unexpected simultaneous rejection: {rejected:?}"
+        );
+        assert_eq!(
+            tight.blob_stats().unwrap().last_acceptance_marker,
+            marker_before
+        );
+        let demand = pressure::capacity_recovery_demand(
+            &rejected,
+            pressure::BlobCapacityRecoveryContext::new(Priority::Immediate),
+        )
+        .unwrap()
+        .expect("actual capacity rejection maps to pressure demand");
+        assert_eq!(
+            demand.partition(),
+            pressure::BlobCapacityPartition::AggregateItems
+        );
+        assert_eq!(demand.deficit(), 1);
     }
 }

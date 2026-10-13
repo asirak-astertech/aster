@@ -141,7 +141,6 @@ pub enum ApplicationErrorKind {
 pub struct ApplicationError {
     kind: ApplicationErrorKind,
     operation: &'static str,
-    cause: ApplicationErrorCause,
 }
 
 impl fmt::Debug for ApplicationError {
@@ -162,13 +161,6 @@ impl PartialEq for ApplicationError {
 
 impl Eq for ApplicationError {}
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-enum ApplicationErrorCause {
-    #[default]
-    None,
-    RecoverableBlobCapacity(aster_redb_store::BlobCapacityGcTarget),
-}
-
 impl ApplicationError {
     /// Stable category suitable for application control flow.
     pub const fn kind(&self) -> ApplicationErrorKind {
@@ -181,38 +173,7 @@ impl ApplicationError {
     }
 
     const fn new(kind: ApplicationErrorKind, operation: &'static str) -> Self {
-        Self {
-            kind,
-            operation,
-            cause: ApplicationErrorCause::None,
-        }
-    }
-
-    pub(crate) const fn recoverable_blob_capacity(
-        operation: &'static str,
-        target: aster_redb_store::BlobCapacityGcTarget,
-    ) -> Self {
-        Self {
-            kind: ApplicationErrorKind::ResourceLimit,
-            operation,
-            cause: ApplicationErrorCause::RecoverableBlobCapacity(target),
-        }
-    }
-
-    pub(crate) const fn is_recoverable_blob_capacity(&self) -> bool {
-        matches!(
-            self.cause,
-            ApplicationErrorCause::RecoverableBlobCapacity(_)
-        )
-    }
-
-    pub(crate) const fn recoverable_blob_capacity_target(
-        &self,
-    ) -> Option<aster_redb_store::BlobCapacityGcTarget> {
-        match self.cause {
-            ApplicationErrorCause::RecoverableBlobCapacity(target) => Some(target),
-            ApplicationErrorCause::None => None,
-        }
+        Self { kind, operation }
     }
 }
 
@@ -2941,34 +2902,15 @@ mod tests {
     static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
 
     #[test]
-    fn application_error_public_projection_omits_private_capacity_cause() {
+    fn application_error_public_projection_is_sanitized() {
         let ordinary = ApplicationError::new(
             ApplicationErrorKind::ResourceLimit,
             "Blob publication admission",
         );
         assert_eq!(ordinary.kind(), ApplicationErrorKind::ResourceLimit);
         assert_eq!(ordinary.operation(), "Blob publication admission");
-        assert!(!ordinary.is_recoverable_blob_capacity());
-
-        for target in [
-            aster_redb_store::BlobCapacityGcTarget::Depot,
-            aster_redb_store::BlobCapacityGcTarget::Operation,
-            aster_redb_store::BlobCapacityGcTarget::PublicationLifecycle,
-        ] {
-            let recoverable =
-                ApplicationError::recoverable_blob_capacity("Blob publication admission", target);
-
-            assert_eq!(recoverable.kind(), ApplicationErrorKind::ResourceLimit);
-            assert_eq!(recoverable.operation(), "Blob publication admission");
-            assert_eq!(ordinary, recoverable);
-            assert_eq!(format!("{ordinary:?}"), format!("{recoverable:?}"));
-            assert_eq!(ordinary.to_string(), recoverable.to_string());
-            assert!(std::error::Error::source(&recoverable).is_none());
-            assert!(!format!("{recoverable:?}").contains("RecoverableBlobCapacity"));
-            assert!(!format!("{recoverable:?}").contains("cause"));
-            assert!(recoverable.is_recoverable_blob_capacity());
-            assert_eq!(recoverable.recoverable_blob_capacity_target(), Some(target));
-        }
+        assert!(std::error::Error::source(&ordinary).is_none());
+        assert!(!format!("{ordinary:?}").contains("cause"));
     }
 
     #[test]

@@ -56,22 +56,23 @@ use aster_negentropy::{
 };
 use aster_profile::{InventorySnapshot, ItemId};
 use aster_redb_store::{
-    ApplyOutcome, BlobCarrierAppendOutcome, BlobCarrierCommitOutcome, BlobCarrierFetchCursor,
-    BlobCarrierObjectId, BlobCarrierPrefixStatus, BlobDepotCompletion, BlobDepotLimits,
-    BlobLeaseLimits, BlobLifecycleLimits, BlobMaintenanceBudget, BlobMaintenanceProgress,
-    BlobSourceProjection, BlobSourceRetention, BlobSourceStageOutcome, BlobStoreError,
-    BlobTransferId, BlobVariantId, ControlOutcome, ControlPolicySnapshot, ControlRejectionReason,
-    ControlTransferId, CustodyObjectKey, CustodyPeerApplyDisposition, CustodyPeerApplyEvidence,
-    CustodyPeerSelectorRevision, CustodyPolicyRevision, CustodyPressureDemand, CustodyQuota,
-    CustodyReconciliationEvidence, CustodyReconciliationSelection, CustodySendAuthorization,
-    CustodySenderProjection, CustodyStoreError, CustodyUsage, EventOnceOutcome,
-    EventOperationAuditProgress, EventOperationAuditState, EventOperationAuditStatus,
-    EventOperationKey, EventOperationLimits, EventOperationRequest, EventOperationResolution,
-    EventPageAttemptCursor, EventPageAttemptCursorUpdate, EventPublicationIntent,
-    EventPublicationSpec, EventReplicationPolicySnapshot, EventSemanticId, EventSubscriptionKey,
-    EventSubscriptionMode, EventSubscriptionSpec, EventTransferId, LocalCustodyCheckpoint,
-    MAX_BLOB_NETWORK_RANGE_BYTES, MAX_BLOB_NETWORK_SOURCE_BYTES, MAX_BLOB_NETWORK_STAGING_ROWS,
-    MAX_CUSTODY_PAGE, MAX_CUSTODY_RETIREMENTS, MAX_EVENT_PAGE, MAX_MUTABLE_TRANSFER_CURSOR_PEERS,
+    ApplyOutcome, BlobCapacityGcTarget, BlobCarrierAppendOutcome, BlobCarrierCommitOutcome,
+    BlobCarrierFetchCursor, BlobCarrierObjectId, BlobCarrierPrefixStatus, BlobDepotCompletion,
+    BlobDepotLimits, BlobLeaseLimits, BlobLifecycleLimits, BlobMaintenanceBudget,
+    BlobMaintenanceProgress, BlobSourceProjection, BlobSourceRetention, BlobSourceStageOutcome,
+    BlobStoreError, BlobTransferId, BlobVariantId, ControlOutcome, ControlPolicySnapshot,
+    ControlRejectionReason, ControlTransferId, CustodyObjectKey, CustodyPeerApplyDisposition,
+    CustodyPeerApplyEvidence, CustodyPeerSelectorRevision, CustodyPolicyRevision,
+    CustodyPressureDemand, CustodyQuota, CustodyReconciliationEvidence,
+    CustodyReconciliationSelection, CustodySendAuthorization, CustodySenderProjection,
+    CustodyStoreError, CustodyUsage, EventOnceOutcome, EventOperationAuditProgress,
+    EventOperationAuditState, EventOperationAuditStatus, EventOperationKey, EventOperationLimits,
+    EventOperationRequest, EventOperationResolution, EventPageAttemptCursor,
+    EventPageAttemptCursorUpdate, EventPublicationIntent, EventPublicationSpec,
+    EventReplicationPolicySnapshot, EventSemanticId, EventSubscriptionKey, EventSubscriptionMode,
+    EventSubscriptionSpec, EventTransferId, LocalCustodyCheckpoint, MAX_BLOB_NETWORK_RANGE_BYTES,
+    MAX_BLOB_NETWORK_SOURCE_BYTES, MAX_BLOB_NETWORK_STAGING_ROWS, MAX_CUSTODY_PAGE,
+    MAX_CUSTODY_RETIREMENTS, MAX_EVENT_PAGE, MAX_MUTABLE_TRANSFER_CURSOR_PEERS,
     MAX_NETWORK_BLOB_BYTES, MAX_NETWORK_BLOB_CHUNKS, MAX_ROUTE_CACHE_ITEMS,
     MutableTransferCursorClass, MutableTransferCursorMode, NumberedEventOperationRequest,
     NumberedEventPublishOutcome, RecordSenderProjection, RecordTransferId, RejectedControl,
@@ -7289,6 +7290,35 @@ enum TestBlobContactFault {
     AppendCoherence = 9,
     CommitLeaseCapacity = 10,
     RangeLeaseCapacity = 11,
+    AppendCapacity = 12,
+    HoldPromotion = 13,
+    StageRetryCoherence = 14,
+    AppendRetryCoherence = 15,
+    PromotionRetryCoherence = 16,
+    StageCapacityThenRetryCoherence = 17,
+    AppendCapacityThenRetryCoherence = 18,
+    PromotionCapacityThenRetryCoherence = 19,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TestBlobAdmissionTrace {
+    Stage(BlobTransferId),
+    Append {
+        source: BlobTransferId,
+        object: BlobCarrierObjectId,
+        total_len: u64,
+        offset: u64,
+        bytes_sha256: [u8; 32],
+    },
+    Commit {
+        source: BlobTransferId,
+        object: BlobCarrierObjectId,
+    },
+    Promotion(BlobTransferId),
+    RoutineCleanupComplete,
+    PressureComplete,
+    CacheReconciled,
 }
 
 #[cfg(test)]
@@ -7313,7 +7343,37 @@ impl TestBlobContactFaultState {
         self.fault.load(Ordering::Acquire) == fault as u8
     }
 
+    fn exhausted(&self) -> bool {
+        self.fault.load(Ordering::Acquire) == 0
+    }
+
     fn fire(&self, fault: TestBlobContactFault) -> bool {
+        let retry = match fault {
+            TestBlobContactFault::StageCapacityThenRetryCoherence => {
+                Some(TestBlobContactFault::StageRetryCoherence)
+            }
+            TestBlobContactFault::AppendCapacityThenRetryCoherence => {
+                Some(TestBlobContactFault::AppendRetryCoherence)
+            }
+            TestBlobContactFault::PromotionCapacityThenRetryCoherence => {
+                Some(TestBlobContactFault::PromotionRetryCoherence)
+            }
+            _ => None,
+        };
+        if let Some(retry) = retry
+            && self
+                .fault
+                .compare_exchange(
+                    fault as u8,
+                    retry as u8,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+        {
+            self.fired.store(true, Ordering::Release);
+            return true;
+        }
         if self
             .fault
             .compare_exchange(fault as u8, 0, Ordering::AcqRel, Ordering::Acquire)
@@ -7388,6 +7448,18 @@ pub(crate) struct AuthenticatedEventRouteCache {
     #[cfg(test)]
     blob_range_source_authentications: AtomicU64,
     #[cfg(test)]
+    blob_capacity_recovery_attempts: AtomicU64,
+    #[cfg(test)]
+    blob_stage_admission_attempts: AtomicU64,
+    #[cfg(test)]
+    blob_carrier_append_attempts: AtomicU64,
+    #[cfg(test)]
+    blob_carrier_commit_attempts: AtomicU64,
+    #[cfg(test)]
+    blob_promotion_attempts: AtomicU64,
+    #[cfg(test)]
+    blob_admission_trace: StdMutex<Vec<TestBlobAdmissionTrace>>,
+    #[cfg(test)]
     blob_contact_fault: Option<Arc<TestBlobContactFaultState>>,
 }
 
@@ -7428,6 +7500,18 @@ impl AuthenticatedEventRouteCache {
             blob_range_depot_rechecks: AtomicU64::new(0),
             #[cfg(test)]
             blob_range_source_authentications: AtomicU64::new(0),
+            #[cfg(test)]
+            blob_capacity_recovery_attempts: AtomicU64::new(0),
+            #[cfg(test)]
+            blob_stage_admission_attempts: AtomicU64::new(0),
+            #[cfg(test)]
+            blob_carrier_append_attempts: AtomicU64::new(0),
+            #[cfg(test)]
+            blob_carrier_commit_attempts: AtomicU64::new(0),
+            #[cfg(test)]
+            blob_promotion_attempts: AtomicU64::new(0),
+            #[cfg(test)]
+            blob_admission_trace: StdMutex::new(Vec::new()),
             #[cfg(test)]
             blob_contact_fault: TEST_BLOB_CONTACT_FAULTS
                 .lock()
@@ -7934,6 +8018,58 @@ impl AuthenticatedEventRouteCache {
         }
     }
 
+    fn remove_evicted_blobs(
+        &self,
+        verifier: &ReferenceEnvelopeSealer,
+        transfer_ids: &[BlobTransferId],
+        _lifecycle: &std::sync::MutexGuard<'_, ()>,
+    ) -> Result<(), NodeError> {
+        let mut inner = self.inner.write().map_err(|_| {
+            NodeError::Protocol("authenticated Event route cache lock is poisoned".into())
+        })?;
+        if inner.verifier_identity != verifier.identity()
+            || inner.mission_authority != verifier.mission_authority_id()
+        {
+            return Err(NodeError::Protocol(
+                "authenticated Event route cache belongs to another verifier".into(),
+            ));
+        }
+        let mut exact = BTreeSet::new();
+        for transfer_id in transfer_ids {
+            if !exact.insert(*transfer_id) {
+                return Err(NodeError::Protocol(
+                    "Blob pressure recovery returned a duplicate transfer identity".into(),
+                ));
+            }
+            if let Some(claim) = inner.blob_claims.get(transfer_id)
+                && (claim.transfer_id != *transfer_id
+                    || claim.mission_authority != inner.mission_authority)
+            {
+                return Err(NodeError::Protocol(
+                    "evicted Blob cache key conflicts with its authenticated claim".into(),
+                ));
+            }
+            if let Some(memo) = inner.pending_blob_completions.get(transfer_id) {
+                let claim = inner.blob_claims.get(transfer_id).ok_or_else(|| {
+                    NodeError::Protocol(
+                        "evicted Blob completion memo lacks its authenticated claim".into(),
+                    )
+                })?;
+                if !memo.matches_claim(claim) {
+                    return Err(NodeError::Protocol(
+                        "evicted Blob completion memo conflicts with its authenticated claim"
+                            .into(),
+                    ));
+                }
+            }
+        }
+        for transfer_id in exact {
+            inner.blob_claims.remove(&transfer_id);
+            inner.pending_blob_completions.remove(&transfer_id);
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     fn blob_claim_count(&self) -> usize {
         self.inner
@@ -7941,6 +8077,15 @@ impl AuthenticatedEventRouteCache {
             .expect("authenticated Blob route cache test lock")
             .blob_claims
             .len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_blob_claim_for_test(&self, transfer_id: BlobTransferId) -> bool {
+        self.inner
+            .read()
+            .expect("authenticated Blob route cache test lock")
+            .blob_claims
+            .contains_key(&transfer_id)
     }
 
     pub(crate) fn is_current_state_sender_projection(
@@ -8282,6 +8427,76 @@ impl AuthenticatedEventRouteCache {
         if let Some(state) = self.blob_contact_fault.as_ref() {
             state.record_result_frame();
         }
+    }
+
+    #[cfg(test)]
+    fn record_blob_capacity_recovery_attempt(&self) {
+        self.blob_capacity_recovery_attempts
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn blob_capacity_recovery_attempts(&self) -> u64 {
+        self.blob_capacity_recovery_attempts.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn record_blob_stage_admission_attempt(&self) {
+        self.blob_stage_admission_attempts
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn blob_stage_admission_attempts(&self) -> u64 {
+        self.blob_stage_admission_attempts.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn record_blob_carrier_append_attempt(&self) {
+        self.blob_carrier_append_attempts
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn blob_carrier_append_attempts(&self) -> u64 {
+        self.blob_carrier_append_attempts.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn record_blob_carrier_commit_attempt(&self) {
+        self.blob_carrier_commit_attempts
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn blob_carrier_commit_attempts(&self) -> u64 {
+        self.blob_carrier_commit_attempts.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn record_blob_promotion_attempt(&self) {
+        self.blob_promotion_attempts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn blob_promotion_attempts(&self) -> u64 {
+        self.blob_promotion_attempts.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn record_blob_admission_trace(&self, step: TestBlobAdmissionTrace) {
+        self.blob_admission_trace
+            .lock()
+            .expect("test Blob admission trace lock")
+            .push(step);
+    }
+
+    #[cfg(test)]
+    fn blob_admission_trace(&self) -> Vec<TestBlobAdmissionTrace> {
+        self.blob_admission_trace
+            .lock()
+            .expect("test Blob admission trace lock")
+            .clone()
     }
 }
 
@@ -11893,8 +12108,15 @@ fn accept_received_mutable(
                 ));
             }
             let cache = contact_mutable_route_cache(verifier)?;
-            let _lifecycle = cache.lock_blob_lifecycle()?;
+            let lifecycle = cache.lock_blob_lifecycle()?;
             guard.check(store)?;
+            #[cfg(test)]
+            {
+                cache.record_blob_stage_admission_attempt();
+                cache.record_blob_admission_trace(TestBlobAdmissionTrace::Stage(
+                    BlobTransferId::new(blob.envelope_id()),
+                ));
+            }
             #[cfg(test)]
             let outcome = if cache
                 .fire_test_blob_contact_fault(TestBlobContactFault::StageCoherence)
@@ -11902,12 +12124,79 @@ fn accept_received_mutable(
                 Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
                     "injected precommit Blob staging coherence failure",
                 )))
+            } else if cache
+                .fire_test_blob_contact_fault(TestBlobContactFault::StageCapacityThenRetryCoherence)
+            {
+                Err(StoreError::Blob(
+                    BlobStoreError::DepotVariantLimitExceeded {
+                        current: 1,
+                        limit: 1,
+                    },
+                ))
             } else {
                 store.stage_verified_blob_source_with_policy(guard.policy(), &blob, sealed, &plan)
             };
             #[cfg(not(test))]
             let outcome =
                 store.stage_verified_blob_source_with_policy(guard.policy(), &blob, sealed, &plan);
+            let outcome = match outcome {
+                Err(error) if blob_apply_capacity_error(&error) => {
+                    let original = error;
+                    let recovered = recover_blob_capacity_after_cleanup(
+                        store,
+                        verifier,
+                        &cache,
+                        &original,
+                        blob.priority(),
+                        Some((blob.topic(), blob.scope(), blob.blob_id())),
+                        plan.manifest().chunk_count(),
+                        1,
+                        contact_custody_sample()?,
+                        &lifecycle,
+                    )?;
+                    if recovered {
+                        #[cfg(test)]
+                        {
+                            cache.record_blob_stage_admission_attempt();
+                            cache.record_blob_admission_trace(TestBlobAdmissionTrace::Stage(
+                                BlobTransferId::new(blob.envelope_id()),
+                            ));
+                        }
+                        #[cfg(test)]
+                        let retry = if cache
+                            .fire_test_blob_contact_fault(TestBlobContactFault::StageRetryCoherence)
+                        {
+                            Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
+                                "injected Blob staging retry coherence failure",
+                            )))
+                        } else {
+                            store.stage_verified_blob_source_with_policy(
+                                guard.policy(),
+                                &blob,
+                                sealed,
+                                &plan,
+                            )
+                        };
+                        #[cfg(not(test))]
+                        let retry = store.stage_verified_blob_source_with_policy(
+                            guard.policy(),
+                            &blob,
+                            sealed,
+                            &plan,
+                        );
+                        match retry {
+                            Ok(outcome) => Ok(outcome),
+                            Err(retry) if equivalent_blob_capacity_error(&original, &retry) => {
+                                Err(original)
+                            }
+                            Err(retry) => Err(retry),
+                        }
+                    } else {
+                        Err(original)
+                    }
+                }
+                outcome => outcome,
+            };
             let disposition = match outcome {
                 Ok(BlobSourceStageOutcome::Inserted) => MutableApplyDisposition::Inserted,
                 Ok(BlobSourceStageOutcome::Duplicate) => MutableApplyDisposition::Duplicate,
@@ -11950,11 +12239,7 @@ fn accept_received_mutable(
                     ));
                 }
                 reconcile_blob_cache_after_successful_pending_abort(
-                    store,
-                    verifier,
-                    &cache,
-                    &claim,
-                    &_lifecycle,
+                    store, verifier, &cache, &claim, &lifecycle,
                 )?;
             }
             Ok(disposition)
@@ -21450,6 +21735,122 @@ fn blob_apply_capacity_error(error: &StoreError) -> bool {
     )
 }
 
+pub(crate) fn blob_capacity_gc_target(error: &StoreError) -> Option<BlobCapacityGcTarget> {
+    match error {
+        StoreError::Blob(
+            BlobStoreError::OperationLimitExceeded { .. }
+            | BlobStoreError::OperationByteLimitExceeded { .. },
+        ) => Some(BlobCapacityGcTarget::Operation),
+        StoreError::Blob(BlobStoreError::PublicationLifecycleCapacity { .. }) => {
+            Some(BlobCapacityGcTarget::PublicationLifecycle)
+        }
+        StoreError::ItemLimitExceeded { .. }
+        | StoreError::PayloadByteLimitExceeded { .. }
+        | StoreError::Blob(
+            BlobStoreError::PublicationLimitExceeded { .. }
+            | BlobStoreError::NetworkStagingRowLimitExceeded { .. }
+            | BlobStoreError::NetworkStagingByteLimitExceeded { .. }
+            | BlobStoreError::DepotByteLimitExceeded { .. }
+            | BlobStoreError::DepotChunkLimitExceeded { .. }
+            | BlobStoreError::DepotVariantLimitExceeded { .. },
+        ) => Some(BlobCapacityGcTarget::Depot),
+        _ => None,
+    }
+}
+
+pub(crate) fn equivalent_blob_capacity_error(first: &StoreError, second: &StoreError) -> bool {
+    matches!(
+        (first, second),
+        (
+            StoreError::ItemLimitExceeded { .. },
+            StoreError::ItemLimitExceeded { .. }
+        ) | (
+            StoreError::PayloadByteLimitExceeded { .. },
+            StoreError::PayloadByteLimitExceeded { .. }
+        ) | (
+            StoreError::Blob(BlobStoreError::PublicationLimitExceeded { .. }),
+            StoreError::Blob(BlobStoreError::PublicationLimitExceeded { .. })
+        ) | (
+            StoreError::Blob(BlobStoreError::CausalFrontierLimitExceeded { .. }),
+            StoreError::Blob(BlobStoreError::CausalFrontierLimitExceeded { .. })
+        ) | (
+            StoreError::Blob(BlobStoreError::DepotByteLimitExceeded { .. }),
+            StoreError::Blob(BlobStoreError::DepotByteLimitExceeded { .. })
+        ) | (
+            StoreError::Blob(BlobStoreError::DepotChunkLimitExceeded { .. }),
+            StoreError::Blob(BlobStoreError::DepotChunkLimitExceeded { .. })
+        ) | (
+            StoreError::Blob(BlobStoreError::DepotVariantLimitExceeded { .. }),
+            StoreError::Blob(BlobStoreError::DepotVariantLimitExceeded { .. })
+        ) | (
+            StoreError::Blob(BlobStoreError::NetworkStagingRowLimitExceeded { .. }),
+            StoreError::Blob(BlobStoreError::NetworkStagingRowLimitExceeded { .. })
+        ) | (
+            StoreError::Blob(BlobStoreError::NetworkStagingByteLimitExceeded { .. }),
+            StoreError::Blob(BlobStoreError::NetworkStagingByteLimitExceeded { .. })
+        ) | (
+            StoreError::Blob(BlobStoreError::OperationLimitExceeded { .. }),
+            StoreError::Blob(BlobStoreError::OperationLimitExceeded { .. })
+        ) | (
+            StoreError::Blob(BlobStoreError::OperationByteLimitExceeded { .. }),
+            StoreError::Blob(BlobStoreError::OperationByteLimitExceeded { .. })
+        ) | (
+            StoreError::Blob(BlobStoreError::PublicationLifecycleCapacity { .. }),
+            StoreError::Blob(BlobStoreError::PublicationLifecycleCapacity { .. })
+        )
+    )
+}
+
+fn blob_capacity_recovery_budget() -> BlobMaintenanceBudget {
+    BlobMaintenanceBudget::new(
+        6 + 4 * aster_redb_store::MAX_BLOB_SUBSCRIPTIONS,
+        16,
+        128 * 1024 * 1024,
+    )
+    .expect("selected capacity recovery bounds are nonzero")
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn recover_blob_capacity_after_cleanup(
+    store: &Store,
+    verifier: &ReferenceEnvelopeSealer,
+    cache: &AuthenticatedEventRouteCache,
+    error: &StoreError,
+    incoming_priority: Priority,
+    content: Option<(&Topic, &Scope, BlobId)>,
+    incoming_depot_chunks: u64,
+    incoming_depot_variants: u64,
+    custody_sample: Option<CustodySample>,
+    lifecycle: &std::sync::MutexGuard<'_, ()>,
+) -> Result<bool, NodeError> {
+    let Some(target) = blob_capacity_gc_target(error) else {
+        return Ok(false);
+    };
+    #[cfg(test)]
+    cache.record_blob_capacity_recovery_attempt();
+    let budget = blob_capacity_recovery_budget();
+    store.run_blob_capacity_gc_for(target, budget, custody_sample)?;
+    #[cfg(test)]
+    cache.record_blob_admission_trace(TestBlobAdmissionTrace::RoutineCleanupComplete);
+    let recovery = store.run_blob_pressure_recovery_after_cleanup(
+        error,
+        incoming_priority,
+        content,
+        (incoming_depot_chunks, incoming_depot_variants),
+        budget,
+        custody_sample,
+    )?;
+    #[cfg(test)]
+    cache.record_blob_admission_trace(TestBlobAdmissionTrace::PressureComplete);
+    let Some(recovery) = recovery else {
+        return Ok(false);
+    };
+    cache.remove_evicted_blobs(verifier, recovery.evicted_transfer_ids(), lifecycle)?;
+    #[cfg(test)]
+    cache.record_blob_admission_trace(TestBlobAdmissionTrace::CacheReconciled);
+    Ok(recovery.deficit_met())
+}
+
 fn blob_publication_capacity_error(error: &StoreError) -> bool {
     matches!(
         error,
@@ -21609,8 +22010,19 @@ fn recover_and_finalize_pending_blob(
     scheduler: Option<(NodeId, Option<BlobCarrierFetchCursor>)>,
 ) -> Result<Option<PendingBlobRecoveryDisposition>, NodeError> {
     guard.check(store)?;
+    let cache = contact_mutable_route_cache(verifier)
+        .map_err(|error| fatal_blob_coherence("pending Blob cache binding", error))?;
     for status in work.iter().filter(|status| status.complete()) {
         guard.check(store)?;
+        let lifecycle = cache.lock_blob_lifecycle()?;
+        #[cfg(test)]
+        {
+            cache.record_blob_carrier_commit_attempt();
+            cache.record_blob_admission_trace(TestBlobAdmissionTrace::Commit {
+                source,
+                object: status.object(),
+            });
+        }
         #[cfg(test)]
         let committed = if fire_test_blob_contact_fault(TestBlobContactFault::CommitLeaseCapacity) {
             Err(StoreError::Blob(BlobStoreError::LeaseCapacity))
@@ -21629,6 +22041,7 @@ fn recover_and_finalize_pending_blob(
             status.object(),
             plan,
         );
+        drop(lifecycle);
         match committed {
             Ok(BlobCarrierCommitOutcome::Committed | BlobCarrierCommitOutcome::Duplicate) => {}
             Err(error) if blob_lease_backpressure_error(&error) => {
@@ -21664,8 +22077,6 @@ fn recover_and_finalize_pending_blob(
     }
 
     guard.check(store)?;
-    let cache = contact_mutable_route_cache(verifier)
-        .map_err(|error| fatal_blob_coherence("pending Blob completion cache binding", error))?;
     let cached_memo = (|| -> Result<Option<PendingBlobCompletionMemo>, NodeError> {
         let _lifecycle = cache.lock_blob_lifecycle()?;
         guard.check(store)?;
@@ -21840,13 +22251,102 @@ fn recover_and_finalize_pending_blob(
             error,
         ));
     }
-    let outcome = match store.apply_verified_blob_with_policy(
+    #[cfg(test)]
+    if cache.fire_test_blob_contact_fault(TestBlobContactFault::HoldPromotion) {
+        drop(lifecycle);
+        return Ok(Some(PendingBlobRecoveryDisposition::Apply(
+            MutableApplyDisposition::DeferredCapacity,
+        )));
+    }
+    #[cfg(test)]
+    {
+        cache.record_blob_promotion_attempt();
+        cache.record_blob_admission_trace(TestBlobAdmissionTrace::Promotion(source));
+    }
+    #[cfg(test)]
+    let outcome = if cache
+        .fire_test_blob_contact_fault(TestBlobContactFault::PromotionCapacityThenRetryCoherence)
+    {
+        Err(StoreError::Blob(BlobStoreError::PublicationLimitExceeded {
+            current: 1,
+            limit: 1,
+        }))
+    } else {
+        store.apply_verified_blob_with_policy(
+            guard.policy(),
+            plan,
+            &lineage,
+            &depot_completion,
+            &content_completion,
+        )
+    };
+    #[cfg(not(test))]
+    let outcome = store.apply_verified_blob_with_policy(
         guard.policy(),
         plan,
         &lineage,
         &depot_completion,
         &content_completion,
-    ) {
+    );
+    let outcome = match outcome {
+        Err(error) if blob_publication_capacity_error(&error) => {
+            let original = error;
+            let recovered = recover_blob_capacity_after_cleanup(
+                store,
+                verifier,
+                &cache,
+                &original,
+                blob.priority(),
+                Some((blob.topic(), blob.scope(), blob.blob_id())),
+                0,
+                0,
+                contact_custody_sample()?,
+                &lifecycle,
+            )?;
+            if recovered {
+                #[cfg(test)]
+                {
+                    cache.record_blob_promotion_attempt();
+                    cache.record_blob_admission_trace(TestBlobAdmissionTrace::Promotion(source));
+                }
+                #[cfg(test)]
+                let retry = if cache
+                    .fire_test_blob_contact_fault(TestBlobContactFault::PromotionRetryCoherence)
+                {
+                    Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
+                        "injected Blob promotion retry coherence failure",
+                    )))
+                } else {
+                    store.apply_verified_blob_with_policy(
+                        guard.policy(),
+                        plan,
+                        &lineage,
+                        &depot_completion,
+                        &content_completion,
+                    )
+                };
+                #[cfg(not(test))]
+                let retry = store.apply_verified_blob_with_policy(
+                    guard.policy(),
+                    plan,
+                    &lineage,
+                    &depot_completion,
+                    &content_completion,
+                );
+                match retry {
+                    Ok(outcome) => Ok(outcome),
+                    Err(retry) if equivalent_blob_capacity_error(&original, &retry) => {
+                        Err(original)
+                    }
+                    Err(retry) => Err(retry),
+                }
+            } else {
+                Err(original)
+            }
+        }
+        outcome => outcome,
+    };
+    let outcome = match outcome {
         Ok(outcome) => outcome,
         Err(error) if blob_publication_capacity_error(&error) => {
             return Ok(Some(PendingBlobRecoveryDisposition::Apply(
@@ -22198,12 +22698,42 @@ async fn sync_blob_carrier_lane(
                     ));
                 }
                 guard.check(store)?;
+                let cache = contact_mutable_route_cache(verifier)?;
+                let lifecycle = cache.lock_blob_lifecycle()?;
+                #[cfg(test)]
+                let append_trace = TestBlobAdmissionTrace::Append {
+                    source: candidate.source,
+                    object: candidate.object,
+                    total_len: candidate.total_len,
+                    offset: candidate.offset,
+                    bytes_sha256: Sha256::digest(&bytes).into(),
+                };
+                #[cfg(test)]
+                {
+                    cache.record_blob_carrier_append_attempt();
+                    cache.record_blob_admission_trace(append_trace.clone());
+                }
                 #[cfg(test)]
                 let appended =
                     if fire_test_blob_contact_fault(TestBlobContactFault::AppendCoherence) {
                         Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
                             "injected Blob carrier append coherence failure",
                         )))
+                    } else if selected
+                        .as_ref()
+                        .is_some_and(|work| work.blob.priority() == Priority::Flash)
+                        && (fire_test_blob_contact_fault(TestBlobContactFault::AppendCapacity)
+                            || fire_test_blob_contact_fault(
+                                TestBlobContactFault::AppendCapacityThenRetryCoherence,
+                            ))
+                    {
+                        Err(StoreError::Blob(
+                            BlobStoreError::NetworkStagingRowLimitExceeded {
+                                current: MAX_BLOB_NETWORK_STAGING_ROWS,
+                                incoming: 1,
+                                limit: MAX_BLOB_NETWORK_STAGING_ROWS,
+                            },
+                        ))
                     } else {
                         store.append_blob_carrier_prefix_with_policy(
                             guard.policy(),
@@ -22223,6 +22753,79 @@ async fn sync_blob_carrier_lane(
                     candidate.offset,
                     &bytes,
                 );
+                let appended = match appended {
+                    Err(error) if blob_apply_capacity_error(&error) => {
+                        let original = error;
+                        let selected_blob = &selected
+                            .as_ref()
+                            .ok_or_else(|| {
+                                NodeError::FatalBlobCoherence(
+                                    "settled Blob range lost its selected admission".into(),
+                                )
+                            })?
+                            .blob;
+                        let recovered = recover_blob_capacity_after_cleanup(
+                            store,
+                            verifier,
+                            &cache,
+                            &original,
+                            selected_blob.priority(),
+                            Some((
+                                selected_blob.topic(),
+                                selected_blob.scope(),
+                                selected_blob.blob_id(),
+                            )),
+                            0,
+                            0,
+                            contact_custody_sample()?,
+                            &lifecycle,
+                        )?;
+                        if recovered {
+                            #[cfg(test)]
+                            {
+                                cache.record_blob_carrier_append_attempt();
+                                cache.record_blob_admission_trace(append_trace);
+                            }
+                            #[cfg(test)]
+                            let retry = if fire_test_blob_contact_fault(
+                                TestBlobContactFault::AppendRetryCoherence,
+                            ) {
+                                Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
+                                    "injected Blob carrier append retry coherence failure",
+                                )))
+                            } else {
+                                store.append_blob_carrier_prefix_with_policy(
+                                    guard.policy(),
+                                    candidate.source,
+                                    candidate.object,
+                                    candidate.total_len,
+                                    candidate.offset,
+                                    &bytes,
+                                )
+                            };
+                            #[cfg(not(test))]
+                            let retry = store.append_blob_carrier_prefix_with_policy(
+                                guard.policy(),
+                                candidate.source,
+                                candidate.object,
+                                candidate.total_len,
+                                candidate.offset,
+                                &bytes,
+                            );
+                            match retry {
+                                Ok(outcome) => Ok(outcome),
+                                Err(retry) if equivalent_blob_capacity_error(&original, &retry) => {
+                                    Err(original)
+                                }
+                                Err(retry) => Err(retry),
+                            }
+                        } else {
+                            Err(original)
+                        }
+                    }
+                    outcome => outcome,
+                };
+                drop(lifecycle);
                 match appended {
                     Ok(BlobCarrierAppendOutcome::Duplicate(status)) => {
                         receipt.duplicates = receipt.duplicates.saturating_add(1);
@@ -28569,6 +29172,34 @@ mod tests {
     use std::sync::{Barrier, mpsc as std_mpsc};
 
     use super::*;
+
+    #[test]
+    fn blob_retry_boundaries_preserve_only_equivalent_second_capacity_errors() {
+        let original = StoreError::Blob(BlobStoreError::NetworkStagingRowLimitExceeded {
+            current: 4,
+            incoming: 1,
+            limit: 4,
+        });
+        let equivalent = StoreError::Blob(BlobStoreError::NetworkStagingRowLimitExceeded {
+            current: 5,
+            incoming: 1,
+            limit: 4,
+        });
+        let invariant = StoreError::Blob(BlobStoreError::SchemaInvariant(
+            "injected second-attempt invariant",
+        ));
+
+        for boundary in ["local", "staging", "carrier append", "promotion"] {
+            assert!(
+                equivalent_blob_capacity_error(&original, &equivalent),
+                "{boundary} must preserve an equivalent capacity rejection"
+            );
+            assert!(
+                !equivalent_blob_capacity_error(&original, &invariant),
+                "{boundary} must propagate a second-attempt invariant"
+            );
+        }
+    }
     use crate::application::{BlobSubscriptionRequest, RecordProjection, StateProjection};
     use crate::bridge_runtime::SelectedEventBridgeEdge;
     use crate::mission::initiate_over_iroh;
@@ -42817,6 +43448,52 @@ mod tests {
         epoch: u64,
         plaintext: &[u8],
     ) -> BlobTransferId {
+        publish_test_blob_with_priority(
+            store,
+            sealer,
+            topic,
+            scope,
+            epoch,
+            Priority::Routine,
+            plaintext,
+        )
+    }
+
+    fn publish_test_blob_with_priority(
+        store: &Store,
+        sealer: &mut ReferenceEnvelopeSealer,
+        topic: &Topic,
+        scope: &Scope,
+        epoch: u64,
+        priority: Priority,
+        plaintext: &[u8],
+    ) -> BlobTransferId {
+        publish_test_blob_with_priority_and_operation_suffix(
+            store,
+            sealer,
+            topic,
+            scope,
+            epoch,
+            priority,
+            plaintext,
+            &[],
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "test fixture keeps each authenticated Blob input explicit at call sites"
+    )]
+    fn publish_test_blob_with_priority_and_operation_suffix(
+        store: &Store,
+        sealer: &mut ReferenceEnvelopeSealer,
+        topic: &Topic,
+        scope: &Scope,
+        epoch: u64,
+        priority: Priority,
+        plaintext: &[u8],
+        operation_suffix: &[u8],
+    ) -> BlobTransferId {
         let prepared = aster_mesh::prepare_blob(
             &mut std::io::Cursor::new(plaintext),
             aster_mesh::SELECTED_BLOB_CHUNK_SIZE,
@@ -42848,7 +43525,7 @@ mod tests {
             .expect("reserve Blob");
         let header = reservation
             .header(
-                Priority::Routine,
+                priority,
                 finished.route_commitment(),
                 u64::try_from(finished.manifest_bytes().len()).expect("manifest length"),
                 epoch,
@@ -42872,13 +43549,14 @@ mod tests {
             .expect("Blob depot completion");
         let mut operation_bytes = b"runtime-blob-e2e/".to_vec();
         operation_bytes.extend_from_slice(&Sha256::digest(plaintext));
+        operation_bytes.extend_from_slice(operation_suffix);
         let operation =
             aster_redb_store::BlobOperationKey::new(operation_bytes).expect("Blob operation");
         let intent = aster_redb_store::BlobPublicationIntent::new(
             sealer.identity(),
             topic.clone(),
             scope.clone(),
-            Priority::Routine,
+            priority,
             prepared.id(),
         )
         .expect("Blob intent");
@@ -42894,6 +43572,59 @@ mod tests {
             .expect("commit test Blob")
             .blob()
             .transfer_id
+    }
+
+    fn assert_single_blob_recovery_retries_identical<F>(
+        cache: &AuthenticatedEventRouteCache,
+        expected_attempt: F,
+    ) where
+        F: Fn(&TestBlobAdmissionTrace) -> bool,
+    {
+        let trace = cache.blob_admission_trace();
+        let cleanup = trace
+            .iter()
+            .position(|step| matches!(step, TestBlobAdmissionTrace::RoutineCleanupComplete))
+            .expect("recovery trace includes routine cleanup");
+        assert!(cleanup > 0, "cleanup follows the rejected admission");
+        assert!(expected_attempt(&trace[cleanup - 1]));
+        assert_eq!(
+            trace.get(cleanup + 1),
+            Some(&TestBlobAdmissionTrace::PressureComplete)
+        );
+        assert_eq!(
+            trace.get(cleanup + 2),
+            Some(&TestBlobAdmissionTrace::CacheReconciled)
+        );
+        let retried = trace
+            .get(cleanup + 3)
+            .expect("recovery trace includes one admission retry");
+        assert!(expected_attempt(retried));
+        assert_eq!(
+            &trace[cleanup - 1],
+            retried,
+            "the retry must use the identical authenticated input"
+        );
+        assert_eq!(
+            trace
+                .iter()
+                .filter(|step| matches!(step, TestBlobAdmissionTrace::RoutineCleanupComplete))
+                .count(),
+            1
+        );
+        assert_eq!(
+            trace
+                .iter()
+                .filter(|step| matches!(step, TestBlobAdmissionTrace::PressureComplete))
+                .count(),
+            1
+        );
+        assert_eq!(
+            trace
+                .iter()
+                .filter(|step| matches!(step, TestBlobAdmissionTrace::CacheReconciled))
+                .count(),
+            1
+        );
     }
 
     fn completed_test_blob_plan(
@@ -42919,6 +43650,1336 @@ mod tests {
         };
         blob.transfer_plan(&manifest_bytes)
             .expect("completed test Blob plan")
+    }
+
+    #[test]
+    fn pressure_cache_reconciliation_removes_pending_memo_and_rejects_wrong_verifier() {
+        let state = root("blob-pressure-cache-reconciliation");
+        fs::create_dir_all(&state).expect("pressure cache state");
+        let services = control_test_services([0xf1; 32]);
+        let store = Store::open_for_mission(
+            state.join(STORE_FILE),
+            services.member.mission_authority_id(),
+        )
+        .expect("pressure cache store");
+        let mut verifier = open_test_sealer(&services.member);
+        let evicted = publish_test_blob(
+            &store,
+            &mut verifier,
+            &services.topic,
+            &services.scope,
+            1,
+            b"pressure pending memo fixture",
+        );
+        let unrelated = publish_test_blob(
+            &store,
+            &mut verifier,
+            &services.topic,
+            &services.scope,
+            1,
+            b"pressure unrelated completed fixture",
+        );
+        let cache = AuthenticatedEventRouteCache::empty_for_store(&verifier, &store)
+            .expect("pressure cache binding");
+
+        let stored = store
+            .get_blob(evicted)
+            .expect("memo fixture lookup")
+            .expect("memo fixture source");
+        let route = verifier
+            .verify_blob(&stored.sealed)
+            .expect("memo fixture route");
+        let BlobContentVerification::ContentVerified {
+            blob,
+            manifest_bytes,
+        } = verifier
+            .verify_blob_content(route, &stored.sealed)
+            .expect("memo fixture content")
+        else {
+            panic!("memo fixture lost content grant")
+        };
+        let projection = store
+            .blob_source_projection(evicted)
+            .expect("memo fixture projection lookup")
+            .expect("memo fixture projection");
+        let depot_completion = store
+            .blob_depot()
+            .and_then(|mut depot| depot.completed_blob(&blob, &manifest_bytes))
+            .expect("memo fixture depot completion");
+        let content_completion = {
+            let depot = store.blob_depot().expect("memo fixture content depot");
+            let mut service = verifier
+                .blob_service_with_store(blob.scope(), blob.topic(), blob.key_epoch(), depot)
+                .expect("memo fixture content service");
+            service
+                .install_verified_manifest(&blob, &manifest_bytes)
+                .expect("activate memo fixture manifest");
+            service
+                .verify_blob_content_completion(&blob, &manifest_bytes)
+                .expect("memo fixture content completion")
+        };
+        let pending_claim = AuthenticatedBlobRouteClaim::from_verified(
+            &blob,
+            &stored.sealed,
+            &projection.source,
+            BlobSourceRetention::Pending,
+            None,
+        )
+        .expect("synthetic pending cache claim");
+        cache
+            .insert_blob(&verifier, pending_claim.clone())
+            .expect("cache pending claim");
+        cache
+            .insert_pending_blob_completion(
+                &verifier,
+                PendingBlobCompletionMemo::new(
+                    &pending_claim,
+                    depot_completion,
+                    content_completion,
+                )
+                .expect("valid pending completion memo"),
+            )
+            .expect("cache pending completion memo");
+
+        let unrelated_stored = store
+            .get_blob(unrelated)
+            .expect("unrelated source lookup")
+            .expect("unrelated source");
+        let unrelated_route = verifier
+            .verify_blob(&unrelated_stored.sealed)
+            .expect("unrelated route");
+        let BlobContentVerification::ContentVerified {
+            blob: unrelated_blob,
+            manifest_bytes: unrelated_manifest,
+        } = verifier
+            .verify_blob_content(unrelated_route, &unrelated_stored.sealed)
+            .expect("unrelated content")
+        else {
+            panic!("unrelated source lost content grant")
+        };
+        let unrelated_projection = store
+            .blob_source_projection(unrelated)
+            .expect("unrelated projection lookup")
+            .expect("unrelated projection");
+        let unrelated_completion = store
+            .blob_depot()
+            .and_then(|mut depot| depot.completed_blob(&unrelated_blob, &unrelated_manifest))
+            .expect("unrelated completion");
+        cache
+            .insert_blob(
+                &verifier,
+                AuthenticatedBlobRouteClaim::from_verified(
+                    &unrelated_blob,
+                    &unrelated_stored.sealed,
+                    &unrelated_projection.source,
+                    unrelated_projection.retention,
+                    Some(unrelated_completion),
+                )
+                .expect("unrelated completed claim"),
+            )
+            .expect("cache unrelated claim");
+
+        let wrong_verifier = open_test_sealer(&services.other);
+        let lifecycle = cache.lock_blob_lifecycle().expect("pressure cache lock");
+        assert!(matches!(
+            cache.remove_evicted_blobs(&wrong_verifier, &[evicted], &lifecycle),
+            Err(NodeError::Protocol(_))
+        ));
+        assert!(cache.has_blob_claim_for_test(evicted));
+        assert!(
+            cache
+                .get_pending_blob_completion(&verifier, evicted)
+                .expect("memo after rejected verifier")
+                .is_some()
+        );
+
+        cache
+            .remove_evicted_blobs(&verifier, &[evicted], &lifecycle)
+            .expect("remove exact evicted cache state");
+        assert!(!cache.has_blob_claim_for_test(evicted));
+        assert!(
+            cache
+                .get_pending_blob_completion(&verifier, evicted)
+                .expect("memo after exact removal")
+                .is_none()
+        );
+        assert!(cache.has_blob_claim_for_test(unrelated));
+
+        drop(lifecycle);
+        drop(store);
+        fs::remove_dir_all(state).expect("pressure cache cleanup");
+    }
+
+    #[tokio::test]
+    async fn remote_blob_pressure_reconciles_completed_cache_and_retries_once() {
+        // Break caught: carrier admission cannot recover a lower-priority
+        // physical variant while its completed authenticated route remains
+        // serveable, nor may it spin through a hidden retry loop.
+        let mut missions = issue_missions(2);
+        let receiver = missions.pop().expect("pressure receiver mission");
+        let source_mission = missions.pop().expect("pressure source mission");
+        let authority = source_mission.credentials.mission_authority_id();
+        assert_eq!(receiver.credentials.mission_authority_id(), authority);
+        let topic = Topic::new("opaque").expect("pressure Blob topic");
+        let scope = Scope::new("test/runtime-contact").expect("pressure Blob scope");
+        let interests = || {
+            MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
+                topic.clone(),
+                scope.clone(),
+                false,
+            )])
+        };
+        let source_state = root("blob-pressure-remote-source");
+        let receiver_state = root("blob-pressure-remote-receiver");
+        fs::create_dir_all(&source_state).expect("remote pressure source state");
+        fs::create_dir_all(&receiver_state).expect("remote pressure receiver state");
+        let source_store = Arc::new(
+            Store::open_for_mission(source_state.join(STORE_FILE), authority)
+                .expect("remote pressure source store"),
+        );
+        let receiver_path = receiver_state.join(STORE_FILE);
+        let receiver_store = Arc::new(
+            Store::open_with_limits_and_blob_depot_limits_for_mission(
+                &receiver_path,
+                StoreLimits::default(),
+                BlobDepotLimits::new(1_000_000, 1, 2).expect("one-chunk remote pressure limits"),
+                authority,
+            )
+            .expect("remote pressure receiver store"),
+        );
+        let mut receiver_verifier = open_test_sealer(&receiver.credentials);
+        let evicted = publish_test_blob_with_priority(
+            &receiver_store,
+            &mut receiver_verifier,
+            &topic,
+            &scope,
+            1,
+            Priority::Routine,
+            &[0x61; 24 * 1024],
+        );
+        let mut source_verifier = open_test_sealer(&source_mission.credentials);
+        let incoming = publish_test_blob_with_priority(
+            &source_store,
+            &mut source_verifier,
+            &topic,
+            &scope,
+            1,
+            Priority::Flash,
+            &[0x62; 24 * 1024],
+        );
+        let source_cache = test_event_route_cache(&source_store, &source_mission.credentials);
+        let receiver_cache = test_event_route_cache(&receiver_store, &receiver.credentials);
+        assert!(receiver_cache.has_blob_claim_for_test(evicted));
+
+        let mut fetched_ranges = 0usize;
+        for _ in 0..16 {
+            let (receiver_receipt, _) = blob_contact_test_pair_with_caches(
+                source_store.clone(),
+                source_mission.credentials.clone(),
+                interests(),
+                Arc::clone(&source_cache),
+                receiver_store.clone(),
+                receiver.credentials.clone(),
+                interests(),
+                Arc::clone(&receiver_cache),
+                None,
+                None,
+                None,
+                None,
+                0,
+            )
+            .await;
+            fetched_ranges = fetched_ranges.saturating_add(receiver_receipt.blob_ranges_fetched);
+            if receiver_store
+                .get_blob(incoming)
+                .expect("incoming remote pressure lookup")
+                .is_some()
+            {
+                break;
+            }
+        }
+
+        assert!(fetched_ranges > 0);
+        assert_eq!(receiver_cache.blob_capacity_recovery_attempts(), 1);
+        assert_eq!(receiver_cache.blob_stage_admission_attempts(), 2);
+        assert_eq!(receiver_cache.blob_carrier_append_attempts(), 2);
+        assert_eq!(receiver_cache.blob_carrier_commit_attempts(), 1);
+        assert_eq!(receiver_cache.blob_promotion_attempts(), 1);
+        assert_single_blob_recovery_retries_identical(
+            &receiver_cache,
+            |step| matches!(step, TestBlobAdmissionTrace::Stage(source) if *source == incoming),
+        );
+        assert!(!receiver_cache.has_blob_claim_for_test(evicted));
+        assert!(receiver_cache.has_blob_claim_for_test(incoming));
+        assert!(
+            receiver_store
+                .get_blob(incoming)
+                .expect("completed incoming remote pressure lookup")
+                .is_some()
+        );
+        assert!(matches!(
+            receiver_store.get_blob(evicted),
+            Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+        ));
+
+        drop(receiver_cache);
+        drop(receiver_store);
+        let reopened = Store::open_with_limits_and_blob_depot_limits_for_mission(
+            &receiver_path,
+            StoreLimits::default(),
+            BlobDepotLimits::new(1_000_000, 1, 2)
+                .expect("reopened one-chunk remote pressure limits"),
+            authority,
+        )
+        .expect("reopen remote pressure receiver");
+        let reopened_cache = test_event_route_cache(&reopened, &receiver.credentials);
+        assert!(!reopened_cache.has_blob_claim_for_test(evicted));
+        assert!(reopened_cache.has_blob_claim_for_test(incoming));
+
+        drop(source_store);
+        drop(reopened);
+        for state in [source_state, receiver_state] {
+            fs::remove_dir_all(state).expect("remote pressure cleanup");
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_blob_staging_pressure_evicts_actual_pending_memo_before_one_retry() {
+        // Break caught: staging pressure must retire an actual durable pending
+        // source and clear its real completion memo, not merely remove a
+        // synthetic pending-shaped claim over completed publication state.
+        let mut missions = issue_missions(2);
+        let receiver = missions.pop().expect("staging receiver mission");
+        let source_mission = missions.pop().expect("staging source mission");
+        let authority = source_mission.credentials.mission_authority_id();
+        let topic = Topic::new("opaque").expect("staging pressure topic");
+        let scope = Scope::new("test/runtime-contact").expect("staging pressure scope");
+        let interests = || {
+            MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
+                topic.clone(),
+                scope.clone(),
+                false,
+            )])
+        };
+        let source_state = root("blob-staging-pressure-source");
+        let receiver_state = root("blob-staging-pressure-receiver");
+        fs::create_dir_all(&source_state).expect("staging pressure source state");
+        fs::create_dir_all(&receiver_state).expect("staging pressure receiver state");
+        let source_store = Arc::new(
+            Store::open_for_mission(source_state.join(STORE_FILE), authority)
+                .expect("staging pressure source store"),
+        );
+        let receiver_store = Arc::new(
+            Store::open_with_limits_and_blob_depot_limits_for_mission(
+                receiver_state.join(STORE_FILE),
+                StoreLimits::default(),
+                BlobDepotLimits::new(1_000_000, 2, 2)
+                    .expect("two physical staging-pressure variants"),
+                authority,
+            )
+            .expect("staging pressure receiver store"),
+        );
+        let mut receiver_verifier = open_test_sealer(&receiver.credentials);
+        let unrelated = publish_test_blob_with_priority(
+            &receiver_store,
+            &mut receiver_verifier,
+            &topic,
+            &scope,
+            1,
+            Priority::Flash,
+            &[0x73; 4 * 1024],
+        );
+        let mut source_verifier = open_test_sealer(&source_mission.credentials);
+        let pending = publish_test_blob_with_priority(
+            &source_store,
+            &mut source_verifier,
+            &topic,
+            &scope,
+            1,
+            Priority::Routine,
+            &[0x74; 8 * 1024],
+        );
+        let source_cache = test_event_route_cache(&source_store, &source_mission.credentials);
+        let promotion_fault = install_test_blob_contact_fault(
+            receiver.credentials.identity(),
+            TestBlobContactFault::HoldPromotion,
+        );
+        let receiver_cache = test_event_route_cache(&receiver_store, &receiver.credentials);
+
+        let mut memo = None;
+        for _ in 0..16 {
+            let _ = blob_contact_test_pair_with_caches(
+                source_store.clone(),
+                source_mission.credentials.clone(),
+                interests(),
+                Arc::clone(&source_cache),
+                receiver_store.clone(),
+                receiver.credentials.clone(),
+                interests(),
+                Arc::clone(&receiver_cache),
+                None,
+                None,
+                None,
+                None,
+                0,
+            )
+            .await;
+            memo = receiver_cache
+                .get_pending_blob_completion(&receiver_verifier, pending)
+                .expect("actual pending completion memo lookup");
+            if memo.is_some() {
+                break;
+            }
+        }
+        assert!(
+            memo.is_some(),
+            "pending completion absent: fault={} stage={} append={} commit={} promotion={} recovery={} pending={}",
+            promotion_fault.fired.load(Ordering::Acquire),
+            receiver_cache.blob_stage_admission_attempts(),
+            receiver_cache.blob_carrier_append_attempts(),
+            receiver_cache.blob_carrier_commit_attempts(),
+            receiver_cache.blob_promotion_attempts(),
+            receiver_cache.blob_capacity_recovery_attempts(),
+            receiver_store
+                .pending_blob_source(pending)
+                .expect("diagnostic pending source lookup")
+                .is_some(),
+        );
+        let memo = memo.expect("checked actual pending completion memo");
+        assert!(promotion_fault.fired.load(Ordering::Acquire));
+        assert!(
+            receiver_store
+                .pending_blob_source(pending)
+                .expect("actual pending source lookup")
+                .is_some()
+        );
+        assert!(receiver_cache.has_blob_claim_for_test(pending));
+        assert!(receiver_cache.has_blob_claim_for_test(unrelated));
+
+        drop(receiver_cache);
+        let receiver_cache = test_event_route_cache(&receiver_store, &receiver.credentials);
+        receiver_cache
+            .insert_pending_blob_completion(&receiver_verifier, memo)
+            .expect("restore actual pending memo into active cache");
+        let incoming = publish_test_blob_with_priority(
+            &source_store,
+            &mut source_verifier,
+            &topic,
+            &scope,
+            1,
+            Priority::Flash,
+            &[0x75; 8 * 1024],
+        );
+        drop(source_cache);
+        let source_cache = test_event_route_cache(&source_store, &source_mission.credentials);
+
+        for _ in 0..16 {
+            let _ = blob_contact_test_pair_with_caches(
+                source_store.clone(),
+                source_mission.credentials.clone(),
+                interests(),
+                Arc::clone(&source_cache),
+                receiver_store.clone(),
+                receiver.credentials.clone(),
+                interests(),
+                Arc::clone(&receiver_cache),
+                None,
+                None,
+                None,
+                None,
+                0,
+            )
+            .await;
+            if receiver_cache.has_blob_claim_for_test(incoming) {
+                break;
+            }
+        }
+
+        assert_eq!(receiver_cache.blob_stage_admission_attempts(), 2);
+        assert_eq!(receiver_cache.blob_capacity_recovery_attempts(), 1);
+        assert_single_blob_recovery_retries_identical(
+            &receiver_cache,
+            |step| matches!(step, TestBlobAdmissionTrace::Stage(source) if *source == incoming),
+        );
+        assert!(!receiver_cache.has_blob_claim_for_test(pending));
+        assert!(
+            receiver_cache
+                .get_pending_blob_completion(&receiver_verifier, pending)
+                .expect("evicted pending memo lookup")
+                .is_none()
+        );
+        assert!(
+            receiver_store
+                .pending_blob_source(pending)
+                .expect("evicted pending source lookup")
+                .is_none()
+        );
+        assert!(receiver_cache.has_blob_claim_for_test(unrelated));
+        assert!(receiver_cache.has_blob_claim_for_test(incoming));
+
+        drop(source_store);
+        drop(receiver_store);
+        for state in [source_state, receiver_state] {
+            fs::remove_dir_all(state).expect("staging pressure cleanup");
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_blob_carrier_commit_uses_staged_reservation_without_pressure() {
+        // Staging reserves the exact incoming depot chunk. Filling all remaining
+        // capacity afterwards cannot make carrier commit fail for capacity, so
+        // this boundary must neither run pressure recovery nor retry.
+        let mut missions = issue_missions(2);
+        let receiver = missions.pop().expect("commit receiver mission");
+        let source_mission = missions.pop().expect("commit source mission");
+        let authority = source_mission.credentials.mission_authority_id();
+        let topic = Topic::new("opaque").expect("commit pressure topic");
+        let scope = Scope::new("test/runtime-contact").expect("commit pressure scope");
+        let interests = || {
+            MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
+                topic.clone(),
+                scope.clone(),
+                false,
+            )])
+        };
+        let source_state = root("blob-carrier-commit-pressure-source");
+        let receiver_state = root("blob-carrier-commit-pressure-receiver");
+        fs::create_dir_all(&source_state).expect("commit pressure source state");
+        fs::create_dir_all(&receiver_state).expect("commit pressure receiver state");
+        let source_store = Arc::new(
+            Store::open_for_mission(source_state.join(STORE_FILE), authority)
+                .expect("commit pressure source store"),
+        );
+        let mut source_verifier = open_test_sealer(&source_mission.credentials);
+        let incoming = publish_test_blob_with_priority(
+            &source_store,
+            &mut source_verifier,
+            &topic,
+            &scope,
+            1,
+            Priority::Flash,
+            &[0x7b; 4 * 1024],
+        );
+        let incoming_sealed = source_store
+            .get_blob(incoming)
+            .expect("commit pressure incoming lookup")
+            .expect("commit pressure incoming source")
+            .sealed;
+        let receiver_store = Arc::new(
+            Store::open_with_limits_and_blob_depot_limits_for_mission(
+                receiver_state.join(STORE_FILE),
+                StoreLimits::default(),
+                BlobDepotLimits::new(1_000_000, 3, 3)
+                    .expect("three reserved commit-pressure variants"),
+                authority,
+            )
+            .expect("commit pressure receiver store"),
+        );
+        let staging_cache = test_event_route_cache(&receiver_store, &receiver.credentials);
+        stage_test_pending_blob(
+            &receiver_store,
+            &staging_cache,
+            &receiver.credentials,
+            incoming,
+            &incoming_sealed,
+        );
+        drop(staging_cache);
+
+        let mut receiver_verifier = open_test_sealer(&receiver.credentials);
+        let evicted = publish_test_blob_with_priority(
+            &receiver_store,
+            &mut receiver_verifier,
+            &topic,
+            &scope,
+            1,
+            Priority::Routine,
+            &[0x7c; 4 * 1024],
+        );
+        let unrelated = publish_test_blob_with_priority(
+            &receiver_store,
+            &mut receiver_verifier,
+            &topic,
+            &scope,
+            1,
+            Priority::Flash,
+            &[0x7d; 4 * 1024],
+        );
+        let source_cache = test_event_route_cache(&source_store, &source_mission.credentials);
+        let receiver_cache = test_event_route_cache(&receiver_store, &receiver.credentials);
+        assert!(
+            receiver_store
+                .pending_blob_source(incoming)
+                .expect("commit pressure pending lookup")
+                .is_some()
+        );
+
+        for _ in 0..16 {
+            let _ = blob_contact_test_pair_with_caches(
+                source_store.clone(),
+                source_mission.credentials.clone(),
+                interests(),
+                Arc::clone(&source_cache),
+                receiver_store.clone(),
+                receiver.credentials.clone(),
+                interests(),
+                Arc::clone(&receiver_cache),
+                None,
+                None,
+                None,
+                None,
+                0,
+            )
+            .await;
+            if receiver_store
+                .get_blob(incoming)
+                .expect("committed incoming lookup")
+                .is_some()
+            {
+                break;
+            }
+        }
+
+        assert_eq!(receiver_cache.blob_stage_admission_attempts(), 0);
+        assert_eq!(receiver_cache.blob_carrier_append_attempts(), 1);
+        assert_eq!(receiver_cache.blob_carrier_commit_attempts(), 1);
+        assert_eq!(receiver_cache.blob_promotion_attempts(), 1);
+        assert_eq!(receiver_cache.blob_capacity_recovery_attempts(), 0);
+        assert!(receiver_cache.has_blob_claim_for_test(evicted));
+        assert!(receiver_cache.has_blob_claim_for_test(unrelated));
+        assert!(receiver_cache.has_blob_claim_for_test(incoming));
+        assert!(
+            receiver_store
+                .get_blob(evicted)
+                .expect("reserved commit leaves lower-priority route")
+                .is_some()
+        );
+        assert!(
+            receiver_store
+                .get_blob(incoming)
+                .expect("completed committed incoming lookup")
+                .is_some()
+        );
+
+        drop(source_store);
+        drop(receiver_store);
+        for state in [source_state, receiver_state] {
+            fs::remove_dir_all(state).expect("commit pressure cleanup");
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_blob_promotion_pressure_reconciles_and_retries_once() {
+        let mut missions = issue_missions(2);
+        let receiver = missions.pop().expect("promotion receiver mission");
+        let source_mission = missions.pop().expect("promotion source mission");
+        let authority = source_mission.credentials.mission_authority_id();
+        let topic = Topic::new("opaque").expect("promotion pressure topic");
+        let scope = Scope::new("test/runtime-contact").expect("promotion pressure scope");
+        let interests = || {
+            MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
+                topic.clone(),
+                scope.clone(),
+                false,
+            )])
+        };
+        let source_state = root("blob-promotion-pressure-source");
+        let receiver_state = root("blob-promotion-pressure-receiver");
+        fs::create_dir_all(&source_state).expect("promotion pressure source state");
+        fs::create_dir_all(&receiver_state).expect("promotion pressure receiver state");
+        let source_store = Arc::new(
+            Store::open_for_mission(source_state.join(STORE_FILE), authority)
+                .expect("promotion pressure source store"),
+        );
+        let constrained = StoreLimits::new(
+            MAX_CONTROL_ITEMS + CUSTODY_EMERGENCY_ITEM_RESERVE + 6,
+            DEFAULT_MAX_TOTAL_PAYLOAD_BYTES,
+        )
+        .expect("three completed Blobs at the promotion boundary");
+        let receiver_store = Arc::new(
+            Store::open_with_limits_for_mission(
+                receiver_state.join(STORE_FILE),
+                constrained,
+                authority,
+            )
+            .expect("promotion pressure receiver store"),
+        );
+        let mut receiver_verifier = open_test_sealer(&receiver.credentials);
+        let evicted = publish_test_blob_with_priority(
+            &receiver_store,
+            &mut receiver_verifier,
+            &topic,
+            &scope,
+            1,
+            Priority::Routine,
+            &[0x76; 4 * 1024],
+        );
+        let unrelated = publish_test_blob_with_priority_and_operation_suffix(
+            &receiver_store,
+            &mut receiver_verifier,
+            &topic,
+            &scope,
+            1,
+            Priority::Flash,
+            &[0x76; 4 * 1024],
+            b"/promotion-unrelated-1",
+        );
+        let unrelated_two = publish_test_blob_with_priority_and_operation_suffix(
+            &receiver_store,
+            &mut receiver_verifier,
+            &topic,
+            &scope,
+            1,
+            Priority::Flash,
+            &[0x76; 4 * 1024],
+            b"/promotion-unrelated-2",
+        );
+        let mut source_verifier = open_test_sealer(&source_mission.credentials);
+        let incoming = publish_test_blob_with_priority(
+            &source_store,
+            &mut source_verifier,
+            &topic,
+            &scope,
+            1,
+            Priority::Flash,
+            &[0x77; 4 * 1024],
+        );
+        let source_cache = test_event_route_cache(&source_store, &source_mission.credentials);
+        let receiver_cache = test_event_route_cache(&receiver_store, &receiver.credentials);
+
+        for _ in 0..16 {
+            let _ = blob_contact_test_pair_with_caches(
+                source_store.clone(),
+                source_mission.credentials.clone(),
+                interests(),
+                Arc::clone(&source_cache),
+                receiver_store.clone(),
+                receiver.credentials.clone(),
+                interests(),
+                Arc::clone(&receiver_cache),
+                None,
+                None,
+                None,
+                None,
+                0,
+            )
+            .await;
+            if receiver_store
+                .pending_blob_source(incoming)
+                .expect("promotion pending source lookup")
+                .is_none()
+                && receiver_store
+                    .get_blob(incoming)
+                    .expect("promotion incoming lookup")
+                    .is_some()
+            {
+                break;
+            }
+        }
+
+        assert!(
+            receiver_store
+                .pending_blob_source(incoming)
+                .expect("final promotion pending lookup")
+                .is_none(),
+            "promotion remained pending: stage={} append={} commit={} promotion={} recovery={} low_claim={} low_projection={} unrelated_claims=({}, {})",
+            receiver_cache.blob_stage_admission_attempts(),
+            receiver_cache.blob_carrier_append_attempts(),
+            receiver_cache.blob_carrier_commit_attempts(),
+            receiver_cache.blob_promotion_attempts(),
+            receiver_cache.blob_capacity_recovery_attempts(),
+            receiver_cache.has_blob_claim_for_test(evicted),
+            receiver_store
+                .blob_source_projection(evicted)
+                .expect("diagnostic low projection")
+                .is_some(),
+            receiver_cache.has_blob_claim_for_test(unrelated),
+            receiver_cache.has_blob_claim_for_test(unrelated_two),
+        );
+        assert_eq!(receiver_cache.blob_stage_admission_attempts(), 1);
+        assert_eq!(receiver_cache.blob_carrier_append_attempts(), 1);
+        assert_eq!(receiver_cache.blob_carrier_commit_attempts(), 1);
+        assert_eq!(receiver_cache.blob_promotion_attempts(), 2);
+        assert_eq!(receiver_cache.blob_capacity_recovery_attempts(), 1);
+        assert_single_blob_recovery_retries_identical(
+            &receiver_cache,
+            |step| matches!(step, TestBlobAdmissionTrace::Promotion(source) if *source == incoming),
+        );
+        assert!(!receiver_cache.has_blob_claim_for_test(evicted));
+        assert!(receiver_cache.has_blob_claim_for_test(unrelated));
+        assert!(receiver_cache.has_blob_claim_for_test(unrelated_two));
+        assert!(receiver_cache.has_blob_claim_for_test(incoming));
+        assert!(
+            receiver_store
+                .get_blob(incoming)
+                .expect("completed promotion incoming lookup")
+                .is_some()
+        );
+        assert!(matches!(
+            receiver_store.get_blob(evicted),
+            Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+        ));
+
+        drop(source_store);
+        drop(receiver_store);
+        for state in [source_state, receiver_state] {
+            fs::remove_dir_all(state).expect("promotion pressure cleanup");
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_blob_append_capacity_runs_recovery_and_retries_once() {
+        let mut missions = issue_missions(2);
+        let receiver = missions.pop().expect("append receiver mission");
+        let source_mission = missions.pop().expect("append source mission");
+        let authority = source_mission.credentials.mission_authority_id();
+        let topic = Topic::new("opaque").expect("append pressure topic");
+        let scope = Scope::new("test/runtime-contact").expect("append pressure scope");
+        let interests = || {
+            MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
+                topic.clone(),
+                scope.clone(),
+                false,
+            )])
+        };
+        let low_state = root("blob-append-pressure-low-source");
+        let source_state = root("blob-append-pressure-source");
+        let receiver_state = root("blob-append-pressure-receiver");
+        for state in [&low_state, &source_state, &receiver_state] {
+            fs::create_dir_all(state).expect("append pressure state");
+        }
+        let low_store = Store::open_for_mission(low_state.join(STORE_FILE), authority)
+            .expect("append low source store");
+        let mut low_verifier = open_test_sealer(&source_mission.credentials);
+        let evicted = publish_test_blob_with_priority(
+            &low_store,
+            &mut low_verifier,
+            &topic,
+            &scope,
+            1,
+            Priority::Routine,
+            &[0x78; 4 * 1024],
+        );
+        let evicted_sealed = low_store
+            .get_blob(evicted)
+            .expect("append low source lookup")
+            .expect("append low source")
+            .sealed;
+        let source_store = Arc::new(
+            Store::open_for_mission(source_state.join(STORE_FILE), authority)
+                .expect("append pressure source store"),
+        );
+        let mut source_verifier = open_test_sealer(&source_mission.credentials);
+        let incoming = publish_test_blob_with_priority(
+            &source_store,
+            &mut source_verifier,
+            &topic,
+            &scope,
+            1,
+            Priority::Flash,
+            &[0x79; 4 * 1024],
+        );
+        let receiver_store = Arc::new(
+            Store::open_for_mission(receiver_state.join(STORE_FILE), authority)
+                .expect("append pressure receiver store"),
+        );
+        let mut receiver_verifier = open_test_sealer(&receiver.credentials);
+        let unrelated = publish_test_blob_with_priority(
+            &receiver_store,
+            &mut receiver_verifier,
+            &topic,
+            &scope,
+            1,
+            Priority::Flash,
+            &[0x7a; 4 * 1024],
+        );
+        let append_fault = install_test_blob_contact_fault(
+            receiver.credentials.identity(),
+            TestBlobContactFault::AppendCapacity,
+        );
+        let source_cache = test_event_route_cache(&source_store, &source_mission.credentials);
+        let receiver_cache = test_event_route_cache(&receiver_store, &receiver.credentials);
+        stage_test_pending_blob(
+            &receiver_store,
+            &receiver_cache,
+            &receiver.credentials,
+            evicted,
+            &evicted_sealed,
+        );
+
+        for _ in 0..16 {
+            let _ = blob_contact_test_pair_with_caches(
+                source_store.clone(),
+                source_mission.credentials.clone(),
+                interests(),
+                Arc::clone(&source_cache),
+                receiver_store.clone(),
+                receiver.credentials.clone(),
+                interests(),
+                Arc::clone(&receiver_cache),
+                None,
+                None,
+                None,
+                None,
+                0,
+            )
+            .await;
+            if receiver_store
+                .get_blob(incoming)
+                .expect("append-pressure incoming lookup")
+                .is_some()
+            {
+                break;
+            }
+        }
+
+        assert!(append_fault.fired.load(Ordering::Acquire));
+        assert_eq!(receiver_cache.blob_stage_admission_attempts(), 1);
+        assert_eq!(receiver_cache.blob_carrier_append_attempts(), 2);
+        assert_eq!(receiver_cache.blob_carrier_commit_attempts(), 1);
+        assert_eq!(receiver_cache.blob_promotion_attempts(), 1);
+        assert_eq!(receiver_cache.blob_capacity_recovery_attempts(), 1);
+        assert_single_blob_recovery_retries_identical(
+            &receiver_cache,
+            |step| matches!(step, TestBlobAdmissionTrace::Append { source, .. } if *source == incoming),
+        );
+        assert!(!receiver_cache.has_blob_claim_for_test(evicted));
+        assert!(
+            receiver_store
+                .pending_blob_source(evicted)
+                .expect("append-evicted pending source lookup")
+                .is_none()
+        );
+        assert!(receiver_cache.has_blob_claim_for_test(unrelated));
+        assert!(receiver_cache.has_blob_claim_for_test(incoming));
+
+        drop(low_store);
+        drop(source_store);
+        drop(receiver_store);
+        for state in [low_state, source_state, receiver_state] {
+            fs::remove_dir_all(state).expect("append pressure cleanup");
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_blob_staging_retry_propagates_injected_invariant() {
+        let mut missions = issue_missions(2);
+        let receiver = missions.pop().expect("staging retry receiver mission");
+        let source_mission = missions.pop().expect("staging retry source mission");
+        let authority = source_mission.credentials.mission_authority_id();
+        let topic = Topic::new("opaque").expect("staging retry topic");
+        let scope = Scope::new("test/runtime-contact").expect("staging retry scope");
+        let interests = || {
+            MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
+                topic.clone(),
+                scope.clone(),
+                false,
+            )])
+        };
+        let source_state = root("blob-staging-retry-invariant-source");
+        let receiver_state = root("blob-staging-retry-invariant-receiver");
+        fs::create_dir_all(&source_state).expect("staging retry source state");
+        fs::create_dir_all(&receiver_state).expect("staging retry receiver state");
+        let source_store = Arc::new(
+            Store::open_for_mission(source_state.join(STORE_FILE), authority)
+                .expect("staging retry source store"),
+        );
+        let receiver_store = Arc::new(
+            Store::open_for_mission(receiver_state.join(STORE_FILE), authority)
+                .expect("staging retry receiver store"),
+        );
+        let mut receiver_verifier = open_test_sealer(&receiver.credentials);
+        let evicted = publish_test_blob_with_priority(
+            &receiver_store,
+            &mut receiver_verifier,
+            &topic,
+            &scope,
+            1,
+            Priority::Routine,
+            &[0x81; 4 * 1024],
+        );
+        let mut source_verifier = open_test_sealer(&source_mission.credentials);
+        let incoming = publish_test_blob_with_priority(
+            &source_store,
+            &mut source_verifier,
+            &topic,
+            &scope,
+            1,
+            Priority::Flash,
+            &[0x82; 4 * 1024],
+        );
+        let retry_fault = install_test_blob_contact_fault(
+            receiver.credentials.identity(),
+            TestBlobContactFault::StageCapacityThenRetryCoherence,
+        );
+        let source_cache = test_event_route_cache(&source_store, &source_mission.credentials);
+        let receiver_cache = test_event_route_cache(&receiver_store, &receiver.credentials);
+
+        let (receiver_result, _) = blob_contact_test_pair_with_caches_results(
+            Arc::clone(&source_store),
+            source_mission.credentials.clone(),
+            interests(),
+            Arc::clone(&source_cache),
+            Arc::clone(&receiver_store),
+            receiver.credentials.clone(),
+            interests(),
+            Arc::clone(&receiver_cache),
+            None,
+            None,
+            None,
+            None,
+            0,
+        )
+        .await;
+
+        assert!(matches!(
+            receiver_result,
+            Err(NodeError::FatalBlobCoherence(ref message))
+                if message.contains("staging retry coherence failure")
+        ));
+        assert!(retry_fault.exhausted());
+        assert_eq!(receiver_cache.blob_stage_admission_attempts(), 2);
+        assert_eq!(receiver_cache.blob_capacity_recovery_attempts(), 1);
+        assert!(!receiver_cache.has_blob_claim_for_test(evicted));
+        assert!(!receiver_cache.has_blob_claim_for_test(incoming));
+
+        drop(source_cache);
+        drop(receiver_cache);
+        drop(source_store);
+        drop(receiver_store);
+        for state in [source_state, receiver_state] {
+            fs::remove_dir_all(state).expect("staging retry cleanup");
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_blob_append_retry_propagates_injected_invariant() {
+        let mut missions = issue_missions(2);
+        let receiver = missions.pop().expect("append retry receiver mission");
+        let source_mission = missions.pop().expect("append retry source mission");
+        let authority = source_mission.credentials.mission_authority_id();
+        let topic = Topic::new("opaque").expect("append retry topic");
+        let scope = Scope::new("test/runtime-contact").expect("append retry scope");
+        let interests = || {
+            MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
+                topic.clone(),
+                scope.clone(),
+                false,
+            )])
+        };
+        let low_state = root("blob-append-retry-invariant-low");
+        let source_state = root("blob-append-retry-invariant-source");
+        let receiver_state = root("blob-append-retry-invariant-receiver");
+        for state in [&low_state, &source_state, &receiver_state] {
+            fs::create_dir_all(state).expect("append retry state");
+        }
+        let low_store = Store::open_for_mission(low_state.join(STORE_FILE), authority)
+            .expect("append retry low store");
+        let mut low_verifier = open_test_sealer(&source_mission.credentials);
+        let evicted = publish_test_blob_with_priority(
+            &low_store,
+            &mut low_verifier,
+            &topic,
+            &scope,
+            1,
+            Priority::Routine,
+            &[0x83; 4 * 1024],
+        );
+        let evicted_sealed = low_store
+            .get_blob(evicted)
+            .expect("append retry low lookup")
+            .expect("append retry low source")
+            .sealed;
+        let source_store = Arc::new(
+            Store::open_for_mission(source_state.join(STORE_FILE), authority)
+                .expect("append retry source store"),
+        );
+        let mut source_verifier = open_test_sealer(&source_mission.credentials);
+        let incoming = publish_test_blob_with_priority(
+            &source_store,
+            &mut source_verifier,
+            &topic,
+            &scope,
+            1,
+            Priority::Flash,
+            &[0x84; 4 * 1024],
+        );
+        let receiver_store = Arc::new(
+            Store::open_for_mission(receiver_state.join(STORE_FILE), authority)
+                .expect("append retry receiver store"),
+        );
+        let retry_fault = install_test_blob_contact_fault(
+            receiver.credentials.identity(),
+            TestBlobContactFault::AppendCapacityThenRetryCoherence,
+        );
+        let source_cache = test_event_route_cache(&source_store, &source_mission.credentials);
+        let receiver_cache = test_event_route_cache(&receiver_store, &receiver.credentials);
+        stage_test_pending_blob(
+            &receiver_store,
+            &receiver_cache,
+            &receiver.credentials,
+            evicted,
+            &evicted_sealed,
+        );
+
+        let mut receiver_error = None;
+        for _ in 0..16 {
+            let (receiver_result, _) = blob_contact_test_pair_with_caches_results(
+                Arc::clone(&source_store),
+                source_mission.credentials.clone(),
+                interests(),
+                Arc::clone(&source_cache),
+                Arc::clone(&receiver_store),
+                receiver.credentials.clone(),
+                interests(),
+                Arc::clone(&receiver_cache),
+                None,
+                None,
+                None,
+                None,
+                0,
+            )
+            .await;
+            if let Err(error) = receiver_result {
+                receiver_error = Some(error);
+                break;
+            }
+        }
+
+        assert!(
+            matches!(
+                &receiver_error,
+                Some(NodeError::FatalBlobCoherence(message))
+                    if message.contains("carrier append retry coherence failure")
+            ),
+            "unexpected append retry result: {receiver_error:?}"
+        );
+        assert!(retry_fault.exhausted());
+        assert_eq!(receiver_cache.blob_stage_admission_attempts(), 1);
+        assert_eq!(receiver_cache.blob_carrier_append_attempts(), 2);
+        assert_eq!(receiver_cache.blob_capacity_recovery_attempts(), 1);
+        assert!(!receiver_cache.has_blob_claim_for_test(evicted));
+        assert!(receiver_cache.has_blob_claim_for_test(incoming));
+
+        drop(low_store);
+        drop(source_cache);
+        drop(receiver_cache);
+        drop(source_store);
+        drop(receiver_store);
+        for state in [low_state, source_state, receiver_state] {
+            fs::remove_dir_all(state).expect("append retry cleanup");
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_blob_promotion_retry_propagates_injected_invariant() {
+        let mut missions = issue_missions(2);
+        let receiver = missions.pop().expect("promotion retry receiver mission");
+        let source_mission = missions.pop().expect("promotion retry source mission");
+        let authority = source_mission.credentials.mission_authority_id();
+        let topic = Topic::new("opaque").expect("promotion retry topic");
+        let scope = Scope::new("test/runtime-contact").expect("promotion retry scope");
+        let interests = || {
+            MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
+                topic.clone(),
+                scope.clone(),
+                false,
+            )])
+        };
+        let source_state = root("blob-promotion-retry-invariant-source");
+        let receiver_state = root("blob-promotion-retry-invariant-receiver");
+        fs::create_dir_all(&source_state).expect("promotion retry source state");
+        fs::create_dir_all(&receiver_state).expect("promotion retry receiver state");
+        let source_store = Arc::new(
+            Store::open_for_mission(source_state.join(STORE_FILE), authority)
+                .expect("promotion retry source store"),
+        );
+        let receiver_store = Arc::new(
+            Store::open_for_mission(receiver_state.join(STORE_FILE), authority)
+                .expect("promotion retry receiver store"),
+        );
+        let mut receiver_verifier = open_test_sealer(&receiver.credentials);
+        let evicted = publish_test_blob_with_priority(
+            &receiver_store,
+            &mut receiver_verifier,
+            &topic,
+            &scope,
+            1,
+            Priority::Routine,
+            &[0x85; 4 * 1024],
+        );
+        let mut source_verifier = open_test_sealer(&source_mission.credentials);
+        let incoming = publish_test_blob_with_priority(
+            &source_store,
+            &mut source_verifier,
+            &topic,
+            &scope,
+            1,
+            Priority::Flash,
+            &[0x85; 4 * 1024],
+        );
+        let retry_fault = install_test_blob_contact_fault(
+            receiver.credentials.identity(),
+            TestBlobContactFault::PromotionCapacityThenRetryCoherence,
+        );
+        let source_cache = test_event_route_cache(&source_store, &source_mission.credentials);
+        let receiver_cache = test_event_route_cache(&receiver_store, &receiver.credentials);
+
+        let mut receiver_error = None;
+        for _ in 0..16 {
+            let (receiver_result, _) = blob_contact_test_pair_with_caches_results(
+                Arc::clone(&source_store),
+                source_mission.credentials.clone(),
+                interests(),
+                Arc::clone(&source_cache),
+                Arc::clone(&receiver_store),
+                receiver.credentials.clone(),
+                interests(),
+                Arc::clone(&receiver_cache),
+                None,
+                None,
+                None,
+                None,
+                0,
+            )
+            .await;
+            if let Err(error) = receiver_result {
+                receiver_error = Some(error);
+                break;
+            }
+        }
+
+        assert!(
+            matches!(
+                &receiver_error,
+                Some(NodeError::FatalBlobCoherence(message))
+                    if message.contains("promotion retry coherence failure")
+            ),
+            "unexpected promotion retry result: {receiver_error:?}; fault_exhausted={} stage={} append={} commit={} promotion={} recovery={} pending={} incoming_claim={} evicted_claim={}",
+            retry_fault.exhausted(),
+            receiver_cache.blob_stage_admission_attempts(),
+            receiver_cache.blob_carrier_append_attempts(),
+            receiver_cache.blob_carrier_commit_attempts(),
+            receiver_cache.blob_promotion_attempts(),
+            receiver_cache.blob_capacity_recovery_attempts(),
+            receiver_store
+                .pending_blob_source(incoming)
+                .expect("promotion retry pending diagnostic")
+                .is_some(),
+            receiver_cache.has_blob_claim_for_test(incoming),
+            receiver_cache.has_blob_claim_for_test(evicted),
+        );
+        assert!(retry_fault.exhausted());
+        assert_eq!(receiver_cache.blob_stage_admission_attempts(), 1);
+        assert_eq!(receiver_cache.blob_carrier_append_attempts(), 0);
+        assert_eq!(receiver_cache.blob_carrier_commit_attempts(), 0);
+        assert_eq!(receiver_cache.blob_promotion_attempts(), 2);
+        assert_eq!(receiver_cache.blob_capacity_recovery_attempts(), 1);
+        assert!(!receiver_cache.has_blob_claim_for_test(evicted));
+        assert!(!receiver_cache.has_blob_claim_for_test(incoming));
+
+        drop(source_cache);
+        drop(receiver_cache);
+        drop(source_store);
+        drop(receiver_store);
+        for state in [source_state, receiver_state] {
+            fs::remove_dir_all(state).expect("promotion retry cleanup");
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_blob_insufficient_pressure_preserves_original_deferral_without_retry() {
+        let mut missions = issue_missions(2);
+        let receiver = missions.pop().expect("insufficient receiver mission");
+        let source_mission = missions.pop().expect("insufficient source mission");
+        let authority = source_mission.credentials.mission_authority_id();
+        let topic = Topic::new("opaque").expect("insufficient Blob topic");
+        let scope = Scope::new("test/runtime-contact").expect("insufficient Blob scope");
+        let interests = || {
+            MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
+                topic.clone(),
+                scope.clone(),
+                false,
+            )])
+        };
+        let source_state = root("blob-pressure-insufficient-source");
+        let receiver_state = root("blob-pressure-insufficient-receiver");
+        fs::create_dir_all(&source_state).expect("insufficient source state");
+        fs::create_dir_all(&receiver_state).expect("insufficient receiver state");
+        let source_store = Arc::new(
+            Store::open_for_mission(source_state.join(STORE_FILE), authority)
+                .expect("insufficient source store"),
+        );
+        let receiver_store = Arc::new(
+            Store::open_with_limits_and_blob_depot_limits_for_mission(
+                receiver_state.join(STORE_FILE),
+                StoreLimits::default(),
+                BlobDepotLimits::new(1_000_000, 4, 1).expect("insufficient one-variant limits"),
+                authority,
+            )
+            .expect("insufficient receiver store"),
+        );
+        let mut receiver_verifier = open_test_sealer(&receiver.credentials);
+        let retained = publish_test_blob_with_priority(
+            &receiver_store,
+            &mut receiver_verifier,
+            &topic,
+            &scope,
+            1,
+            Priority::Priority,
+            &[0x71; 8 * 1024],
+        );
+        let mut source_verifier = open_test_sealer(&source_mission.credentials);
+        let incoming = publish_test_blob_with_priority(
+            &source_store,
+            &mut source_verifier,
+            &topic,
+            &scope,
+            1,
+            Priority::Priority,
+            &[0x72; 8 * 1024],
+        );
+        let source_cache = test_event_route_cache(&source_store, &source_mission.credentials);
+        let receiver_cache = test_event_route_cache(&receiver_store, &receiver.credentials);
+
+        let (receiver_receipt, _) = blob_contact_test_pair_with_caches(
+            source_store.clone(),
+            source_mission.credentials.clone(),
+            interests(),
+            source_cache,
+            receiver_store.clone(),
+            receiver.credentials.clone(),
+            interests(),
+            Arc::clone(&receiver_cache),
+            None,
+            None,
+            None,
+            None,
+            0,
+        )
+        .await;
+
+        assert_eq!(receiver_cache.blob_capacity_recovery_attempts(), 1);
+        assert!(receiver_receipt.blob_deferred > 0);
+        assert!(receiver_cache.has_blob_claim_for_test(retained));
+        assert!(!receiver_cache.has_blob_claim_for_test(incoming));
+        assert!(
+            receiver_store
+                .get_blob(retained)
+                .expect("retained equal-priority lookup")
+                .is_some()
+        );
+        assert!(
+            receiver_store
+                .get_blob(incoming)
+                .expect("unadmitted equal-priority lookup")
+                .is_none()
+        );
+
+        drop(source_store);
+        drop(receiver_store);
+        for state in [source_state, receiver_state] {
+            fs::remove_dir_all(state).expect("insufficient pressure cleanup");
+        }
     }
 
     #[test]
@@ -44100,6 +46161,47 @@ mod tests {
         client_reconciliation_exchanges_before_defer: Option<usize>,
         preaccounted_contact_items: usize,
     ) -> (PeerReceipt, PeerReceipt) {
+        let (client, server) = blob_contact_test_pair_with_caches_results(
+            server_store,
+            server_mission,
+            server_interests,
+            server_cache,
+            client_store,
+            client_mission,
+            client_interests,
+            client_cache,
+            server_bridge,
+            client_bridge,
+            server_reconciliation_exchanges_before_defer,
+            client_reconciliation_exchanges_before_defer,
+            preaccounted_contact_items,
+        )
+        .await;
+        (
+            client.expect("Blob client contact").receipt,
+            server.expect("Blob server contact").receipt,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn blob_contact_test_pair_with_caches_results(
+        server_store: Arc<Store>,
+        server_mission: UnprotectedReferenceMission,
+        server_interests: MutableSourceInterests,
+        server_cache: Arc<AuthenticatedEventRouteCache>,
+        client_store: Arc<Store>,
+        client_mission: UnprotectedReferenceMission,
+        client_interests: MutableSourceInterests,
+        client_cache: Arc<AuthenticatedEventRouteCache>,
+        server_bridge: Option<SelectedEventBridgeHandle>,
+        client_bridge: Option<SelectedEventBridgeHandle>,
+        server_reconciliation_exchanges_before_defer: Option<usize>,
+        client_reconciliation_exchanges_before_defer: Option<usize>,
+        preaccounted_contact_items: usize,
+    ) -> (
+        Result<CompletedPeerContact, NodeError>,
+        Result<CompletedPeerContact, NodeError>,
+    ) {
         let server = Endpoint::bind(
             aster_iroh::SecretKey::generate(),
             EndpointConfig::direct("127.0.0.1:0".parse().expect("server address")),
@@ -44183,15 +46285,11 @@ mod tests {
                     ),
                 ),
             )
-            .await
-            .expect("Blob client contact");
-        let server_receipt = server_task
-            .await
-            .expect("Blob server task")
-            .expect("Blob server contact");
+            .await;
+        let server_receipt = server_task.await.expect("Blob server task");
         client.close().await;
         server.close().await;
-        (client_receipt.receipt, server_receipt.receipt)
+        (client_receipt, server_receipt)
     }
 
     #[tokio::test]

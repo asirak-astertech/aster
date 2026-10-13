@@ -486,6 +486,15 @@ Pressure eviction begins only after routine cleanup. An incoming publication or
 transfer can evict only candidates whose effective priority is strictly lower
 than the incoming priority. Equal- and higher-priority live data is protected.
 
+Pressure selection is partition-specific. Aggregate item/byte and per-content
+publication pressure selects live publications; network-staging row/byte
+pressure selects pending sources; and depot byte/chunk/variant pressure selects
+whole physical variants. Operation, publication-lifecycle, causal-frontier,
+lease, lineage-fence, and replay-fence limits do not invoke pressure eviction:
+retirement cannot safely or immediately recover those resources. A pressure
+attempt receives the exact rejected partition and deficit and considers only
+candidates capable of releasing that partition.
+
 Candidate ordering is deterministic:
 
 1. ascending effective priority;
@@ -495,11 +504,27 @@ Candidate ordering is deterministic:
 5. oldest acceptance order; and
 6. exact publication or variant identity.
 
+"Least completion" is an exact rational comparison without floating point.
+For a pending-source candidate it is durable carrier-prefix bytes divided by
+the authenticated total carrier bytes. For an incomplete whole-variant
+candidate it is durable committed plaintext bytes divided by the authenticated
+manifest total length. Cross multiplication uses overflow-safe widened
+arithmetic, and the exact identity breaks a remaining tie.
+
 For shared content, effective priority is the maximum priority of all surviving
 publication and pending-source roots. Final-reference expiry is the latest
 expiry of those roots; any durable root makes the variant durable for ranking.
 Removing a publication claims only metadata bytes unless the final physical
 root also disappears.
+
+The acceptance-order tie-break for a shared variant is the minimum order among
+its roots. Completed publications use their existing acceptance markers.
+Pending sources use a separate durable monotonic order allocated when the
+source is first staged; promotion receives the normal publication marker so
+subscription order continues to reflect application-visible completion.
+Writable migration assigns legacy pending sources deterministic increasing
+orders in exact transfer-identity order because their historical arrival order
+is not recoverable.
 
 Completed content may be physically evicted only when every surviving root is
 strictly lower priority than the incoming work. The eviction transaction then
@@ -513,6 +538,14 @@ per-scope Blob quotas. Pressure eviction never deletes lineage or replay fences
 and therefore cannot recover their separate security capacity; callers receive
 the distinct typed capacity errors defined above rather than an ordinary depot
 capacity error.
+
+One candidate is an atomic pressure work unit. Selection chooses the first
+eligible candidate in the ordering above and preflights every root, operation,
+delivery, index, lease-generation check, retirement record, and deletion
+manifest row needed for that candidate before mutation. If that complete unit
+does not fit the remaining bounded recovery budget, the attempt makes no
+mutation, does not skip to a lower-ranked candidate, and returns the original
+capacity failure after the caller's single retry.
 
 ## Operation retirement retention
 

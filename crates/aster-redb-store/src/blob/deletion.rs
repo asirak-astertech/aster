@@ -5,7 +5,7 @@ use redb::{
     MultimapTableHandle, ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle,
 };
 
-use super::{BlobStoreError, BlobVariantId, MAX_SELECTED_BLOB_CHUNKS};
+use super::{BlobStoreError, BlobVariantId, MAX_SELECTED_BLOB_CHUNKS, MaintenanceCharge};
 use crate::StoreError;
 use crate::custody::{LowerBoundAgeCheckpoint, LowerBoundContinuity, project_lower_bound_age};
 
@@ -92,6 +92,9 @@ thread_local! {
     };
     static TEST_MANIFEST_ADMISSION_MUTATIONS: std::cell::Cell<u64> = const {
         std::cell::Cell::new(0)
+    };
+    static TEST_MANIFEST_ADMISSION_DISCOVERY_FORBIDDEN: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
     };
     static TEST_MANIFEST_FINALIZATION_FAULT_ORDINAL: std::cell::Cell<Option<u64>> = const {
         std::cell::Cell::new(None)
@@ -1051,6 +1054,26 @@ pub(crate) fn variant_has_deletion_manifest_write(
     Ok(true)
 }
 
+pub(crate) fn bounded_variant_has_deletion_manifest_write(
+    write: &redb::WriteTransaction,
+    variant: BlobVariantId,
+    charge: &mut MaintenanceCharge,
+) -> Result<Option<bool>, StoreError> {
+    let manifests = write.open_table(BLOB_DELETION_MANIFESTS)?;
+    let Some(encoded) = manifests.get(variant.as_bytes().as_slice())? else {
+        return Ok(Some(false));
+    };
+    if !charge.charge(variant.as_bytes(), encoded.value().len())? {
+        return Ok(None);
+    }
+    if decode_manifest_header(encoded.value())?.variant_id != variant {
+        return Err(invariant(
+            "Blob deletion manifest key differs from its identity",
+        ));
+    }
+    Ok(Some(true))
+}
+
 #[cfg(test)]
 pub(crate) fn set_manifest_admission_fault_ordinal_for_test(ordinal: Option<u64>) {
     TEST_MANIFEST_ADMISSION_FAULT_ORDINAL.set(ordinal);
@@ -1060,6 +1083,21 @@ pub(crate) fn set_manifest_admission_fault_ordinal_for_test(ordinal: Option<u64>
 #[cfg(test)]
 pub(crate) fn manifest_admission_mutations_for_test() -> u64 {
     TEST_MANIFEST_ADMISSION_MUTATIONS.get()
+}
+
+#[cfg(test)]
+pub(crate) fn set_manifest_admission_discovery_forbidden_for_test(forbidden: bool) {
+    TEST_MANIFEST_ADMISSION_DISCOVERY_FORBIDDEN.set(forbidden);
+}
+
+fn manifest_admission_discovery_boundary() -> Result<(), StoreError> {
+    #[cfg(test)]
+    if TEST_MANIFEST_ADMISSION_DISCOVERY_FORBIDDEN.get() {
+        return Err(invariant(
+            "injected Blob manifest admission discovery failure",
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn begin_manifest_admission_mutations() {
@@ -1161,41 +1199,128 @@ fn require_admission_accounting(
 /// Atomically replaces one exact variant's ordinary chunk authority with its
 /// durable deletion-manifest authority. The caller owns the surrounding write
 /// transaction, the depot coordination lock, and the provisional lease fence.
-pub(crate) fn admit_variant_write(
+fn charge_pressure_admission_row(
+    charge: &mut Option<&mut MaintenanceCharge>,
+    key: &[u8],
+    value_len: usize,
+) -> Result<bool, StoreError> {
+    match charge.as_deref_mut() {
+        Some(charge) => charge.charge(key, value_len),
+        None => Ok(true),
+    }
+}
+
+#[derive(Debug)]
+struct BlobDeletionAdmissionChunkPlan {
+    key: [u8; 40],
+    expected_active: Vec<u8>,
+    encoded_deletion: Vec<u8>,
+}
+
+/// An owned, transaction-local admission plan. Every discovered byte needed
+/// by apply is retained here, so applying the plan performs point mutations
+/// only and never repeats range discovery or record decoding.
+#[derive(Debug)]
+pub(crate) struct BlobDeletionAdmissionPlan {
+    variant: BlobVariantId,
+    chunks: Vec<BlobDeletionAdmissionChunkPlan>,
+    encoded_manifest: Vec<u8>,
+    encoded_continuity: Option<Vec<u8>>,
+    metadata_updates: Vec<(&'static str, u64)>,
+}
+
+pub(crate) fn plan_variant_admission_write(
     write: &redb::WriteTransaction,
     variant: BlobVariantId,
     expected_import: &[u8],
     expected_lineage: &[u8],
     owner_binding: [u8; 32],
     custody_sample: Option<CustodySample>,
-) -> Result<bool, StoreError> {
-    let existing_stats = require_admission_accounting(write)?;
-    if variant_has_deletion_manifest_write(write, variant)? {
-        return Ok(false);
+    mut pressure_charge: Option<&mut MaintenanceCharge>,
+) -> Result<Option<BlobDeletionAdmissionPlan>, StoreError> {
+    manifest_admission_discovery_boundary()?;
+    for field in DELETION_METADATA_FIELDS {
+        if !charge_pressure_admission_row(
+            &mut pressure_charge,
+            field.as_bytes(),
+            std::mem::size_of::<u64>(),
+        )? {
+            return Ok(None);
+        }
     }
-    let original_import = write
-        .open_table(super::BLOB_IMPORTS)?
+    let existing_stats = require_admission_accounting(write)?;
+    let manifests = write.open_table(BLOB_DELETION_MANIFESTS)?;
+    if let Some(encoded) = manifests.get(variant.as_bytes().as_slice())? {
+        if !charge_pressure_admission_row(
+            &mut pressure_charge,
+            variant.as_bytes(),
+            encoded.value().len(),
+        )? {
+            return Ok(None);
+        }
+        if decode_manifest_header(encoded.value())?.variant_id != variant {
+            return Err(invariant(
+                "Blob deletion manifest key differs from its identity",
+            ));
+        }
+        return Ok(None);
+    }
+    drop(manifests);
+    let imports = write.open_table(super::BLOB_IMPORTS)?;
+    let original_import = imports
         .get(variant.as_bytes().as_slice())?
-        .ok_or_else(|| invariant("Blob manifest admission import is missing"))?
-        .value()
-        .to_vec();
+        .ok_or_else(|| invariant("Blob manifest admission import is missing"))?;
+    if !charge_pressure_admission_row(
+        &mut pressure_charge,
+        variant.as_bytes(),
+        original_import.value().len(),
+    )? {
+        return Ok(None);
+    }
+    let encoded_import = original_import.value().to_vec();
+    drop(original_import);
+    drop(imports);
+    let original_import = encoded_import;
     if original_import != expected_import {
         return Err(invariant(
             "Blob manifest admission import changed after discovery",
         ));
     }
     let import = super::depot::deletion_import_projection(variant.as_bytes(), &original_import)?;
+    for field in [
+        super::DEPOT_OWNER_BINDING_0,
+        super::DEPOT_OWNER_BINDING_1,
+        super::DEPOT_OWNER_BINDING_2,
+        super::DEPOT_OWNER_BINDING_3,
+    ] {
+        if !charge_pressure_admission_row(
+            &mut pressure_charge,
+            field.as_bytes(),
+            std::mem::size_of::<u64>(),
+        )? {
+            return Ok(None);
+        }
+    }
     let actual_owner = super::depot::depot_owner_binding_if_present_write(write)?
         .ok_or_else(|| invariant("Blob manifest admission owner binding is missing"))?;
     if actual_owner != owner_binding {
         return Err(invariant("Blob manifest admission owner binding changed"));
     }
-    let lineage_fence = write
-        .open_table(super::lifecycle::BLOB_LINEAGE_FENCES)?
+    let lineage_fences = write.open_table(super::lifecycle::BLOB_LINEAGE_FENCES)?;
+    let lineage_fence = lineage_fences
         .get(variant.as_bytes().as_slice())?
-        .ok_or_else(|| invariant("Blob manifest admission lineage fence is missing"))?
-        .value()
-        .to_vec();
+        .ok_or_else(|| invariant("Blob manifest admission lineage fence is missing"))?;
+    if !charge_pressure_admission_row(
+        &mut pressure_charge,
+        variant.as_bytes(),
+        lineage_fence.value().len(),
+    )? {
+        return Ok(None);
+    }
+    let encoded_lineage_fence = lineage_fence.value().to_vec();
+    drop(lineage_fence);
+    drop(lineage_fences);
+    let lineage_fence = encoded_lineage_fence;
     if lineage_fence != expected_lineage {
         return Err(invariant(
             "Blob manifest admission lineage changed after discovery",
@@ -1209,7 +1334,7 @@ pub(crate) fn admit_variant_write(
 
     let first = chunk_key(variant, 0);
     let last = chunk_key(variant, u64::MAX);
-    if write
+    if let Some(row) = write
         .open_table(BLOB_DELETION_CHUNKS)?
         .range::<&[u8]>((
             std::ops::Bound::Included(first.as_slice()),
@@ -1217,8 +1342,11 @@ pub(crate) fn admit_variant_write(
         ))?
         .next()
         .transpose()?
-        .is_some()
     {
+        let (key, value) = row;
+        if !charge_pressure_admission_row(&mut pressure_charge, key.value(), value.value().len())? {
+            return Ok(None);
+        }
         return Err(invariant(
             "Blob manifest admission found pre-existing deletion chunk authority",
         ));
@@ -1230,6 +1358,9 @@ pub(crate) fn admit_variant_write(
         std::ops::Bound::Included(last.as_slice()),
     ))? {
         let (key, value) = row?;
+        if !charge_pressure_admission_row(&mut pressure_charge, key.value(), value.value().len())? {
+            return Ok(None);
+        }
         let (actual_variant, index) = parse_chunk_key(key.value())?;
         if actual_variant != variant {
             return Err(invariant(
@@ -1255,6 +1386,23 @@ pub(crate) fn admit_variant_write(
     for (index, original_chunk) in &originals {
         let projected =
             super::depot::deletion_chunk_projection(&original_import, *index, original_chunk)?;
+        if !charge_pressure_admission_row(
+            &mut pressure_charge,
+            chunk_key(variant, *index).as_slice(),
+            original_chunk.len(),
+        )? {
+            return Ok(None);
+        }
+        let encoded_chunk_len = CHUNK_FIXED_BYTES
+            .checked_add(original_chunk.len())
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+        if !charge_pressure_admission_row(
+            &mut pressure_charge,
+            chunk_key(variant, *index).as_slice(),
+            encoded_chunk_len,
+        )? {
+            return Ok(None);
+        }
         charged_reserved_bytes = charged_reserved_bytes
             .checked_add(projected.charged_reserved_bytes)
             .ok_or(StoreError::PayloadByteAccountingOverflow)?;
@@ -1298,38 +1446,75 @@ pub(crate) fn admit_variant_write(
     )?;
     let chunk_count =
         u64::try_from(chunks.len()).map_err(|_| StoreError::ItemCountAccountingOverflow)?;
-    let initial_age = match custody_sample {
+    let continuity = write.open_table(BLOB_DELETION_CONTINUITY)?;
+    let encoded_continuity_before = match continuity.get(CONTINUITY_KEY)? {
+        Some(encoded) => {
+            if !charge_pressure_admission_row(
+                &mut pressure_charge,
+                &[CONTINUITY_KEY],
+                encoded.value().len(),
+            )? {
+                return Ok(None);
+            }
+            Some(encoded.value().to_vec())
+        }
+        None => None,
+    };
+    drop(continuity);
+    let previous_continuity = encoded_continuity_before
+        .as_deref()
+        .map(decode_continuity_state)
+        .transpose()?;
+    let (observed_continuity, initial_age) = match custody_sample {
         Some(sample) => {
-            let continuity = observe_blob_deletion_continuity_write(write, sample)?;
-            if continuity.last_sample.clock_id == sample.clock_id
-                && continuity.last_sample.tick_ms == sample.tick_ms
+            let (state, observed) = project_observed_blob_deletion_continuity(
+                previous_continuity,
+                sample,
+                existing_stats.manifests,
+            )?;
+            let age = if observed.last_sample.clock_id == sample.clock_id
+                && observed.last_sample.tick_ms == sample.tick_ms
             {
                 BlobDeletionAge {
                     cumulative_age_ms: 0,
                     checkpoint: Some(sample),
-                    continuity_generation: continuity.generation,
+                    continuity_generation: observed.generation,
                     continuity_lost: false,
                 }
             } else {
                 BlobDeletionAge {
                     cumulative_age_ms: 0,
                     checkpoint: None,
-                    continuity_generation: continuity.generation,
+                    continuity_generation: observed.generation,
                     continuity_lost: true,
                 }
-            }
+            };
+            (Some(state), age)
         }
         None => {
-            let continuity =
-                blob_deletion_continuity_state_write(write)?.map(newest_blob_deletion_continuity);
-            BlobDeletionAge {
-                cumulative_age_ms: 0,
-                checkpoint: None,
-                continuity_generation: continuity.map_or(0, |continuity| continuity.generation),
-                continuity_lost: continuity.is_some(),
-            }
+            let continuity = previous_continuity.map(newest_blob_deletion_continuity);
+            (
+                previous_continuity,
+                BlobDeletionAge {
+                    cumulative_age_ms: 0,
+                    checkpoint: None,
+                    continuity_generation: continuity.map_or(0, |continuity| continuity.generation),
+                    continuity_lost: continuity.is_some(),
+                },
+            )
         }
     };
+    let encoded_manifest_len = MANIFEST_FIXED_BYTES
+        .checked_add(lineage_fence.len())
+        .and_then(|length| length.checked_add(original_import.len()))
+        .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+    if !charge_pressure_admission_row(
+        &mut pressure_charge,
+        variant.as_bytes(),
+        encoded_manifest_len,
+    )? {
+        return Ok(None);
+    }
     let manifest = BlobDeletionManifest {
         variant_id: variant,
         blob_id: import.blob_id,
@@ -1356,6 +1541,11 @@ pub(crate) fn admit_variant_write(
     };
     manifest.validate()?;
     let encoded_manifest = encode_manifest_record(&manifest)?;
+    if encoded_manifest.len() != encoded_manifest_len {
+        return Err(invariant(
+            "Blob deletion manifest encoding differs from its planned length",
+        ));
+    }
     let encoded_chunks = manifest
         .chunks
         .iter()
@@ -1371,94 +1561,195 @@ pub(crate) fn admit_variant_write(
             )?)
             .ok_or(StoreError::PayloadByteAccountingOverflow)?;
     }
-
-    begin_manifest_admission_mutations();
-    let mut active_chunks = write.open_table(super::BLOB_CHUNKS)?;
-    for (index, _) in &originals {
-        active_chunks
-            .remove(chunk_key(variant, *index).as_slice())?
-            .ok_or_else(|| invariant("Blob manifest admission lost ordinary chunk authority"))?;
-        manifest_admission_mutation_boundary()?;
-    }
-    drop(active_chunks);
-    write
-        .open_table(BLOB_DELETION_MANIFESTS)?
-        .insert(variant.as_bytes().as_slice(), encoded_manifest.as_slice())?;
-    account_admitted_manifest_in_continuity_transition(write, manifest.variant_id, manifest.age)?;
-    manifest_admission_mutation_boundary()?;
-    let mut deletion_chunks = write.open_table(BLOB_DELETION_CHUNKS)?;
-    for (chunk, encoded) in manifest.chunks.iter().zip(&encoded_chunks) {
-        deletion_chunks.insert(
-            chunk_key(variant, chunk.index).as_slice(),
-            encoded.as_slice(),
-        )?;
-        manifest_admission_mutation_boundary()?;
-    }
-    drop(deletion_chunks);
-
-    let mut metadata = write.open_table(BLOB_DELETION_METADATA)?;
-    for (field, current, delta) in [
-        (BLOB_DELETION_MANIFEST_ROWS, existing_stats.manifests, 1),
-        (BLOB_DELETION_CHUNK_ROWS, existing_stats.chunks, chunk_count),
+    let admitted_continuity =
+        project_admitted_manifest_in_continuity_transition(observed_continuity, manifest.age)?;
+    let encoded_continuity = if admitted_continuity != previous_continuity {
+        let state = admitted_continuity.ok_or_else(|| {
+            invariant("Blob manifest admission removed deletion continuity authority")
+        })?;
+        let encoded_len = continuity_state_encoded_len(state)?;
+        if !charge_pressure_admission_row(&mut pressure_charge, &[CONTINUITY_KEY], encoded_len)? {
+            return Ok(None);
+        }
+        let encoded = encode_continuity_state(state)?;
+        if encoded.len() != encoded_len {
+            return Err(invariant(
+                "Blob deletion continuity encoding differs from its planned length",
+            ));
+        }
+        Some(encoded)
+    } else {
+        None
+    };
+    let count_updates = [
+        (
+            BLOB_DELETION_MANIFEST_ROWS,
+            existing_stats
+                .manifests
+                .checked_add(1)
+                .ok_or(StoreError::ItemCountAccountingOverflow)?,
+        ),
+        (
+            BLOB_DELETION_CHUNK_ROWS,
+            existing_stats
+                .chunks
+                .checked_add(chunk_count)
+                .ok_or(StoreError::ItemCountAccountingOverflow)?,
+        ),
         (
             BLOB_DELETION_QUEUED_CHUNKS,
-            existing_stats.queued_chunks,
-            queued,
+            existing_stats
+                .queued_chunks
+                .checked_add(queued)
+                .ok_or(StoreError::ItemCountAccountingOverflow)?,
         ),
         (
             BLOB_DELETION_DELETED_CHUNKS,
-            existing_stats.deleted_chunks,
-            deleted,
+            existing_stats
+                .deleted_chunks
+                .checked_add(deleted)
+                .ok_or(StoreError::ItemCountAccountingOverflow)?,
         ),
         (
             BLOB_DELETION_CHARGED_VARIANTS,
-            existing_stats.charged_variants,
-            1,
+            existing_stats
+                .charged_variants
+                .checked_add(1)
+                .ok_or(StoreError::ItemCountAccountingOverflow)?,
         ),
         (
             BLOB_DELETION_CHARGED_FILES,
-            existing_stats.charged_files,
-            charged_files,
-        ),
-    ] {
-        metadata.insert(
-            field,
-            current
-                .checked_add(delta)
+            existing_stats
+                .charged_files
+                .checked_add(charged_files)
                 .ok_or(StoreError::ItemCountAccountingOverflow)?,
-        )?;
-        manifest_admission_mutation_boundary()?;
-    }
-    for (field, current, delta) in [
+        ),
+    ];
+    let byte_updates = [
         (
             BLOB_DELETION_MANIFEST_BYTES,
-            existing_stats.manifest_bytes,
-            manifest_bytes,
+            existing_stats
+                .manifest_bytes
+                .checked_add(manifest_bytes)
+                .ok_or(StoreError::PayloadByteAccountingOverflow)?,
         ),
         (
             BLOB_DELETION_CHUNK_BYTES,
-            existing_stats.chunk_bytes,
-            chunk_bytes,
+            existing_stats
+                .chunk_bytes
+                .checked_add(chunk_bytes)
+                .ok_or(StoreError::PayloadByteAccountingOverflow)?,
         ),
         (
             BLOB_DELETION_CHARGED_RESERVED_BYTES,
-            existing_stats.charged_reserved_bytes,
-            charged_reserved_bytes,
+            existing_stats
+                .charged_reserved_bytes
+                .checked_add(charged_reserved_bytes)
+                .ok_or(StoreError::PayloadByteAccountingOverflow)?,
         ),
         (
             BLOB_DELETION_CHARGED_COMMITTED_BYTES,
-            existing_stats.charged_committed_bytes,
-            charged_committed_bytes,
-        ),
-    ] {
-        metadata.insert(
-            field,
-            current
-                .checked_add(delta)
+            existing_stats
+                .charged_committed_bytes
+                .checked_add(charged_committed_bytes)
                 .ok_or(StoreError::PayloadByteAccountingOverflow)?,
-        )?;
+        ),
+    ];
+    for (field, _) in count_updates.iter().chain(byte_updates.iter()) {
+        if !charge_pressure_admission_row(
+            &mut pressure_charge,
+            field.as_bytes(),
+            std::mem::size_of::<u64>(),
+        )? {
+            return Ok(None);
+        }
+    }
+    let mut metadata_updates = Vec::with_capacity(10);
+    metadata_updates.extend(count_updates);
+    metadata_updates.extend(byte_updates);
+    let chunks = originals
+        .into_iter()
+        .zip(encoded_chunks)
+        .map(
+            |((index, expected_active), encoded_deletion)| BlobDeletionAdmissionChunkPlan {
+                key: chunk_key(variant, index),
+                expected_active,
+                encoded_deletion,
+            },
+        )
+        .collect();
+    Ok(Some(BlobDeletionAdmissionPlan {
+        variant,
+        chunks,
+        encoded_manifest,
+        encoded_continuity,
+        metadata_updates,
+    }))
+}
+
+pub(crate) fn apply_variant_admission_plan_write(
+    write: &redb::WriteTransaction,
+    plan: BlobDeletionAdmissionPlan,
+) -> Result<(), StoreError> {
+    begin_manifest_admission_mutations();
+    let mut active_chunks = write.open_table(super::BLOB_CHUNKS)?;
+    for chunk in &plan.chunks {
+        let removed = active_chunks
+            .remove(chunk.key.as_slice())?
+            .ok_or_else(|| invariant("Blob manifest admission lost ordinary chunk authority"))?;
+        if removed.value() != chunk.expected_active.as_slice() {
+            return Err(invariant(
+                "Blob manifest admission ordinary chunk changed after planning",
+            ));
+        }
         manifest_admission_mutation_boundary()?;
     }
+    drop(active_chunks);
+    write.open_table(BLOB_DELETION_MANIFESTS)?.insert(
+        plan.variant.as_bytes().as_slice(),
+        plan.encoded_manifest.as_slice(),
+    )?;
+    if let Some(encoded) = &plan.encoded_continuity {
+        write
+            .open_table(BLOB_DELETION_CONTINUITY)?
+            .insert(CONTINUITY_KEY, encoded.as_slice())?;
+    }
+    manifest_admission_mutation_boundary()?;
+    let mut deletion_chunks = write.open_table(BLOB_DELETION_CHUNKS)?;
+    for chunk in &plan.chunks {
+        deletion_chunks.insert(chunk.key.as_slice(), chunk.encoded_deletion.as_slice())?;
+        manifest_admission_mutation_boundary()?;
+    }
+    drop(deletion_chunks);
+    let mut metadata = write.open_table(BLOB_DELETION_METADATA)?;
+    for (field, value) in plan.metadata_updates {
+        metadata.insert(field, value)?;
+        manifest_admission_mutation_boundary()?;
+    }
+    Ok(())
+}
+
+pub(crate) fn admit_variant_write(
+    write: &redb::WriteTransaction,
+    variant: BlobVariantId,
+    expected_import: &[u8],
+    expected_lineage: &[u8],
+    owner_binding: [u8; 32],
+    custody_sample: Option<CustodySample>,
+) -> Result<bool, StoreError> {
+    let Some(plan) = plan_variant_admission_write(
+        write,
+        variant,
+        expected_import,
+        expected_lineage,
+        owner_binding,
+        custody_sample,
+        None,
+    )?
+    else {
+        return Ok(false);
+    };
+    apply_variant_admission_plan_write(write, plan)?;
     Ok(true)
 }
 
@@ -3281,13 +3572,17 @@ fn validate_continuity_state(state: BlobDeletionContinuityState) -> Result<(), S
     Ok(())
 }
 
+fn continuity_state_encoded_len(state: BlobDeletionContinuityState) -> Result<usize, StoreError> {
+    validate_continuity_state(state)?;
+    43usize
+        .checked_add(usize::from(state.transition.is_some()) * 97)
+        .and_then(|length| length.checked_add(usize::from(state.pending.is_some()) * 64))
+        .ok_or(StoreError::PayloadByteAccountingOverflow)
+}
+
 fn encode_continuity_state(state: BlobDeletionContinuityState) -> Result<Vec<u8>, StoreError> {
     validate_continuity_state(state)?;
-    let mut encoded = Vec::with_capacity(
-        35 + usize::from(state.transition.is_some()) * 97
-            + usize::from(state.pending.is_some()) * 64
-            + 8,
-    );
+    let mut encoded = Vec::with_capacity(continuity_state_encoded_len(state)?);
     encoded.push(CONTINUITY_STATE_VERSION);
     encoded.extend_from_slice(&state.current.generation.to_be_bytes());
     encoded.extend_from_slice(&state.current.last_sample.clock_id);
@@ -3630,16 +3925,30 @@ fn account_finalized_manifest_in_continuity_transition(
     store_blob_deletion_continuity_state(write, state)
 }
 
+#[cfg(test)]
 fn account_admitted_manifest_in_continuity_transition(
     write: &redb::WriteTransaction,
     _variant: BlobVariantId,
     age: BlobDeletionAge,
 ) -> Result<(), StoreError> {
-    let Some(mut state) = blob_deletion_continuity_state_write(write)? else {
-        return Ok(());
+    let previous = blob_deletion_continuity_state_write(write)?;
+    let projected = project_admitted_manifest_in_continuity_transition(previous, age)?;
+    if projected != previous
+        && let Some(state) = projected
+    {
+        store_blob_deletion_continuity_state(write, state)?;
+    }
+    Ok(())
+}
+
+fn project_admitted_manifest_in_continuity_transition(
+    state: Option<BlobDeletionContinuityState>,
+    age: BlobDeletionAge,
+) -> Result<Option<BlobDeletionContinuityState>, StoreError> {
+    let Some(mut state) = state else {
+        return Ok(None);
     };
     let newest_generation = newest_blob_deletion_continuity(state).generation;
-    let mut changed = false;
     if let Some(mut transition) = state.transition
         && age.continuity_generation < state.current.generation
     {
@@ -3652,7 +3961,6 @@ fn account_admitted_manifest_in_continuity_transition(
         // idempotent and do not consume `remaining` again.
         transition.after = None;
         state.transition = Some(transition);
-        changed = true;
     }
     if let Some(mut pending) = state.pending
         && age.continuity_generation < pending.current.generation
@@ -3662,19 +3970,106 @@ fn account_admitted_manifest_in_continuity_transition(
             .checked_add(1)
             .ok_or(StoreError::ItemCountAccountingOverflow)?;
         state.pending = Some(pending);
-        changed = true;
     }
     if age.checkpoint.is_none() && age.continuity_generation == newest_generation {
         state.deferred = state
             .deferred
             .checked_add(1)
             .ok_or(StoreError::ItemCountAccountingOverflow)?;
-        changed = true;
     }
-    if changed {
-        store_blob_deletion_continuity_state(write, state)?;
-    }
-    Ok(())
+    Ok(Some(state))
+}
+
+fn project_observed_blob_deletion_continuity(
+    previous_state: Option<BlobDeletionContinuityState>,
+    sample: CustodySample,
+    manifest_count: u64,
+) -> Result<(BlobDeletionContinuityState, BlobDeletionContinuity), StoreError> {
+    let (state, observed) = match previous_state {
+        None => {
+            let current = BlobDeletionContinuity {
+                generation: 1,
+                last_sample: sample,
+            };
+            (
+                BlobDeletionContinuityState {
+                    current,
+                    transition: None,
+                    pending: None,
+                    deferred: 0,
+                },
+                current,
+            )
+        }
+        Some(mut state) if state.pending.is_some() => {
+            let mut pending = state.pending.expect("matched pending continuity");
+            if pending.current.last_sample.clock_id != sample.clock_id
+                || sample.tick_ms < pending.current.last_sample.tick_ms
+            {
+                // Keep draining the two frozen memberships. The caller uses
+                // the returned mismatch to admit this later-domain row as an
+                // age-zero deferred member instead of extending old work.
+                (state, pending.current)
+            } else {
+                pending.current.last_sample = sample;
+                state.pending = Some(pending);
+                (state, pending.current)
+            }
+        }
+        Some(mut state)
+            if state.current.last_sample.clock_id == sample.clock_id
+                && sample.tick_ms >= state.current.last_sample.tick_ms =>
+        {
+            state.current.last_sample = sample;
+            let observed = state.current;
+            (state, observed)
+        }
+        Some(mut state) if state.transition.is_some() => {
+            let next =
+                BlobDeletionContinuity {
+                    generation: state.current.generation.checked_add(1).ok_or_else(|| {
+                        invariant("Blob deletion continuity generation overflowed")
+                    })?,
+                    last_sample: sample,
+                };
+            if manifest_count == 0 {
+                return Err(invariant(
+                    "Blob deletion continuity transition lost its manifest membership",
+                ));
+            }
+            state.pending = Some(BlobDeletionPendingContinuity {
+                current: next,
+                anchor: sample,
+                remaining: manifest_count,
+            });
+            state.deferred = 0;
+            (state, next)
+        }
+        Some(state) => {
+            let next =
+                BlobDeletionContinuity {
+                    generation: state.current.generation.checked_add(1).ok_or_else(|| {
+                        invariant("Blob deletion continuity generation overflowed")
+                    })?,
+                    last_sample: sample,
+                };
+            (
+                BlobDeletionContinuityState {
+                    current: next,
+                    transition: (manifest_count != 0).then_some(BlobDeletionContinuityTransition {
+                        previous: state.current,
+                        anchor: sample,
+                        after: None,
+                        remaining: manifest_count,
+                    }),
+                    pending: None,
+                    deferred: 0,
+                },
+                next,
+            )
+        }
+    };
+    Ok((state, observed))
 }
 
 #[allow(dead_code)]
@@ -3683,91 +4078,9 @@ pub(crate) fn observe_blob_deletion_continuity_write(
     sample: CustodySample,
 ) -> Result<BlobDeletionContinuity, StoreError> {
     let previous_state = blob_deletion_continuity_state_write(write)?;
+    let manifest_count = write.open_table(BLOB_DELETION_MANIFESTS)?.len()?;
     let (state, observed) =
-        match previous_state {
-            None => {
-                let current = BlobDeletionContinuity {
-                    generation: 1,
-                    last_sample: sample,
-                };
-                (
-                    BlobDeletionContinuityState {
-                        current,
-                        transition: None,
-                        pending: None,
-                        deferred: 0,
-                    },
-                    current,
-                )
-            }
-            Some(mut state) if state.pending.is_some() => {
-                let mut pending = state.pending.expect("matched pending continuity");
-                if pending.current.last_sample.clock_id != sample.clock_id
-                    || sample.tick_ms < pending.current.last_sample.tick_ms
-                {
-                    // Keep draining the two frozen memberships. The caller uses
-                    // the returned mismatch to admit this later-domain row as an
-                    // age-zero deferred member instead of extending old work.
-                    (state, pending.current)
-                } else {
-                    pending.current.last_sample = sample;
-                    state.pending = Some(pending);
-                    (state, pending.current)
-                }
-            }
-            Some(mut state)
-                if state.current.last_sample.clock_id == sample.clock_id
-                    && sample.tick_ms >= state.current.last_sample.tick_ms =>
-            {
-                state.current.last_sample = sample;
-                let observed = state.current;
-                (state, observed)
-            }
-            Some(mut state) if state.transition.is_some() => {
-                let next = BlobDeletionContinuity {
-                    generation: state.current.generation.checked_add(1).ok_or_else(|| {
-                        invariant("Blob deletion continuity generation overflowed")
-                    })?,
-                    last_sample: sample,
-                };
-                let remaining = write.open_table(BLOB_DELETION_MANIFESTS)?.len()?;
-                if remaining == 0 {
-                    return Err(invariant(
-                        "Blob deletion continuity transition lost its manifest membership",
-                    ));
-                }
-                state.pending = Some(BlobDeletionPendingContinuity {
-                    current: next,
-                    anchor: sample,
-                    remaining,
-                });
-                state.deferred = 0;
-                (state, next)
-            }
-            Some(state) => {
-                let next = BlobDeletionContinuity {
-                    generation: state.current.generation.checked_add(1).ok_or_else(|| {
-                        invariant("Blob deletion continuity generation overflowed")
-                    })?,
-                    last_sample: sample,
-                };
-                let remaining = write.open_table(BLOB_DELETION_MANIFESTS)?.len()?;
-                (
-                    BlobDeletionContinuityState {
-                        current: next,
-                        transition: (remaining != 0).then_some(BlobDeletionContinuityTransition {
-                            previous: state.current,
-                            anchor: sample,
-                            after: None,
-                            remaining,
-                        }),
-                        pending: None,
-                        deferred: 0,
-                    },
-                    next,
-                )
-            }
-        };
+        project_observed_blob_deletion_continuity(previous_state, sample, manifest_count)?;
     if previous_state != Some(state) {
         store_blob_deletion_continuity_state(write, state)?;
     }

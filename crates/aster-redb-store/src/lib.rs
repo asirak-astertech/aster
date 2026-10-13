@@ -34,11 +34,15 @@
 //! and exact manifest-authorized reclamation of already-unreferenced staging and
 //! completed variants. Charged physical accounting remains in force until
 //! deletion finalization, and durable manifests resume safely after restart.
+//! Blob admission may perform one bounded pressure-recovery attempt for the
+//! exact rejected partition and strictly lower-priority work. Depot variants,
+//! chunks, and bytes remain charged until manifest-backed physical deletion
+//! finalizes; only then can depot pressure authorize the single retry.
 //! Policy-invalidated live publications retire atomically with their operation
 //! and delivery aliases; permanent fences remain, and the retained retirement
 //! records expire after 45 days of accumulated conservative lower-bound age.
-//! This is not finite Blob TTL, pressure eviction, route-only custody, or a
-//! public protocol/API/CLI lifecycle surface.
+//! This does not activate finite Blob TTL and adds no supported public Blob
+//! API, wire, CLI, or route-only custody surface.
 
 #![forbid(unsafe_code)]
 

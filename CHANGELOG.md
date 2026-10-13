@@ -21,9 +21,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lifecycle accounting with audit-first atomic predecessor migration.
 - Persistent six-class Blob maintenance discovery with independently nonzero
   row/file/byte budgets, durable fair cursors, and automatic bounded startup and
-  periodic background turns. Destructive handlers remain disabled: this does
-  not add retention/retirement expiry, physical reclamation or deletion
-  manifests, pressure eviction, or finite Blob TTL.
+  periodic background turns. This does not activate finite Blob TTL.
+- Bounded Blob pressure recovery for the exact rejected publication,
+  network-staging, or depot partition. It evicts only strictly lower-priority
+  work in deterministic incomplete-before-completed order, then expiry class
+  and finite deadline, exact completion fraction, acceptance order, and exact
+  identity, and never skips an oversized first
+  atomic candidate, reconciles local caches, and retries admission once.
+  Deletion remains manifest-backed and resumable, with depot capacity charged
+  until physical finalization. Finite Blob TTL remains inactive. Blob wire
+  bytes, supported public Blob API, and CLI behavior are unchanged.
 
 ### Changed
 

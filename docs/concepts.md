@@ -140,9 +140,10 @@ The selected runtime does not provide retention-driven State or Record
 collection. Blob maintenance reclaims exact already-unreferenced staging and
 completed variants, atomically retires current-policy-invalidated publications
 and their aliases, and expires those retained retirement records after 45 days
-of accumulated conservative lower-bound age. It does not implement finite Blob
-TTL, pressure eviction, route-only custody, or public protocol/API/CLI lifecycle
-controls. See the
+of accumulated conservative lower-bound age. Blob admission can also perform
+one bounded, partition-specific pressure-recovery attempt for strictly
+lower-priority Blob work; it does not activate finite Blob TTL, route-only
+custody, or public protocol/API/CLI lifecycle controls. See the
 [current implementation boundary](../README.md#current-implementation-boundary).
 
 ### Priority and TTL

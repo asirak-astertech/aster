@@ -27,12 +27,13 @@ use aster_mesh::{
     PreparedBlob, Priority, ReferenceEnvelopeSealer, SELECTED_BLOB_CHUNK_SIZE, Scope, Topic,
     prepare_blob,
 };
+#[cfg(test)]
+use aster_redb_store::{BlobCapacityGcTarget, BlobMaintenanceBudget};
 use aster_redb_store::{
-    BlobCapacityGcTarget, BlobDeliveryAck as StoreBlobDeliveryAck,
-    BlobDeliveryToken as StoreBlobDeliveryToken, BlobDepotCompletion, BlobMaintenanceBudget,
-    BlobOperationKey, BlobOperationRequest, BlobPublicationDisposition, BlobPublicationIntent,
-    BlobReadPlan, BlobSemanticId, BlobSourceProjection, BlobSourceRetention, BlobStoreError,
-    BlobSubscriptionId as StoreBlobSubscriptionId, BlobSubscriptionKey,
+    BlobDeliveryAck as StoreBlobDeliveryAck, BlobDeliveryToken as StoreBlobDeliveryToken,
+    BlobDepotCompletion, BlobOperationKey, BlobOperationRequest, BlobPublicationDisposition,
+    BlobPublicationIntent, BlobReadPlan, BlobSemanticId, BlobSourceProjection, BlobSourceRetention,
+    BlobStoreError, BlobSubscriptionId as StoreBlobSubscriptionId, BlobSubscriptionKey,
     BlobSubscriptionPollSelection, BlobSubscriptionRemoveOutcome, BlobSubscriptionSpec,
     BlobTransferStatusSnapshot as StoreBlobTransferStatusSnapshot, BlobVariantId,
     ControlPolicySnapshot, ControlTransferId, MAX_BLOB_OPERATION_KEY_BYTES,
@@ -54,11 +55,45 @@ use crate::{
     mission::UnprotectedReferenceMission,
     runtime::{
         AuthenticatedEventRouteCache, NodeCustodyClock, STORE_FILE, StartupEventVerification,
-        cache_authenticated_blob_route_claim, ensure_principal_active,
-        ensure_state_accepts_normal_operation, open_startup_event_verifier_and_cache,
+        blob_capacity_gc_target, cache_authenticated_blob_route_claim, ensure_principal_active,
+        ensure_state_accepts_normal_operation, equivalent_blob_capacity_error,
+        open_startup_event_verifier_and_cache, recover_blob_capacity_after_cleanup,
         refresh_application_policy,
     },
 };
+
+#[derive(Clone, Eq, PartialEq)]
+struct BlobAdmissionRecoveryContext {
+    priority: Priority,
+    topic: Topic,
+    scope: Scope,
+    blob_id: CoreBlobId,
+    depot_chunks: u64,
+    depot_variants: u64,
+}
+
+enum BlobPublishAttemptError {
+    Application(ApplicationError),
+    Capacity {
+        error: StoreError,
+        context: BlobAdmissionRecoveryContext,
+    },
+}
+
+impl From<ApplicationError> for BlobPublishAttemptError {
+    fn from(error: ApplicationError) -> Self {
+        Self::Application(error)
+    }
+}
+
+impl BlobPublishAttemptError {
+    fn into_application(self) -> ApplicationError {
+        match self {
+            Self::Application(error) => error,
+            Self::Capacity { error, .. } => blob_store_application_error("blob publish", error),
+        }
+    }
+}
 
 struct AdmittedFile<'a> {
     file: &'a mut fs::File,
@@ -70,6 +105,10 @@ struct AdmittedFile<'a> {
     expected_len: u64,
     #[cfg(test)]
     total_bytes_read: u64,
+    #[cfg(test)]
+    fail_retry_rewind: bool,
+    #[cfg(test)]
+    start_zero_seeks: u8,
 }
 
 struct LivePublishContext<'a> {
@@ -173,6 +212,16 @@ impl Read for AdmittedFile<'_> {
 impl Seek for AdmittedFile<'_> {
     fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
         self.require_admission()?;
+        #[cfg(test)]
+        if matches!(position, std::io::SeekFrom::Start(0)) {
+            self.start_zero_seeks = self.start_zero_seeks.saturating_add(1);
+            if self.fail_retry_rewind && self.start_zero_seeks == 3 {
+                self.fail_retry_rewind = false;
+                return Err(std::io::Error::other(
+                    "injected live Blob retry rewind failure",
+                ));
+            }
+        }
         let offset = self.file.seek(position)?;
         if offset > self.max_len {
             Err(std::io::Error::new(
@@ -1153,6 +1202,8 @@ pub struct SelectedBlobNode {
     #[cfg(test)]
     live_publish_pass_two_gate: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
     #[cfg(test)]
+    live_publish_retry_rewind_failure: bool,
+    #[cfg(test)]
     live_operation_preflight_coherence_fault: bool,
     #[cfg(test)]
     live_read_projection_coherence_fault: bool,
@@ -1167,7 +1218,7 @@ pub struct SelectedBlobNode {
     #[cfg(test)]
     capacity_gc_targets: Vec<BlobCapacityGcTarget>,
     #[cfg(test)]
-    injected_capacity_failures: std::collections::VecDeque<BlobStoreError>,
+    injected_capacity_failures: std::collections::VecDeque<StoreError>,
     #[cfg(test)]
     publish_attempts: u64,
     #[cfg(test)]
@@ -1241,6 +1292,8 @@ impl SelectedBlobNode {
             #[cfg(test)]
             live_publish_pass_two_gate: None,
             #[cfg(test)]
+            live_publish_retry_rewind_failure: false,
+            #[cfg(test)]
             live_operation_preflight_coherence_fault: false,
             #[cfg(test)]
             live_read_projection_coherence_fault: false,
@@ -1285,6 +1338,8 @@ impl SelectedBlobNode {
             #[cfg(test)]
             live_publish_pass_two_gate: None,
             #[cfg(test)]
+            live_publish_retry_rewind_failure: false,
+            #[cfg(test)]
             live_operation_preflight_coherence_fault: false,
             #[cfg(test)]
             live_read_projection_coherence_fault: false,
@@ -1323,6 +1378,11 @@ impl SelectedBlobNode {
         release: Arc<std::sync::Barrier>,
     ) {
         self.live_publish_pass_two_gate = Some((reached, release));
+    }
+
+    #[cfg(test)]
+    fn inject_live_publish_retry_rewind_failure(&mut self) {
+        self.live_publish_retry_rewind_failure = true;
     }
 
     #[cfg(test)]
@@ -1483,19 +1543,41 @@ impl SelectedBlobNode {
         source: &mut R,
     ) -> Result<BlobPublishResult, ApplicationError> {
         let retry_request = request.clone();
-        match self.publish_inner(request, source, None) {
-            Err(error) if error.is_recoverable_blob_capacity() => {
-                self.run_capacity_gc_before_retry(
-                    error
-                        .recoverable_blob_capacity_target()
-                        .expect("recoverable capacity error has an internal target"),
-                )?;
-                source
-                    .seek(std::io::SeekFrom::Start(0))
-                    .map_err(|error| application_error("blob publish", error.into()))?;
-                self.publish_inner(retry_request, source, None)
+        match self.publish_inner(request, source, None, None, None) {
+            Err(BlobPublishAttemptError::Capacity { error, context }) => {
+                if source.seek(std::io::SeekFrom::Start(0)).is_err() {
+                    return Err(blob_store_application_error("blob publish", error));
+                }
+                let source_route_cache = Arc::clone(&self.source_route_cache);
+                let lifecycle = source_route_cache
+                    .lock_blob_lifecycle()
+                    .map_err(|error| application_error("blob publish", error))?;
+                if !self.recover_capacity_while_locked(
+                    &source_route_cache,
+                    &lifecycle,
+                    &error,
+                    &context,
+                )? {
+                    return Err(blob_store_application_error("blob publish", error));
+                }
+                match self.publish_inner(
+                    retry_request,
+                    source,
+                    None,
+                    Some(&lifecycle),
+                    Some(&context),
+                ) {
+                    Ok(result) => Ok(result),
+                    Err(BlobPublishAttemptError::Capacity { error: retry, .. })
+                        if equivalent_blob_capacity_error(&error, &retry) =>
+                    {
+                        Err(blob_store_application_error("blob publish", error))
+                    }
+                    Err(retry) => Err(retry.into_application()),
+                }
             }
-            result => result,
+            Err(error) => Err(error.into_application()),
+            Ok(result) => Ok(result),
         }
     }
 
@@ -1571,23 +1653,58 @@ impl SelectedBlobNode {
             expected_len,
             #[cfg(test)]
             total_bytes_read: 0,
+            #[cfg(test)]
+            fail_retry_rewind: std::mem::replace(
+                &mut self.live_publish_retry_rewind_failure,
+                false,
+            ),
+            #[cfg(test)]
+            start_zero_seeks: 0,
         };
         let retry_request = request.clone();
-        let result = match self.publish_inner(request, &mut source, Some(&mut context)) {
-            Err(error) if error.is_recoverable_blob_capacity() => {
+        let result = match self.publish_inner(request, &mut source, Some(&mut context), None, None)
+        {
+            Err(BlobPublishAttemptError::Capacity {
+                error,
+                context: recovery,
+            }) => {
                 context.require_admission()?;
-                self.run_capacity_gc_before_retry(
-                    error
-                        .recoverable_blob_capacity_target()
-                        .expect("recoverable capacity error has an internal target"),
+                if source.seek(std::io::SeekFrom::Start(0)).is_err() {
+                    return Err(blob_store_application_error("blob publish", error));
+                }
+                let source_route_cache = Arc::clone(&self.source_route_cache);
+                let lifecycle = source_route_cache
+                    .lock_blob_lifecycle()
+                    .map_err(|error| application_error("blob publish", error))?;
+                let recovered = self.recover_capacity_while_locked(
+                    &source_route_cache,
+                    &lifecycle,
+                    &error,
+                    &recovery,
                 )?;
-                context.require_admission()?;
-                source
-                    .seek(std::io::SeekFrom::Start(0))
-                    .map_err(|error| application_error("blob publish", error.into()))?;
-                self.publish_inner(retry_request, &mut source, Some(&mut context))
+                if recovered {
+                    context.require_admission()?;
+                    match self.publish_inner(
+                        retry_request,
+                        &mut source,
+                        Some(&mut context),
+                        Some(&lifecycle),
+                        Some(&recovery),
+                    ) {
+                        Ok(result) => Ok(result),
+                        Err(BlobPublishAttemptError::Capacity { error: retry, .. })
+                            if equivalent_blob_capacity_error(&error, &retry) =>
+                        {
+                            Err(blob_store_application_error("blob publish", error))
+                        }
+                        Err(retry) => Err(retry.into_application()),
+                    }
+                } else {
+                    Err(blob_store_application_error("blob publish", error))
+                }
             }
-            result => result,
+            Err(error) => Err(error.into_application()),
+            Ok(result) => Ok(result),
         };
         #[cfg(test)]
         {
@@ -1596,46 +1713,57 @@ impl SelectedBlobNode {
         result
     }
 
-    fn run_capacity_gc_before_retry(
+    fn recover_capacity_while_locked(
         &mut self,
-        target: BlobCapacityGcTarget,
-    ) -> Result<(), ApplicationError> {
+        source_route_cache: &AuthenticatedEventRouteCache,
+        lifecycle: &std::sync::MutexGuard<'_, ()>,
+        error: &StoreError,
+        context: &BlobAdmissionRecoveryContext,
+    ) -> Result<bool, ApplicationError> {
+        let Some(target) = blob_capacity_gc_target(error) else {
+            return Ok(false);
+        };
+        #[cfg(not(test))]
+        let _ = target;
         #[cfg(test)]
         {
             self.capacity_gc_attempts = self.capacity_gc_attempts.saturating_add(1);
             self.capacity_gc_targets.push(target);
         }
-        let budget = BlobMaintenanceBudget::new(
-            6 + 4 * aster_redb_store::MAX_BLOB_SUBSCRIPTIONS,
-            16,
-            128 * 1024 * 1024,
-        )
-        .expect("selected capacity GC bounds are nonzero");
         let sample = self
             .custody_clock
             .sample()
             .map_err(|error| application_error("blob publish", error))?;
-        self.store
-            .run_blob_capacity_gc_for(target, budget, Some(sample))
-            .map(|_| ())
-            .map_err(|error| application_error("blob publish", error.into()))
+        recover_blob_capacity_after_cleanup(
+            &self.store,
+            &self.verifier,
+            source_route_cache,
+            error,
+            context.priority,
+            Some((&context.topic, &context.scope, context.blob_id)),
+            context.depot_chunks,
+            context.depot_variants,
+            Some(sample),
+            lifecycle,
+        )
+        .map_err(|error| application_error("blob publish", error))
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "one retry retains the original store error and immutable recovery context by value"
+    )]
     fn publish_inner<R: Read + Seek>(
         &mut self,
         request: BlobPublishRequest,
         source: &mut R,
         mut live: Option<&mut LivePublishContext<'_>>,
-    ) -> Result<BlobPublishResult, ApplicationError> {
+        held_lifecycle: Option<&std::sync::MutexGuard<'_, ()>>,
+        expected_recovery: Option<&BlobAdmissionRecoveryContext>,
+    ) -> Result<BlobPublishResult, BlobPublishAttemptError> {
         #[cfg(test)]
         {
             self.publish_attempts = self.publish_attempts.saturating_add(1);
-            if let Some(error) = self.injected_capacity_failures.pop_front() {
-                return Err(blob_store_application_error(
-                    "blob publish",
-                    StoreError::Blob(error),
-                ));
-            }
         }
         let BlobPublishRequest {
             operation_key,
@@ -1658,16 +1786,52 @@ impl SelectedBlobNode {
             return Err(ApplicationError::new(
                 ApplicationErrorKind::InvalidRequest,
                 "blob publish",
-            ));
+            )
+            .into());
         }
         if live.is_some()
             && (prepared.total_len() > MAX_SELECTED_LIVE_BLOB_BYTES
                 || prepared.chunk_count() > MAX_SELECTED_LIVE_BLOB_CHUNKS)
         {
-            return Err(ApplicationError::new(
-                ApplicationErrorKind::ResourceLimit,
+            return Err(
+                ApplicationError::new(ApplicationErrorKind::ResourceLimit, "blob publish").into(),
+            );
+        }
+        let recovery_context = BlobAdmissionRecoveryContext {
+            priority,
+            topic: topic.clone(),
+            scope: scope.clone(),
+            blob_id: prepared.id(),
+            // Core depot mutation rejects one chunk row at a time. Earlier
+            // chunks may already be durable when this admission fails, so the
+            // rejected atomic unit is exactly one chunk, not the manifest.
+            depot_chunks: 1,
+            depot_variants: 1,
+        };
+        if expected_recovery.is_some_and(|expected| expected != &recovery_context) {
+            return Err(
+                ApplicationError::new(ApplicationErrorKind::Conflict, "blob publish").into(),
+            );
+        }
+        #[cfg(test)]
+        if let Some(error) = self.injected_capacity_failures.pop_front() {
+            if blob_capacity_gc_target(&error).is_some() {
+                return Err(BlobPublishAttemptError::Capacity {
+                    error,
+                    context: recovery_context,
+                });
+            }
+            if let Some(context) = live.as_deref_mut()
+                && live_blob_durable_coherence_error(&error)
+            {
+                *context.fatal = Some(NodeError::FatalBlobCoherence(
+                    "injected live Blob retry reported durable coherence loss".into(),
+                ));
+            }
+            return Err(BlobPublishAttemptError::Application(ApplicationError::new(
+                store_error_kind(&error),
                 "blob publish",
-            ));
+            )));
         }
         if let Some(context) = live.as_deref_mut() {
             context.require_admission()?;
@@ -1677,10 +1841,9 @@ impl SelectedBlobNode {
                 .map_err(|error| application_error("blob publish", error.into()))?
                 != 0
             {
-                return Err(ApplicationError::new(
-                    ApplicationErrorKind::Conflict,
-                    "blob publish",
-                ));
+                return Err(
+                    ApplicationError::new(ApplicationErrorKind::Conflict, "blob publish").into(),
+                );
             }
         }
         let intent = BlobPublicationIntent::new(
@@ -1694,20 +1857,25 @@ impl SelectedBlobNode {
         let operation_request = BlobOperationRequest::new(&operation, &intent);
 
         let retry_cache = Arc::clone(&self.source_route_cache);
-        let retry_lifecycle = match retry_cache.lock_blob_lifecycle() {
-            Ok(lifecycle) => lifecycle,
-            Err(error) => {
-                if let Some(context) = live.as_deref_mut() {
-                    *context.fatal = Some(live_blob_coherence_fatal(
-                        "pre-retry Blob lifecycle lock",
-                        error,
-                    ));
-                    return Err(ApplicationError::new(
-                        ApplicationErrorKind::Integrity,
-                        "blob publish",
-                    ));
+        let retry_lifecycle = if held_lifecycle.is_some() {
+            None
+        } else {
+            match retry_cache.lock_blob_lifecycle() {
+                Ok(lifecycle) => Some(lifecycle),
+                Err(error) => {
+                    if let Some(context) = live.as_deref_mut() {
+                        *context.fatal = Some(live_blob_coherence_fatal(
+                            "pre-retry Blob lifecycle lock",
+                            error,
+                        ));
+                        return Err(ApplicationError::new(
+                            ApplicationErrorKind::Integrity,
+                            "blob publish",
+                        )
+                        .into());
+                    }
+                    return Err(application_error("blob publish", error).into());
                 }
-                return Err(application_error("blob publish", error));
             }
         };
         let operation_preflight = {
@@ -1737,9 +1905,10 @@ impl SelectedBlobNode {
                     return Err(ApplicationError::new(
                         ApplicationErrorKind::Integrity,
                         "blob publish",
-                    ));
+                    )
+                    .into());
                 }
-                return Err(application_error("blob publish", error.into()));
+                return Err(application_error("blob publish", error.into()).into());
             }
         };
         if let Some(existing) = existing {
@@ -1757,7 +1926,7 @@ impl SelectedBlobNode {
                             "live Blob operation retry lost its exact authenticated claim".into(),
                         ));
                     }
-                    return Err(error);
+                    return Err(error.into());
                 }
             };
             return Ok(result);
@@ -1781,9 +1950,16 @@ impl SelectedBlobNode {
                         return Err(ApplicationError::new(
                             ApplicationErrorKind::Integrity,
                             "blob publish",
-                        ));
+                        )
+                        .into());
                     }
-                    return Err(application_error("blob publish", error.into()));
+                    if blob_capacity_gc_target(&error).is_some() {
+                        return Err(BlobPublishAttemptError::Capacity {
+                            error,
+                            context: recovery_context.clone(),
+                        });
+                    }
+                    return Err(application_error("blob publish", error.into()).into());
                 }
             };
             let mut service = self
@@ -1799,14 +1975,17 @@ impl SelectedBlobNode {
                     Ok(result) => result,
                     Err(error) => {
                         drop(service);
-                        return Err(live_blob_core_error(&self.store, error, &mut live));
+                        return Err(live_blob_core_attempt_error(
+                            error,
+                            &mut live,
+                            &recovery_context,
+                        ));
                     }
                 };
             if !progress.complete || progress.verified_chunks != prepared.chunk_count() {
-                return Err(ApplicationError::new(
-                    ApplicationErrorKind::Integrity,
-                    "blob publish",
-                ));
+                return Err(
+                    ApplicationError::new(ApplicationErrorKind::Integrity, "blob publish").into(),
+                );
             }
             if let Some(context) = live.as_deref_mut() {
                 context.require_admission()?;
@@ -1818,7 +1997,9 @@ impl SelectedBlobNode {
             let result = service.finish_manifest(&manifest);
             drop(service);
             (
-                result.map_err(|error| live_blob_core_error(&self.store, error, &mut live))?,
+                result.map_err(|error| {
+                    live_blob_core_attempt_error(error, &mut live, &recovery_context)
+                })?,
                 local_import_lease,
             )
         };
@@ -1842,10 +2023,9 @@ impl SelectedBlobNode {
             || verified.manifest_bytes != finished.manifest_bytes()
             || verified.blob.manifest_digest() != finished.manifest_digest()
         {
-            return Err(ApplicationError::new(
-                ApplicationErrorKind::Integrity,
-                "blob publish",
-            ));
+            return Err(
+                ApplicationError::new(ApplicationErrorKind::Integrity, "blob publish").into(),
+            );
         }
         let completion = match if live.is_some() {
             self.store
@@ -1867,29 +2047,35 @@ impl SelectedBlobNode {
                     return Err(ApplicationError::new(
                         ApplicationErrorKind::Integrity,
                         "blob publish",
-                    ));
+                    )
+                    .into());
                 }
-                return Err(application_error("blob publish", error.into()));
+                return Err(application_error("blob publish", error.into()).into());
             }
         };
         let source_route_cache = Arc::clone(&self.source_route_cache);
         if let Some(context) = live.as_deref_mut() {
             context.require_admission()?;
         }
-        let _lifecycle = match source_route_cache.lock_blob_lifecycle() {
-            Ok(lifecycle) => lifecycle,
-            Err(error) => {
-                if let Some(context) = live.as_deref_mut() {
-                    *context.fatal = Some(live_blob_coherence_fatal(
-                        "pre-commit Blob lifecycle lock",
-                        error,
-                    ));
-                    return Err(ApplicationError::new(
-                        ApplicationErrorKind::Integrity,
-                        "blob publish",
-                    ));
+        let _lifecycle = if held_lifecycle.is_some() {
+            None
+        } else {
+            match source_route_cache.lock_blob_lifecycle() {
+                Ok(lifecycle) => Some(lifecycle),
+                Err(error) => {
+                    if let Some(context) = live.as_deref_mut() {
+                        *context.fatal = Some(live_blob_coherence_fatal(
+                            "pre-commit Blob lifecycle lock",
+                            error,
+                        ));
+                        return Err(ApplicationError::new(
+                            ApplicationErrorKind::Integrity,
+                            "blob publish",
+                        )
+                        .into());
+                    }
+                    return Err(application_error("blob publish", error).into());
                 }
-                return Err(application_error("blob publish", error));
             }
         };
         if let Some(context) = live.as_deref_mut() {
@@ -1915,9 +2101,16 @@ impl SelectedBlobNode {
                     return Err(ApplicationError::new(
                         ApplicationErrorKind::Integrity,
                         "blob publish",
-                    ));
+                    )
+                    .into());
                 }
-                return Err(blob_store_application_error("blob publish", error));
+                if blob_capacity_gc_target(&error).is_some() {
+                    return Err(BlobPublishAttemptError::Capacity {
+                        error,
+                        context: recovery_context,
+                    });
+                }
+                return Err(blob_store_application_error("blob publish", error).into());
             }
         };
         drop(local_import_lease);
@@ -1935,7 +2128,7 @@ impl SelectedBlobNode {
                         "durable live Blob commit failed post-commit verification".into(),
                     ));
                 }
-                return Err(error);
+                return Err(error.into());
             }
         };
         if let Err(error) = cache_authenticated_blob_route_claim(
@@ -1952,12 +2145,11 @@ impl SelectedBlobNode {
                     "durable live Blob commit cache transition",
                     error,
                 ));
-                return Err(ApplicationError::new(
-                    ApplicationErrorKind::Integrity,
-                    "blob publish",
-                ));
+                return Err(
+                    ApplicationError::new(ApplicationErrorKind::Integrity, "blob publish").into(),
+                );
             }
-            return Err(application_error("blob publish", error));
+            return Err(application_error("blob publish", error).into());
         }
         Ok(blob_publish_result(&stored, outcome.inserted()))
     }
@@ -3547,6 +3739,7 @@ fn blob_prepare_error(error: BlobError) -> ApplicationError {
     }
 }
 
+#[cfg(test)]
 fn blob_store_error_recoverable_capacity(error: &BlobStoreError) -> Option<BlobCapacityGcTarget> {
     match error {
         BlobStoreError::DepotByteLimitExceeded { .. }
@@ -3564,58 +3757,55 @@ fn blob_store_error_recoverable_capacity(error: &BlobStoreError) -> Option<BlobC
 }
 
 fn blob_store_application_error(operation: &'static str, error: StoreError) -> ApplicationError {
-    if let StoreError::Blob(blob_error) = &error
-        && let Some(target) = blob_store_error_recoverable_capacity(blob_error)
-    {
-        return ApplicationError::recoverable_blob_capacity(operation, target);
-    }
     application_error(operation, error.into())
 }
 
-fn blob_error_recoverable_capacity(error: &BlobError) -> Option<BlobCapacityGcTarget> {
-    let BlobError::Store(adapter) = error else {
-        return None;
-    };
-    adapter
-        .downcast_ref::<StoreError>()
-        .and_then(|error| match error {
-            StoreError::Blob(error) => blob_store_error_recoverable_capacity(error),
-            _ => None,
-        })
-}
-
-fn live_blob_core_error(
-    _store: &Store,
+fn live_blob_core_attempt_error(
     error: BlobError,
     live: &mut Option<&mut LivePublishContext<'_>>,
-) -> ApplicationError {
-    if let BlobError::Store(adapter) = &error {
-        // The core keeps the concrete adapter error as a typed source while
-        // its public display remains sanitized. This preserves the exact
-        // quota/conflict versus durable-coherence boundary even when a marked
-        // target chunk fails during an otherwise opaque core operation.
-        if let Some(store_error) = adapter.downcast_ref::<StoreError>() {
+    recovery: &BlobAdmissionRecoveryContext,
+) -> BlobPublishAttemptError {
+    let BlobError::Store(adapter) = error else {
+        return BlobPublishAttemptError::Application(blob_core_error("blob publish", error));
+    };
+    match adapter.downcast::<StoreError>() {
+        Ok(error) => {
+            let error = *error;
             if let Some(context) = live.as_deref_mut()
-                && live_blob_durable_coherence_error(store_error)
+                && live_blob_durable_coherence_error(&error)
             {
                 *context.fatal = Some(NodeError::FatalBlobCoherence(
                     "live Blob core adapter reported durable coherence loss".into(),
                 ));
-                return ApplicationError::new(ApplicationErrorKind::Integrity, "blob publish");
+                return BlobPublishAttemptError::Application(ApplicationError::new(
+                    ApplicationErrorKind::Integrity,
+                    "blob publish",
+                ));
             }
-            if let Some(target) = blob_error_recoverable_capacity(&error) {
-                return ApplicationError::recoverable_blob_capacity("blob publish", target);
+            if blob_capacity_gc_target(&error).is_some() {
+                return BlobPublishAttemptError::Capacity {
+                    error,
+                    context: recovery.clone(),
+                };
             }
-            return ApplicationError::new(store_error_kind(store_error), "blob publish");
+            BlobPublishAttemptError::Application(ApplicationError::new(
+                store_error_kind(&error),
+                "blob publish",
+            ))
         }
-        if let Some(context) = live.as_deref_mut() {
-            *context.fatal = Some(NodeError::FatalBlobCoherence(
-                "live Blob core adapter returned an unexpected error type".into(),
-            ));
+        Err(adapter) => {
+            if let Some(context) = live.as_deref_mut() {
+                *context.fatal = Some(NodeError::FatalBlobCoherence(
+                    "live Blob core adapter returned an unexpected error type".into(),
+                ));
+            }
+            let _ = adapter;
+            BlobPublishAttemptError::Application(ApplicationError::new(
+                ApplicationErrorKind::Integrity,
+                "blob publish",
+            ))
         }
-        return ApplicationError::new(ApplicationErrorKind::Integrity, "blob publish");
     }
-    blob_core_error("blob publish", error)
 }
 
 fn blob_core_error(operation: &'static str, error: BlobError) -> ApplicationError {
@@ -3953,6 +4143,64 @@ mod tests {
 
     impl Seek for CountingCursor {
         fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(position)
+        }
+    }
+
+    enum RetryRewindAction {
+        Replace(Vec<u8>),
+        Fail,
+    }
+
+    struct StatefulRetrySource {
+        inner: Cursor<Vec<u8>>,
+        action: Option<RetryRewindAction>,
+        start_zero_seeks: u8,
+    }
+
+    impl StatefulRetrySource {
+        fn replacing(initial: Vec<u8>, replacement: Vec<u8>) -> Self {
+            assert_eq!(initial.len(), replacement.len());
+            Self {
+                inner: Cursor::new(initial),
+                action: Some(RetryRewindAction::Replace(replacement)),
+                start_zero_seeks: 0,
+            }
+        }
+
+        fn failing(bytes: Vec<u8>) -> Self {
+            Self {
+                inner: Cursor::new(bytes),
+                action: Some(RetryRewindAction::Fail),
+                start_zero_seeks: 0,
+            }
+        }
+    }
+
+    impl Read for StatefulRetrySource {
+        fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+            self.inner.read(output)
+        }
+    }
+
+    impl Seek for StatefulRetrySource {
+        fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+            if matches!(position, SeekFrom::Start(0)) {
+                self.start_zero_seeks = self.start_zero_seeks.saturating_add(1);
+                if self.start_zero_seeks == 3 {
+                    match self.action.take() {
+                        Some(RetryRewindAction::Replace(replacement)) => {
+                            self.inner = Cursor::new(replacement);
+                        }
+                        Some(RetryRewindAction::Fail) => {
+                            return Err(std::io::Error::other(
+                                "injected stopped Blob retry rewind failure",
+                            ));
+                        }
+                        None => {}
+                    }
+                }
+            }
             self.inner.seek(position)
         }
     }
@@ -4890,10 +5138,9 @@ mod tests {
     }
 
     #[test]
-    fn blob_capacity_failure_runs_bounded_gc_then_retries_admission_once() {
-        // Break caught: stopped and live publication must preserve the exact
-        // depot-capacity cause, reclaim a real abandoned completed variant,
-        // and perform exactly one fresh preparation/admission retry.
+    fn blob_routine_cleanup_without_pressure_proof_returns_original_without_retry() {
+        // Ordinary GC still runs first, but freeing an abandoned variant does
+        // not by itself prove the rejected request's exact pressure deficit.
         for live in [false, true] {
             let root = TestRoot::new(if live {
                 "live-capacity-gc-success"
@@ -4920,35 +5167,569 @@ mod tests {
                     request(b"blob/live-capacity-gc-success"),
                     fs::File::open(source_path).expect("open live capacity retry source"),
                 )
-                .expect("live publication succeeds after exact reclamation");
+                .expect_err("routine cleanup alone cannot authorize the retry");
                 assert_eq!(
                     node.last_live_publish_source_bytes_read,
-                    3 * u64::try_from(plaintext.len()).expect("source length"),
-                    "failed preparation plus successful preparation/encryption is exactly three passes",
+                    u64::try_from(plaintext.len()).expect("source length"),
+                    "the pre-encryption depot rejection performs one preparation pass",
                 );
             } else {
                 let mut source = CountingCursor::new(plaintext.clone());
                 node.publish(request(b"blob/stopped-capacity-gc-success"), &mut source)
-                    .expect("stopped publication succeeds after exact reclamation");
+                    .expect_err("routine cleanup alone cannot authorize the retry");
                 assert_eq!(
                     source.bytes_read,
-                    3 * u64::try_from(plaintext.len()).expect("source length"),
-                    "failed preparation plus successful preparation/encryption is exactly three passes",
+                    u64::try_from(plaintext.len()).expect("source length"),
+                    "the pre-encryption depot rejection performs one preparation pass",
                 );
             }
             assert_eq!(node.capacity_gc_attempts, 1);
             assert_eq!(node.capacity_gc_targets, [BlobCapacityGcTarget::Depot]);
-            assert_eq!(node.publish_attempts, 2);
+            assert_eq!(node.publish_attempts, 1);
             let stats = node.store.blob_stats().expect("post-retry Blob stats");
-            assert_eq!(stats.publications, 1);
-            assert_eq!(stats.variants, 1);
+            assert_eq!(stats.publications, 0);
+            assert_eq!(stats.variants, 0);
         }
     }
 
     #[test]
-    fn blob_unrecoverable_depot_capacity_retries_once_without_extra_source_pass() {
+    fn blob_pressure_recovery_evicts_completed_cache_before_one_retry() {
+        // Break caught: local publication cannot merely run ordinary GC and
+        // retry while a lower-priority live variant still owns the rejected
+        // depot partition and an authenticated in-memory serving claim.
+        let root = TestRoot::new("local-pressure-completed-cache");
+        persist_member_mission(&root);
+        let mut node = SelectedBlobNode::open_unprotected_reference_with_options(
+            root.path(),
+            root.mission_path(),
+            SelectedBlobOptions {
+                depot_limits: BlobDepotLimits::new(1_000_000, 4, 1)
+                    .expect("one-variant pressure limits"),
+            },
+        )
+        .expect("open local pressure node");
+        let mut low = request(b"blob/local-pressure/low");
+        low.priority = Priority::Routine;
+        node.publish(low, &mut Cursor::new(vec![0x31; 128]))
+            .expect("publish lower-priority fixture");
+        let evicted = node
+            .store
+            .blob_inventory()
+            .expect("low-priority inventory")
+            .into_iter()
+            .next()
+            .expect("low-priority transfer");
+        assert!(
+            node.source_route_cache.has_blob_claim_for_test(evicted),
+            "completed fixture starts with an authenticated cache claim"
+        );
+        let attempts_before = node.publish_attempts;
+        let mut incoming = request(b"blob/local-pressure/high");
+        incoming.priority = Priority::Flash;
+
+        node.publish(incoming, &mut Cursor::new(vec![0x32; 129]))
+            .expect("strictly higher-priority publication recovers depot capacity");
+
+        assert_eq!(node.publish_attempts - attempts_before, 2);
+        assert_eq!(node.capacity_gc_attempts, 1);
+        assert!(
+            !node.source_route_cache.has_blob_claim_for_test(evicted),
+            "the evicted completed transfer cannot remain serveable from memory"
+        );
+        assert_eq!(
+            node.store
+                .blob_inventory()
+                .expect("post-pressure inventory")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn blob_pressure_uses_the_exact_rejected_chunk_not_the_whole_manifest() {
+        // Break caught: after the first chunk of a two-chunk import commits,
+        // the failing atomic admission is only the second chunk. Charging the
+        // whole manifest makes a one-chunk eviction look insufficient and
+        // incorrectly suppresses the sole retry.
+        let root = TestRoot::new("local-pressure-exact-rejected-chunk");
+        persist_member_mission(&root);
+        let mut node = SelectedBlobNode::open_unprotected_reference_with_options(
+            root.path(),
+            root.mission_path(),
+            SelectedBlobOptions {
+                depot_limits: BlobDepotLimits::new(64 * 1024 * 1024, 2, 2)
+                    .expect("two-chunk pressure limits"),
+            },
+        )
+        .expect("open exact-chunk pressure node");
+        let mut low = request(b"blob/local-pressure/exact-chunk-low");
+        low.priority = Priority::Routine;
+        node.publish(low, &mut Cursor::new(vec![0x33; 128]))
+            .expect("publish one-chunk lower-priority fixture");
+        let evicted = node.store.blob_inventory().expect("low inventory")[0];
+        let attempts_before = node.publish_attempts;
+        let mut incoming = request(b"blob/local-pressure/exact-chunk-high");
+        incoming.priority = Priority::Flash;
+        let incoming_bytes = vec![0x34; SELECTED_BLOB_CHUNK_SIZE as usize + 1];
+
+        node.publish(incoming, &mut Cursor::new(incoming_bytes))
+            .expect("one evicted chunk exactly satisfies the rejected chunk admission");
+
+        assert_eq!(node.publish_attempts - attempts_before, 2);
+        assert_eq!(node.capacity_gc_attempts, 1);
+        assert!(!node.source_route_cache.has_blob_claim_for_test(evicted));
+        let stats = node.store.blob_stats().expect("post-exact-chunk stats");
+        assert_eq!(stats.publications, 1);
+        let admitted = node.store.blob_inventory().expect("admitted inventory")[0];
+        assert_eq!(
+            node.store
+                .blob_source_projection(admitted)
+                .expect("admitted projection lookup")
+                .expect("admitted projection")
+                .source
+                .chunk_count,
+            2
+        );
+    }
+
+    #[test]
+    fn blob_pressure_retires_one_publication_with_the_production_budget() {
+        // Break caught: a sole-root publication was rejected by a worst-case
+        // fan-out gate even when its actual retirement plan fit the fixed node
+        // recovery budget.
+        let root = TestRoot::new("local-pressure-actual-publication-plan");
+        persist_member_mission(&root);
+        let mut node = selected_node(&root);
+        let mut low = request(b"blob/local-pressure/actual-plan-low");
+        low.priority = Priority::Routine;
+        node.publish(low, &mut Cursor::new(vec![0x81; 128]))
+            .expect("publish actual-plan fixture");
+        let evicted = node.store.blob_inventory().expect("fixture inventory")[0];
+        node.injected_capacity_failures
+            .push_back(StoreError::ItemLimitExceeded {
+                current: 1,
+                limit: 1,
+            });
+        let attempts_before = node.publish_attempts;
+        let mut incoming = request(b"blob/local-pressure/actual-plan-high");
+        incoming.priority = Priority::Flash;
+
+        node.publish(incoming, &mut Cursor::new(vec![0x82; 129]))
+            .expect("actual sole-root plan fits production recovery budget");
+
+        assert_eq!(node.publish_attempts - attempts_before, 2);
+        assert_eq!(node.capacity_gc_attempts, 1);
+        assert!(!node.source_route_cache.has_blob_claim_for_test(evicted));
+        assert_eq!(
+            node.store
+                .blob_inventory()
+                .expect("post-pressure inventory")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn blob_pressure_retry_propagates_a_second_attempt_invariant() {
+        let root = TestRoot::new("local-pressure-second-invariant");
+        persist_member_mission(&root);
+        let mut node = selected_node(&root);
+        let mut low = request(b"blob/local-pressure/second-invariant-low");
+        low.priority = Priority::Routine;
+        node.publish(low, &mut Cursor::new(vec![0x83; 128]))
+            .expect("publish second-invariant fixture");
+        node.injected_capacity_failures.extend([
+            StoreError::ItemLimitExceeded {
+                current: 1,
+                limit: 1,
+            },
+            StoreError::Blob(BlobStoreError::SchemaInvariant(
+                "injected second Blob publication attempt invariant",
+            )),
+        ]);
+        let attempts_before = node.publish_attempts;
+        let mut incoming = request(b"blob/local-pressure/second-invariant-high");
+        incoming.priority = Priority::Flash;
+
+        let error = node
+            .publish(incoming, &mut Cursor::new(vec![0x84; 129]))
+            .expect_err("second-attempt invariant must not be replaced by capacity");
+
+        assert_eq!(error.kind(), ApplicationErrorKind::Integrity);
+        assert_eq!(node.publish_attempts - attempts_before, 2);
+        assert_eq!(node.capacity_gc_attempts, 1);
+    }
+
+    #[test]
+    fn blob_pressure_retry_rejects_changed_stateful_source_identity() {
+        // Break caught: the eviction proof for the first prepared Blob must
+        // never authorize a different same-length Blob returned after rewind.
+        let root = TestRoot::new("local-pressure-stateful-source-change");
+        persist_member_mission(&root);
+        let mut node = SelectedBlobNode::open_unprotected_reference_with_options(
+            root.path(),
+            root.mission_path(),
+            SelectedBlobOptions {
+                depot_limits: BlobDepotLimits::new(1_000_000, 4, 1)
+                    .expect("one-variant stateful pressure limits"),
+            },
+        )
+        .expect("open stateful pressure node");
+        let mut low = request(b"blob/local-pressure/stateful-low");
+        low.priority = Priority::Routine;
+        node.publish(low, &mut Cursor::new(vec![0x35; 128]))
+            .expect("publish stateful lower-priority fixture");
+        let low = node.store.blob_inventory().expect("stateful low inventory")[0];
+        let attempts_before = node.publish_attempts;
+        let mut incoming = request(b"blob/local-pressure/stateful-incoming");
+        incoming.priority = Priority::Flash;
+        let mut source = StatefulRetrySource::replacing(vec![0x36; 129], vec![0x37; 129]);
+
+        let error = node
+            .publish(incoming, &mut source)
+            .expect_err("pressure proof for the first identity cannot admit the replacement");
+
+        assert_eq!(error.kind(), ApplicationErrorKind::Conflict);
+        assert_eq!(node.publish_attempts - attempts_before, 2);
+        assert_eq!(node.capacity_gc_attempts, 1);
+        assert!(!node.source_route_cache.has_blob_claim_for_test(low));
+        assert!(
+            node.store
+                .blob_inventory()
+                .expect("no replacement inventory")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn blob_retry_rewind_failure_precedes_stopped_pressure_mutation() {
+        // Break caught: a failed retry rewind after eviction destroys useful
+        // state even though the promised retry can never be attempted.
+        let root = TestRoot::new("local-pressure-stopped-rewind-failure");
+        persist_member_mission(&root);
+        let mut node = SelectedBlobNode::open_unprotected_reference_with_options(
+            root.path(),
+            root.mission_path(),
+            SelectedBlobOptions {
+                depot_limits: BlobDepotLimits::new(1_000_000, 4, 1)
+                    .expect("one-variant rewind limits"),
+            },
+        )
+        .expect("open stopped rewind node");
+        let mut low = request(b"blob/local-pressure/stopped-rewind-low");
+        low.priority = Priority::Routine;
+        node.publish(low, &mut Cursor::new(vec![0x38; 128]))
+            .expect("publish stopped rewind fixture");
+        let low = node
+            .store
+            .blob_inventory()
+            .expect("stopped rewind inventory")[0];
+        let recoveries_before = node.capacity_gc_attempts;
+        let attempts_before = node.publish_attempts;
+        let mut incoming = request(b"blob/local-pressure/stopped-rewind-incoming");
+        incoming.priority = Priority::Flash;
+        let mut source = StatefulRetrySource::failing(vec![0x39; 129]);
+
+        let error = node
+            .publish(incoming, &mut source)
+            .expect_err("failed rewind returns the original capacity rejection");
+
+        assert_eq!(error.kind(), ApplicationErrorKind::ResourceLimit);
+        assert_eq!(node.publish_attempts - attempts_before, 1);
+        assert_eq!(node.capacity_gc_attempts, recoveries_before);
+        assert!(node.source_route_cache.has_blob_claim_for_test(low));
+        assert_eq!(
+            node.store.blob_inventory().expect("preserved inventory"),
+            [low]
+        );
+    }
+
+    #[test]
+    fn live_blob_pressure_retry_rejects_same_length_file_change() {
+        // Break caught: a live file can change bytes without changing length
+        // between preparation attempts; the original eviction proof remains
+        // bound to the original Blob identity.
+        let root = TestRoot::new("live-pressure-same-length-change");
+        persist_member_mission(&root);
+        let mut node = SelectedBlobNode::open_unprotected_reference_with_options(
+            root.path(),
+            root.mission_path(),
+            SelectedBlobOptions {
+                depot_limits: BlobDepotLimits::new(8 * 1024 * 1024, 4, 1)
+                    .expect("one-variant live identity limits"),
+            },
+        )
+        .expect("open live identity node");
+        let mut low = request(b"blob/live-pressure/identity-low");
+        low.priority = Priority::Routine;
+        node.publish(low, &mut Cursor::new(vec![0x3a; 128]))
+            .expect("publish live identity fixture");
+        let low = node
+            .store
+            .blob_inventory()
+            .expect("live identity inventory")[0];
+        let source_path = root.path().join("live-pressure-change.bin");
+        let bytes = vec![0x3b; SELECTED_BLOB_CHUNK_SIZE as usize + 17];
+        fs::write(&source_path, &bytes).expect("write live pressure source");
+        let source = fs::File::open(&source_path).expect("open live pressure source");
+        let reached = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        node.set_live_publish_pass_two_gate(Arc::clone(&reached), Arc::clone(&release));
+        let mutate_path = source_path.clone();
+        let changed_offset = u64::from(SELECTED_BLOB_CHUNK_SIZE) + 7;
+        let mutator = std::thread::spawn(move || {
+            reached.wait();
+            let mut file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(mutate_path)
+                .expect("open live retry mutation handle");
+            file.seek(SeekFrom::Start(changed_offset))
+                .expect("seek live retry mutation");
+            file.write_all(&[0x3c]).expect("mutate live retry source");
+            file.sync_data().expect("sync live retry mutation");
+            release.wait();
+        });
+        let attempts_before = node.publish_attempts;
+        let mut incoming = request(b"blob/live-pressure/identity-incoming");
+        incoming.priority = Priority::Flash;
+
+        let error = node
+            .publish_live(incoming, source)
+            .expect_err("pressure proof cannot admit changed live-file content");
+        mutator.join().expect("join live retry mutator");
+
+        assert_eq!(error.kind(), ApplicationErrorKind::Conflict);
+        assert_eq!(node.publish_attempts - attempts_before, 2);
+        assert_eq!(node.capacity_gc_attempts, 1);
+        assert!(!node.source_route_cache.has_blob_claim_for_test(low));
+        assert!(
+            node.store
+                .blob_inventory()
+                .expect("no changed live inventory")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn live_blob_retry_rewind_failure_precedes_pressure_mutation() {
+        let root = TestRoot::new("live-pressure-rewind-failure");
+        persist_member_mission(&root);
+        let mut node = SelectedBlobNode::open_unprotected_reference_with_options(
+            root.path(),
+            root.mission_path(),
+            SelectedBlobOptions {
+                depot_limits: BlobDepotLimits::new(1_000_000, 4, 1)
+                    .expect("one-variant live rewind limits"),
+            },
+        )
+        .expect("open live rewind node");
+        let mut low = request(b"blob/live-pressure/rewind-low");
+        low.priority = Priority::Routine;
+        node.publish(low, &mut Cursor::new(vec![0x3d; 128]))
+            .expect("publish live rewind fixture");
+        let low = node.store.blob_inventory().expect("live rewind inventory")[0];
+        let source_path = root.path().join("live-pressure-rewind.bin");
+        fs::write(&source_path, vec![0x3e; 129]).expect("write live rewind source");
+        let source = fs::File::open(&source_path).expect("open live rewind source");
+        node.inject_live_publish_retry_rewind_failure();
+        let recoveries_before = node.capacity_gc_attempts;
+        let attempts_before = node.publish_attempts;
+        let mut incoming = request(b"blob/live-pressure/rewind-incoming");
+        incoming.priority = Priority::Flash;
+
+        let error = node
+            .publish_live(incoming, source)
+            .expect_err("live rewind failure returns the original capacity rejection");
+
+        assert_eq!(error.kind(), ApplicationErrorKind::ResourceLimit);
+        assert_eq!(node.publish_attempts - attempts_before, 1);
+        assert_eq!(node.capacity_gc_attempts, recoveries_before);
+        assert!(node.source_route_cache.has_blob_claim_for_test(low));
+        assert_eq!(
+            node.store
+                .blob_inventory()
+                .expect("preserved live inventory"),
+            [low]
+        );
+    }
+
+    #[test]
+    fn blob_insufficient_pressure_returns_without_retrying_admission() {
+        // Break caught: equal-priority data cannot be evicted and an
+        // unproven deficit cannot authorize the single admission retry.
+        let root = TestRoot::new("local-pressure-insufficient");
+        persist_member_mission(&root);
+        let mut node = SelectedBlobNode::open_unprotected_reference_with_options(
+            root.path(),
+            root.mission_path(),
+            SelectedBlobOptions {
+                depot_limits: BlobDepotLimits::new(1_000_000, 4, 1)
+                    .expect("one-variant pressure limits"),
+            },
+        )
+        .expect("open insufficient-pressure node");
+        let mut retained = request(b"blob/local-pressure/retained");
+        retained.priority = Priority::Priority;
+        node.publish(retained, &mut Cursor::new(vec![0x41; 128]))
+            .expect("publish equal-priority fixture");
+        let retained = node
+            .store
+            .blob_inventory()
+            .expect("retained inventory")
+            .into_iter()
+            .next()
+            .expect("retained transfer");
+        let attempts_before = node.publish_attempts;
+        let mut incoming = request(b"blob/local-pressure/equal");
+        incoming.priority = Priority::Priority;
+
+        let error = node
+            .publish(incoming, &mut Cursor::new(vec![0x42; 129]))
+            .expect_err("equal priority cannot recover the rejected partition");
+
+        assert_eq!(error.kind(), ApplicationErrorKind::ResourceLimit);
+        assert_eq!(node.publish_attempts - attempts_before, 1);
+        assert_eq!(node.capacity_gc_attempts, 1);
+        assert!(
+            node.source_route_cache.has_blob_claim_for_test(retained),
+            "insufficient recovery preserves the unrelated equal-priority route"
+        );
+    }
+
+    #[test]
+    fn blob_shared_variant_with_equal_priority_root_is_not_partially_evicted() {
+        let root = TestRoot::new("local-pressure-shared-variant");
+        persist_member_mission(&root);
+        let mut node = SelectedBlobNode::open_unprotected_reference_with_options(
+            root.path(),
+            root.mission_path(),
+            SelectedBlobOptions {
+                depot_limits: BlobDepotLimits::new(1_000_000, 4, 1)
+                    .expect("one shared-variant pressure limit"),
+            },
+        )
+        .expect("open shared-variant pressure node");
+        let shared = vec![0x51; 128];
+        let mut low = request(b"blob/local-pressure/shared-low");
+        low.priority = Priority::Routine;
+        node.publish(low, &mut Cursor::new(shared.clone()))
+            .expect("publish lower-priority shared source");
+        let low = node.store.blob_inventory().expect("low shared inventory")[0];
+        let mut retained = request(b"blob/local-pressure/shared-retained");
+        retained.priority = Priority::Flash;
+        node.publish(retained, &mut Cursor::new(shared))
+            .expect("publish equal-content retained source");
+        let retained = node
+            .store
+            .blob_inventory()
+            .expect("shared inventory")
+            .into_iter()
+            .find(|transfer| *transfer != low)
+            .expect("retained shared transfer");
+        let attempts_before = node.publish_attempts;
+        let mut incoming = request(b"blob/local-pressure/shared-blocked");
+        incoming.priority = Priority::Flash;
+
+        let error = node
+            .publish(incoming, &mut Cursor::new(vec![0x52; 129]))
+            .expect_err("shared retained variant leaves the exact deficit unproven");
+
+        assert_eq!(error.kind(), ApplicationErrorKind::ResourceLimit);
+        assert_eq!(node.publish_attempts - attempts_before, 1);
+        assert_eq!(node.capacity_gc_attempts, 1);
+        assert!(node.source_route_cache.has_blob_claim_for_test(low));
+        assert!(node.source_route_cache.has_blob_claim_for_test(retained));
+        let mut expected = vec![low, retained];
+        expected.sort_unstable();
+        assert_eq!(
+            node.store
+                .blob_inventory()
+                .expect("post-shared-pressure inventory"),
+            expected
+        );
+        assert_eq!(
+            node.store
+                .blob_stats()
+                .expect("post-shared-pressure stats")
+                .variants,
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn blob_physical_deletion_failure_records_retry_and_reconciles_before_single_retry() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = TestRoot::new("local-pressure-physical-failure");
+        persist_member_mission(&root);
+        let mut node = SelectedBlobNode::open_unprotected_reference_with_options(
+            root.path(),
+            root.mission_path(),
+            SelectedBlobOptions {
+                depot_limits: BlobDepotLimits::new(400, 4, 4)
+                    .expect("byte-constrained physical-failure limits"),
+            },
+        )
+        .expect("open physical-failure pressure node");
+        let mut low = request(b"blob/local-pressure/physical-low");
+        low.priority = Priority::Routine;
+        node.publish(low, &mut Cursor::new(vec![0x61; 128]))
+            .expect("publish physical-failure fixture");
+        let evicted = node
+            .store
+            .blob_inventory()
+            .expect("physical-failure inventory")[0];
+        let variant_directory = first_chunk_file(&root.depot_path())
+            .parent()
+            .expect("physical-failure variant directory")
+            .to_path_buf();
+        fs::set_permissions(&variant_directory, fs::Permissions::from_mode(0o500))
+            .expect("make variant directory non-writable");
+        let attempts_before = node.publish_attempts;
+        let mut incoming = request(b"blob/local-pressure/physical-high");
+        incoming.priority = Priority::Flash;
+
+        let result = node.publish(incoming, &mut Cursor::new(vec![0x62; 129]));
+        for _ in 0..16 {
+            node.store
+                .run_blob_maintenance_turn(
+                    BlobMaintenanceBudget::new(64, 16, 128 * 1024 * 1024)
+                        .expect("physical-failure maintenance budget"),
+                )
+                .expect("physical unlink failure remains durable maintenance state");
+            if node
+                .store
+                .blob_gc_status(None)
+                .expect("physical-failure interim status")
+                .retry_attempts
+                > 0
+            {
+                break;
+            }
+        }
+        fs::set_permissions(&variant_directory, fs::Permissions::from_mode(0o700))
+            .expect("restore variant directory permissions");
+        let error =
+            result.expect_err("deferred physical unlink cannot prove the rejected depot deficit");
+        assert_eq!(error.kind(), ApplicationErrorKind::ResourceLimit);
+        assert_eq!(node.publish_attempts - attempts_before, 1);
+        assert_eq!(node.capacity_gc_attempts, 1);
+        assert!(!node.source_route_cache.has_blob_claim_for_test(evicted));
+        let status = node
+            .store
+            .blob_gc_status(None)
+            .expect("physical-failure GC status");
+        assert!(status.retry_attempts > 0);
+        assert!(status.last_failure.is_some());
+        assert!(status.deletion_pending_files > 0);
+    }
+
+    #[test]
+    fn blob_unrecoverable_depot_capacity_returns_without_retrying_source() {
         // Break caught: eligible but unsatisfiable depot pressure must stop
-        // after one targeted attempt and one admission retry.
+        // after one targeted attempt without an admission retry.
         for live in [false, true] {
             let root = TestRoot::new(if live {
                 "live-capacity-gc-unsatisfied"
@@ -4977,8 +5758,8 @@ mod tests {
                     .expect_err("live tiny depot remains exhausted");
                 assert_eq!(
                     node.last_live_publish_source_bytes_read,
-                    4 * u64::try_from(plaintext.len()).expect("source length"),
-                    "two failed attempts perform exactly prepare/encrypt and no third source pass",
+                    2 * u64::try_from(plaintext.len()).expect("source length"),
+                    "one failed attempt performs exactly prepare/encrypt",
                 );
                 error
             } else {
@@ -4991,22 +5772,22 @@ mod tests {
                     .expect_err("stopped tiny depot remains exhausted");
                 assert_eq!(
                     source.bytes_read,
-                    4 * u64::try_from(plaintext.len()).expect("source length"),
-                    "two failed attempts perform exactly prepare/encrypt and no third source pass",
+                    2 * u64::try_from(plaintext.len()).expect("source length"),
+                    "one failed attempt performs exactly prepare/encrypt",
                 );
                 error
             };
             assert_eq!(error.kind(), ApplicationErrorKind::ResourceLimit);
             assert_eq!(node.capacity_gc_attempts, 1);
             assert_eq!(node.capacity_gc_targets, [BlobCapacityGcTarget::Depot]);
-            assert_eq!(node.publish_attempts, 2);
+            assert_eq!(node.publish_attempts, 1);
         }
     }
 
     #[test]
-    fn blob_lifecycle_capacity_control_flow_expires_once_retries_once_and_never_loops() {
-        // Publication-lifecycle pressure is retryable only when one due,
-        // cursor-neutral expiry unit can release the exact bounded authority.
+    fn blob_lifecycle_capacity_control_flow_requires_pressure_deficit_proof() {
+        // A due routine-expiry unit can release authority, but its progress
+        // alone cannot authorize retry without exact pressure deficit proof.
         let reclaimable_root = TestRoot::new("lifecycle-capacity-reclaimable");
         let mut rekey = persist_rekey_mission(&reclaimable_root);
         let publication_cap =
@@ -5064,17 +5845,19 @@ mod tests {
             1,
             "the publication cap is occupied by one due retired record"
         );
-        node.publish(
-            request(b"blob/lifecycle-capacity/replacement"),
-            &mut Cursor::new(b"replacement lifecycle capacity source".to_vec()),
-        )
-        .expect("one due expiry pass releases the publication cap for one retry");
+        let error = node
+            .publish(
+                request(b"blob/lifecycle-capacity/replacement"),
+                &mut Cursor::new(b"replacement lifecycle capacity source".to_vec()),
+            )
+            .expect_err("routine lifecycle expiry alone cannot authorize the retry");
+        assert_eq!(error.kind(), ApplicationErrorKind::ResourceLimit);
         assert_eq!(node.capacity_gc_attempts, 1);
         assert_eq!(
             node.capacity_gc_targets,
             [BlobCapacityGcTarget::PublicationLifecycle]
         );
-        assert_eq!(node.publish_attempts, 2);
+        assert_eq!(node.publish_attempts, 1);
         let after_recovery = node
             .store
             .blob_gc_status(Some(aster_mesh::CustodySample {
@@ -5089,11 +5872,11 @@ mod tests {
                 .blob_stats()
                 .expect("post-retry lifecycle stats")
                 .publications,
-            1
+            0
         );
 
         // An eligible capacity failure that remains unsatisfied gets exactly
-        // one GC attempt and one retry; the second failure is returned.
+        // one cleanup/pressure attempt and no admission retry.
         let unsatisfied_root = TestRoot::new("lifecycle-capacity-unsatisfied");
         persist_member_mission(&unsatisfied_root);
         let mut unsatisfied = selected_node_with_lifecycle_limits_and_clock(
@@ -5119,7 +5902,7 @@ mod tests {
             unsatisfied.capacity_gc_targets,
             [BlobCapacityGcTarget::PublicationLifecycle]
         );
-        assert_eq!(unsatisfied.publish_attempts, 3);
+        assert_eq!(unsatisfied.publish_attempts, 2);
 
         // Permanent replay authority is not reclaimable and therefore must
         // not enter the capacity-GC retry path at all.
@@ -5151,11 +5934,11 @@ mod tests {
     }
 
     #[test]
-    fn blob_operation_capacity_classes_each_drive_one_targeted_pass_and_one_retry() {
+    fn blob_operation_capacity_without_pressure_evidence_does_not_retry() {
         // The fixed production limits are intentionally large, so inject the
         // typed store boundary immediately before preparation. The ordinary
-        // publish loop, classifier, capacity call, rewind, and second attempt
-        // remain the real control flow under test.
+        // publish loop, classifier, and bounded capacity call remain real;
+        // no candidate means no pressure proof and therefore no retry.
         for (case, failure) in [
             (
                 "operation-count",
@@ -5176,17 +5959,20 @@ mod tests {
             let root = TestRoot::new(case);
             persist_member_mission(&root);
             let mut node = selected_node(&root);
-            node.injected_capacity_failures.push_back(failure);
+            node.injected_capacity_failures
+                .push_back(StoreError::Blob(failure));
 
-            node.publish(
-                request(format!("blob/{case}").as_bytes()),
-                &mut Cursor::new(format!("{case} source").into_bytes()),
-            )
-            .expect("one operation-targeted retry succeeds");
+            let error = node
+                .publish(
+                    request(format!("blob/{case}").as_bytes()),
+                    &mut Cursor::new(format!("{case} source").into_bytes()),
+                )
+                .expect_err("operation pressure without a candidate remains rejected");
 
+            assert_eq!(error.kind(), ApplicationErrorKind::ResourceLimit);
             assert_eq!(node.capacity_gc_attempts, 1);
             assert_eq!(node.capacity_gc_targets, [BlobCapacityGcTarget::Operation]);
-            assert_eq!(node.publish_attempts, 2);
+            assert_eq!(node.publish_attempts, 1);
         }
     }
 
@@ -5416,6 +6202,8 @@ mod tests {
             pass_two_gate: None,
             expected_len: MAX_SELECTED_LIVE_BLOB_BYTES,
             total_bytes_read: 0,
+            fail_retry_rewind: false,
+            start_zero_seeks: 0,
         };
         let error = admitted
             .seek(std::io::SeekFrom::End(0))
@@ -5861,33 +6649,6 @@ mod tests {
         ] {
             assert!(blob_store_error_recoverable_capacity(&error).is_none());
         }
-
-        for error in [
-            BlobError::InvalidManifest,
-            BlobError::LengthOverflow,
-            BlobError::Io(std::io::Error::new(
-                std::io::ErrorKind::FileTooLarge,
-                "test length limit",
-            )),
-            BlobError::Store(Box::new(StoreError::Blob(
-                BlobStoreError::PublicationLimitExceeded {
-                    current: 1,
-                    limit: 1,
-                },
-            ))),
-        ] {
-            assert!(blob_error_recoverable_capacity(&error).is_none());
-        }
-        assert!(
-            blob_error_recoverable_capacity(&BlobError::Store(Box::new(StoreError::Blob(
-                BlobStoreError::DepotByteLimitExceeded {
-                    current: 10,
-                    incoming: 1,
-                    limit: 10,
-                }
-            ))))
-            .is_some()
-        );
     }
 
     #[test]

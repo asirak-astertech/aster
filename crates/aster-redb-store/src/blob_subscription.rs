@@ -1706,29 +1706,32 @@ fn encode_blob_retired_delivery_record(record: BlobRetiredDeliveryRecord) -> Vec
     encoded
 }
 
-pub(crate) fn retire_blob_deliveries_write(
+pub(crate) struct BlobDeliveryRetirementPlan {
+    rows: Vec<BlobDeliveryRetirementRow>,
+}
+
+struct BlobDeliveryRetirementRow {
+    key: Vec<u8>,
+    live: Vec<u8>,
+}
+
+pub(crate) fn apply_blob_delivery_retirement_plan_write(
     write: &redb::WriteTransaction,
-    transfer: BlobTransferId,
+    plan: BlobDeliveryRetirementPlan,
     semantic_id: BlobSemanticId,
     retirement_generation: u64,
 ) -> Result<(), StoreError> {
-    let keys = super::blob::lifecycle::delivery_keys_for_owner(write, transfer)?;
-    for key in keys {
-        let encoded = write
+    for row in plan.rows {
+        let current = write
             .open_table(BLOB_SUBSCRIPTION_PENDING)?
-            .get(key.as_slice())?
+            .get(row.key.as_slice())?
             .map(|value| value.value().to_vec())
             .ok_or(StoreError::BlobInvariant(
-                "Blob delivery owner points to a missing pending row",
+                "planned Blob delivery row disappeared before retirement",
             ))?;
-        let BlobDeliveryRecord::Pending(pending) = decode_blob_delivery_record(&encoded)? else {
+        if current != row.live {
             return Err(StoreError::BlobInvariant(
-                "live Blob delivery owner points to retired delivery state",
-            ));
-        };
-        if pending.semantic_id != semantic_id {
-            return Err(StoreError::BlobInvariant(
-                "Blob delivery owner points to another semantic publication",
+                "planned Blob delivery row changed before retirement",
             ));
         }
         let retired = encode_blob_retired_delivery_record(BlobRetiredDeliveryRecord {
@@ -1737,7 +1740,7 @@ pub(crate) fn retire_blob_deliveries_write(
         });
         write
             .open_table(BLOB_SUBSCRIPTION_PENDING)?
-            .insert(key.as_slice(), retired.as_slice())?;
+            .insert(row.key.as_slice(), retired.as_slice())?;
     }
     Ok(())
 }
@@ -1747,23 +1750,24 @@ pub(crate) fn retire_blob_deliveries_write(
 /// forward delivery and its audited inverse owner are each admitted and
 /// charged once; unrelated acknowledgement and cursor rows are neither read
 /// nor mutated here.
-pub(crate) fn blob_delivery_retirement_charge_write(
+pub(crate) fn plan_blob_delivery_retirement_write(
     write: &redb::WriteTransaction,
     transfer: BlobTransferId,
     semantic_id: BlobSemanticId,
     charge: &mut super::blob::MaintenanceCharge,
-) -> Result<bool, StoreError> {
+) -> Result<Option<BlobDeliveryRetirementPlan>, StoreError> {
     let (start, end) = super::blob::lifecycle::inverse_owner_bounds(transfer);
     let owners = write.open_table(super::blob::lifecycle::BLOB_DELIVERY_OWNERS)?;
     let pending_rows = write.open_table(BLOB_SUBSCRIPTION_PENDING)?;
     let mut owner_rows = 0u64;
+    let mut rows = Vec::new();
     for row in owners.range::<&[u8]>((
         std::ops::Bound::Included(start.as_slice()),
         std::ops::Bound::Included(end.as_slice()),
     ))? {
         let (owner_key, delivery_key) = row?;
         if !charge.charge(owner_key.value(), delivery_key.value().len())? {
-            return Ok(false);
+            return Ok(None);
         }
         if super::blob::lifecycle::inverse_owner_key(transfer, delivery_key.value()).as_slice()
             != owner_key.value()
@@ -1781,10 +1785,10 @@ pub(crate) fn blob_delivery_retirement_charge_write(
             ));
         }
         if !charge.has_capacity_for_row() {
-            return Ok(false);
+            return Ok(None);
         }
         if !charge.charge(delivery_key.value(), BLOB_PENDING_DELIVERY_RECORD_BYTES)? {
-            return Ok(false);
+            return Ok(None);
         }
         let encoded = pending_rows
             .get(delivery_key.value())?
@@ -1802,8 +1806,12 @@ pub(crate) fn blob_delivery_retirement_charge_write(
                 "Blob delivery owner points to another semantic publication",
             ));
         }
+        rows.push(BlobDeliveryRetirementRow {
+            key: delivery_key.value().to_vec(),
+            live: encoded.value().to_vec(),
+        });
     }
-    Ok(true)
+    Ok(Some(BlobDeliveryRetirementPlan { rows }))
 }
 
 fn charge_retirement_delivery_expiry_entry(
