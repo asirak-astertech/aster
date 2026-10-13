@@ -95,6 +95,8 @@ const SEMANTIC_PROTOCOL_V5: u16 = super::SEMANTIC_PROTOCOL_V5;
 const SEMANTIC_PROTOCOL_V6: u16 = super::SEMANTIC_PROTOCOL_V6;
 #[cfg(test)]
 const SEMANTIC_PROTOCOL_V7: u16 = super::SEMANTIC_PROTOCOL_V7;
+#[cfg(test)]
+const SEMANTIC_PROTOCOL_V8: u16 = super::SEMANTIC_PROTOCOL_V8;
 const SUITE_ID: u16 = super::HYBRID_SUITE_ID;
 const PUBLIC_HEADER_LEN: usize = 44;
 const SELECTOR_LEN: usize = 16;
@@ -6403,6 +6405,7 @@ fn parse_batch_envelope(
             | super::SEMANTIC_PROTOCOL_V5
             | super::SEMANTIC_PROTOCOL_V6
             | super::SEMANTIC_PROTOCOL_V7
+            | super::SEMANTIC_PROTOCOL_V8
     ) {
         return Err(authentication_failed());
     }
@@ -9904,6 +9907,7 @@ mod tests {
             SEMANTIC_PROTOCOL_V5,
             SEMANTIC_PROTOCOL_V6,
             SEMANTIC_PROTOCOL_V7,
+            SEMANTIC_PROTOCOL_V8,
         ] {
             let mut provisioner = ReferenceProvisioner::from_seed([0x40 + version as u8; 32])
                 .unwrap_or_else(|error| panic!("v{version} provisioner failed: {error}"));
@@ -9919,7 +9923,7 @@ mod tests {
             assert_eq!(responder.semantic_version(), version);
         }
 
-        for unsupported in [0, SEMANTIC_PROTOCOL_V7 + 1] {
+        for unsupported in [0, SEMANTIC_PROTOCOL_V8 + 1] {
             let mut provisioner = ReferenceProvisioner::from_seed([0x50 + unsupported as u8; 32])
                 .unwrap_or_else(|error| panic!("v{unsupported} provisioner failed: {error}"));
             let initiator_bundle = provisioner
@@ -9997,6 +10001,7 @@ mod tests {
         assert_eq!(
             hello.supported_versions,
             vec![
+                SEMANTIC_PROTOCOL_V8,
                 SEMANTIC_PROTOCOL_V7,
                 SEMANTIC_PROTOCOL_V6,
                 SEMANTIC_PROTOCOL_V5,
@@ -10043,6 +10048,7 @@ mod tests {
         assert_eq!(
             default_hello.supported_versions,
             vec![
+                SEMANTIC_PROTOCOL_V8,
                 SEMANTIC_PROTOCOL_V7,
                 SEMANTIC_PROTOCOL_V6,
                 SEMANTIC_PROTOCOL_V5,
@@ -10070,8 +10076,8 @@ mod tests {
             .unwrap_or_else(|error| panic!("server finished failed: {error}"));
         assert_eq!(initiator_session.peer_identity(), responder_id);
         assert_eq!(responder_session.peer_identity(), initiator_id);
-        assert_eq!(initiator_session.semantic_version(), SEMANTIC_PROTOCOL_V7);
-        assert_eq!(responder_session.semantic_version(), SEMANTIC_PROTOCOL_V7);
+        assert_eq!(initiator_session.semantic_version(), SEMANTIC_PROTOCOL_V8);
+        assert_eq!(responder_session.semantic_version(), SEMANTIC_PROTOCOL_V8);
 
         let frame = initiator_session
             .seal_frame(b"opaque replication frame")
@@ -12608,6 +12614,7 @@ mod tests {
         assert_eq!(
             hello.supported_versions,
             vec![
+                SEMANTIC_PROTOCOL_V8,
                 SEMANTIC_PROTOCOL_V7,
                 SEMANTIC_PROTOCOL_V6,
                 SEMANTIC_PROTOCOL_V5,
@@ -12624,7 +12631,7 @@ mod tests {
             .unwrap_or_else(|error| panic!("client flight failed: {error}"));
         let mut server_hello = decode_server_flight(&second_flight)
             .unwrap_or_else(|error| panic!("server flight decode failed: {error}"));
-        assert_eq!(server_hello.selected_version, SEMANTIC_PROTOCOL_V7);
+        assert_eq!(server_hello.selected_version, SEMANTIC_PROTOCOL_V8);
 
         // Version 5 was genuinely offered, so membership checks alone would
         // accept it. The rewrite must still fail because selection is bound

@@ -4846,6 +4846,7 @@ fn semantic_restart_progress_allowed(
             | wire::SEMANTIC_PROTOCOL_V5
             | wire::SEMANTIC_PROTOCOL_V6
             | wire::SEMANTIC_PROTOCOL_V7
+            | wire::SEMANTIC_PROTOCOL_V8
     ) {
         return false;
     }
@@ -4868,6 +4869,7 @@ fn semantic_restart_progress_allowed(
             | wire::SEMANTIC_PROTOCOL_V5
             | wire::SEMANTIC_PROTOCOL_V6
             | wire::SEMANTIC_PROTOCOL_V7
+            | wire::SEMANTIC_PROTOCOL_V8
     ) {
         return false;
     }
@@ -6061,7 +6063,11 @@ mod tests {
             &proof,
             wire::SEMANTIC_PROTOCOL_V7
         ));
-        assert!(!semantic_restart_progress_allowed(&proof, 8));
+        assert!(semantic_restart_progress_allowed(
+            &proof,
+            wire::SEMANTIC_PROTOCOL_V8
+        ));
+        assert!(!semantic_restart_progress_allowed(&proof, 9));
     }
 
     #[test]

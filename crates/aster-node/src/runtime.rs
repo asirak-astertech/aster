@@ -128,8 +128,8 @@ use crate::{
         ChangeTurnFinishedV1, ChangeTurnHeaderV1, EventPagePackingState, EventPageScheduleLimits,
         EventPageSchedulePosition, EventTurnPlanV1, LaneId, LocalEventSendDifference,
         MAX_CHANGE_PAGE_CODEC_BYTES, MAX_EVENT_TURN_PLAN_CODEC_BYTES, NegotiatedTransferProfiles,
-        SEMANTIC_PROTOCOL_V7, TransferProfileOfferV1, blind_set_commitment,
-        build_local_event_send_plan_with_limits, negotiate_transfer_profiles,
+        SEMANTIC_PROTOCOL_V7, SEMANTIC_PROTOCOL_V8, TransferProfileOfferV1, blind_set_commitment,
+        build_local_event_send_plan_with_limits, negotiate_transfer_profiles_for_semantic_version,
         pack_event_page_entry, schedule_digest, transfer_profile_digest,
         validate_remote_event_page_budget, validate_remote_event_send_plan,
     },
@@ -18783,7 +18783,7 @@ where
         .checked_add(REFERENCE_SESSION_FRAME_OVERHEAD_BYTES)
         .ok_or_else(|| NodeError::Protocol("protected Event frame length overflow".into()))?;
     check_protected_frame_with_reserve(receipt, expected_wire_bytes, reserve)?;
-    let protected = mission.seal_v7_application_frame(
+    let protected = mission.seal_profiled_application_frame(
         profiles.digest,
         LaneId::Event,
         profile,
@@ -18869,7 +18869,7 @@ async fn read_v7_event_turn_frame(
         .negotiated
         .profile(LaneId::Event)
         .ok_or_else(|| NodeError::Protocol("Event lane has no negotiated profile".into()))?;
-    let plaintext = mission.open_v7_application_frame(
+    let plaintext = mission.open_profiled_application_frame(
         profiles.digest,
         LaneId::Event,
         profile,
@@ -24298,12 +24298,15 @@ fn record_local_event_plan(
     Ok(())
 }
 
-fn local_transfer_profile_offer() -> TransferProfileOfferV1 {
+fn local_transfer_profile_offer(
+    semantic_version: u16,
+) -> Result<TransferProfileOfferV1, NodeError> {
     #[cfg(test)]
     if let Ok(Some(offer)) = TEST_TRANSFER_PROFILE_OFFER.try_with(|offer| offer.borrow().clone()) {
-        return offer;
+        return Ok(offer);
     }
-    TransferProfileOfferV1::current()
+    TransferProfileOfferV1::for_semantic_version(semantic_version)
+        .map_err(|error| NodeError::Protocol(error.to_string()))
 }
 
 async fn sync_transfer_profiles(
@@ -24314,12 +24317,7 @@ async fn sync_transfer_profiles(
     if mission.semantic_version() < SEMANTIC_PROTOCOL_V7 {
         return Ok(None);
     }
-    if mission.semantic_version() != SEMANTIC_PROTOCOL_V7 {
-        return Err(NodeError::Protocol(
-            "unsupported semantic version for transfer-profile exchange".into(),
-        ));
-    }
-    let initiator = local_transfer_profile_offer();
+    let initiator = local_transfer_profile_offer(mission.semantic_version())?;
     let response = request_mission_frame(
         connection,
         mission,
@@ -24332,8 +24330,12 @@ async fn sync_transfer_profiles(
             "semantic-v7 contact did not begin with the responder transfer-profile offer".into(),
         ));
     };
-    let negotiated = negotiate_transfer_profiles(&initiator, &responder)
-        .map_err(|error| NodeError::Protocol(error.to_string()))?;
+    let negotiated = negotiate_transfer_profiles_for_semantic_version(
+        mission.semantic_version(),
+        &initiator,
+        &responder,
+    )
+    .map_err(|error| NodeError::Protocol(error.to_string()))?;
     let digest = transfer_profile_digest(&initiator, &responder, &negotiated);
     let profiles = V7TransferProfiles { negotiated, digest };
     record_v7_transfer_profiles(receipt, &profiles);
@@ -24348,12 +24350,8 @@ async fn serve_transfer_profiles(
     if mission.semantic_version() < SEMANTIC_PROTOCOL_V7 {
         return Ok(None);
     }
-    if mission.semantic_version() != SEMANTIC_PROTOCOL_V7 {
-        return Err(NodeError::Protocol(
-            "unsupported semantic version for transfer-profile exchange".into(),
-        ));
-    }
-    let responder = TransferProfileOfferV1::current();
+    let responder = TransferProfileOfferV1::for_semantic_version(mission.semantic_version())
+        .map_err(|error| NodeError::Protocol(error.to_string()))?;
     let mut initiator = None;
     let wire_budget = exchange_wire_budget(receipt)?;
     let (complete, request_bytes, response_bytes) = respond_mission_frame(
@@ -24380,8 +24378,12 @@ async fn serve_transfer_profiles(
     let initiator = initiator.ok_or_else(|| {
         NodeError::Protocol("initiator transfer-profile offer disappeared".into())
     })?;
-    let negotiated = negotiate_transfer_profiles(&initiator, &responder)
-        .map_err(|error| NodeError::Protocol(error.to_string()))?;
+    let negotiated = negotiate_transfer_profiles_for_semantic_version(
+        mission.semantic_version(),
+        &initiator,
+        &responder,
+    )
+    .map_err(|error| NodeError::Protocol(error.to_string()))?;
     let digest = transfer_profile_digest(&initiator, &responder, &negotiated);
     let profiles = V7TransferProfiles { negotiated, digest };
     record_v7_transfer_profiles(receipt, &profiles);
@@ -24402,7 +24404,7 @@ async fn sync_event_turn_plans(
         .ok_or_else(|| NodeError::Protocol("Event lane has no negotiated profile".into()))?;
     let plaintext =
         Frame::EventTurnPlan(local_plan).encode_for_semantic_version(mission.semantic_version())?;
-    let protected_request = mission.seal_v7_application_frame(
+    let protected_request = mission.seal_profiled_application_frame(
         profiles.digest,
         LaneId::Event,
         profile,
@@ -24415,7 +24417,7 @@ async fn sync_event_turn_plans(
             require_contact_frame_initiation()
         })
         .await?;
-    let plaintext = mission.open_v7_application_frame(
+    let plaintext = mission.open_profiled_application_frame(
         profiles.digest,
         LaneId::Event,
         profile,
@@ -24454,7 +24456,7 @@ async fn serve_event_turn_plans(
                 .map_err(|_| CarrierError::Transport("live emission policy changed".into()))?;
             request_len = Some(protected_request.len());
             let handled = (|| -> Result<Vec<u8>, NodeError> {
-                let plaintext = mission.open_v7_application_frame(
+                let plaintext = mission.open_profiled_application_frame(
                     profiles.digest,
                     LaneId::Event,
                     profile,
@@ -24473,7 +24475,7 @@ async fn serve_event_turn_plans(
                 require_contact_frame_response(&response_frame)?;
                 let plaintext =
                     response_frame.encode_for_semantic_version(mission.semantic_version())?;
-                let protected_response = mission.seal_v7_application_frame(
+                let protected_response = mission.seal_profiled_application_frame(
                     profiles.digest,
                     LaneId::Event,
                     profile,
@@ -33688,7 +33690,7 @@ mod tests {
         assert_eq!(response_plan, server_response_plan);
         assert_eq!(receipt.protected_frames, 4);
         assert_eq!(server_receipt.protected_frames, 4);
-        assert_eq!(mission.semantic_version(), SEMANTIC_PROTOCOL_V7);
+        assert_eq!(mission.semantic_version(), SEMANTIC_PROTOCOL_V8);
         client.close().await;
         server.close().await;
     }
@@ -46508,7 +46510,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(source_receipt.semantic_version, SEMANTIC_PROTOCOL_V7);
+        assert_eq!(source_receipt.semantic_version, SEMANTIC_PROTOCOL_V8);
         assert!(
             source_receipt.event_page_entries_sent > 0,
             "source receipt: {source_receipt:?}; receiver receipt: {receiver_receipt:?}"
@@ -49353,7 +49355,7 @@ mod tests {
             services.other.clone(),
         )
         .await;
-        assert_eq!(finite_source.semantic_version, SEMANTIC_PROTOCOL_V7);
+        assert_eq!(finite_source.semantic_version, SEMANTIC_PROTOCOL_V8);
         assert_eq!(finite_source.offered, 1);
         assert_eq!(finite_source.event_pages_sent, 1);
         assert_eq!(finite_source.event_page_entries_sent, 1);
@@ -49504,7 +49506,7 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(source.semantic_version, SEMANTIC_PROTOCOL_V7);
+        assert_eq!(source.semantic_version, SEMANTIC_PROTOCOL_V8);
         assert_eq!(source.offered, EVENT_COUNT);
         assert_eq!(
             source.event_pages_sent,
@@ -49707,7 +49709,7 @@ mod tests {
             TransferProfileId::EventPagesV1 as u16,
             TransferProfileId::LegacyV6 as u16,
             TransferProfileId::LegacyV6 as u16,
-            TransferProfileId::LegacyV6 as u16,
+            TransferProfileId::BlobCustodyV1 as u16,
             TransferProfileId::LegacyV6 as u16,
         ]);
         assert_eq!(
@@ -53287,7 +53289,7 @@ mod tests {
             matching_interest.clone(),
         )
         .await;
-        if mission.semantic_version() == SEMANTIC_PROTOCOL_V7 {
+        if mission.semantic_version() >= SEMANTIC_PROTOCOL_V7 {
             defer_empty_mutable_classes(&connection, &mut mission, &mut receipt).await;
             assert_eq!(
                 request_mission_frame(
@@ -53337,7 +53339,7 @@ mod tests {
                 }
             );
         }
-        if mission.semantic_version() != SEMANTIC_PROTOCOL_V7 {
+        if mission.semantic_version() < SEMANTIC_PROTOCOL_V7 {
             reconcile_equal_event_lane(
                 &connection,
                 &mut mission,

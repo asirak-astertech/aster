@@ -82,7 +82,7 @@ The protocol has two deterministic encodings. Replication messages use the RFC
 [`wire.cddl`](wire.cddl) defines those maps. Security objects—credentials, source envelopes,
 handshake flights, custody wrappers, controls, and Blob manifests—use the fixed,
 length-prefixed binary structures in [envelope.md](envelope.md); the
-semantic-v2/v3/v4/v5/v6/v7 batch additions use the fixed structures in §6.1. Those readers reject
+semantic-v2/v3/v4/v5/v6/v7/v8 batch additions use the fixed structures in §6.1. Those readers reject
 truncation, trailing bytes, nonzero reserved fields, unknown critical kinds, and
 lengths above their field-specific bound before allocation. A security object is
 never reinterpreted as a CBOR object or vice versa.
@@ -94,9 +94,9 @@ words, signature messages, KDF salts, labels, and contexts are normative in
 Security digests and semantic identifiers are 32-byte SHA-256 results. The
 replication namespace uses a fixed 33-byte `ObjectID = kind u8 || digest[32]`.
 Semantic version 1 permits kind `1` source envelopes and kind `2` Blob chunk
-carriers. Semantic versions 2 through 7 additionally permit kind `3`
+carriers. Semantic versions 2 through 8 additionally permit kind `3`
 source-batch proofs, kind `4` bridge authorizations, and kind `5` bridge-route
-wrappers. Semantic versions 3 through 7 additionally enable session-bound
+wrappers. Semantic versions 3 through 8 additionally enable session-bound
 custody records for the selected Event/RouteEvent path without allocating a new
 stable transfer-object kind. Semantic version 4 adds selected protected
 State/Record mechanics frames, inherited by later versions; semantic version 5
@@ -187,7 +187,7 @@ TTL, publisher/counter/context, Event sequence, tombstone state, declared
 content length, authenticated Blob route commitment, content group/epoch/nonce,
 ciphertext length, and the authentication fields selected by the envelope
 format. Format 2 carries the unchanged singleton authentication-manifest
-identifier and hybrid source signature. Semantic-v2/v3/v4/v5/v6/v7 format 3 carries the exact
+identifier and hybrid source signature. Semantic-v2/v3/v4/v5/v6/v7/v8 format 3 carries the exact
 batch reference, Merkle path, and item ECDSA suffix in §6.1. A consumer MUST
 reject if a repeated semantic field differs from decrypted ItemCore.
 
@@ -218,11 +218,11 @@ delivery. Missing or stripped signatures fail.
 The fixed envelope includes a singleton authentication-manifest identifier and
 both publisher signatures bind the complete canonical semantic header, including
 the conditional Blob route commitment. Its bytes and meaning remain unchanged:
-semantic-v2/v3/v4/v5/v6/v7 peers MAY still use format 2 for a singleton or urgent fallback, but
+semantic-v2/v3/v4/v5/v6/v7/v8 peers MAY still use format 2 for a singleton or urgent fallback, but
 no implementation may reinterpret a format-2 byte as compact batch
 authentication.
 
-### 6.1 Semantic-v2/v3/v4/v5/v6/v7 content-committing PQ batch profile
+### 6.1 Semantic-v2/v3/v4/v5/v6/v7/v8 content-committing PQ batch profile
 
 This profile amortizes the authority credential and ML-DSA source signature
 without removing post-quantum authentication. It is available only after the
@@ -327,7 +327,7 @@ noncanonical; structure and the computed root decide validity.
 
 #### 6.1.3 BatchProof object and compact item suffix
 
-The batch proof is a stable semantic-v2/v3/v4/v5/v6/v7 transfer object with `ObjectKind = 3`.
+The batch proof is a stable semantic-v2/v3/v4/v5/v6/v7/v8 transfer object with `ObjectKind = 3`.
 Its protected route plaintext is exactly:
 
 ```text
@@ -389,7 +389,7 @@ rejects a canonical message containing a kind-3 ObjectID, and a semantic-v1
 fixed-envelope decoder rejects an `ASTRENV3` header before route or content
 dispatch.
 This rule preserves all semantic-v1 format-2 bytes and corpus vectors exactly.
-A semantic-v2, semantic-v3, semantic-v4, semantic-v5, semantic-v6, or semantic-v7 session accepts format-2 singleton fallback as
+A semantic-v2, semantic-v3, semantic-v4, semantic-v5, semantic-v6, semantic-v7, or semantic-v8 session accepts format-2 singleton fallback as
 well as valid format-3 proof/item representations. When both representations
 are published, they share ItemID but retain distinct EnvelopeIDs, receipts,
 retry completion, custody, and garbage-collection references. ItemID
@@ -585,7 +585,7 @@ bounded retention cannot prevent that indefinitely.
 For each policy-filtered snapshot selected by the embedding node, the implemented
 inventory is an exact sparse nibble-radix Merkle tree keyed by the full 33-byte
 typed ObjectID. It therefore has 66 nibble levels. A leaf commits to that full
-typed identifier, keeping source envelopes, Blob chunk carriers, and semantic-v2/v3/v4/v5/v6/v7
+typed identifier, keeping source envelopes, Blob chunk carriers, and semantic-v2/v3/v4/v5/v6/v7/v8
 batch proofs disjoint even if their 32-byte digests collide. Internal hashes
 commit to depth, ordered child summaries, and counts. ItemID, singleton/batch
 identifiers, proof dependencies, and semantic fields are authenticated inside
@@ -673,13 +673,13 @@ protocol receipt state.
 ### 9.1 Selected semantic-v4 State and Record reconciliation
 
 The selected mechanics profile adds State and Record when the authenticated
-mission session selects semantic version `4`, `5`, `6`, or `7`. Semantic
+mission session selects semantic version `4`, `5`, `6`, `7`, or `8`. Semantic
 versions `1`, `2`, and `3` retain their Event compatibility behavior and MUST
 NOT send, accept, reserve, or count mutable frames. The current default semantic
-offer is `[7, 6, 5, 4, 3, 2, 1]`; stable replication-wire/profile, handshake
+offer is `[8, 7, 6, 5, 4, 3, 2, 1]`; stable replication-wire/profile, handshake
 framing, source envelopes, and suite remain version `1`. Semantic v5 inherits
 these State/Record mechanics unchanged and adds the separate Blob mechanics in
-§9.2; semantic v6 and v7 inherit both ordinary lanes unchanged.
+§9.2; semantic v6, v7, and v8 inherit both ordinary lanes unchanged.
 
 State and Record are independent classes (`State = 1`, `Record = 2`). Each has
 two receiver-directed lanes, so every contact has four independent reconciliation
@@ -752,14 +752,15 @@ receiving selected Event work.
 Semantic version `5` inherits the exact Event behavior of versions `1` through
 `4` and the semantic-v4 State/Record mechanics above. It additionally allocates
 one selected Blob source class (`MutableClass = 3`) and one Blob carrier lane.
-Semantic versions `6` and `7` inherit that complete v5 ordinary-lane behavior
-unchanged. The current default descending offer is `[7, 6, 5, 4, 3, 2, 1]`.
+Semantic versions `6`, `7`, and `8` inherit that complete v5 ordinary-lane
+behavior unchanged. The current default descending offer is
+`[8, 7, 6, 5, 4, 3, 2, 1]`.
 Stable replication-wire and ABI version `1`, handshake framing,
 `ASTRENV2`/`ASTRENV3` source formats, `ASTRBT01` carriers, typed ObjectIDs, and
 the registered cryptographic suite do not change. A semantic-v1, v2, v3, or v4
 session MUST emit, accept, reserve, and count zero Blob interest, Blob-class
 mutable, Blob range, and Blob carrier finish frames. State and Record retain
-their semantic-v4 behavior in v5 through v7.
+their semantic-v4 behavior in v5 through v8.
 
 The core SQLite compatibility store advances schema 14 to 15 only to admit
 `origin_semantic_version = 5` in `transfer_identities`. The transactional
@@ -987,15 +988,18 @@ content-authorized target delivery may open the committed payload, and the
 selected runtime emits only its length and SHA-256 digest.
 
 
-### 9.4 Selected semantic-v7 transfer profiles and receipt-free Event pages
+### 9.4 Selected semantic-v7/v8 transfer profiles and receipt-free Event pages
 
 Semantic version `7` inherits every semantic-v6 source object and mechanics lane
-without changing v1-v6 bytes. Immediately after the four-flight handshake, the
+without changing v1-v6 bytes. Semantic version `8` inherits every v7 source
+object, ordinary lane, and profile-exchange byte without revising v5-v7 durable
+Blob mechanics. Immediately after the four-flight handshake, the
 initiator sends and the responder returns one protected canonical
 `TransferProfileOfferV1`. Known lane IDs are `1` Event, `2` State, `3` Record,
-`4` Blob, and `5` EventBridge. Known profile IDs are `1` `LegacyV6` and `2`
-`EventPagesV1`. Lanes and profiles are strictly descending and unique. Every
-known lane MUST offer `LegacyV6`; only Event may offer `EventPagesV1`. Unknown
+`4` Blob, and `5` EventBridge. Known profile IDs are `1` `LegacyV6`, `2`
+`EventPagesV1`, and `3` `BlobCustodyV1`. Lanes and profiles are strictly
+descending and unique. Every known lane MUST offer `LegacyV6`; only Event may
+offer `EventPagesV1`, and only Blob may offer `BlobCustodyV1`. Unknown
 IDs with bit `0x8000` set are critical and fail the contact; other unknown IDs
 remain canonical digest input but are not selected.
 
@@ -1003,9 +1007,16 @@ Both peers compute the same highest common profile independently for each lane
 and bind the complete canonical offers plus intersections into
 `transfer_profile_digest`. The current offer selects `EventPagesV1` for Event
 when both peers support it and `LegacyV6` for State, Record, Blob, and
-EventBridge. Thus semantic v7 never removes another data class. A missing
-mandatory legacy profile, empty intersection, digest mismatch, or profile
-substitution fails closed.
+EventBridge. A v7 offer is byte-identical to its prior canonical encoding and
+offers Blob only `[LegacyV6]`. A v8 offer changes only the Blob profile list to
+`[BlobCustodyV1, LegacyV6]`. Thus semantic v8 never removes another data class;
+it allocates Blob custody negotiation only. A missing mandatory legacy profile,
+an empty intersection, digest mismatch, or profile substitution fails closed.
+
+`BlobCustodyV1` is selected only in a semantic-v8 session. This allocation does
+not yet define custody claim or Blob frame grammar and does not activate finite
+Blob source transfer. A Blob lane selected as `LegacyV6`, including every v7
+session and any v8 fallback, continues to suppress finite-Blob source transfer.
 
 Each Event direction then exchanges one `EventTurnPlanV1`: `PageActive`,
 `PageBlindActive`, `LegacyActive`, `Empty`, or `Suppressed`. `PageActive` binds
@@ -1044,10 +1055,13 @@ attempt cursor, and retries from fresh reconciliation on a later contact.
 
 The protected mechanics tags are `0xd1` profile offer, `0xd2` Event turn plan,
 `0xd3` change-turn header, `0xd4` change page, and `0xd5` change-turn terminal.
-They are invalid in semantic-v1 through semantic-v6 sessions. The v7 Event
-plan/header/page/terminal records use the contextual AAD in
-[envelope.md](envelope.md) section 9. Profile offers and every `LegacyV6` lane
-record retain the ordinary transport-frame AAD. The reference shares one
+They are invalid in semantic-v1 through semantic-v6 sessions. Selected lane
+records use a version-specific contextual AAD: semantic v7 uses exact
+`ASTER/v7-lane-record/v1\0`, while semantic v8 uses exact
+`ASTER/v8-lane-record/v1\0`. Both domains bind the selected semantic version,
+transfer-profile digest, lane, selected profile, and direction. Every other
+semantic version/domain substitution fails closed. Profile offers and every
+`LegacyV6` lane record retain the ordinary transport-frame AAD. The reference shares one
 directional record sequence and one independently advancing AES-GCM nonce
 generator across both AAD domains; the nonce is not derived from the record
 sequence. It maintains fixed 128-record ordinary and contextual receive replay
@@ -1057,7 +1071,7 @@ precedes replay-state mutation, and reuse within either domain or cross-domain
 reinterpretation fails closed without mutating either window.
 
 All following integers are unsigned big-endian. These are the complete canonical
-semantic-v7 plaintext layouts; decoders reject truncation, trailing bytes,
+semantic-v7/v8 plaintext layouts; decoders reject truncation, trailing bytes,
 noncanonical ordering, invalid counts, and arithmetic overflow:
 
 ```text
@@ -1222,7 +1236,7 @@ wrapper in [envelope.md](envelope.md) §7 remains a distinct legacy per-hop
 object and is never reinterpreted as this semantic-v3-format session record.
 
 The protected semantic-v3-format Event-interest request and reply, used in
-semantic-v3, semantic-v4, semantic-v5, semantic-v6, and semantic-v7
+semantic-v3, semantic-v4, semantic-v5, semantic-v6, semantic-v7, and semantic-v8
 `LegacyV6` sessions, also carry the
 receiver's opaque durable selector generation. Zero is canonical only for an
 empty interest; otherwise the generation is at least the number of projected
@@ -1335,14 +1349,14 @@ Emission modes are:
 - `Normal`: all eligible application traffic and configured contact initiation.
 - `AtLeast(p)`: Event application objects below `p` are withheld. It does not by
   itself disable configured contact initiation, the protocol/control work
-  needed to authenticate and complete an allowed contact, semantic-v4/v5/v6/v7
-  State/Record reconciliation, or semantic-v5/v6/v7 Blob transfer; the threshold is
+  needed to authenticate and complete an allowed contact, semantic-v4/v5/v6/v7/v8
+  State/Record reconciliation, or semantic-v5/v6/v7/v8 Blob transfer; the threshold is
   Event-only.
 - `ReceiveOnly`: no contact initiation, discovery, inventory disclosure, or
   application/control object transmission; mandatory connection
   authentication, acknowledgements, and bounded apply results may occur while
   ingesting authenticated inbound Event work. It initiates and discloses no
-  semantic-v4/v5/v6/v7 State/Record lane or semantic-v5/v6/v7 Blob lane.
+  semantic-v4/v5/v6/v7/v8 State/Record lane or semantic-v5/v6/v7/v8 Blob lane.
 - `PassiveOnly`: zero framework-originated bytes; receives only unsolicited
   independently protected broadcast/push.
 
@@ -1382,7 +1396,7 @@ is persisted with the authorization. The former format `1` and bare root-signed
 control shape are not accepted. Exact fields and signature input are in
 [envelope.md](envelope.md) §6.2.
 
-The semantic-version-2/3/v4/v5/v6/v7 bridge path decrypts protected route metadata, evaluates
+The semantic-version-2/3/v4/v5/v6/v7/v8 bridge path decrypts protected route metadata, evaluates
 an authority-issued exact directed-edge policy plus a local narrowing filter,
 and creates a destination routing wrapper around the byte-identical format-2
 source envelope. ObjectKind 4 authorization controls and ObjectKind 5 wrappers
@@ -1457,8 +1471,9 @@ The key schedule uses exact concatenation of the 32-byte P-256 ECDH result and
 direction/protection/confirmation labels. The stable handshake framing,
 credential/envelope encoding, cryptographic profile, and replication wire
 profile remain version `1`. Inside that framing, a default initiator offers
-semantic versions `[7, 6, 5, 4, 3, 2, 1]`; an honest current responder selects
-the highest common value, so current peers select `7`, a v6-only peer selects
+semantic versions `[8, 7, 6, 5, 4, 3, 2, 1]`; an honest current responder selects
+the highest common value, so current peers select `8`, a v7-only peer selects
+`7`, a v6-only peer selects
 `6`, a v5-only peer selects `5`, a v4-only peer selects `4`, a v3-only peer
 selects `3`, a v2-only peer selects `2`, and a v1-only peer selects `1`. The
 selected semantic version is bound into the public transcript, key schedule,
@@ -1836,11 +1851,11 @@ version, cryptographic suite ID, and object/data-class registries are separate.
 A transport addition changes none of them. `PROTOCOL_VERSION` and the legacy C
 `aster_protocol_version()` report stable replication-wire/profile version `1`;
 the unambiguous replication-wire surfaces also report `1`, while the default and
-highest-supported semantic-version surfaces report `7`.
-The default semantic offer is `[7, 6, 5, 4, 3, 2, 1]`.
+highest-supported semantic-version surfaces report `8`.
+The default semantic offer is `[8, 7, 6, 5, 4, 3, 2, 1]`.
 
-The current handshake negotiates semantic versions `7`, `6`, `5`, `4`, `3`,
-`2`, and `1` and the complete suite `0x0001`. Offers are nonempty, nonzero,
+The current handshake negotiates semantic versions `8`, `7`, `6`, `5`, `4`,
+`3`, `2`, and `1` and the complete suite `0x0001`. Offers are nonempty, nonzero,
 duplicate-free canonical descending lists of at most 16 values. The responder selects the highest common semantic
 version and its locally preferred complete common suite; the initiator requires
 both selections to have been offered and to be locally supported.
@@ -1856,13 +1871,16 @@ The semantic-version inheritance registry is normative:
 | `5` | v4 | direct Blob transfer |
 | `6` | v5 ordinary lanes byte-for-byte | Event bridge transfer |
 | `7` | v6 byte-for-byte | per-lane transfer profiles and receipt-free Event pages |
+| `8` | v7 byte-for-byte except the v8 Blob offer and lane AAD domain | `BlobCustodyV1` negotiation allocation; finite Blob transfer remains suppressed under `LegacyV6` |
 
 An inherited version retains every earlier stable encoding and selected-lane
 rule unless the registry names an additional mechanic. In particular, semantic
 v6 does not revise v1-v5 object bytes or ordinary-lane frame bytes; it only
 allocates the separately gated Event bridge mechanics in §9.3. Semantic v7
 does not revise v1-v6 bytes; it adds the negotiated transfer profiles and
-receipt-free Event-page mechanics in §9.4.
+receipt-free Event-page mechanics in §9.4. Semantic v8 does not revise v1-v7
+stable object bytes or durable Blob mechanics; it adds only the v8 Blob profile
+offer and the distinct v8 lane-record AAD domain described in §9.4.
 
 Semantic `1`
 permits transfer object kinds `1` (source envelope) and `2` (Blob chunk).
@@ -1881,7 +1899,7 @@ frames, and v1-v6 filter all v7 profile/page frames, completely.
 A v1 session filters
 those extended kinds before inventory-root construction and rejects them in
 messages, durable progress, and transfer events rather than silently processing
-v2/v3/v4/v5/v6/v7 semantics. Semantic 1 also rejects envelope format 3 and compact batch
+v2/v3/v4/v5/v6/v7/v8 semantics. Semantic 1 also rejects envelope format 3 and compact batch
 authentication. Semantics 2, 3, 4, 5, 6, and 7 permit both the unchanged format-2
 singleton and the §6.1 format-3 batch representation; negotiated semantics
 never rewrite stored stable bytes.
@@ -1893,9 +1911,9 @@ v3, v4, v5, v6, or v7 may resume only on v2, v3, v4, v5, v6, or v7. Recognized s
 under any supported version may resume on any supported version, while extended
 kinds `3..5` resume only on v2, v3, v4, v5, v6, or v7. Migrated progress
 without trustworthy origin-version provenance is suppressed rather than guessed.
-Selected mutable State/Record transfer itself remains v4/v5/v6/v7-only,
-selected Blob mechanics remain v5/v6/v7-only, and selected Event-bridge
-mechanics remain v6/v7-only regardless of the stable source object's earlier compatibility
+Selected mutable State/Record transfer itself remains v4/v5/v6/v7/v8-only,
+selected Blob mechanics remain v5/v6/v7/v8-only, and selected Event-bridge
+mechanics remain v6/v7/v8-only regardless of the stable source object's earlier compatibility
 provenance.
 Eligibility filtering occurs before page limits so incompatible early rows
 cannot starve later compatible work.
@@ -2023,11 +2041,11 @@ and visible quota/eviction policy. Evictions and conflicts surface to the app.
 | class | 0 State, 1 Event, 2 Record, 3 Blob; every other value rejected in profile 1 |
 | priority | 0 Routine, 1 Priority, 2 Immediate, 3 Flash |
 | message | 1 Interest, 2 Summary, 3 Probe, 4 Node, 5 Offer, 6 Want, 7 Data, 8 Receipt |
-| transfer object kind | semantic 1: 1 source envelope, 2 Blob chunk; semantics 2 through 7 add 3 source-batch proof, 4 bridge authorization, 5 bridge-route wrapper; later mechanics allocate no new object kind |
-| semantic-v7 lane | 1 Event, 2 State, 3 Record, 4 Blob, 5 EventBridge; critical extension bit `0x8000` |
-| semantic-v7 transfer profile | 1 `LegacyV6`, 2 `EventPagesV1`; critical extension bit `0x8000` |
-| semantic-v7 mechanics tag | `0xd1` TransferProfileOfferV1, `0xd2` EventTurnPlanV1, `0xd3` ChangeTurnHeaderV1, `0xd4` ChangePageV7, `0xd5` ChangeTurnFinishedV1 |
-| source envelope format | 2 singleton hybrid authentication; semantics 2 through 7 add 3 content-committing batch authentication |
+| transfer object kind | semantic 1: 1 source envelope, 2 Blob chunk; semantics 2 through 8 add 3 source-batch proof, 4 bridge authorization, 5 bridge-route wrapper; later mechanics allocate no new object kind |
+| semantic-v7/v8 lane | 1 Event, 2 State, 3 Record, 4 Blob, 5 EventBridge; critical extension bit `0x8000` |
+| semantic-v7/v8 transfer profile | 1 `LegacyV6`, 2 `EventPagesV1`, 3 `BlobCustodyV1` (Blob only, v8 only); critical extension bit `0x8000` |
+| semantic-v7/v8 mechanics tag | `0xd1` TransferProfileOfferV1, `0xd2` EventTurnPlanV1, `0xd3` ChangeTurnHeaderV1, `0xd4` ChangePageV7, `0xd5` ChangeTurnFinishedV1 |
+| source envelope format | 2 singleton hybrid authentication; semantics 2 through 8 add 3 content-committing batch authentication |
 | batch authentication mode | 1 exact proof reference, Merkle path, and P-256 item signature |
 | suite | `0x0001` provisional hybrid reference suite |
 | map field | unknown `0..63` critical; unknown `64..2^64-1` optional |
@@ -2047,7 +2065,7 @@ forbidden. The closed fixed-binary magic, kind, and role registries are in
 - Encryption does not hide traffic analysis.
 - PQ handshakes/signatures remain large; caching/batching reduces frequency only.
 - Format 2 carries a full credential and two large signatures per singleton
-  source envelope. The semantic-v2/v3/v4/v5/v6/v7 provider and atomic explicit batch
+  source envelope. The semantic-v2/v3/v4/v5/v6/v7/v8 provider and atomic explicit batch
   source/store/application path plus reference peer proof/compact runtime
   amortize transferred verification bytes, but the required 3 kbps end-to-end
   measurement and independent interoperability remain separate gates.

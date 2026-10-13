@@ -13,6 +13,7 @@ use crate::frame::EventDirection;
 use sha2::{Digest, Sha256};
 
 pub(crate) const SEMANTIC_PROTOCOL_V7: u16 = 7;
+pub(crate) const SEMANTIC_PROTOCOL_V8: u16 = 8;
 pub(crate) const MAX_CHANGE_PAGE_PROTECTED_BYTES: usize = aster_iroh::DEFAULT_MAX_EXCHANGE_BYTES;
 const MECHANICS_FRAME_OVERHEAD_BYTES: usize = crate::frame::MECHANICS_FRAME_PREFIX_BYTES;
 pub(crate) const MAX_CHANGE_PAGE_CODEC_BYTES: usize = MAX_CHANGE_PAGE_PROTECTED_BYTES
@@ -108,6 +109,7 @@ impl LaneId {
 pub(crate) enum TransferProfileId {
     LegacyV6 = 1,
     EventPagesV1 = 2,
+    BlobCustodyV1 = 3,
 }
 
 impl TransferProfileId {
@@ -115,6 +117,7 @@ impl TransferProfileId {
         match value {
             1 => Some(Self::LegacyV6),
             2 => Some(Self::EventPagesV1),
+            3 => Some(Self::BlobCustodyV1),
             _ => None,
         }
     }
@@ -126,6 +129,45 @@ pub(crate) struct TransferProfileOfferV1 {
 }
 
 impl TransferProfileOfferV1 {
+    pub(crate) fn for_semantic_version(semantic_version: u16) -> Result<Self, EventPagesError> {
+        match semantic_version {
+            SEMANTIC_PROTOCOL_V7 => Ok(Self::current()),
+            SEMANTIC_PROTOCOL_V8 => Ok(Self {
+                lanes: vec![
+                    (
+                        LaneId::EventBridge as u16,
+                        vec![TransferProfileId::LegacyV6 as u16],
+                    ),
+                    (
+                        LaneId::Blob as u16,
+                        vec![
+                            TransferProfileId::BlobCustodyV1 as u16,
+                            TransferProfileId::LegacyV6 as u16,
+                        ],
+                    ),
+                    (
+                        LaneId::Record as u16,
+                        vec![TransferProfileId::LegacyV6 as u16],
+                    ),
+                    (
+                        LaneId::State as u16,
+                        vec![TransferProfileId::LegacyV6 as u16],
+                    ),
+                    (
+                        LaneId::Event as u16,
+                        vec![
+                            TransferProfileId::EventPagesV1 as u16,
+                            TransferProfileId::LegacyV6 as u16,
+                        ],
+                    ),
+                ],
+            }),
+            _ => Err(EventPagesError::invalid(
+                "transfer-profile exchange requires semantic v7 or v8",
+            )),
+        }
+    }
+
     pub(crate) fn current() -> Self {
         Self {
             lanes: vec![
@@ -250,6 +292,12 @@ impl TransferProfileOfferV1 {
                     "EventPagesV1 is valid only for the Event lane",
                 ));
             }
+            if lane != LaneId::Blob && profiles.contains(&(TransferProfileId::BlobCustodyV1 as u16))
+            {
+                return Err(EventPagesError::invalid(
+                    "BlobCustodyV1 is valid only for the Blob lane",
+                ));
+            }
         }
         if known_lanes.len() != LaneId::DESCENDING.len() {
             return Err(EventPagesError::invalid(
@@ -361,6 +409,30 @@ pub(crate) fn negotiate_transfer_profiles(
         lanes.push((lane, common));
     }
     Ok(NegotiatedTransferProfiles { lanes })
+}
+
+pub(crate) fn negotiate_transfer_profiles_for_semantic_version(
+    semantic_version: u16,
+    initiator: &TransferProfileOfferV1,
+    responder: &TransferProfileOfferV1,
+) -> Result<NegotiatedTransferProfiles, EventPagesError> {
+    if !matches!(
+        semantic_version,
+        SEMANTIC_PROTOCOL_V7 | SEMANTIC_PROTOCOL_V8
+    ) {
+        return Err(EventPagesError::invalid(
+            "transfer-profile exchange requires semantic v7 or v8",
+        ));
+    }
+    let negotiated = negotiate_transfer_profiles(initiator, responder)?;
+    if semantic_version < SEMANTIC_PROTOCOL_V8
+        && negotiated.profile(LaneId::Blob) == Some(TransferProfileId::BlobCustodyV1)
+    {
+        return Err(EventPagesError::invalid(
+            "BlobCustodyV1 requires semantic v8",
+        ));
+    }
+    Ok(negotiated)
 }
 
 fn profiles_for(
@@ -1854,6 +1926,104 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blob_custody_profile_is_advertised_only_for_semantic_v8_and_fails_closed() {
+        let v7 = TransferProfileOfferV1::for_semantic_version(SEMANTIC_PROTOCOL_V7)
+            .expect("v7 transfer-profile offer");
+        let v8 =
+            TransferProfileOfferV1::for_semantic_version(8).expect("v8 transfer-profile offer");
+
+        assert_eq!(v7, TransferProfileOfferV1::current());
+        assert_eq!(
+            v7.encode().expect("v7 canonical offer"),
+            vec![
+                1, 5, // codec version and lane count
+                0, 5, 1, 0, 1, // EventBridge: LegacyV6
+                0, 4, 1, 0, 1, // Blob: LegacyV6
+                0, 3, 1, 0, 1, // Record: LegacyV6
+                0, 2, 1, 0, 1, // State: LegacyV6
+                0, 1, 2, 0, 2, 0, 1, // Event: EventPagesV1, LegacyV6
+            ],
+            "semantic-v7 offer encoding is an immutable compatibility vector"
+        );
+        assert_eq!(
+            v7.known_lanes()
+                .into_iter()
+                .find(|(lane, _)| *lane == LaneId::Blob),
+            Some((LaneId::Blob, vec![TransferProfileId::LegacyV6]))
+        );
+        assert_eq!(
+            v8.known_lanes()
+                .into_iter()
+                .find(|(lane, _)| *lane == LaneId::Blob),
+            Some((
+                LaneId::Blob,
+                vec![
+                    TransferProfileId::BlobCustodyV1,
+                    TransferProfileId::LegacyV6
+                ]
+            ))
+        );
+        assert_eq!(
+            negotiate_transfer_profiles(&v8, &v7)
+                .expect("v8/v7 profile negotiation")
+                .profile(LaneId::Blob),
+            Some(TransferProfileId::LegacyV6)
+        );
+        assert!(
+            negotiate_transfer_profiles_for_semantic_version(SEMANTIC_PROTOCOL_V7, &v8, &v8)
+                .is_err(),
+            "semantic v7 must not select BlobCustodyV1 even from a malformed local offer"
+        );
+
+        let custody_on_event = TransferProfileOfferV1::from_lanes(vec![
+            (LaneId::EventBridge, vec![TransferProfileId::LegacyV6]),
+            (
+                LaneId::Blob,
+                vec![
+                    TransferProfileId::BlobCustodyV1,
+                    TransferProfileId::LegacyV6,
+                ],
+            ),
+            (LaneId::Record, vec![TransferProfileId::LegacyV6]),
+            (LaneId::State, vec![TransferProfileId::LegacyV6]),
+            (
+                LaneId::Event,
+                vec![
+                    TransferProfileId::BlobCustodyV1,
+                    TransferProfileId::EventPagesV1,
+                    TransferProfileId::LegacyV6,
+                ],
+            ),
+        ]);
+        assert!(custody_on_event.encode().is_err());
+
+        let custody_only_blob = TransferProfileOfferV1::from_lanes(vec![
+            (LaneId::EventBridge, vec![TransferProfileId::LegacyV6]),
+            (LaneId::Blob, vec![TransferProfileId::BlobCustodyV1]),
+            (LaneId::Record, vec![TransferProfileId::LegacyV6]),
+            (LaneId::State, vec![TransferProfileId::LegacyV6]),
+            (LaneId::Event, vec![TransferProfileId::LegacyV6]),
+        ]);
+        assert!(negotiate_transfer_profiles(&v8, &custody_only_blob).is_err());
+
+        let duplicate_custody = TransferProfileOfferV1::from_lanes(vec![
+            (LaneId::EventBridge, vec![TransferProfileId::LegacyV6]),
+            (
+                LaneId::Blob,
+                vec![
+                    TransferProfileId::BlobCustodyV1,
+                    TransferProfileId::BlobCustodyV1,
+                    TransferProfileId::LegacyV6,
+                ],
+            ),
+            (LaneId::Record, vec![TransferProfileId::LegacyV6]),
+            (LaneId::State, vec![TransferProfileId::LegacyV6]),
+            (LaneId::Event, vec![TransferProfileId::LegacyV6]),
+        ]);
+        assert!(duplicate_custody.encode().is_err());
+    }
 
     #[test]
     fn canonical_offer_and_intersection_cover_every_lane_without_disabling_legacy() {

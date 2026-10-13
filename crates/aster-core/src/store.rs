@@ -23,7 +23,7 @@ use crate::model::{
 };
 use crate::wire::{
     ObjectId, ObjectKind, SEMANTIC_PROTOCOL_V2, SEMANTIC_PROTOCOL_V3, SEMANTIC_PROTOCOL_V4,
-    SEMANTIC_PROTOCOL_V5, SEMANTIC_PROTOCOL_V6, SEMANTIC_PROTOCOL_V7,
+    SEMANTIC_PROTOCOL_V5, SEMANTIC_PROTOCOL_V6, SEMANTIC_PROTOCOL_V7, SEMANTIC_PROTOCOL_V8,
 };
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 use sha2::{Digest, Sha256};
@@ -2351,6 +2351,7 @@ impl SqliteStore {
                 | SEMANTIC_PROTOCOL_V5
                 | SEMANTIC_PROTOCOL_V6
                 | SEMANTIC_PROTOCOL_V7
+                | SEMANTIC_PROTOCOL_V8
         ) {
             return Ok(None);
         }

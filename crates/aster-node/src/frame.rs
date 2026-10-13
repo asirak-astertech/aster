@@ -2129,7 +2129,7 @@ const fn is_v7_only_tag(tag: u8) -> bool {
 }
 
 fn validate_semantic_version(semantic_version: u16) -> Result<(), NodeError> {
-    if !(1..=crate::event_pages::SEMANTIC_PROTOCOL_V7).contains(&semantic_version) {
+    if !(1..=crate::event_pages::SEMANTIC_PROTOCOL_V8).contains(&semantic_version) {
         return Err(NodeError::Protocol(format!(
             "unsupported semantic protocol version {semantic_version}"
         )));
@@ -4354,13 +4354,17 @@ mod tests {
         ];
 
         for frame in frames {
-            let encoded = frame
-                .encode_for_semantic_version(7)
-                .expect("v7 frame encodes for v7");
-            assert_eq!(
-                Frame::decode_for_semantic_version(&encoded, 7).expect("v7 frame decodes for v7"),
-                frame
-            );
+            for semantic_version in 7..=8 {
+                let encoded = frame
+                    .encode_for_semantic_version(semantic_version)
+                    .expect("v7-or-later frame encodes");
+                assert_eq!(
+                    Frame::decode_for_semantic_version(&encoded, semantic_version)
+                        .expect("v7-or-later frame decodes"),
+                    frame
+                );
+            }
+            let encoded = frame.encode().expect("mechanics frame");
             for legacy_version in 1..=6 {
                 assert!(frame.encode_for_semantic_version(legacy_version).is_err());
                 assert!(Frame::decode_for_semantic_version(&encoded, legacy_version).is_err());
@@ -4374,7 +4378,7 @@ mod tests {
             direction: EventDirection::ToSessionInitiator,
         };
         let raw = frame.encode().unwrap();
-        for semantic_version in 1..=7 {
+        for semantic_version in 1..=8 {
             assert_eq!(
                 frame.encode_for_semantic_version(semantic_version).unwrap(),
                 raw
@@ -4384,6 +4388,6 @@ mod tests {
                 frame
             );
         }
-        assert!(Frame::decode_for_semantic_version(&raw, 8).is_err());
+        assert!(Frame::decode_for_semantic_version(&raw, 9).is_err());
     }
 }

@@ -2323,9 +2323,9 @@ impl MissionSession {
         self.inner.open_frame(frame).map_err(Into::into)
     }
 
-    /// Protects one semantic-v7 record with exact negotiated profile, lane,
+    /// Protects one semantic-v7-or-v8 record with exact negotiated profile, lane,
     /// and direction context as authenticated associated data.
-    pub(crate) fn seal_v7_application_frame(
+    pub(crate) fn seal_profiled_application_frame(
         &mut self,
         transfer_profile_digest: [u8; 32],
         lane: crate::event_pages::LaneId,
@@ -2333,16 +2333,21 @@ impl MissionSession {
         direction: crate::frame::EventDirection,
         plaintext: &[u8],
     ) -> Result<Vec<u8>, MissionSessionError> {
-        let context =
-            self.v7_application_record_context(transfer_profile_digest, lane, profile, direction)?;
+        let context = Self::lane_record_context(
+            self.semantic_version(),
+            transfer_profile_digest,
+            lane,
+            profile,
+            direction,
+        )?;
         self.inner
             .seal_frame_with_context(plaintext, &context)
             .map_err(Into::into)
     }
 
-    /// Opens one semantic-v7 record only under the exact negotiated profile,
+    /// Opens one semantic-v7-or-v8 record only under the exact negotiated profile,
     /// lane, and direction context supplied by the local state machine.
-    pub(crate) fn open_v7_application_frame(
+    pub(crate) fn open_profiled_application_frame(
         &mut self,
         transfer_profile_digest: [u8; 32],
         lane: crate::event_pages::LaneId,
@@ -2350,28 +2355,73 @@ impl MissionSession {
         direction: crate::frame::EventDirection,
         frame: &[u8],
     ) -> Result<Vec<u8>, MissionSessionError> {
-        let context =
-            self.v7_application_record_context(transfer_profile_digest, lane, profile, direction)?;
+        let context = Self::lane_record_context(
+            self.semantic_version(),
+            transfer_profile_digest,
+            lane,
+            profile,
+            direction,
+        )?;
         self.inner
             .open_frame_with_context(frame, &context)
             .map_err(Into::into)
     }
 
-    fn v7_application_record_context(
-        &self,
+    #[cfg(test)]
+    fn seal_v7_application_frame(
+        &mut self,
+        transfer_profile_digest: [u8; 32],
+        lane: crate::event_pages::LaneId,
+        profile: crate::event_pages::TransferProfileId,
+        direction: crate::frame::EventDirection,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, MissionSessionError> {
+        self.seal_profiled_application_frame(
+            transfer_profile_digest,
+            lane,
+            profile,
+            direction,
+            plaintext,
+        )
+    }
+
+    #[cfg(test)]
+    fn open_v7_application_frame(
+        &mut self,
+        transfer_profile_digest: [u8; 32],
+        lane: crate::event_pages::LaneId,
+        profile: crate::event_pages::TransferProfileId,
+        direction: crate::frame::EventDirection,
+        frame: &[u8],
+    ) -> Result<Vec<u8>, MissionSessionError> {
+        self.open_profiled_application_frame(
+            transfer_profile_digest,
+            lane,
+            profile,
+            direction,
+            frame,
+        )
+    }
+
+    fn lane_record_context(
+        semantic_version: u16,
         transfer_profile_digest: [u8; 32],
         lane: crate::event_pages::LaneId,
         profile: crate::event_pages::TransferProfileId,
         direction: crate::frame::EventDirection,
     ) -> Result<Vec<u8>, MissionSessionError> {
-        if self.semantic_version() != crate::event_pages::SEMANTIC_PROTOCOL_V7 {
-            return Err(MissionSessionError::Authentication(EnvelopeError(
-                "semantic-v7 record context is unavailable for this session".into(),
-            )));
-        }
+        let domain = match semantic_version {
+            crate::event_pages::SEMANTIC_PROTOCOL_V7 => b"ASTER/v7-lane-record/v1\0".as_slice(),
+            crate::event_pages::SEMANTIC_PROTOCOL_V8 => b"ASTER/v8-lane-record/v1\0".as_slice(),
+            _ => {
+                return Err(MissionSessionError::Authentication(EnvelopeError(
+                    "profiled record context is unavailable for this session".into(),
+                )));
+            }
+        };
         let mut context = Vec::with_capacity(24 + 2 + 32 + 2 + 2 + 1);
-        context.extend_from_slice(b"ASTER/v7-lane-record/v1\0");
-        context.extend_from_slice(&self.semantic_version().to_be_bytes());
+        context.extend_from_slice(domain);
+        context.extend_from_slice(&semantic_version.to_be_bytes());
         context.extend_from_slice(&transfer_profile_digest);
         context.extend_from_slice(&(lane as u16).to_be_bytes());
         context.extend_from_slice(&(profile as u16).to_be_bytes());
@@ -3365,6 +3415,79 @@ mod tests {
             receiver.open_application_frame(&ordinary).is_err(),
             "ordinary replay must still be rejected"
         );
+    }
+
+    #[test]
+    fn semantic_v8_lane_records_bind_the_v8_domain_and_reject_v7_substitution() {
+        let mut provisioner = ReferenceProvisioner::from_seed([0x44; 32]).expect("provisioner");
+        let initiator = issue(&mut provisioner, 1);
+        let responder = issue(&mut provisioner, 2);
+        let (mut sender, mut receiver) =
+            establish(&initiator, &responder).expect("establish semantic-v8 session");
+        assert_eq!(
+            sender.semantic_version(),
+            crate::event_pages::SEMANTIC_PROTOCOL_V8
+        );
+
+        let offer = crate::event_pages::TransferProfileOfferV1::for_semantic_version(
+            crate::event_pages::SEMANTIC_PROTOCOL_V8,
+        )
+        .expect("v8 transfer profiles");
+        let negotiated = crate::event_pages::negotiate_transfer_profiles(&offer, &offer)
+            .expect("negotiate v8 profiles");
+        let digest = crate::event_pages::transfer_profile_digest(&offer, &offer, &negotiated);
+        let lane = crate::event_pages::LaneId::Blob;
+        let profile = crate::event_pages::TransferProfileId::BlobCustodyV1;
+        let direction = EventDirection::ToSessionResponder;
+
+        let v8 = sender
+            .seal_profiled_application_frame(digest, lane, profile, direction, b"v8")
+            .expect("seal v8 lane record");
+        assert_eq!(
+            receiver
+                .open_profiled_application_frame(digest, lane, profile, direction, &v8)
+                .expect("open v8 lane record"),
+            b"v8"
+        );
+
+        let mut v7_context = b"ASTER/v7-lane-record/v1\0".to_vec();
+        v7_context.extend_from_slice(&crate::event_pages::SEMANTIC_PROTOCOL_V8.to_be_bytes());
+        v7_context.extend_from_slice(&digest);
+        v7_context.extend_from_slice(&(lane as u16).to_be_bytes());
+        v7_context.extend_from_slice(&(profile as u16).to_be_bytes());
+        v7_context.push(2);
+        let substituted = sender
+            .inner
+            .seal_frame_with_context(b"v7-substitution", &v7_context)
+            .expect("seal substituted v7-domain record");
+        assert!(
+            receiver
+                .open_profiled_application_frame(digest, lane, profile, direction, &substituted)
+                .is_err(),
+            "semantic-v8 lane record protection must reject the v7 AAD domain"
+        );
+    }
+
+    #[test]
+    fn semantic_v7_lane_record_context_stays_byte_identical() {
+        let digest = [0x51; 32];
+        let context = MissionSession::lane_record_context(
+            crate::event_pages::SEMANTIC_PROTOCOL_V7,
+            digest,
+            crate::event_pages::LaneId::Event,
+            crate::event_pages::TransferProfileId::EventPagesV1,
+            EventDirection::ToSessionResponder,
+        )
+        .expect("v7 lane context");
+        let mut expected = b"ASTER/v7-lane-record/v1\0".to_vec();
+        expected.extend_from_slice(&7u16.to_be_bytes());
+        expected.extend_from_slice(&digest);
+        expected.extend_from_slice(&(crate::event_pages::LaneId::Event as u16).to_be_bytes());
+        expected.extend_from_slice(
+            &(crate::event_pages::TransferProfileId::EventPagesV1 as u16).to_be_bytes(),
+        );
+        expected.push(2);
+        assert_eq!(context, expected);
     }
 
     fn finite_page_fixture(
