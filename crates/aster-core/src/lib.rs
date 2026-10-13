@@ -150,8 +150,8 @@ pub use blob::{
 };
 #[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
 pub use blob_custody::{
-    BLOB_CUSTODY_CLAIM_V1_BYTES, BlobCustodyClaimV1, BlobCustodyDirectionV1, BlobCustodyError,
-    BlobCustodyTransferId, VerifiedBlobCustodyClaimV1,
+    AuthenticatedBlobCustodyContactV1, BLOB_CUSTODY_CLAIM_V1_BYTES, BlobCustodyClaimV1,
+    BlobCustodyDirectionV1, BlobCustodyError, BlobCustodyTransferId, VerifiedBlobCustodyClaimV1,
 };
 #[cfg(feature = "reference-session")]
 pub use bridge_adapter::{

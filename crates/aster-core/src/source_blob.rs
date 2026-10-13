@@ -1589,7 +1589,8 @@ mod tests {
         // or omitting any session, transfer, source-header, sample, or age bind.
         use crate::CustodySample;
         use crate::blob_custody::{
-            BlobCustodyClaimV1, BlobCustodyDirectionV1, BlobCustodyError, BlobCustodyTransferId,
+            AuthenticatedBlobCustodyContactV1, BlobCustodyClaimV1, BlobCustodyDirectionV1,
+            BlobCustodyError, BlobCustodyTransferId,
         };
 
         let Services {
@@ -1618,6 +1619,12 @@ mod tests {
             clock_id: [0x71; 16],
             tick_ms: 1_500,
         };
+        let authenticated_contact = AuthenticatedBlobCustodyContactV1::from_opened_record(
+            [0x61; 32],
+            [0x62; 32],
+            BlobCustodyDirectionV1::ToSessionResponder,
+            9,
+        );
         let claim = BlobCustodyClaimV1::from_authenticated_source(
             [0x61; 32],
             41,
@@ -1633,9 +1640,8 @@ mod tests {
         let decoded = BlobCustodyClaimV1::decode(&claim.encode()).expect("decode raw frame claim");
         let verified = decoded
             .verify_authenticated_source(
-                [0x61; 32],
+                &authenticated_contact,
                 41,
-                BlobCustodyDirectionV1::ToSessionResponder,
                 transfer_id,
                 &blob,
                 &sealed.bytes,
@@ -1651,6 +1657,31 @@ mod tests {
         assert_eq!(verified.priority(), Priority::Priority);
         assert_eq!(verified.ttl_ms(), 9_000);
         assert_eq!(verified.forwarding_age_ms(), 725);
+        assert_eq!(
+            verified.contact_identity(),
+            authenticated_contact.contact_identity()
+        );
+
+        let other_contact = AuthenticatedBlobCustodyContactV1::from_opened_record(
+            [0x63; 32],
+            [0x62; 32],
+            BlobCustodyDirectionV1::ToSessionResponder,
+            9,
+        );
+        assert_eq!(
+            decoded.verify_authenticated_source(
+                &other_contact,
+                41,
+                transfer_id,
+                &blob,
+                &sealed.bytes,
+                700,
+                sample,
+                25,
+            ),
+            Err(BlobCustodyError::ContextMismatch),
+            "a capability from another authenticated session must not authorize the claim"
+        );
 
         for offset in [
             14usize, 46, 54, 55, 87, 95, 127, 159, 160, 168, 176, 192, 200,
@@ -1665,9 +1696,8 @@ mod tests {
                 .expect("substitution remains structurally canonical");
             assert_eq!(
                 substituted.verify_authenticated_source(
-                    [0x61; 32],
+                    &authenticated_contact,
                     41,
-                    BlobCustodyDirectionV1::ToSessionResponder,
                     transfer_id,
                     &blob,
                     &sealed.bytes,

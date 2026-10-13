@@ -12,6 +12,9 @@ const MAGIC: &[u8; 8] = b"ASTRBL08";
 const FORMAT_VERSION: u16 = 1;
 const SEMANTIC_VERSION: u16 = 8;
 const PROFILE_ID: u16 = 3;
+const BLOB_LANE_ID: u16 = 4;
+const V8_LANE_RECORD_DOMAIN: &[u8] = b"ASTER/v8-lane-record/v1\0";
+const CONTACT_ID_DOMAIN: &[u8] = b"ASTER/v8-blob-custody-contact/v1\0";
 
 /// Sanitized semantic-v8 Blob custody claim failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -54,6 +57,99 @@ impl BlobCustodyDirectionV1 {
             _ => Err(BlobCustodyError::InvalidClaim),
         }
     }
+}
+
+/// Opaque proof that one peer record was authenticated and replay-checked in
+/// the semantic-v8 `BlobCustodyV1` lane domain.
+///
+/// Construction is core-private. Public callers can receive this value only
+/// from `ReferenceAuthenticatedSession::open_blob_custody_frame` after an
+/// authenticated profile-3 Blob-lane record open succeeds.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthenticatedBlobCustodyContactV1 {
+    semantic_version: u16,
+    profile_id: u16,
+    session_transcript: [u8; 32],
+    transfer_profile_digest: [u8; 32],
+    direction: BlobCustodyDirectionV1,
+    record_sequence: u64,
+    contact_identity: [u8; 32],
+}
+
+impl AuthenticatedBlobCustodyContactV1 {
+    pub(crate) fn from_opened_record(
+        session_transcript: [u8; 32],
+        transfer_profile_digest: [u8; 32],
+        direction: BlobCustodyDirectionV1,
+        record_sequence: u64,
+    ) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(CONTACT_ID_DOMAIN);
+        hasher.update(SEMANTIC_VERSION.to_be_bytes());
+        hasher.update(PROFILE_ID.to_be_bytes());
+        hasher.update(session_transcript);
+        hasher.update(transfer_profile_digest);
+        hasher.update([direction as u8]);
+        hasher.update(record_sequence.to_be_bytes());
+        Self {
+            semantic_version: SEMANTIC_VERSION,
+            profile_id: PROFILE_ID,
+            session_transcript,
+            transfer_profile_digest,
+            direction,
+            record_sequence,
+            contact_identity: hasher.finalize().into(),
+        }
+    }
+
+    /// Returns the authenticated session's selected semantic version.
+    pub const fn semantic_version(&self) -> u16 {
+        self.semantic_version
+    }
+
+    /// Returns the selected Blob-lane transfer profile identifier.
+    pub const fn profile_id(&self) -> u16 {
+        self.profile_id
+    }
+
+    /// Returns the completed authenticated-session transcript identity.
+    pub const fn session_transcript(&self) -> [u8; 32] {
+        self.session_transcript
+    }
+
+    /// Returns the authenticated transfer-profile negotiation digest.
+    pub const fn transfer_profile_digest(&self) -> [u8; 32] {
+        self.transfer_profile_digest
+    }
+
+    /// Returns the receiver direction authenticated by the opened record.
+    pub const fn direction(&self) -> BlobCustodyDirectionV1 {
+        self.direction
+    }
+
+    /// Returns the replay-checked record sequence for this contact.
+    pub const fn record_sequence(&self) -> u64 {
+        self.record_sequence
+    }
+
+    /// Returns a non-secret identity of this exact authenticated contact.
+    pub const fn contact_identity(&self) -> [u8; 32] {
+        self.contact_identity
+    }
+}
+
+pub(crate) fn blob_custody_lane_record_context(
+    transfer_profile_digest: [u8; 32],
+    direction: BlobCustodyDirectionV1,
+) -> Vec<u8> {
+    let mut context = Vec::with_capacity(V8_LANE_RECORD_DOMAIN.len() + 2 + 32 + 2 + 2 + 1);
+    context.extend_from_slice(V8_LANE_RECORD_DOMAIN);
+    context.extend_from_slice(&SEMANTIC_VERSION.to_be_bytes());
+    context.extend_from_slice(&transfer_profile_digest);
+    context.extend_from_slice(&BLOB_LANE_ID.to_be_bytes());
+    context.extend_from_slice(&PROFILE_ID.to_be_bytes());
+    context.push(direction as u8);
+    context
 }
 
 /// Typed identity of exact stable source-sealed Blob bytes.
@@ -146,9 +242,8 @@ impl BlobCustodyClaimV1 {
     #[allow(clippy::too_many_arguments)]
     pub fn verify_authenticated_source(
         &self,
-        session_transcript: [u8; 32],
+        authenticated_contact: &AuthenticatedBlobCustodyContactV1,
         exchange_id: u64,
-        direction: BlobCustodyDirectionV1,
         source_transfer_id: BlobCustodyTransferId,
         source: &ContentVerifiedBlobEnvelope,
         exact_source_bytes: &[u8],
@@ -157,9 +252,9 @@ impl BlobCustodyClaimV1 {
         hop_delta_ms: u64,
     ) -> Result<VerifiedBlobCustodyClaimV1, BlobCustodyError> {
         let expected = Self::from_authenticated_source(
-            session_transcript,
+            authenticated_contact.session_transcript,
             exchange_id,
-            direction,
+            authenticated_contact.direction,
             source_transfer_id,
             source,
             exact_source_bytes,
@@ -170,7 +265,10 @@ impl BlobCustodyClaimV1 {
         if *self != expected {
             return Err(BlobCustodyError::ContextMismatch);
         }
-        Ok(VerifiedBlobCustodyClaimV1::from_verified(*self))
+        Ok(VerifiedBlobCustodyClaimV1::from_verified(
+            *self,
+            authenticated_contact.clone(),
+        ))
     }
 
     /// Decodes the one exact fixed-width canonical representation.
@@ -321,16 +419,69 @@ impl BlobCustodyClaimV1 {
 /// Fields and construction are private. `aster-redb-store` can consume this
 /// core type without depending on `aster-node`, while raw frame claims cannot
 /// construct it.
+///
+/// Caller-selected claim context plus a content-verified source is not enough
+/// to mint admission authority; an opaque capability from a replay-checked
+/// semantic-v8 Blob-custody record open is also required:
+///
+/// ```compile_fail
+/// use aster_mesh::{
+///     BlobCustodyClaimV1, BlobCustodyDirectionV1, BlobCustodyTransferId,
+///     ContentVerifiedBlobEnvelope, CustodySample, VerifiedBlobCustodyClaimV1,
+/// };
+///
+/// fn forge_from_public_values(
+///     claim: &BlobCustodyClaimV1,
+///     source: &ContentVerifiedBlobEnvelope,
+///     exact_source_bytes: &[u8],
+/// ) -> VerifiedBlobCustodyClaimV1 {
+///     claim.verify_authenticated_source(
+///         [0x11; 32],
+///         7,
+///         BlobCustodyDirectionV1::ToSessionResponder,
+///         BlobCustodyTransferId::from_exact_hash(source.envelope_id()),
+///         source,
+///         exact_source_bytes,
+///         0,
+///         CustodySample { clock_id: [0x22; 16], tick_ms: 9 },
+///         1,
+///     ).unwrap()
+/// }
+/// ```
+///
+/// Nor can a caller manufacture the required contact capability:
+///
+/// ```compile_fail
+/// use aster_mesh::{AuthenticatedBlobCustodyContactV1, BlobCustodyDirectionV1};
+///
+/// let forged = AuthenticatedBlobCustodyContactV1 {
+///     semantic_version: 8,
+///     profile_id: 3,
+///     session_transcript: [0x11; 32],
+///     transfer_profile_digest: [0x22; 32],
+///     direction: BlobCustodyDirectionV1::ToSessionResponder,
+///     record_sequence: 0,
+///     contact_identity: [0x33; 32],
+/// };
+/// ```
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VerifiedBlobCustodyClaimV1 {
     claim: BlobCustodyClaimV1,
     digest: [u8; 32],
+    authenticated_contact: AuthenticatedBlobCustodyContactV1,
 }
 
 impl VerifiedBlobCustodyClaimV1 {
-    fn from_verified(claim: BlobCustodyClaimV1) -> Self {
+    fn from_verified(
+        claim: BlobCustodyClaimV1,
+        authenticated_contact: AuthenticatedBlobCustodyContactV1,
+    ) -> Self {
         let digest = claim.digest();
-        Self { claim, digest }
+        Self {
+            claim,
+            digest,
+            authenticated_contact,
+        }
     }
 
     /// Digest of the exact raw claim that was verified.
@@ -364,6 +515,12 @@ impl VerifiedBlobCustodyClaimV1 {
 
     pub const fn forwarding_age_ms(&self) -> u64 {
         self.claim.forwarding_age_ms
+    }
+
+    /// Non-secret identity of the exact authenticated, replay-checked contact
+    /// record that authorized verification.
+    pub const fn contact_identity(&self) -> [u8; 32] {
+        self.authenticated_contact.contact_identity
     }
 }
 

@@ -19,6 +19,9 @@ use crate::blob::{
     BlobId, BlobPhysicalLineage, BlobRouteCommitment, BlobStore, BlobStoreConfig,
     ReferenceBlobService,
 };
+use crate::blob_custody::{
+    AuthenticatedBlobCustodyContactV1, BlobCustodyDirectionV1, blob_custody_lane_record_context,
+};
 use crate::bridge::{
     self, AuthorizationEnvelope, BridgeAuthorization, BridgeOuterKind, BridgeRoute,
 };
@@ -95,7 +98,6 @@ const SEMANTIC_PROTOCOL_V5: u16 = super::SEMANTIC_PROTOCOL_V5;
 const SEMANTIC_PROTOCOL_V6: u16 = super::SEMANTIC_PROTOCOL_V6;
 #[cfg(test)]
 const SEMANTIC_PROTOCOL_V7: u16 = super::SEMANTIC_PROTOCOL_V7;
-#[cfg(test)]
 const SEMANTIC_PROTOCOL_V8: u16 = super::SEMANTIC_PROTOCOL_V8;
 const SUITE_ID: u16 = super::HYBRID_SUITE_ID;
 const PUBLIC_HEADER_LEN: usize = 44;
@@ -4639,6 +4641,7 @@ impl ReferenceSessionAwaitingFinished {
             peer_route_grant_commitments: self.peer_route_grant_commitments,
             semantic_version: protocol_version,
             session_id,
+            role: SessionRole::Initiator,
             channel: keys.into_channel(),
         })
     }
@@ -4807,11 +4810,18 @@ impl ReferenceSessionResponderPending {
                 peer_route_grant_commitments,
                 semantic_version: protocol_version,
                 session_id,
+                role: SessionRole::Responder,
                 channel: keys.into_channel(),
             },
             finished_flight,
         ))
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionRole {
+    Initiator,
+    Responder,
 }
 
 /// Completed mutually authenticated adjacency with ordered, encrypted, replay-protected frames.
@@ -4821,6 +4831,7 @@ pub struct ReferenceAuthenticatedSession {
     peer_route_grant_commitments: Vec<[u8; 32]>,
     semantic_version: u16,
     session_id: [u8; 32],
+    role: SessionRole,
     channel: SecureChannel,
 }
 
@@ -4916,6 +4927,64 @@ impl ReferenceAuthenticatedSession {
         self.channel
             .open_contextual(&self.provider, &record, &aad)
             .map_err(handshake_error)
+    }
+
+    /// Protects one frame in the fixed semantic-v8 Blob lane/profile-3 domain.
+    ///
+    /// This allocates no finite Blob lifecycle behavior; it only ensures that a
+    /// later receiver capability can be tied to the authenticated profile/lane
+    /// record rather than caller-selected claim fields.
+    pub fn seal_blob_custody_frame(
+        &mut self,
+        transfer_profile_digest: [u8; 32],
+        direction: BlobCustodyDirectionV1,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, EnvelopeError> {
+        let expected_direction = match self.role {
+            SessionRole::Initiator => BlobCustodyDirectionV1::ToSessionResponder,
+            SessionRole::Responder => BlobCustodyDirectionV1::ToSessionInitiator,
+        };
+        if self.semantic_version != SEMANTIC_PROTOCOL_V8 || direction != expected_direction {
+            return Err(blob_custody_contact_unavailable());
+        }
+        let context = blob_custody_lane_record_context(transfer_profile_digest, direction);
+        self.seal_frame_with_context(plaintext, &context)
+    }
+
+    /// Authenticates and replay-checks one fixed semantic-v8 Blob/profile-3
+    /// lane record and returns its opaque contact authority.
+    ///
+    /// The returned capability is bound to this completed session transcript,
+    /// exact negotiated-profile digest, Blob profile/direction AAD, and accepted
+    /// record sequence. Raw application values cannot construct it.
+    pub fn open_blob_custody_frame(
+        &mut self,
+        transfer_profile_digest: [u8; 32],
+        direction: BlobCustodyDirectionV1,
+        frame: &[u8],
+    ) -> Result<(Vec<u8>, AuthenticatedBlobCustodyContactV1), EnvelopeError> {
+        let expected_direction = match self.role {
+            SessionRole::Initiator => BlobCustodyDirectionV1::ToSessionInitiator,
+            SessionRole::Responder => BlobCustodyDirectionV1::ToSessionResponder,
+        };
+        if self.semantic_version != SEMANTIC_PROTOCOL_V8 || direction != expected_direction {
+            return Err(blob_custody_contact_unavailable());
+        }
+        let record = decode_transport_frame(frame)?;
+        let record_sequence = record.sequence;
+        let context = blob_custody_lane_record_context(transfer_profile_digest, direction);
+        let aad = transport_frame_context_aad(&context)?;
+        let plaintext = self
+            .channel
+            .open_contextual(&self.provider, &record, &aad)
+            .map_err(handshake_error)?;
+        let authority = AuthenticatedBlobCustodyContactV1::from_opened_record(
+            self.session_id,
+            transfer_profile_digest,
+            direction,
+            record_sequence,
+        );
+        Ok((plaintext, authority))
     }
 
     /// Encrypts and authenticates one fixed, transfer-bound semantic-v3 custody claim.
@@ -5035,6 +5104,10 @@ fn custody_authentication_failed() -> EnvelopeError {
 
 fn custody_version_unavailable() -> EnvelopeError {
     EnvelopeError("semantic protocol v3 custody is unavailable".into())
+}
+
+fn blob_custody_contact_unavailable() -> EnvelopeError {
+    EnvelopeError("semantic-v8 Blob custody contact is unavailable".into())
 }
 
 fn handshake_prefix(kind: u8) -> Vec<u8> {
@@ -10250,6 +10323,169 @@ mod tests {
                     &wrong_context,
                     CustodyExpectation::new(wrong_source, expected.exchange_id()),
                 )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn v8_blob_custody_authority_requires_profiled_replay_checked_record_open() {
+        // Mutation caught: minting Blob admission authority without a
+        // semantic-v8, profile-3, direction-bound authenticated record open,
+        // or reusing one protected record across a replay/contact boundary.
+        let mut provisioner = ReferenceProvisioner::from_seed([0x83; 32])
+            .unwrap_or_else(|error| panic!("provisioner failed: {error}"));
+        let initiator_bytes = provisioner
+            .issue_node(1, &[member_access(vec![0])])
+            .and_then(|bundle| bundle.to_bytes())
+            .unwrap_or_else(|error| panic!("initiator fixture failed: {error}"));
+        let responder_bytes = provisioner
+            .issue_node(2, &[member_access(vec![0])])
+            .and_then(|bundle| bundle.to_bytes())
+            .unwrap_or_else(|error| panic!("responder fixture failed: {error}"));
+        let pair = |version| {
+            complete_sessions_with_versions(
+                ProvisioningBundle::from_bytes(&initiator_bytes)
+                    .unwrap_or_else(|error| panic!("initiator parse failed: {error}")),
+                ProvisioningBundle::from_bytes(&responder_bytes)
+                    .unwrap_or_else(|error| panic!("responder parse failed: {error}")),
+                vec![version],
+            )
+        };
+        let (mut sender, mut receiver) = pair(SEMANTIC_PROTOCOL_V8);
+        let (_other_sender, mut other_receiver) = pair(SEMANTIC_PROTOCOL_V8);
+        let profile_digest = [0x91; 32];
+        let direction = crate::BlobCustodyDirectionV1::ToSessionResponder;
+
+        assert!(
+            sender
+                .seal_blob_custody_frame(
+                    profile_digest,
+                    crate::BlobCustodyDirectionV1::ToSessionInitiator,
+                    b"mislabeled sender role",
+                )
+                .is_err(),
+            "an initiator may seal only a transfer received by the responder"
+        );
+        let mut wrong_receiver_context = b"ASTER/v8-lane-record/v1\0".to_vec();
+        wrong_receiver_context.extend_from_slice(&8u16.to_be_bytes());
+        wrong_receiver_context.extend_from_slice(&profile_digest);
+        wrong_receiver_context.extend_from_slice(&4u16.to_be_bytes());
+        wrong_receiver_context.extend_from_slice(&3u16.to_be_bytes());
+        wrong_receiver_context.push(1);
+        let wrong_receiver = sender
+            .seal_frame_with_context(b"mislabeled receiver role", &wrong_receiver_context)
+            .unwrap_or_else(|error| panic!("wrong-receiver frame seal failed: {error}"));
+        assert!(
+            receiver
+                .open_blob_custody_frame(
+                    profile_digest,
+                    crate::BlobCustodyDirectionV1::ToSessionInitiator,
+                    &wrong_receiver,
+                )
+                .is_err(),
+            "a responder may open only a transfer received by the responder"
+        );
+
+        let mut legacy_profile_context = b"ASTER/v8-lane-record/v1\0".to_vec();
+        legacy_profile_context.extend_from_slice(&8u16.to_be_bytes());
+        legacy_profile_context.extend_from_slice(&profile_digest);
+        legacy_profile_context.extend_from_slice(&4u16.to_be_bytes());
+        legacy_profile_context.extend_from_slice(&1u16.to_be_bytes());
+        legacy_profile_context.push(2);
+        let legacy_profile = sender
+            .seal_frame_with_context(b"legacy profile substitution", &legacy_profile_context)
+            .unwrap_or_else(|error| panic!("legacy-profile frame seal failed: {error}"));
+        assert!(
+            receiver
+                .open_blob_custody_frame(profile_digest, direction, &legacy_profile)
+                .is_err(),
+            "a protected Blob record from profile 1 must not mint profile-3 authority"
+        );
+
+        let first = sender
+            .seal_blob_custody_frame(profile_digest, direction, b"finite source frame")
+            .unwrap_or_else(|error| panic!("Blob custody frame seal failed: {error}"));
+        assert!(
+            receiver
+                .open_blob_custody_frame([0x92; 32], direction, &first)
+                .is_err()
+        );
+        let (opened, authority) = receiver
+            .open_blob_custody_frame(profile_digest, direction, &first)
+            .unwrap_or_else(|error| panic!("Blob custody frame open failed: {error}"));
+        assert_eq!(opened, b"finite source frame");
+        assert_eq!(authority.semantic_version(), SEMANTIC_PROTOCOL_V8);
+        assert_eq!(authority.profile_id(), 3);
+        assert_eq!(authority.direction(), direction);
+        assert_eq!(authority.transfer_profile_digest(), profile_digest);
+        assert_ne!(authority.session_transcript(), [0; 32]);
+        assert_ne!(authority.contact_identity(), [0; 32]);
+        assert!(
+            receiver
+                .open_blob_custody_frame(profile_digest, direction, &first)
+                .is_err()
+        );
+
+        let mut literal_profile_context = b"ASTER/v8-lane-record/v1\0".to_vec();
+        literal_profile_context.extend_from_slice(&8u16.to_be_bytes());
+        literal_profile_context.extend_from_slice(&profile_digest);
+        literal_profile_context.extend_from_slice(&4u16.to_be_bytes());
+        literal_profile_context.extend_from_slice(&3u16.to_be_bytes());
+        literal_profile_context.push(2);
+        let literal_profile = sender
+            .seal_frame_with_context(b"literal profile-3 context", &literal_profile_context)
+            .unwrap_or_else(|error| panic!("literal profile-3 frame seal failed: {error}"));
+        assert_eq!(
+            receiver
+                .open_blob_custody_frame(profile_digest, direction, &literal_profile)
+                .unwrap_or_else(|error| panic!("literal profile-3 frame open failed: {error}"))
+                .0,
+            b"literal profile-3 context"
+        );
+
+        let second = sender
+            .seal_blob_custody_frame(profile_digest, direction, b"second finite source frame")
+            .unwrap_or_else(|error| panic!("second Blob custody seal failed: {error}"));
+        assert!(
+            receiver
+                .open_blob_custody_frame(
+                    profile_digest,
+                    crate::BlobCustodyDirectionV1::ToSessionInitiator,
+                    &second,
+                )
+                .is_err()
+        );
+        let (_, second_authority) = receiver
+            .open_blob_custody_frame(profile_digest, direction, &second)
+            .unwrap_or_else(|error| panic!("second Blob custody open failed: {error}"));
+        assert_ne!(
+            second_authority.contact_identity(),
+            authority.contact_identity()
+        );
+
+        let cross_session = sender
+            .seal_blob_custody_frame(profile_digest, direction, b"cross-session frame")
+            .unwrap_or_else(|error| panic!("cross-session frame seal failed: {error}"));
+        assert!(
+            other_receiver
+                .open_blob_custody_frame(profile_digest, direction, &cross_session)
+                .is_err()
+        );
+        assert!(
+            receiver
+                .open_blob_custody_frame(profile_digest, direction, &cross_session)
+                .is_ok()
+        );
+
+        let (mut v7_sender, mut v7_receiver) = pair(SEMANTIC_PROTOCOL_V7);
+        assert!(
+            v7_sender
+                .seal_blob_custody_frame(profile_digest, direction, b"wrong semantic")
+                .is_err()
+        );
+        assert!(
+            v7_receiver
+                .open_blob_custody_frame(profile_digest, direction, &first)
                 .is_err()
         );
     }
