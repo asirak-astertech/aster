@@ -38,17 +38,18 @@ use aster_iroh::{
     PreparedNearbyDiscoveryBrowser,
 };
 use aster_mesh::{
-    BlobContentVerification, BlobError, BlobId, BlobPhysicalLineage, ContentVerifiedBlobEnvelope,
-    ContentVerifiedEventEnvelope, CustodyClaims, CustodyError, CustodyExpectation, CustodyHop,
-    CustodySample, CustodyTransferClaims, CustodyTransferId, EventContentVerification,
-    EventRouteLineage, MAX_CUSTODY_WRAPPER_BYTES, MIN_CUSTODY_SEMANTIC_VERSION, NodeId, Priority,
-    ProvisioningAccess, ProvisioningLoadId, ProvisioningProtectionError, ProvisioningSecretLoader,
-    ProvisioningSecretRef, ProvisioningUnprotector, REFERENCE_SESSION_FRAME_OVERHEAD_BYTES,
-    RecordContentVerification, ReferenceEnvelopeSealer, ReferenceProvisioner,
-    RouteVerifiedEventEnvelope, RouteVerifiedRecordEnvelope, RouteVerifiedStateEnvelope, Scope,
-    ScopeRekeyRecipient, SourceRouteLineage, StateContentVerification, Topic,
-    VerifiedBlobContentCompletion, VerifiedBlobTransferPlan, VerifiedControlEnvelope,
-    VerifiedControlKind, VerifiedCustodyClaims, engine::EnvelopeError,
+    BlobContentVerification, BlobCustodyClaimV1, BlobError, BlobId, BlobPhysicalLineage,
+    ContentVerifiedBlobEnvelope, ContentVerifiedEventEnvelope, CustodyClaims, CustodyError,
+    CustodyExpectation, CustodyHop, CustodySample, CustodyTransferClaims, CustodyTransferId,
+    EventContentVerification, EventRouteLineage, MAX_CUSTODY_WRAPPER_BYTES,
+    MIN_CUSTODY_SEMANTIC_VERSION, NodeId, Priority, ProvisioningAccess, ProvisioningLoadId,
+    ProvisioningProtectionError, ProvisioningSecretLoader, ProvisioningSecretRef,
+    ProvisioningUnprotector, REFERENCE_SESSION_FRAME_OVERHEAD_BYTES, RecordContentVerification,
+    ReferenceEnvelopeSealer, ReferenceProvisioner, RouteVerifiedEventEnvelope,
+    RouteVerifiedRecordEnvelope, RouteVerifiedStateEnvelope, Scope, ScopeRekeyRecipient,
+    SourceRouteLineage, StateContentVerification, Topic, VerifiedBlobContentCompletion,
+    VerifiedBlobTransferPlan, VerifiedControlEnvelope, VerifiedControlKind, VerifiedCustodyClaims,
+    engine::EnvelopeError,
 };
 use aster_negentropy::{
     DEFAULT_FRAME_SIZE_LIMIT, Difference, Initiator, InitiatorStep, MAX_CARDINALITY_LIMIT,
@@ -415,6 +416,15 @@ const MUTABLE_FETCH_RESULT_EXCHANGE_BYTES: usize =
 const MUTABLE_TRANSFER_EXCHANGE_MAX_BYTES: usize = MUTABLE_OBJECT_PLAINTEXT_MAX_BYTES
     + MUTABLE_APPLY_PLAINTEXT_BYTES
     + 2 * APPLICATION_PROTECTION_OVERHEAD_BYTES;
+const MUTABLE_V8_BLOB_SOURCE_FIELD_MAX_BYTES: usize =
+    crate::frame::BLOB_CUSTODY_CLAIM_FIELD_MAX_BYTES;
+const MUTABLE_V8_BLOB_DIGEST_FIELD_MAX_BYTES: usize =
+    crate::frame::BLOB_CUSTODY_DIGEST_FIELD_MAX_BYTES;
+const MUTABLE_V8_BLOB_TRANSFER_EXCHANGE_MAX_BYTES: usize = MUTABLE_TRANSFER_EXCHANGE_MAX_BYTES
+    + MUTABLE_V8_BLOB_SOURCE_FIELD_MAX_BYTES
+    + MUTABLE_V8_BLOB_DIGEST_FIELD_MAX_BYTES;
+const MUTABLE_V8_BLOB_FETCH_RESULT_EXCHANGE_BYTES: usize =
+    MUTABLE_FETCH_RESULT_EXCHANGE_BYTES + 2 * MUTABLE_V8_BLOB_DIGEST_FIELD_MAX_BYTES;
 const MUTABLE_LANE_GUARANTEED_ITEMS: usize = 1;
 const MUTABLE_LANE_RECONCILIATION_EXCHANGES: usize = 2 * MUTABLE_RECONCILIATION_ROUNDS as usize + 2;
 const MUTABLE_LANE_FULL_GUARANTEE_BYTES: usize = MUTABLE_LANE_RECONCILIATION_EXCHANGES
@@ -452,6 +462,9 @@ const MUTABLE_V5_CONTACT_RESERVE_BYTES: usize = 2 * MUTABLE_INTEREST_EXCHANGE_MA
     + 6 * MUTABLE_LANE_FULL_GUARANTEE_BYTES
     + 3 * MUTABLE_FETCH_RESULT_EXCHANGE_BYTES
     + BLOB_CARRIER_CONTACT_RESERVE_BYTES;
+const MUTABLE_V8_CONTACT_RESERVE_BYTES: usize = MUTABLE_V5_CONTACT_RESERVE_BYTES
+    + 2 * (MUTABLE_V8_BLOB_TRANSFER_EXCHANGE_MAX_BYTES - MUTABLE_TRANSFER_EXCHANGE_MAX_BYTES)
+    + (MUTABLE_V8_BLOB_FETCH_RESULT_EXCHANGE_BYTES - MUTABLE_FETCH_RESULT_EXCHANGE_BYTES);
 const MUTABLE_V5_CONTACT_RESERVE_EXCHANGES: usize =
     3 + 6 * MUTABLE_LANE_FULL_GUARANTEE_EXCHANGES + 3 + BLOB_CARRIER_CONTACT_RESERVE_EXCHANGES;
 const CONTACT_DEADLINE: Duration = Duration::from_secs(30);
@@ -646,7 +659,13 @@ struct ContactReserve {
 
 fn post_event_reserve(semantic_version: u16) -> Option<ContactReserve> {
     match semantic_version {
-        SEMANTIC_PROTOCOL_V7.. => Some(ContactReserve {
+        SEMANTIC_PROTOCOL_V8.. => Some(ContactReserve {
+            items: 6 * MUTABLE_LANE_GUARANTEED_ITEMS + 1 + EVENT_BRIDGE_CONTACT_RESERVE_ITEMS,
+            protected_frames: MUTABLE_V5_CONTACT_RESERVE_EXCHANGES * EXCHANGE_FRAMES
+                + EVENT_BRIDGE_CONTACT_RESERVE_FRAMES,
+            protected_bytes: MUTABLE_V8_CONTACT_RESERVE_BYTES + EVENT_BRIDGE_CONTACT_RESERVE_BYTES,
+        }),
+        SEMANTIC_PROTOCOL_V7 => Some(ContactReserve {
             items: 6 * MUTABLE_LANE_GUARANTEED_ITEMS + 1 + EVENT_BRIDGE_CONTACT_RESERVE_ITEMS,
             protected_frames: MUTABLE_V5_CONTACT_RESERVE_EXCHANGES * EXCHANGE_FRAMES
                 + EVENT_BRIDGE_CONTACT_RESERVE_FRAMES,
@@ -11936,11 +11955,17 @@ fn accept_received_mutable(
     admission: MutablePeerAdmission<'_>,
     id: MutableTransferId,
     sealed: &[u8],
+    blob_claim: Option<&BlobCustodyClaimV1>,
 ) -> Result<MutableApplyDisposition, NodeError> {
     guard.check(store)?;
     if sealed.len() > MAX_OBJECT_BYTES {
         return Err(NodeError::Protocol(
             "received mutable source object exceeds the selected transfer bound".into(),
+        ));
+    }
+    if id.class() != MutableClass::Blob && blob_claim.is_some() {
+        return Err(NodeError::Protocol(
+            "Blob custody claim crossed mutable classes".into(),
         ));
     }
     match id {
@@ -12096,6 +12121,12 @@ fn accept_received_mutable(
                     "Blob receive interest lacks the exact current content grant".into(),
                 ));
             };
+            require_blob_claim_presence(blob.ttl_ms(), blob_claim.is_some())?;
+            if blob.ttl_ms().is_some() {
+                return Err(NodeError::Protocol(
+                    "finite Blob custody admission is not active".into(),
+                ));
+            }
             verifier.verify_current_blob_lineage(&blob)?;
             let plan = blob.transfer_plan(&manifest_bytes).map_err(|error| {
                 NodeError::Protocol(format!("received Blob transfer plan is invalid: {error}"))
@@ -12244,6 +12275,34 @@ fn accept_received_mutable(
             }
             Ok(disposition)
         }
+    }
+}
+
+fn require_blob_claim_presence(
+    authenticated_ttl_ms: Option<u64>,
+    claim_present: bool,
+) -> Result<(), NodeError> {
+    match (authenticated_ttl_ms, claim_present) {
+        (None, false) | (Some(_), true) => Ok(()),
+        (None, true) => Err(NodeError::Protocol(
+            "durable Blob source carried a custody claim".into(),
+        )),
+        (Some(_), false) => Err(NodeError::Protocol(
+            "finite Blob source omitted its custody claim".into(),
+        )),
+    }
+}
+
+fn require_blob_custody_digest(
+    verified_digest: Option<[u8; 32]>,
+    received_digest: Option<[u8; 32]>,
+) -> Result<(), NodeError> {
+    if verified_digest == received_digest {
+        Ok(())
+    } else {
+        Err(NodeError::Protocol(
+            "Blob custody settlement digest differs from verified source context".into(),
+        ))
     }
 }
 
@@ -20494,6 +20553,35 @@ const fn mutable_lane_fetch_result_exchanges(direction: EventDirection) -> usize
     }
 }
 
+const fn mutable_transfer_exchange_max_bytes(semantic_version: u16, class: MutableClass) -> usize {
+    if semantic_version >= SEMANTIC_PROTOCOL_V8 && matches!(class, MutableClass::Blob) {
+        MUTABLE_V8_BLOB_TRANSFER_EXCHANGE_MAX_BYTES
+    } else {
+        MUTABLE_TRANSFER_EXCHANGE_MAX_BYTES
+    }
+}
+
+const fn mutable_fetch_result_exchange_bytes(semantic_version: u16, class: MutableClass) -> usize {
+    if semantic_version >= SEMANTIC_PROTOCOL_V8 && matches!(class, MutableClass::Blob) {
+        MUTABLE_V8_BLOB_FETCH_RESULT_EXCHANGE_BYTES
+    } else {
+        MUTABLE_FETCH_RESULT_EXCHANGE_BYTES
+    }
+}
+
+const fn mutable_lane_full_guarantee_bytes(semantic_version: u16, class: MutableClass) -> usize {
+    MUTABLE_LANE_RECONCILIATION_EXCHANGES * MUTABLE_RECONCILIATION_EXCHANGE_MAX_BYTES
+        + mutable_transfer_exchange_max_bytes(semantic_version, class)
+        + MUTABLE_FINISH_EXCHANGE_BYTES
+}
+
+fn mutable_lane_class(semantic_version: u16, lane_index: usize) -> Result<MutableClass, NodeError> {
+    mutable_classes_for_semantic(semantic_version)
+        .get(lane_index / 2)
+        .copied()
+        .ok_or_else(|| NodeError::Protocol("mutable lane order differs".into()))
+}
+
 fn mutable_future_fetch_lanes(
     semantic_version: u16,
     class: MutableClass,
@@ -20566,11 +20654,27 @@ fn mutable_future_reserve(
         .and_then(|count| count.checked_add(carrier_exchanges))
         .ok_or_else(|| NodeError::Protocol("mutable future frame reserve overflow".into()))?;
     let future_interest_bytes = future_mutable_interest_bytes(semantic_version, class)?;
-    let bytes = future_lanes
-        .checked_mul(MUTABLE_LANE_FULL_GUARANTEE_BYTES)
-        .and_then(|count| {
-            count.checked_add(future_fetch_lanes * MUTABLE_FETCH_RESULT_EXCHANGE_BYTES)
-        })
+    let future_lane_bytes =
+        ((current + 1)..(current + 1 + future_lanes)).try_fold(0usize, |total, lane_index| {
+            total
+                .checked_add(mutable_lane_full_guarantee_bytes(
+                    semantic_version,
+                    mutable_lane_class(semantic_version, lane_index)?,
+                ))
+                .ok_or_else(|| NodeError::Protocol("mutable future byte reserve overflow".into()))
+        })?;
+    let future_fetch_bytes = ((current + 1)..(current + 1 + future_lanes))
+        .filter(|lane_index| lane_index % 2 == 1)
+        .try_fold(0usize, |total, lane_index| {
+            total
+                .checked_add(mutable_fetch_result_exchange_bytes(
+                    semantic_version,
+                    mutable_lane_class(semantic_version, lane_index)?,
+                ))
+                .ok_or_else(|| NodeError::Protocol("mutable future byte reserve overflow".into()))
+        })?;
+    let bytes = future_lane_bytes
+        .checked_add(future_fetch_bytes)
         .and_then(|count| count.checked_add(future_interest_bytes))
         .and_then(|count| count.checked_add(carrier_bytes))
         .ok_or_else(|| NodeError::Protocol("mutable future byte reserve overflow".into()))?;
@@ -20601,9 +20705,28 @@ fn mutable_interest_reserve(
         .and_then(|count| count.checked_add(carrier_exchanges))
         .ok_or_else(|| NodeError::Protocol("mutable interest frame reserve overflow".into()))?;
     let future_interest_bytes = future_mutable_interest_bytes(semantic_version, class)?;
-    let bytes = lanes
-        .checked_mul(MUTABLE_LANE_FULL_GUARANTEE_BYTES)
-        .and_then(|count| count.checked_add(fetch_lanes * MUTABLE_FETCH_RESULT_EXCHANGE_BYTES))
+    let first_class = mutable_class_index(semantic_version, class)?;
+    let lane_bytes = mutable_classes_for_semantic(semantic_version)[first_class..]
+        .iter()
+        .try_fold(0usize, |total, class| {
+            total
+                .checked_add(2 * mutable_lane_full_guarantee_bytes(semantic_version, *class))
+                .ok_or_else(|| NodeError::Protocol("mutable interest byte reserve overflow".into()))
+        })?;
+    let fetch_bytes = mutable_classes_for_semantic(semantic_version)[first_class..]
+        .iter()
+        .try_fold(0usize, |total, class| {
+            total
+                .checked_add(mutable_fetch_result_exchange_bytes(
+                    semantic_version,
+                    *class,
+                ))
+                .ok_or_else(|| NodeError::Protocol("mutable interest byte reserve overflow".into()))
+        })?;
+    debug_assert_eq!(lanes, remaining_classes * 2);
+    debug_assert_eq!(fetch_lanes, remaining_classes);
+    let bytes = lane_bytes
+        .checked_add(fetch_bytes)
         .and_then(|count| count.checked_add(future_interest_bytes))
         .and_then(|count| count.checked_add(carrier_bytes))
         .ok_or_else(|| NodeError::Protocol("mutable interest byte reserve overflow".into()))?;
@@ -20695,9 +20818,14 @@ fn mutable_reconciliation_reserve(
         })?;
     let bytes = remaining_reconciliation
         .checked_mul(MUTABLE_RECONCILIATION_EXCHANGE_MAX_BYTES)
-        .and_then(|count| count.checked_add(MUTABLE_TRANSFER_EXCHANGE_MAX_BYTES))
         .and_then(|count| {
-            count.checked_add(fetch_result_exchanges * MUTABLE_FETCH_RESULT_EXCHANGE_BYTES)
+            count.checked_add(mutable_transfer_exchange_max_bytes(semantic_version, class))
+        })
+        .and_then(|count| {
+            count.checked_add(
+                fetch_result_exchanges
+                    * mutable_fetch_result_exchange_bytes(semantic_version, class),
+            )
         })
         .and_then(|count| count.checked_add(MUTABLE_FINISH_EXCHANGE_BYTES))
         .and_then(|count| count.checked_add(future_bytes))
@@ -20831,22 +20959,28 @@ fn acknowledge_mutable_fetch_result(
     class: MutableClass,
     direction: EventDirection,
     pending_id: MutableTransferId,
+    verified_digest: Option<[u8; 32]>,
 ) -> Result<(Frame, MutableApplyDisposition), NodeError> {
     match frame {
         Frame::MutableFetchResult {
             direction: request_direction,
             id,
             disposition,
+            custody_digest,
         } if direction == EventDirection::ToSessionInitiator
             && request_direction == direction
             && id.class() == class
             && id == pending_id =>
         {
+            if class == MutableClass::Blob {
+                require_blob_custody_digest(verified_digest, custody_digest)?;
+            }
             Ok((
                 Frame::MutableFetchResultAck {
                     direction,
                     id,
                     disposition,
+                    custody_digest,
                 },
                 disposition,
             ))
@@ -20865,17 +20999,22 @@ fn require_mutable_fetch_result_ack(
     direction: EventDirection,
     id: MutableTransferId,
     disposition: MutableApplyDisposition,
+    verified_digest: Option<[u8; 32]>,
 ) -> Result<(), NodeError> {
     match frame {
         Frame::MutableFetchResultAck {
             direction: response_direction,
             id: response_id,
             disposition: response_disposition,
+            custody_digest,
         } if direction == EventDirection::ToSessionInitiator
             && response_direction == direction
             && response_id == id
             && response_disposition == disposition =>
         {
+            if id.class() == MutableClass::Blob {
+                require_blob_custody_digest(verified_digest, custody_digest)?;
+            }
             Ok(())
         }
         Frame::MutableFetchResultAck { .. } => Err(NodeError::Protocol(
@@ -20889,7 +21028,7 @@ fn require_mutable_fetch_result_ack(
 
 #[derive(Debug, Default)]
 struct MutableFetchSettlement {
-    pending: Option<MutableTransferId>,
+    pending: Option<(MutableTransferId, Option<[u8; 32]>)>,
     deferred_capacity: usize,
 }
 
@@ -20900,7 +21039,7 @@ impl MutableFetchSettlement {
                 "a second mutable fetch preceded settlement of the pending fetch".into(),
             ));
         }
-        self.pending = Some(id);
+        self.pending = Some((id, None));
         Ok(())
     }
 
@@ -20911,11 +21050,11 @@ impl MutableFetchSettlement {
         direction: EventDirection,
         receipt: &mut PeerReceipt,
     ) -> Result<Frame, NodeError> {
-        let pending_id = self.pending.ok_or_else(|| {
+        let (pending_id, verified_digest) = self.pending.ok_or_else(|| {
             NodeError::Protocol("mutable fetch result lacks a pending fetch".into())
         })?;
         let (acknowledgement, disposition) =
-            acknowledge_mutable_fetch_result(frame, class, direction, pending_id)?;
+            acknowledge_mutable_fetch_result(frame, class, direction, pending_id, verified_digest)?;
         let next_deferred_capacity = match disposition {
             MutableApplyDisposition::DeferredCapacity => {
                 self.deferred_capacity.checked_add(1).ok_or_else(|| {
@@ -21331,13 +21470,20 @@ fn mutable_transfer_capacity(
     let reserve_bytes = future_bytes
         .checked_add(MUTABLE_FINISH_EXCHANGE_BYTES)
         .and_then(|count| {
-            count.checked_add(fetch_result_exchanges * MUTABLE_FETCH_RESULT_EXCHANGE_BYTES)
+            count.checked_add(
+                fetch_result_exchanges
+                    * mutable_fetch_result_exchange_bytes(semantic_version, class),
+            )
         })
         .ok_or_else(|| NodeError::Protocol("mutable transfer byte reserve overflow".into()))?;
     if exchange_preserves_reserve(
         receipt,
-        MUTABLE_OBJECT_PLAINTEXT_MAX_BYTES,
-        MUTABLE_APPLY_PLAINTEXT_BYTES,
+        MUTABLE_OBJECT_PLAINTEXT_MAX_BYTES
+            + usize::from(semantic_version >= SEMANTIC_PROTOCOL_V8 && class == MutableClass::Blob)
+                * MUTABLE_V8_BLOB_SOURCE_FIELD_MAX_BYTES,
+        MUTABLE_APPLY_PLAINTEXT_BYTES
+            + usize::from(semantic_version >= SEMANTIC_PROTOCOL_V8 && class == MutableClass::Blob)
+                * MUTABLE_V8_BLOB_DIGEST_FIELD_MAX_BYTES,
         reserve_exchanges,
         reserve_bytes,
     )? {
@@ -23544,6 +23690,7 @@ async fn sync_mutable_transfer_lane(
                         direction,
                         id,
                         bytes,
+                        claim: None,
                     },
                     receipt,
                 )
@@ -23552,6 +23699,7 @@ async fn sync_mutable_transfer_lane(
                     direction: response_direction,
                     id: applied,
                     disposition,
+                    custody_digest,
                 } = response
                 else {
                     return Err(NodeError::Protocol(
@@ -23562,6 +23710,9 @@ async fn sync_mutable_transfer_lane(
                     return Err(NodeError::Protocol(
                         "mutable offer acknowledgement crossed lanes".into(),
                     ));
+                }
+                if class == MutableClass::Blob {
+                    require_blob_custody_digest(None, custody_digest)?;
                 }
                 let _advanced =
                     advance_mutable_transfer_cursor(store, peer, class, direction, cursor, id)?;
@@ -23603,6 +23754,7 @@ async fn sync_mutable_transfer_lane(
                     direction: response_direction,
                     id: received,
                     bytes,
+                    claim,
                 } = response
                 else {
                     return Err(NodeError::Protocol("mutable fetch response differs".into()));
@@ -23627,6 +23779,7 @@ async fn sync_mutable_transfer_lane(
                     },
                     received,
                     &bytes,
+                    claim.as_ref(),
                 )?;
                 #[cfg(test)]
                 if class == MutableClass::Blob {
@@ -23639,6 +23792,7 @@ async fn sync_mutable_transfer_lane(
                         direction,
                         id: received,
                         disposition,
+                        custody_digest: None,
                     },
                     receipt,
                 )
@@ -23648,6 +23802,7 @@ async fn sync_mutable_transfer_lane(
                     direction,
                     received,
                     disposition,
+                    None,
                 )?;
                 let _advanced = advance_mutable_transfer_cursor(
                     store, peer, class, direction, cursor, received,
@@ -26446,6 +26601,7 @@ async fn serve_mutable_transfer_lane(
                     direction: request_direction,
                     id,
                     bytes,
+                    claim,
                 } if direction == EventDirection::ToSessionResponder
                     && request_direction == direction
                     && id.class() == class =>
@@ -26469,6 +26625,7 @@ async fn serve_mutable_transfer_lane(
                         },
                         id,
                         &bytes,
+                        claim.as_ref(),
                     )?;
                     match disposition {
                         MutableApplyDisposition::Inserted => receipt.inserted += 1,
@@ -26494,6 +26651,7 @@ async fn serve_mutable_transfer_lane(
                             direction,
                             id,
                             disposition,
+                            custody_digest: None,
                         },
                         false,
                     ))
@@ -26524,6 +26682,7 @@ async fn serve_mutable_transfer_lane(
                             direction,
                             id,
                             bytes,
+                            claim: None,
                         },
                         false,
                     ))
@@ -30597,6 +30756,13 @@ mod tests {
         assert_eq!(BLOB_CARRIER_CONTACT_RESERVE_EXCHANGES, 6);
         assert_eq!(MUTABLE_V5_CONTACT_RESERVE_BYTES, 32_406_730);
         assert_eq!(MUTABLE_V5_CONTACT_RESERVE_EXCHANGES, 804);
+        // Mutation caught: omitting any one of the two 211-byte v8 Blob
+        // source fields or the three 33-byte settlement digest fields.
+        assert_eq!(MUTABLE_V8_BLOB_SOURCE_FIELD_MAX_BYTES, 211);
+        assert_eq!(MUTABLE_V8_BLOB_DIGEST_FIELD_MAX_BYTES, 33);
+        assert_eq!(MUTABLE_V8_BLOB_TRANSFER_EXCHANGE_MAX_BYTES, 1_049_007);
+        assert_eq!(MUTABLE_V8_BLOB_FETCH_RESULT_EXCHANGE_BYTES, 250);
+        assert_eq!(MUTABLE_V8_CONTACT_RESERVE_BYTES, 32_407_284);
         assert_eq!(
             future_blob_carrier_lane_reserve(EventDirection::ToSessionResponder),
             (3, 17_127)
@@ -30628,6 +30794,16 @@ mod tests {
                 protected_frames: MUTABLE_V5_CONTACT_RESERVE_EXCHANGES * EXCHANGE_FRAMES
                     + EVENT_BRIDGE_CONTACT_RESERVE_FRAMES,
                 protected_bytes: MUTABLE_V5_CONTACT_RESERVE_BYTES
+                    + EVENT_BRIDGE_CONTACT_RESERVE_BYTES,
+            })
+        );
+        assert_eq!(
+            post_event_reserve(SEMANTIC_PROTOCOL_V8),
+            Some(ContactReserve {
+                items: 9,
+                protected_frames: MUTABLE_V5_CONTACT_RESERVE_EXCHANGES * EXCHANGE_FRAMES
+                    + EVENT_BRIDGE_CONTACT_RESERVE_FRAMES,
+                protected_bytes: MUTABLE_V8_CONTACT_RESERVE_BYTES
                     + EVENT_BRIDGE_CONTACT_RESERVE_BYTES,
             })
         );
@@ -30926,16 +31102,19 @@ mod tests {
                 direction: EventDirection::ToSessionResponder,
                 id,
                 disposition: MutableApplyDisposition::Duplicate,
+                custody_digest: None,
             },
             Frame::MutableFetchResult {
                 direction,
                 id: other_id,
                 disposition: MutableApplyDisposition::Duplicate,
+                custody_digest: None,
             },
             Frame::MutableFetchResult {
                 direction,
                 id: cross_class,
                 disposition: MutableApplyDisposition::Duplicate,
+                custody_digest: None,
             },
         ] {
             assert!(
@@ -30952,6 +31131,7 @@ mod tests {
                     direction,
                     id,
                     disposition: MutableApplyDisposition::Duplicate,
+                    custody_digest: None,
                 },
                 MutableClass::State,
                 direction,
@@ -30966,6 +31146,7 @@ mod tests {
                 direction,
                 id,
                 disposition: MutableApplyDisposition::Duplicate,
+                custody_digest: None,
             }
         );
         assert!(
@@ -30975,6 +31156,7 @@ mod tests {
                         direction,
                         id,
                         disposition: MutableApplyDisposition::Duplicate,
+                        custody_digest: None,
                     },
                     MutableClass::State,
                     direction,
@@ -30990,6 +31172,7 @@ mod tests {
                     direction,
                     id: other_id,
                     disposition: MutableApplyDisposition::DeferredCapacity,
+                    custody_digest: None,
                 },
                 MutableClass::State,
                 direction,
@@ -31003,6 +31186,7 @@ mod tests {
                 direction,
                 id: other_id,
                 disposition: MutableApplyDisposition::DeferredCapacity,
+                custody_digest: None,
             }
         );
         require_mutable_fetch_result_ack(
@@ -31010,10 +31194,12 @@ mod tests {
                 direction,
                 id: other_id,
                 disposition: MutableApplyDisposition::DeferredCapacity,
+                custody_digest: None,
             },
             direction,
             other_id,
             MutableApplyDisposition::DeferredCapacity,
+            None,
         )
         .expect("exact acknowledgement");
         assert!(
@@ -31022,10 +31208,12 @@ mod tests {
                     direction,
                     id: other_id,
                     disposition: MutableApplyDisposition::DeferredCapacity,
+                    custody_digest: None,
                 },
                 direction,
                 other_id,
                 MutableApplyDisposition::Duplicate,
+                None,
             )
             .is_err()
         );
@@ -31034,11 +31222,13 @@ mod tests {
                 direction: EventDirection::ToSessionResponder,
                 id: other_id,
                 disposition: MutableApplyDisposition::DeferredCapacity,
+                custody_digest: None,
             },
             Frame::MutableFetchResultAck {
                 direction,
                 id,
                 disposition: MutableApplyDisposition::DeferredCapacity,
+                custody_digest: None,
             },
             Frame::MutableFinished {
                 class: MutableClass::State,
@@ -31052,6 +31242,7 @@ mod tests {
                     direction,
                     other_id,
                     MutableApplyDisposition::DeferredCapacity,
+                    None,
                 )
                 .is_err()
             );
@@ -31161,6 +31352,158 @@ mod tests {
             fair.offered += 1;
         }
         assert_eq!(fair.offered, MAX_CONTACT_ITEMS);
+    }
+
+    #[test]
+    fn v8_blob_overhead_preserves_finish_defer_and_every_other_guaranteed_lane() {
+        // Mutation caught: budgeting v8 as v7 lets a maximum finite Blob
+        // exchange consume bytes reserved for settlement, finish, or a later lane.
+        let exact = PeerReceipt {
+            handshake_frames: MAX_CONTACT_FRAMES
+                - MUTABLE_V5_CONTACT_RESERVE_EXCHANGES * EXCHANGE_FRAMES,
+            handshake_bytes: MAX_CONTACT_BYTES - MUTABLE_V8_CONTACT_RESERVE_BYTES,
+            ..PeerReceipt::default()
+        };
+        assert!(
+            mutable_class_can_start(&exact, SEMANTIC_PROTOCOL_V8, MutableClass::State)
+                .expect("exact v8 reserve")
+        );
+
+        let byte_short = PeerReceipt {
+            handshake_bytes: exact.handshake_bytes + 1,
+            ..exact
+        };
+        assert!(
+            !mutable_class_can_start(&byte_short, SEMANTIC_PROTOCOL_V8, MutableClass::State)
+                .expect("short v8 reserve")
+        );
+
+        assert_eq!(
+            mutable_transfer_exchange_max_bytes(SEMANTIC_PROTOCOL_V8, MutableClass::Blob),
+            MUTABLE_V8_BLOB_TRANSFER_EXCHANGE_MAX_BYTES
+        );
+        assert_eq!(
+            mutable_fetch_result_exchange_bytes(SEMANTIC_PROTOCOL_V8, MutableClass::Blob),
+            MUTABLE_V8_BLOB_FETCH_RESULT_EXCHANGE_BYTES
+        );
+        assert_eq!(
+            mutable_transfer_exchange_max_bytes(SEMANTIC_PROTOCOL_V7, MutableClass::Blob),
+            MUTABLE_TRANSFER_EXCHANGE_MAX_BYTES
+        );
+        assert_eq!(
+            mutable_transfer_exchange_max_bytes(SEMANTIC_PROTOCOL_V8, MutableClass::State),
+            MUTABLE_TRANSFER_EXCHANGE_MAX_BYTES
+        );
+    }
+
+    #[test]
+    fn blob_source_and_settlement_presence_pair_only_with_authenticated_ttl_state() {
+        // Mutation caught: accepting a raw claim on durable source bytes,
+        // accepting a finite source without a claim, or settling under a
+        // digest other than the verifier-returned exact claim digest.
+        assert!(require_blob_claim_presence(None, false).is_ok());
+        assert!(require_blob_claim_presence(None, true).is_err());
+        assert!(require_blob_claim_presence(Some(1), false).is_err());
+        assert!(require_blob_claim_presence(Some(1), true).is_ok());
+
+        let expected = [0x71; 32];
+        assert!(require_blob_custody_digest(None, None).is_ok());
+        assert!(require_blob_custody_digest(None, Some(expected)).is_err());
+        assert!(require_blob_custody_digest(Some(expected), None).is_err());
+        assert!(require_blob_custody_digest(Some(expected), Some(expected)).is_ok());
+        assert!(require_blob_custody_digest(Some(expected), Some([0x72; 32])).is_err());
+    }
+
+    #[test]
+    fn checked_in_blob_custody_v8_vectors_enforce_claim_frame_and_pairing_oracles() {
+        // Mutation caught: changing a canonical field, accepting malformed
+        // optional fields, losing context binding, or trusting a wrong digest.
+        let document = include_str!("../../../conformance/vectors/blob-custody-v8.tsv");
+        let exact_digest = [
+            0x97, 0xdb, 0x5c, 0x5c, 0xad, 0xc1, 0x02, 0xf7, 0xf5, 0x8c, 0xee, 0xea, 0x9a, 0x0b,
+            0xbb, 0xc6, 0xbf, 0x18, 0x42, 0x90, 0x16, 0xbb, 0x00, 0x33, 0x58, 0x2e, 0xea, 0x68,
+            0x2c, 0xbc, 0xfe, 0x95,
+        ];
+        let mut accepted = 0usize;
+        let mut rejected = 0usize;
+        for (line_index, line) in document.lines().enumerate() {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let fields: Vec<_> = line.split('\t').collect();
+            assert_eq!(fields.len(), 4, "vector row {} shape", line_index + 1);
+            let disposition = fields[0];
+            let name = fields[1];
+            let kind = fields[2];
+            let encoded = fields[3];
+            assert_eq!(encoded.len() % 2, 0, "{name}: even hexadecimal width");
+            let bytes: Vec<u8> = (0..encoded.len())
+                .step_by(2)
+                .map(|offset| {
+                    u8::from_str_radix(&encoded[offset..offset + 2], 16)
+                        .unwrap_or_else(|_| panic!("{name}: hexadecimal byte"))
+                })
+                .collect();
+
+            let oracle_accepts = match kind {
+                "claim" => BlobCustodyClaimV1::decode(&bytes)
+                    .is_ok_and(|claim| claim.encode().as_slice() == bytes),
+                "context" => BlobCustodyClaimV1::decode(&bytes).is_ok_and(|claim| {
+                    claim.session_transcript() == [0x11; 32]
+                        && claim.exchange_id() == 0
+                        && claim.direction()
+                            == aster_mesh::BlobCustodyDirectionV1::ToSessionInitiator
+                        && claim.source_transfer_id().as_bytes() == &[0x22; 32]
+                        && claim.source_len() == 1
+                        && claim.publication_id() == [0x33; 32]
+                        && claim.blob_id().as_bytes() == &[0x44; 32]
+                        && claim.priority() == Priority::Routine
+                        && claim.ttl_ms() == 1
+                }),
+                "source-frame" => {
+                    Frame::decode_for_semantic_version(&bytes, 8).is_ok_and(|frame| {
+                        frame
+                            .encode_for_semantic_version(8)
+                            .is_ok_and(|canonical| canonical == bytes)
+                    })
+                }
+                "durable-source-pair" | "finite-source-pair" => {
+                    Frame::decode_for_semantic_version(&bytes, 8).is_ok_and(|frame| {
+                        let claim_present = match frame {
+                            Frame::MutableOffer { claim, .. }
+                            | Frame::MutableObject { claim, .. } => claim.is_some(),
+                            _ => return false,
+                        };
+                        let ttl_ms = (kind == "finite-source-pair").then_some(1);
+                        require_blob_claim_presence(ttl_ms, claim_present).is_ok()
+                    })
+                }
+                "finite-settlement" | "durable-settlement" => {
+                    Frame::decode_for_semantic_version(&bytes, 8).is_ok_and(|frame| {
+                        let digest = match frame {
+                            Frame::MutableApplyResult { custody_digest, .. }
+                            | Frame::MutableFetchResult { custody_digest, .. }
+                            | Frame::MutableFetchResultAck { custody_digest, .. } => custody_digest,
+                            _ => return false,
+                        };
+                        let expected = (kind == "finite-settlement").then_some(exact_digest);
+                        require_blob_custody_digest(expected, digest).is_ok()
+                    })
+                }
+                _ => panic!("{name}: unknown vector kind {kind}"),
+            };
+            assert_eq!(
+                oracle_accepts,
+                disposition == "ACCEPT",
+                "{name}: vector disposition"
+            );
+            match disposition {
+                "ACCEPT" => accepted += 1,
+                "REJECT" => rejected += 1,
+                _ => panic!("{name}: unknown vector disposition {disposition}"),
+            }
+        }
+        assert_eq!((accepted, rejected), (7, 19));
     }
 
     #[test]
@@ -32058,6 +32401,7 @@ mod tests {
                         },
                         MutableTransferId::State(historical_state),
                         &historical_state_source.sealed,
+                        None,
                     )
                     .expect("accept post-startup historical State"),
                     MutableApplyDisposition::Inserted
@@ -32077,6 +32421,7 @@ mod tests {
                         },
                         MutableTransferId::State(historical_state),
                         &historical_state_source.sealed,
+                        None,
                     )
                     .expect("accept duplicate historical State"),
                     MutableApplyDisposition::Duplicate
@@ -32094,6 +32439,7 @@ mod tests {
                         },
                         MutableTransferId::Record(historical_record),
                         &historical_record_source.sealed,
+                        None,
                     )
                     .expect("accept post-startup historical Record"),
                     MutableApplyDisposition::Inserted

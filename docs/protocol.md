@@ -1013,10 +1013,45 @@ offers Blob only `[LegacyV6]`. A v8 offer changes only the Blob profile list to
 it allocates Blob custody negotiation only. A missing mandatory legacy profile,
 an empty intersection, digest mismatch, or profile substitution fails closed.
 
-`BlobCustodyV1` is selected only in a semantic-v8 session. This allocation does
-not yet define custody claim or Blob frame grammar and does not activate finite
-Blob source transfer. A Blob lane selected as `LegacyV6`, including every v7
-session and any v8 fallback, continues to suppress finite-Blob source transfer.
+`BlobCustodyV1` is selected only in a semantic-v8 session. It allocates the
+following Blob-only extension to the existing mutable tags without allocating
+any new tag. After the existing length-prefixed source bytes in a Blob
+`MutableOffer` or `MutableObject`, v8 appends:
+
+```text
+claim_present                   u8 = 0 or 1
+claim_len                       u16 = 208, iff claim_present = 1
+claim                           BlobCustodyClaimV1[208], iff claim_present = 1
+```
+
+Zero ends the frame. One requires the exact length and exact claim bytes. Any
+other discriminator, wrong length, truncation, repeated field, or trailing byte
+fails. A source-authenticated positive Blob TTL requires a claim; an absent TTL
+requires zero. The pairing decision occurs only after source authentication.
+
+After the disposition byte in a v8 Blob `MutableApplyResult`,
+`MutableFetchResult`, or `MutableFetchResultAck`, v8 appends:
+
+```text
+digest_present                  u8 = 0 or 1
+claim_digest                    SHA-256(claim[208]), iff digest_present = 1
+```
+
+Zero ends the frame; one requires exactly 32 digest bytes. Finite settlement
+requires the digest returned by verification of the exact source claim;
+durable settlement requires zero. Raw decoded claims are never admission
+authority. State and Record bytes are unchanged in v8, and all of these Blob
+tags retain their v1-v7 encoding before v8. The maximum v8 Blob source-field
+overhead is 211 bytes and each result/ack field is 33 bytes. The exact selected
+v8 mutable contact byte reserve is 32,407,284 bytes, 554 bytes above the v7
+reserve; frame and item counts are unchanged.
+
+This grammar and the shared verified capability do not activate finite Blob
+inventory, offer/fetch scheduling, pending insertion, carrier work, cursor
+advancement, or promotion. A Blob lane selected as `LegacyV6`, including every
+v7 session and any v8 fallback, suppresses finite-Blob source transfer; the
+current `BlobCustodyV1` runtime also fails closed before finite storage until the
+later lifecycle increment is enabled.
 
 Each Event direction then exchanges one `EventTurnPlanV1`: `PageActive`,
 `PageBlindActive`, `LegacyActive`, `Empty`, or `Suppressed`. `PageActive` binds
@@ -1879,17 +1914,18 @@ v6 does not revise v1-v5 object bytes or ordinary-lane frame bytes; it only
 allocates the separately gated Event bridge mechanics in §9.3. Semantic v7
 does not revise v1-v6 bytes; it adds the negotiated transfer profiles and
 receipt-free Event-page mechanics in §9.4. Semantic v8 does not revise v1-v7
-stable object bytes or durable Blob mechanics; it adds only the v8 Blob profile
-offer and the distinct v8 lane-record AAD domain described in §9.4.
+stable object bytes or v1-v7 durable Blob mechanics; it adds the v8 Blob
+profile offer, exact Blob-only optional fields, verified claim capability, and
+the distinct v8 lane-record AAD domain described in §9.4.
 
 Semantic `1`
 permits transfer object kinds `1` (source envelope) and `2` (Blob chunk).
-Semantics `2`, `3`, `4`, `5`, `6`, and `7` additionally permit the reserved kinds `3`
+Semantics `2` through `8` additionally permit the reserved kinds `3`
 (source-batch proof), `4` (bridge authorization), and `5` (bridge-route
-wrapper). Semantics `3`, `4`, `5`, `6`, and `7` add the bounded session custody
+wrapper). Semantics `3` through `8` add the bounded session custody
 record in [envelope.md](envelope.md) §7.1; none allocates another stable object
-kind. Semantics `4`, `5`, `6`, and `7` enable the §9.1 selected State/Record
-mechanics frames; semantics `5`, `6`, and `7` enable the §9.2 selected Blob mechanics
+kind. Semantics `4` through `8` enable the §9.1 selected State/Record
+mechanics frames; semantics `5` through `8` enable the §9.2 selected Blob mechanics
 frames. Semantic `6` preserves all v5 ordinary-lane bytes and additionally
 enables the mutually opted-in §9.3 selected Event-bridge mechanics frames.
 Semantic `7` preserves all v6 mechanics and adds the §9.4 profile exchange and
@@ -1982,6 +2018,7 @@ outbound, and replay limits:
 | retained handshake flight | 1 entry | a causal authenticated next flight replaces or retires it |
 | combined pending logical bytes | 16 MiB | checked before every retry insert/refresh, outbox insert, and handshake replacement |
 | selected mutable object | 1 MiB | oversized State/Record bytes fail before durable admission; malformed or unauthorized bytes remain fatal |
+| semantic-v8 Blob custody claim | exactly 208 bytes; source field at most 211 bytes and result/ack field at most 33 bytes | wrong presence, length, context, digest, duplicate, truncation, or trailing bytes fail closed; finite admission remains inactive |
 | selected mutable class | 4,096 rows and 16 MiB encoded source bytes, independently for State and Record | an otherwise valid new object receives `DeferredCapacity`; no existing mutable row is pruned |
 | mutable fairness cursor | 256 configured mission peers, 4 peer/class/local-mode rows each, 1,024 rows total | startup rejects an overbound configured set and prunes rows for peers no longer configured; ordinary data quota cannot consume the reserve |
 | live application command lane | 32 commands shared by Event, State, Record, and Blob; one queued command for the joined Blob worker | a full Blob worker queue returns explicit `ResourceLimit`; shutdown and zeroization close both admissions and join the worker |

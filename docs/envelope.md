@@ -148,6 +148,7 @@ that 32-byte value itself is the input to both signature algorithms.
 | Bridge edge enrollment | `"ASTRBE01"` | provider-authenticated administrative capability; at most 32 KiB; not a mesh replication object |
 | Legacy per-hop forwarding wrapper | `"ASTRFWD1"` | provider-owned network object; protected body at most 64 KiB including tag |
 | Semantic-v3-format custody claim, used by v3/v4/v5/v6/v7/v8 | `"ASTRCU03"` inside `"ASTRFR01"` | exact 150-byte plaintext; exact current outer record 202 bytes, hard bound 256 bytes |
+| Semantic-v8 Blob custody claim | `"ASTRBL08"` in a v8 Blob mutable source frame | exact 208-byte canonical claim; decoded bytes remain untrusted until exact-context verification |
 | Handshake flight | `"ASTRHS01"` | network, at most 64 KiB per flight |
 | Protected transport frame | `"ASTRFR01"` | network; plaintext at most 16 MiB |
 | Blob manifest | `"ASTRBM01"` | canonical source-authenticated object, at most 1 MiB |
@@ -980,6 +981,51 @@ keys bind the actually negotiated session. With the current §9
 encoding the complete record is exactly 202 bytes; implementations MUST reject
 an empty record or one larger than 256 bytes. Stable source bytes remain in the
 ordinary peer-neutral transfer path and are not embedded in this claim.
+
+### 7.2 Semantic-v8 Blob custody claim
+
+`BlobCustodyClaimV1` is a fixed-domain claim carried only by the semantic-v8
+Blob mutable-frame grammar in [protocol.md](protocol.md) §9.4. It is exactly 208
+bytes:
+
+```text
+magic                           "ASTRBL08"         8
+format_version                  u16 = 1             2
+semantic_version                u16 = 8             2
+profile_id                      u16 = 3             2
+session_transcript              32 bytes           32
+exchange_id                     u64                 8
+direction                       u8 = 1 or 2          1
+source_transfer_id              32 bytes           32
+source_len                      u64, nonzero         8
+publication_id                  32 bytes           32
+blob_id                         32 bytes           32
+priority                        u8 = 0..3            1
+ttl_ms                          u64, nonzero         8
+prior_cumulative_age_ms         u64                 8
+sender_clock_id                 16 bytes           16
+sender_tick_ms                  u64                 8
+hop_delta_ms                    u64                 8
+```
+
+Direction `1` means the authenticated session initiator receives the source;
+direction `2` means the responder receives it. `session_transcript`, exchange,
+direction, typed transfer ID, and source length MUST equal the live protected
+exchange. Publication ID, BlobID, priority, and positive TTL MUST equal the
+freshly content-verified source envelope. Sender sample and hop contribution
+are verifier inputs, never values trusted merely because the claim decoded.
+`prior_cumulative_age_ms + hop_delta_ms` is checked and overflow fails. The
+settlement digest is ordinary SHA-256 over all 208 canonical bytes, with no
+additional prefix.
+
+Decoding proves only grammar. The verifier reconstructs all fields from the
+authenticated session and exact content-verified source, compares the complete
+claim, and only then returns a nonconstructible verified Blob custody
+capability. Store admission MUST accept that capability, never the decoded
+claim. The exact vectors are in
+`conformance/vectors/blob-custody-v8.tsv`. This object definition does not
+activate finite Blob scheduling, storage, carrier transfer, cursor advancement,
+or promotion.
 
 ## 8. Handshake flights and transcript
 

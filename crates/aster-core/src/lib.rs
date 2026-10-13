@@ -47,6 +47,8 @@ pub mod blob;
 mod blob;
 #[cfg(all(feature = "reference-session", not(feature = "sqlite-store")))]
 mod blob;
+#[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
+mod blob_custody;
 #[cfg(all(feature = "sqlite-store", feature = "adapter-sdk"))]
 pub mod causal;
 #[cfg(all(feature = "sqlite-store", not(feature = "adapter-sdk")))]
@@ -145,6 +147,11 @@ pub use blob::{
     MAX_BLOB_SCHEMA_ID_BYTES, MAX_BLOB_TRANSFER_OBJECT_BYTES, MIN_BLOB_CHUNK_SIZE, PreparedBlob,
     ReferenceBlobService, SELECTED_BLOB_CHUNK_SIZE, VerifiedBlobContentCompletion,
     VerifiedBlobTransferObject, VerifiedBlobTransferPlan, prepare_blob,
+};
+#[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
+pub use blob_custody::{
+    BLOB_CUSTODY_CLAIM_V1_BYTES, BlobCustodyClaimV1, BlobCustodyDirectionV1, BlobCustodyError,
+    BlobCustodyTransferId, VerifiedBlobCustodyClaimV1,
 };
 #[cfg(feature = "reference-session")]
 pub use bridge_adapter::{

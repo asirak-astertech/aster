@@ -113,7 +113,7 @@ impl RouteVerifiedBlobEnvelope {
         self.envelope.header.priority
     }
 
-    /// Finite TTL is unsupported by the selected Blob slice.
+    /// Source-authenticated finite TTL, or `None` for durable Blob data.
     pub const fn ttl_ms(&self) -> Option<u64> {
         self.envelope.header.ttl_ms
     }
@@ -282,7 +282,7 @@ impl ContentVerifiedBlobEnvelope {
         self.route.priority()
     }
 
-    /// Finite TTL is unsupported by the selected Blob slice.
+    /// Source-authenticated finite TTL, or `None` for durable Blob data.
     pub const fn ttl_ms(&self) -> Option<u64> {
         self.route.ttl_ms()
     }
@@ -810,7 +810,7 @@ fn validate_selected_blob_header(header: &EnvelopeHeader) -> Result<(), Envelope
     if header.class != DataClass::Blob
         || header.event_sequence.is_some()
         || header.tombstone
-        || header.ttl_ms.is_some()
+        || header.ttl_ms == Some(0)
         || header.content_len == 0
         || header.content_len > MAX_BLOB_MANIFEST_BYTES
         || route.chunk_count() == 0
@@ -1480,24 +1480,22 @@ mod tests {
         .expect("seal class-confused payload through generic boundary");
         assert!(reader.verify_blob(&generic_state.bytes).is_err());
 
-        for ttl_ms in [Some(0), Some(50)] {
-            let mut finite = selected.clone();
-            finite.ttl_ms = ttl_ms;
-            assert!(
-                publisher
-                    .seal_blob_manifest(&finite, fixture.finished.manifest_bytes())
-                    .is_err()
-            );
-            let generic = <ReferenceEnvelopeSealer as EnvelopeSealer>::seal(
-                &mut publisher,
-                SealRequest {
-                    header: &finite,
-                    payload: fixture.finished.manifest_bytes(),
-                },
-            )
-            .expect("generic provider permits finite TTL syntax");
-            assert!(reader.verify_blob(&generic.bytes).is_err());
-        }
+        let mut zero_ttl = selected.clone();
+        zero_ttl.ttl_ms = Some(0);
+        assert!(
+            publisher
+                .seal_blob_manifest(&zero_ttl, fixture.finished.manifest_bytes())
+                .is_err()
+        );
+        let generic = <ReferenceEnvelopeSealer as EnvelopeSealer>::seal(
+            &mut publisher,
+            SealRequest {
+                header: &zero_ttl,
+                payload: fixture.finished.manifest_bytes(),
+            },
+        )
+        .expect("generic provider permits zero TTL syntax");
+        assert!(reader.verify_blob(&generic.bytes).is_err());
 
         let empty = prepare_blob(
             &mut Cursor::new(Vec::<u8>::new()),
@@ -1539,6 +1537,168 @@ mod tests {
             publisher
                 .seal_blob_manifest(&selected, &manifest_tamper)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn positive_blob_ttl_preserves_authenticated_route_and_manifest_bindings() {
+        // Mutation caught: continuing to reject every finite Blob, or bypassing
+        // the existing route/manifest/header checks when TTL becomes positive.
+        let Services {
+            mut publisher,
+            other: _,
+            mut reader,
+            relay: _,
+            wrong_topic: _,
+        } = services();
+        let fixture = fixture(
+            &publisher,
+            &topic(),
+            1,
+            b"finite selected Blob".to_vec(),
+            BlobMetadata::new(None, vec![8]).expect("metadata"),
+        );
+        let mut finite = header(publisher.identity(), &fixture.finished, topic(), 1, 9);
+        finite.ttl_ms = Some(50);
+        let sealed = publisher
+            .seal_blob_manifest(&finite, fixture.finished.manifest_bytes())
+            .expect("seal positive finite Blob");
+        let route = reader
+            .verify_blob(&sealed.bytes)
+            .expect("verify finite route");
+        assert_eq!(route.ttl_ms(), Some(50));
+        assert_eq!(route.priority(), Priority::Immediate);
+        assert_eq!(route.publisher(), publisher.identity());
+        assert_eq!(route.blob_id(), fixture.finished.id());
+        match reader
+            .verify_blob_content(route, &sealed.bytes)
+            .expect("verify finite content")
+        {
+            BlobContentVerification::ContentVerified { blob, .. } => {
+                assert_eq!(blob.ttl_ms(), Some(50));
+                assert_eq!(blob.blob_id(), fixture.finished.id());
+                assert_eq!(blob.manifest(), &fixture.manifest);
+            }
+            BlobContentVerification::RouteOnly(_) => panic!("reader lost finite content grant"),
+        }
+    }
+
+    #[test]
+    fn blob_custody_capability_binds_every_authenticated_source_and_contact_field() {
+        // Mutation caught: minting a verified capability from raw frame fields,
+        // or omitting any session, transfer, source-header, sample, or age bind.
+        use crate::CustodySample;
+        use crate::blob_custody::{
+            BlobCustodyClaimV1, BlobCustodyDirectionV1, BlobCustodyError, BlobCustodyTransferId,
+        };
+
+        let Services {
+            mut publisher,
+            other: _,
+            mut reader,
+            relay: _,
+            wrong_topic: _,
+        } = services();
+        let fixture = fixture(
+            &publisher,
+            &topic(),
+            1,
+            b"claim-bound selected Blob".to_vec(),
+            BlobMetadata::new(None, vec![3, 8]).expect("metadata"),
+        );
+        let mut finite = header(publisher.identity(), &fixture.finished, topic(), 1, 17);
+        finite.priority = Priority::Priority;
+        finite.ttl_ms = Some(9_000);
+        let sealed = publisher
+            .seal_blob_manifest(&finite, fixture.finished.manifest_bytes())
+            .expect("seal finite Blob");
+        let (blob, _) = content_verified(&mut reader, &sealed.bytes);
+        let transfer_id = BlobCustodyTransferId::from_exact_hash(blob.envelope_id());
+        let sample = CustodySample {
+            clock_id: [0x71; 16],
+            tick_ms: 1_500,
+        };
+        let claim = BlobCustodyClaimV1::from_authenticated_source(
+            [0x61; 32],
+            41,
+            BlobCustodyDirectionV1::ToSessionResponder,
+            transfer_id,
+            &blob,
+            &sealed.bytes,
+            700,
+            sample,
+            25,
+        )
+        .expect("build authenticated finite claim");
+        let decoded = BlobCustodyClaimV1::decode(&claim.encode()).expect("decode raw frame claim");
+        let verified = decoded
+            .verify_authenticated_source(
+                [0x61; 32],
+                41,
+                BlobCustodyDirectionV1::ToSessionResponder,
+                transfer_id,
+                &blob,
+                &sealed.bytes,
+                700,
+                sample,
+                25,
+            )
+            .expect("verify exact authenticated context");
+        assert_eq!(verified.digest(), claim.digest());
+        assert_eq!(verified.source_transfer_id(), transfer_id);
+        assert_eq!(verified.publication_id(), blob.item_id());
+        assert_eq!(verified.blob_id(), blob.blob_id());
+        assert_eq!(verified.priority(), Priority::Priority);
+        assert_eq!(verified.ttl_ms(), 9_000);
+        assert_eq!(verified.forwarding_age_ms(), 725);
+
+        for offset in [
+            14usize, 46, 54, 55, 87, 95, 127, 159, 160, 168, 176, 192, 200,
+        ] {
+            let mut substituted = claim.encode();
+            if offset == 54 {
+                substituted[offset] = 1;
+            } else {
+                substituted[offset] ^= 1;
+            }
+            let substituted = BlobCustodyClaimV1::decode(&substituted)
+                .expect("substitution remains structurally canonical");
+            assert_eq!(
+                substituted.verify_authenticated_source(
+                    [0x61; 32],
+                    41,
+                    BlobCustodyDirectionV1::ToSessionResponder,
+                    transfer_id,
+                    &blob,
+                    &sealed.bytes,
+                    700,
+                    sample,
+                    25,
+                ),
+                Err(BlobCustodyError::ContextMismatch),
+                "bound-field byte offset {offset}"
+            );
+        }
+
+        let mut durable = finite;
+        durable.ttl_ms = None;
+        let durable_sealed = publisher
+            .seal_blob_manifest(&durable, fixture.finished.manifest_bytes())
+            .expect("seal durable Blob");
+        let (durable_blob, _) = content_verified(&mut reader, &durable_sealed.bytes);
+        assert_eq!(
+            BlobCustodyClaimV1::from_authenticated_source(
+                [0x61; 32],
+                41,
+                BlobCustodyDirectionV1::ToSessionResponder,
+                BlobCustodyTransferId::from_exact_hash(durable_blob.envelope_id()),
+                &durable_blob,
+                &durable_sealed.bytes,
+                0,
+                sample,
+                0,
+            ),
+            Err(BlobCustodyError::InvalidClaim)
         );
     }
 

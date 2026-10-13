@@ -288,6 +288,28 @@ pub fn fuzz_decode_mechanics_frame(input: &[u8]) -> bool {
     true
 }
 
+/// Exercises version-selected mechanics decoding, including semantic-v8 Blob fields.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_decode_mechanics_frame_for_semantic_version(
+    input: &[u8],
+    semantic_version: u16,
+) -> bool {
+    let Ok(frame) = frame::Frame::decode_for_semantic_version(input, semantic_version) else {
+        return false;
+    };
+    let canonical = frame
+        .encode_for_semantic_version(semantic_version)
+        .expect("an accepted versioned mechanics frame must re-encode");
+    assert_eq!(canonical.as_slice(), input);
+    assert_eq!(
+        frame::Frame::decode_for_semantic_version(&canonical, semantic_version)
+            .expect("canonical versioned mechanics frame must decode"),
+        frame
+    );
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
