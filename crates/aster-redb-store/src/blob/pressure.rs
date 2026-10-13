@@ -872,7 +872,20 @@ pub(crate) struct PressurePendingRoot {
     pub(crate) blob_id: BlobId,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PressurePendingRootEncodingGeneration {
+    PressureV3,
+    PressureV4,
+}
+
 pub(super) fn encode_pending_root(root: &PressurePendingRoot) -> Result<Vec<u8>, StoreError> {
+    encode_pending_root_for_generation(root, PressurePendingRootEncodingGeneration::PressureV4)
+}
+
+pub(super) fn encode_pending_root_for_generation(
+    root: &PressurePendingRoot,
+    generation: PressurePendingRootEncodingGeneration,
+) -> Result<Vec<u8>, StoreError> {
     if root.acceptance_order == 0 {
         return Err(pressure_corruption(
             "Blob pressure pending root has a zero acceptance order",
@@ -884,10 +897,16 @@ pub(super) fn encode_pending_root(root: &PressurePendingRoot) -> Result<Vec<u8>,
         .map_err(|_| pressure_corruption("Blob pressure topic length overflows"))?;
     let scope_len = u16::try_from(scope.len())
         .map_err(|_| pressure_corruption("Blob pressure scope length overflows"))?;
-    let mut output = Vec::with_capacity(142 + topic.len() + scope.len());
+    let binding_len = match generation {
+        PressurePendingRootEncodingGeneration::PressureV3 => 0,
+        PressurePendingRootEncodingGeneration::PressureV4 => 32,
+    };
+    let mut output = Vec::with_capacity(110 + binding_len + topic.len() + scope.len());
     output.push(PRESSURE_RECORD_VERSION);
     output.extend_from_slice(root.variant_id.as_bytes());
-    output.extend_from_slice(&root.authenticated_source_binding);
+    if generation == PressurePendingRootEncodingGeneration::PressureV4 {
+        output.extend_from_slice(&root.authenticated_source_binding);
+    }
     output.push(root.priority as u8);
     output.extend_from_slice(&root.acceptance_order.to_be_bytes());
     output.extend_from_slice(&root.completion.numerator.to_be_bytes());
@@ -902,10 +921,20 @@ pub(super) fn encode_pending_root(root: &PressurePendingRoot) -> Result<Vec<u8>,
 }
 
 pub(super) fn decode_pending_root(bytes: &[u8]) -> Result<PressurePendingRoot, StoreError> {
+    decode_pending_root_for_generation(bytes, PressurePendingRootEncodingGeneration::PressureV4)
+}
+
+pub(super) fn decode_pending_root_for_generation(
+    bytes: &[u8],
+    generation: PressurePendingRootEncodingGeneration,
+) -> Result<PressurePendingRoot, StoreError> {
     let mut cursor = PressureCursor::new(bytes);
     cursor.version()?;
     let variant_id = BlobVariantId::from_bytes(cursor.array()?);
-    let authenticated_source_binding = cursor.array()?;
+    let authenticated_source_binding = match generation {
+        PressurePendingRootEncodingGeneration::PressureV3 => [0; 32],
+        PressurePendingRootEncodingGeneration::PressureV4 => cursor.array()?,
+    };
     let priority = decode_priority(cursor.u8()?)?;
     let acceptance_order = cursor.u64()?;
     if acceptance_order == 0 {
@@ -1884,6 +1913,7 @@ fn build_pressure_image(
     chunks: &impl ReadableTable<&'static [u8], &'static [u8]>,
     next_pending_acceptance_order: u64,
     publication_encoding: super::lifecycle::PublicationEncodingGeneration,
+    pending_root_encoding: PressurePendingRootEncodingGeneration,
 ) -> Result<PressureImage, StoreError> {
     if next_pending_acceptance_order == 0 {
         return Err(pressure_corruption(
@@ -1979,9 +2009,10 @@ fn build_pressure_image(
             scope: record.metadata.header.scope.clone(),
             blob_id: record.metadata.blob_id,
         };
-        image
-            .pending_roots
-            .insert(key.value().to_vec(), encode_pending_root(&root)?);
+        image.pending_roots.insert(
+            key.value().to_vec(),
+            encode_pending_root_for_generation(&root, pending_root_encoding)?,
+        );
         image
             .pending_sources
             .insert(encode_pending_index_key(root.clone(), source), Vec::new());
@@ -2293,6 +2324,7 @@ fn audit_or_migrate_pressure_write_inner(
                 &write.open_table(super::BLOB_CHUNKS)?,
                 migrated_next,
                 super::lifecycle::publication_encoding_migration_write(write)?,
+                PressurePendingRootEncodingGeneration::PressureV4,
             )?;
             apply_image(write, &image)
         }
@@ -2337,6 +2369,7 @@ fn audit_or_migrate_pressure_write_inner(
                 } else {
                     super::lifecycle::publication_encoding_migration_write(write)?
                 },
+                PressurePendingRootEncodingGeneration::PressureV4,
             )?;
             if version != PRESSURE_SCHEMA_VERSION {
                 replace_image(write, &image)
@@ -2434,6 +2467,11 @@ pub(crate) fn inspect_pressure_read(
             super::lifecycle::publication_encoding_read(read)?
         } else {
             super::lifecycle::publication_encoding_migration_read(read)?
+        },
+        if version == PRESSURE_SCHEMA_VERSION {
+            PressurePendingRootEncodingGeneration::PressureV4
+        } else {
+            PressurePendingRootEncodingGeneration::PressureV3
         },
     )?;
     audit_image_read(read, &image)
@@ -2640,8 +2678,35 @@ pub(super) fn rekey_pending_source_lifetime_write(
             "pending Blob pressure root lacks its exact index",
         ));
     }
-    let mut updated = old;
-    updated.expiry = lifetime_expiry(record.metadata.lifetime)?;
+    let updated = PressurePendingRoot {
+        variant_id: record.metadata.variant_id,
+        authenticated_source_binding: record.authenticated_source_binding,
+        priority: record.metadata.header.priority,
+        acceptance_order: record.pending_acceptance_order,
+        completion: pending_progress(
+            transfer,
+            record,
+            &write.open_table(super::BLOB_CARRIER_PREFIXES)?,
+            &write.open_table(super::BLOB_IMPORTS)?,
+            &write.open_table(super::BLOB_CHUNKS)?,
+        )?,
+        expiry: lifetime_expiry(record.metadata.lifetime)?,
+        topic: record.metadata.header.topic.clone(),
+        scope: record.metadata.header.scope.clone(),
+        blob_id: record.metadata.blob_id,
+    };
+    if old.variant_id != updated.variant_id
+        || old.priority != updated.priority
+        || old.acceptance_order != updated.acceptance_order
+        || old.completion != updated.completion
+        || old.topic != updated.topic
+        || old.scope != updated.scope
+        || old.blob_id != updated.blob_id
+    {
+        return Err(pressure_corruption(
+            "pending Blob pressure root contradicts its source during re-key",
+        ));
+    }
     let encoded = encode_pending_root(&updated)?;
     write
         .open_table(BLOB_PRESSURE_PENDING_ROOTS)?
@@ -3868,13 +3933,15 @@ mod tests {
     use redb::ReadableDatabase;
 
     use super::{
-        PRESSURE_RECORD_VERSION, PressureExpiry, PressureFraction, PressurePendingRoot,
-        PressurePublicationKey, PressurePublicationRoot, PressureVariantSummary,
-        compare_pressure_fraction, decode_content_publication_key, decode_pending_index_key,
-        decode_pending_root, decode_publication_key, decode_publication_root,
+        PRESSURE_EXPIRY_DURABLE, PRESSURE_RECORD_VERSION, PressureExpiry, PressureFraction,
+        PressurePendingRoot, PressurePendingRootEncodingGeneration, PressurePublicationKey,
+        PressurePublicationRoot, PressureVariantSummary, compare_pressure_fraction,
+        decode_content_publication_key, decode_pending_index_key, decode_pending_root,
+        decode_pending_root_for_generation, decode_publication_key, decode_publication_root,
         decode_variant_index_key, decode_variant_summary, encode_content_publication_key,
-        encode_pending_index_key, encode_pending_root, encode_publication_key,
-        encode_publication_root, encode_variant_index_key, encode_variant_summary,
+        encode_pending_index_key, encode_pending_root, encode_pending_root_for_generation,
+        encode_publication_key, encode_publication_root, encode_variant_index_key,
+        encode_variant_summary,
     };
     use crate::StoreError;
     use crate::blob::{BlobSemanticId, BlobTransferId, BlobVariantId};
@@ -4023,9 +4090,53 @@ mod tests {
         let encoded_pending = encode_pending_root(&pending).expect("encode pending root");
         assert_eq!(decode_pending_root(&encoded_pending).unwrap(), pending);
         assert!(decode_pending_root(&encoded_pending[..encoded_pending.len() - 1]).is_err());
-        let mut unknown_pending = encoded_pending;
+        let mut unknown_pending = encoded_pending.clone();
         unknown_pending[0] = PRESSURE_RECORD_VERSION.wrapping_add(1);
         assert!(decode_pending_root(&unknown_pending).is_err());
+
+        let historical = encode_pending_root_for_generation(
+            &pending,
+            PressurePendingRootEncodingGeneration::PressureV3,
+        )
+        .expect("encode exact pressure-v3 pending root");
+        assert_eq!(
+            historical,
+            [
+                vec![PRESSURE_RECORD_VERSION],
+                pending.variant_id.as_bytes().to_vec(),
+                vec![pending.priority as u8],
+                pending.acceptance_order.to_be_bytes().to_vec(),
+                pending.completion.numerator.to_be_bytes().to_vec(),
+                pending.completion.denominator.to_be_bytes().to_vec(),
+                vec![PRESSURE_EXPIRY_DURABLE],
+                0u64.to_be_bytes().to_vec(),
+                7u16.to_be_bytes().to_vec(),
+                b"pending".to_vec(),
+                5u16.to_be_bytes().to_vec(),
+                b"scope".to_vec(),
+                pending.blob_id.as_bytes().to_vec(),
+            ]
+            .concat(),
+            "pressure-v3 pending roots have no authenticated binding bytes"
+        );
+        let mut historical_pending = pending.clone();
+        historical_pending.authenticated_source_binding = [0; 32];
+        assert_eq!(
+            decode_pending_root_for_generation(
+                &historical,
+                PressurePendingRootEncodingGeneration::PressureV3,
+            )
+            .unwrap(),
+            historical_pending
+        );
+        assert!(decode_pending_root(&historical).is_err());
+        assert!(
+            decode_pending_root_for_generation(
+                &encoded_pending,
+                PressurePendingRootEncodingGeneration::PressureV3,
+            )
+            .is_err()
+        );
     }
 
     #[test]

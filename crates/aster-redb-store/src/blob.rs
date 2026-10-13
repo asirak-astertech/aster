@@ -3289,8 +3289,12 @@ impl Store {
                 finite.as_ref().map(|verified| verified.receiver_sample),
             )?;
             pending.metadata.lifetime = merged;
+            pending.authenticated_source_binding =
+                pending_blob_authenticated_source_binding(&pending.metadata, &pending.sealed)?;
             let mut expected = existing.clone();
             expected.metadata.lifetime = merged;
+            expected.authenticated_source_binding =
+                pending_blob_authenticated_source_binding(&expected.metadata, &expected.sealed)?;
             if expected != pending {
                 return Err(blob_error(BlobStoreError::PendingSourceConflict));
             }
@@ -14901,6 +14905,111 @@ mod tests {
         // Mutation caught: staging or reopen cannot discard authenticated age,
         // exact TTL, or semantic-v8/profile-3 provenance.
         assert_eq!(pending_lifetime(&target), expected);
+        let before_pending_duplicate_stats = target.blob_stats().expect("pending duplicate stats");
+        let pending_later_sample = CustodySample {
+            clock_id: [0x66; 16],
+            tick_ms: 100,
+        };
+        let pending_later_admission = VerifiedFiniteBlobAdmission::for_test(
+            proof.blob.envelope_id(),
+            u64::try_from(proof.sealed.len()).expect("finite source length"),
+            proof.blob.item_id(),
+            proof.blob.blob_id(),
+            proof.blob.priority(),
+            5_000,
+            1_200,
+            pending_later_sample,
+        );
+        assert_eq!(
+            target
+                .stage_verified_blob_source_with_lifetime(
+                    &policy,
+                    &proof.blob,
+                    &proof.sealed,
+                    &plan,
+                    Some(pending_later_admission),
+                )
+                .expect("merge pending finite duplicate"),
+            BlobSourceStageOutcome::Duplicate
+        );
+        let pending_merged = BlobLifetime::Finite {
+            ttl_ms: 5_000,
+            age: custody::LowerBoundAgeCheckpoint {
+                cumulative_age_ms: 1_200,
+                checkpoint: Some(pending_later_sample),
+                continuity_generation: 2,
+                continuity_lost: true,
+            },
+            provenance: BlobFiniteProvenance::NetworkV1 {
+                semantic_version: 8,
+                profile_id: aster_mesh::TransferProfileId::BlobCustodyV1 as u16,
+            },
+        };
+        assert_eq!(pending_lifetime(&target), pending_merged);
+        assert_eq!(
+            target.blob_stats().expect("merged pending duplicate stats"),
+            before_pending_duplicate_stats,
+            "a pending duplicate may update authority but not staging rows/bytes/counters"
+        );
+        {
+            let read = target
+                .database
+                .begin_read()
+                .expect("merged pending authority");
+            let pending = decode_pending_blob_source(
+                read.open_table(BLOB_PENDING_SOURCES)
+                    .unwrap()
+                    .get(transfer.as_bytes().as_slice())
+                    .unwrap()
+                    .unwrap()
+                    .value(),
+            )
+            .unwrap();
+            let pressure = pressure::decode_pending_root(
+                read.open_table(pressure::BLOB_PRESSURE_PENDING_ROOTS)
+                    .unwrap()
+                    .get(transfer.as_bytes().as_slice())
+                    .unwrap()
+                    .unwrap()
+                    .value(),
+            )
+            .unwrap();
+            let binding =
+                pending_blob_authenticated_source_binding(&pending.metadata, &pending.sealed)
+                    .unwrap();
+            assert_eq!(pending.authenticated_source_binding, binding);
+            assert_eq!(pressure.authenticated_source_binding, binding);
+            assert_eq!(pressure.expiry, pressure::PressureExpiry::Finite(3_900));
+        }
+        let before_pending_mismatch = blob_current_admission_digest(&target);
+        let pending_mismatch = VerifiedFiniteBlobAdmission::for_test(
+            proof.blob.envelope_id(),
+            u64::try_from(proof.sealed.len()).expect("finite source length"),
+            proof.blob.item_id(),
+            proof.blob.blob_id(),
+            proof.blob.priority(),
+            4_999,
+            4_000,
+            CustodySample {
+                clock_id: [0x69; 16],
+                tick_ms: 400,
+            },
+        );
+        assert!(matches!(
+            target.stage_verified_blob_source_with_lifetime(
+                &policy,
+                &proof.blob,
+                &proof.sealed,
+                &plan,
+                Some(pending_mismatch),
+            ),
+            Err(StoreError::Blob(BlobStoreError::PendingSourceConflict))
+        ));
+        assert_eq!(
+            blob_current_admission_digest(&target),
+            before_pending_mismatch,
+            "an immutable pending-source mismatch must not mutate authority"
+        );
         let (original_pending, original_pressure_root, original_staging_bytes) = {
             let read = target
                 .database
@@ -15081,7 +15190,7 @@ mod tests {
 
         let target = Store::open_for_mission(&target_root.database, services.authority)
             .expect("reopen finite pending source");
-        assert_eq!(pending_lifetime(&target), expected);
+        assert_eq!(pending_lifetime(&target), pending_merged);
 
         transfer_all_blob_carriers(&source, &target, &policy, &plan);
         let depot_completion = target
@@ -15182,11 +15291,11 @@ mod tests {
         };
         // Mutation caught: promotion must copy the pending lifetime exactly;
         // it cannot restart custody age at publication acceptance.
-        assert_eq!(publication_lifetime(&target), expected);
+        assert_eq!(publication_lifetime(&target), pending_merged);
 
         let later_sample = CustodySample {
-            clock_id: [0x66; 16],
-            tick_ms: 100,
+            clock_id: [0x67; 16],
+            tick_ms: 200,
         };
         let later_admission = VerifiedFiniteBlobAdmission::for_test(
             proof.blob.envelope_id(),
@@ -15195,7 +15304,7 @@ mod tests {
             proof.blob.blob_id(),
             proof.blob.priority(),
             5_000,
-            1_200,
+            1_700,
             later_sample,
         );
         assert_eq!(
@@ -15213,9 +15322,9 @@ mod tests {
         let merged = BlobLifetime::Finite {
             ttl_ms: 5_000,
             age: custody::LowerBoundAgeCheckpoint {
-                cumulative_age_ms: 1_200,
+                cumulative_age_ms: 1_700,
                 checkpoint: Some(later_sample),
-                continuity_generation: 2,
+                continuity_generation: 3,
                 continuity_lost: true,
             },
             provenance: BlobFiniteProvenance::NetworkV1 {
@@ -15227,46 +15336,89 @@ mod tests {
         // branch would discard both the maximum age and sticky continuity loss.
         assert_eq!(publication_lifetime(&target), merged);
 
-        let before_mismatch = {
-            let read = target
+        let (lineage_key, original_lineage_fence) = {
+            let write = target
                 .database
-                .begin_read()
-                .expect("finite mismatch digest");
-            blob_database_digest_read(&read)
+                .begin_write()
+                .expect("downstream rollback fixture");
+            let lineage_key = proof.completion.variant_id().as_bytes().to_vec();
+            let mut lineage_fence = write
+                .open_table(lifecycle::BLOB_LINEAGE_FENCES)
+                .unwrap()
+                .get(lineage_key.as_slice())
+                .unwrap()
+                .unwrap()
+                .value()
+                .to_vec();
+            let original = lineage_fence.clone();
+            lineage_fence[1] ^= 0x80;
+            write
+                .open_table(lifecycle::BLOB_LINEAGE_FENCES)
+                .unwrap()
+                .insert(lineage_key.as_slice(), lineage_fence.as_slice())
+                .unwrap();
+            write.commit().unwrap();
+            (lineage_key, original)
         };
+        let continuity_authority = |store: &Store| {
+            let read = store.database.begin_read().expect("continuity snapshot");
+            read.open_table(custody::CUSTODY_CONTINUITY)
+                .unwrap()
+                .iter()
+                .unwrap()
+                .map(|row| {
+                    let (key, value) = row.unwrap();
+                    (key.value().to_owned(), value.value().to_vec())
+                })
+                .collect::<Vec<_>>()
+        };
+        let before_mismatch = blob_current_admission_digest(&target);
+        let before_continuity = continuity_authority(&target);
         let mismatch = VerifiedFiniteBlobAdmission::for_test(
             proof.blob.envelope_id(),
             u64::try_from(proof.sealed.len()).expect("finite source length"),
             proof.blob.item_id(),
             proof.blob.blob_id(),
             proof.blob.priority(),
-            4_999,
+            5_000,
             4_000,
             CustodySample {
-                clock_id: [0x67; 16],
-                tick_ms: 200,
+                clock_id: [0x68; 16],
+                tick_ms: 300,
             },
         );
-        assert!(matches!(
-            target.stage_verified_blob_source_with_lifetime(
+        let downstream_error = target
+            .stage_verified_blob_source_with_lifetime(
                 &policy,
                 &proof.blob,
                 &proof.sealed,
                 &plan,
                 Some(mismatch),
-            ),
-            Err(StoreError::Blob(BlobStoreError::PendingSourceConflict))
+            )
+            .expect_err("downstream lineage binding contradiction must abort duplicate");
+        assert!(matches!(
+            downstream_error,
+            StoreError::Blob(BlobStoreError::PhysicalLineageConflict)
         ));
-        // Mutation caught: a mismatched duplicate may not advance continuity,
-        // publication age, pressure indexes, or any aggregate counter.
-        let after_mismatch = {
-            let read = target
+        // Mutation caught: this valid accepted duplicate passes source
+        // prevalidation and observes a new continuity sample before the
+        // downstream reference audit fails. The whole transaction, including
+        // the continuity observation, must roll back to the byte-identical
+        // corrupted baseline.
+        assert_eq!(blob_current_admission_digest(&target), before_mismatch);
+        assert_eq!(continuity_authority(&target), before_continuity);
+        {
+            let write = target
                 .database
-                .begin_read()
-                .expect("finite mismatch digest");
-            blob_database_digest_read(&read)
-        };
-        assert_eq!(after_mismatch, before_mismatch);
+                .begin_write()
+                .expect("restore rollback fixture");
+            write
+                .open_table(lifecycle::BLOB_LINEAGE_FENCES)
+                .unwrap()
+                .insert(lineage_key.as_slice(), original_lineage_fence.as_slice())
+                .unwrap();
+            write.commit().unwrap();
+        }
         drop(target);
         let reopened = Store::open_for_mission(&target_root.database, services.authority)
             .expect("reopen promoted finite source");
@@ -18399,6 +18551,35 @@ mod tests {
         }
     }
 
+    fn downgrade_pressure_pending_roots_to_v3_for_test(write: &redb::WriteTransaction) {
+        let rows = write
+            .open_table(pressure::BLOB_PRESSURE_PENDING_ROOTS)
+            .expect("current pressure pending roots")
+            .iter()
+            .expect("current pressure pending-root rows")
+            .map(|row| {
+                let (key, value) = row.expect("current pressure pending-root row");
+                (key.value().to_vec(), value.value().to_vec())
+            })
+            .collect::<Vec<_>>();
+        let mut table = write
+            .open_table(pressure::BLOB_PRESSURE_PENDING_ROOTS)
+            .expect("rewrite pressure-v3 pending roots");
+        for (key, encoded) in rows {
+            let root = pressure::decode_pending_root(&encoded)
+                .expect("decode current pressure pending root");
+            let predecessor = pressure::encode_pending_root_for_generation(
+                &root,
+                pressure::PressurePendingRootEncodingGeneration::PressureV3,
+            )
+            .expect("encode pressure-v3 pending root");
+            assert_eq!(encoded.len() - predecessor.len(), 32);
+            table
+                .insert(key.as_slice(), predecessor.as_slice())
+                .expect("write pressure-v3 pending root");
+        }
+    }
+
     fn strip_blob_lifecycle_schema_for_test(path: &Path) {
         let database = Database::open(path).expect("raw lifecycle predecessor database");
         let write = database
@@ -18513,6 +18694,7 @@ mod tests {
         }
         drop(operations);
         downgrade_pending_sources_to_v2_for_test(&write);
+        downgrade_pressure_pending_roots_to_v3_for_test(&write);
         write
             .open_table(pressure::BLOB_PRESSURE_METADATA)
             .expect("predecessor pressure metadata")
@@ -18552,6 +18734,7 @@ mod tests {
             }
         }
         downgrade_pending_sources_to_v2_for_test(&write);
+        downgrade_pressure_pending_roots_to_v3_for_test(&write);
         write
             .open_table(lifecycle::BLOB_LIFECYCLE_METADATA)
             .expect("lifecycle-v3 metadata")
@@ -18645,6 +18828,7 @@ mod tests {
         }
         drop(operation_table);
         downgrade_pending_sources_to_v2_for_test(&write);
+        downgrade_pressure_pending_roots_to_v3_for_test(&write);
         let mut metadata = write.open_table(METADATA).expect("Blob metadata");
         let operation_bytes = metadata
             .get(BLOB_OPERATION_TOTAL_BYTES)
@@ -18728,6 +18912,7 @@ mod tests {
             }
         }
         downgrade_pending_sources_to_v2_for_test(&write);
+        downgrade_pressure_pending_roots_to_v3_for_test(&write);
         write
             .delete_table(lifecycle::BLOB_RETIREMENT_RESOLVERS)
             .expect("delete lifecycle-v3 retirement resolvers");
@@ -21000,6 +21185,8 @@ mod tests {
         transfer: BlobTransferId,
         operation: BlobOperationKey,
         operation_digest: [u8; 32],
+        retirement_reason: lifecycle::RetirementReason,
+        intent_digest: [u8; 32],
         publication_deadline: CustodySample,
         operation_deadline: CustodySample,
         replay_key: [u8; 40],
@@ -21065,12 +21252,16 @@ mod tests {
             .value()
             .to_vec();
         drop(read);
-        let (_, _, publication_age) = lifecycle::publication_retirement(&publication)
-            .expect("decode publication retirement")
-            .expect("publication is retired");
-        let (_, _, _, _, operation_age) = lifecycle::operation_retirement(&operation_record)
-            .expect("decode operation retirement")
-            .expect("operation is retired");
+        let (retirement_reason, _, publication_age) =
+            lifecycle::publication_retirement(&publication)
+                .expect("decode publication retirement")
+                .expect("publication is retired");
+        let (operation_reason, _, retired_operation_digest, intent_digest, operation_age) =
+            lifecycle::operation_retirement(&operation_record)
+                .expect("decode operation retirement")
+                .expect("operation is retired");
+        assert_eq!(operation_reason, retirement_reason);
+        assert_eq!(retired_operation_digest, operation_digest);
         let publication_deadline = publication_age
             .project(Some(sample))
             .expect("project publication deadline")
@@ -21097,6 +21288,8 @@ mod tests {
             transfer,
             operation,
             operation_digest,
+            retirement_reason,
+            intent_digest,
             publication_deadline,
             operation_deadline,
             replay_key: accepted_dot_key(stored.header.stamp.dot),
@@ -21589,15 +21782,14 @@ mod tests {
             .expect("current finite-lifetime schema");
         let plaintext = b"finite lifetime migration fixture";
         let prepared = prepared_blob(plaintext);
-        let first = publish_blob(
+        let (first, first_operation, first_intent) = publish_blob(
             &store,
             &mut services,
             &prepared,
             plaintext,
             1,
             b"finite-lifetime-v3-operation-a",
-        )
-        .0;
+        );
         let second = publish_blob(
             &store,
             &mut services,
@@ -21714,6 +21906,22 @@ mod tests {
                 .value(),
             1
         );
+        let predecessor_pressure_root = predecessor_read
+            .open_table(pressure::BLOB_PRESSURE_PENDING_ROOTS)
+            .unwrap()
+            .get(pending_transfer.as_bytes().as_slice())
+            .unwrap()
+            .unwrap()
+            .value()
+            .to_vec();
+        assert!(
+            pressure::decode_pending_root_for_generation(
+                &predecessor_pressure_root,
+                pressure::PressurePendingRootEncodingGeneration::PressureV3,
+            )
+            .is_ok()
+        );
+        assert!(pressure::decode_pending_root(&predecessor_pressure_root).is_err());
         assert_eq!(
             predecessor_read
                 .open_table(lifecycle::BLOB_LIFECYCLE_METADATA)
@@ -21745,10 +21953,23 @@ mod tests {
         // wholly predecessor lifecycle and pressure image.
         assert_eq!(blob_database_digest(&root.database), predecessor);
 
-        drop(
-            Store::open_for_mission(&root.database, services.authority)
-                .expect("atomic writable finite-lifetime migration"),
+        let migrated_store = Store::open_for_mission(&root.database, services.authority)
+            .expect("atomic writable finite-lifetime migration");
+        let migrated_policy = migrated_store
+            .control_policy_snapshot()
+            .expect("migrated active-operation policy");
+        assert_eq!(
+            migrated_store
+                .blob_for_operation_with_policy(
+                    &migrated_policy,
+                    &BlobOperationRequest::new(&first_operation, &first_intent),
+                )
+                .expect("active operation remains active after migration")
+                .expect("active operation target remains resolvable")
+                .transfer_id,
+            first.transfer_id
         );
+        drop(migrated_store);
         let migrated_database = Database::open(&root.database).unwrap();
         let migrated_read = migrated_database.begin_read().unwrap();
         let shared_summary = pressure::decode_variant_summary(
@@ -21763,19 +21984,71 @@ mod tests {
         .unwrap();
         assert_eq!(shared_summary.publication_roots, 2);
         assert_eq!(shared_summary.pending_roots, 0);
-        assert!(
-            decode_pending_blob_source(
-                migrated_read
-                    .open_table(BLOB_PENDING_SOURCES)
-                    .unwrap()
-                    .get(pending_transfer.as_bytes().as_slice())
-                    .unwrap()
-                    .unwrap()
-                    .value(),
-            )
-            .is_ok()
+        let migrated_pending = decode_pending_blob_source(
+            migrated_read
+                .open_table(BLOB_PENDING_SOURCES)
+                .unwrap()
+                .get(pending_transfer.as_bytes().as_slice())
+                .unwrap()
+                .unwrap()
+                .value(),
+        )
+        .unwrap();
+        let migrated_pressure_root = pressure::decode_pending_root(
+            migrated_read
+                .open_table(pressure::BLOB_PRESSURE_PENDING_ROOTS)
+                .unwrap()
+                .get(pending_transfer.as_bytes().as_slice())
+                .unwrap()
+                .unwrap()
+                .value(),
+        )
+        .unwrap();
+        assert_eq!(
+            migrated_pressure_root.authenticated_source_binding,
+            migrated_pending.authenticated_source_binding
         );
+        let retired_publication = migrated_read
+            .open_table(BLOB_PUBLICATIONS)
+            .unwrap()
+            .get(retired.transfer.as_bytes().as_slice())
+            .unwrap()
+            .unwrap()
+            .value()
+            .to_vec();
+        assert_eq!(
+            lifecycle::publication_retirement(&retired_publication)
+                .unwrap()
+                .expect("retired publication remains retired")
+                .0,
+            retired.retirement_reason
+        );
+        assert!(
+            lifecycle::retired_publication_payload(&retired_publication)
+                .unwrap()
+                .is_some(),
+            "retained compact retirement keeps its exact resolver payload"
+        );
+        let retired_operation = migrated_read
+            .open_table(BLOB_OPERATIONS)
+            .unwrap()
+            .get(retired.operation.as_bytes())
+            .unwrap()
+            .unwrap()
+            .value()
+            .to_vec();
+        let (reason, _, operation_digest, intent_digest, _) =
+            lifecycle::operation_retirement(&retired_operation)
+                .unwrap()
+                .expect("retired operation remains retired");
+        assert_eq!(reason, retired.retirement_reason);
+        assert_eq!(operation_digest, retired.operation_digest);
+        assert_eq!(intent_digest, retired.intent_digest);
         drop(migrated_read);
+        let resolver_audit = migrated_database.begin_write().unwrap();
+        lifecycle::require_publication_retirement_resolver_write(&resolver_audit, retired.transfer)
+            .expect("retired publication remains resolvable");
+        drop(resolver_audit);
         drop(migrated_database);
         let migrated = blob_database_digest(&root.database);
         let current = Database::open(&root.database).expect("current pressure database");
