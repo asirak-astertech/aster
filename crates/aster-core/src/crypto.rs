@@ -2669,6 +2669,7 @@ mod tests {
             assert_eq!(
                 stripped_hello.supported_versions,
                 vec![
+                    SEMANTIC_PROTOCOL_V8,
                     SEMANTIC_PROTOCOL_V7,
                     SEMANTIC_PROTOCOL_V6,
                     SEMANTIC_PROTOCOL_V5,

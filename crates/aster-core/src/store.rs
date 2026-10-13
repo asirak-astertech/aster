@@ -21486,10 +21486,9 @@ mod sqlite_integration_tests {
         store
             .begin_transfer_for_semantic_version(proof_v4, 8, Priority::Immediate, None, 7)
             .unwrap();
-        assert!(matches!(
-            store.begin_transfer_for_semantic_version(proof_v4, 8, Priority::Immediate, None, 8),
-            Err(StoreError::Invalid(_))
-        ));
+        store
+            .begin_transfer_for_semantic_version(proof_v4, 8, Priority::Immediate, None, 8)
+            .unwrap();
 
         let unknown = ObjectId::new(ObjectKind::SourceEnvelope, [0xf3; 32]);
         store
@@ -22942,7 +22941,14 @@ mod sqlite_integration_tests {
                 .envelope_id,
             compact.envelope_id
         );
-        assert!(store.stored_item_representation(&compact.id, 8).is_err());
+        assert_eq!(
+            store
+                .stored_item_representation(&compact.id, 8)
+                .unwrap()
+                .unwrap()
+                .envelope_id,
+            compact.envelope_id
+        );
         let next = store
             .reserve_batch_publish(
                 [7; 32],
