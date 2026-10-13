@@ -6030,6 +6030,10 @@ impl Store {
         if let Some(migration) = &blob_lifecycle_migration {
             migration.apply(&write)?;
         }
+        // Pressure v4 is derived only after the authoritative Blob lifecycle,
+        // publication, and pending-source encodings have reached their final
+        // current image in this same top-level transaction.
+        blob::pressure::audit_or_migrate_pressure_write(&write)?;
         audit_control_tables(&write)?;
         let mut mission_authority = read_mission_binding(&write)?;
         let bridge_event_stats =

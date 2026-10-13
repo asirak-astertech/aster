@@ -39709,7 +39709,7 @@ mod tests {
             // exercised.
             assert_eq!(encoded.get(1), Some(&1), "fixture has one live wrapper");
             assert!(
-                matches!(encoded.get(2).copied(), Some(1 | 2)),
+                matches!(encoded.get(2).copied(), Some(1..=3)),
                 "fixture has one canonical metadata payload"
             );
             // Metadata: version + five 32-byte identities + lineage flag +
@@ -39722,6 +39722,14 @@ mod tests {
             let mut cursor = payload + 1 + 5 * 32;
             assert_eq!(encoded[cursor], 1, "fixture has both lineage bindings");
             cursor += 1 + 2 * 32;
+            if encoded[payload] == 3 {
+                let lifetime_len = usize::from(u16::from_be_bytes(
+                    encoded[cursor..cursor + 2]
+                        .try_into()
+                        .expect("canonical lifetime length"),
+                ));
+                cursor += 2 + lifetime_len;
+            }
             let priority = cursor;
             cursor += 1;
             let publisher = cursor;
@@ -39755,7 +39763,7 @@ mod tests {
             assert_eq!(
                 encoded.len(),
                 context_start + context_count * 40,
-                "fixture has one exact v2 Blob metadata row"
+                "fixture has one exact Blob metadata row"
             );
 
             match tamper {

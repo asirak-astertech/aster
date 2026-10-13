@@ -17,9 +17,9 @@ const PRESSURE_CANDIDATE_COMPLETED: u8 = 1;
 const PRESSURE_EXPIRY_EXPIRED_FINITE: u8 = 0;
 const PRESSURE_EXPIRY_FINITE: u8 = 1;
 const PRESSURE_EXPIRY_DURABLE: u8 = 2;
-const PRESSURE_SCHEMA_VERSION: u64 = 3;
-const PREVIOUS_PRESSURE_SCHEMA_VERSION: u64 = 2;
-const PRESSURE_SCHEMA_VERSION_FIELD: &str = "schema_version";
+const PRESSURE_SCHEMA_VERSION: u64 = 4;
+pub(crate) const PREVIOUS_PRESSURE_SCHEMA_VERSION: u64 = 3;
+pub(crate) const PRESSURE_SCHEMA_VERSION_FIELD: &str = "schema_version";
 pub(super) const NEXT_PENDING_ACCEPTANCE_ORDER: &str = "next_pending_acceptance_order";
 const PRESSURE_CONTENT_DOMAIN: &[u8] = b"aster/blob-pressure-content/v1";
 
@@ -639,6 +639,46 @@ impl PressureExpiry {
             _ => Err(pressure_corruption(
                 "Blob pressure record has an unknown expiry tag",
             )),
+        }
+    }
+}
+
+fn lifetime_expiry(lifetime: super::BlobLifetime) -> Result<PressureExpiry, StoreError> {
+    match lifetime {
+        super::BlobLifetime::Durable => Ok(PressureExpiry::Durable),
+        super::BlobLifetime::Finite { ttl_ms, age, .. } => {
+            super::validate_blob_lifetime(lifetime)?;
+            if age.cumulative_age_ms >= ttl_ms {
+                return Ok(PressureExpiry::ExpiredFinite);
+            }
+            let remaining = ttl_ms - age.cumulative_age_ms;
+            match age.checkpoint {
+                Some(checkpoint) => checkpoint
+                    .tick_ms
+                    .checked_add(remaining)
+                    .filter(|deadline| *deadline != 0)
+                    .map(PressureExpiry::Finite)
+                    .ok_or_else(|| {
+                        pressure_corruption("Blob pressure expiry arithmetic overflowed")
+                    }),
+                None => Ok(PressureExpiry::Finite(u64::MAX)),
+            }
+        }
+    }
+}
+
+fn latest_expiry(left: PressureExpiry, right: PressureExpiry) -> PressureExpiry {
+    match (left, right) {
+        (PressureExpiry::Durable, _) | (_, PressureExpiry::Durable) => PressureExpiry::Durable,
+        (PressureExpiry::Finite(left), PressureExpiry::Finite(right)) => {
+            PressureExpiry::Finite(left.max(right))
+        }
+        (PressureExpiry::Finite(value), PressureExpiry::ExpiredFinite)
+        | (PressureExpiry::ExpiredFinite, PressureExpiry::Finite(value)) => {
+            PressureExpiry::Finite(value)
+        }
+        (PressureExpiry::ExpiredFinite, PressureExpiry::ExpiredFinite) => {
+            PressureExpiry::ExpiredFinite
         }
     }
 }
@@ -1833,6 +1873,7 @@ fn build_pressure_image(
     imports: &impl ReadableTable<&'static [u8], &'static [u8]>,
     chunks: &impl ReadableTable<&'static [u8], &'static [u8]>,
     next_pending_acceptance_order: u64,
+    publication_encoding: super::lifecycle::PublicationEncodingGeneration,
 ) -> Result<PressureImage, StoreError> {
     if next_pending_acceptance_order == 0 {
         return Err(pressure_corruption(
@@ -1843,7 +1884,8 @@ fn build_pressure_image(
         next_pending_acceptance_order,
         ..PressureImage::default()
     };
-    let mut variant_roots = BTreeMap::<BlobVariantId, Vec<(Priority, u64, bool)>>::new();
+    let mut variant_roots =
+        BTreeMap::<BlobVariantId, Vec<(Priority, u64, bool, PressureExpiry)>>::new();
     for row in publications.iter()? {
         note_full_scan_row();
         let (key, value) = row?;
@@ -1853,7 +1895,10 @@ fn build_pressure_image(
         let transfer = BlobTransferId::new(key.value().try_into().map_err(|_| {
             pressure_corruption("Blob pressure publication has an invalid transfer key")
         })?);
-        let metadata = super::decode_blob_metadata(value.value())?;
+        let payload =
+            super::lifecycle::publication_payload_for_encoding(value.value(), publication_encoding)
+                .map_err(blob_error)?;
+        let metadata = super::decode_blob_metadata(payload)?;
         if metadata.transfer_id != transfer {
             return Err(pressure_corruption(
                 "Blob pressure publication key differs from its metadata",
@@ -1868,7 +1913,7 @@ fn build_pressure_image(
             semantic_id: metadata.semantic_id,
             priority: metadata.header.priority,
             acceptance_order,
-            expiry: PressureExpiry::Durable,
+            expiry: lifetime_expiry(metadata.lifetime)?,
             topic: metadata.header.topic.clone(),
             scope: metadata.header.scope.clone(),
             blob_id: metadata.blob_id,
@@ -1890,6 +1935,7 @@ fn build_pressure_image(
             root.priority,
             acceptance_order,
             false,
+            root.expiry,
         ));
     }
 
@@ -1914,7 +1960,7 @@ fn build_pressure_image(
             priority: record.metadata.header.priority,
             acceptance_order,
             completion: pending_progress(source, &record, carrier_prefixes, imports, chunks)?,
-            expiry: PressureExpiry::Durable,
+            expiry: lifetime_expiry(record.metadata.lifetime)?,
             topic: record.metadata.header.topic.clone(),
             scope: record.metadata.header.scope.clone(),
             blob_id: record.metadata.blob_id,
@@ -1929,6 +1975,7 @@ fn build_pressure_image(
             root.priority,
             acceptance_order,
             true,
+            root.expiry,
         ));
     }
     if next_pending_acceptance_order <= maximum_pending_order {
@@ -1983,19 +2030,20 @@ fn build_pressure_image(
             .ok_or_else(|| pressure_corruption("Blob pressure rooted variant lacks its import"))?;
         let effective_priority = roots
             .iter()
-            .map(|(priority, _, _)| *priority)
+            .map(|(priority, _, _, _)| *priority)
             .max()
             .ok_or_else(|| pressure_corruption("Blob pressure variant has no roots"))?;
         let minimum_root_acceptance_order = roots
             .iter()
-            .map(|(_, order, _)| *order)
+            .map(|(_, order, _, _)| *order)
             .min()
             .ok_or_else(|| pressure_corruption("Blob pressure variant has no roots"))?;
         let publication_roots =
-            u64::try_from(roots.iter().filter(|(_, _, pending)| !*pending).count())
+            u64::try_from(roots.iter().filter(|(_, _, pending, _)| !*pending).count())
                 .map_err(|_| StoreError::ItemCountAccountingOverflow)?;
-        let pending_roots = u64::try_from(roots.iter().filter(|(_, _, pending)| *pending).count())
-            .map_err(|_| StoreError::ItemCountAccountingOverflow)?;
+        let pending_roots =
+            u64::try_from(roots.iter().filter(|(_, _, pending, _)| *pending).count())
+                .map_err(|_| StoreError::ItemCountAccountingOverflow)?;
         let numerator = if fact.finalized_root.is_some() {
             fact.total_len
         } else {
@@ -2008,7 +2056,11 @@ fn build_pressure_image(
             finalized: fact.finalized_root.is_some(),
             publication_roots,
             pending_roots,
-            final_reference_expiry: PressureExpiry::Durable,
+            final_reference_expiry: roots
+                .iter()
+                .map(|(_, _, _, expiry)| *expiry)
+                .reduce(latest_expiry)
+                .ok_or_else(|| pressure_corruption("Blob pressure variant has no expiries"))?,
         };
         image
             .variant_summaries
@@ -2185,6 +2237,7 @@ pub(crate) fn audit_or_migrate_pressure_write(
                 &write.open_table(super::BLOB_IMPORTS)?,
                 &write.open_table(super::BLOB_CHUNKS)?,
                 migrated_next,
+                super::lifecycle::publication_encoding_migration_write(write)?,
             )?;
             apply_image(write, &image)
         }
@@ -2201,7 +2254,10 @@ pub(crate) fn audit_or_migrate_pressure_write(
                 .ok_or_else(|| {
                     pressure_corruption("Blob pressure metadata schema is incomplete or unknown")
                 })?;
-            if version != PRESSURE_SCHEMA_VERSION && version != PREVIOUS_PRESSURE_SCHEMA_VERSION {
+            if !matches!(
+                version,
+                2 | PREVIOUS_PRESSURE_SCHEMA_VERSION | PRESSURE_SCHEMA_VERSION
+            ) {
                 return Err(pressure_corruption(
                     "Blob pressure metadata schema is incomplete or unknown",
                 ));
@@ -2221,8 +2277,13 @@ pub(crate) fn audit_or_migrate_pressure_write(
                 &write.open_table(super::BLOB_IMPORTS)?,
                 &write.open_table(super::BLOB_CHUNKS)?,
                 next,
+                if version == PRESSURE_SCHEMA_VERSION {
+                    super::lifecycle::publication_encoding_write(write)?
+                } else {
+                    super::lifecycle::publication_encoding_migration_write(write)?
+                },
             )?;
-            if version == PREVIOUS_PRESSURE_SCHEMA_VERSION {
+            if version != PRESSURE_SCHEMA_VERSION {
                 replace_image(write, &image)
             } else {
                 audit_image_write(write, &image)
@@ -2252,12 +2313,21 @@ pub(crate) fn inspect_pressure_read(read: &redb::ReadTransaction) -> Result<(), 
         ));
     }
     let metadata = read.open_table(BLOB_PRESSURE_METADATA)?;
-    if metadata.len()? != 2
-        || metadata
-            .get(PRESSURE_SCHEMA_VERSION_FIELD)?
-            .map(|value| value.value())
-            != Some(PRESSURE_SCHEMA_VERSION)
-    {
+    if metadata.len()? != 2 {
+        return Err(pressure_corruption(
+            "Blob pressure metadata schema is incomplete or unknown",
+        ));
+    }
+    let version = metadata
+        .get(PRESSURE_SCHEMA_VERSION_FIELD)?
+        .map(|value| value.value())
+        .ok_or_else(|| {
+            pressure_corruption("Blob pressure metadata schema is incomplete or unknown")
+        })?;
+    if !matches!(
+        version,
+        2 | PREVIOUS_PRESSURE_SCHEMA_VERSION | PRESSURE_SCHEMA_VERSION
+    ) {
         return Err(pressure_corruption(
             "Blob pressure metadata schema is incomplete or unknown",
         ));
@@ -2275,6 +2345,11 @@ pub(crate) fn inspect_pressure_read(read: &redb::ReadTransaction) -> Result<(), 
         &read.open_table(super::BLOB_IMPORTS)?,
         &read.open_table(super::BLOB_CHUNKS)?,
         next,
+        if version == PRESSURE_SCHEMA_VERSION {
+            super::lifecycle::publication_encoding_read(read)?
+        } else {
+            super::lifecycle::publication_encoding_migration_read(read)?
+        },
     )?;
     audit_image_read(read, &image)
 }
@@ -2361,7 +2436,7 @@ pub(super) fn insert_pending_source_write(
             &write.open_table(super::BLOB_IMPORTS)?,
             &write.open_table(super::BLOB_CHUNKS)?,
         )?,
-        expiry: PressureExpiry::Durable,
+        expiry: lifetime_expiry(record.metadata.lifetime)?,
         topic: record.metadata.header.topic.clone(),
         scope: record.metadata.header.scope.clone(),
         blob_id: record.metadata.blob_id,
@@ -2397,6 +2472,7 @@ pub(super) fn insert_pending_source_write(
             root.priority,
             root.acceptance_order,
             true,
+            root.expiry,
         )
     } else {
         refresh_variant_summary(write, root.variant_id, true)
@@ -2425,7 +2501,7 @@ pub(super) fn require_pending_source_write(
             &write.open_table(super::BLOB_IMPORTS)?,
             &write.open_table(super::BLOB_CHUNKS)?,
         )?,
-        expiry: PressureExpiry::Durable,
+        expiry: lifetime_expiry(record.metadata.lifetime)?,
         topic: record.metadata.header.topic.clone(),
         scope: record.metadata.header.scope.clone(),
         blob_id: record.metadata.blob_id,
@@ -2454,6 +2530,45 @@ pub(super) fn require_pending_source_write(
         ));
     }
     Ok(())
+}
+
+pub(super) fn rekey_pending_source_lifetime_write(
+    write: &redb::WriteTransaction,
+    transfer: BlobTransferId,
+    record: &super::PendingBlobSourceRecord,
+) -> Result<(), StoreError> {
+    let old_encoded = write
+        .open_table(BLOB_PRESSURE_PENDING_ROOTS)?
+        .get(transfer.as_bytes().as_slice())?
+        .map(|value| value.value().to_vec())
+        .ok_or_else(|| pressure_corruption("pending Blob source lacks its pressure root"))?;
+    let old = decode_pending_root(&old_encoded)?;
+    if write
+        .open_table(BLOB_PRESSURE_PENDING_SOURCES)?
+        .remove(&encode_pending_index_key(old.clone(), transfer))?
+        .as_ref()
+        .is_none_or(|value| !value.value().is_empty())
+    {
+        return Err(pressure_corruption(
+            "pending Blob pressure root lacks its exact index",
+        ));
+    }
+    let mut updated = old;
+    updated.expiry = lifetime_expiry(record.metadata.lifetime)?;
+    let encoded = encode_pending_root(&updated)?;
+    write
+        .open_table(BLOB_PRESSURE_PENDING_ROOTS)?
+        .insert(transfer.as_bytes().as_slice(), encoded.as_slice())?;
+    if write
+        .open_table(BLOB_PRESSURE_PENDING_SOURCES)?
+        .insert(&encode_pending_index_key(updated, transfer), &[] as &[u8])?
+        .is_some()
+    {
+        return Err(pressure_corruption(
+            "pending Blob pressure re-key duplicated its index",
+        ));
+    }
+    refresh_variant_summary(write, record.metadata.variant_id, false)
 }
 
 fn publication_root_write(
@@ -2486,11 +2601,70 @@ fn publication_root_write(
         semantic_id: metadata.semantic_id,
         priority: metadata.header.priority,
         acceptance_order,
-        expiry: PressureExpiry::Durable,
+        expiry: lifetime_expiry(metadata.lifetime)?,
         topic: metadata.header.topic,
         scope: metadata.header.scope,
         blob_id: metadata.blob_id,
     })
+}
+
+pub(super) fn rekey_publication_lifetime_write(
+    write: &redb::WriteTransaction,
+    transfer: BlobTransferId,
+) -> Result<(), StoreError> {
+    let encoded = write
+        .open_table(BLOB_PRESSURE_PUBLICATION_ROOTS)?
+        .get(transfer.as_bytes().as_slice())?
+        .map(|value| value.value().to_vec())
+        .ok_or_else(|| pressure_corruption("publication lacks its pressure root"))?;
+    let old = decode_publication_root(&encoded)?;
+    let old_global = encode_publication_key(PressurePublicationKey {
+        priority: old.priority,
+        expiry: old.expiry,
+        acceptance_order: old.acceptance_order,
+        transfer_id: transfer,
+    });
+    if write
+        .open_table(BLOB_PRESSURE_PUBLICATIONS)?
+        .remove(old_global.as_slice())?
+        .is_none()
+        || write
+            .open_table(BLOB_PRESSURE_CONTENT_PUBLICATIONS)?
+            .remove(encode_content_publication_key(&old, transfer)?.as_slice())?
+            .is_none()
+    {
+        return Err(pressure_corruption(
+            "publication pressure root lacks its exact index",
+        ));
+    }
+    let updated = publication_root_write(write, transfer)?;
+    let updated_encoded = encode_publication_root(&updated)?;
+    write
+        .open_table(BLOB_PRESSURE_PUBLICATION_ROOTS)?
+        .insert(transfer.as_bytes().as_slice(), updated_encoded.as_slice())?;
+    let global = encode_publication_key(PressurePublicationKey {
+        priority: updated.priority,
+        expiry: updated.expiry,
+        acceptance_order: updated.acceptance_order,
+        transfer_id: transfer,
+    });
+    if write
+        .open_table(BLOB_PRESSURE_PUBLICATIONS)?
+        .insert(global.as_slice(), &[] as &[u8])?
+        .is_some()
+        || write
+            .open_table(BLOB_PRESSURE_CONTENT_PUBLICATIONS)?
+            .insert(
+                encode_content_publication_key(&updated, transfer)?.as_slice(),
+                &[] as &[u8],
+            )?
+            .is_some()
+    {
+        return Err(pressure_corruption(
+            "publication pressure re-key duplicated its index",
+        ));
+    }
+    refresh_variant_summary(write, updated.variant_id, false)
 }
 
 fn require_publication_root_write(
@@ -2658,6 +2832,7 @@ fn require_variant_references_write(
     let mut minimum_order = u64::MAX;
     let mut publication_roots = 0u64;
     let mut pending_roots = 0u64;
+    let mut final_reference_expiry = PressureExpiry::ExpiredFinite;
     for &(owner, transfer) in references {
         match owner {
             super::lifecycle::VariantReferenceOwner::Publication => {
@@ -2670,6 +2845,7 @@ fn require_variant_references_write(
                 require_publication_root_write(write, transfer, &root)?;
                 effective_priority = effective_priority.max(root.priority);
                 minimum_order = minimum_order.min(root.acceptance_order);
+                final_reference_expiry = latest_expiry(final_reference_expiry, root.expiry);
                 publication_roots = publication_roots
                     .checked_add(1)
                     .ok_or(StoreError::ItemCountAccountingOverflow)?;
@@ -2689,6 +2865,10 @@ fn require_variant_references_write(
                 require_pending_source_write(write, transfer, &record)?;
                 effective_priority = effective_priority.max(record.metadata.header.priority);
                 minimum_order = minimum_order.min(record.pending_acceptance_order);
+                final_reference_expiry = latest_expiry(
+                    final_reference_expiry,
+                    lifetime_expiry(record.metadata.lifetime)?,
+                );
                 pending_roots = pending_roots
                     .checked_add(1)
                     .ok_or(StoreError::ItemCountAccountingOverflow)?;
@@ -2703,7 +2883,7 @@ fn require_variant_references_write(
         finalized,
         publication_roots,
         pending_roots,
-        final_reference_expiry: PressureExpiry::Durable,
+        final_reference_expiry,
     };
     let actual = write
         .open_table(BLOB_PRESSURE_VARIANT_SUMMARIES)?
@@ -2768,7 +2948,7 @@ fn bounded_publication_root_write(
         semantic_id: metadata.semantic_id,
         priority: metadata.header.priority,
         acceptance_order,
-        expiry: PressureExpiry::Durable,
+        expiry: lifetime_expiry(metadata.lifetime)?,
         topic: metadata.header.topic,
         scope: metadata.header.scope,
         blob_id: metadata.blob_id,
@@ -2915,7 +3095,7 @@ fn bounded_pending_root_write(
         priority: record.metadata.header.priority,
         acceptance_order: record.pending_acceptance_order,
         completion,
-        expiry: PressureExpiry::Durable,
+        expiry: lifetime_expiry(record.metadata.lifetime)?,
         topic: record.metadata.header.topic.clone(),
         scope: record.metadata.header.scope.clone(),
         blob_id: record.metadata.blob_id,
@@ -3009,6 +3189,7 @@ pub(crate) fn require_variant_with_references_bounded_write(
     let mut minimum_order = u64::MAX;
     let mut publication_roots = 0u64;
     let mut pending_roots = 0u64;
+    let mut final_reference_expiry = PressureExpiry::ExpiredFinite;
     for &(owner, transfer) in references {
         match owner {
             super::lifecycle::VariantReferenceOwner::Publication => {
@@ -3022,6 +3203,7 @@ pub(crate) fn require_variant_with_references_bounded_write(
                 }
                 effective_priority = effective_priority.max(root.priority);
                 minimum_order = minimum_order.min(root.acceptance_order);
+                final_reference_expiry = latest_expiry(final_reference_expiry, root.expiry);
                 publication_roots = publication_roots
                     .checked_add(1)
                     .ok_or(StoreError::ItemCountAccountingOverflow)?;
@@ -3048,6 +3230,7 @@ pub(crate) fn require_variant_with_references_bounded_write(
                 }
                 effective_priority = effective_priority.max(root.priority);
                 minimum_order = minimum_order.min(root.acceptance_order);
+                final_reference_expiry = latest_expiry(final_reference_expiry, root.expiry);
                 pending_roots = pending_roots
                     .checked_add(1)
                     .ok_or(StoreError::ItemCountAccountingOverflow)?;
@@ -3075,7 +3258,7 @@ pub(crate) fn require_variant_with_references_bounded_write(
         || actual.finalized != finalized
         || actual.publication_roots != publication_roots
         || actual.pending_roots != pending_roots
-        || actual.final_reference_expiry != PressureExpiry::Durable
+        || actual.final_reference_expiry != final_reference_expiry
     {
         return Err(pressure_corruption(
             "Blob pressure variant summary contradicts its bounded roots",
@@ -3115,6 +3298,7 @@ fn add_root_to_variant_summary_without_references(
     priority: Priority,
     acceptance_order: u64,
     pending: bool,
+    expiry: PressureExpiry,
 ) -> Result<(), StoreError> {
     let old = write
         .open_table(BLOB_PRESSURE_VARIANT_SUMMARIES)?
@@ -3156,7 +3340,9 @@ fn add_root_to_variant_summary_without_references(
         finalized,
         publication_roots,
         pending_roots,
-        final_reference_expiry: PressureExpiry::Durable,
+        final_reference_expiry: old.map_or(expiry, |value| {
+            latest_expiry(value.final_reference_expiry, expiry)
+        }),
     };
     let encoded = encode_variant_summary(summary);
     write
@@ -3220,6 +3406,7 @@ fn refresh_variant_summary(
     let mut minimum_order = u64::MAX;
     let mut publication_roots = 0u64;
     let mut pending_roots = 0u64;
+    let mut final_reference_expiry = PressureExpiry::ExpiredFinite;
     for (owner, transfer) in references {
         match owner {
             super::lifecycle::VariantReferenceOwner::Publication => {
@@ -3238,6 +3425,7 @@ fn refresh_variant_summary(
                 }
                 effective_priority = effective_priority.max(root.priority);
                 minimum_order = minimum_order.min(root.acceptance_order);
+                final_reference_expiry = latest_expiry(final_reference_expiry, root.expiry);
                 publication_roots = publication_roots
                     .checked_add(1)
                     .ok_or(StoreError::ItemCountAccountingOverflow)?;
@@ -3258,6 +3446,7 @@ fn refresh_variant_summary(
                 }
                 effective_priority = effective_priority.max(root.priority);
                 minimum_order = minimum_order.min(root.acceptance_order);
+                final_reference_expiry = latest_expiry(final_reference_expiry, root.expiry);
                 pending_roots = pending_roots
                     .checked_add(1)
                     .ok_or(StoreError::ItemCountAccountingOverflow)?;
@@ -3272,7 +3461,7 @@ fn refresh_variant_summary(
         finalized,
         publication_roots,
         pending_roots,
-        final_reference_expiry: PressureExpiry::Durable,
+        final_reference_expiry,
     };
     let encoded = encode_variant_summary(summary);
     write
@@ -3316,7 +3505,7 @@ pub(crate) fn reconcile_variant_write(
                 if old.variant_id != record.metadata.variant_id
                     || old.priority != record.metadata.header.priority
                     || old.acceptance_order != record.pending_acceptance_order
-                    || old.expiry != PressureExpiry::Durable
+                    || old.expiry != lifetime_expiry(record.metadata.lifetime)?
                     || old.topic != record.metadata.header.topic
                     || old.scope != record.metadata.header.scope
                     || old.blob_id != record.metadata.blob_id
@@ -3347,7 +3536,7 @@ pub(crate) fn reconcile_variant_write(
                         &write.open_table(super::BLOB_IMPORTS)?,
                         &write.open_table(super::BLOB_CHUNKS)?,
                     )?,
-                    expiry: PressureExpiry::Durable,
+                    expiry: lifetime_expiry(record.metadata.lifetime)?,
                     topic: record.metadata.header.topic,
                     scope: record.metadata.header.scope,
                     blob_id: record.metadata.blob_id,
@@ -3425,6 +3614,7 @@ pub(crate) fn insert_publication_write(
             root.priority,
             root.acceptance_order,
             false,
+            root.expiry,
         )
     } else {
         refresh_variant_summary(write, variant, true)
@@ -3623,6 +3813,39 @@ mod tests {
             scope: Scope::new("alpha/bravo").expect("scope"),
             blob_id: BlobId::from_bytes([0x44; 32]),
         }
+    }
+
+    #[test]
+    fn finite_lifetime_pressure_expiry_and_shared_root_dominance_are_exact() {
+        let finite = crate::blob::BlobLifetime::Finite {
+            ttl_ms: 1_000,
+            age: crate::custody::LowerBoundAgeCheckpoint {
+                cumulative_age_ms: 250,
+                checkpoint: Some(aster_mesh::CustodySample {
+                    clock_id: [0x21; 16],
+                    tick_ms: 4_000,
+                }),
+                continuity_generation: 1,
+                continuity_lost: false,
+            },
+            provenance: crate::blob::BlobFiniteProvenance::Local,
+        };
+        // Mutation caught: pressure ranking must use the authoritative
+        // checkpoint plus remaining lower-bound lifetime, not raw TTL.
+        assert_eq!(
+            super::lifetime_expiry(finite).unwrap(),
+            PressureExpiry::Finite(4_750)
+        );
+        assert_eq!(
+            super::latest_expiry(PressureExpiry::Finite(4_750), PressureExpiry::Finite(9_000),),
+            PressureExpiry::Finite(9_000)
+        );
+        // Mutation caught: one durable shared root dominates every finite
+        // final-reference expiry in the variant summary.
+        assert_eq!(
+            super::latest_expiry(PressureExpiry::Finite(9_000), PressureExpiry::Durable),
+            PressureExpiry::Durable
+        );
     }
 
     #[test]

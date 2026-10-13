@@ -157,7 +157,7 @@ pub(crate) const BLOB_RETIREMENT_RESOLVERS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.blob-retirement-resolvers.v1");
 
 const BLOB_LIFECYCLE_SCHEMA_VERSION_FIELD: &str = "schema_version";
-const BLOB_LIFECYCLE_SCHEMA_VERSION: u64 = 3;
+const BLOB_LIFECYCLE_SCHEMA_VERSION: u64 = 4;
 const BLOB_LINEAGE_ROWS: &str = "lineage_rows";
 const BLOB_LINEAGE_BYTES: &str = "lineage_bytes";
 const BLOB_REPLAY_ROWS: &str = "replay_rows";
@@ -188,14 +188,15 @@ const BLOB_LIFECYCLE_METADATA_FIELDS: [&str; 14] = [
     BLOB_NEXT_RETIREMENT_GENERATION,
 ];
 
-const PREDECESSOR_PUBLICATION_RECORD_VERSION: u8 = 3;
-const CURRENT_PUBLICATION_RECORD_VERSION: u8 = 4;
+pub(crate) const PREDECESSOR_PUBLICATION_RECORD_VERSION: u8 = 4;
+const CURRENT_PUBLICATION_RECORD_VERSION: u8 = 5;
+pub(crate) const LIFECYCLE_V1_PUBLICATION_RECORD_VERSION: u8 = 3;
 const CURRENT_OPERATION_RECORD_VERSION: u8 = 2;
 
 const RECORD_VERSION: u8 = 1;
 const RECLAIMED_LINEAGE_FENCE_VERSION: u8 = 2;
-const PUBLICATION_STATE_LIVE_TAG: u8 = 1;
-const PUBLICATION_STATE_RETIRED_TAG: u8 = 2;
+pub(crate) const PUBLICATION_STATE_LIVE_TAG: u8 = 1;
+pub(crate) const PUBLICATION_STATE_RETIRED_TAG: u8 = 2;
 const OPERATION_STATE_ACTIVE_TAG: u8 = 1;
 const OPERATION_STATE_RETIRED_TAG: u8 = 2;
 const VARIANT_REFERENCE_PUBLICATION_TAG: u8 = 1;
@@ -797,12 +798,23 @@ enum LifecycleSchemaState {
     Legacy,
     V1,
     V2,
+    V3,
+    Current,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PublicationEncodingGeneration {
+    RawPredecessor,
+    RawCurrent,
+    LifecycleV1,
+    LifecycleV2OrV3,
     Current,
 }
 
 #[derive(Debug)]
 struct ExpectedLifecycleImage {
     publications: BTreeMap<Vec<u8>, Vec<u8>>,
+    pending_sources: BTreeMap<Vec<u8>, Vec<u8>>,
     live_publications: BTreeSet<Vec<u8>>,
     retired_publications: BTreeSet<Vec<u8>>,
     operations: BTreeMap<Vec<u8>, Vec<u8>>,
@@ -975,7 +987,7 @@ pub(crate) fn require_blob_lifecycle_absent_read(
 
 pub(crate) fn publication_payload(bytes: &[u8]) -> Result<&[u8], BlobStoreError> {
     match bytes.first().copied() {
-        Some(1 | 2) => Ok(bytes),
+        Some(1..=3) => Ok(bytes),
         Some(PREDECESSOR_PUBLICATION_RECORD_VERSION | CURRENT_PUBLICATION_RECORD_VERSION) => {
             if bytes.len() < 3 {
                 return Err(BlobStoreError::SchemaInvariant(
@@ -987,7 +999,7 @@ pub(crate) fn publication_payload(bytes: &[u8]) -> Result<&[u8], BlobStoreError>
                     "retired Blob publication has no live metadata payload",
                 ));
             }
-            if !matches!(bytes[2], 1 | 2) {
+            if !matches!(bytes[2], 1..=3) {
                 return Err(BlobStoreError::SchemaInvariant(
                     "Blob publication lifecycle wrapper has a noncanonical payload",
                 ));
@@ -1000,8 +1012,161 @@ pub(crate) fn publication_payload(bytes: &[u8]) -> Result<&[u8], BlobStoreError>
     }
 }
 
+pub(crate) fn publication_payload_for_encoding(
+    bytes: &[u8],
+    generation: PublicationEncodingGeneration,
+) -> Result<&[u8], BlobStoreError> {
+    match generation {
+        PublicationEncodingGeneration::RawPredecessor if matches!(bytes.first(), Some(1 | 2)) => {
+            Ok(bytes)
+        }
+        PublicationEncodingGeneration::RawCurrent if bytes.first().copied() == Some(3) => Ok(bytes),
+        PublicationEncodingGeneration::LifecycleV1
+            if bytes.len() >= 3
+                && bytes[0] == LIFECYCLE_V1_PUBLICATION_RECORD_VERSION
+                && PublicationState::decode(&bytes[1..2])? == PublicationState::Live
+                && matches!(bytes[2], 1 | 2) =>
+        {
+            Ok(&bytes[2..])
+        }
+        PublicationEncodingGeneration::LifecycleV2OrV3
+            if bytes.first().copied() == Some(PREDECESSOR_PUBLICATION_RECORD_VERSION) =>
+        {
+            let payload = publication_payload(bytes)?;
+            if !matches!(payload.first(), Some(1 | 2)) {
+                return Err(BlobStoreError::SchemaInvariant(
+                    "Blob publication payload contradicts its lifecycle schema",
+                ));
+            }
+            Ok(payload)
+        }
+        PublicationEncodingGeneration::Current
+            if bytes.first().copied() == Some(CURRENT_PUBLICATION_RECORD_VERSION) =>
+        {
+            let payload = publication_payload(bytes)?;
+            if payload.first().copied() != Some(3) {
+                return Err(BlobStoreError::SchemaInvariant(
+                    "Blob publication payload contradicts its lifecycle schema",
+                ));
+            }
+            Ok(payload)
+        }
+        _ => Err(BlobStoreError::SchemaInvariant(
+            "Blob publication encoding contradicts its lifecycle schema",
+        )),
+    }
+}
+
+fn publication_encoding_from_schema(schema: LifecycleSchemaState) -> PublicationEncodingGeneration {
+    match schema {
+        LifecycleSchemaState::Legacy => PublicationEncodingGeneration::RawPredecessor,
+        LifecycleSchemaState::V1 => PublicationEncodingGeneration::LifecycleV1,
+        LifecycleSchemaState::V2 | LifecycleSchemaState::V3 => {
+            PublicationEncodingGeneration::LifecycleV2OrV3
+        }
+        LifecycleSchemaState::Current => PublicationEncodingGeneration::Current,
+    }
+}
+
+pub(crate) fn publication_encoding_write(
+    write: &redb::WriteTransaction,
+) -> Result<PublicationEncodingGeneration, StoreError> {
+    #[cfg(test)]
+    if TEST_BLOB_LIFECYCLE_MIGRATION_DISABLED.get() {
+        return publication_encoding_migration_write(write);
+    }
+    match write
+        .open_table(BLOB_LIFECYCLE_METADATA)?
+        .get(BLOB_LIFECYCLE_SCHEMA_VERSION_FIELD)?
+        .map(|value| value.value())
+    {
+        Some(3) => Ok(PublicationEncodingGeneration::LifecycleV2OrV3),
+        Some(BLOB_LIFECYCLE_SCHEMA_VERSION) => Ok(PublicationEncodingGeneration::Current),
+        _ => Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
+            "Blob lifecycle schema version is unknown",
+        ))),
+    }
+}
+
+pub(crate) fn publication_encoding_migration_read(
+    read: &redb::ReadTransaction,
+) -> Result<PublicationEncodingGeneration, StoreError> {
+    let mut schema = lifecycle_schema_state_read(read)?;
+    #[cfg(test)]
+    if schema == LifecycleSchemaState::Legacy
+        && TEST_BLOB_LIFECYCLE_MIGRATION_DISABLED.with(|disabled| disabled.get())
+    {
+        return Ok(PublicationEncodingGeneration::RawCurrent);
+    }
+    if schema == LifecycleSchemaState::Current {
+        schema = match read
+            .open_table(BLOB_LIFECYCLE_METADATA)?
+            .get(BLOB_LIFECYCLE_SCHEMA_VERSION_FIELD)?
+            .map(|value| value.value())
+        {
+            Some(3) => LifecycleSchemaState::V3,
+            Some(BLOB_LIFECYCLE_SCHEMA_VERSION) => LifecycleSchemaState::Current,
+            _ => {
+                return Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
+                    "Blob lifecycle schema version is unknown",
+                )));
+            }
+        };
+    }
+    Ok(publication_encoding_from_schema(schema))
+}
+
+pub(crate) fn publication_encoding_migration_write(
+    write: &redb::WriteTransaction,
+) -> Result<PublicationEncodingGeneration, StoreError> {
+    let mut schema = lifecycle_schema_state_write(write)?;
+    #[cfg(test)]
+    if schema == LifecycleSchemaState::Legacy && TEST_BLOB_LIFECYCLE_MIGRATION_DISABLED.get() {
+        return Ok(PublicationEncodingGeneration::RawCurrent);
+    }
+    if schema == LifecycleSchemaState::Current {
+        schema = match write
+            .open_table(BLOB_LIFECYCLE_METADATA)?
+            .get(BLOB_LIFECYCLE_SCHEMA_VERSION_FIELD)?
+            .map(|value| value.value())
+        {
+            Some(3) => LifecycleSchemaState::V3,
+            Some(BLOB_LIFECYCLE_SCHEMA_VERSION) => LifecycleSchemaState::Current,
+            _ => {
+                return Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
+                    "Blob lifecycle schema version is unknown",
+                )));
+            }
+        };
+    }
+    Ok(publication_encoding_from_schema(schema))
+}
+
+pub(crate) fn publication_encoding_read(
+    read: &redb::ReadTransaction,
+) -> Result<PublicationEncodingGeneration, StoreError> {
+    #[cfg(test)]
+    if TEST_BLOB_LIFECYCLE_MIGRATION_DISABLED.with(|disabled| disabled.get()) {
+        return publication_encoding_migration_read(read);
+    }
+    match read
+        .open_table(BLOB_LIFECYCLE_METADATA)?
+        .get(BLOB_LIFECYCLE_SCHEMA_VERSION_FIELD)?
+        .map(|value| value.value())
+    {
+        Some(3) => Ok(PublicationEncodingGeneration::LifecycleV2OrV3),
+        Some(BLOB_LIFECYCLE_SCHEMA_VERSION) => Ok(PublicationEncodingGeneration::Current),
+        _ => Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
+            "Blob lifecycle schema version is unknown",
+        ))),
+    }
+}
+
 pub(crate) fn publication_record_is_retired(bytes: &[u8]) -> Result<bool, BlobStoreError> {
-    if bytes.first().copied() != Some(CURRENT_PUBLICATION_RECORD_VERSION) {
+    if !matches!(
+        bytes.first().copied(),
+        Some(PREDECESSOR_PUBLICATION_RECORD_VERSION | CURRENT_PUBLICATION_RECORD_VERSION)
+    ) {
         return Ok(false);
     }
     match bytes.get(1).copied() {
@@ -1019,10 +1184,58 @@ pub(crate) fn publication_record_is_retired(bytes: &[u8]) -> Result<bool, BlobSt
     }
 }
 
+pub(crate) fn publication_record_is_retired_for_encoding(
+    bytes: &[u8],
+    generation: PublicationEncodingGeneration,
+) -> Result<bool, BlobStoreError> {
+    match generation {
+        PublicationEncodingGeneration::RawPredecessor
+        | PublicationEncodingGeneration::RawCurrent
+        | PublicationEncodingGeneration::LifecycleV1 => {
+            publication_payload_for_encoding(bytes, generation)?;
+            Ok(false)
+        }
+        PublicationEncodingGeneration::LifecycleV2OrV3 | PublicationEncodingGeneration::Current => {
+            let expected = match generation {
+                PublicationEncodingGeneration::LifecycleV2OrV3 => {
+                    PREDECESSOR_PUBLICATION_RECORD_VERSION
+                }
+                PublicationEncodingGeneration::Current => CURRENT_PUBLICATION_RECORD_VERSION,
+                PublicationEncodingGeneration::RawPredecessor
+                | PublicationEncodingGeneration::RawCurrent
+                | PublicationEncodingGeneration::LifecycleV1 => {
+                    unreachable!("predecessor/current branch")
+                }
+            };
+            if bytes.first().copied() != Some(expected) {
+                return Err(BlobStoreError::SchemaInvariant(
+                    "Blob publication encoding contradicts its lifecycle schema",
+                ));
+            }
+            match bytes.get(1).copied() {
+                Some(PUBLICATION_STATE_LIVE_TAG) => {
+                    publication_payload_for_encoding(bytes, generation)?;
+                    Ok(false)
+                }
+                Some(PUBLICATION_STATE_RETIRED_TAG) => {
+                    publication_retirement(bytes)?;
+                    Ok(true)
+                }
+                _ => Err(BlobStoreError::SchemaInvariant(
+                    "Blob publication lifecycle state is unknown",
+                )),
+            }
+        }
+    }
+}
+
 pub(crate) fn publication_retirement(
     bytes: &[u8],
 ) -> Result<Option<(RetirementReason, u64, RetirementAge)>, BlobStoreError> {
-    if bytes.first().copied() != Some(CURRENT_PUBLICATION_RECORD_VERSION) {
+    if !matches!(
+        bytes.first().copied(),
+        Some(PREDECESSOR_PUBLICATION_RECORD_VERSION | CURRENT_PUBLICATION_RECORD_VERSION)
+    ) {
         return Ok(None);
     }
     match bytes.get(1).copied() {
@@ -1123,7 +1336,7 @@ pub(crate) fn retired_publication_payload(
             .try_into()
             .expect("checked retired marker"),
     );
-    if marker == 0 || !matches!(bytes.get(marker_offset + 8), Some(1 | 2)) {
+    if marker == 0 || !matches!(bytes.get(marker_offset + 8), Some(1..=3)) {
         return Err(BlobStoreError::SchemaInvariant(
             "retired Blob publication lookup payload is not canonical",
         ));
@@ -1137,9 +1350,46 @@ fn publication_is_current(bytes: &[u8]) -> bool {
 
 fn wrap_publication(bytes: &[u8]) -> Result<Vec<u8>, StoreError> {
     let payload = publication_payload(bytes).map_err(StoreError::Blob)?;
-    if publication_is_current(bytes) || !matches!(payload.first(), Some(1 | 2)) {
+    if publication_is_current(bytes) || !matches!(payload.first(), Some(1..=3)) {
         return Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
             "Blob predecessor publication is not canonical",
+        )));
+    }
+    let payload = super::encode_blob_metadata(super::decode_blob_metadata(payload)?)?;
+    let mut wrapped = Vec::with_capacity(payload.len() + 2);
+    wrapped.push(CURRENT_PUBLICATION_RECORD_VERSION);
+    wrapped.extend_from_slice(&PublicationState::Live.encode());
+    wrapped.extend_from_slice(&payload);
+    Ok(wrapped)
+}
+
+fn wrap_v1_publication(bytes: &[u8]) -> Result<Vec<u8>, StoreError> {
+    if bytes.len() < 3
+        || bytes[0] != LIFECYCLE_V1_PUBLICATION_RECORD_VERSION
+        || PublicationState::decode(&bytes[1..2])? != PublicationState::Live
+    {
+        return Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
+            "Blob lifecycle-v1 publication wrapper is not canonical",
+        )));
+    }
+    let payload = super::encode_blob_metadata(super::decode_blob_metadata(&bytes[2..])?)?;
+    let mut wrapped = Vec::with_capacity(payload.len() + 2);
+    wrapped.push(CURRENT_PUBLICATION_RECORD_VERSION);
+    wrapped.extend_from_slice(&PublicationState::Live.encode());
+    wrapped.extend_from_slice(&payload);
+    Ok(wrapped)
+}
+
+pub(crate) fn replace_live_publication_payload(
+    encoded: &[u8],
+    payload: &[u8],
+) -> Result<Vec<u8>, StoreError> {
+    if publication_record_is_retired(encoded)?
+        || encoded.first().copied() != Some(CURRENT_PUBLICATION_RECORD_VERSION)
+        || !matches!(payload.first(), Some(1..=3))
+    {
+        return Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
+            "Blob publication lifetime update is not a current live record",
         )));
     }
     let mut wrapped = Vec::with_capacity(payload.len() + 2);
@@ -1147,6 +1397,38 @@ fn wrap_publication(bytes: &[u8]) -> Result<Vec<u8>, StoreError> {
     wrapped.extend_from_slice(&PublicationState::Live.encode());
     wrapped.extend_from_slice(payload);
     Ok(wrapped)
+}
+
+fn upgrade_v3_publication(encoded: &[u8]) -> Result<Vec<u8>, StoreError> {
+    if encoded.first().copied() != Some(PREDECESSOR_PUBLICATION_RECORD_VERSION) {
+        return Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
+            "Blob lifecycle-v3 publication wrapper is missing",
+        )));
+    }
+    if publication_record_is_retired(encoded)? {
+        let state_end = 1 + RETIRED_PUBLICATION_STATE_BYTES;
+        let Some((marker, payload)) = retired_publication_payload(encoded)? else {
+            let mut upgraded = Vec::with_capacity(state_end);
+            upgraded.push(CURRENT_PUBLICATION_RECORD_VERSION);
+            upgraded.extend_from_slice(&encoded[1..state_end]);
+            return Ok(upgraded);
+        };
+        let metadata = super::decode_blob_metadata(payload)?;
+        let payload = super::encode_blob_metadata(metadata)?;
+        let mut upgraded = Vec::with_capacity(state_end + 8 + payload.len());
+        upgraded.push(CURRENT_PUBLICATION_RECORD_VERSION);
+        upgraded.extend_from_slice(&encoded[1..state_end]);
+        upgraded.extend_from_slice(&marker.to_be_bytes());
+        upgraded.extend_from_slice(&payload);
+        return Ok(upgraded);
+    }
+    let metadata = super::decode_blob_metadata(encoded)?;
+    let payload = super::encode_blob_metadata(metadata)?;
+    let mut upgraded = Vec::with_capacity(payload.len() + 2);
+    upgraded.push(CURRENT_PUBLICATION_RECORD_VERSION);
+    upgraded.extend_from_slice(&PublicationState::Live.encode());
+    upgraded.extend_from_slice(&payload);
+    Ok(upgraded)
 }
 
 fn admission_schema_is_current(write: &redb::WriteTransaction) -> Result<bool, StoreError> {
@@ -2886,6 +3168,7 @@ fn reconstruct_expected_image(
 ) -> Result<ExpectedLifecycleImage, StoreError> {
     let mut expected = ExpectedLifecycleImage {
         publications: BTreeMap::new(),
+        pending_sources: BTreeMap::new(),
         live_publications: BTreeSet::new(),
         retired_publications: BTreeSet::new(),
         operations: BTreeMap::new(),
@@ -2903,6 +3186,7 @@ fn reconstruct_expected_image(
         usage: BlobLifecycleUsage::default(),
     };
     let mut import_lineages = BTreeMap::new();
+    let mut publication_intents = BTreeMap::<BlobTransferId, [u8; 32]>::new();
     for import in imports {
         if import_lineages
             .insert(import.variant_id, import.physical_lineage)
@@ -2936,32 +3220,60 @@ fn reconstruct_expected_image(
         let transfer = super::parse_blob_transfer_id("Blob publication table", key.value())?;
         let encoded = value.value();
         match schema {
-            LifecycleSchemaState::Legacy if matches!(encoded.first().copied(), Some(3 | 4)) => {
+            LifecycleSchemaState::Legacy if matches!(encoded.first().copied(), Some(4 | 5)) => {
                 return Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
                     "Blob predecessor contains a current publication wrapper",
                 )));
             }
             LifecycleSchemaState::V1
-                if encoded.first().copied() != Some(PREDECESSOR_PUBLICATION_RECORD_VERSION) =>
+                if encoded.first().copied() != Some(LIFECYCLE_V1_PUBLICATION_RECORD_VERSION) =>
             {
                 return Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
                     "Blob lifecycle-v1 publication wrapper is missing",
                 )));
             }
-            LifecycleSchemaState::V2 | LifecycleSchemaState::Current
-                if !publication_is_current(encoded) =>
+            LifecycleSchemaState::V2 | LifecycleSchemaState::V3
+                if encoded.first().copied() != Some(PREDECESSOR_PUBLICATION_RECORD_VERSION) =>
             {
+                return Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
+                    "predecessor Blob publication is missing its lifecycle wrapper",
+                )));
+            }
+            LifecycleSchemaState::Current if !publication_is_current(encoded) => {
                 return Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
                     "current Blob publication is missing its lifecycle wrapper",
                 )));
             }
             _ => {}
         }
+        if schema == LifecycleSchemaState::V3
+            && encoded.first().copied() != Some(PREDECESSOR_PUBLICATION_RECORD_VERSION)
+        {
+            return Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
+                "Blob lifecycle-v3 publication wrapper is missing",
+            )));
+        }
         if matches!(
             schema,
-            LifecycleSchemaState::V2 | LifecycleSchemaState::Current
+            LifecycleSchemaState::V2 | LifecycleSchemaState::V3 | LifecycleSchemaState::Current
         ) && encoded.get(1).copied() == Some(PUBLICATION_STATE_RETIRED_TAG)
         {
+            if let Some((_, payload)) =
+                retired_publication_payload(encoded).map_err(StoreError::Blob)?
+            {
+                let metadata = super::decode_blob_metadata(payload)?;
+                if metadata.header.ttl_ms.is_some() {
+                    let intent = super::BlobPublicationIntent::new_with_ttl(
+                        metadata.header.stamp.dot.publisher,
+                        metadata.header.topic.clone(),
+                        metadata.header.scope.clone(),
+                        metadata.header.priority,
+                        metadata.blob_id,
+                        metadata.header.ttl_ms,
+                    )?;
+                    publication_intents.insert(transfer, intent.digest());
+                }
+            }
             let Some((_, generation, age)) =
                 publication_retirement(encoded).map_err(StoreError::Blob)?
             else {
@@ -2989,15 +3301,37 @@ fn reconstruct_expected_image(
             expected
                 .retired_publications
                 .insert(transfer.as_bytes().to_vec());
+            let retained = if matches!(schema, LifecycleSchemaState::V2 | LifecycleSchemaState::V3)
+            {
+                upgrade_v3_publication(encoded)?
+            } else {
+                encoded.to_vec()
+            };
             insert_unique(
                 &mut expected.publications,
                 key.value().to_vec(),
-                encoded.to_vec(),
+                retained,
                 "multiple Blob publication rows claim one transfer identity",
             )?;
             continue;
         }
-        let publication = super::decode_blob_metadata(encoded)?;
+        let publication_payload = if schema == LifecycleSchemaState::V1 {
+            &encoded[2..]
+        } else {
+            encoded
+        };
+        let publication = super::decode_blob_metadata(publication_payload)?;
+        let intent = super::BlobPublicationIntent::new_with_ttl(
+            publication.header.stamp.dot.publisher,
+            publication.header.topic.clone(),
+            publication.header.scope.clone(),
+            publication.header.priority,
+            publication.blob_id,
+            publication.header.ttl_ms,
+        )?;
+        if publication.header.ttl_ms.is_some() {
+            publication_intents.insert(transfer, intent.digest());
+        }
         expected
             .live_publications
             .insert(transfer.as_bytes().to_vec());
@@ -3052,8 +3386,10 @@ fn reconstruct_expected_image(
             "multiple Blob publications claim one variant reference",
         )?;
         let wrapped = match schema {
-            LifecycleSchemaState::Legacy | LifecycleSchemaState::V1 => wrap_publication(encoded)?,
-            LifecycleSchemaState::V2 | LifecycleSchemaState::Current => encoded.to_vec(),
+            LifecycleSchemaState::Legacy => wrap_publication(encoded)?,
+            LifecycleSchemaState::V1 => wrap_v1_publication(encoded)?,
+            LifecycleSchemaState::V2 | LifecycleSchemaState::V3 => upgrade_v3_publication(encoded)?,
+            LifecycleSchemaState::Current => encoded.to_vec(),
         };
         insert_unique(
             &mut expected.publications,
@@ -3087,6 +3423,17 @@ fn reconstruct_expected_image(
             Vec::new(),
             "multiple pending Blob sources claim one variant reference",
         )?;
+        let upgraded = if schema == LifecycleSchemaState::Current {
+            value
+        } else {
+            super::encode_pending_blob_source(&pending)?
+        };
+        insert_unique(
+            &mut expected.pending_sources,
+            key,
+            upgraded,
+            "multiple pending Blob source rows claim one transfer identity",
+        )?;
     }
     expected.usage.reference_rows = u64::try_from(expected.references.len())
         .map_err(|_| StoreError::ItemCountAccountingOverflow)?;
@@ -3097,7 +3444,7 @@ fn reconstruct_expected_image(
         super::BlobOperationKey::new(key.value().to_vec())?;
         if matches!(
             schema,
-            LifecycleSchemaState::V2 | LifecycleSchemaState::Current
+            LifecycleSchemaState::V2 | LifecycleSchemaState::V3 | LifecycleSchemaState::Current
         ) && encoded.get(1).copied() == Some(OPERATION_STATE_RETIRED_TAG)
         {
             if encoded.first().copied() != Some(CURRENT_OPERATION_RECORD_VERSION) {
@@ -3153,6 +3500,14 @@ fn reconstruct_expected_image(
                 "active Blob lifecycle operation points to a missing or retired publication",
             )));
         }
+        if publication_intents
+            .get(&operation.transfer_id)
+            .is_some_and(|digest| digest != &operation.intent_digest)
+        {
+            return Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
+                "Blob operation intent digest contradicts its publication lifetime",
+            )));
+        }
         match schema {
             LifecycleSchemaState::Legacy | LifecycleSchemaState::V1
                 if encoded.first().copied() != Some(super::BLOB_OPERATION_VERSION) =>
@@ -3161,7 +3516,7 @@ fn reconstruct_expected_image(
                     "Blob predecessor operation is not canonical",
                 )));
             }
-            LifecycleSchemaState::V2 | LifecycleSchemaState::Current
+            LifecycleSchemaState::V2 | LifecycleSchemaState::V3 | LifecycleSchemaState::Current
                 if encoded.first().copied() != Some(CURRENT_OPERATION_RECORD_VERSION) =>
             {
                 return Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
@@ -3172,7 +3527,9 @@ fn reconstruct_expected_image(
         }
         let wrapped = match schema {
             LifecycleSchemaState::Legacy | LifecycleSchemaState::V1 => wrap_operation(encoded)?,
-            LifecycleSchemaState::V2 | LifecycleSchemaState::Current => encoded.to_vec(),
+            LifecycleSchemaState::V2 | LifecycleSchemaState::V3 | LifecycleSchemaState::Current => {
+                encoded.to_vec()
+            }
         };
         expected.operation_bytes = expected
             .operation_bytes
@@ -3205,6 +3562,7 @@ fn reconstruct_expected_image(
 fn audit_metadata(
     metadata: &impl ReadableTable<&'static str, u64>,
     mut usage: BlobLifecycleUsage,
+    schema_version: u64,
 ) -> Result<BlobLifecycleUsage, StoreError> {
     if metadata.len()? != BLOB_LIFECYCLE_METADATA_FIELDS.len() as u64 {
         return Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
@@ -3212,10 +3570,7 @@ fn audit_metadata(
         )));
     }
     for (field, expected) in [
-        (
-            BLOB_LIFECYCLE_SCHEMA_VERSION_FIELD,
-            BLOB_LIFECYCLE_SCHEMA_VERSION,
-        ),
+        (BLOB_LIFECYCLE_SCHEMA_VERSION_FIELD, schema_version),
         (BLOB_LINEAGE_ROWS, usage.lineage_rows),
         (BLOB_LINEAGE_BYTES, usage.lineage_bytes),
         (BLOB_REPLAY_ROWS, usage.replay_rows),
@@ -3651,7 +4006,10 @@ fn audit_current_rows(
     }
     match schema_version {
         2 => audit_v2_metadata(metadata, actual_usage),
-        BLOB_LIFECYCLE_SCHEMA_VERSION => audit_metadata(metadata, actual_usage),
+        3 => audit_metadata(metadata, actual_usage, 3),
+        BLOB_LIFECYCLE_SCHEMA_VERSION => {
+            audit_metadata(metadata, actual_usage, BLOB_LIFECYCLE_SCHEMA_VERSION)
+        }
         _ => Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
             "Blob lifecycle schema version is unknown",
         ))),
@@ -3701,7 +4059,25 @@ pub(crate) fn stage_blob_lifecycle_migration_write(
     owner_binding: [u8; 32],
     stats: &mut BlobStoreStats,
 ) -> Result<Option<BlobLifecycleMigration>, StoreError> {
-    let schema = lifecycle_schema_state_write(write)?;
+    let mut schema = lifecycle_schema_state_write(write)?;
+    if schema == LifecycleSchemaState::Current {
+        let version = write
+            .open_table(BLOB_LIFECYCLE_METADATA)?
+            .get(BLOB_LIFECYCLE_SCHEMA_VERSION_FIELD)?
+            .map(|value| value.value())
+            .ok_or(StoreError::Blob(BlobStoreError::SchemaInvariant(
+                "Blob lifecycle metadata lacks its schema version",
+            )))?;
+        schema = match version {
+            3 => LifecycleSchemaState::V3,
+            BLOB_LIFECYCLE_SCHEMA_VERSION => LifecycleSchemaState::Current,
+            _ => {
+                return Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
+                    "Blob lifecycle schema version is unknown",
+                )));
+            }
+        };
+    }
     #[cfg(test)]
     if schema == LifecycleSchemaState::Legacy && TEST_BLOB_LIFECYCLE_MIGRATION_DISABLED.get() {
         return Ok(None);
@@ -3760,6 +4136,14 @@ pub(crate) fn stage_blob_lifecycle_migration_write(
             Ok(Some(BlobLifecycleMigration { image: expected }))
         }
         LifecycleSchemaState::V2 => {
+            let upgraded_publications = std::mem::take(&mut expected.publications);
+            expected.publications = publications
+                .iter()?
+                .map(|row| {
+                    let (key, value) = row?;
+                    Ok((key.value().to_vec(), value.value().to_vec()))
+                })
+                .collect::<Result<BTreeMap<_, _>, redb::StorageError>>()?;
             let actual_usage = audit_current_rows(
                 &write.open_table(BLOB_LIFECYCLE_METADATA)?,
                 &write.open_table(BLOB_VARIANT_REFERENCES)?,
@@ -3775,6 +4159,7 @@ pub(crate) fn stage_blob_lifecycle_migration_write(
                 2,
             )?;
             preflight_migration_limits(actual_usage, limits)?;
+            expected.publications = upgraded_publications;
             expected.deadlines = expected
                 .deadlines
                 .keys()
@@ -3792,6 +4177,37 @@ pub(crate) fn stage_blob_lifecycle_migration_write(
             expected.usage.retirement_resolver_rows =
                 u64::try_from(expected.retirement_resolvers.len())
                     .map_err(|_| StoreError::ItemCountAccountingOverflow)?;
+            expected.usage.apply_to_stats(stats);
+            Ok(Some(BlobLifecycleMigration { image: expected }))
+        }
+        LifecycleSchemaState::V3 => {
+            let upgraded_publications = std::mem::take(&mut expected.publications);
+            expected.publications = publications
+                .iter()?
+                .map(|row| {
+                    let (key, value) = row?;
+                    Ok((key.value().to_vec(), value.value().to_vec()))
+                })
+                .collect::<Result<BTreeMap<_, _>, redb::StorageError>>()?;
+            let actual_usage = audit_current_rows(
+                &write.open_table(BLOB_LIFECYCLE_METADATA)?,
+                &write.open_table(BLOB_VARIANT_REFERENCES)?,
+                &write.open_table(BLOB_LINEAGE_FENCES)?,
+                &write.open_table(BLOB_REPLAY_FENCES)?,
+                &write.open_table(BLOB_MAINTENANCE_CURSORS)?,
+                &write.open_table(BLOB_OPERATION_OWNERS)?,
+                &write.open_table(BLOB_DELIVERY_OWNERS)?,
+                &write.open_table(BLOB_RETENTION_DEADLINES)?,
+                Some(collect_retirement_resolvers(
+                    &write.open_table(BLOB_RETIREMENT_RESOLVERS)?,
+                )?),
+                &expected,
+                owner_binding,
+                3,
+            )?;
+            preflight_migration_limits(actual_usage, limits)?;
+            expected.publications = upgraded_publications;
+            expected.usage = actual_usage;
             expected.usage.apply_to_stats(stats);
             Ok(Some(BlobLifecycleMigration { image: expected }))
         }
@@ -3839,7 +4255,25 @@ pub(crate) fn inspect_blob_lifecycle_read(
         .list_tables()?
         .map(|table| table.name().to_owned())
         .collect::<BTreeSet<_>>();
-    let schema = lifecycle_schema_state_read(read)?;
+    let mut schema = lifecycle_schema_state_read(read)?;
+    if schema == LifecycleSchemaState::Current {
+        let version = read
+            .open_table(BLOB_LIFECYCLE_METADATA)?
+            .get(BLOB_LIFECYCLE_SCHEMA_VERSION_FIELD)?
+            .map(|value| value.value())
+            .ok_or(StoreError::Blob(BlobStoreError::SchemaInvariant(
+                "Blob lifecycle metadata lacks its schema version",
+            )))?;
+        schema = match version {
+            3 => LifecycleSchemaState::V3,
+            BLOB_LIFECYCLE_SCHEMA_VERSION => LifecycleSchemaState::Current,
+            _ => {
+                return Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
+                    "Blob lifecycle schema version is unknown",
+                )));
+            }
+        };
+    }
     let pending_rows = if normal.contains(super::BLOB_PENDING_SOURCES.name()) {
         read.open_table(super::BLOB_PENDING_SOURCES)?
             .iter()?
@@ -3880,8 +4314,18 @@ pub(crate) fn inspect_blob_lifecycle_read(
     }
     if matches!(
         schema,
-        LifecycleSchemaState::V2 | LifecycleSchemaState::Current
+        LifecycleSchemaState::V2 | LifecycleSchemaState::V3 | LifecycleSchemaState::Current
     ) {
+        if matches!(schema, LifecycleSchemaState::V2 | LifecycleSchemaState::V3) {
+            expected.publications = read
+                .open_table(super::BLOB_PUBLICATIONS)?
+                .iter()?
+                .map(|row| {
+                    let (key, value) = row?;
+                    Ok((key.value().to_vec(), value.value().to_vec()))
+                })
+                .collect::<Result<BTreeMap<_, _>, redb::StorageError>>()?;
+        }
         return audit_current_rows(
             &read.open_table(BLOB_LIFECYCLE_METADATA)?,
             &read.open_table(BLOB_VARIANT_REFERENCES)?,
@@ -3891,7 +4335,10 @@ pub(crate) fn inspect_blob_lifecycle_read(
             &read.open_table(BLOB_OPERATION_OWNERS)?,
             &read.open_table(BLOB_DELIVERY_OWNERS)?,
             &read.open_table(BLOB_RETENTION_DEADLINES)?,
-            if schema == LifecycleSchemaState::Current {
+            if matches!(
+                schema,
+                LifecycleSchemaState::V3 | LifecycleSchemaState::Current
+            ) {
                 Some(collect_retirement_resolvers(
                     &read.open_table(BLOB_RETIREMENT_RESOLVERS)?,
                 )?)
@@ -3902,6 +4349,8 @@ pub(crate) fn inspect_blob_lifecycle_read(
             owner_binding,
             if schema == LifecycleSchemaState::Current {
                 BLOB_LIFECYCLE_SCHEMA_VERSION
+            } else if schema == LifecycleSchemaState::V3 {
+                3
             } else {
                 2
             },
@@ -4008,6 +4457,27 @@ impl BlobLifecycleMigration {
             operations.insert(key.as_slice(), value.as_slice())?;
         }
         drop(operations);
+        let mut pending = write.open_table(super::BLOB_PENDING_SOURCES)?;
+        for (key, value) in &self.image.pending_sources {
+            pending.insert(key.as_slice(), value.as_slice())?;
+        }
+        drop(pending);
+        let pending_bytes =
+            self.image
+                .pending_sources
+                .iter()
+                .try_fold(0u64, |total, (key, value)| {
+                    total
+                        .checked_add(super::staging_entry_bytes(key.len(), value.len())?)
+                        .ok_or(StoreError::PayloadByteAccountingOverflow)
+                })?;
+        let mut network_metadata = write.open_table(super::BLOB_NETWORK_METADATA)?;
+        network_metadata.insert(
+            super::BLOB_NETWORK_STAGING_ROWS,
+            u64::try_from(self.image.pending_sources.len())
+                .map_err(|_| StoreError::ItemCountAccountingOverflow)?,
+        )?;
+        network_metadata.insert(super::BLOB_NETWORK_STAGING_BYTES, pending_bytes)?;
         write.open_table(super::METADATA)?.insert(
             super::BLOB_OPERATION_TOTAL_BYTES,
             self.image.operation_bytes,
@@ -4605,6 +5075,48 @@ mod tests {
         let mut replay_with_trailing = expected_replay.to_vec();
         replay_with_trailing.push(0);
         assert!(ReplayFence::decode(&replay_with_trailing).is_err());
+    }
+
+    #[test]
+    fn publication_v3_collision_is_resolved_only_by_trusted_schema_generation() {
+        let metadata_like = [3, 1, 3, 0xaa, 0xbb];
+        // Mutation caught: content sniffing would unwrap this valid metadata-v3
+        // prefix merely because its transfer bytes resemble a v1 wrapper.
+        assert_eq!(
+            publication_payload_for_encoding(
+                &metadata_like,
+                PublicationEncodingGeneration::RawCurrent,
+            )
+            .unwrap(),
+            metadata_like
+        );
+        assert!(
+            publication_payload_for_encoding(
+                &metadata_like,
+                PublicationEncodingGeneration::LifecycleV1,
+            )
+            .is_err(),
+            "historical lifecycle-v1 authority cannot admit a metadata-v3 payload"
+        );
+
+        let malformed_wrapper_that_starts_like_metadata = [3, 0, 3, 0xcc];
+        // Mutation caught: fallback parse order must not reinterpret malformed
+        // lifecycle-v1 state as current metadata under a v1 schema authority.
+        assert!(
+            publication_payload_for_encoding(
+                &malformed_wrapper_that_starts_like_metadata,
+                PublicationEncodingGeneration::LifecycleV1,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            publication_payload_for_encoding(
+                &malformed_wrapper_that_starts_like_metadata,
+                PublicationEncodingGeneration::RawCurrent,
+            )
+            .unwrap(),
+            malformed_wrapper_that_starts_like_metadata
+        );
     }
 
     #[test]

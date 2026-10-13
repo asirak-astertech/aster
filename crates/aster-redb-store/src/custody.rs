@@ -1096,6 +1096,10 @@ pub(crate) struct ContinuityRecord {
 }
 
 impl ContinuityRecord {
+    pub(crate) const fn generation(self) -> u64 {
+        self.generation
+    }
+
     pub(crate) const fn sample(self) -> CustodySample {
         self.sample
     }
