@@ -505,8 +505,10 @@ signature.
 
 No multi-item batch certificate, proof, or credential cache reference is encoded
 inside an `ASTRENV2` format-2 object. Semantic-version-2, semantic-version-3,
-semantic-version-4, semantic-version-5, and semantic-version-6 sessions also support the separate `ASTRENV3` format-3 source-batch proof and
-compact item representations defined in [protocol.md](protocol.md) §6.1. Those bytes MUST NOT
+semantic-version-4, semantic-version-5, semantic-version-6, semantic-version-7,
+and semantic-version-8 sessions also support the separate `ASTRENV3` format-3
+source-batch proof and compact item representations defined in
+[protocol.md](protocol.md) §6.1. Those bytes MUST NOT
 be inserted into or reinterpreted as an `ASTRENV2` object; format 2 remains the
 singleton fallback for semantic-version-2/3/v4/v5/v6/v7/v8 peers and the only source-envelope
 format accepted by semantic version 1.

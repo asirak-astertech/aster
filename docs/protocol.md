@@ -1224,7 +1224,7 @@ evidence or age charge. The wrapper contains no wall-clock timestamp, and
 profile 1 defines no cross-node wall-time adjustment.
 
 For selected Event/RouteEvent `LegacyV6` transfer under semantic version 3, 4,
-5, 6, or 7, each offer
+5, 6, 7, or 8, each offer
 carries the exact 150-byte `ASTRCU03` claim defined in
 [envelope.md](envelope.md) §7.1 inside a replay-checked `ASTRFR01` session
 record. The claim binds the completed session transcript, transfer digest and

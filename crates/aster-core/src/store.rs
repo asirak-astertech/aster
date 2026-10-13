@@ -32,7 +32,7 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::path::Path;
 
-const SCHEMA_VERSION: i64 = 16;
+const SCHEMA_VERSION: i64 = 17;
 // Schema-11 stores had one node-global frontier. Schema 12 preserves every one
 // of those observations in this domain, which cannot collide with validated
 // Topic or Scope values because both reject the empty string.
@@ -1180,13 +1180,13 @@ fn transfer_resume_is_compatible(
         (None, None) => true,
         (None, Some(_)) | (Some(_), None) => false,
         (Some(origin), Some(requested))
-            if !matches!(origin, 1..=7) || !matches!(requested, 1..=7) =>
+            if !matches!(origin, 1..=8) || !matches!(requested, 1..=8) =>
         {
             false
         }
         (Some(_), Some(_)) if kind == ObjectKind::BlobChunk => true,
         (Some(1), Some(requested))
-            if kind == ObjectKind::SourceEnvelope && matches!(requested, 1..=7) =>
+            if kind == ObjectKind::SourceEnvelope && matches!(requested, 1..=8) =>
         {
             true
         }
@@ -1607,7 +1607,7 @@ pub trait RecordStore {
         now_ms: Option<u64>,
         semantic_version: u16,
     ) -> Result<(), StoreError> {
-        if !matches!(semantic_version, 1..=7) {
+        if !matches!(semantic_version, 1..=8) {
             return Err(StoreError::Invalid(
                 "unsupported transfer semantic version".into(),
             ));
@@ -2054,6 +2054,10 @@ impl SqliteStore {
         }
         if version == 15 {
             migrate_v15_to_v16(&connection)?;
+            version = 16;
+        }
+        if version == 16 {
+            migrate_v16_to_v17(&connection)?;
         }
         persist_config(&connection, &config)?;
         Ok(Self {
@@ -2134,7 +2138,7 @@ impl SqliteStore {
         now_ms: Option<u64>,
         origin_semantic_version: Option<u16>,
     ) -> Result<(), StoreError> {
-        if origin_semantic_version.is_some_and(|version| !matches!(version, 1..=7)) {
+        if origin_semantic_version.is_some_and(|version| !matches!(version, 1..=8)) {
             return Err(StoreError::Invalid(
                 "unsupported transfer semantic version".into(),
             ));
@@ -2224,7 +2228,7 @@ impl SqliteStore {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        if selected_version.is_some_and(|version| !matches!(version, 1..=7)) {
+        if selected_version.is_some_and(|version| !matches!(version, 1..=8)) {
             return Err(StoreError::Invalid(
                 "unsupported transfer semantic version".into(),
             ));
@@ -2245,11 +2249,11 @@ impl SqliteStore {
                 values.push(vec![ObjectKind::SourceEnvelope as u8].into());
                 values.push(vec![ObjectKind::BlobChunk as u8].into());
             }
-            Some(2) | Some(3) | Some(4) | Some(5) | Some(6) | Some(7) => {
+            Some(2) | Some(3) | Some(4) | Some(5) | Some(6) | Some(7) | Some(8) => {
                 sql.push_str(
                     " WHERE i.origin_semantic_version IS NOT NULL AND\n\
                        (substr(i.object_id,1,1) IN (?,?) OR\n\
-                        (i.origin_semantic_version IN (2,3,4,5,6,7) AND\n\
+                        (i.origin_semantic_version IN (2,3,4,5,6,7,8) AND\n\
                          substr(i.object_id,1,1) IN (?,?,?)))",
                 );
                 values.push(vec![ObjectKind::SourceEnvelope as u8].into());
@@ -3512,7 +3516,7 @@ impl SqliteStore {
         item_id: &ItemId,
         semantic_version: u16,
     ) -> Result<Option<StoredItemRepresentation>, StoreError> {
-        if !matches!(semantic_version, 1..=7) {
+        if !matches!(semantic_version, 1..=8) {
             return Err(StoreError::Invalid(
                 "unsupported representation semantic version".into(),
             ));
@@ -11580,7 +11584,8 @@ fn create_schema(connection: &Connection) -> Result<(), StoreError> {
     migrate_v12_to_v13(connection)?;
     migrate_v13_to_v14(connection)?;
     migrate_v14_to_v15(connection)?;
-    migrate_v15_to_v16(connection)
+    migrate_v15_to_v16(connection)?;
+    migrate_v16_to_v17(connection)
 }
 
 fn migrate_v1_to_v2(connection: &Connection) -> Result<(), StoreError> {
@@ -12365,6 +12370,26 @@ fn migrate_v15_to_v16(connection: &Connection) -> Result<(), StoreError> {
            SELECT storage_key,object_id,origin_semantic_version FROM transfer_identities_v15;\n\
          DROP TABLE transfer_identities_v15;\n\
          PRAGMA user_version=16;\n\
+         COMMIT;",
+    )?;
+    Ok(())
+}
+
+fn migrate_v16_to_v17(connection: &Connection) -> Result<(), StoreError> {
+    connection.execute_batch(
+        "BEGIN IMMEDIATE;\n\
+         ALTER TABLE transfer_identities RENAME TO transfer_identities_v16;\n\
+         CREATE TABLE transfer_identities (\n\
+           storage_key BLOB PRIMARY KEY REFERENCES wants(object_id) ON DELETE CASCADE\n\
+             CHECK(length(storage_key)=32),\n\
+           object_id BLOB NOT NULL UNIQUE CHECK(length(object_id)=33),\n\
+           origin_semantic_version INTEGER\n\
+             CHECK(origin_semantic_version IS NULL OR origin_semantic_version IN (1,2,3,4,5,6,7,8))\n\
+         ) STRICT;\n\
+         INSERT INTO transfer_identities(storage_key,object_id,origin_semantic_version)\n\
+           SELECT storage_key,object_id,origin_semantic_version FROM transfer_identities_v16;\n\
+         DROP TABLE transfer_identities_v16;\n\
+         PRAGMA user_version=17;\n\
          COMMIT;",
     )?;
     Ok(())
@@ -17930,6 +17955,26 @@ mod sqlite_integration_tests {
             .unwrap();
     }
 
+    fn downgrade_schema_v17_to_v16_for_test(connection: &Connection) {
+        connection
+            .execute_batch(
+                "ALTER TABLE transfer_identities RENAME TO transfer_identities_v17;\n\
+                 CREATE TABLE transfer_identities (\n\
+                   storage_key BLOB PRIMARY KEY REFERENCES wants(object_id) ON DELETE CASCADE\n\
+                     CHECK(length(storage_key)=32),\n\
+                   object_id BLOB NOT NULL UNIQUE CHECK(length(object_id)=33),\n\
+                   origin_semantic_version INTEGER\n\
+                     CHECK(origin_semantic_version IS NULL OR origin_semantic_version IN (1,2,3,4,5,6,7))\n\
+                 ) STRICT;\n\
+                 INSERT INTO transfer_identities(storage_key,object_id,origin_semantic_version)\n\
+                   SELECT storage_key,object_id,origin_semantic_version\n\
+                   FROM transfer_identities_v17;\n\
+                 DROP TABLE transfer_identities_v17;\n\
+                 PRAGMA user_version=16;",
+            )
+            .unwrap();
+    }
+
     fn downgrade_schema_v12_to_v11_for_test(connection: &Connection) {
         downgrade_schema_v13_to_v12_for_test(connection);
         connection
@@ -18470,7 +18515,7 @@ mod sqlite_integration_tests {
         ));
         let existing_v5 = ObjectId::new(ObjectKind::SourceBatchProof, [0xd8; 32]);
         let new_v6 = ObjectId::new(ObjectKind::BridgeRouteWrapper, [0xd9; 32]);
-        let rejected_v8 = ObjectId::new(ObjectKind::SourceEnvelope, [0xda; 32]);
+        let new_v8 = ObjectId::new(ObjectKind::SourceEnvelope, [0xda; 32]);
         {
             let mut store = SqliteStore::open(&path, StoreConfig::default()).unwrap();
             store
@@ -18511,16 +18556,12 @@ mod sqlite_integration_tests {
             store
                 .put_sealed_chunk(transfer_storage_key(new_v6), 9, 0, &[3, 4, 5], None)
                 .unwrap();
-            assert!(matches!(
-                store.begin_transfer_for_semantic_version(
-                    rejected_v8,
-                    7,
-                    Priority::Routine,
-                    None,
-                    8
-                ),
-                Err(StoreError::Invalid(_))
-            ));
+            store
+                .begin_transfer_for_semantic_version(new_v8, 7, Priority::Routine, None, 8)
+                .unwrap();
+            store
+                .put_sealed_chunk(transfer_storage_key(new_v8), 7, 0, &[8, 8], None)
+                .unwrap();
         }
         {
             let mut store = SqliteStore::open(&path, StoreConfig::default()).unwrap();
@@ -18535,6 +18576,160 @@ mod sqlite_integration_tests {
                     && entry.origin_semantic_version == Some(6)
                     && entry.received == [ChunkRange::new(0, 3).unwrap()]
             }));
+            assert!(progress.iter().any(|entry| {
+                entry.object_id == new_v8
+                    && entry.origin_semantic_version == Some(8)
+                    && entry.received == [ChunkRange::new(0, 2).unwrap()]
+            }));
+        }
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("sqlite3-wal"));
+        let _ = fs::remove_file(path.with_extension("sqlite3-shm"));
+    }
+
+    #[test]
+    fn schema_v16_migrates_and_v8_provenance_survives_restart() {
+        let path = std::env::temp_dir().join(format!(
+            "aster-transfer-v16-to-v17-{}-{}.sqlite3",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let existing_v7 = ObjectId::new(ObjectKind::SourceBatchProof, [0xdc; 32]);
+        let new_v8 = ObjectId::new(ObjectKind::BridgeRouteWrapper, [0xdd; 32]);
+        {
+            let mut store = SqliteStore::open(&path, StoreConfig::default()).unwrap();
+            store
+                .begin_transfer_for_semantic_version(existing_v7, 8, Priority::Immediate, None, 7)
+                .unwrap();
+            store
+                .put_sealed_chunk(transfer_storage_key(existing_v7), 8, 0, &[1, 2], None)
+                .unwrap();
+        }
+        {
+            let connection = Connection::open(&path).unwrap();
+            downgrade_schema_v17_to_v16_for_test(&connection);
+            assert_eq!(
+                connection
+                    .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                16
+            );
+        }
+        {
+            let mut store = SqliteStore::open(&path, StoreConfig::default()).unwrap();
+            assert_eq!(
+                store
+                    .connection
+                    .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                17
+            );
+            let migrated = store.transfer_progress_for_semantic_version(8, 8).unwrap();
+            assert!(migrated.iter().any(|entry| {
+                entry.object_id == existing_v7
+                    && entry.origin_semantic_version == Some(7)
+                    && entry.received == [ChunkRange::new(0, 2).unwrap()]
+            }));
+            store
+                .begin_transfer_for_semantic_version(new_v8, 9, Priority::Routine, None, 8)
+                .unwrap();
+            store
+                .put_sealed_chunk(transfer_storage_key(new_v8), 9, 0, &[3, 4, 5], None)
+                .unwrap();
+        }
+        {
+            let mut store = SqliteStore::open(&path, StoreConfig::default()).unwrap();
+            let progress = store.transfer_progress_for_semantic_version(8, 8).unwrap();
+            assert!(progress.iter().any(|entry| {
+                entry.object_id == existing_v7
+                    && entry.origin_semantic_version == Some(7)
+                    && entry.received == [ChunkRange::new(0, 2).unwrap()]
+            }));
+            assert!(progress.iter().any(|entry| {
+                entry.object_id == new_v8
+                    && entry.origin_semantic_version == Some(8)
+                    && entry.received == [ChunkRange::new(0, 3).unwrap()]
+            }));
+        }
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("sqlite3-wal"));
+        let _ = fs::remove_file(path.with_extension("sqlite3-shm"));
+    }
+
+    #[test]
+    fn invalid_schema_v16_provenance_rolls_back_v17_migration() {
+        let path = std::env::temp_dir().join(format!(
+            "aster-transfer-v16-to-v17-rollback-{}-{}.sqlite3",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let existing_v7 = ObjectId::new(ObjectKind::SourceBatchProof, [0xde; 32]);
+        let storage_key = transfer_storage_key(existing_v7);
+        {
+            let mut store = SqliteStore::open(&path, StoreConfig::default()).unwrap();
+            store
+                .begin_transfer_for_semantic_version(existing_v7, 8, Priority::Immediate, None, 7)
+                .unwrap();
+        }
+        {
+            let connection = Connection::open(&path).unwrap();
+            downgrade_schema_v17_to_v16_for_test(&connection);
+            connection
+                .execute_batch("PRAGMA ignore_check_constraints=ON;")
+                .unwrap();
+            connection
+                .execute(
+                    "UPDATE transfer_identities SET origin_semantic_version=9\n\
+                     WHERE storage_key=?1",
+                    params![storage_key.as_slice()],
+                )
+                .unwrap();
+            connection
+                .execute_batch("PRAGMA ignore_check_constraints=OFF;")
+                .unwrap();
+        }
+
+        assert!(matches!(
+            SqliteStore::open(&path, StoreConfig::default()),
+            Err(StoreError::Sqlite(_))
+        ));
+
+        {
+            let connection = Connection::open(&path).unwrap();
+            assert_eq!(
+                connection
+                    .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                16
+            );
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT origin_semantic_version FROM transfer_identities\n\
+                         WHERE storage_key=?1",
+                        params![storage_key.as_slice()],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                9
+            );
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT count(*) FROM sqlite_master\n\
+                         WHERE type='table' AND name='transfer_identities_v16'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                0
+            );
         }
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(path.with_extension("sqlite3-wal"));
@@ -21376,7 +21571,13 @@ mod sqlite_integration_tests {
                 .len(),
             5
         );
-        assert!(store.transfer_progress_for_semantic_version(8, 16).is_err());
+        assert_eq!(
+            store
+                .transfer_progress_for_semantic_version(8, 16)
+                .unwrap()
+                .len(),
+            5
+        );
     }
 
     #[test]

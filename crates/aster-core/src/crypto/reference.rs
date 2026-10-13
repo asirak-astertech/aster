@@ -9985,7 +9985,7 @@ mod tests {
     }
 
     #[test]
-    fn mission_proof_rejects_stripping_v7_from_the_default_offer() {
+    fn mission_proof_rejects_stripping_v8_from_the_default_offer() {
         let mut provisioner = ReferenceProvisioner::from_seed([0x74; 32])
             .unwrap_or_else(|error| panic!("provisioner failed: {error}"));
         let initiator_bundle = provisioner
@@ -10015,6 +10015,7 @@ mod tests {
         assert_eq!(
             hello.supported_versions,
             vec![
+                SEMANTIC_PROTOCOL_V7,
                 SEMANTIC_PROTOCOL_V6,
                 SEMANTIC_PROTOCOL_V5,
                 SEMANTIC_PROTOCOL_V4,
