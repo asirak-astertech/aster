@@ -3403,9 +3403,35 @@ fn reconstruct_expected_image(
     expected.usage.publication_rows = u64::try_from(expected.publications.len())
         .map_err(|_| StoreError::ItemCountAccountingOverflow)?;
 
+    let mut saw_pending_without_order = false;
+    let mut saw_pending_with_order = false;
+    let mut next_pending_order = 1u64;
     for (key, value) in pending_sources {
         let transfer = super::parse_blob_transfer_id("pending Blob source table", &key)?;
-        let pending = super::decode_pending_blob_source(&value)?;
+        let mut pending = super::decode_pending_blob_source_for_encoding(
+            &value,
+            if schema == LifecycleSchemaState::Current {
+                super::PendingBlobEncodingGeneration::Current
+            } else {
+                super::PendingBlobEncodingGeneration::Predecessor
+            },
+        )?;
+        if pending.pending_acceptance_order == 0 {
+            saw_pending_without_order = true;
+            pending.pending_acceptance_order = next_pending_order;
+            next_pending_order = next_pending_order.checked_add(1).ok_or_else(|| {
+                StoreError::Blob(BlobStoreError::SchemaInvariant(
+                    "pending Blob acceptance order overflows during migration",
+                ))
+            })?;
+        } else {
+            saw_pending_with_order = true;
+        }
+        if saw_pending_without_order && saw_pending_with_order {
+            return Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
+                "pending Blob sources mix ordered and unordered predecessor generations",
+            )));
+        }
         if pending.metadata.transfer_id != transfer
             || import_lineages.get(&pending.metadata.variant_id) != Some(&pending.physical_lineage)
         {

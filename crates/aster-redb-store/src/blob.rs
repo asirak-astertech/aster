@@ -1116,6 +1116,7 @@ pub struct BlobReservation {
     publisher: NodeId,
     topic: Topic,
     scope: Scope,
+    ttl_ms: Option<u64>,
     previous_counter: u64,
     counter: u64,
     context: VersionVector,
@@ -1161,7 +1162,7 @@ impl BlobReservation {
             event_sequence: None,
             logical_key: route.blob_id().as_bytes().to_vec(),
             blob_route: Some(route),
-            ttl_ms: None,
+            ttl_ms: self.ttl_ms,
             content_len: manifest_len,
             tombstone: false,
             key_epoch,
@@ -1806,6 +1807,7 @@ struct PendingBlobSourceRecord {
     metadata: BlobMetadata,
     route_lineage: [u8; 32],
     physical_lineage: [u8; 32],
+    authenticated_source_binding: [u8; 32],
     carriers: Vec<PendingBlobCarrierRecord>,
     sealed: Vec<u8>,
 }
@@ -2418,6 +2420,8 @@ impl Store {
             .map(|value| decode_pending_blob_source(value.value()))
             .transpose()?
             .ok_or_else(|| blob_error(BlobStoreError::PendingSourceMissing))?;
+        require_pending_matches_verified_source(&pending, blob, &pending.sealed)
+            .map_err(|_| blob_error(BlobStoreError::CompletionMismatch))?;
         enforce_blob_policy_read(&read, authority, policy, &pending.metadata.header)?;
         require_pending_blob_plan(&pending, plan)?;
         blob.verify_exact_sealed(&pending.sealed)
@@ -2506,6 +2510,22 @@ impl Store {
         topic: &Topic,
         scope: &Scope,
     ) -> Result<BlobReservation, StoreError> {
+        self.reserve_blob_with_lifetime_policy(policy, publisher, topic, scope, None)
+    }
+
+    pub(crate) fn reserve_blob_with_lifetime_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        publisher: NodeId,
+        topic: &Topic,
+        scope: &Scope,
+        ttl_ms: Option<u64>,
+    ) -> Result<BlobReservation, StoreError> {
+        if ttl_ms == Some(0) {
+            return Err(blob_error(BlobStoreError::InvalidPublication(
+                "finite Blob TTL must be positive",
+            )));
+        }
         self.require_live()?;
         let authority = self.require_bound_mission()?;
         let read = self.database.begin_read()?;
@@ -2568,6 +2588,7 @@ impl Store {
             publisher,
             topic: topic.clone(),
             scope: scope.clone(),
+            ttl_ms,
             previous_counter,
             counter,
             context,
@@ -3114,6 +3135,7 @@ impl Store {
             metadata,
             route_lineage: *blob.route_lineage().binding(),
             physical_lineage: *blob.physical_lineage().binding(),
+            authenticated_source_binding: [0; 32],
             carriers,
             sealed: sealed.to_vec(),
         };
@@ -3145,6 +3167,9 @@ impl Store {
         } else {
             None
         };
+        pending.authenticated_source_binding =
+            pending_blob_authenticated_source_binding(&pending.metadata, &pending.sealed)?;
+        require_pending_matches_verified_source(&pending, blob, sealed)?;
         pressure::require_variant_write(&write, pending.metadata.variant_id)?;
         enforce_blob_policy_write(&write, authority, policy, &pending.metadata.header)?;
         let staging = blob_network_staging_usage_write(&write, authority)?;
@@ -3216,6 +3241,7 @@ impl Store {
                 lifecycle::VariantReferenceOwner::Publication,
                 transfer_id,
             )?;
+            write.commit()?;
             return Ok(BlobSourceStageOutcome::Duplicate);
         }
         if lifecycle::check_replay_fence(&write, replay_fence)?
@@ -4614,6 +4640,7 @@ impl Store {
                 return Err(blob_error(BlobStoreError::PendingSourceMissing));
             }
             if let Some(pending) = pending.as_ref() {
+                require_pending_authenticated_source_binding(pending)?;
                 require_pending_blob_plan(pending, plan)?;
                 enforce_blob_policy_read(&preflight, authority, policy, &pending.metadata.header)?;
                 if pending.metadata.transfer_id != source
@@ -4677,6 +4704,9 @@ impl Store {
         )?;
 
         let (metadata, sealed) = if let Some(pending) = pending.as_ref() {
+            // Recheck the authenticated-source projection in the final write
+            // transaction immediately before any publication/index mutation.
+            require_pending_authenticated_source_binding(pending)?;
             require_pending_blob_plan(pending, plan)?;
             (&pending.metadata, pending.sealed.as_slice())
         } else {
@@ -4989,11 +5019,69 @@ impl Store {
         sealed: &[u8],
         completion: &BlobDepotCompletion,
     ) -> Result<BlobOnceOutcome, StoreError> {
+        self.commit_reserved_blob_once_with_lifetime(
+            policy,
+            request,
+            reservation,
+            blob,
+            sealed,
+            completion,
+            BlobLifetime::Durable,
+        )
+    }
+
+    #[allow(
+        dead_code,
+        clippy::too_many_arguments,
+        reason = "Task 6 activates this crate-private local path"
+    )]
+    pub(crate) fn commit_reserved_local_finite_blob_once_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        request: &BlobOperationRequest<'_>,
+        reservation: &BlobReservation,
+        blob: &ContentVerifiedBlobEnvelope,
+        sealed: &[u8],
+        completion: &BlobDepotCompletion,
+        age: custody::LowerBoundAgeCheckpoint,
+    ) -> Result<BlobOnceOutcome, StoreError> {
+        let ttl_ms = reservation.ttl_ms.ok_or_else(|| {
+            blob_error(BlobStoreError::InvalidPublication(
+                "local finite Blob reservation is missing its TTL",
+            ))
+        })?;
+        self.commit_reserved_blob_once_with_lifetime(
+            policy,
+            request,
+            reservation,
+            blob,
+            sealed,
+            completion,
+            BlobLifetime::Finite {
+                ttl_ms,
+                age,
+                provenance: BlobFiniteProvenance::Local,
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn commit_reserved_blob_once_with_lifetime(
+        &self,
+        policy: &ControlPolicySnapshot,
+        request: &BlobOperationRequest<'_>,
+        reservation: &BlobReservation,
+        blob: &ContentVerifiedBlobEnvelope,
+        sealed: &[u8],
+        completion: &BlobDepotCompletion,
+        lifetime: BlobLifetime,
+    ) -> Result<BlobOnceOutcome, StoreError> {
         self.require_live()?;
         if policy != reservation.control_policy() {
             return Err(blob_error(BlobStoreError::ReservationChanged));
         }
-        let prepared = PreparedBlobPublication::from_verified(blob, sealed, completion)?;
+        validate_blob_lifetime(lifetime)?;
+        let prepared = PreparedBlobPublication::from_verified(blob, sealed, completion, lifetime)?;
         validate_blob_reservation(reservation, &prepared)?;
         validate_blob_publication_intent(request.intent, &prepared)?;
 
@@ -5409,6 +5497,7 @@ impl PreparedBlobPublication {
         blob: &ContentVerifiedBlobEnvelope,
         sealed: &[u8],
         completion: &BlobDepotCompletion,
+        lifetime: BlobLifetime,
     ) -> Result<Self, StoreError> {
         blob.verify_exact_sealed(sealed)
             .map_err(|error| blob_error(BlobStoreError::Verification(error.to_string())))?;
@@ -5454,7 +5543,7 @@ impl PreparedBlobPublication {
             manifest_digest,
             route_lineage: Some(route_lineage),
             physical_lineage: Some(physical_lineage),
-            lifetime: BlobLifetime::Durable,
+            lifetime,
             header: header.clone(),
         })?;
         Ok(Self {
@@ -9546,6 +9635,7 @@ fn validate_blob_reservation(
         || header.topic != reservation.topic
         || header.scope != reservation.scope
         || header.stamp.context != reservation.context
+        || header.ttl_ms != reservation.ttl_ms
     {
         return Err(blob_error(BlobStoreError::InvalidPublication(
             "sealed Blob does not match its durable reservation",
@@ -11937,6 +12027,7 @@ pub(crate) fn audit_blob_tables_write(
         write,
         read_mission_binding(write)?,
         &publications,
+        pending_blob_encoding_for_publication_encoding(publication_encoding),
     )?;
     stats.pending_sources = network.pending_sources;
     stats.carrier_prefixes = network.carrier_prefixes;
@@ -12251,7 +12342,11 @@ pub(crate) fn inspect_blob_tables_read(
     stats.committed_file_bytes = depot_stats.committed_file_bytes;
     stats.reserved_file_bytes = depot_stats.reserved_file_bytes;
     if network_present == network.len() {
-        let network = inspect_blob_network_tables_read_with_publications(read, &publications)?;
+        let network = inspect_blob_network_tables_read_with_publications(
+            read,
+            &publications,
+            pending_blob_encoding_for_publication_encoding(publication_encoding),
+        )?;
         stats.pending_sources = network.pending_sources;
         stats.carrier_prefixes = network.carrier_prefixes;
         stats.network_staging_bytes = network.staging.bytes;
@@ -12294,7 +12389,14 @@ pub(crate) fn inspect_blob_tables_read(
     lifecycle_usage.apply_to_stats(&mut stats);
     drop(publications);
     drop(markers);
-    pressure::inspect_pressure_read(read)?;
+    pressure::inspect_pressure_read(
+        read,
+        matches!(
+            publication_encoding,
+            lifecycle::PublicationEncodingGeneration::Current
+                | lifecycle::PublicationEncodingGeneration::RawCurrent
+        ),
+    )?;
     Ok(BlobAuditSnapshot {
         stats,
         deletion_schema_migrated: false,
@@ -12705,6 +12807,7 @@ fn audit_blob_network_rows(
     imports: &impl ReadableTable<&'static [u8], &'static [u8]>,
     chunks: &impl ReadableTable<&'static [u8], &'static [u8]>,
     mission_authority: Option<NodeId>,
+    pending_encoding: PendingBlobEncodingGeneration,
 ) -> Result<BlobNetworkAudit, StoreError> {
     #[cfg(test)]
     TEST_BLOB_NETWORK_GLOBAL_AUDITS.with(|count| count.set(count.get().saturating_add(1)));
@@ -12723,7 +12826,7 @@ fn audit_blob_network_rows(
     for row in pending.iter()? {
         let (key, value) = row?;
         let source = parse_blob_transfer_id("pending Blob source table", key.value())?;
-        let record = decode_pending_blob_source(value.value())?;
+        let record = decode_pending_blob_source_for_encoding(value.value(), pending_encoding)?;
         let Some(route) = record.metadata.header.blob_route else {
             return Err(blob_error(BlobStoreError::SchemaInvariant(
                 "pending Blob source key or network profile is inconsistent",
@@ -12861,6 +12964,7 @@ fn audit_blob_network_tables_write_with_publications(
     write: &redb::WriteTransaction,
     mission_authority: Option<NodeId>,
     publications: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    pending_encoding: PendingBlobEncodingGeneration,
 ) -> Result<BlobNetworkAudit, StoreError> {
     let pending = write.open_table(BLOB_PENDING_SOURCES)?;
     let carriers = write.open_table(BLOB_CARRIER_PREFIXES)?;
@@ -12877,12 +12981,14 @@ fn audit_blob_network_tables_write_with_publications(
         &imports,
         &chunks,
         mission_authority,
+        pending_encoding,
     )
 }
 
 fn inspect_blob_network_tables_read_with_publications(
     read: &redb::ReadTransaction,
     publications: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    pending_encoding: PendingBlobEncodingGeneration,
 ) -> Result<BlobNetworkAudit, StoreError> {
     let pending = read.open_table(BLOB_PENDING_SOURCES)?;
     let carriers = read.open_table(BLOB_CARRIER_PREFIXES)?;
@@ -12899,6 +13005,7 @@ fn inspect_blob_network_tables_read_with_publications(
         &imports,
         &chunks,
         read_mission_binding_read(read)?,
+        pending_encoding,
     )
 }
 
@@ -13298,6 +13405,97 @@ fn decode_retired_blob_metadata_for_encoding(
     decode_blob_metadata(payload).map(|metadata| Some((metadata, marker)))
 }
 
+const PENDING_BLOB_AUTHENTICATED_SOURCE_DOMAIN: &[u8] =
+    b"aster/store/blob/pending-authenticated-source/v1";
+
+fn pending_blob_authenticated_source_binding(
+    metadata: &BlobMetadata,
+    sealed: &[u8],
+) -> Result<[u8; 32], StoreError> {
+    let encoded_metadata = encode_blob_metadata(metadata.clone())?;
+    let mut digest = Sha256::new();
+    digest.update(PENDING_BLOB_AUTHENTICATED_SOURCE_DOMAIN);
+    digest.update(metadata.transfer_id.as_bytes());
+    digest.update(Sha256::digest(sealed));
+    digest.update(
+        u64::try_from(sealed.len())
+            .map_err(|_| StoreError::PayloadByteAccountingOverflow)?
+            .to_be_bytes(),
+    );
+    digest.update(
+        u64::try_from(encoded_metadata.len())
+            .map_err(|_| StoreError::PayloadByteAccountingOverflow)?
+            .to_be_bytes(),
+    );
+    digest.update(&encoded_metadata);
+    Ok(digest.finalize().into())
+}
+
+fn require_pending_authenticated_source_binding(
+    pending: &PendingBlobSourceRecord,
+) -> Result<(), StoreError> {
+    if pending.authenticated_source_binding
+        != pending_blob_authenticated_source_binding(&pending.metadata, &pending.sealed)?
+    {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "pending Blob metadata differs from its authenticated source binding",
+        )));
+    }
+    Ok(())
+}
+
+fn require_pending_matches_verified_source(
+    pending: &PendingBlobSourceRecord,
+    blob: &ContentVerifiedBlobEnvelope,
+    sealed: &[u8],
+) -> Result<(), StoreError> {
+    blob.verify_exact_sealed(sealed)
+        .map_err(|error| blob_error(BlobStoreError::Verification(error.to_string())))?;
+    let manifest = blob.manifest();
+    if pending.sealed != sealed
+        || pending.metadata.transfer_id != BlobTransferId::new(blob.envelope_id())
+        || pending.metadata.semantic_id != BlobSemanticId::new(blob.item_id())
+        || pending.metadata.blob_id != blob.blob_id()
+        || pending.metadata.variant_id
+            != blob_variant_id(
+                blob.blob_id(),
+                manifest.content_group(),
+                manifest.content_epoch(),
+            )
+        || pending.metadata.manifest_digest != *blob.manifest_digest()
+        || pending.metadata.route_lineage != Some(*blob.route_lineage().binding())
+        || pending.metadata.physical_lineage != Some(*blob.physical_lineage().binding())
+        || pending.metadata.header != *blob.header()
+        || pending.route_lineage != *blob.route_lineage().binding()
+        || pending.physical_lineage != *blob.physical_lineage().binding()
+    {
+        return Err(blob_error(BlobStoreError::PendingSourceConflict));
+    }
+    require_pending_authenticated_source_binding(pending)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingBlobEncodingGeneration {
+    Predecessor,
+    Current,
+}
+
+fn pending_blob_encoding_for_publication_encoding(
+    generation: lifecycle::PublicationEncodingGeneration,
+) -> PendingBlobEncodingGeneration {
+    match generation {
+        lifecycle::PublicationEncodingGeneration::Current
+        | lifecycle::PublicationEncodingGeneration::RawCurrent => {
+            PendingBlobEncodingGeneration::Current
+        }
+        lifecycle::PublicationEncodingGeneration::RawPredecessor
+        | lifecycle::PublicationEncodingGeneration::LifecycleV1
+        | lifecycle::PublicationEncodingGeneration::LifecycleV2OrV3 => {
+            PendingBlobEncodingGeneration::Predecessor
+        }
+    }
+}
+
 fn encode_pending_blob_source(record: &PendingBlobSourceRecord) -> Result<Vec<u8>, StoreError> {
     if record.pending_acceptance_order == 0
         || record.route_lineage == [0; 32]
@@ -13332,6 +13530,7 @@ fn encode_pending_blob_source(record: &PendingBlobSourceRecord) -> Result<Vec<u8
     {
         return Err(blob_error(BlobStoreError::PendingSourceConflict));
     }
+    require_pending_authenticated_source_binding(record)?;
     let metadata = encode_blob_metadata(record.metadata.clone())?;
     let metadata_len = u32::try_from(metadata.len()).map_err(|_| {
         blob_error(BlobStoreError::InvalidPublication(
@@ -13346,7 +13545,7 @@ fn encode_pending_blob_source(record: &PendingBlobSourceRecord) -> Result<Vec<u8
     let mut encoded = Vec::with_capacity(
         1usize
             .checked_add(72)
-            .and_then(|value| value.checked_add(4))
+            .and_then(|value| value.checked_add(32 + 4))
             .and_then(|value| value.checked_add(metadata.len()))
             .and_then(|value| value.checked_add(4))
             .and_then(|value| {
@@ -13366,6 +13565,7 @@ fn encode_pending_blob_source(record: &PendingBlobSourceRecord) -> Result<Vec<u8
     encoded.extend_from_slice(&record.physical_lineage);
     encoded.extend_from_slice(&metadata_len.to_be_bytes());
     encoded.extend_from_slice(&metadata);
+    encoded.extend_from_slice(&record.authenticated_source_binding);
     encoded.extend_from_slice(&carrier_count.to_be_bytes());
     for carrier in &record.carriers {
         encoded.extend_from_slice(carrier.object.as_bytes());
@@ -13377,11 +13577,19 @@ fn encode_pending_blob_source(record: &PendingBlobSourceRecord) -> Result<Vec<u8
 }
 
 fn decode_pending_blob_source(bytes: &[u8]) -> Result<PendingBlobSourceRecord, StoreError> {
+    decode_pending_blob_source_for_encoding(bytes, PendingBlobEncodingGeneration::Current)
+}
+
+fn decode_pending_blob_source_for_encoding(
+    bytes: &[u8],
+    generation: PendingBlobEncodingGeneration,
+) -> Result<PendingBlobSourceRecord, StoreError> {
     let mut cursor = MetadataCursor::new(bytes);
     let version = cursor.u8()?;
-    let pending_acceptance_order = match version {
-        LEGACY_PENDING_BLOB_SOURCE_VERSION => 0,
-        PENDING_BLOB_SOURCE_VERSION_V2 | PENDING_BLOB_SOURCE_VERSION => {
+    let pending_acceptance_order = match (generation, version) {
+        (PendingBlobEncodingGeneration::Predecessor, LEGACY_PENDING_BLOB_SOURCE_VERSION) => 0,
+        (PendingBlobEncodingGeneration::Predecessor, PENDING_BLOB_SOURCE_VERSION_V2)
+        | (PendingBlobEncodingGeneration::Current, PENDING_BLOB_SOURCE_VERSION) => {
             let order = cursor.u64()?;
             if order == 0 {
                 return Err(blob_error(BlobStoreError::SchemaInvariant(
@@ -13392,7 +13600,7 @@ fn decode_pending_blob_source(bytes: &[u8]) -> Result<PendingBlobSourceRecord, S
         }
         _ => {
             return Err(blob_error(BlobStoreError::SchemaInvariant(
-                "unknown pending Blob source encoding version",
+                "pending Blob source encoding contradicts its lifecycle schema",
             )));
         }
     };
@@ -13408,7 +13616,17 @@ fn decode_pending_blob_source(bytes: &[u8]) -> Result<PendingBlobSourceRecord, S
             "pending Blob metadata length overflows",
         ))
     })?;
-    let metadata = decode_blob_metadata(cursor.take(metadata_len)?)?;
+    let metadata_bytes = cursor.take(metadata_len)?;
+    let expected_metadata_version = match generation {
+        PendingBlobEncodingGeneration::Predecessor => BLOB_METADATA_VERSION_V2,
+        PendingBlobEncodingGeneration::Current => BLOB_METADATA_VERSION,
+    };
+    if metadata_bytes.first().copied() != Some(expected_metadata_version) {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "pending Blob metadata encoding contradicts its lifecycle schema",
+        )));
+    }
+    let metadata = decode_blob_metadata(metadata_bytes)?;
     if metadata.route_lineage != Some(route_lineage)
         || metadata.physical_lineage != Some(physical_lineage)
     {
@@ -13416,6 +13634,11 @@ fn decode_pending_blob_source(bytes: &[u8]) -> Result<PendingBlobSourceRecord, S
             "pending Blob source metadata differs from its lineage binding",
         )));
     }
+    let authenticated_source_binding = if generation == PendingBlobEncodingGeneration::Current {
+        cursor.array()?
+    } else {
+        [0; 32]
+    };
     let carrier_count = usize::try_from(cursor.u32()?).map_err(|_| {
         blob_error(BlobStoreError::SchemaInvariant(
             "pending Blob carrier count overflows",
@@ -13477,14 +13700,21 @@ fn decode_pending_blob_source(bytes: &[u8]) -> Result<PendingBlobSourceRecord, S
             "pending Blob source fails its exact transfer identity",
         )));
     }
-    Ok(PendingBlobSourceRecord {
+    let mut pending = PendingBlobSourceRecord {
         pending_acceptance_order,
         metadata,
         route_lineage,
         physical_lineage,
+        authenticated_source_binding,
         carriers,
         sealed,
-    })
+    };
+    if generation == PendingBlobEncodingGeneration::Predecessor {
+        pending.authenticated_source_binding =
+            pending_blob_authenticated_source_binding(&pending.metadata, &pending.sealed)?;
+    }
+    require_pending_authenticated_source_binding(&pending)?;
+    Ok(pending)
 }
 
 fn current_pending_projection_read(
@@ -14119,16 +14349,17 @@ mod tests {
     ) -> BlobProof {
         let policy = store.control_policy_snapshot().expect("Blob policy");
         let reservation = store
-            .reserve_blob_with_policy(
+            .reserve_blob_with_lifetime_policy(
                 &policy,
                 services.publisher.identity(),
                 &blob_topic(),
                 &blob_scope(),
+                ttl_ms,
             )
             .expect("Blob reservation");
         let finished = finish_variant(store, &services.publisher, prepared, plaintext, epoch)
             .expect("finish Blob depot variant");
-        let mut header = reservation
+        let header = reservation
             .header(
                 priority,
                 finished.route_commitment(),
@@ -14136,7 +14367,6 @@ mod tests {
                 epoch,
             )
             .expect("Blob header");
-        header.ttl_ms = ttl_ms;
         let sealed = services
             .publisher
             .seal_blob_manifest(&header, finished.manifest_bytes())
@@ -14435,6 +14665,43 @@ mod tests {
         assert_eq!(decode_blob_lifetime(&expected).expect("decode"), lifetime);
         assert_eq!(encode_blob_lifetime(BlobLifetime::Durable).unwrap(), [0]);
 
+        // Every bounded field boundary fails closed; no truncated checkpoint
+        // or provenance shape can be reinterpreted as a shorter generation.
+        for truncated_len in [0, 1, 8, 17, 18, 33, 42, 49, 50, 51, 54] {
+            assert!(decode_blob_lifetime(&expected[..truncated_len]).is_err());
+        }
+        for (offset, replacement) in [(17, 2), (50, 2)] {
+            let mut malformed = expected.clone();
+            malformed[offset] = replacement;
+            assert!(decode_blob_lifetime(&malformed).is_err());
+        }
+        let mut zero_clock = expected.clone();
+        zero_clock[18..34].fill(0);
+        assert!(decode_blob_lifetime(&zero_clock).is_err());
+        let mut zero_generation = expected.clone();
+        zero_generation[42..50].fill(0);
+        assert!(decode_blob_lifetime(&zero_generation).is_err());
+        let mut zero_ttl = expected.clone();
+        zero_ttl[1..9].fill(0);
+        assert!(decode_blob_lifetime(&zero_ttl).is_err());
+        let no_checkpoint = encode_blob_lifetime(BlobLifetime::Finite {
+            ttl_ms: 10,
+            age: custody::LowerBoundAgeCheckpoint {
+                cumulative_age_ms: 1,
+                checkpoint: None,
+                continuity_generation: 0,
+                continuity_lost: true,
+            },
+            provenance: BlobFiniteProvenance::Local,
+        })
+        .unwrap();
+        let mut bad_no_checkpoint_generation = no_checkpoint.clone();
+        bad_no_checkpoint_generation[18..26].copy_from_slice(&1u64.to_be_bytes());
+        assert!(decode_blob_lifetime(&bad_no_checkpoint_generation).is_err());
+        let mut bad_no_checkpoint_continuity = no_checkpoint;
+        bad_no_checkpoint_continuity[26] = 0;
+        assert!(decode_blob_lifetime(&bad_no_checkpoint_continuity).is_err());
+
         // Mutation caught: surplus bytes and unsupported protocol provenance
         // must be corruption rather than forward-compatible reinterpretation.
         let mut surplus = expected.clone();
@@ -14524,6 +14791,10 @@ mod tests {
             metadata: metadata.clone(),
             route_lineage: metadata.route_lineage.unwrap(),
             physical_lineage: metadata.physical_lineage.unwrap(),
+            authenticated_source_binding: pending_blob_authenticated_source_binding(
+                &metadata, &sealed,
+            )
+            .unwrap(),
             carriers: vec![PendingBlobCarrierRecord {
                 object: BlobCarrierObjectId::new(object).unwrap(),
                 total_len: 123,
@@ -14546,7 +14817,7 @@ mod tests {
     }
 
     #[test]
-    fn verified_finite_projection_stages_promotes_and_reopens_without_lifetime_reset() {
+    fn verified_finite_projection_stages_promotes_merges_duplicate_and_reopens() {
         let source_root = BlobTestRoot::new("verified-finite-source");
         let target_root = BlobTestRoot::new("verified-finite-target");
         let mut services = blob_services(0x64);
@@ -14630,7 +14901,184 @@ mod tests {
         // Mutation caught: staging or reopen cannot discard authenticated age,
         // exact TTL, or semantic-v8/profile-3 provenance.
         assert_eq!(pending_lifetime(&target), expected);
+        let (original_pending, original_pressure_root, original_staging_bytes) = {
+            let read = target
+                .database
+                .begin_read()
+                .expect("pending authority snapshot");
+            let pending = read
+                .open_table(BLOB_PENDING_SOURCES)
+                .expect("pending authority table")
+                .get(transfer.as_bytes().as_slice())
+                .expect("pending authority lookup")
+                .expect("pending authority row")
+                .value()
+                .to_vec();
+            let pressure = read
+                .open_table(pressure::BLOB_PRESSURE_PENDING_ROOTS)
+                .expect("pending pressure authority table")
+                .get(transfer.as_bytes().as_slice())
+                .expect("pending pressure authority lookup")
+                .expect("pending pressure authority row")
+                .value()
+                .to_vec();
+            let staging_bytes = read
+                .open_table(BLOB_NETWORK_METADATA)
+                .expect("pending staging accounting")
+                .get(BLOB_NETWORK_STAGING_BYTES)
+                .expect("pending staging byte lookup")
+                .expect("pending staging byte counter")
+                .value();
+            (pending, pressure, staging_bytes)
+        };
         drop(target);
+
+        // The same-size matrix covers every duplicated authenticated identity.
+        // Case zero leaves the old binding in place; the remaining cases
+        // simulate a writer recomputing the pending-row binding without the
+        // independently stored pressure authority.
+        for case in 0..7 {
+            let tampered = mutate_current_pending_metadata_for_test(
+                &original_pending,
+                case != 0,
+                |metadata| match case {
+                    0 | 1 => metadata.semantic_id = BlobSemanticId::new([0x91 + case; 32]),
+                    2 => metadata.header.stamp.dot.publisher = [0x93; 32],
+                    3 => metadata.header.stamp.dot.counter += 1,
+                    4 => {
+                        metadata.header.ttl_ms = Some(5_001);
+                        let BlobLifetime::Finite { ttl_ms, .. } = &mut metadata.lifetime else {
+                            panic!("finite pending lifetime");
+                        };
+                        *ttl_ms = 5_001;
+                    }
+                    5 => metadata.header.priority = Priority::Priority,
+                    6 => metadata.manifest_digest = [0x97; 32],
+                    _ => unreachable!(),
+                },
+            );
+            assert_eq!(tampered.len(), original_pending.len());
+            rewrite_pending_row_for_test(&target_root.database, transfer, &tampered);
+            let corrupted = blob_database_digest(&target_root.database);
+            assert_blob_schema_invariant(
+                &Store::inspect_existing(&target_root.database)
+                    .expect_err("read-only pending identity tamper must fail"),
+            );
+            let writable = Store::open_for_mission(&target_root.database, services.authority)
+                .err()
+                .expect("writable pending identity tamper must fail");
+            assert_blob_schema_invariant(&writable);
+            assert_eq!(blob_database_digest(&target_root.database), corrupted);
+            rewrite_pending_row_for_test(&target_root.database, transfer, &original_pending);
+        }
+
+        // A structurally complete predecessor-v2 pending row is not accepted
+        // merely because its tags and byte accounting are self-consistent in
+        // an otherwise-current lifecycle-v4 database.
+        let predecessor_v2 = {
+            let mut pending = decode_pending_blob_source(&original_pending).unwrap();
+            pending.metadata.lifetime = BlobLifetime::Durable;
+            pending.metadata.header.ttl_ms = None;
+            let metadata = downgrade_blob_metadata_to_v2_for_test(
+                &encode_blob_metadata(pending.metadata).unwrap(),
+            );
+            let metadata_length_offset = 1 + 8 + 2 * 32;
+            let metadata_offset = metadata_length_offset + 4;
+            let old_metadata_len = usize::try_from(u32::from_be_bytes(
+                original_pending[metadata_length_offset..metadata_offset]
+                    .try_into()
+                    .unwrap(),
+            ))
+            .unwrap();
+            let mut predecessor = original_pending[..metadata_length_offset].to_vec();
+            predecessor[0] = PENDING_BLOB_SOURCE_VERSION_V2;
+            predecessor.extend_from_slice(&u32::try_from(metadata.len()).unwrap().to_be_bytes());
+            predecessor.extend_from_slice(&metadata);
+            predecessor
+                .extend_from_slice(&original_pending[metadata_offset + old_metadata_len + 32..]);
+            predecessor
+        };
+        rewrite_pending_row_for_test(&target_root.database, transfer, &predecessor_v2);
+        {
+            let database = Database::open(&target_root.database).unwrap();
+            let write = database.begin_write().unwrap();
+            write
+                .open_table(BLOB_NETWORK_METADATA)
+                .unwrap()
+                .insert(
+                    BLOB_NETWORK_STAGING_BYTES,
+                    original_staging_bytes
+                        - u64::try_from(original_pending.len() - predecessor_v2.len()).unwrap(),
+                )
+                .unwrap();
+            write.commit().unwrap();
+        }
+        let predecessor_v2_digest = blob_database_digest(&target_root.database);
+        assert_blob_schema_invariant(
+            &Store::inspect_existing(&target_root.database)
+                .expect_err("current lifecycle must reject pending v2"),
+        );
+        let writable = Store::open_for_mission(&target_root.database, services.authority)
+            .err()
+            .expect("writable current lifecycle must reject pending v2");
+        assert_blob_schema_invariant(&writable);
+        assert_eq!(
+            blob_database_digest(&target_root.database),
+            predecessor_v2_digest
+        );
+        rewrite_pending_row_for_test(&target_root.database, transfer, &original_pending);
+        {
+            let database = Database::open(&target_root.database).unwrap();
+            let write = database.begin_write().unwrap();
+            write
+                .open_table(BLOB_NETWORK_METADATA)
+                .unwrap()
+                .insert(BLOB_NETWORK_STAGING_BYTES, original_staging_bytes)
+                .unwrap();
+            write.commit().unwrap();
+        }
+
+        // Tampering only the independent authority copy is equally fatal.
+        let mut pressure_root = pressure::decode_pending_root(&original_pressure_root).unwrap();
+        pressure_root.authenticated_source_binding[0] ^= 0x80;
+        let tampered_pressure = pressure::encode_pending_root(&pressure_root).unwrap();
+        {
+            let database = Database::open(&target_root.database).unwrap();
+            let write = database.begin_write().unwrap();
+            write
+                .open_table(pressure::BLOB_PRESSURE_PENDING_ROOTS)
+                .unwrap()
+                .insert(transfer.as_bytes().as_slice(), tampered_pressure.as_slice())
+                .unwrap();
+            write.commit().unwrap();
+        }
+        let pressure_tamper_digest = blob_database_digest(&target_root.database);
+        assert_blob_schema_invariant(
+            &Store::inspect_existing(&target_root.database)
+                .expect_err("read-only pressure binding tamper must fail"),
+        );
+        let writable = Store::open_for_mission(&target_root.database, services.authority)
+            .err()
+            .expect("writable pressure binding tamper must fail");
+        assert_blob_schema_invariant(&writable);
+        assert_eq!(
+            blob_database_digest(&target_root.database),
+            pressure_tamper_digest
+        );
+        {
+            let database = Database::open(&target_root.database).unwrap();
+            let write = database.begin_write().unwrap();
+            write
+                .open_table(pressure::BLOB_PRESSURE_PENDING_ROOTS)
+                .unwrap()
+                .insert(
+                    transfer.as_bytes().as_slice(),
+                    original_pressure_root.as_slice(),
+                )
+                .unwrap();
+            write.commit().unwrap();
+        }
+
         let target = Store::open_for_mission(&target_root.database, services.authority)
             .expect("reopen finite pending source");
         assert_eq!(pending_lifetime(&target), expected);
@@ -14661,6 +15109,48 @@ mod tests {
             .reader
             .verify_current_blob_lineage(&proof.blob)
             .expect("finite current lineage");
+
+        // Recheck the cross-indexed authority in the final promotion
+        // transaction. A same-row metadata+binding rewrite must fail before
+        // publication, pressure-index, frontier, or counter mutation.
+        let promotion_tamper =
+            mutate_current_pending_metadata_for_test(&original_pending, true, |metadata| {
+                metadata.header.priority = Priority::Priority
+            });
+        {
+            let write = target.database.begin_write().unwrap();
+            write
+                .open_table(BLOB_PENDING_SOURCES)
+                .unwrap()
+                .insert(transfer.as_bytes().as_slice(), promotion_tamper.as_slice())
+                .unwrap();
+            write.commit().unwrap();
+        }
+        let before_rejected_promotion = blob_current_admission_digest(&target);
+        assert_blob_schema_invariant(
+            &target
+                .apply_verified_blob_with_policy(
+                    &policy,
+                    &plan,
+                    &lineage,
+                    &depot_completion,
+                    &content_completion,
+                )
+                .expect_err("tampered pending authority must not promote"),
+        );
+        assert_eq!(
+            blob_current_admission_digest(&target),
+            before_rejected_promotion
+        );
+        {
+            let write = target.database.begin_write().unwrap();
+            write
+                .open_table(BLOB_PENDING_SOURCES)
+                .unwrap()
+                .insert(transfer.as_bytes().as_slice(), original_pending.as_slice())
+                .unwrap();
+            write.commit().unwrap();
+        }
         assert!(matches!(
             target
                 .apply_verified_blob_with_policy(
@@ -14693,10 +15183,94 @@ mod tests {
         // Mutation caught: promotion must copy the pending lifetime exactly;
         // it cannot restart custody age at publication acceptance.
         assert_eq!(publication_lifetime(&target), expected);
+
+        let later_sample = CustodySample {
+            clock_id: [0x66; 16],
+            tick_ms: 100,
+        };
+        let later_admission = VerifiedFiniteBlobAdmission::for_test(
+            proof.blob.envelope_id(),
+            u64::try_from(proof.sealed.len()).expect("finite source length"),
+            proof.blob.item_id(),
+            proof.blob.blob_id(),
+            proof.blob.priority(),
+            5_000,
+            1_200,
+            later_sample,
+        );
+        assert_eq!(
+            target
+                .stage_verified_blob_source_with_lifetime(
+                    &policy,
+                    &proof.blob,
+                    &proof.sealed,
+                    &plan,
+                    Some(later_admission),
+                )
+                .expect("merge accepted finite duplicate"),
+            BlobSourceStageOutcome::Duplicate
+        );
+        let merged = BlobLifetime::Finite {
+            ttl_ms: 5_000,
+            age: custody::LowerBoundAgeCheckpoint {
+                cumulative_age_ms: 1_200,
+                checkpoint: Some(later_sample),
+                continuity_generation: 2,
+                continuity_lost: true,
+            },
+            provenance: BlobFiniteProvenance::NetworkV1 {
+                semantic_version: 8,
+                profile_id: aster_mesh::TransferProfileId::BlobCustodyV1 as u16,
+            },
+        };
+        // Mutation caught: returning Duplicate before committing the accepted
+        // branch would discard both the maximum age and sticky continuity loss.
+        assert_eq!(publication_lifetime(&target), merged);
+
+        let before_mismatch = {
+            let read = target
+                .database
+                .begin_read()
+                .expect("finite mismatch digest");
+            blob_database_digest_read(&read)
+        };
+        let mismatch = VerifiedFiniteBlobAdmission::for_test(
+            proof.blob.envelope_id(),
+            u64::try_from(proof.sealed.len()).expect("finite source length"),
+            proof.blob.item_id(),
+            proof.blob.blob_id(),
+            proof.blob.priority(),
+            4_999,
+            4_000,
+            CustodySample {
+                clock_id: [0x67; 16],
+                tick_ms: 200,
+            },
+        );
+        assert!(matches!(
+            target.stage_verified_blob_source_with_lifetime(
+                &policy,
+                &proof.blob,
+                &proof.sealed,
+                &plan,
+                Some(mismatch),
+            ),
+            Err(StoreError::Blob(BlobStoreError::PendingSourceConflict))
+        ));
+        // Mutation caught: a mismatched duplicate may not advance continuity,
+        // publication age, pressure indexes, or any aggregate counter.
+        let after_mismatch = {
+            let read = target
+                .database
+                .begin_read()
+                .expect("finite mismatch digest");
+            blob_database_digest_read(&read)
+        };
+        assert_eq!(after_mismatch, before_mismatch);
         drop(target);
         let reopened = Store::open_for_mission(&target_root.database, services.authority)
             .expect("reopen promoted finite source");
-        assert_eq!(publication_lifetime(&reopened), expected);
+        assert_eq!(publication_lifetime(&reopened), merged);
     }
 
     #[test]
@@ -17693,6 +18267,46 @@ mod tests {
         predecessor
     }
 
+    fn mutate_current_pending_metadata_for_test(
+        encoded: &[u8],
+        rebind: bool,
+        mutate: impl FnOnce(&mut BlobMetadata),
+    ) -> Vec<u8> {
+        let mut pending = decode_pending_blob_source(encoded).expect("current pending source");
+        mutate(&mut pending.metadata);
+        if rebind {
+            pending.authenticated_source_binding =
+                pending_blob_authenticated_source_binding(&pending.metadata, &pending.sealed)
+                    .expect("recompute test binding");
+            return encode_pending_blob_source(&pending).expect("re-encode rebound pending source");
+        }
+
+        let metadata_length_offset = 1 + 8 + 2 * 32;
+        let metadata_offset = metadata_length_offset + 4;
+        let metadata_len = usize::try_from(u32::from_be_bytes(
+            encoded[metadata_length_offset..metadata_offset]
+                .try_into()
+                .expect("pending metadata length"),
+        ))
+        .expect("pending metadata length fits usize");
+        let metadata = encode_blob_metadata(pending.metadata).expect("encode tampered metadata");
+        assert_eq!(metadata.len(), metadata_len, "tamper must remain same-size");
+        let mut tampered = encoded.to_vec();
+        tampered[metadata_offset..metadata_offset + metadata_len].copy_from_slice(&metadata);
+        tampered
+    }
+
+    fn rewrite_pending_row_for_test(path: &Path, transfer: BlobTransferId, encoded: &[u8]) {
+        let database = Database::open(path).expect("pending tamper database");
+        let write = database.begin_write().expect("pending tamper write");
+        write
+            .open_table(BLOB_PENDING_SOURCES)
+            .expect("pending tamper table")
+            .insert(transfer.as_bytes().as_slice(), encoded)
+            .expect("rewrite pending tamper row");
+        write.commit().expect("commit pending tamper row");
+    }
+
     fn downgrade_blob_publication_for_test(encoded: &[u8], wrapper: u8) -> Vec<u8> {
         let payload_offset = match encoded.get(1).copied() {
             Some(lifecycle::PUBLICATION_STATE_LIVE_TAG) => 2,
@@ -17753,7 +18367,7 @@ mod tests {
                     .to_be_bytes(),
             );
             predecessor.extend_from_slice(&metadata);
-            predecessor.extend_from_slice(&encoded[metadata_offset + metadata_len..]);
+            predecessor.extend_from_slice(&encoded[metadata_offset + metadata_len + 32..]);
             removed_bytes = removed_bytes
                 .checked_add(
                     u64::try_from(encoded.len() - predecessor.len())
@@ -17908,6 +18522,50 @@ mod tests {
             )
             .expect("downgrade predecessor pressure schema");
         write.commit().expect("commit lifecycle predecessor");
+    }
+
+    fn downgrade_blob_lifecycle_to_v3_for_test(path: &Path) {
+        let database = Database::open(path).expect("raw lifecycle-v3 database");
+        let write = database.begin_write().expect("raw lifecycle-v3 write");
+        let rows = write
+            .open_table(BLOB_PUBLICATIONS)
+            .expect("current publications")
+            .iter()
+            .expect("current publication rows")
+            .map(|row| {
+                let (key, value) = row.expect("current publication row");
+                (key.value().to_vec(), value.value().to_vec())
+            })
+            .collect::<Vec<_>>();
+        {
+            let mut publications = write
+                .open_table(BLOB_PUBLICATIONS)
+                .expect("rewrite lifecycle-v3 publications");
+            for (key, value) in rows {
+                let predecessor = downgrade_blob_publication_for_test(
+                    &value,
+                    lifecycle::PREDECESSOR_PUBLICATION_RECORD_VERSION,
+                );
+                publications
+                    .insert(key.as_slice(), predecessor.as_slice())
+                    .expect("write lifecycle-v3 publication");
+            }
+        }
+        downgrade_pending_sources_to_v2_for_test(&write);
+        write
+            .open_table(lifecycle::BLOB_LIFECYCLE_METADATA)
+            .expect("lifecycle-v3 metadata")
+            .insert("schema_version", 3)
+            .expect("lifecycle-v3 version");
+        write
+            .open_table(pressure::BLOB_PRESSURE_METADATA)
+            .expect("pressure-v3 metadata")
+            .insert(
+                pressure::PRESSURE_SCHEMA_VERSION_FIELD,
+                pressure::PREVIOUS_PRESSURE_SCHEMA_VERSION,
+            )
+            .expect("pressure-v3 version");
+        write.commit().expect("commit lifecycle-v3 predecessor");
     }
 
     fn downgrade_blob_lifecycle_to_v1_for_test(path: &Path) {
@@ -19520,6 +20178,163 @@ mod tests {
                 .blob_stats,
             partitioned
         );
+
+        let finite_root = BlobTestRoot::new("local-finite-operation-retry");
+        let finite_store = Store::open_for_mission(&finite_root.database, services.authority)
+            .expect("local finite store");
+        let finite_plaintext = b"local finite operation identity".to_vec();
+        let finite_prepared = prepared_blob(&finite_plaintext);
+        let finite_proof = prepare_blob_proof_with_lifetime(
+            &finite_store,
+            &mut services,
+            &finite_prepared,
+            &finite_plaintext,
+            1,
+            Priority::Immediate,
+            Some(5_000),
+        );
+        let finite_age = custody::LowerBoundAgeCheckpoint {
+            cumulative_age_ms: 250,
+            checkpoint: Some(CustodySample {
+                clock_id: [0x62; 16],
+                tick_ms: 1_000,
+            }),
+            continuity_generation: 1,
+            continuity_lost: false,
+        };
+        let finite_operation =
+            BlobOperationKey::new(b"local-finite-operation".to_vec()).expect("finite operation");
+        let finite_intent = BlobPublicationIntent::new_with_ttl(
+            services.publisher.identity(),
+            blob_topic(),
+            blob_scope(),
+            Priority::Immediate,
+            finite_prepared.id(),
+            Some(5_000),
+        )
+        .expect("finite intent");
+        let finite_request = BlobOperationRequest::new(&finite_operation, &finite_intent);
+        let inserted = finite_store
+            .commit_reserved_local_finite_blob_once_with_policy(
+                &finite_proof.policy,
+                &finite_request,
+                &finite_proof.reservation,
+                &finite_proof.blob,
+                &finite_proof.sealed,
+                &finite_proof.completion,
+                finite_age,
+            )
+            .expect("commit local finite Blob");
+        let finite_transfer = match inserted {
+            BlobOnceOutcome::Inserted { blob } => blob.transfer_id,
+            other => panic!("unexpected local finite insertion: {other:?}"),
+        };
+        let stored_finite_lifetime = |store: &Store| {
+            let read = store.database.begin_read().expect("local finite read");
+            let encoded = read
+                .open_table(BLOB_PUBLICATIONS)
+                .expect("local finite publications")
+                .get(finite_transfer.as_bytes().as_slice())
+                .expect("local finite lookup")
+                .expect("local finite publication")
+                .value()
+                .to_vec();
+            decode_blob_metadata(&encoded)
+                .expect("local finite metadata")
+                .lifetime
+        };
+        let expected_finite = BlobLifetime::Finite {
+            ttl_ms: 5_000,
+            age: finite_age,
+            provenance: BlobFiniteProvenance::Local,
+        };
+        assert_eq!(stored_finite_lifetime(&finite_store), expected_finite);
+        let finite_stats = finite_store.blob_stats().expect("finite operation stats");
+        assert!(matches!(
+            finite_store
+                .commit_reserved_local_finite_blob_once_with_policy(
+                    &finite_proof.policy,
+                    &finite_request,
+                    &finite_proof.reservation,
+                    &finite_proof.blob,
+                    &finite_proof.sealed,
+                    &finite_proof.completion,
+                    finite_age,
+                )
+                .expect("exact finite retry"),
+            BlobOnceOutcome::Existing { .. }
+        ));
+        assert_eq!(
+            finite_store.blob_stats().expect("finite retry stats"),
+            finite_stats
+        );
+
+        for conflicting in [
+            BlobPublicationIntent::new(
+                services.publisher.identity(),
+                blob_topic(),
+                blob_scope(),
+                Priority::Immediate,
+                finite_prepared.id(),
+            )
+            .expect("durable conflict"),
+            BlobPublicationIntent::new_with_ttl(
+                services.publisher.identity(),
+                blob_topic(),
+                blob_scope(),
+                Priority::Immediate,
+                finite_prepared.id(),
+                Some(5_001),
+            )
+            .expect("TTL conflict"),
+        ] {
+            assert!(matches!(
+                finite_store.blob_for_operation_with_policy(
+                    &finite_proof.policy,
+                    &BlobOperationRequest::new(&finite_operation, &conflicting),
+                ),
+                Err(StoreError::Blob(BlobStoreError::OperationConflict))
+            ));
+        }
+        assert!(matches!(
+            finite_store.reserve_blob_with_lifetime_policy(
+                &finite_proof.policy,
+                services.publisher.identity(),
+                &blob_topic(),
+                &blob_scope(),
+                Some(0),
+            ),
+            Err(StoreError::Blob(BlobStoreError::InvalidPublication(_)))
+        ));
+        // Mutation caught: local finite commit must bind exact TTL into the
+        // reservation, intent, metadata, and operation retry identity.
+        drop(finite_store);
+        let finite_reopened = Store::open_for_mission(&finite_root.database, services.authority)
+            .expect("reopen local finite store");
+        assert_eq!(stored_finite_lifetime(&finite_reopened), expected_finite);
+
+        // Mutation caught: a durable publication under the same operation key
+        // cannot be reinterpreted as finite after restart.
+        let durable_as_finite = BlobPublicationIntent::new_with_ttl(
+            services.publisher.identity(),
+            blob_topic(),
+            blob_scope(),
+            Priority::Immediate,
+            prepared.id(),
+            Some(5_000),
+        )
+        .expect("durable-to-finite conflict");
+        let reopened_durable = Store::open_for_mission(&root.database, services.authority)
+            .expect("reopen durable operation store");
+        assert!(matches!(
+            reopened_durable.blob_for_operation_with_policy(
+                &reopened_durable
+                    .control_policy_snapshot()
+                    .expect("durable policy"),
+                &BlobOperationRequest::new(&operation, &durable_as_finite),
+            ),
+            Err(StoreError::Blob(BlobStoreError::OperationConflict))
+        ));
     }
 
     #[test]
@@ -20767,63 +21582,160 @@ mod tests {
     #[test]
     fn finite_lifetime_schema_v3_to_v4_is_read_only_safe_atomic_and_idempotent() {
         let root = BlobTestRoot::new("finite-lifetime-v3-migration");
+        let source_root = BlobTestRoot::new("finite-lifetime-v3-pending-source");
         let mut services = blob_services(0xe1);
+        let retired = seed_retired_store_fixture(&root, &mut services);
         let store = Store::open_for_mission(&root.database, services.authority)
             .expect("current finite-lifetime schema");
         let plaintext = b"finite lifetime migration fixture";
         let prepared = prepared_blob(plaintext);
-        publish_blob(
+        let first = publish_blob(
             &store,
             &mut services,
             &prepared,
             plaintext,
             1,
-            b"finite-lifetime-v3-operation",
-        );
+            b"finite-lifetime-v3-operation-a",
+        )
+        .0;
+        let second = publish_blob(
+            &store,
+            &mut services,
+            &prepared,
+            plaintext,
+            1,
+            b"finite-lifetime-v3-operation-b",
+        )
+        .0;
+        assert_eq!(first.variant_id, second.variant_id);
         drop(store);
-
-        let database = Database::open(&root.database).expect("raw predecessor database");
-        let write = database.begin_write().expect("predecessor write");
-        let rows = write
-            .open_table(BLOB_PUBLICATIONS)
-            .unwrap()
-            .iter()
-            .unwrap()
-            .map(|row| {
-                let (key, value) = row.unwrap();
-                (key.value().to_vec(), value.value().to_vec())
-            })
-            .collect::<Vec<_>>();
-        {
-            let mut publications = write.open_table(BLOB_PUBLICATIONS).unwrap();
-            for (key, value) in rows {
-                let predecessor = downgrade_blob_publication_for_test(
-                    &value,
-                    lifecycle::PREDECESSOR_PUBLICATION_RECORD_VERSION,
-                );
-                publications
-                    .insert(key.as_slice(), predecessor.as_slice())
-                    .unwrap();
-            }
-        }
-        write
-            .open_table(lifecycle::BLOB_LIFECYCLE_METADATA)
-            .unwrap()
-            .insert("schema_version", 3)
-            .unwrap();
-        write
-            .open_table(pressure::BLOB_PRESSURE_METADATA)
-            .unwrap()
-            .insert("schema_version", 3)
-            .unwrap();
-        write.commit().unwrap();
-        drop(database);
+        let source = Store::open_for_mission(&source_root.database, services.authority)
+            .expect("migration pending source store");
+        let target = Store::open_for_mission(&root.database, services.authority)
+            .expect("migration pending target store");
+        let pending_plaintext = b"finite migration pending v2 authority".to_vec();
+        let pending_prepared = prepared_blob(&pending_plaintext);
+        let pending_access =
+            ProvisioningAccess::member(blob_scope(), vec![1, 2, 3], vec![blob_topic()])
+                .expect("migration pending access");
+        let pending_publisher = services
+            .provisioner
+            .issue_node(3, &[pending_access])
+            .and_then(ReferenceEnvelopeSealer::open)
+            .expect("migration pending publisher");
+        let live_publisher = std::mem::replace(&mut services.publisher, pending_publisher);
+        let pending = prepare_blob_proof(
+            &source,
+            &mut services,
+            &pending_prepared,
+            &pending_plaintext,
+            1,
+        );
+        services.publisher = live_publisher;
+        let pending_plan = pending
+            .blob
+            .transfer_plan(&pending.manifest_bytes)
+            .expect("migration pending plan");
+        let pending_transfer = BlobTransferId::new(pending.blob.envelope_id());
+        let policy = target.control_policy_snapshot().expect("migration policy");
+        target
+            .stage_verified_blob_source_with_policy(
+                &policy,
+                &pending.blob,
+                &pending.sealed,
+                &pending_plan,
+            )
+            .expect("stage migration pending source");
+        let staging_plaintext = b"finite migration exact unpublished staging".to_vec();
+        let staging_prepared = prepared_blob(&staging_plaintext);
+        finish_variant(
+            &target,
+            &services.publisher,
+            &staging_prepared,
+            &staging_plaintext,
+            1,
+        )
+        .expect("stage migration unpublished variant");
+        drop(target);
+        drop(source);
+        downgrade_blob_lifecycle_to_v3_for_test(&root.database);
 
         let predecessor = blob_database_digest(&root.database);
         // Mutation caught: read-only inspection must select the predecessor
         // codecs explicitly and must not rewrite any predecessor byte.
         Store::inspect_existing(&root.database).expect("read-only finite predecessor audit");
         assert_eq!(blob_database_digest(&root.database), predecessor);
+
+        let predecessor_database = Database::open(&root.database).unwrap();
+        let predecessor_read = predecessor_database.begin_read().unwrap();
+        assert_eq!(
+            predecessor_read
+                .open_table(BLOB_PENDING_SOURCES)
+                .unwrap()
+                .get(pending_transfer.as_bytes().as_slice())
+                .unwrap()
+                .unwrap()
+                .value()[0],
+            PENDING_BLOB_SOURCE_VERSION_V2
+        );
+        assert!(
+            lifecycle::publication_record_is_retired_for_encoding(
+                predecessor_read
+                    .open_table(BLOB_PUBLICATIONS)
+                    .unwrap()
+                    .get(retired.transfer.as_bytes().as_slice())
+                    .unwrap()
+                    .unwrap()
+                    .value(),
+                lifecycle::PublicationEncodingGeneration::LifecycleV2OrV3,
+            )
+            .unwrap()
+        );
+        assert!(
+            lifecycle::operation_retirement(
+                predecessor_read
+                    .open_table(BLOB_OPERATIONS)
+                    .unwrap()
+                    .get(retired.operation.as_bytes())
+                    .unwrap()
+                    .unwrap()
+                    .value(),
+            )
+            .unwrap()
+            .is_some()
+        );
+        assert_eq!(
+            predecessor_read
+                .open_table(lifecycle::BLOB_LIFECYCLE_METADATA)
+                .unwrap()
+                .get("retired_publication_rows")
+                .unwrap()
+                .unwrap()
+                .value(),
+            1
+        );
+        assert_eq!(
+            predecessor_read
+                .open_table(lifecycle::BLOB_LIFECYCLE_METADATA)
+                .unwrap()
+                .get("retired_operation_rows")
+                .unwrap()
+                .unwrap()
+                .value(),
+            1
+        );
+        assert_eq!(
+            predecessor_read
+                .open_table(BLOB_NETWORK_METADATA)
+                .unwrap()
+                .get(BLOB_NETWORK_STAGING_ROWS)
+                .unwrap()
+                .unwrap()
+                .value(),
+            1
+        );
+        drop(predecessor_read);
+        drop(predecessor_database);
 
         pressure::TEST_PRESSURE_MIGRATION_FAULT.set(true);
         assert!(Store::open_for_mission(&root.database, services.authority).is_err());
@@ -20837,6 +21749,34 @@ mod tests {
             Store::open_for_mission(&root.database, services.authority)
                 .expect("atomic writable finite-lifetime migration"),
         );
+        let migrated_database = Database::open(&root.database).unwrap();
+        let migrated_read = migrated_database.begin_read().unwrap();
+        let shared_summary = pressure::decode_variant_summary(
+            migrated_read
+                .open_table(pressure::BLOB_PRESSURE_VARIANT_SUMMARIES)
+                .unwrap()
+                .get(first.variant_id.as_bytes().as_slice())
+                .unwrap()
+                .unwrap()
+                .value(),
+        )
+        .unwrap();
+        assert_eq!(shared_summary.publication_roots, 2);
+        assert_eq!(shared_summary.pending_roots, 0);
+        assert!(
+            decode_pending_blob_source(
+                migrated_read
+                    .open_table(BLOB_PENDING_SOURCES)
+                    .unwrap()
+                    .get(pending_transfer.as_bytes().as_slice())
+                    .unwrap()
+                    .unwrap()
+                    .value(),
+            )
+            .is_ok()
+        );
+        drop(migrated_read);
+        drop(migrated_database);
         let migrated = blob_database_digest(&root.database);
         let current = Database::open(&root.database).expect("current pressure database");
         lifecycle::reset_lifecycle_schema_enumerations_for_test();
@@ -20852,8 +21792,9 @@ mod tests {
             Store::open_for_mission(&root.database, services.authority)
                 .expect("idempotent current reopen"),
         );
-        // Mutation caught: a current-schema reopen must not enumerate/rewrite
-        // the migrated rows into a second different image.
+        // Current reopen still performs the required strict cross-index startup
+        // audit, but it must not run a second migration reconstruction or
+        // rewrite the migrated rows into a different image.
         assert_eq!(blob_database_digest(&root.database), migrated);
     }
 
@@ -20893,6 +21834,15 @@ mod tests {
                 );
                 assert_eq!(first.variant_id, second.variant_id);
 
+                finish_variant(
+                    &target,
+                    &services.publisher,
+                    &staging_prepared,
+                    &staging_plaintext,
+                    1,
+                )
+                .expect("finish unpublished lifecycle staging variant");
+
                 let pending = prepare_blob_proof(
                     &source,
                     &mut services,
@@ -20919,15 +21869,6 @@ mod tests {
                     BlobSourceStageOutcome::Inserted
                 );
                 let pending_transfer = BlobTransferId::new(pending.blob.envelope_id());
-
-                finish_variant(
-                    &target,
-                    &services.publisher,
-                    &staging_prepared,
-                    &staging_plaintext,
-                    1,
-                )
-                .expect("finish unpublished lifecycle staging variant");
                 drop(source);
                 drop(target);
                 (
@@ -20958,7 +21899,10 @@ mod tests {
             .expect("migrate populated lifecycle predecessor");
         let mut expected_migrated = predecessor;
         expected_migrated.operation_bytes += 2 * predecessor.operations;
-        expected_migrated.network_staging_bytes += 3 * predecessor.pending_sources;
+        // Current pending v3 restores the three-byte durable lifetime field
+        // plus the independent 32-byte authenticated-source binding removed
+        // by the exact predecessor fixture.
+        expected_migrated.network_staging_bytes += 35 * predecessor.pending_sources;
         assert_eq!(
             migrated.blob_stats().expect("migrated Blob stats"),
             expected_migrated
@@ -21468,6 +22412,24 @@ mod tests {
             write
                 .delete_table(BLOB_CARRIER_FETCH_CURSORS)
                 .expect("carrier cursors");
+            write
+                .delete_table(pressure::BLOB_PRESSURE_METADATA)
+                .expect("pressure metadata");
+            for table in [
+                pressure::BLOB_PRESSURE_PUBLICATION_ROOTS,
+                pressure::BLOB_PRESSURE_PENDING_ROOTS,
+                pressure::BLOB_PRESSURE_VARIANT_SUMMARIES,
+                pressure::BLOB_PRESSURE_PUBLICATIONS,
+                pressure::BLOB_PRESSURE_CONTENT_PUBLICATIONS,
+            ] {
+                write.delete_table(table).expect("pressure table");
+            }
+            write
+                .delete_table(pressure::BLOB_PRESSURE_PENDING_SOURCES)
+                .expect("pending pressure index");
+            write
+                .delete_table(pressure::BLOB_PRESSURE_VARIANTS)
+                .expect("variant pressure index");
             write
                 .delete_table(BLOB_ACCEPTANCE_ORDER)
                 .expect("acceptance order");
@@ -33701,6 +34663,7 @@ mod tests {
     fn blob_pressure_schema_requires_writable_atomic_idempotent_migration() {
         let root = BlobTestRoot::new("pressure-schema-migration");
         drop(Store::open(&root.database).expect("current pressure schema"));
+        downgrade_blob_lifecycle_to_v3_for_test(&root.database);
         strip_blob_pressure_schema_for_test(&root.database);
 
         assert_blob_schema_invariant(
@@ -33751,6 +34714,7 @@ mod tests {
             b"previous-expiry-order",
         );
         drop(store);
+        downgrade_blob_lifecycle_to_v3_for_test(&root.database);
         let database = Database::open(&root.database).unwrap();
         let write = database.begin_write().unwrap();
         write
@@ -33802,6 +34766,41 @@ mod tests {
             Err(error) => error,
         };
         assert_blob_schema_invariant(&writable);
+
+        for (label, lifecycle_version, pressure_version) in
+            [("current-old", 4, 3), ("old-current", 3, 4)]
+        {
+            let mixed = BlobTestRoot::new(label);
+            drop(Store::open(&mixed.database).expect("create complete current schema"));
+            let database = Database::open(&mixed.database).expect("mixed-schema database");
+            let write = database.begin_write().expect("mixed-schema write");
+            write
+                .open_table(lifecycle::BLOB_LIFECYCLE_METADATA)
+                .expect("lifecycle metadata")
+                .insert("schema_version", lifecycle_version)
+                .expect("set lifecycle generation");
+            write
+                .open_table(pressure::BLOB_PRESSURE_METADATA)
+                .expect("pressure metadata")
+                .insert(pressure::PRESSURE_SCHEMA_VERSION_FIELD, pressure_version)
+                .expect("set pressure generation");
+            write.commit().expect("commit mixed schema");
+            drop(database);
+            let before = blob_database_digest(&mixed.database);
+            assert_blob_schema_invariant(
+                &Store::inspect_existing(&mixed.database)
+                    .expect_err("read-only mixed schema must fail closed"),
+            );
+            let writable = Store::open(&mixed.database)
+                .err()
+                .expect("writable mixed schema must fail closed");
+            assert_blob_schema_invariant(&writable);
+            assert_eq!(
+                blob_database_digest(&mixed.database),
+                before,
+                "mixed schema must remain byte-identical"
+            );
+        }
     }
 
     #[test]
@@ -33991,6 +34990,7 @@ mod tests {
             .expect("stage pressure-cap source");
         let transfer = BlobTransferId::new(proof.blob.envelope_id());
         drop(target);
+        downgrade_blob_lifecycle_to_v3_for_test(&target_root.database);
 
         let exact_legacy_bytes = {
             let database = Database::open(&target_root.database).expect("pressure-cap database");
@@ -34163,6 +35163,7 @@ mod tests {
             );
         }
         drop(target);
+        downgrade_blob_lifecycle_to_v3_for_test(&target_root.database);
         {
             let database = Database::open(&target_root.database).expect("legacy pending database");
             let write = database.begin_write().expect("legacy pending write");
@@ -34204,9 +35205,9 @@ mod tests {
             write.commit().expect("commit legacy pending sources");
         }
         strip_blob_pressure_schema_for_test(&target_root.database);
-        assert_blob_schema_invariant(
-            &Store::inspect_existing(&target_root.database)
-                .expect_err("legacy pending pressure state needs writable migration"),
+        assert!(
+            Store::inspect_existing(&target_root.database).is_err(),
+            "legacy pending pressure state needs writable migration"
         );
         let target = Store::open_for_mission(&target_root.database, services.authority)
             .expect("migrate pending pressure orders");

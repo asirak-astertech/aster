@@ -752,7 +752,10 @@ pub(crate) fn encode_publication_key(key: PressurePublicationKey) -> Vec<u8> {
     output.push(PRESSURE_RECORD_VERSION);
     output.push(key.priority as u8);
     output.push(PRESSURE_CANDIDATE_COMPLETED);
-    key.expiry.encode(&mut output);
+    // Task 3 persists authoritative expiry on roots and summaries but does
+    // not activate it as a pressure-selection discriminator. Task 4 can
+    // replace this projection and atomically re-key the indexes.
+    PressureExpiry::Durable.encode(&mut output);
     output.extend_from_slice(&key.acceptance_order.to_be_bytes());
     output.extend_from_slice(key.transfer_id.as_bytes());
     output
@@ -859,6 +862,7 @@ pub(crate) fn decode_publication_root(bytes: &[u8]) -> Result<PressurePublicatio
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PressurePendingRoot {
     pub(crate) variant_id: BlobVariantId,
+    pub(crate) authenticated_source_binding: [u8; 32],
     pub(crate) priority: Priority,
     pub(crate) acceptance_order: u64,
     pub(crate) completion: PressureFraction,
@@ -868,7 +872,7 @@ pub(crate) struct PressurePendingRoot {
     pub(crate) blob_id: BlobId,
 }
 
-fn encode_pending_root(root: &PressurePendingRoot) -> Result<Vec<u8>, StoreError> {
+pub(super) fn encode_pending_root(root: &PressurePendingRoot) -> Result<Vec<u8>, StoreError> {
     if root.acceptance_order == 0 {
         return Err(pressure_corruption(
             "Blob pressure pending root has a zero acceptance order",
@@ -880,9 +884,10 @@ fn encode_pending_root(root: &PressurePendingRoot) -> Result<Vec<u8>, StoreError
         .map_err(|_| pressure_corruption("Blob pressure topic length overflows"))?;
     let scope_len = u16::try_from(scope.len())
         .map_err(|_| pressure_corruption("Blob pressure scope length overflows"))?;
-    let mut output = Vec::with_capacity(110 + topic.len() + scope.len());
+    let mut output = Vec::with_capacity(142 + topic.len() + scope.len());
     output.push(PRESSURE_RECORD_VERSION);
     output.extend_from_slice(root.variant_id.as_bytes());
+    output.extend_from_slice(&root.authenticated_source_binding);
     output.push(root.priority as u8);
     output.extend_from_slice(&root.acceptance_order.to_be_bytes());
     output.extend_from_slice(&root.completion.numerator.to_be_bytes());
@@ -900,6 +905,7 @@ pub(super) fn decode_pending_root(bytes: &[u8]) -> Result<PressurePendingRoot, S
     let mut cursor = PressureCursor::new(bytes);
     cursor.version()?;
     let variant_id = BlobVariantId::from_bytes(cursor.array()?);
+    let authenticated_source_binding = cursor.array()?;
     let priority = decode_priority(cursor.u8()?)?;
     let acceptance_order = cursor.u64()?;
     if acceptance_order == 0 {
@@ -917,6 +923,7 @@ pub(super) fn decode_pending_root(bytes: &[u8]) -> Result<PressurePendingRoot, S
     cursor.finish()?;
     Ok(PressurePendingRoot {
         variant_id,
+        authenticated_source_binding,
         priority,
         acceptance_order,
         completion,
@@ -935,7 +942,7 @@ pub(crate) fn encode_pending_index_key(
     output[0] = PRESSURE_RECORD_VERSION;
     output[1] = root.priority as u8;
     output[2] = 0; // incomplete
-    encode_fixed_expiry(root.expiry, &mut output[3..12]);
+    encode_fixed_expiry(PressureExpiry::Durable, &mut output[3..12]);
     output[12..20].copy_from_slice(&root.completion.numerator.to_be_bytes());
     output[20..28].copy_from_slice(&root.completion.denominator.to_be_bytes());
     output[28..36].copy_from_slice(&root.acceptance_order.to_be_bytes());
@@ -951,7 +958,7 @@ pub(crate) fn encode_variant_index_key(
     output[0] = PRESSURE_RECORD_VERSION;
     output[1] = summary.effective_priority as u8;
     output[2] = u8::from(summary.finalized);
-    encode_fixed_expiry(summary.final_reference_expiry, &mut output[3..12]);
+    encode_fixed_expiry(PressureExpiry::Durable, &mut output[3..12]);
     output[12..20].copy_from_slice(&summary.committed_progress.numerator.to_be_bytes());
     output[20..28].copy_from_slice(&summary.committed_progress.denominator.to_be_bytes());
     output[28..36].copy_from_slice(&summary.minimum_root_acceptance_order.to_be_bytes());
@@ -1725,7 +1732,10 @@ impl PressureTableCatalog for redb::ReadTransaction {
     }
 }
 
-fn migrate_pending_acceptance_orders(write: &redb::WriteTransaction) -> Result<u64, StoreError> {
+fn migrate_pending_acceptance_orders(
+    write: &redb::WriteTransaction,
+    generation: super::PendingBlobEncodingGeneration,
+) -> Result<u64, StoreError> {
     let pending = write.open_table(super::BLOB_PENDING_SOURCES)?;
     let mut records = Vec::new();
     let mut saw_legacy = false;
@@ -1739,7 +1749,7 @@ fn migrate_pending_acceptance_orders(write: &redb::WriteTransaction) -> Result<u
                 "pending Blob pressure migration found an invalid transfer identity",
             ));
         }
-        let record = super::decode_pending_blob_source(value.value())?;
+        let record = super::decode_pending_blob_source_for_encoding(value.value(), generation)?;
         if record.pending_acceptance_order == 0 {
             saw_legacy = true;
         } else {
@@ -1947,7 +1957,10 @@ fn build_pressure_image(
         let source = BlobTransferId::new(key.value().try_into().map_err(|_| {
             pressure_corruption("Blob pressure pending source has an invalid transfer key")
         })?);
-        let record = super::decode_pending_blob_source(value.value())?;
+        let record = super::decode_pending_blob_source_for_encoding(
+            value.value(),
+            super::pending_blob_encoding_for_publication_encoding(publication_encoding),
+        )?;
         let acceptance_order = record.pending_acceptance_order;
         if acceptance_order == 0 || !pending_orders.insert(acceptance_order) {
             return Err(pressure_corruption(
@@ -1957,6 +1970,7 @@ fn build_pressure_image(
         maximum_pending_order = maximum_pending_order.max(acceptance_order);
         let root = PressurePendingRoot {
             variant_id: record.metadata.variant_id,
+            authenticated_source_binding: record.authenticated_source_binding,
             priority: record.metadata.header.priority,
             acceptance_order,
             completion: pending_progress(source, &record, carrier_prefixes, imports, chunks)?,
@@ -2222,11 +2236,52 @@ fn replace_image(write: &redb::WriteTransaction, image: &PressureImage) -> Resul
     apply_image(write, image)
 }
 
-pub(crate) fn audit_or_migrate_pressure_write(
+fn pressure_generation_is_current_write(
     write: &redb::WriteTransaction,
+    state: PressureSchemaState,
+) -> Result<bool, StoreError> {
+    if state == PressureSchemaState::Predecessor {
+        return Ok(false);
+    }
+    match write
+        .open_table(BLOB_PRESSURE_METADATA)?
+        .get(PRESSURE_SCHEMA_VERSION_FIELD)?
+        .map(|value| value.value())
+    {
+        Some(PRESSURE_SCHEMA_VERSION) => Ok(true),
+        Some(2) | Some(PREVIOUS_PRESSURE_SCHEMA_VERSION) => Ok(false),
+        _ => Err(pressure_corruption(
+            "Blob pressure metadata schema is incomplete or unknown",
+        )),
+    }
+}
+
+fn audit_or_migrate_pressure_write_inner(
+    write: &redb::WriteTransaction,
+    lifecycle_was_predecessor: Option<bool>,
 ) -> Result<(), StoreError> {
     let state = pressure_schema_state(write)?;
-    let migrated_next = migrate_pending_acceptance_orders(write)?;
+    let pressure_is_current = pressure_generation_is_current_write(write, state)?;
+    // An entirely absent pressure group is the legitimate additive-schema
+    // predecessor for either historical lifecycle generation. Only a
+    // complete pressure group carries a generation that can contradict the
+    // lifecycle generation.
+    if state == PressureSchemaState::Current
+        && let Some(lifecycle_was_predecessor) = lifecycle_was_predecessor
+        && lifecycle_was_predecessor == pressure_is_current
+    {
+        return Err(pressure_corruption(
+            "Blob lifecycle and pressure schema generations are mixed",
+        ));
+    }
+    let publication_generation = if pressure_is_current || lifecycle_was_predecessor.is_some() {
+        super::lifecycle::publication_encoding_write(write)?
+    } else {
+        super::lifecycle::publication_encoding_migration_write(write)?
+    };
+    let pending_generation =
+        super::pending_blob_encoding_for_publication_encoding(publication_generation);
+    let migrated_next = migrate_pending_acceptance_orders(write, pending_generation)?;
     match state {
         PressureSchemaState::Predecessor => {
             let image = build_pressure_image(
@@ -2292,6 +2347,28 @@ pub(crate) fn audit_or_migrate_pressure_write(
     }
 }
 
+pub(crate) fn audit_or_migrate_pressure_write(
+    write: &redb::WriteTransaction,
+) -> Result<(), StoreError> {
+    audit_or_migrate_pressure_write_inner(write, None)
+}
+
+pub(crate) fn audit_or_migrate_pressure_after_lifecycle_write(
+    write: &redb::WriteTransaction,
+    lifecycle_was_predecessor: bool,
+) -> Result<(), StoreError> {
+    #[cfg(test)]
+    if super::lifecycle::TEST_BLOB_LIFECYCLE_MIGRATION_DISABLED.get() {
+        // The legacy lifecycle fixture hook deliberately leaves lifecycle
+        // initialization disabled while constructing a predecessor database.
+        // Its caller pairs the generations before any reopen assertion. Keep
+        // this escape hatch test-only so production opens always enforce the
+        // exact lifecycle/pressure generation matrix below.
+        return audit_or_migrate_pressure_write_inner(write, None);
+    }
+    audit_or_migrate_pressure_write_inner(write, Some(lifecycle_was_predecessor))
+}
+
 /// Verifies the complete pressure projection before an authoritative Blob
 /// transition starts. This keeps the post-mutation synchronizer from ever
 /// turning a pre-existing orphan, partial row, or contradiction into a repair.
@@ -2306,7 +2383,10 @@ pub(crate) fn require_pressure_consistent_write(
     audit_or_migrate_pressure_write(write)
 }
 
-pub(crate) fn inspect_pressure_read(read: &redb::ReadTransaction) -> Result<(), StoreError> {
+pub(crate) fn inspect_pressure_read(
+    read: &redb::ReadTransaction,
+    lifecycle_is_current: bool,
+) -> Result<(), StoreError> {
     if pressure_schema_state(read)? == PressureSchemaState::Predecessor {
         return Err(pressure_corruption(
             "Blob pressure predecessor schema requires writable migration",
@@ -2330,6 +2410,11 @@ pub(crate) fn inspect_pressure_read(read: &redb::ReadTransaction) -> Result<(), 
     ) {
         return Err(pressure_corruption(
             "Blob pressure metadata schema is incomplete or unknown",
+        ));
+    }
+    if lifecycle_is_current != (version == PRESSURE_SCHEMA_VERSION) {
+        return Err(pressure_corruption(
+            "Blob lifecycle and pressure schema generations are mixed",
         ));
     }
     let next = metadata
@@ -2427,6 +2512,7 @@ pub(super) fn insert_pending_source_write(
     }
     let root = PressurePendingRoot {
         variant_id: record.metadata.variant_id,
+        authenticated_source_binding: record.authenticated_source_binding,
         priority: record.metadata.header.priority,
         acceptance_order: record.pending_acceptance_order,
         completion: pending_progress(
@@ -2492,6 +2578,7 @@ pub(super) fn require_pending_source_write(
     let root = decode_pending_root(&encoded)?;
     let expected = PressurePendingRoot {
         variant_id: record.metadata.variant_id,
+        authenticated_source_binding: record.authenticated_source_binding,
         priority: record.metadata.header.priority,
         acceptance_order: record.pending_acceptance_order,
         completion: pending_progress(
@@ -3092,6 +3179,7 @@ fn bounded_pending_root_write(
     };
     let expected = PressurePendingRoot {
         variant_id: record.metadata.variant_id,
+        authenticated_source_binding: record.authenticated_source_binding,
         priority: record.metadata.header.priority,
         acceptance_order: record.pending_acceptance_order,
         completion,
@@ -3527,6 +3615,7 @@ pub(crate) fn reconcile_variant_write(
                 }
                 let expected = PressurePendingRoot {
                     variant_id: record.metadata.variant_id,
+                    authenticated_source_binding: record.authenticated_source_binding,
                     priority: record.metadata.header.priority,
                     acceptance_order: record.pending_acceptance_order,
                     completion: pending_progress(
@@ -3849,7 +3938,7 @@ mod tests {
     }
 
     #[test]
-    fn pressure_publication_key_has_one_canonical_big_endian_order() {
+    fn pressure_publication_key_keeps_expiry_inactive_until_task_four() {
         let minimum = PressurePublicationKey {
             priority: Priority::Routine,
             expiry: PressureExpiry::Durable,
@@ -3877,17 +3966,17 @@ mod tests {
         let maximum_bytes = encode_publication_key(maximum);
         assert_eq!(
             maximum_bytes,
-            [
-                vec![2, 3, 1, 1],
-                vec![0xff; 8],
-                vec![0xff; 8],
-                vec![0xff; 32],
-            ]
-            .concat()
+            [vec![2, 3, 1, 2], vec![0; 8], vec![0xff; 8], vec![0xff; 32],].concat()
         );
         assert_eq!(minimum_bytes.len(), maximum_bytes.len());
         assert_eq!(decode_publication_key(&minimum_bytes).unwrap(), minimum);
-        assert_eq!(decode_publication_key(&maximum_bytes).unwrap(), maximum);
+        assert_eq!(
+            decode_publication_key(&maximum_bytes).unwrap(),
+            PressurePublicationKey {
+                expiry: PressureExpiry::Durable,
+                ..maximum
+            }
+        );
         assert!(decode_publication_key(&minimum_bytes[..minimum_bytes.len() - 1]).is_err());
         let mut unknown = minimum_bytes;
         unknown[0] = PRESSURE_RECORD_VERSION.wrapping_add(1);
@@ -3922,6 +4011,7 @@ mod tests {
 
         let pending = PressurePendingRoot {
             variant_id: BlobVariantId::from_bytes([0x55; 32]),
+            authenticated_source_binding: [0x56; 32],
             priority: Priority::Routine,
             acceptance_order: u64::MAX,
             completion: PressureFraction::new(u64::MAX - 1, u64::MAX).unwrap(),
@@ -3942,6 +4032,7 @@ mod tests {
     fn pressure_pending_and_variant_indexes_encode_complete_exact_ordering() {
         let minimum_pending = PressurePendingRoot {
             variant_id: BlobVariantId::from_bytes([0; 32]),
+            authenticated_source_binding: [0; 32],
             priority: Priority::Routine,
             acceptance_order: 1,
             completion: PressureFraction::new(0, 1).unwrap(),
@@ -3955,7 +4046,7 @@ mod tests {
         assert_eq!(
             minimum_pending_key.as_slice(),
             [
-                vec![2, 0, 0, 0],
+                vec![2, 0, 0, 2],
                 vec![0; 8],
                 vec![0; 8],
                 vec![0, 0, 0, 0, 0, 0, 0, 1],
@@ -3971,6 +4062,7 @@ mod tests {
         assert_eq!(decoded_minimum.transfer_id, BlobTransferId::new([0; 32]));
         let maximum_pending = PressurePendingRoot {
             variant_id: BlobVariantId::from_bytes([0xff; 32]),
+            authenticated_source_binding: [0xff; 32],
             priority: Priority::Flash,
             acceptance_order: u64::MAX,
             completion: PressureFraction::new(u64::MAX, u64::MAX).unwrap(),
@@ -4085,7 +4177,7 @@ mod tests {
         assert_eq!(
             minimum_variant_key.as_slice(),
             [
-                vec![2, 0, 0, 0],
+                vec![2, 0, 0, 2],
                 vec![0; 8],
                 vec![0; 8],
                 vec![0, 0, 0, 0, 0, 0, 0, 1],
@@ -4098,7 +4190,13 @@ mod tests {
         );
         assert_eq!(
             decode_variant_index_key(&minimum_variant_key).unwrap(),
-            (minimum_summary, BlobVariantId::from_bytes([0; 32]))
+            (
+                PressureVariantSummary {
+                    final_reference_expiry: PressureExpiry::Durable,
+                    ..minimum_summary
+                },
+                BlobVariantId::from_bytes([0; 32]),
+            )
         );
         assert_eq!(
             <super::PressureVariantIndexKey as redb::Key>::compare(
@@ -4131,6 +4229,7 @@ mod tests {
     fn pressure_index_comparators_keep_equivalent_fraction_bytes_distinct() {
         let pending = PressurePendingRoot {
             variant_id: BlobVariantId::from_bytes([0x11; 32]),
+            authenticated_source_binding: [0x12; 32],
             priority: Priority::Routine,
             acceptance_order: 7,
             completion: PressureFraction::new(1, 2).unwrap(),
@@ -4286,8 +4385,8 @@ mod tests {
                 vec![0, 128],
                 vec![b'z'; 128],
                 vec![0xff; 32],
-                vec![3, 1, 1],
-                vec![0xff; 8],
+                vec![3, 1, 2],
+                vec![0; 8],
                 vec![0xff; 8],
                 vec![0xff; 32],
             ]
@@ -4673,10 +4772,10 @@ mod tests {
     }
 
     #[test]
-    fn pressure_real_indexes_rank_expired_finite_before_durable_for_every_candidate_kind() {
-        // Canonical order places an expired finite root before durable state,
-        // even when the durable candidate has the newer acceptance order.
-        let (path, database) = pressure_database("expired-finite-before-durable-selection");
+    fn pressure_real_indexes_persist_expiry_without_activating_selection() {
+        // Task 3 retains authoritative finite expiry in roots and summaries,
+        // while the pre-Task-4 selector continues to use acceptance/progress.
+        let (path, database) = pressure_database("expiry-persisted-selection-inactive");
         let durable_transfer = BlobTransferId::new([0x91; 32]);
         let finite_transfer = BlobTransferId::new([0x92; 32]);
         let durable_variant = BlobVariantId::from_bytes([0xa1; 32]);
@@ -4688,7 +4787,7 @@ mod tests {
             variant_id: durable_variant,
             semantic_id: BlobSemanticId::new([0xc1; 32]),
             priority: Priority::Routine,
-            acceptance_order: 9,
+            acceptance_order: 1,
             expiry: PressureExpiry::Durable,
             topic: topic.clone(),
             scope: scope.clone(),
@@ -4698,7 +4797,7 @@ mod tests {
             variant_id: finite_variant,
             semantic_id: BlobSemanticId::new([0xc2; 32]),
             priority: Priority::Routine,
-            acceptance_order: 1,
+            acceptance_order: 9,
             expiry: PressureExpiry::ExpiredFinite,
             topic: topic.clone(),
             scope: scope.clone(),
@@ -4706,8 +4805,9 @@ mod tests {
         };
         let durable_pending = PressurePendingRoot {
             variant_id: durable_variant,
+            authenticated_source_binding: [0xd1; 32],
             priority: Priority::Routine,
-            acceptance_order: 9,
+            acceptance_order: 1,
             completion: PressureFraction::new(1, 2).unwrap(),
             expiry: PressureExpiry::Durable,
             topic: topic.clone(),
@@ -4716,9 +4816,10 @@ mod tests {
         };
         let finite_pending = PressurePendingRoot {
             variant_id: finite_variant,
+            authenticated_source_binding: [0xd2; 32],
             priority: Priority::Routine,
-            acceptance_order: 1,
-            completion: PressureFraction::new(0, 2).unwrap(),
+            acceptance_order: 9,
+            completion: PressureFraction::new(1, 2).unwrap(),
             expiry: PressureExpiry::ExpiredFinite,
             topic,
             scope,
@@ -4726,7 +4827,7 @@ mod tests {
         };
         let durable_summary = PressureVariantSummary {
             effective_priority: Priority::Routine,
-            minimum_root_acceptance_order: 9,
+            minimum_root_acceptance_order: 1,
             committed_progress: PressureFraction::new(1, 2).unwrap(),
             finalized: false,
             publication_roots: 0,
@@ -4735,8 +4836,8 @@ mod tests {
         };
         let finite_summary = PressureVariantSummary {
             effective_priority: Priority::Routine,
-            minimum_root_acceptance_order: 1,
-            committed_progress: PressureFraction::new(0, 2).unwrap(),
+            minimum_root_acceptance_order: 9,
+            committed_progress: PressureFraction::new(1, 2).unwrap(),
             finalized: false,
             publication_roots: 0,
             pending_roots: 1,
@@ -4822,15 +4923,15 @@ mod tests {
         for (partition, expected) in [
             (
                 super::BlobCapacityPartition::AggregateItems,
-                super::PressureCandidate::Publication(finite_transfer),
+                super::PressureCandidate::Publication(durable_transfer),
             ),
             (
                 super::BlobCapacityPartition::NetworkStagingRows,
-                super::PressureCandidate::PendingSource(finite_transfer),
+                super::PressureCandidate::PendingSource(durable_transfer),
             ),
             (
                 super::BlobCapacityPartition::DepotVariants,
-                super::PressureCandidate::Variant(finite_variant),
+                super::PressureCandidate::Variant(durable_variant),
             ),
         ] {
             let selected = super::select_pressure_candidate_read(
@@ -4842,6 +4943,32 @@ mod tests {
             assert!(selected.proven());
             assert_eq!(selected.candidate(), Some(expected));
         }
+        assert_eq!(
+            super::decode_publication_root(
+                read.open_table(super::BLOB_PRESSURE_PUBLICATION_ROOTS)
+                    .unwrap()
+                    .get(finite_transfer.as_bytes().as_slice())
+                    .unwrap()
+                    .unwrap()
+                    .value(),
+            )
+            .unwrap()
+            .expiry,
+            PressureExpiry::ExpiredFinite
+        );
+        assert_eq!(
+            super::decode_variant_summary(
+                read.open_table(super::BLOB_PRESSURE_VARIANT_SUMMARIES)
+                    .unwrap()
+                    .get(finite_variant.as_bytes().as_slice())
+                    .unwrap()
+                    .unwrap()
+                    .value(),
+            )
+            .unwrap()
+            .final_reference_expiry,
+            PressureExpiry::ExpiredFinite
+        );
         drop(read);
         drop(database);
         std::fs::remove_file(path).unwrap();
@@ -4873,10 +5000,9 @@ mod tests {
     }
 
     #[test]
-    fn pressure_real_publication_index_ranks_finite_deadlines_then_exact_identity() {
-        // Hand-derived order: all candidates tie on priority and acceptance
-        // order. Deadline 10 precedes deadline 20, and the two deadline-10
-        // candidates are then ordered by their exact transfer identities.
+    fn pressure_real_publication_index_ignores_deadline_until_task_four() {
+        // All candidates tie on priority and acceptance order, so the
+        // pre-Task-4 selector uses exact transfer identity, not deadline.
         let (path, database) = pressure_database("real-publication-finite-and-identity");
         let topic = Topic::new("finite-publication-order").unwrap();
         let scope = Scope::new("mission/finite-publication-order").unwrap();
@@ -4925,7 +5051,7 @@ mod tests {
         }
 
         let budget = super::BlobPressureRecoveryBudget::new(16, 16 * 1024, 3, 3, 1).unwrap();
-        for expected in [0x31, 0x32, 0x20] {
+        for expected in [0x20, 0x31, 0x32] {
             let read = database.begin_read().unwrap();
             let selection = super::select_pressure_candidate_read(
                 &read,
@@ -5008,6 +5134,7 @@ mod tests {
                 let transfer = BlobTransferId::new([identity; 32]);
                 let root = PressurePendingRoot {
                     variant_id: BlobVariantId::from_bytes([identity; 32]),
+                    authenticated_source_binding: [identity.wrapping_add(1); 32],
                     priority: Priority::Routine,
                     acceptance_order: order,
                     completion,
