@@ -2,7 +2,7 @@
 
 This is the shortest path to Aster's **selected live Blob application surface**,
 its durable metadata-delivery queue, its exclusive stopped streaming facade,
-and the semantic-v5 direct transfer boundary for already-durable Blobs.
+and the semantic-v7 receipt-free streaming boundary for already-durable Blobs.
 `RunningNode::selected_blobs()` returns a cloneable `SelectedBlobHandle`: an
 application may durably publish an owned regular file while the node has no
 peers, read one freshly authenticated plaintext page at a time, and consume
@@ -19,10 +19,11 @@ The exclusive `SelectedBlobNode` remains available when no runtime owns the same
 store and provides the same delivery lifecycle plus synchronous seekable-source
 publication and streaming `read_into`. Separately, semantic v5 reconciles
 already-durable Blob sources and direct carrier ranges between current
-content-capable peers. Semantic v6 inherits that Blob lane unchanged, and
-semantic v7 negotiates it through mandatory `LegacyV6`; `EventPagesV1` is
-Event-only. The default offer is `[7, 6, 5, 4, 3, 2, 1]`; v1-v4 emit zero Blob
-frames, and stable
+content-capable peers. Both endpoints must support semantic-v7
+`BlobRangesStreamV1`; old Blob transfer has no fallback. Incompatible profile
+offers or older semantic Blob carrier attempts fail explicitly. `EventPagesV1`
+is Event-only. The default semantic offer remains `[7, 6, 5, 4, 3, 2, 1]`;
+v1-v4 emit zero Blob frames, and stable
 wire/ABI, source, manifest, and `ASTRBT01` formats remain version 1.
 
 ## Use the live actor API
