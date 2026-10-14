@@ -54,7 +54,7 @@ ml-kem = { version = "=0.3.2", default-features = false, features = ["alloc", "h
 minicbor = { version = "=2.3.0", default-features = false }
 negentropy = "=0.5.1"
 p256 = { version = "=0.14.0", default-features = false, features = ["arithmetic", "ecdh", "ecdsa", "std"] }
-proptest = { version = "=1.11.0", default-features = false, features = ["std"] }
+proptest = { version = "=1.12.0", default-features = false, features = ["std"] }
 rand_core = "=0.10.1"
 redb = { version = "=4.2.0", default-features = false, features = ["std"] }
 rustix = { version = "=1.1.4", features = ["fs", "process"] }
