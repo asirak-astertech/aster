@@ -2658,9 +2658,7 @@ fn observe_and_fault_test_blob_settlement(
                 authority_digest,
                 logical_digest: store.test_blob_logical_digest(),
             });
-            let Some(fault) = state.fault.filter(|fault| fault.kind == kind) else {
-                return None;
-            };
+            let fault = state.fault.filter(|fault| fault.kind == kind)?;
             state.fault = None;
             match fault.mutation {
                 TestBlobSettlementMutation::CorruptProtectedDisposition => {
@@ -51411,11 +51409,7 @@ mod tests {
                     | Window::CompletedCacheRepairCapability
                     | Window::CompletedCacheRepairFinalComparison
                     | Window::PostPromotionLoad
-            ) {
-                services.other.identity()
-            } else if matches!(
-                window,
-                Window::PostStage
+                    | Window::PostStage
                     | Window::FinalComparison
                     | Window::CompletedPostStageCapability
                     | Window::CompletedPostStageFinalComparison
