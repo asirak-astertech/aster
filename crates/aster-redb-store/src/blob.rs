@@ -147,10 +147,25 @@ pub const MAX_BLOB_NETWORK_SOURCE_BYTES: usize = 1024 * 1024;
 /// This private runtime integration bound covers one 12-row publication
 /// discovery, ten fixed retirement rows, two operation-accounting rows, every
 /// globally bounded operation plus owner/resolver/deadline, and every bounded
-/// live delivery plus inverse owner.
+/// live delivery conversion: old inverse owner, pending row, cursor, v3
+/// primary, order row, and v3 inverse owner.
+const MAX_BLOB_POLICY_RETIREMENT_DELIVERY_ROWS: u64 = crate::MAX_BLOB_SUBSCRIPTIONS
+    .checked_mul(6)
+    .expect("bounded Blob retirement delivery rows fit u64");
+const MAX_BLOB_POLICY_RETIREMENT_OPERATION_ROWS: u64 = MAX_BLOB_OPERATIONS
+    .checked_mul(4)
+    .expect("bounded Blob retirement operation rows fit u64");
+const MAX_BLOB_POLICY_RETIREMENT_FIXED_ROWS: u64 = 12u64
+    .checked_add(10)
+    .expect("bounded Blob retirement fixed rows fit u64")
+    .checked_add(2)
+    .expect("bounded Blob retirement accounting rows fit u64");
 #[doc(hidden)]
-pub const MAX_BLOB_POLICY_RETIREMENT_ROWS: u64 =
-    12 + 10 + 2 + 4 * MAX_BLOB_OPERATIONS + 2 * crate::MAX_BLOB_SUBSCRIPTIONS;
+pub const MAX_BLOB_POLICY_RETIREMENT_ROWS: u64 = MAX_BLOB_POLICY_RETIREMENT_FIXED_ROWS
+    .checked_add(MAX_BLOB_POLICY_RETIREMENT_OPERATION_ROWS)
+    .expect("bounded Blob retirement fixed and operation rows fit u64")
+    .checked_add(MAX_BLOB_POLICY_RETIREMENT_DELIVERY_ROWS)
+    .expect("bounded Blob retirement row ceiling fits u64");
 
 const MAX_BLOB_LIVE_PUBLICATION_RECORD_BYTES: u64 = 2 // lifecycle wrapper
     + 1 // metadata version
@@ -229,8 +244,17 @@ const MAX_BLOB_POLICY_RETIREMENT_ACCOUNTING_BYTES: u64 = ("next_retirement_gener
 /// `bytes_examined` charges each unique existing row once at its pre-mutation
 /// encoding and each newly inserted resolver/deadline at its canonical
 /// encoding. Repeated implementation reads do not multiply the charge.
+const MAX_BLOB_POLICY_RETIREMENT_DELIVERY_BYTES: u64 = (64 + 40) // old inverse owner
+    + (40 + 49) // content pending row
+    + (64 + 41) // content cursor
+    + (72 + 26) // v3 retirement primary
+    + 80 // v3 order row with empty value
+    + (64 + 72); // v3 inverse owner
+const MAX_BLOB_POLICY_RETIREMENT_DELIVERIES_BYTES: u64 = crate::MAX_BLOB_SUBSCRIPTIONS
+    .checked_mul(MAX_BLOB_POLICY_RETIREMENT_DELIVERY_BYTES)
+    .expect("bounded Blob retirement delivery bytes fit u64");
 #[doc(hidden)]
-pub const MAX_BLOB_POLICY_RETIREMENT_BYTES: u64 = MAX_BLOB_POLICY_RETIREMENT_DISCOVERY_BYTES
+pub const MAX_BLOB_POLICY_RETIREMENT_BYTES: u64 = (MAX_BLOB_POLICY_RETIREMENT_DISCOVERY_BYTES
         + 8 + 32 // acceptance-order row
         + 33 + 57 // publication resolver and deadline
         + MAX_BLOB_POLICY_RETIREMENT_ACCOUNTING_BYTES
@@ -238,8 +262,36 @@ pub const MAX_BLOB_POLICY_RETIREMENT_BYTES: u64 = MAX_BLOB_POLICY_RETIREMENT_DIS
         + MAX_BLOB_OPERATIONS
             * ((64 + MAX_BLOB_OPERATION_KEY_BYTES as u64)
                 + (33 + MAX_BLOB_OPERATION_KEY_BYTES as u64)
-                + 57)
-        + crate::MAX_BLOB_SUBSCRIPTIONS * ((40 + 49) + (64 + 40));
+                + 57))
+    .checked_add(MAX_BLOB_POLICY_RETIREMENT_DELIVERIES_BYTES)
+    .expect("bounded Blob retirement byte ceiling fits u64");
+
+fn contact_expiry_retirement_budget(
+    limits: BlobLifecycleLimits,
+) -> Result<BlobMaintenanceBudget, BlobStoreError> {
+    let roots = limits
+        .max_publication_rows()
+        .checked_add(MAX_BLOB_NETWORK_STAGING_ROWS)
+        .ok_or(BlobStoreError::InvalidMaintenanceBudget)?;
+    let pressure_rows = roots
+        .checked_mul(8)
+        .and_then(|rows| rows.checked_add(32))
+        .ok_or(BlobStoreError::InvalidMaintenanceBudget)?;
+    let pressure_bytes = roots
+        .checked_mul(2_048)
+        .and_then(|bytes| bytes.checked_add(64 * 1024))
+        .ok_or(BlobStoreError::InvalidMaintenanceBudget)?;
+    BlobMaintenanceBudget::new(
+        MAX_BLOB_POLICY_RETIREMENT_ROWS
+            .checked_add(pressure_rows)
+            .ok_or(BlobStoreError::InvalidMaintenanceBudget)?,
+        1,
+        MAX_BLOB_POLICY_RETIREMENT_BYTES
+            .checked_add(pressure_bytes)
+            .ok_or(BlobStoreError::InvalidMaintenanceBudget)?,
+    )
+}
+
 /// Conservative complete-unit row ceiling for retiring a maximum-fanout final
 /// root and atomically replacing its maximum chunk set with deletion authority.
 #[cfg(test)]
@@ -1109,6 +1161,16 @@ impl<'a> BlobOperationRequest<'a> {
     }
 }
 
+// The active retry already owns sealed source bytes; boxing it would add a
+// second allocation to every successful idempotency lookup.
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum BlobOperationRetry {
+    Missing,
+    Active(StoredBlob),
+    Retired(lifecycle::RetirementReason),
+}
+
 /// Optimistic Blob publication reservation over shared causal ledgers.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BlobReservation {
@@ -1745,6 +1807,182 @@ pub(crate) fn evaluate_blob_lifetime(
             ))
         })?,
     })
+}
+
+fn blob_lifetime_is_visible_read(
+    read: &redb::ReadTransaction,
+    lifetime: BlobLifetime,
+) -> Result<bool, StoreError> {
+    let continuity = custody::lower_bound_continuity_read(read)?;
+    let sample = continuity.map(|authority| authority.sample);
+    Ok(matches!(
+        evaluate_blob_lifetime(lifetime, continuity, sample)?,
+        BlobLifetimeEvaluation::Durable | BlobLifetimeEvaluation::FiniteLive { .. }
+    ))
+}
+
+fn blob_lifetime_is_visible_write(
+    write: &redb::WriteTransaction,
+    lifetime: BlobLifetime,
+) -> Result<bool, StoreError> {
+    let continuity = custody::lower_bound_continuity_write(write)?;
+    let sample = continuity.map(|authority| authority.sample);
+    Ok(matches!(
+        evaluate_blob_lifetime(lifetime, continuity, sample)?,
+        BlobLifetimeEvaluation::Durable | BlobLifetimeEvaluation::FiniteLive { .. }
+    ))
+}
+
+fn require_blob_lifetime_visible_read(
+    read: &redb::ReadTransaction,
+    lifetime: BlobLifetime,
+) -> Result<(), StoreError> {
+    if blob_lifetime_is_visible_read(read, lifetime)? {
+        Ok(())
+    } else {
+        Err(blob_error(BlobStoreError::ExpiredOrRetired))
+    }
+}
+
+fn require_blob_lifetime_visible_write(
+    write: &redb::WriteTransaction,
+    lifetime: BlobLifetime,
+) -> Result<(), StoreError> {
+    if blob_lifetime_is_visible_write(write, lifetime)? {
+        Ok(())
+    } else {
+        Err(blob_error(BlobStoreError::ExpiredOrRetired))
+    }
+}
+
+/// Synchronizes both persisted finite-lifetime scanners before an ordinary
+/// mutation observes or changes Blob authority.  The transaction either
+/// establishes the new fenced pressure pass and invalidates both stale TTL
+/// cycles together, or rolls all of that state back with the caller.
+fn synchronize_blob_policy_generation_write(
+    write: &redb::WriteTransaction,
+) -> Result<Option<custody::LowerBoundContinuity>, StoreError> {
+    let continuity = custody::lower_bound_continuity_write(write)?;
+    if let Some(continuity) = continuity {
+        lifecycle::synchronize_ttl_expiry_cycles_write(
+            write,
+            continuity.generation,
+            continuity.sample,
+        )?;
+    }
+    pressure::synchronize_reanchor_state_write(write)?;
+    Ok(continuity)
+}
+
+#[derive(Clone, Copy)]
+struct PolicyGenerationSyncPlan {
+    continuity: Option<custody::LowerBoundContinuity>,
+    reset_ttl_cycles: bool,
+    reset_pressure_reanchor: bool,
+}
+
+impl PolicyGenerationSyncPlan {
+    const fn needed(self) -> bool {
+        self.reset_ttl_cycles || self.reset_pressure_reanchor
+    }
+}
+
+fn plan_blob_policy_generation_sync_write(
+    write: &redb::WriteTransaction,
+) -> Result<PolicyGenerationSyncPlan, StoreError> {
+    let continuity = custody::lower_bound_continuity_write(write)?;
+    let reset_ttl_cycles = match continuity {
+        Some(value) => {
+            lifecycle::ttl_expiry_cycles_need_sync_write(write, value.generation, value.sample)?
+        }
+        None => false,
+    };
+    let reset_pressure_reanchor = pressure::reanchor_state_needs_sync_write(write)?;
+    Ok(PolicyGenerationSyncPlan {
+        continuity,
+        reset_ttl_cycles,
+        reset_pressure_reanchor,
+    })
+}
+
+fn charge_blob_policy_generation_sync_write(
+    write: &redb::WriteTransaction,
+    plan: PolicyGenerationSyncPlan,
+    charge: &mut MaintenanceCharge,
+) -> Result<bool, StoreError> {
+    if plan.reset_ttl_cycles && !lifecycle::charge_ttl_expiry_sync_state_write(write, charge)? {
+        return Ok(false);
+    }
+    if plan.reset_pressure_reanchor && !pressure::charge_reanchor_sync_state_write(write, charge)? {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn apply_blob_policy_generation_sync_write(
+    write: &redb::WriteTransaction,
+    plan: PolicyGenerationSyncPlan,
+) -> Result<(), StoreError> {
+    if plan.reset_ttl_cycles {
+        let continuity = plan.continuity.ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "Blob TTL generation sync lacks continuity",
+            ))
+        })?;
+        lifecycle::synchronize_ttl_expiry_cycles_write(
+            write,
+            continuity.generation,
+            continuity.sample,
+        )?;
+    }
+    if plan.reset_pressure_reanchor {
+        pressure::synchronize_reanchor_state_write(write)?;
+    }
+    Ok(())
+}
+
+/// Projects one pending root into the current continuity generation before a
+/// progress mutation.  The source row, authenticated binding, TTL deadline,
+/// and pressure root/index move atomically.
+fn normalize_pending_blob_policy_write(
+    write: &redb::WriteTransaction,
+    source: BlobTransferId,
+    mut pending: PendingBlobSourceRecord,
+    limits: BlobLifecycleLimits,
+) -> Result<PendingBlobSourceRecord, StoreError> {
+    synchronize_blob_policy_generation_write(write)?;
+    let old_lifetime = pending.metadata.lifetime;
+    let projected = lifecycle::project_lifetime_for_policy_write(write, old_lifetime)?;
+    if projected == old_lifetime {
+        return Ok(pending);
+    }
+    lifecycle::replace_policy_ttl_deadline_write(
+        write,
+        source,
+        lifecycle::TtlDeadlineKind::PendingSource,
+        Some(old_lifetime),
+        Some(projected),
+        limits,
+    )?;
+    pending.metadata.lifetime = projected;
+    pending.authenticated_source_binding =
+        pending_blob_authenticated_source_binding(&pending.metadata, &pending.sealed)?;
+    let replacement = encode_pending_blob_source(&pending)?;
+    let previous_len = write
+        .open_table(BLOB_PENDING_SOURCES)?
+        .get(source.as_bytes().as_slice())?
+        .map(|value| value.value().len())
+        .ok_or_else(|| blob_error(BlobStoreError::PendingSourceMissing))?;
+    if replacement.len() != previous_len {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "pending Blob generation projection changed fixed row accounting",
+        )));
+    }
+    write
+        .open_table(BLOB_PENDING_SOURCES)?
+        .insert(source.as_bytes().as_slice(), replacement.as_slice())?;
+    pressure::rekey_pending_source_lifetime_write(write, source, &pending)?;
+    Ok(pending)
 }
 
 fn merge_blob_lifetime(
@@ -2420,6 +2658,7 @@ impl Store {
             .map(|value| decode_pending_blob_source(value.value()))
             .transpose()?
             .ok_or_else(|| blob_error(BlobStoreError::PendingSourceMissing))?;
+        require_blob_lifetime_visible_read(&read, pending.metadata.lifetime)?;
         require_pending_matches_verified_source(&pending, blob, &pending.sealed)
             .map_err(|_| blob_error(BlobStoreError::CompletionMismatch))?;
         enforce_blob_policy_read(&read, authority, policy, &pending.metadata.header)?;
@@ -2601,6 +2840,18 @@ impl Store {
         policy: &ControlPolicySnapshot,
         request: &BlobOperationRequest<'_>,
     ) -> Result<Option<StoredBlob>, StoreError> {
+        match self.blob_operation_retry_with_policy(policy, request)? {
+            BlobOperationRetry::Missing => Ok(None),
+            BlobOperationRetry::Active(blob) => Ok(Some(blob)),
+            BlobOperationRetry::Retired(_) => Err(blob_error(BlobStoreError::ExpiredOrRetired)),
+        }
+    }
+
+    pub(crate) fn blob_operation_retry_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        request: &BlobOperationRequest<'_>,
+    ) -> Result<BlobOperationRetry, StoreError> {
         self.require_live()?;
         let authority = self.require_bound_mission()?;
         let read = self.database.begin_read()?;
@@ -2610,7 +2861,7 @@ impl Store {
             .get(request.operation.as_bytes())?
             .map(|value| value.value().to_vec());
         if let Some(encoded) = existing_encoded.as_deref()
-            && let Some((_, _, operation_digest, intent_digest, _)) =
+            && let Some((reason, _, operation_digest, intent_digest, _)) =
                 lifecycle::operation_retirement(encoded).map_err(blob_error)?
         {
             if operation_digest != Sha256::digest(request.operation.as_bytes()).as_slice() {
@@ -2619,7 +2870,7 @@ impl Store {
                 )));
             }
             return if intent_digest == request.intent.digest() {
-                Err(blob_error(BlobStoreError::ExpiredOrRetired))
+                Ok(BlobOperationRetry::Retired(reason))
             } else {
                 Err(blob_error(BlobStoreError::OperationConflict))
             };
@@ -2654,9 +2905,9 @@ impl Store {
                             "Blob operation points to a missing publication",
                         )))
                     },
-                    |blob| Ok(Some(blob)),
+                    |blob| Ok(BlobOperationRetry::Active(blob)),
                 ),
-            None => Ok(None),
+            None => Ok(BlobOperationRetry::Missing),
         }
     }
 
@@ -2796,6 +3047,10 @@ impl Store {
         for row in table.iter()? {
             let (key, value) = row?;
             if lifecycle::publication_record_is_retired(value.value()).map_err(blob_error)? {
+                continue;
+            }
+            let metadata = decode_blob_metadata(value.value())?;
+            if !blob_lifetime_is_visible_read(&read, metadata.lifetime)? {
                 continue;
             }
             inventory.push(parse_blob_transfer_id(
@@ -2963,10 +3218,18 @@ impl Store {
     ) -> Result<Option<aster_mesh::CustodySample>, StoreError> {
         self.require_live()?;
         let read = self.database.begin_read()?;
-        Ok(
-            lifecycle::nearest_retention_deadline_read(&read, current.clock_id)?
-                .map(|(deadline, _)| deadline),
-        )
+        let retention = lifecycle::nearest_retention_deadline_read(&read, current.clock_id)?
+            .map(|(deadline, _)| deadline);
+        let ttl = custody::lower_bound_continuity_read(&read)?
+            .filter(|continuity| continuity.sample.clock_id == current.clock_id)
+            .map(|continuity| lifecycle::nearest_ttl_deadline_read(&read, continuity))
+            .transpose()?
+            .flatten();
+        Ok(match (retention, ttl) {
+            (Some(left), Some(right)) if right.tick_ms < left.tick_ms => Some(right),
+            (Some(left), _) => Some(left),
+            (None, right) => right,
+        })
     }
 
     /// Atomically stages one complete source-authenticated manifest and its
@@ -3167,6 +3430,9 @@ impl Store {
         } else {
             None
         };
+        synchronize_blob_policy_generation_write(&write)?;
+        pending.metadata.lifetime =
+            lifecycle::project_lifetime_for_policy_write(&write, pending.metadata.lifetime)?;
         pending.authenticated_source_binding =
             pending_blob_authenticated_source_binding(&pending.metadata, &pending.sealed)?;
         require_pending_matches_verified_source(&pending, blob, sealed)?;
@@ -3180,18 +3446,49 @@ impl Store {
             self.blob_depot_owner_token,
         )?;
         let replay_fence = blob_replay_fence(&pending.metadata, &pending.sealed)?;
+        let candidate_expired = matches!(
+            evaluate_blob_lifetime(
+                pending.metadata.lifetime,
+                admission_continuity,
+                finite.as_ref().map(|verified| verified.receiver_sample),
+            )?,
+            BlobLifetimeEvaluation::FiniteExpired { .. }
+        );
+        let publication_encoded = write
+            .open_table(BLOB_PUBLICATIONS)?
+            .get(transfer_id.as_bytes().as_slice())?
+            .map(|value| value.value().to_vec());
+        let publication_retired = publication_encoded
+            .as_deref()
+            .map(lifecycle::publication_record_is_retired)
+            .transpose()
+            .map_err(blob_error)?
+            .unwrap_or(false);
+        if publication_retired {
+            if lifecycle::check_replay_fence(&write, replay_fence)?
+                != lifecycle::ReplayFenceStatus::Exact
+            {
+                return Err(blob_error(BlobStoreError::SchemaInvariant(
+                    "retired Blob publication is missing its replay fence",
+                )));
+            }
+            return Ok(BlobSourceStageOutcome::Duplicate);
+        }
 
-        if let Some(accepted) = load_blob_from_write(&write, transfer_id)? {
-            let accepted_encoded = write
-                .open_table(BLOB_PUBLICATIONS)?
-                .get(transfer_id.as_bytes().as_slice())?
+        if publication_encoded.is_some() {
+            let accepted = load_blob_from_write(&write, transfer_id)?.ok_or_else(|| {
+                blob_error(BlobStoreError::SchemaInvariant(
+                    "live Blob publication disappeared during duplicate merge",
+                ))
+            })?;
+            let accepted_encoded = publication_encoded
+                .as_ref()
                 .ok_or_else(|| {
                     blob_error(BlobStoreError::SchemaInvariant(
                         "accepted Blob publication disappeared during duplicate merge",
                     ))
                 })?
-                .value()
-                .to_vec();
+                .clone();
             let accepted_metadata = decode_blob_metadata(&accepted_encoded)?;
             if accepted.semantic_id != pending.metadata.semantic_id
                 || accepted.blob_id != pending.metadata.blob_id
@@ -3210,7 +3507,24 @@ impl Store {
                 admission_continuity,
                 finite.as_ref().map(|verified| verified.receiver_sample),
             )?;
+            let merged = lifecycle::project_lifetime_for_policy_write(&write, merged)?;
+            let merged_accepted_expired = matches!(
+                evaluate_blob_lifetime(
+                    merged,
+                    admission_continuity,
+                    finite.as_ref().map(|verified| verified.receiver_sample),
+                )?,
+                BlobLifetimeEvaluation::FiniteExpired { .. }
+            );
             if merged != accepted_metadata.lifetime {
+                lifecycle::replace_policy_ttl_deadline_write(
+                    &write,
+                    transfer_id,
+                    lifecycle::TtlDeadlineKind::LivePublication,
+                    Some(accepted_metadata.lifetime),
+                    Some(merged),
+                    self.blob_lifecycle_limits,
+                )?;
                 let mut metadata = accepted_metadata;
                 metadata.lifetime = merged;
                 let payload = encode_blob_metadata(metadata)?;
@@ -3241,6 +3555,32 @@ impl Store {
                 lifecycle::VariantReferenceOwner::Publication,
                 transfer_id,
             )?;
+            if merged_accepted_expired {
+                let mut charge = MaintenanceCharge::new(
+                    contact_expiry_retirement_budget(self.blob_lifecycle_limits)
+                        .map_err(blob_error)?,
+                    0,
+                    0,
+                );
+                let mut remaining_operations = MAX_BLOB_OPERATIONS;
+                let retirement = plan_blob_publication_retirement_write(
+                    &write,
+                    self.blob_lifecycle_limits,
+                    transfer_id,
+                    lifecycle::RetirementReason::Expired,
+                    PublicationPressurePreflight::Required,
+                    finite.as_ref().map(|verified| verified.receiver_sample),
+                    &mut charge,
+                    &mut remaining_operations,
+                )?
+                .ok_or_else(|| blob_error(BlobStoreError::InvalidMaintenanceBudget))?;
+                apply_blob_publication_retirement_plan_write(
+                    &write,
+                    self.blob_lifecycle_limits,
+                    retirement,
+                    PublicationPressureApply::RefreshVariant,
+                )?;
+            }
             write.commit()?;
             return Ok(BlobSourceStageOutcome::Duplicate);
         }
@@ -3280,6 +3620,9 @@ impl Store {
             .as_deref()
             .map(decode_pending_blob_source)
             .transpose()?;
+        if candidate_expired && existing.is_none() {
+            return Err(blob_error(BlobStoreError::ExpiredOrRetired));
+        }
         if let Some(existing) = existing.as_ref() {
             pending.pending_acceptance_order = existing.pending_acceptance_order;
             let merged = merge_blob_lifetime(
@@ -3288,7 +3631,8 @@ impl Store {
                 admission_continuity,
                 finite.as_ref().map(|verified| verified.receiver_sample),
             )?;
-            pending.metadata.lifetime = merged;
+            pending.metadata.lifetime =
+                lifecycle::project_lifetime_for_policy_write(&write, merged)?;
             pending.authenticated_source_binding =
                 pending_blob_authenticated_source_binding(&pending.metadata, &pending.sealed)?;
             let mut expected = existing.clone();
@@ -3299,6 +3643,15 @@ impl Store {
                 return Err(blob_error(BlobStoreError::PendingSourceConflict));
             }
         }
+        let merged_pending_expired = existing.is_some()
+            && matches!(
+                evaluate_blob_lifetime(
+                    pending.metadata.lifetime,
+                    admission_continuity,
+                    finite.as_ref().map(|verified| verified.receiver_sample),
+                )?,
+                BlobLifetimeEvaluation::FiniteExpired { .. }
+            );
         if existing.is_some() {
             lifecycle::require_lineage_fence(
                 &write,
@@ -3336,6 +3689,14 @@ impl Store {
             let pending_acceptance_order =
                 pressure::allocate_pending_acceptance_order_write(&write)?;
             pending.pending_acceptance_order = pending_acceptance_order;
+            lifecycle::replace_policy_ttl_deadline_write(
+                &write,
+                transfer_id,
+                lifecycle::TtlDeadlineKind::PendingSource,
+                None,
+                Some(pending.metadata.lifetime),
+                self.blob_lifecycle_limits,
+            )?;
             let encoded = encode_pending_blob_source(&pending)?;
             write
                 .open_table(BLOB_PENDING_SOURCES)?
@@ -3361,6 +3722,14 @@ impl Store {
             )?;
             pressure::insert_pending_source_write(&write, transfer_id, &pending)?;
         } else {
+            lifecycle::replace_policy_ttl_deadline_write(
+                &write,
+                transfer_id,
+                lifecycle::TtlDeadlineKind::PendingSource,
+                existing.as_ref().map(|record| record.metadata.lifetime),
+                Some(pending.metadata.lifetime),
+                self.blob_lifecycle_limits,
+            )?;
             let encoded = encode_pending_blob_source(&pending)?;
             let previous_len = existing_bytes.as_ref().map(Vec::len).ok_or_else(|| {
                 blob_error(BlobStoreError::SchemaInvariant(
@@ -3376,6 +3745,18 @@ impl Store {
                 .open_table(BLOB_PENDING_SOURCES)?
                 .insert(transfer_id.as_bytes().as_slice(), encoded.as_slice())?;
             pressure::rekey_pending_source_lifetime_write(&write, transfer_id, &pending)?;
+        }
+        if merged_pending_expired {
+            apply_expired_pending_source_write(
+                &write,
+                authority,
+                owner_binding,
+                transfer_id,
+                finite.as_ref().map(|verified| verified.receiver_sample),
+                self.blob_lifecycle_limits,
+                false,
+                None,
+            )?;
         }
         write.commit()?;
         Ok(if existing.is_some() {
@@ -3393,11 +3774,17 @@ impl Store {
         self.require_live()?;
         self.require_bound_mission()?;
         let read = self.database.begin_read()?;
-        read.open_table(BLOB_PENDING_SOURCES)?
+        let pending = read
+            .open_table(BLOB_PENDING_SOURCES)?
             .get(source.as_bytes().as_slice())?
             .map(|value| decode_pending_blob_source(value.value()))
-            .transpose()
-            .map(|record| record.map(pending_blob_source_projection))
+            .transpose()?;
+        match pending {
+            Some(record) if blob_lifetime_is_visible_read(&read, record.metadata.lifetime)? => {
+                Ok(Some(pending_blob_source_projection(record)))
+            }
+            Some(_) | None => Ok(None),
+        }
     }
 
     /// Loads one exact lifecycle-neutral source claim from completed or pending state.
@@ -3437,6 +3824,9 @@ impl Store {
             return Ok(None);
         }
         if let Some(metadata) = completed {
+            if !blob_lifetime_is_visible_read(&read, metadata.lifetime)? {
+                return Ok(None);
+            }
             let sealed_len = read
                 .open_table(BLOB_BYTES)?
                 .get(source.as_bytes().as_slice())?
@@ -3465,15 +3855,19 @@ impl Store {
         }
         pending
             .map(|pending| {
+                if !blob_lifetime_is_visible_read(&read, pending.metadata.lifetime)? {
+                    return Ok(None);
+                }
                 let sealed_len = u64::try_from(pending.sealed.len())
                     .map_err(|_| StoreError::PayloadByteAccountingOverflow)?;
                 let shape = durable_blob_source_shape_read(&read, &pending.metadata, false)?;
-                Ok::<_, StoreError>(RetainedBlobSource {
+                Ok::<_, StoreError>(Some(RetainedBlobSource {
                     source: blob_source_projection(&pending.metadata, sealed_len, shape)?,
                     retention: BlobSourceRetention::Pending,
-                })
+                }))
             })
             .transpose()
+            .map(Option::flatten)
     }
 
     /// Visits the bounded retained union from one redb snapshot.
@@ -3509,6 +3903,9 @@ impl Store {
                 continue;
             }
             if policy.is_some() && !blob_header_is_current_read(&read, &metadata.header)? {
+                continue;
+            }
+            if !blob_lifetime_is_visible_read(&read, metadata.lifetime)? {
                 continue;
             }
             let sealed_len = read
@@ -3548,6 +3945,9 @@ impl Store {
             }
             let pending = decode_pending_blob_source(value.value())?;
             if policy.is_some() && !blob_header_is_current_read(&read, &pending.metadata.header)? {
+                continue;
+            }
+            if !blob_lifetime_is_visible_read(&read, pending.metadata.lifetime)? {
                 continue;
             }
             let sealed_len = u64::try_from(pending.sealed.len())
@@ -3594,6 +3994,9 @@ impl Store {
                 .with(|count| count.set(count.get().saturating_add(1)));
             let pending = decode_pending_blob_source(value.value())?;
             if policy.is_some() && !blob_header_is_current_read(&read, &pending.metadata.header)? {
+                continue;
+            }
+            if !blob_lifetime_is_visible_read(&read, pending.metadata.lifetime)? {
                 continue;
             }
             let sealed_len = u64::try_from(pending.sealed.len())
@@ -3669,6 +4072,9 @@ impl Store {
             let (_, value) = row?;
             let pending = decode_pending_blob_source(value.value())?;
             if !blob_header_is_current_read(&read, &pending.metadata.header)? {
+                continue;
+            }
+            if !blob_lifetime_is_visible_read(&read, pending.metadata.lifetime)? {
                 continue;
             }
             let sealed_len = u64::try_from(pending.sealed.len())
@@ -3904,6 +4310,16 @@ impl Store {
         self.require_live()?;
         self.require_bound_mission()?;
         let read = self.database.begin_read()?;
+        let pending = read
+            .open_table(BLOB_PENDING_SOURCES)?
+            .get(source.as_bytes().as_slice())?
+            .map(|value| decode_pending_blob_source(value.value()))
+            .transpose()?;
+        if let Some(pending) = pending.as_ref()
+            && !blob_lifetime_is_visible_read(&read, pending.metadata.lifetime)?
+        {
+            return Ok(None);
+        }
         let key = blob_carrier_prefix_key(source, object);
         let record = read
             .open_table(BLOB_CARRIER_PREFIXES)?
@@ -3954,6 +4370,13 @@ impl Store {
             .map(|value| decode_pending_blob_source(value.value()))
             .transpose()?
             .ok_or_else(|| blob_error(BlobStoreError::PendingSourceMissing))?;
+        let pending = normalize_pending_blob_policy_write(
+            &write,
+            source,
+            pending,
+            self.blob_lifecycle_limits,
+        )?;
+        require_blob_lifetime_visible_write(&write, pending.metadata.lifetime)?;
         pressure::require_pending_source_write(&write, source, &pending)?;
         pressure::require_variant_write(&write, pending.metadata.variant_id)?;
         if pending.metadata.transfer_id != source
@@ -4071,6 +4494,16 @@ impl Store {
         self.require_live()?;
         self.require_bound_mission()?;
         let read = self.database.begin_read()?;
+        let pending = read
+            .open_table(BLOB_PENDING_SOURCES)?
+            .get(source.as_bytes().as_slice())?
+            .map(|value| decode_pending_blob_source(value.value()))
+            .transpose()?;
+        if let Some(pending) = pending.as_ref()
+            && !blob_lifetime_is_visible_read(&read, pending.metadata.lifetime)?
+        {
+            return Ok(None);
+        }
         let key = blob_carrier_prefix_key(source, object);
         let record = read
             .open_table(BLOB_CARRIER_PREFIXES)?
@@ -4124,6 +4557,12 @@ impl Store {
                     "Blob carrier prefix is orphaned from its pending source",
                 ))
             })?;
+        let pending = normalize_pending_blob_policy_write(
+            &write,
+            source,
+            pending,
+            self.blob_lifecycle_limits,
+        )?;
         pressure::require_pending_source_write(&write, source, &pending)?;
         pressure::require_variant_write(&write, pending.metadata.variant_id)?;
         if pending.metadata.transfer_id != source
@@ -4191,6 +4630,7 @@ impl Store {
                 "pending Blob source key differs from its authenticated identity",
             )));
         }
+        synchronize_blob_policy_generation_write(&write)?;
         pressure::require_pending_source_write(&write, source, &pending)?;
         pressure::require_variant_write(&write, pending.metadata.variant_id)?;
         let owner_binding = depot::require_depot_owner_binding_write(
@@ -4211,7 +4651,13 @@ impl Store {
             lifecycle::VariantReferenceOwner::PendingSource,
             source,
         )?;
-        remove_pending_source_rows_write(&write, staging, source, &pending)?;
+        remove_pending_source_rows_write(
+            &write,
+            staging,
+            source,
+            &pending,
+            self.blob_lifecycle_limits,
+        )?;
         pressure::remove_pending_source_write(&write, source, pending.metadata.variant_id)?;
         write.commit()?;
         Ok(true)
@@ -4239,6 +4685,7 @@ impl Store {
                 .map(|value| decode_pending_blob_source(value.value()))
                 .transpose()?
                 .ok_or_else(|| blob_error(BlobStoreError::PendingSourceMissing))?;
+            require_blob_lifetime_visible_read(&read, pending.metadata.lifetime)?;
             if pending.metadata.transfer_id != source
                 || read
                     .open_table(BLOB_PUBLICATIONS)?
@@ -4346,6 +4793,12 @@ impl Store {
                 .map(|value| decode_pending_blob_source(value.value()))
                 .transpose()?
                 .ok_or_else(|| blob_error(BlobStoreError::PendingSourceMissing))?;
+            let current_pending = normalize_pending_blob_policy_write(
+                &write,
+                source,
+                current_pending,
+                self.blob_lifecycle_limits,
+            )?;
             pressure::require_pending_source_write(&write, source, &current_pending)?;
             pressure::require_variant_write(&write, current_pending.metadata.variant_id)?;
             enforce_blob_policy_write(&write, authority, policy, &current_pending.metadata.header)?;
@@ -4404,6 +4857,7 @@ impl Store {
             .map(|value| decode_pending_blob_source(value.value()))
             .transpose()?
             .ok_or_else(|| blob_error(BlobStoreError::PendingSourceMissing))?;
+        require_blob_lifetime_visible_read(&read, pending.metadata.lifetime)?;
         enforce_blob_policy_read(&read, authority, policy, &pending.metadata.header)?;
         require_pending_blob_plan(&pending, plan)?;
         let committed = depot::committed_pending_plan_chunks_read(&read, plan)?;
@@ -4524,6 +4978,7 @@ impl Store {
             let Some(stored) = stored else {
                 return Ok(None);
             };
+            require_blob_lifetime_visible_read(&read, stored.metadata.lifetime)?;
             enforce_blob_policy_read(&read, authority, policy, &stored.metadata.header)?;
             if stored.metadata.variant_id != completion.variant_id()
                 || stored.projection.blob_id != plan.manifest().id()
@@ -4575,14 +5030,9 @@ impl Store {
             })?;
         }
         let read = self.database.begin_read()?;
-        require_control_policy_read(&read, authority, policy)?;
-        let stored = completed_blob_range_source_snapshot_read(&read, source)
-            .map_err(|error| {
-                blob_preflight_decode_error(error, "completed Blob range source is malformed")
-            })?
-            .ok_or_else(|| blob_error(BlobStoreError::CompletionMismatch))?;
-        enforce_blob_policy_read(&read, authority, policy, &stored.metadata.header)?;
-        if stored != initial_stored {
+        if !completed_blob_range_source_postcheck_read(&read, &initial_stored).map_err(|error| {
+            blob_preflight_decode_error(error, "completed Blob range source is malformed")
+        })? {
             return Err(blob_error(BlobStoreError::CompletionMismatch));
         }
         Ok(Some(range))
@@ -4644,6 +5094,11 @@ impl Store {
                 return Err(blob_error(BlobStoreError::PendingSourceMissing));
             }
             if let Some(pending) = pending.as_ref() {
+                let projected = lifecycle::project_lifetime_for_policy_read(
+                    &preflight,
+                    pending.metadata.lifetime,
+                )?;
+                require_blob_lifetime_visible_read(&preflight, projected)?;
                 require_pending_authenticated_source_binding(pending)?;
                 require_pending_blob_plan(pending, plan)?;
                 enforce_blob_policy_read(&preflight, authority, policy, &pending.metadata.header)?;
@@ -4690,11 +5145,24 @@ impl Store {
             .get(source.as_bytes().as_slice())?
             .map(|value| decode_pending_blob_source(value.value()))
             .transpose()?;
+        let pending = match pending {
+            Some(pending) => Some(normalize_pending_blob_policy_write(
+                &write,
+                source,
+                pending,
+                self.blob_lifecycle_limits,
+            )?),
+            None => {
+                synchronize_blob_policy_generation_write(&write)?;
+                None
+            }
+        };
         let accepted = load_blob_from_write(&write, source)?;
         if pending.is_none() && accepted.is_none() {
             return Err(blob_error(BlobStoreError::PendingSourceMissing));
         }
         if let Some(pending) = pending.as_ref() {
+            require_blob_lifetime_visible_write(&write, pending.metadata.lifetime)?;
             pressure::require_pending_source_write(&write, source, pending)?;
         } else {
             pressure::require_publication_write(&write, source)?;
@@ -4725,6 +5193,7 @@ impl Store {
                         "completed Blob source lost its metadata",
                     ))
                 })?;
+            require_blob_lifetime_visible_write(&write, metadata.lifetime)?;
             // Own the decoded metadata for the remainder of this branch.
             if metadata.transfer_id != accepted.transfer_id {
                 return Err(blob_error(BlobStoreError::SchemaInvariant(
@@ -4829,6 +5298,7 @@ impl Store {
                 staging,
                 source,
                 pending.as_ref().expect("pending branch"),
+                self.blob_lifecycle_limits,
             )?;
             pressure::promote_pending_source_write(&write, source, metadata.variant_id)?;
             write.commit()?;
@@ -4962,6 +5432,13 @@ impl Store {
             lifecycle::VariantReferenceOwner::PendingSource,
             lifecycle::VariantReferenceOwner::Publication,
         )?;
+        lifecycle::move_policy_ttl_deadline_kind_write(
+            &write,
+            source,
+            metadata.lifetime,
+            lifecycle::TtlDeadlineKind::PendingSource,
+            lifecycle::TtlDeadlineKind::LivePublication,
+        )?;
         let encoded_metadata =
             lifecycle::live_publication_record(&write, &encode_blob_metadata(metadata.clone())?)?;
         write
@@ -5000,11 +5477,12 @@ impl Store {
             &metadata.header.scope,
             metadata.header.stamp.dot.counter,
         )?;
-        remove_pending_source_rows_write(
+        remove_pending_source_rows_after_ttl_move_write(
             &write,
             staging,
             source,
             pending.as_ref().expect("pending branch"),
+            self.blob_lifecycle_limits,
         )?;
         pressure::promote_pending_source_write(&write, source, metadata.variant_id)?;
         write.commit()?;
@@ -5085,7 +5563,8 @@ impl Store {
             return Err(blob_error(BlobStoreError::ReservationChanged));
         }
         validate_blob_lifetime(lifetime)?;
-        let prepared = PreparedBlobPublication::from_verified(blob, sealed, completion, lifetime)?;
+        let mut prepared =
+            PreparedBlobPublication::from_verified(blob, sealed, completion, lifetime)?;
         validate_blob_reservation(reservation, &prepared)?;
         validate_blob_publication_intent(request.intent, &prepared)?;
 
@@ -5096,12 +5575,23 @@ impl Store {
         self.require_live()?;
         let read = self.database.begin_read()?;
         deletion::require_variant_available_read(&read, prepared.variant_id)?;
+        require_blob_lifetime_visible_read(&read, lifetime)?;
         drop(read);
         depot::verify_completion(self, completion)?;
 
         let write = self.database.begin_write()?;
         enforce_live_write(&write)?;
+        synchronize_blob_policy_generation_write(&write)?;
+        let projected_lifetime =
+            lifecycle::project_lifetime_for_policy_write(&write, prepared.lifetime)?;
+        if projected_lifetime != prepared.lifetime {
+            let mut metadata = decode_blob_metadata(&prepared.encoded_metadata)?;
+            metadata.lifetime = projected_lifetime;
+            prepared.encoded_metadata = encode_blob_metadata(metadata)?;
+            prepared.lifetime = projected_lifetime;
+        }
         deletion::require_variant_available_write(&write, prepared.variant_id)?;
+        require_blob_lifetime_visible_write(&write, prepared.lifetime)?;
         enforce_blob_policy_write(&write, prepared.mission_authority, policy, &prepared.header)?;
         let owner_binding = depot::require_depot_owner_binding_write(
             &write,
@@ -5126,6 +5616,7 @@ impl Store {
                     "Blob operation points to a missing publication",
                 ))
             })?;
+            require_blob_publication_visible_write(&write, existing.transfer_id)?;
             let physical_lineage = blob
                 .physical_lineage
                 .ok_or_else(|| blob_error(BlobStoreError::PhysicalLineageMigrationRequired))?;
@@ -5207,6 +5698,7 @@ impl Store {
                     "Blob semantic item index points to a missing publication",
                 ))
             })?;
+            require_blob_publication_visible_write(&write, accepted)?;
             if stored.header != prepared.header
                 || stored.sealed != prepared.sealed
                 || stored.variant_id != prepared.variant_id
@@ -5304,6 +5796,8 @@ impl Store {
                 || pending.sealed != prepared.sealed
                 || pending.route_lineage != prepared.route_lineage
                 || pending.physical_lineage != prepared.physical_lineage
+                || (matches!(prepared.lifetime, BlobLifetime::Finite { .. })
+                    && pending.metadata.lifetime != prepared.lifetime)
             {
                 return Err(blob_error(BlobStoreError::PendingSourceConflict));
             }
@@ -5398,6 +5892,24 @@ impl Store {
                 prepared.transfer_id,
             )?;
         }
+        if pending.is_some() {
+            lifecycle::move_policy_ttl_deadline_kind_write(
+                &write,
+                prepared.transfer_id,
+                prepared.lifetime,
+                lifecycle::TtlDeadlineKind::PendingSource,
+                lifecycle::TtlDeadlineKind::LivePublication,
+            )?;
+        } else {
+            lifecycle::replace_policy_ttl_deadline_write(
+                &write,
+                prepared.transfer_id,
+                lifecycle::TtlDeadlineKind::LivePublication,
+                None,
+                Some(prepared.lifetime),
+                self.blob_lifecycle_limits,
+            )?;
+        }
         let encoded_metadata =
             lifecycle::live_publication_record(&write, &prepared.encoded_metadata)?;
         write.open_table(BLOB_BYTES)?.insert(
@@ -5441,11 +5953,12 @@ impl Store {
         )?;
         insert_blob_operation(&write, self.limits, request, prepared.transfer_id)?;
         if let Some(pending) = pending.as_ref() {
-            remove_pending_source_rows_write(
+            remove_pending_source_rows_after_ttl_move_write(
                 &write,
                 pending_staging.expect("pending source has staging accounting"),
                 prepared.transfer_id,
                 pending,
+                self.blob_lifecycle_limits,
             )?;
         }
         if pending.is_some() {
@@ -5492,6 +6005,7 @@ struct PreparedBlobPublication {
     route_lineage: [u8; 32],
     physical_lineage: [u8; 32],
     header: EnvelopeHeader,
+    lifetime: BlobLifetime,
     sealed: Vec<u8>,
     encoded_metadata: Vec<u8>,
 }
@@ -5560,6 +6074,7 @@ impl PreparedBlobPublication {
             route_lineage,
             physical_lineage,
             header,
+            lifetime,
             sealed: sealed.to_vec(),
             encoded_metadata,
         })
@@ -5635,6 +6150,7 @@ struct MaintenancePage {
     rows: Vec<MaintenancePageRow>,
     rows_examined: u64,
     bytes: u64,
+    identities: BTreeMap<MaintenanceRowIdentity, usize>,
     complete: bool,
 }
 
@@ -5657,9 +6173,34 @@ pub(crate) struct MaintenanceCharge {
     budget: BlobMaintenanceBudget,
     rows: u64,
     bytes: u64,
+    identities: BTreeMap<MaintenanceRowIdentity, usize>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct MaintenanceRowIdentity {
+    table: String,
+    key: Vec<u8>,
+}
+
+impl MaintenanceRowIdentity {
+    pub(crate) fn new(table: impl Into<String>, key: impl Into<Vec<u8>>) -> Self {
+        Self {
+            table: table.into(),
+            key: key.into(),
+        }
+    }
 }
 
 impl MaintenanceCharge {
+    fn new(budget: BlobMaintenanceBudget, rows: u64, bytes: u64) -> Self {
+        Self {
+            budget,
+            rows,
+            bytes,
+            identities: BTreeMap::new(),
+        }
+    }
+
     pub(crate) fn has_capacity_for_row(&self) -> bool {
         self.rows < self.budget.rows && self.bytes < self.budget.bytes
     }
@@ -5668,7 +6209,11 @@ impl MaintenanceCharge {
         self.charge_lengths(key.len(), value_len)
     }
 
-    fn charge_lengths(&mut self, key_len: usize, value_len: usize) -> Result<bool, StoreError> {
+    pub(crate) fn charge_lengths(
+        &mut self,
+        key_len: usize,
+        value_len: usize,
+    ) -> Result<bool, StoreError> {
         if self.rows >= self.budget.rows {
             return Ok(false);
         }
@@ -5690,14 +6235,42 @@ impl MaintenanceCharge {
         self.bytes = next_bytes;
         Ok(true)
     }
+
+    /// Charges a concrete table/key authority once. Repeated ownership of the
+    /// same row is free only when every plan agrees on its encoded value size;
+    /// a contradictory projection is structural corruption, not a budget
+    /// outcome.
+    pub(crate) fn charge_row(
+        &mut self,
+        identity: MaintenanceRowIdentity,
+        value_len: usize,
+    ) -> Result<bool, StoreError> {
+        if let Some(previous) = self.identities.get(&identity) {
+            if *previous != value_len {
+                return Err(blob_error(BlobStoreError::SchemaInvariant(
+                    "Blob maintenance plans disagree on one row projection",
+                )));
+            }
+            return Ok(true);
+        }
+        if !self.charge_lengths(identity.key.len(), value_len)? {
+            return Ok(false);
+        }
+        self.identities.insert(identity, value_len);
+        Ok(true)
+    }
 }
 
 fn pressure_charge_u64_rows(
     charge: &mut MaintenanceCharge,
+    table: &'static str,
     fields: &[&str],
 ) -> Result<bool, StoreError> {
     for field in fields {
-        if !charge.charge(field.as_bytes(), std::mem::size_of::<u64>())? {
+        if !charge.charge_row(
+            MaintenanceRowIdentity::new(table, field.as_bytes()),
+            std::mem::size_of::<u64>(),
+        )? {
             return Ok(false);
         }
     }
@@ -5717,7 +6290,10 @@ fn pressure_deletion_evidence_write(
             "final Blob pressure root lacks its depot import",
         ))
     })?;
-    if !charge.charge(variant.as_bytes(), import.value().len())? {
+    if !charge.charge_row(
+        MaintenanceRowIdentity::new("aster.blob-imports.v1", variant.as_bytes()),
+        import.value().len(),
+    )? {
         return Ok(None);
     }
     let import_bytes = import.value().to_vec();
@@ -5732,7 +6308,10 @@ fn pressure_deletion_evidence_write(
                 "final Blob pressure root lacks its lineage fence",
             ))
         })?;
-    if !charge.charge(variant.as_bytes(), lineage.value().len())? {
+    if !charge.charge_row(
+        MaintenanceRowIdentity::new("aster.blob-lineage-fences.v1", variant.as_bytes()),
+        lineage.value().len(),
+    )? {
         return Ok(None);
     }
     let lineage_bytes = lineage.value().to_vec();
@@ -5742,6 +6321,7 @@ fn pressure_deletion_evidence_write(
 fn pressure_charge_depot_owner_binding(charge: &mut MaintenanceCharge) -> Result<bool, StoreError> {
     pressure_charge_u64_rows(
         charge,
+        "aster.blob-depot-metadata.v1",
         &[
             DEPOT_OWNER_BINDING_0,
             DEPOT_OWNER_BINDING_1,
@@ -5765,7 +6345,10 @@ fn capture_required_maintenance_bytes(
     let value = table
         .get(key)?
         .ok_or_else(|| blob_error(BlobStoreError::SchemaInvariant(missing)))?;
-    if !charge.charge(key, value.value().len())? {
+    if !charge.charge_row(
+        MaintenanceRowIdentity::new(definition.name(), key),
+        value.value().len(),
+    )? {
         return Ok(None);
     }
     Ok(Some(value.value().to_vec()))
@@ -5784,7 +6367,10 @@ fn capture_optional_maintenance_bytes(
     let Some(value) = table.get(key)? else {
         return Ok(Ok(None));
     };
-    if !charge.charge(key, value.value().len())? {
+    if !charge.charge_row(
+        MaintenanceRowIdentity::new(definition.name(), key),
+        value.value().len(),
+    )? {
         return Ok(Err(()));
     }
     Ok(Ok(Some(value.value().to_vec())))
@@ -5804,7 +6390,10 @@ fn capture_required_maintenance_u64(
     let value = table
         .get(key)?
         .ok_or_else(|| blob_error(BlobStoreError::SchemaInvariant(missing)))?;
-    if !charge.charge(key, std::mem::size_of::<u64>())? {
+    if !charge.charge_row(
+        MaintenanceRowIdentity::new(definition.name(), key),
+        std::mem::size_of::<u64>(),
+    )? {
         return Ok(None);
     }
     Ok(Some(value.value()))
@@ -6699,7 +7288,10 @@ fn append_maintenance_range<'a>(
             return Ok(true);
         };
         let (key, value) = row?;
-        if !charge.charge(key.value(), value.value().len())? {
+        if !charge.charge_row(
+            MaintenanceRowIdentity::new(definition.name(), key.value()),
+            value.value().len(),
+        )? {
             return Ok(false);
         }
         let key = key.value().to_vec();
@@ -6722,20 +7314,15 @@ fn append_maintenance_range<'a>(
     }
 }
 
-fn bounded_single_maintenance_page(
+fn bounded_single_maintenance_page_with_charge(
     write: &redb::WriteTransaction,
     definition: TableDefinition<&'static [u8], &'static [u8]>,
     kind: MaintenanceRowKind,
     after: Option<&[u8]>,
-    budget: BlobMaintenanceBudget,
+    mut charge: MaintenanceCharge,
 ) -> Result<MaintenancePage, StoreError> {
     let total_rows = write.open_table(definition)?.len()?;
     let mut rows = Vec::new();
-    let mut charge = MaintenanceCharge {
-        budget,
-        rows: 0,
-        bytes: 0,
-    };
     let first_complete = append_maintenance_range(
         write,
         definition,
@@ -6771,9 +7358,11 @@ fn bounded_single_maintenance_page(
         rows,
         rows_examined: charge.rows,
         bytes: charge.bytes,
+        identities: charge.identities,
     })
 }
 
+#[cfg(test)]
 fn bounded_composite_maintenance_page(
     write: &redb::WriteTransaction,
     primary: TableDefinition<&'static [u8], &'static [u8]>,
@@ -6796,6 +7385,29 @@ fn bounded_composite_maintenance_page(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn bounded_composite_maintenance_page_with_charge(
+    write: &redb::WriteTransaction,
+    primary: TableDefinition<&'static [u8], &'static [u8]>,
+    primary_kind: MaintenanceRowKind,
+    secondary: TableDefinition<&'static [u8], &'static [u8]>,
+    secondary_kind: MaintenanceRowKind,
+    after: Option<&[u8]>,
+    charge: MaintenanceCharge,
+) -> Result<MaintenancePage, StoreError> {
+    bounded_composite_maintenance_page_with_source_limit_and_charge(
+        write,
+        primary,
+        primary_kind,
+        secondary,
+        secondary_kind,
+        after,
+        u64::MAX,
+        charge,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn bounded_composite_maintenance_page_with_source_limit(
     write: &redb::WriteTransaction,
     primary: TableDefinition<&'static [u8], &'static [u8]>,
@@ -6806,6 +7418,29 @@ fn bounded_composite_maintenance_page_with_source_limit(
     budget: BlobMaintenanceBudget,
     source_row_limit: u64,
 ) -> Result<MaintenancePage, StoreError> {
+    bounded_composite_maintenance_page_with_source_limit_and_charge(
+        write,
+        primary,
+        primary_kind,
+        secondary,
+        secondary_kind,
+        after,
+        source_row_limit,
+        MaintenanceCharge::new(budget, 0, 0),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bounded_composite_maintenance_page_with_source_limit_and_charge(
+    write: &redb::WriteTransaction,
+    primary: TableDefinition<&'static [u8], &'static [u8]>,
+    primary_kind: MaintenanceRowKind,
+    secondary: TableDefinition<&'static [u8], &'static [u8]>,
+    secondary_kind: MaintenanceRowKind,
+    after: Option<&[u8]>,
+    source_row_limit: u64,
+    mut charge: MaintenanceCharge,
+) -> Result<MaintenancePage, StoreError> {
     let total_rows = write
         .open_table(primary)?
         .len()?
@@ -6813,11 +7448,6 @@ fn bounded_composite_maintenance_page_with_source_limit(
         .ok_or(StoreError::ItemCountAccountingOverflow)?;
     let selected_rows = total_rows.min(source_row_limit);
     let mut rows = Vec::new();
-    let mut charge = MaintenanceCharge {
-        budget,
-        rows: 0,
-        bytes: 0,
-    };
     let mut append = |definition, kind, tag, lower, upper| {
         append_maintenance_range(
             write,
@@ -6917,6 +7547,7 @@ fn bounded_composite_maintenance_page_with_source_limit(
         rows,
         rows_examined: charge.rows,
         bytes: charge.bytes,
+        identities: charge.identities,
     })
 }
 
@@ -7247,11 +7878,7 @@ fn bounded_import_maintenance_page_read(
 ) -> Result<MaintenancePage, StoreError> {
     let total_rows = read.open_table(BLOB_IMPORTS)?.len()?;
     let mut rows = Vec::new();
-    let mut charge = MaintenanceCharge {
-        budget,
-        rows: 0,
-        bytes: 0,
-    };
+    let mut charge = MaintenanceCharge::new(budget, 0, 0);
     let first_complete = append_import_maintenance_range_read(
         read,
         after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded),
@@ -7281,6 +7908,7 @@ fn bounded_import_maintenance_page_read(
         rows,
         rows_examined: charge.rows,
         bytes: charge.bytes,
+        identities: charge.identities,
     })
 }
 
@@ -7291,11 +7919,7 @@ fn bounded_capacity_import_page_read(
 ) -> Result<MaintenancePage, StoreError> {
     let total_rows = read.open_table(BLOB_IMPORTS)?.len()?;
     let mut rows = Vec::new();
-    let mut charge = MaintenanceCharge {
-        budget,
-        rows: 0,
-        bytes: 0,
-    };
+    let mut charge = MaintenanceCharge::new(budget, 0, 0);
     let complete = append_import_maintenance_range_read(
         read,
         after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded),
@@ -7310,6 +7934,7 @@ fn bounded_capacity_import_page_read(
         rows,
         rows_examined: charge.rows,
         bytes: charge.bytes,
+        identities: charge.identities,
         complete,
     })
 }
@@ -7771,6 +8396,36 @@ impl Store {
             .map_err(|_| blob_error(BlobStoreError::DepotIntegrity("depot lock is poisoned")))?;
         self.require_live()?;
 
+        if let Some(sample) = custody_sample {
+            let write = self.database.begin_write()?;
+            enforce_live_write(&write)?;
+            custody::observe_continuity_write(&write, sample)?;
+            let generation_sync = plan_blob_policy_generation_sync_write(&write)?;
+            let policy_unit = generation_sync.needed();
+            let maintenance_budget =
+                lifecycle::BlobMaintenanceBudget::new(budget.rows, 1, budget.bytes)?;
+            let mut charge = MaintenanceCharge::new(maintenance_budget, 0, 0);
+            if policy_unit
+                && !charge_blob_policy_generation_sync_write(&write, generation_sync, &mut charge)?
+            {
+                return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                    charge.rows,
+                    charge.bytes,
+                ));
+            }
+            if policy_unit {
+                apply_blob_policy_generation_sync_write(&write, generation_sync)?;
+            }
+            let pressure_ready = pressure::pressure_ready_write(&write)?;
+            write.commit()?;
+            if policy_unit || !pressure_ready {
+                return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                    charge.rows,
+                    charge.bytes,
+                ));
+            }
+        }
+
         let read = self.database.begin_read()?;
         let selection = pressure::select_pressure_candidate_read(&read, demand, budget)?;
         drop(read);
@@ -7810,13 +8465,19 @@ impl Store {
 
         let write = self.database.begin_write()?;
         enforce_live_write(&write)?;
+        if !pressure::pressure_ready_write(&write)? {
+            return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                selection.rows_examined(),
+                selection.bytes_examined(),
+            ));
+        }
         let maintenance_budget =
             lifecycle::BlobMaintenanceBudget::new(budget.rows, 1, budget.bytes)?;
-        let mut charge = MaintenanceCharge {
-            budget: maintenance_budget,
-            rows: selection.rows_examined(),
-            bytes: selection.bytes_examined(),
-        };
+        let mut charge = MaintenanceCharge::new(
+            maintenance_budget,
+            selection.rows_examined(),
+            selection.bytes_examined(),
+        );
         let publications = write.open_table(BLOB_PUBLICATIONS)?;
         let publication_record = publications
             .get(transfer.as_bytes().as_slice())?
@@ -7825,12 +8486,6 @@ impl Store {
                     "Blob pressure candidate publication disappeared",
                 ))
             })?;
-        if !charge.charge(transfer.as_bytes(), publication_record.value().len())? {
-            return Ok(pressure::BlobCapacityRecoveryResult::empty(
-                charge.rows,
-                charge.bytes,
-            ));
-        }
         let encoded_publication = publication_record.value().to_vec();
         drop(publication_record);
         drop(publications);
@@ -7848,7 +8503,7 @@ impl Store {
                 "Blob pressure candidate changed after ordered selection",
             )));
         }
-        let Some(references) = pressure::bounded_variant_references_write(
+        let Some(pressure_snapshot) = plan_pressure_variant_snapshot_write(
             &write,
             publication.variant_id,
             budget.roots,
@@ -7860,21 +8515,10 @@ impl Store {
                 charge.bytes,
             ));
         };
-        if !pressure::require_variant_with_references_bounded_write(
-            &write,
-            publication.variant_id,
-            &references,
-            &mut charge,
-        )? {
-            return Ok(pressure::BlobCapacityRecoveryResult::empty(
-                charge.rows,
-                charge.bytes,
-            ));
-        }
-        let final_root = references.len() == 1;
+        let final_root = pressure_snapshot.references.len() == 1;
         if final_root
-            && (references[0] != (lifecycle::VariantReferenceOwner::Publication, transfer)
-                || budget.deletion_manifests < 1)
+            && pressure_snapshot.references[0]
+                != (lifecycle::VariantReferenceOwner::Publication, transfer)
         {
             return Ok(pressure::BlobCapacityRecoveryResult::empty(
                 charge.rows,
@@ -7882,12 +8526,30 @@ impl Store {
             ));
         }
         let mut remaining_operations = budget.operations;
+        let continuity = custody::lower_bound_continuity_write(&write)?;
+        let retirement_sample = custody_sample.or(continuity.map(|value| value.sample));
+        let retirement_reason = if matches!(
+            evaluate_blob_lifetime(publication.lifetime, continuity, retirement_sample,)?,
+            BlobLifetimeEvaluation::FiniteExpired { .. }
+        ) {
+            lifecycle::RetirementReason::Expired
+        } else {
+            lifecycle::RetirementReason::Evicted
+        };
+        let proven_expired = retirement_reason == lifecycle::RetirementReason::Expired;
+        if final_root && !proven_expired && budget.deletion_manifests < 1 {
+            return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                charge.rows,
+                charge.bytes,
+            ));
+        }
         let Some(retirement_plan) = plan_blob_publication_retirement_write(
             &write,
             self.blob_lifecycle_limits,
             transfer,
-            lifecycle::RetirementReason::Evicted,
-            custody_sample,
+            retirement_reason,
+            PublicationPressurePreflight::Snapshot(&pressure_snapshot),
+            retirement_sample,
             &mut charge,
             &mut remaining_operations,
         )?
@@ -7897,7 +8559,7 @@ impl Store {
                 charge.bytes,
             ));
         };
-        let deletion_evidence = if final_root {
+        let deletion_evidence = if final_root && !proven_expired {
             match deletion::bounded_variant_has_deletion_manifest_write(
                 &write,
                 publication.variant_id,
@@ -8023,18 +8685,15 @@ impl Store {
         } else {
             None
         };
-        if !pressure_charge_u64_rows(&mut charge, &[BLOB_ITEM_COUNT, BLOB_TOTAL_BYTES])? {
-            return Ok(pressure::BlobCapacityRecoveryResult::empty(
-                charge.rows,
-                charge.bytes,
-            ));
-        }
         apply_blob_publication_retirement_plan_write(
             &write,
             self.blob_lifecycle_limits,
             retirement_plan,
-            true,
-            final_root,
+            if final_root {
+                PublicationPressureApply::RemoveRootOnly
+            } else {
+                PublicationPressureApply::RefreshVariant
+            },
         )?;
         if final_root {
             pressure::remove_drained_variant_write(&write, publication.variant_id)?;
@@ -8199,51 +8858,24 @@ impl Store {
         let authority = self.require_bound_mission()?;
         let write = self.database.begin_write()?;
         enforce_live_write(&write)?;
-        let maintenance_budget =
-            lifecycle::BlobMaintenanceBudget::new(budget.rows, 1, budget.bytes)?;
-        let mut charge = MaintenanceCharge {
-            budget: maintenance_budget,
-            rows: selection.rows_examined(),
-            bytes: selection.bytes_examined(),
-        };
-        for field in [BLOB_NETWORK_STAGING_ROWS, BLOB_NETWORK_STAGING_BYTES] {
-            if !charge.charge(field.as_bytes(), std::mem::size_of::<u64>())? {
-                return Ok(pressure::BlobCapacityRecoveryResult::empty(
-                    charge.rows,
-                    charge.bytes,
-                ));
-            }
-        }
-        let staging = blob_network_staging_usage_write(&write, authority)?;
-        let pending_sources = write.open_table(BLOB_PENDING_SOURCES)?;
-        let encoded_pending = pending_sources
-            .get(transfer.as_bytes().as_slice())?
-            .ok_or_else(|| {
-                blob_error(BlobStoreError::SchemaInvariant(
-                    "Blob pressure pending candidate disappeared",
-                ))
-            })?;
-        if !charge.charge(transfer.as_bytes(), encoded_pending.value().len())? {
+        if !pressure::pressure_ready_write(&write)? {
             return Ok(pressure::BlobCapacityRecoveryResult::empty(
-                charge.rows,
-                charge.bytes,
+                selection.rows_examined(),
+                selection.bytes_examined(),
             ));
         }
-        let pending_bytes = encoded_pending.value().to_vec();
-        drop(encoded_pending);
-        drop(pending_sources);
-        let encoded_pending = pending_bytes;
-        let pending = decode_pending_blob_source(&encoded_pending)?;
-        if pending.metadata.transfer_id != transfer
-            || pending.metadata.header.priority >= demand.incoming_priority()
-        {
-            return Err(blob_error(BlobStoreError::SchemaInvariant(
-                "Blob pressure pending candidate changed after ordered selection",
-            )));
-        }
-        let Some(references) = pressure::bounded_variant_references_write(
+        let maintenance_budget =
+            lifecycle::BlobMaintenanceBudget::new(budget.rows, 1, budget.bytes)?;
+        let mut charge = MaintenanceCharge::new(
+            maintenance_budget,
+            selection.rows_examined(),
+            selection.bytes_examined(),
+        );
+        let Some(removal) = plan_pending_pressure_removal_write(
             &write,
-            pending.metadata.variant_id,
+            authority,
+            transfer,
+            demand,
             budget.roots,
             &mut charge,
         )?
@@ -8253,90 +8885,30 @@ impl Store {
                 charge.bytes,
             ));
         };
-        if !pressure::require_variant_with_references_bounded_write(
-            &write,
-            pending.metadata.variant_id,
-            &references,
-            &mut charge,
-        )? {
-            return Ok(pressure::BlobCapacityRecoveryResult::empty(
-                charge.rows,
-                charge.bytes,
-            ));
-        }
-        let final_root = references.len() == 1;
+        let pending = &removal.authority.pending;
+        let final_root = removal.pressure.references.len() == 1;
         if final_root
-            && (references[0] != (lifecycle::VariantReferenceOwner::PendingSource, transfer)
-                || budget.deletion_manifests < 1)
+            && removal.pressure.references[0]
+                != (lifecycle::VariantReferenceOwner::PendingSource, transfer)
         {
             return Ok(pressure::BlobCapacityRecoveryResult::empty(
                 charge.rows,
                 charge.bytes,
             ));
         }
-        let mut removed_rows = 1u64;
-        let mut removed_bytes = staging_entry_bytes(32, encoded_pending.len())?;
-        for carrier in &pending.carriers {
-            let key = blob_carrier_prefix_key(transfer, carrier.object);
-            let prefixes = write.open_table(BLOB_CARRIER_PREFIXES)?;
-            if let Some(encoded_guard) = prefixes.get(key.as_slice())? {
-                if !charge.charge(key.as_slice(), encoded_guard.value().len())? {
-                    return Ok(pressure::BlobCapacityRecoveryResult::empty(
-                        charge.rows,
-                        charge.bytes,
-                    ));
-                }
-                let encoded = encoded_guard.value().to_vec();
-                let record = decode_blob_carrier_prefix(&encoded)?;
-                if record.source != transfer || record.total_len != carrier.total_len {
-                    return Err(blob_error(BlobStoreError::SchemaInvariant(
-                        "Blob pressure carrier prefix contradicts its pending source",
-                    )));
-                }
-                removed_rows = removed_rows
-                    .checked_add(1)
-                    .ok_or(StoreError::ItemCountAccountingOverflow)?;
-                removed_bytes = removed_bytes
-                    .checked_add(staging_entry_bytes(key.len(), encoded.len())?)
-                    .ok_or(StoreError::PayloadByteAccountingOverflow)?;
-            }
-        }
-        for field in [BLOB_NETWORK_STAGING_ROWS, BLOB_NETWORK_STAGING_BYTES] {
-            if !charge.charge(field.as_bytes(), std::mem::size_of::<u64>())? {
-                return Ok(pressure::BlobCapacityRecoveryResult::empty(
-                    charge.rows,
-                    charge.bytes,
-                ));
-            }
-        }
-        let reference_key = variant_reference_key(
-            pending.metadata.variant_id,
-            lifecycle::VariantReferenceOwner::PendingSource,
-            transfer,
+        let continuity = custody::lower_bound_continuity_write(&write)?;
+        let retirement_sample = custody_sample.or(continuity.map(|value| value.sample));
+        let proven_expired = matches!(
+            evaluate_blob_lifetime(pending.metadata.lifetime, continuity, retirement_sample)?,
+            BlobLifetimeEvaluation::FiniteExpired { .. }
         );
-        let references_table = write.open_table(lifecycle::BLOB_VARIANT_REFERENCES)?;
-        let reference = references_table
-            .get(reference_key.as_slice())?
-            .ok_or_else(|| {
-                blob_error(BlobStoreError::SchemaInvariant(
-                    "Blob pressure pending candidate lacks its variant reference",
-                ))
-            })?;
-        if !charge.charge(reference_key.as_slice(), 0)? {
+        if final_root && !proven_expired && budget.deletion_manifests < 1 {
             return Ok(pressure::BlobCapacityRecoveryResult::empty(
                 charge.rows,
                 charge.bytes,
             ));
         }
-        if !reference.value().is_empty() {
-            return Err(blob_error(BlobStoreError::SchemaInvariant(
-                "Blob pressure pending candidate has a malformed variant reference",
-            )));
-        }
-        drop(reference);
-        drop(references_table);
-
-        let deletion_evidence = if final_root {
+        let deletion_evidence = if final_root && !proven_expired {
             match deletion::bounded_variant_has_deletion_manifest_write(
                 &write,
                 pending.metadata.variant_id,
@@ -8438,7 +9010,13 @@ impl Store {
             lifecycle::VariantReferenceOwner::PendingSource,
             transfer,
         )?;
-        remove_pending_source_rows_write(&write, staging, transfer, &pending)?;
+        apply_pending_removal_authority_write(
+            &write,
+            &removal.authority,
+            removal.authority.staging_before,
+            self.blob_lifecycle_limits,
+            true,
+        )?;
         if final_root {
             pressure::remove_pending_source_root_write(
                 &write,
@@ -8453,16 +9031,26 @@ impl Store {
             deletion::apply_variant_admission_plan_write(&write, plan)?;
         }
         let after = blob_network_staging_usage_write(&write, authority)?;
-        if staging.rows.checked_sub(after.rows) != Some(removed_rows)
-            || staging.bytes.checked_sub(after.bytes) != Some(removed_bytes)
+        if removal
+            .authority
+            .staging_before
+            .rows
+            .checked_sub(after.rows)
+            != Some(removal.authority.removed_rows)
+            || removal
+                .authority
+                .staging_before
+                .bytes
+                .checked_sub(after.bytes)
+                != Some(removal.authority.removed_bytes)
         {
             return Err(blob_error(BlobStoreError::SchemaInvariant(
                 "Blob pending pressure recovery disagrees with committed accounting delta",
             )));
         }
         let recovered_units = match demand.partition() {
-            pressure::BlobCapacityPartition::NetworkStagingRows => removed_rows,
-            pressure::BlobCapacityPartition::NetworkStagingBytes => removed_bytes,
+            pressure::BlobCapacityPartition::NetworkStagingRows => removal.authority.removed_rows,
+            pressure::BlobCapacityPartition::NetworkStagingBytes => removal.authority.removed_bytes,
             _ => {
                 return Err(blob_error(BlobStoreError::SchemaInvariant(
                     "pending Blob pressure selected for another partition",
@@ -8494,75 +9082,81 @@ impl Store {
         let authority = self.require_bound_mission()?;
         let write = self.database.begin_write()?;
         enforce_live_write(&write)?;
-        let maintenance_budget =
-            lifecycle::BlobMaintenanceBudget::new(budget.rows, 1, budget.bytes)?;
-        let mut charge = MaintenanceCharge {
-            budget: maintenance_budget,
-            rows: selection.rows_examined(),
-            bytes: selection.bytes_examined(),
-        };
-        let accounting_rows = [
-            DEPOT_RESERVED_FILE_BYTES,
-            deletion::BLOB_DELETION_CHARGED_VARIANTS,
-            deletion::BLOB_DELETION_CHARGED_RESERVED_BYTES,
-            BLOB_NETWORK_SCHEMA_VERSION_FIELD,
-            BLOB_NETWORK_STAGING_ROWS,
-            BLOB_NETWORK_STAGING_BYTES,
-            BLOB_ITEM_COUNT,
-            BLOB_TOTAL_BYTES,
-        ];
-        // Reserve both sides of the store-owned accounting delta audit before
-        // discovering or allocating the candidate's fan-out.
-        if !pressure_charge_u64_rows(&mut charge, &accounting_rows)?
-            || !pressure_charge_u64_rows(&mut charge, &accounting_rows)?
-        {
+        if !pressure::pressure_ready_write(&write)? {
             return Ok(pressure::BlobCapacityRecoveryResult::empty(
-                charge.rows,
-                charge.bytes,
+                selection.rows_examined(),
+                selection.bytes_examined(),
             ));
         }
+        let maintenance_budget =
+            lifecycle::BlobMaintenanceBudget::new(budget.rows, 1, budget.bytes)?;
+        let mut charge = MaintenanceCharge::new(
+            maintenance_budget,
+            selection.rows_examined(),
+            selection.bytes_examined(),
+        );
         let before_depot = depot::depot_admission_usage_write(&write)?;
-        let before_staging = blob_network_staging_usage_write(&write, authority)?;
-        let before_items = write
-            .open_table(METADATA)?
-            .get(BLOB_ITEM_COUNT)?
-            .ok_or(StoreError::MissingAccountingMetadata {
-                field: BLOB_ITEM_COUNT,
-            })?
-            .value();
-        let before_bytes = write
-            .open_table(METADATA)?
-            .get(BLOB_TOTAL_BYTES)?
-            .ok_or(StoreError::MissingAccountingMetadata {
-                field: BLOB_TOTAL_BYTES,
-            })?
-            .value();
-
-        let Some(references) =
-            pressure::bounded_variant_references_write(&write, variant, budget.roots, &mut charge)?
+        let Some(pressure_snapshot) =
+            plan_pressure_variant_snapshot_write(&write, variant, budget.roots, &mut charge)?
         else {
             return Ok(pressure::BlobCapacityRecoveryResult::empty(
                 charge.rows,
                 charge.bytes,
             ));
         };
-        if references.is_empty() {
+        if pressure_snapshot.references.is_empty() {
             return Err(blob_error(BlobStoreError::SchemaInvariant(
                 "Blob pressure selected an unrooted variant",
             )));
         }
-        if !pressure::require_variant_with_references_bounded_write(
-            &write,
-            variant,
-            &references,
-            &mut charge,
-        )? {
-            return Ok(pressure::BlobCapacityRecoveryResult::empty(
-                charge.rows,
-                charge.bytes,
-            ));
-        }
-        if budget.deletion_manifests < 1 {
+        let has_publications = pressure_snapshot
+            .references
+            .iter()
+            .any(|(owner, _)| *owner == lifecycle::VariantReferenceOwner::Publication);
+        let has_pending = pressure_snapshot
+            .references
+            .iter()
+            .any(|(owner, _)| *owner == lifecycle::VariantReferenceOwner::PendingSource);
+        let before_staging = if has_pending {
+            if !charge_staging_accounting(&mut charge)? {
+                return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                    charge.rows,
+                    charge.bytes,
+                ));
+            }
+            Some(blob_network_staging_usage_write(&write, authority)?)
+        } else {
+            None
+        };
+        let (before_items, before_bytes) = if has_publications {
+            if !pressure_charge_u64_rows(
+                &mut charge,
+                "aster.metadata.v1",
+                &[BLOB_ITEM_COUNT, BLOB_TOTAL_BYTES],
+            )? {
+                return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                    charge.rows,
+                    charge.bytes,
+                ));
+            }
+            let metadata = write.open_table(METADATA)?;
+            let items = metadata
+                .get(BLOB_ITEM_COUNT)?
+                .ok_or(StoreError::MissingAccountingMetadata {
+                    field: BLOB_ITEM_COUNT,
+                })?
+                .value();
+            let bytes = metadata
+                .get(BLOB_TOTAL_BYTES)?
+                .ok_or(StoreError::MissingAccountingMetadata {
+                    field: BLOB_TOTAL_BYTES,
+                })?
+                .value();
+            (Some(items), Some(bytes))
+        } else {
+            (None, None)
+        };
+        if !lifecycle::charge_variant_reference_counter(&mut charge)? {
             return Ok(pressure::BlobCapacityRecoveryResult::empty(
                 charge.rows,
                 charge.bytes,
@@ -8570,18 +9164,14 @@ impl Store {
         }
         let mut publication_roots = Vec::new();
         let mut pending_roots = Vec::new();
+        let mut all_roots_proven_expired = true;
         let mut remaining_operations = budget.operations;
         let mut publication_bytes = 0u64;
         let mut staging_rows = 0u64;
         let mut staging_bytes = 0u64;
-        for (owner, transfer) in references {
-            let reference_key = variant_reference_key(variant, owner, transfer);
-            if !charge.charge(reference_key.as_slice(), 0)? {
-                return Ok(pressure::BlobCapacityRecoveryResult::empty(
-                    charge.rows,
-                    charge.bytes,
-                ));
-            }
+        let continuity = custody::lower_bound_continuity_write(&write)?;
+        let retirement_sample = custody_sample.or(continuity.map(|value| value.sample));
+        for &(owner, transfer) in &pressure_snapshot.references {
             match owner {
                 lifecycle::VariantReferenceOwner::Publication => {
                     let publications = write.open_table(BLOB_PUBLICATIONS)?;
@@ -8592,12 +9182,6 @@ impl Store {
                                 "Blob variant pressure publication disappeared",
                             ))
                         })?;
-                    if !charge.charge(transfer.as_bytes(), encoded.value().len())? {
-                        return Ok(pressure::BlobCapacityRecoveryResult::empty(
-                            charge.rows,
-                            charge.bytes,
-                        ));
-                    };
                     let publication = decode_blob_metadata(encoded.value())?;
                     drop(encoded);
                     drop(publications);
@@ -8608,12 +9192,26 @@ impl Store {
                             "Blob variant pressure publication contradicts its summary",
                         )));
                     }
+                    let proven_expired = matches!(
+                        evaluate_blob_lifetime(
+                            publication.lifetime,
+                            continuity,
+                            retirement_sample,
+                        )?,
+                        BlobLifetimeEvaluation::FiniteExpired { .. }
+                    );
+                    all_roots_proven_expired &= proven_expired;
                     let Some(retirement_plan) = plan_blob_publication_retirement_write(
                         &write,
                         self.blob_lifecycle_limits,
                         transfer,
-                        lifecycle::RetirementReason::Evicted,
-                        custody_sample,
+                        if proven_expired {
+                            lifecycle::RetirementReason::Expired
+                        } else {
+                            lifecycle::RetirementReason::Evicted
+                        },
+                        PublicationPressurePreflight::Snapshot(&pressure_snapshot),
+                        retirement_sample,
                         &mut charge,
                         &mut remaining_operations,
                     )?
@@ -8648,12 +9246,6 @@ impl Store {
                                 "Blob variant pressure pending source disappeared",
                             ))
                         })?;
-                    if !charge.charge(transfer.as_bytes(), encoded_guard.value().len())? {
-                        return Ok(pressure::BlobCapacityRecoveryResult::empty(
-                            charge.rows,
-                            charge.bytes,
-                        ));
-                    }
                     let encoded = encoded_guard.value().to_vec();
                     drop(encoded_guard);
                     drop(pending_sources);
@@ -8665,38 +9257,49 @@ impl Store {
                             "Blob variant pressure pending source contradicts its summary",
                         )));
                     }
+                    all_roots_proven_expired &= matches!(
+                        evaluate_blob_lifetime(
+                            pending.metadata.lifetime,
+                            continuity,
+                            retirement_sample,
+                        )?,
+                        BlobLifetimeEvaluation::FiniteExpired { .. }
+                    );
+                    let Some(authority_plan) = plan_pending_removal_authority_write(
+                        &write,
+                        authority,
+                        transfer,
+                        &pending,
+                        &mut charge,
+                    )?
+                    else {
+                        return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                            charge.rows,
+                            charge.bytes,
+                        ));
+                    };
+                    if !lifecycle::charge_policy_ttl_deadline_write(
+                        transfer,
+                        lifecycle::TtlDeadlineKind::PendingSource,
+                        Some(pending.metadata.lifetime),
+                        None,
+                        &mut charge,
+                    )? {
+                        return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                            charge.rows,
+                            charge.bytes,
+                        ));
+                    }
                     staging_rows = staging_rows
-                        .checked_add(1)
+                        .checked_add(authority_plan.removed_rows)
                         .ok_or(StoreError::ItemCountAccountingOverflow)?;
                     staging_bytes = staging_bytes
-                        .checked_add(staging_entry_bytes(32, encoded.len())?)
+                        .checked_add(authority_plan.removed_bytes)
                         .ok_or(StoreError::PayloadByteAccountingOverflow)?;
-                    for carrier in &pending.carriers {
-                        let key = blob_carrier_prefix_key(transfer, carrier.object);
-                        let prefixes = write.open_table(BLOB_CARRIER_PREFIXES)?;
-                        if let Some(encoded_guard) = prefixes.get(key.as_slice())? {
-                            if !charge.charge(key.as_slice(), encoded_guard.value().len())? {
-                                return Ok(pressure::BlobCapacityRecoveryResult::empty(
-                                    charge.rows,
-                                    charge.bytes,
-                                ));
-                            }
-                            let encoded_prefix = encoded_guard.value().to_vec();
-                            let prefix = decode_blob_carrier_prefix(&encoded_prefix)?;
-                            if prefix.source != transfer || prefix.total_len != carrier.total_len {
-                                return Err(blob_error(BlobStoreError::SchemaInvariant(
-                                    "Blob variant pressure carrier prefix contradicts its source",
-                                )));
-                            }
-                            staging_rows = staging_rows
-                                .checked_add(1)
-                                .ok_or(StoreError::ItemCountAccountingOverflow)?;
-                            staging_bytes = staging_bytes
-                                .checked_add(staging_entry_bytes(key.len(), encoded_prefix.len())?)
-                                .ok_or(StoreError::PayloadByteAccountingOverflow)?;
-                        }
-                    }
-                    pending_roots.push((transfer, pending));
+                    pending_roots.push(WholeVariantPendingRemovalPlan {
+                        transfer,
+                        authority: authority_plan,
+                    });
                 }
             }
         }
@@ -8707,139 +9310,217 @@ impl Store {
                 charge.bytes,
             ));
         }
-        match deletion::bounded_variant_has_deletion_manifest_write(&write, variant, &mut charge)? {
-            Some(false) => {}
-            Some(true) => {
-                return Err(blob_error(BlobStoreError::SchemaInvariant(
-                    "live Blob pressure variant already has deletion authority",
-                )));
+        if !all_roots_proven_expired && budget.deletion_manifests < 1 {
+            return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                charge.rows,
+                charge.bytes,
+            ));
+        }
+        let deletion_evidence = if all_roots_proven_expired {
+            None
+        } else {
+            match deletion::bounded_variant_has_deletion_manifest_write(
+                &write,
+                variant,
+                &mut charge,
+            )? {
+                Some(false) => {}
+                Some(true) => {
+                    return Err(blob_error(BlobStoreError::SchemaInvariant(
+                        "live Blob pressure variant already has deletion authority",
+                    )));
+                }
+                None => {
+                    return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                        charge.rows,
+                        charge.bytes,
+                    ));
+                }
             }
-            None => {
+            let Some((import, lineage)) =
+                pressure_deletion_evidence_write(&write, variant, &mut charge)?
+            else {
+                return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                    charge.rows,
+                    charge.bytes,
+                ));
+            };
+            if !pressure_charge_depot_owner_binding(&mut charge)? {
                 return Ok(pressure::BlobCapacityRecoveryResult::empty(
                     charge.rows,
                     charge.bytes,
                 ));
             }
-        }
-        let Some((import, lineage)) =
-            pressure_deletion_evidence_write(&write, variant, &mut charge)?
-        else {
-            return Ok(pressure::BlobCapacityRecoveryResult::empty(
-                charge.rows,
-                charge.bytes,
-            ));
-        };
-        if !pressure_charge_depot_owner_binding(&mut charge)? {
-            return Ok(pressure::BlobCapacityRecoveryResult::empty(
-                charge.rows,
-                charge.bytes,
-            ));
-        }
-        let owner = depot::require_depot_owner_binding_write(
-            &write,
-            &self.path,
-            self.backing_identity,
-            self.blob_depot_owner_token,
-        )?;
-        let snapshot = self
-            .blob_lease_registry
-            .snapshot(
-                self.blob_depot_owner_binding,
-                lease::BlobLeaseTarget::Variant(variant),
-            )
-            .map_err(lease::store_error)?;
-        #[cfg(test)]
-        if TEST_BLOB_MANIFEST_ADMISSION_GENERATION_CHURN.get() {
-            drop(
-                self.blob_lease_registry
-                    .acquire(
-                        self.blob_depot_owner_binding,
-                        lease::BlobLeaseTarget::Variant(variant),
-                        lease::BlobLeaseKind::InternalChunkWork,
-                    )
-                    .map_err(lease::store_error)?,
-            );
-        }
-        let deletion_admission = match self.blob_lease_registry.try_mark_delete_pending(snapshot) {
-            Ok(admission) => admission,
-            Err(
-                lease::BlobLeaseAcquireError::ActiveLeases
-                | lease::BlobLeaseAcquireError::GenerationChanged
-                | lease::BlobLeaseAcquireError::DeletePending,
-            ) => {
+            let owner = depot::require_depot_owner_binding_write(
+                &write,
+                &self.path,
+                self.backing_identity,
+                self.blob_depot_owner_token,
+            )?;
+            let snapshot = self
+                .blob_lease_registry
+                .snapshot(
+                    self.blob_depot_owner_binding,
+                    lease::BlobLeaseTarget::Variant(variant),
+                )
+                .map_err(lease::store_error)?;
+            #[cfg(test)]
+            if TEST_BLOB_MANIFEST_ADMISSION_GENERATION_CHURN.get() {
+                drop(
+                    self.blob_lease_registry
+                        .acquire(
+                            self.blob_depot_owner_binding,
+                            lease::BlobLeaseTarget::Variant(variant),
+                            lease::BlobLeaseKind::InternalChunkWork,
+                        )
+                        .map_err(lease::store_error)?,
+                );
+            }
+            let deletion_admission =
+                match self.blob_lease_registry.try_mark_delete_pending(snapshot) {
+                    Ok(admission) => admission,
+                    Err(
+                        lease::BlobLeaseAcquireError::ActiveLeases
+                        | lease::BlobLeaseAcquireError::GenerationChanged
+                        | lease::BlobLeaseAcquireError::DeletePending,
+                    ) => {
+                        return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                            charge.rows,
+                            charge.bytes,
+                        ));
+                    }
+                    Err(error) => return Err(lease::store_error(error)),
+                };
+
+            let Some(deletion_plan) = deletion::plan_variant_admission_write(
+                &write,
+                variant,
+                &import,
+                &lineage,
+                owner,
+                custody_sample,
+                Some(&mut charge),
+            )?
+            else {
                 return Ok(pressure::BlobCapacityRecoveryResult::empty(
                     charge.rows,
                     charge.bytes,
                 ));
-            }
-            Err(error) => return Err(lease::store_error(error)),
+            };
+            Some((deletion_plan, deletion_admission))
         };
 
-        let Some(deletion_plan) = deletion::plan_variant_admission_write(
-            &write,
-            variant,
-            &import,
-            &lineage,
-            owner,
-            custody_sample,
-            Some(&mut charge),
-        )?
-        else {
-            return Ok(pressure::BlobCapacityRecoveryResult::empty(
-                charge.rows,
-                charge.bytes,
-            ));
+        let (deletion_plan, deletion_admission) = match deletion_evidence {
+            Some((plan, admission)) => (Some(plan), Some(admission)),
+            None => (None, None),
         };
+        let plan = WholeVariantRetirementPlan {
+            pressure: pressure_snapshot,
+            publications: publication_roots,
+            pending: pending_roots,
+            deletion: deletion_plan,
+            publication_bytes,
+            staging_rows,
+            staging_bytes,
+        };
+        let WholeVariantRetirementPlan {
+            pressure,
+            publications,
+            pending,
+            deletion,
+            publication_bytes,
+            staging_rows,
+            staging_bytes,
+        } = plan;
+        if pressure.references.len() != publications.len() + pending.len() {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "whole-variant retirement plan lost a pressure root",
+            )));
+        }
 
-        let publication_count = u64::try_from(publication_roots.len())
+        let publication_count = u64::try_from(publications.len())
             .map_err(|_| StoreError::ItemCountAccountingOverflow)?;
-        let mut evicted = publication_roots
+        let mut evicted = publications
             .iter()
             .map(|(transfer, _)| *transfer)
             .collect::<Vec<_>>();
-        for (_, retirement_plan) in publication_roots {
+        for (_, retirement_plan) in publications {
             apply_blob_publication_retirement_plan_write(
                 &write,
                 self.blob_lifecycle_limits,
                 retirement_plan,
-                true,
-                true,
+                PublicationPressureApply::RemoveRootOnly,
             )?;
         }
-        for (transfer, pending) in &pending_roots {
+        let mut pending_staging =
+            before_staging.unwrap_or(BlobNetworkStagingUsage { rows: 0, bytes: 0 });
+        for pending_plan in &pending {
             lifecycle::remove_variant_reference(
                 &write,
                 variant,
                 lifecycle::VariantReferenceOwner::PendingSource,
-                *transfer,
+                pending_plan.transfer,
             )?;
-            let staging = blob_network_staging_usage_write(&write, authority)?;
-            remove_pending_source_rows_write(&write, staging, *transfer, pending)?;
-            pressure::remove_pending_source_root_write(&write, *transfer, variant)?;
+            pending_staging = apply_pending_removal_authority_write(
+                &write,
+                &pending_plan.authority,
+                pending_staging,
+                self.blob_lifecycle_limits,
+                true,
+            )?;
+            pressure::remove_pending_source_root_write(&write, pending_plan.transfer, variant)?;
         }
         pressure::remove_drained_variant_write(&write, variant)?;
-        deletion::apply_variant_admission_plan_write(&write, deletion_plan)?;
+        if let Some(deletion) = deletion {
+            deletion::apply_variant_admission_plan_write(&write, deletion)?;
+        }
         let after_depot = depot::depot_admission_usage_write(&write)?;
-        let after_staging = blob_network_staging_usage_write(&write, authority)?;
-        let after_items = write
-            .open_table(METADATA)?
-            .get(BLOB_ITEM_COUNT)?
-            .ok_or(StoreError::MissingAccountingMetadata {
-                field: BLOB_ITEM_COUNT,
-            })?
-            .value();
-        let after_bytes = write
-            .open_table(METADATA)?
-            .get(BLOB_TOTAL_BYTES)?
-            .ok_or(StoreError::MissingAccountingMetadata {
-                field: BLOB_TOTAL_BYTES,
-            })?
-            .value();
-        if before_items.checked_sub(after_items) != Some(publication_count)
-            || before_bytes.checked_sub(after_bytes) != Some(publication_bytes)
-            || before_staging.rows.checked_sub(after_staging.rows) != Some(staging_rows)
-            || before_staging.bytes.checked_sub(after_staging.bytes) != Some(staging_bytes)
+        let after_staging = if has_pending {
+            Some(blob_network_staging_usage_write(&write, authority)?)
+        } else {
+            None
+        };
+        let (after_items, after_bytes) = if has_publications {
+            let metadata = write.open_table(METADATA)?;
+            (
+                Some(
+                    metadata
+                        .get(BLOB_ITEM_COUNT)?
+                        .ok_or(StoreError::MissingAccountingMetadata {
+                            field: BLOB_ITEM_COUNT,
+                        })?
+                        .value(),
+                ),
+                Some(
+                    metadata
+                        .get(BLOB_TOTAL_BYTES)?
+                        .ok_or(StoreError::MissingAccountingMetadata {
+                            field: BLOB_TOTAL_BYTES,
+                        })?
+                        .value(),
+                ),
+            )
+        } else {
+            (None, None)
+        };
+        let publication_delta_matches = match (before_items, after_items, before_bytes, after_bytes)
         {
+            (Some(before_items), Some(after_items), Some(before_bytes), Some(after_bytes)) => {
+                before_items.checked_sub(after_items) == Some(publication_count)
+                    && before_bytes.checked_sub(after_bytes) == Some(publication_bytes)
+            }
+            (None, None, None, None) => publication_count == 0 && publication_bytes == 0,
+            _ => false,
+        };
+        let staging_delta_matches = match (before_staging, after_staging) {
+            (Some(before), Some(after)) => {
+                before.rows.checked_sub(after.rows) == Some(staging_rows)
+                    && before.bytes.checked_sub(after.bytes) == Some(staging_bytes)
+            }
+            (None, None) => staging_rows == 0 && staging_bytes == 0,
+            _ => false,
+        };
+        if !publication_delta_matches || !staging_delta_matches {
             return Err(blob_error(BlobStoreError::SchemaInvariant(
                 "whole-variant pressure recovery disagrees with logical accounting delta",
             )));
@@ -8875,12 +9556,14 @@ impl Store {
                 )));
             }
         };
-        evicted.extend(pending_roots.into_iter().map(|(transfer, _)| transfer));
+        evicted.extend(pending.into_iter().map(|plan| plan.transfer));
         evicted.sort_unstable();
         write.commit()?;
-        deletion_admission
-            .durable_committed()
-            .map_err(lease::store_error)?;
+        if let Some(deletion_admission) = deletion_admission {
+            deletion_admission
+                .durable_committed()
+                .map_err(lease::store_error)?;
+        }
         Ok(pressure::BlobCapacityRecoveryResult::recovered(
             evicted,
             recovered_units,
@@ -9344,6 +10027,7 @@ impl Store {
         if let Some(sample) = custody_sample {
             let write = self.database.begin_write()?;
             enforce_live_write(&write)?;
+            custody::observe_continuity_write(&write, sample)?;
             let age_progress = deletion::checkpoint_blob_deletion_ages_write(
                 &write,
                 sample,
@@ -9381,50 +10065,198 @@ impl Store {
         enforce_live_write(&write)?;
         lifecycle::require_maintenance_accounting(&write)?;
         let cursor = lifecycle::load_maintenance_cursor(&write)?;
+        let generation_sync = plan_blob_policy_generation_sync_write(&write)?;
+        if generation_sync.needed() {
+            let (mut charge, cursor_fits) =
+                begin_policy_maintenance_charge(&write, budget, cursor.class)?;
+            if !cursor_fits
+                || !charge_blob_policy_generation_sync_write(&write, generation_sync, &mut charge)?
+            {
+                return Ok(BlobMaintenanceProgress {
+                    class: cursor.class,
+                    rows_examined: charge.rows,
+                    files_examined: 0,
+                    bytes_examined: charge.bytes,
+                    candidates: Vec::new(),
+                    class_has_more_work: true,
+                    awaiting_later_handler: false,
+                });
+            }
+            apply_blob_policy_generation_sync_write(&write, generation_sync)?;
+            lifecycle::advance_maintenance_cursor(
+                &write,
+                cursor.class,
+                cursor.position.as_deref(),
+            )?;
+            let progress = BlobMaintenanceProgress {
+                class: cursor.class,
+                rows_examined: charge.rows,
+                files_examined: 0,
+                bytes_examined: charge.bytes,
+                candidates: Vec::new(),
+                class_has_more_work: true,
+                awaiting_later_handler: false,
+            };
+            write.commit()?;
+            return Ok(progress);
+        }
+        let effective_custody_sample = custody_sample
+            .or(custody::lower_bound_continuity_write(&write)?.map(|continuity| continuity.sample));
+        if cursor.class == BlobMaintenanceClass::ExpiredPublicationsAndPendingSources
+            && let Some((rows_examined, bytes_examined, applied)) =
+                apply_one_blob_policy_reanchor_write(
+                    &write,
+                    self.blob_lifecycle_limits,
+                    self.mission_authority,
+                    self.blob_depot_owner_binding,
+                    budget,
+                    effective_custody_sample,
+                    cursor.class,
+                )?
+        {
+            if !applied {
+                return Ok(BlobMaintenanceProgress {
+                    class: cursor.class,
+                    rows_examined,
+                    files_examined: 0,
+                    bytes_examined,
+                    candidates: Vec::new(),
+                    class_has_more_work: true,
+                    awaiting_later_handler: false,
+                });
+            }
+            lifecycle::advance_maintenance_cursor(
+                &write,
+                cursor.class,
+                cursor.position.as_deref(),
+            )?;
+            write.commit()?;
+            return Ok(BlobMaintenanceProgress {
+                class: cursor.class,
+                rows_examined,
+                files_examined: 0,
+                bytes_examined,
+                candidates: Vec::new(),
+                class_has_more_work: true,
+                awaiting_later_handler: false,
+            });
+        }
+        if cursor.class == BlobMaintenanceClass::ExpiredPublicationsAndPendingSources
+            && !pressure::pressure_ready_write(&write)?
+        {
+            lifecycle::advance_maintenance_cursor(
+                &write,
+                cursor.class,
+                cursor.position.as_deref(),
+            )?;
+            write.commit()?;
+            return Ok(BlobMaintenanceProgress {
+                class: cursor.class,
+                rows_examined: 0,
+                files_examined: 0,
+                bytes_examined: 0,
+                candidates: Vec::new(),
+                class_has_more_work: true,
+                awaiting_later_handler: false,
+            });
+        }
+        if cursor.class == BlobMaintenanceClass::ExpiredPublicationsAndPendingSources
+            && let Some((rows_examined, bytes_examined, applied)) = apply_one_blob_ttl_expiry_write(
+                &write,
+                self.blob_lifecycle_limits,
+                self.mission_authority,
+                self.blob_depot_owner_binding,
+                budget,
+                cursor.class,
+            )?
+        {
+            if !applied {
+                return Ok(BlobMaintenanceProgress {
+                    class: cursor.class,
+                    rows_examined,
+                    files_examined: 0,
+                    bytes_examined,
+                    candidates: Vec::new(),
+                    class_has_more_work: true,
+                    awaiting_later_handler: false,
+                });
+            }
+            lifecycle::advance_maintenance_cursor(
+                &write,
+                cursor.class,
+                cursor.position.as_deref(),
+            )?;
+            write.commit()?;
+            return Ok(BlobMaintenanceProgress {
+                class: cursor.class,
+                rows_examined,
+                files_examined: 0,
+                bytes_examined,
+                candidates: Vec::new(),
+                class_has_more_work: true,
+                awaiting_later_handler: false,
+            });
+        }
         if cursor.class == BlobMaintenanceClass::ExpiredRetirementRecords
-            && let Some(sample) = custody_sample
+            && let Some(sample) = effective_custody_sample
             && let Some(progress) =
                 expire_one_retirement_record_write(&write, &cursor, budget, sample)?
         {
             write.commit()?;
             return Ok(progress);
         }
+        let mut page_charge = MaintenanceCharge::new(budget, 0, 0);
+        if !lifecycle::charge_maintenance_cursor_write(&write, cursor.class, &mut page_charge)? {
+            return Ok(BlobMaintenanceProgress {
+                class: cursor.class,
+                rows_examined: page_charge.rows,
+                files_examined: 0,
+                bytes_examined: page_charge.bytes,
+                candidates: Vec::new(),
+                class_has_more_work: true,
+                awaiting_later_handler: false,
+            });
+        }
         let page = match cursor.class {
             BlobMaintenanceClass::ExpiredPublicationsAndPendingSources => {
                 // Policy retirement is one bounded atomic source unit. Do not
                 // pre-read later source rows and consume the budget needed to
                 // retire the selected maximum-fanout publication.
-                bounded_composite_maintenance_page_with_source_limit(
+                bounded_composite_maintenance_page_with_source_limit_and_charge(
                     &write,
                     BLOB_PUBLICATIONS,
                     MaintenanceRowKind::Publication,
                     BLOB_PENDING_SOURCES,
                     MaintenanceRowKind::Pending,
                     cursor.position.as_deref(),
-                    budget,
                     1,
+                    page_charge,
                 )?
             }
-            BlobMaintenanceClass::InvalidPendingWork => bounded_composite_maintenance_page(
-                &write,
-                BLOB_PENDING_SOURCES,
-                MaintenanceRowKind::Pending,
-                BLOB_CARRIER_PREFIXES,
-                MaintenanceRowKind::Carrier,
-                cursor.position.as_deref(),
-                budget,
-            )?,
+            BlobMaintenanceClass::InvalidPendingWork => {
+                bounded_composite_maintenance_page_with_charge(
+                    &write,
+                    BLOB_PENDING_SOURCES,
+                    MaintenanceRowKind::Pending,
+                    BLOB_CARRIER_PREFIXES,
+                    MaintenanceRowKind::Carrier,
+                    cursor.position.as_deref(),
+                    page_charge,
+                )?
+            }
             BlobMaintenanceClass::UnreferencedLocalImportStaging
             | BlobMaintenanceClass::UnreferencedCompletedVariants => {
                 unreachable!("import maintenance classes use exact manifest admission")
             }
-            BlobMaintenanceClass::ExpiredRetirementRecords => bounded_single_maintenance_page(
-                &write,
-                BLOB_OPERATIONS,
-                MaintenanceRowKind::Operation,
-                cursor.position.as_deref(),
-                budget,
-            )?,
+            BlobMaintenanceClass::ExpiredRetirementRecords => {
+                bounded_single_maintenance_page_with_charge(
+                    &write,
+                    BLOB_OPERATIONS,
+                    MaintenanceRowKind::Operation,
+                    cursor.position.as_deref(),
+                    page_charge,
+                )?
+            }
             BlobMaintenanceClass::ManifestBackedPhysicalDeletion => {
                 unreachable!("physical deletion uses descriptor-relative bounded work")
             }
@@ -9455,13 +10287,22 @@ impl Store {
                                     budget,
                                     rows: page.rows_examined,
                                     bytes: page.bytes,
+                                    identities: page.identities.clone(),
                                 };
+                                if !lifecycle::charge_maintenance_cursor_write(
+                                    &write,
+                                    cursor.class,
+                                    &mut charge,
+                                )? {
+                                    retirement_blocked = Some((charge.rows, charge.bytes));
+                                    break;
+                                }
                                 let Some(retirement_plan) =
                                     invalidated_blob_publication_retirement_plan_write(
                                         &write,
                                         self.blob_lifecycle_limits,
                                         transfer,
-                                        custody_sample,
+                                        effective_custody_sample,
                                         &mut charge,
                                     )?
                                 else {
@@ -9472,8 +10313,7 @@ impl Store {
                                     &write,
                                     self.blob_lifecycle_limits,
                                     retirement_plan,
-                                    false,
-                                    false,
+                                    PublicationPressureApply::RefreshVariant,
                                 )?;
                                 retired_position = Some(row.position.clone());
                                 retirement_charge = Some((charge.rows, charge.bytes));
@@ -9610,9 +10450,32 @@ impl Store {
         } else {
             cursor.position.as_deref()
         };
+        let cursor_charge = if retirement_charge.is_none() {
+            let mut charge = MaintenanceCharge {
+                budget,
+                rows: page.rows_examined,
+                bytes: page.bytes,
+                identities: page.identities.clone(),
+            };
+            if !lifecycle::charge_maintenance_cursor_write(&write, cursor.class, &mut charge)? {
+                return Ok(BlobMaintenanceProgress {
+                    class: cursor.class,
+                    rows_examined: charge.rows,
+                    files_examined: 0,
+                    bytes_examined: charge.bytes,
+                    candidates,
+                    class_has_more_work: true,
+                    awaiting_later_handler: false,
+                });
+            }
+            Some((charge.rows, charge.bytes))
+        } else {
+            None
+        };
         lifecycle::advance_maintenance_cursor(&write, cursor.class, next_position)?;
-        let (rows_examined, bytes_examined) =
-            retirement_charge.unwrap_or((page.rows_examined, page.bytes));
+        let (rows_examined, bytes_examined) = retirement_charge
+            .or(cursor_charge)
+            .expect("cursor charge is present");
         let progress = BlobMaintenanceProgress {
             class: cursor.class,
             rows_examined,
@@ -9777,11 +10640,165 @@ struct BlobPublicationRetirementPlan {
     deliveries: crate::blob_subscription::BlobDeliveryRetirementPlan,
 }
 
+/// Typed proof that the complete pressure authority for one variant was
+/// bounded, charged, and found internally consistent in this transaction.
+///
+/// Passing this proof to the central publication-retirement planner transfers
+/// ownership of the pressure rows already charged by the bounded snapshot;
+/// callers cannot bypass pressure preflight with an unstructured boolean.
+struct PressureVariantSnapshot {
+    variant_id: BlobVariantId,
+    references: Vec<(lifecycle::VariantReferenceOwner, BlobTransferId)>,
+}
+
+/// Complete, already-charged logical removal unit for one pending pressure
+/// root. The pressure snapshot owns the pending/ref/prefix/root/index rows;
+/// this plan owns only the distinct TTL and shared accounting rows.
+struct PendingRemovalPlan {
+    pressure: PressureVariantSnapshot,
+    authority: PendingRemovalAuthorityPlan,
+}
+
+struct WholeVariantPendingRemovalPlan {
+    transfer: BlobTransferId,
+    authority: PendingRemovalAuthorityPlan,
+}
+
+/// Exact pending/source-prefix authority admitted before one bounded removal.
+///
+/// Pressure progress may legitimately observe a durable chunk and skip its
+/// still-retained carrier prefix after a crash between depot and redb cleanup.
+/// Removal nevertheless deletes that prefix, so this plan independently
+/// captures and charges every present prefix that apply can touch.
+struct PendingRemovalAuthorityPlan {
+    source: BlobTransferId,
+    encoded_pending: Vec<u8>,
+    pending: PendingBlobSourceRecord,
+    prefixes: Vec<([u8; BLOB_CARRIER_PREFIX_KEY_BYTES], Vec<u8>)>,
+    staging_before: BlobNetworkStagingUsage,
+    removed_rows: u64,
+    removed_bytes: u64,
+}
+
+/// One admitted whole-variant mutation. The shared pressure snapshot and
+/// deletion plan are owned once; child plans contain only their distinct
+/// publication or pending authority.
+struct WholeVariantRetirementPlan {
+    pressure: PressureVariantSnapshot,
+    publications: Vec<(BlobTransferId, BlobPublicationRetirementPlan)>,
+    pending: Vec<WholeVariantPendingRemovalPlan>,
+    deletion: Option<deletion::BlobDeletionAdmissionPlan>,
+    publication_bytes: u64,
+    staging_rows: u64,
+    staging_bytes: u64,
+}
+
+impl PressureVariantSnapshot {
+    fn contains(&self, owner: lifecycle::VariantReferenceOwner, transfer: BlobTransferId) -> bool {
+        self.references.contains(&(owner, transfer))
+    }
+}
+
+enum PublicationPressurePreflight<'a> {
+    Required,
+    Snapshot(&'a PressureVariantSnapshot),
+}
+
+fn plan_pressure_variant_snapshot_write(
+    write: &redb::WriteTransaction,
+    variant_id: BlobVariantId,
+    root_limit: u64,
+    charge: &mut MaintenanceCharge,
+) -> Result<Option<PressureVariantSnapshot>, StoreError> {
+    let Some(references) =
+        pressure::bounded_variant_references_write(write, variant_id, root_limit, charge)?
+    else {
+        return Ok(None);
+    };
+    if !pressure::require_variant_with_references_bounded_write(
+        write,
+        variant_id,
+        &references,
+        charge,
+    )? {
+        return Ok(None);
+    }
+    Ok(Some(PressureVariantSnapshot {
+        variant_id,
+        references,
+    }))
+}
+
+fn plan_pending_pressure_removal_write(
+    write: &redb::WriteTransaction,
+    authority: NodeId,
+    transfer: BlobTransferId,
+    demand: pressure::BlobCapacityRecoveryDemand,
+    root_limit: u64,
+    charge: &mut MaintenanceCharge,
+) -> Result<Option<PendingRemovalPlan>, StoreError> {
+    let encoded = write
+        .open_table(BLOB_PENDING_SOURCES)?
+        .get(transfer.as_bytes().as_slice())?
+        .map(|value| value.value().to_vec())
+        .ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "Blob pressure pending candidate disappeared",
+            ))
+        })?;
+    let pending = decode_pending_blob_source(&encoded)?;
+    if pending.metadata.transfer_id != transfer
+        || pending.metadata.header.priority >= demand.incoming_priority()
+    {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "Blob pressure pending candidate changed after ordered selection",
+        )));
+    }
+    let Some(pressure) = plan_pressure_variant_snapshot_write(
+        write,
+        pending.metadata.variant_id,
+        root_limit,
+        charge,
+    )?
+    else {
+        return Ok(None);
+    };
+    if !pressure.contains(lifecycle::VariantReferenceOwner::PendingSource, transfer) {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "Blob pressure pending candidate lacks its variant reference",
+        )));
+    }
+
+    let Some(authority) =
+        plan_pending_removal_authority_write(write, authority, transfer, &pending, charge)?
+    else {
+        return Ok(None);
+    };
+    if !lifecycle::charge_policy_ttl_deadline_write(
+        transfer,
+        lifecycle::TtlDeadlineKind::PendingSource,
+        Some(pending.metadata.lifetime),
+        None,
+        charge,
+    )? || !lifecycle::charge_variant_reference_counter(charge)?
+    {
+        return Ok(None);
+    }
+    Ok(Some(PendingRemovalPlan {
+        pressure,
+        authority,
+    }))
+}
+
+// One bounded retirement unit carries independent durable authority, budget,
+// and operation-cap inputs that must remain explicit at every caller.
+#[allow(clippy::too_many_arguments)]
 fn plan_blob_publication_retirement_write(
     write: &redb::WriteTransaction,
     limits: BlobLifecycleLimits,
     transfer: BlobTransferId,
     reason: lifecycle::RetirementReason,
+    pressure_preflight: PublicationPressurePreflight<'_>,
     custody_sample: Option<aster_mesh::CustodySample>,
     charge: &mut MaintenanceCharge,
     remaining_operations: &mut u64,
@@ -9791,7 +10808,10 @@ fn plan_blob_publication_retirement_write(
         field: &'static str,
         charge: &mut MaintenanceCharge,
     ) -> Result<Option<u64>, StoreError> {
-        if !charge.charge(field.as_bytes(), std::mem::size_of::<u64>())? {
+        if !charge.charge_row(
+            MaintenanceRowIdentity::new("aster.metadata.v1", field.as_bytes()),
+            std::mem::size_of::<u64>(),
+        )? {
             return Ok(None);
         }
         write
@@ -9822,6 +10842,39 @@ fn plan_blob_publication_retirement_write(
             "Blob retirement charge differs from its publication key",
         )));
     }
+    let pressure_precharged = match pressure_preflight {
+        PublicationPressurePreflight::Required => false,
+        PublicationPressurePreflight::Snapshot(snapshot) => {
+            if snapshot.variant_id != publication.variant_id
+                || !snapshot.contains(lifecycle::VariantReferenceOwner::Publication, transfer)
+            {
+                return Err(blob_error(BlobStoreError::SchemaInvariant(
+                    "Blob retirement pressure snapshot names another root",
+                )));
+            }
+            true
+        }
+    };
+    if !lifecycle::charge_policy_ttl_deadline_write(
+        transfer,
+        lifecycle::TtlDeadlineKind::LivePublication,
+        Some(publication.lifetime),
+        None,
+        charge,
+    )? || !lifecycle::charge_variant_reference_counter(charge)?
+        || (!pressure_precharged
+            && !pressure::preflight_policy_root_mutation_write(
+                write,
+                publication.variant_id,
+                lifecycle::VariantReferenceOwner::Publication,
+                transfer,
+                policy_root_limit(limits)?,
+                false,
+                charge,
+            )?)
+    {
+        return Ok(None);
+    }
     match reason {
         lifecycle::RetirementReason::Invalidated
             if blob_header_is_current_write(write, &publication.header)? =>
@@ -9832,9 +10885,15 @@ fn plan_blob_publication_retirement_write(
         }
         lifecycle::RetirementReason::Invalidated | lifecycle::RetirementReason::Evicted => {}
         lifecycle::RetirementReason::Expired => {
-            return Err(blob_error(BlobStoreError::SchemaInvariant(
-                "Blob retirement helper received an unsupported expiry reason",
-            )));
+            let continuity = custody::lower_bound_continuity_write(write)?;
+            if !matches!(
+                evaluate_blob_lifetime(publication.lifetime, continuity, custody_sample)?,
+                BlobLifetimeEvaluation::FiniteExpired { .. }
+            ) {
+                return Err(blob_error(BlobStoreError::SchemaInvariant(
+                    "Blob expiry retirement candidate is not provably expired",
+                )));
+            }
         }
     }
     let source_bytes = write.open_table(BLOB_BYTES)?;
@@ -9845,7 +10904,10 @@ fn plan_blob_publication_retirement_write(
                 "Blob retirement candidate is missing source bytes",
             ))
         })?;
-    if !charge.charge(transfer.as_bytes(), source.value().len())? {
+    if !charge.charge_row(
+        MaintenanceRowIdentity::new("aster.semantic-blob-bytes.v1", transfer.as_bytes()),
+        source.value().len(),
+    )? {
         return Ok(None);
     }
     let source_len = u64::try_from(source.value().len())
@@ -9859,7 +10921,13 @@ fn plan_blob_publication_retirement_write(
                 "Blob retirement candidate is missing its acceptance marker",
             ))
         })?;
-    if !charge.charge_lengths(std::mem::size_of::<u64>(), std::mem::size_of::<[u8; 32]>())? {
+    if !charge.charge_row(
+        MaintenanceRowIdentity::new(
+            "aster.semantic-blob-acceptance-order.v1",
+            marker.to_be_bytes(),
+        ),
+        std::mem::size_of::<[u8; 32]>(),
+    )? {
         return Ok(None);
     }
     let acceptance_order = write.open_table(crate::blob_subscription::BLOB_ACCEPTANCE_ORDER)?;
@@ -10020,6 +11088,7 @@ fn plan_blob_publication_retirement_write(
         write,
         transfer,
         publication.semantic_id,
+        reason,
         charge,
     )?
     else {
@@ -10055,6 +11124,7 @@ fn invalidated_blob_publication_retirement_plan_write(
         limits,
         transfer,
         lifecycle::RetirementReason::Invalidated,
+        PublicationPressurePreflight::Required,
         custody_sample,
         charge,
         &mut remaining_operations,
@@ -10083,8 +11153,7 @@ fn apply_blob_publication_retirement_plan_write(
     write: &redb::WriteTransaction,
     limits: BlobLifecycleLimits,
     plan: BlobPublicationRetirementPlan,
-    variant_prevalidated: bool,
-    defer_variant_summary: bool,
+    pressure_apply: PublicationPressureApply,
 ) -> Result<(), StoreError> {
     let BlobPublicationRetirementPlan {
         transfer,
@@ -10115,8 +11184,16 @@ fn apply_blob_publication_retirement_plan_write(
             "planned Blob retirement publication changed before apply",
         )));
     }
+    lifecycle::replace_policy_ttl_deadline_write(
+        write,
+        transfer,
+        lifecycle::TtlDeadlineKind::LivePublication,
+        Some(decode_blob_metadata(&live_record)?.lifetime),
+        None,
+        limits,
+    )?;
     pressure::require_publication_write(write, transfer)?;
-    if !variant_prevalidated {
+    if matches!(pressure_apply, PublicationPressureApply::RefreshVariant) {
         pressure::require_variant_write(write, variant_id)?;
     }
     lifecycle::require_variant_reference(
@@ -10298,12 +11375,23 @@ fn apply_blob_publication_retirement_plan_write(
     )?;
     metadata.insert(BLOB_OPERATION_TOTAL_BYTES, operation_bytes_after)?;
     drop(metadata);
-    if defer_variant_summary {
-        pressure::remove_publication_root_write(write, transfer, variant_id)?;
-    } else {
-        pressure::remove_publication_write(write, transfer, variant_id)?;
+    match pressure_apply {
+        PublicationPressureApply::RefreshVariant => {
+            pressure::remove_publication_write(write, transfer, variant_id)?;
+        }
+        PublicationPressureApply::RemoveRootOnly => {
+            pressure::remove_publication_root_write(write, transfer, variant_id)?;
+        }
     }
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum PublicationPressureApply {
+    RefreshVariant,
+    /// A parent whole/final-variant plan removes the shared summary/index only
+    /// after all child roots have committed.
+    RemoveRootOnly,
 }
 
 fn blob_header_is_current_read(
@@ -10729,6 +11817,11 @@ fn blob_read_plan_read(
             saw_retired = true;
             continue;
         }
+        let metadata = decode_blob_metadata(&publication)?;
+        if !blob_lifetime_is_visible_read(read, metadata.lifetime)? {
+            saw_retired = true;
+            continue;
+        }
         rows.push(blob_read_candidate_projection_read(
             read,
             transfer,
@@ -10846,14 +11939,17 @@ fn completed_blob_range_source_snapshot_read(
     read: &redb::ReadTransaction,
     transfer_id: BlobTransferId,
 ) -> Result<Option<CompletedBlobRangeSourceSnapshot>, StoreError> {
-    let Some(metadata) = read
+    let Some(encoded) = read
         .open_table(BLOB_PUBLICATIONS)?
         .get(transfer_id.as_bytes().as_slice())?
-        .map(|value| decode_blob_metadata(value.value()))
-        .transpose()?
+        .map(|value| value.value().to_vec())
     else {
         return Ok(None);
     };
+    if lifecycle::publication_record_is_retired(&encoded).map_err(blob_error)? {
+        return Err(blob_error(BlobStoreError::ExpiredOrRetired));
+    }
+    let metadata = decode_blob_metadata(&encoded)?;
     if metadata.transfer_id != transfer_id {
         return Err(blob_error(BlobStoreError::CompletionMismatch));
     }
@@ -10882,6 +11978,69 @@ fn completed_blob_range_source_snapshot_read(
     }))
 }
 
+fn completed_blob_range_source_postcheck_read(
+    read: &redb::ReadTransaction,
+    initial: &CompletedBlobRangeSourceSnapshot,
+) -> Result<bool, StoreError> {
+    let transfer_id = initial.metadata.transfer_id;
+    let Some(encoded) = read
+        .open_table(BLOB_PUBLICATIONS)?
+        .get(transfer_id.as_bytes().as_slice())?
+        .map(|value| value.value().to_vec())
+    else {
+        return Ok(false);
+    };
+    if lifecycle::publication_record_is_retired(&encoded).map_err(blob_error)? {
+        let Some((acceptance_marker, payload)) =
+            lifecycle::retired_publication_payload(&encoded).map_err(blob_error)?
+        else {
+            return Ok(false);
+        };
+        return Ok(acceptance_marker == initial.acceptance_marker
+            && blob_metadata_immutable_identity_eq(
+                &decode_blob_metadata(payload)?,
+                &initial.metadata,
+            ));
+    }
+    let Some(current) = completed_blob_range_source_snapshot_read(read, transfer_id)? else {
+        return Ok(false);
+    };
+    Ok(current.acceptance_marker == initial.acceptance_marker
+        && blob_source_projection_immutable_identity_eq(&current.projection, &initial.projection)
+        && blob_metadata_immutable_identity_eq(&current.metadata, &initial.metadata))
+}
+
+fn blob_source_projection_immutable_identity_eq(
+    left: &BlobSourceProjection,
+    right: &BlobSourceProjection,
+) -> bool {
+    left.transfer_id == right.transfer_id
+        && left.semantic_id == right.semantic_id
+        && left.publisher == right.publisher
+        && left.topic == right.topic
+        && left.scope == right.scope
+        && left.epoch == right.epoch
+        && left.sealed_len == right.sealed_len
+        && left.route_lineage == right.route_lineage
+        && left.physical_lineage == right.physical_lineage
+        && left.manifest_digest == right.manifest_digest
+        && left.blob_id == right.blob_id
+        && left.total_len == right.total_len
+        && left.chunk_size == right.chunk_size
+        && left.chunk_count == right.chunk_count
+}
+
+fn blob_metadata_immutable_identity_eq(left: &BlobMetadata, right: &BlobMetadata) -> bool {
+    left.transfer_id == right.transfer_id
+        && left.semantic_id == right.semantic_id
+        && left.blob_id == right.blob_id
+        && left.variant_id == right.variant_id
+        && left.manifest_digest == right.manifest_digest
+        && left.route_lineage == right.route_lineage
+        && left.physical_lineage == right.physical_lineage
+        && left.header == right.header
+}
+
 fn load_blob_from_read(
     read: &redb::ReadTransaction,
     transfer_id: BlobTransferId,
@@ -10896,7 +12055,11 @@ fn load_blob_from_read(
         {
             return Err(blob_error(BlobStoreError::ExpiredOrRetired));
         }
-        Some(encoded) => Some(decode_blob_metadata(&encoded)?),
+        Some(encoded) => {
+            let metadata = decode_blob_metadata(&encoded)?;
+            require_blob_lifetime_visible_read(read, metadata.lifetime)?;
+            Some(metadata)
+        }
         None => None,
     };
     metadata
@@ -10954,7 +12117,10 @@ fn load_blob_from_write(
         {
             return Err(blob_error(BlobStoreError::ExpiredOrRetired));
         }
-        Some(encoded) => Some(decode_blob_metadata(&encoded)?),
+        Some(encoded) => {
+            let metadata = decode_blob_metadata(&encoded)?;
+            Some(metadata)
+        }
         None => None,
     };
     let blob = metadata
@@ -10995,6 +12161,25 @@ fn load_blob_from_write(
         require_blob_causal_authority_write(write, blob)?;
     }
     Ok(blob)
+}
+
+fn require_blob_publication_visible_write(
+    write: &redb::WriteTransaction,
+    transfer_id: BlobTransferId,
+) -> Result<(), StoreError> {
+    let encoded = write
+        .open_table(BLOB_PUBLICATIONS)?
+        .get(transfer_id.as_bytes().as_slice())?
+        .map(|value| value.value().to_vec())
+        .ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "Blob visibility check points to a missing publication",
+            ))
+        })?;
+    if lifecycle::publication_record_is_retired(&encoded).map_err(blob_error)? {
+        return Err(blob_error(BlobStoreError::ExpiredOrRetired));
+    }
+    require_blob_lifetime_visible_write(write, decode_blob_metadata(&encoded)?.lifetime)
 }
 
 /// Point-checks the exact causal authority required by one live publication.
@@ -11143,17 +12328,17 @@ pub(crate) fn blob_subscription_identity_write(
         .map(Option::flatten)
 }
 
-pub(crate) fn blob_subscription_retirement_generation_write(
+pub(crate) fn blob_subscription_retirement_write(
     write: &redb::WriteTransaction,
     transfer_id: BlobTransferId,
-) -> Result<Option<u64>, StoreError> {
+) -> Result<Option<(lifecycle::RetirementReason, u64)>, StoreError> {
     write
         .open_table(BLOB_PUBLICATIONS)?
         .get(transfer_id.as_bytes().as_slice())?
         .map(|value| {
             lifecycle::publication_retirement(value.value())
                 .map_err(blob_error)
-                .map(|retirement| retirement.map(|(_, generation, _)| generation))
+                .map(|retirement| retirement.map(|(reason, generation, _)| (reason, generation)))
         })
         .transpose()
         .map(Option::flatten)
@@ -11222,6 +12407,44 @@ pub(crate) fn blob_subscription_retirement_generation_read(
         .map(Option::flatten)
 }
 
+pub(crate) fn blob_subscription_retirement_read(
+    read: &redb::ReadTransaction,
+    transfer_id: BlobTransferId,
+) -> Result<Option<(lifecycle::RetirementReason, u64)>, StoreError> {
+    read.open_table(BLOB_PUBLICATIONS)?
+        .get(transfer_id.as_bytes().as_slice())?
+        .map(|value| {
+            lifecycle::publication_retirement(value.value())
+                .map_err(blob_error)
+                .map(|retirement| retirement.map(|(reason, generation, _)| (reason, generation)))
+        })
+        .transpose()
+        .map(Option::flatten)
+}
+
+pub(crate) fn blob_subscription_lifetime_hidden_read(
+    read: &redb::ReadTransaction,
+    transfer_id: BlobTransferId,
+) -> Result<bool, StoreError> {
+    let Some(encoded) = read
+        .open_table(BLOB_PUBLICATIONS)?
+        .get(transfer_id.as_bytes().as_slice())?
+        .map(|value| value.value().to_vec())
+    else {
+        return Ok(false);
+    };
+    if lifecycle::publication_record_is_retired(&encoded).map_err(blob_error)? {
+        return Ok(false);
+    }
+    let metadata = decode_blob_metadata(&encoded)?;
+    if metadata.transfer_id != transfer_id {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "Blob subscription lifetime lookup differs from its publication key",
+        )));
+    }
+    blob_lifetime_is_visible_read(read, metadata.lifetime).map(|visible| !visible)
+}
+
 pub(crate) fn blob_subscription_projection_read(
     read: &redb::ReadTransaction,
     transfer_id: BlobTransferId,
@@ -11241,6 +12464,9 @@ pub(crate) fn blob_subscription_projection_read(
         return Err(blob_error(BlobStoreError::SchemaInvariant(
             "Blob subscription projection differs from its publication key",
         )));
+    }
+    if !blob_lifetime_is_visible_read(read, metadata.lifetime)? {
+        return Ok(None);
     }
     let content_key = blob_content_key(
         &metadata.header.topic,
@@ -11278,6 +12504,9 @@ pub(crate) fn blob_subscription_projection_matches_write(
         return Ok(false);
     };
     if metadata.transfer_id != transfer_id {
+        return Ok(false);
+    }
+    if !blob_lifetime_is_visible_write(write, metadata.lifetime)? {
         return Ok(false);
     }
     let Some(sealed_len) = write
@@ -12393,14 +13622,7 @@ pub(crate) fn inspect_blob_tables_read(
     lifecycle_usage.apply_to_stats(&mut stats);
     drop(publications);
     drop(markers);
-    pressure::inspect_pressure_read(
-        read,
-        matches!(
-            publication_encoding,
-            lifecycle::PublicationEncodingGeneration::Current
-                | lifecycle::PublicationEncodingGeneration::RawCurrent
-        ),
-    )?;
+    pressure::inspect_pressure_read(read, lifecycle::lifecycle_generation_is_current_read(read)?)?;
     Ok(BlobAuditSnapshot {
         stats,
         deletion_schema_migrated: false,
@@ -13736,6 +14958,9 @@ fn current_pending_projection_read(
     if !blob_header_is_current_read(read, &pending.metadata.header)? {
         return Ok(None);
     }
+    if !blob_lifetime_is_visible_read(read, pending.metadata.lifetime)? {
+        return Ok(None);
+    }
     let sealed_len = u64::try_from(pending.sealed.len())
         .map_err(|_| StoreError::PayloadByteAccountingOverflow)?;
     let shape = durable_blob_source_shape_read(read, &pending.metadata, false)?;
@@ -13894,11 +15119,171 @@ fn pending_blob_source_projection(record: PendingBlobSourceRecord) -> PendingBlo
     }
 }
 
+fn plan_pending_removal_authority_write(
+    write: &redb::WriteTransaction,
+    authority: NodeId,
+    source: BlobTransferId,
+    expected: &PendingBlobSourceRecord,
+    charge: &mut MaintenanceCharge,
+) -> Result<Option<PendingRemovalAuthorityPlan>, StoreError> {
+    if !charge_staging_accounting(charge)? {
+        return Ok(None);
+    }
+    let staging_before = blob_network_staging_usage_write(write, authority)?;
+    let encoded_pending = write
+        .open_table(BLOB_PENDING_SOURCES)?
+        .get(source.as_bytes().as_slice())?
+        .map(|value| value.value().to_vec())
+        .ok_or_else(|| blob_error(BlobStoreError::PendingSourceMissing))?;
+    if !charge.charge_row(
+        MaintenanceRowIdentity::new("aster.pending-blob-sources.v1", source.as_bytes()),
+        encoded_pending.len(),
+    )? {
+        return Ok(None);
+    }
+    let pending = decode_pending_blob_source(&encoded_pending)?;
+    if pending != *expected || pending.metadata.transfer_id != source {
+        return Err(blob_error(BlobStoreError::PendingSourceConflict));
+    }
+    let mut prefixes = Vec::with_capacity(pending.carriers.len());
+    let mut removed_rows = 1u64;
+    let mut removed_bytes = staging_entry_bytes(32, encoded_pending.len())?;
+    for carrier in &pending.carriers {
+        let key = blob_carrier_prefix_key(source, carrier.object);
+        let encoded = write
+            .open_table(BLOB_CARRIER_PREFIXES)?
+            .get(key.as_slice())?
+            .map(|value| value.value().to_vec());
+        let Some(encoded) = encoded else {
+            continue;
+        };
+        if !charge.charge_row(
+            MaintenanceRowIdentity::new("aster.pending-blob-carrier-prefixes.v1", key.as_slice()),
+            encoded.len(),
+        )? {
+            return Ok(None);
+        }
+        let prefix = decode_blob_carrier_prefix(&encoded)?;
+        if prefix.source != source || prefix.total_len != carrier.total_len {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "Blob carrier prefix differs from its authenticated pending source",
+            )));
+        }
+        removed_rows = removed_rows
+            .checked_add(1)
+            .ok_or(StoreError::ItemCountAccountingOverflow)?;
+        removed_bytes = removed_bytes
+            .checked_add(staging_entry_bytes(key.len(), encoded.len())?)
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+        prefixes.push((key, encoded));
+    }
+    Ok(Some(PendingRemovalAuthorityPlan {
+        source,
+        encoded_pending,
+        pending,
+        prefixes,
+        staging_before,
+        removed_rows,
+        removed_bytes,
+    }))
+}
+
+fn apply_pending_removal_authority_write(
+    write: &redb::WriteTransaction,
+    plan: &PendingRemovalAuthorityPlan,
+    staging: BlobNetworkStagingUsage,
+    limits: BlobLifecycleLimits,
+    remove_ttl_deadline: bool,
+) -> Result<BlobNetworkStagingUsage, StoreError> {
+    let current = write
+        .open_table(BLOB_PENDING_SOURCES)?
+        .get(plan.source.as_bytes().as_slice())?
+        .map(|value| value.value().to_vec())
+        .ok_or_else(|| blob_error(BlobStoreError::PendingSourceMissing))?;
+    if current != plan.encoded_pending {
+        return Err(blob_error(BlobStoreError::PendingSourceConflict));
+    }
+    if remove_ttl_deadline {
+        lifecycle::replace_policy_ttl_deadline_write(
+            write,
+            plan.source,
+            lifecycle::TtlDeadlineKind::PendingSource,
+            Some(plan.pending.metadata.lifetime),
+            None,
+            limits,
+        )?;
+    }
+    for (key, expected) in &plan.prefixes {
+        let current = write
+            .open_table(BLOB_CARRIER_PREFIXES)?
+            .get(key.as_slice())?
+            .map(|value| value.value().to_vec())
+            .ok_or_else(|| {
+                blob_error(BlobStoreError::SchemaInvariant(
+                    "planned Blob carrier prefix disappeared before removal",
+                ))
+            })?;
+        if current != *expected {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "planned Blob carrier prefix changed before removal",
+            )));
+        }
+    }
+    write
+        .open_table(BLOB_PENDING_SOURCES)?
+        .remove(plan.source.as_bytes().as_slice())?;
+    {
+        let mut prefixes = write.open_table(BLOB_CARRIER_PREFIXES)?;
+        for (key, _) in &plan.prefixes {
+            prefixes.remove(key.as_slice())?;
+        }
+    }
+    let after = BlobNetworkStagingUsage {
+        rows: staging.rows.checked_sub(plan.removed_rows).ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "Blob staging row counter underflows on source removal",
+            ))
+        })?,
+        bytes: staging
+            .bytes
+            .checked_sub(plan.removed_bytes)
+            .ok_or_else(|| {
+                blob_error(BlobStoreError::SchemaInvariant(
+                    "Blob staging byte counter underflows on source removal",
+                ))
+            })?,
+    };
+    update_blob_network_staging_usage(write, after)?;
+    Ok(after)
+}
+
 fn remove_pending_source_rows_write(
     write: &redb::WriteTransaction,
     staging: BlobNetworkStagingUsage,
     source: BlobTransferId,
     expected: &PendingBlobSourceRecord,
+    limits: BlobLifecycleLimits,
+) -> Result<(), StoreError> {
+    remove_pending_source_rows_write_inner(write, staging, source, expected, limits, true)
+}
+
+fn remove_pending_source_rows_after_ttl_move_write(
+    write: &redb::WriteTransaction,
+    staging: BlobNetworkStagingUsage,
+    source: BlobTransferId,
+    expected: &PendingBlobSourceRecord,
+    limits: BlobLifecycleLimits,
+) -> Result<(), StoreError> {
+    remove_pending_source_rows_write_inner(write, staging, source, expected, limits, false)
+}
+
+fn remove_pending_source_rows_write_inner(
+    write: &redb::WriteTransaction,
+    staging: BlobNetworkStagingUsage,
+    source: BlobTransferId,
+    expected: &PendingBlobSourceRecord,
+    limits: BlobLifecycleLimits,
+    remove_ttl_deadline: bool,
 ) -> Result<(), StoreError> {
     let encoded_pending = write
         .open_table(BLOB_PENDING_SOURCES)?
@@ -13910,6 +15295,16 @@ fn remove_pending_source_rows_write(
     }
     if expected.metadata.transfer_id != source {
         return Err(blob_error(BlobStoreError::PendingSourceConflict));
+    }
+    if remove_ttl_deadline {
+        lifecycle::replace_policy_ttl_deadline_write(
+            write,
+            source,
+            lifecycle::TtlDeadlineKind::PendingSource,
+            Some(expected.metadata.lifetime),
+            None,
+            limits,
+        )?;
     }
     let mut prefix_rows = Vec::with_capacity(expected.carriers.len());
     let mut removed_bytes = staging_entry_bytes(32, encoded_pending.len())?;
@@ -13962,6 +15357,488 @@ fn remove_pending_source_rows_write(
             })?,
         },
     )
+}
+
+#[allow(
+    dead_code,
+    reason = "the inactive lifecycle-v5 expiry selector activates this production transaction seam"
+)]
+// The expiry apply seam keeps mission, depot, continuity, limits, and the
+// optional precharged removal authority explicit for atomic validation.
+#[allow(clippy::too_many_arguments)]
+fn apply_expired_pending_source_write(
+    write: &redb::WriteTransaction,
+    authority: NodeId,
+    depot_owner_binding: [u8; 32],
+    source: BlobTransferId,
+    custody_sample: Option<aster_mesh::CustodySample>,
+    limits: BlobLifecycleLimits,
+    variant_prevalidated: bool,
+    removal_plan: Option<&PendingRemovalAuthorityPlan>,
+) -> Result<(), StoreError> {
+    let encoded_pending = match removal_plan {
+        Some(plan) if plan.source == source => plan.encoded_pending.clone(),
+        Some(_) => return Err(blob_error(BlobStoreError::PendingSourceConflict)),
+        None => write
+            .open_table(BLOB_PENDING_SOURCES)?
+            .get(source.as_bytes().as_slice())?
+            .map(|value| value.value().to_vec())
+            .ok_or_else(|| blob_error(BlobStoreError::PendingSourceMissing))?,
+    };
+    let pending = match removal_plan {
+        Some(plan) => plan.pending.clone(),
+        None => decode_pending_blob_source(&encoded_pending)?,
+    };
+    if pending.metadata.transfer_id != source {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "pending Blob source key differs from its authenticated identity",
+        )));
+    }
+    let continuity = custody::lower_bound_continuity_write(write)?;
+    if !matches!(
+        evaluate_blob_lifetime(pending.metadata.lifetime, continuity, custody_sample)?,
+        BlobLifetimeEvaluation::FiniteExpired { .. }
+    ) {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "Blob pending expiry candidate is not provably expired",
+        )));
+    }
+    let staging = removal_plan.map_or_else(
+        || blob_network_staging_usage_write(write, authority),
+        |plan| Ok(plan.staging_before),
+    )?;
+    pressure::require_pending_source_write(write, source, &pending)?;
+    if !variant_prevalidated {
+        pressure::require_variant_write(write, pending.metadata.variant_id)?;
+    }
+    lifecycle::require_lineage_fence(
+        write,
+        pending.metadata.variant_id,
+        pending.physical_lineage,
+        depot_owner_binding,
+    )?;
+    lifecycle::remove_variant_reference(
+        write,
+        pending.metadata.variant_id,
+        lifecycle::VariantReferenceOwner::PendingSource,
+        source,
+    )?;
+    if let Some(plan) = removal_plan {
+        apply_pending_removal_authority_write(write, plan, staging, limits, true)?;
+    } else {
+        remove_pending_source_rows_write(write, staging, source, &pending, limits)?;
+    }
+    pressure::remove_pending_source_write(write, source, pending.metadata.variant_id)
+}
+
+fn policy_root_limit(limits: BlobLifecycleLimits) -> Result<u64, StoreError> {
+    limits
+        .max_publication_rows()
+        .checked_add(MAX_BLOB_NETWORK_STAGING_ROWS)
+        .ok_or(StoreError::ItemCountAccountingOverflow)
+}
+
+fn charge_staging_accounting(charge: &mut MaintenanceCharge) -> Result<bool, StoreError> {
+    for field in [
+        BLOB_NETWORK_SCHEMA_VERSION_FIELD,
+        BLOB_NETWORK_STAGING_ROWS,
+        BLOB_NETWORK_STAGING_BYTES,
+    ] {
+        if !charge.charge_row(
+            MaintenanceRowIdentity::new("aster.blob-network-metadata.v1", field.as_bytes()),
+            std::mem::size_of::<u64>(),
+        )? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn begin_policy_maintenance_charge(
+    write: &redb::WriteTransaction,
+    budget: BlobMaintenanceBudget,
+    maintenance_class: lifecycle::BlobMaintenanceClass,
+) -> Result<(MaintenanceCharge, bool), StoreError> {
+    let mut charge = MaintenanceCharge::new(budget, 0, 0);
+    if !lifecycle::charge_maintenance_cursor_write(write, maintenance_class, &mut charge)? {
+        return Ok((charge, false));
+    }
+    Ok((charge, true))
+}
+
+fn apply_one_blob_policy_reanchor_write(
+    write: &redb::WriteTransaction,
+    limits: BlobLifecycleLimits,
+    authority: Option<NodeId>,
+    depot_owner_binding: [u8; 32],
+    budget: BlobMaintenanceBudget,
+    custody_sample: Option<aster_mesh::CustodySample>,
+    maintenance_class: lifecycle::BlobMaintenanceClass,
+) -> Result<Option<(u64, u64, bool)>, StoreError> {
+    let Some(turn) = pressure::plan_reanchor_turn_write(write)? else {
+        return Ok(None);
+    };
+    let Some(transfer) = turn.transfer else {
+        let (mut charge, cursor_fits) =
+            begin_policy_maintenance_charge(write, budget, maintenance_class)?;
+        if !cursor_fits || !pressure::charge_reanchor_turn_write(write, turn, &mut charge)? {
+            return Ok(Some((charge.rows, charge.bytes, false)));
+        }
+        pressure::finish_reanchor_turn_write(write, turn)?;
+        return Ok(Some((charge.rows, charge.bytes, true)));
+    };
+    match turn.root {
+        pressure::PressureReanchorRoot::Publication => {
+            let encoded = write
+                .open_table(BLOB_PUBLICATIONS)?
+                .get(transfer.as_bytes().as_slice())?
+                .map(|value| value.value().to_vec())
+                .ok_or_else(|| {
+                    blob_error(BlobStoreError::SchemaInvariant(
+                        "Blob pressure reanchor publication disappeared",
+                    ))
+                })?;
+            if lifecycle::publication_record_is_retired(&encoded).map_err(blob_error)? {
+                return Err(blob_error(BlobStoreError::SchemaInvariant(
+                    "Blob pressure reanchor selected a retired publication",
+                )));
+            }
+            let mut metadata = decode_blob_metadata(&encoded)?;
+            let old_lifetime = metadata.lifetime;
+            let projected = lifecycle::project_lifetime_for_policy_write(write, old_lifetime)?;
+            let continuity = custody::lower_bound_continuity_write(write)?;
+            let expired = matches!(
+                evaluate_blob_lifetime(projected, continuity, custody_sample)?,
+                BlobLifetimeEvaluation::FiniteExpired { .. }
+            );
+            let (mut charge, cursor_fits) =
+                begin_policy_maintenance_charge(write, budget, maintenance_class)?;
+            if !cursor_fits
+                || !pressure::charge_reanchor_turn_write(write, turn, &mut charge)?
+                || !charge.charge_row(
+                    MaintenanceRowIdentity::new(
+                        "aster.semantic-blob-publications.v1",
+                        transfer.as_bytes(),
+                    ),
+                    encoded.len(),
+                )?
+                || (!expired
+                    && projected != old_lifetime
+                    && (!pressure::preflight_policy_root_mutation_write(
+                        write,
+                        metadata.variant_id,
+                        lifecycle::VariantReferenceOwner::Publication,
+                        transfer,
+                        policy_root_limit(limits)?,
+                        true,
+                        &mut charge,
+                    )? || !lifecycle::charge_policy_ttl_deadline_write(
+                        transfer,
+                        lifecycle::TtlDeadlineKind::LivePublication,
+                        Some(old_lifetime),
+                        Some(projected),
+                        &mut charge,
+                    )?))
+            {
+                return Ok(Some((charge.rows, charge.bytes, false)));
+            }
+            if expired {
+                let mut operations = MAX_BLOB_OPERATIONS;
+                let Some(plan) = plan_blob_publication_retirement_write(
+                    write,
+                    limits,
+                    transfer,
+                    lifecycle::RetirementReason::Expired,
+                    PublicationPressurePreflight::Required,
+                    custody_sample,
+                    &mut charge,
+                    &mut operations,
+                )?
+                else {
+                    return Ok(Some((charge.rows, charge.bytes, false)));
+                };
+                apply_blob_publication_retirement_plan_write(
+                    write,
+                    limits,
+                    plan,
+                    PublicationPressureApply::RefreshVariant,
+                )?;
+                pressure::finish_reanchor_turn_write(write, turn)?;
+                return Ok(Some((charge.rows, charge.bytes, true)));
+            }
+            if projected != old_lifetime {
+                lifecycle::replace_policy_ttl_deadline_write(
+                    write,
+                    transfer,
+                    lifecycle::TtlDeadlineKind::LivePublication,
+                    Some(old_lifetime),
+                    Some(projected),
+                    limits,
+                )?;
+                metadata.lifetime = projected;
+                let payload = encode_blob_metadata(metadata)?;
+                let replacement = lifecycle::replace_live_publication_payload(&encoded, &payload)?;
+                write
+                    .open_table(BLOB_PUBLICATIONS)?
+                    .insert(transfer.as_bytes().as_slice(), replacement.as_slice())?;
+                pressure::rekey_publication_lifetime_write(write, transfer)?;
+            }
+            pressure::finish_reanchor_turn_write(write, turn)?;
+            Ok(Some((charge.rows, charge.bytes, true)))
+        }
+        pressure::PressureReanchorRoot::Pending => {
+            let authority = authority.ok_or(StoreError::MissionNotBound)?;
+            let encoded = write
+                .open_table(BLOB_PENDING_SOURCES)?
+                .get(transfer.as_bytes().as_slice())?
+                .map(|value| value.value().to_vec())
+                .ok_or_else(|| blob_error(BlobStoreError::PendingSourceMissing))?;
+            let mut pending = decode_pending_blob_source(&encoded)?;
+            let old_lifetime = pending.metadata.lifetime;
+            let projected = lifecycle::project_lifetime_for_policy_write(write, old_lifetime)?;
+            let continuity = custody::lower_bound_continuity_write(write)?;
+            let expired = matches!(
+                evaluate_blob_lifetime(projected, continuity, custody_sample)?,
+                BlobLifetimeEvaluation::FiniteExpired { .. }
+            );
+            let (mut charge, cursor_fits) =
+                begin_policy_maintenance_charge(write, budget, maintenance_class)?;
+            if !cursor_fits
+                || !pressure::charge_reanchor_turn_write(write, turn, &mut charge)?
+                || !charge.charge_row(
+                    MaintenanceRowIdentity::new(
+                        "aster.pending-blob-sources.v1",
+                        transfer.as_bytes(),
+                    ),
+                    encoded.len(),
+                )?
+                || !pressure::preflight_policy_root_mutation_write(
+                    write,
+                    pending.metadata.variant_id,
+                    lifecycle::VariantReferenceOwner::PendingSource,
+                    transfer,
+                    policy_root_limit(limits)?,
+                    !expired && projected != old_lifetime,
+                    &mut charge,
+                )?
+                || !lifecycle::charge_policy_ttl_deadline_write(
+                    transfer,
+                    lifecycle::TtlDeadlineKind::PendingSource,
+                    Some(old_lifetime),
+                    (!expired).then_some(projected),
+                    &mut charge,
+                )?
+                || (!expired
+                    && projected != old_lifetime
+                    && !charge_staging_accounting(&mut charge)?)
+                || (expired
+                    && (!lifecycle::charge_variant_reference_counter(&mut charge)?
+                        || !lifecycle::charge_lineage_fence_authority_write(
+                            write,
+                            pending.metadata.variant_id,
+                            &mut charge,
+                        )?))
+            {
+                return Ok(Some((charge.rows, charge.bytes, false)));
+            }
+            let removal_plan = if expired {
+                let Some(plan) = plan_pending_removal_authority_write(
+                    write,
+                    authority,
+                    transfer,
+                    &pending,
+                    &mut charge,
+                )?
+                else {
+                    return Ok(Some((charge.rows, charge.bytes, false)));
+                };
+                Some(plan)
+            } else {
+                None
+            };
+            if expired {
+                apply_expired_pending_source_write(
+                    write,
+                    authority,
+                    depot_owner_binding,
+                    transfer,
+                    custody_sample,
+                    limits,
+                    true,
+                    removal_plan.as_ref(),
+                )?;
+            } else if projected != old_lifetime {
+                lifecycle::replace_policy_ttl_deadline_write(
+                    write,
+                    transfer,
+                    lifecycle::TtlDeadlineKind::PendingSource,
+                    Some(old_lifetime),
+                    Some(projected),
+                    limits,
+                )?;
+                pending.metadata.lifetime = projected;
+                pending.authenticated_source_binding =
+                    pending_blob_authenticated_source_binding(&pending.metadata, &pending.sealed)?;
+                let replacement = encode_pending_blob_source(&pending)?;
+                let old_bytes = staging_entry_bytes(32, encoded.len())?;
+                let new_bytes = staging_entry_bytes(32, replacement.len())?;
+                write
+                    .open_table(BLOB_PENDING_SOURCES)?
+                    .insert(transfer.as_bytes().as_slice(), replacement.as_slice())?;
+                let usage = blob_network_staging_usage_write(write, authority)?;
+                update_blob_network_staging_usage(
+                    write,
+                    BlobNetworkStagingUsage {
+                        rows: usage.rows,
+                        bytes: usage
+                            .bytes
+                            .checked_sub(old_bytes)
+                            .and_then(|value| value.checked_add(new_bytes))
+                            .ok_or(StoreError::PayloadByteAccountingOverflow)?,
+                    },
+                )?;
+                pressure::rekey_pending_source_lifetime_write(write, transfer, &pending)?;
+            }
+            pressure::finish_reanchor_turn_write(write, turn)?;
+            Ok(Some((charge.rows, charge.bytes, true)))
+        }
+    }
+}
+
+fn apply_one_blob_ttl_expiry_write(
+    write: &redb::WriteTransaction,
+    limits: BlobLifecycleLimits,
+    authority: Option<NodeId>,
+    depot_owner_binding: [u8; 32],
+    budget: BlobMaintenanceBudget,
+    maintenance_class: lifecycle::BlobMaintenanceClass,
+) -> Result<Option<(u64, u64, bool)>, StoreError> {
+    let Some(continuity) = custody::lower_bound_continuity_write(write)? else {
+        return Ok(None);
+    };
+    let Some(turn) =
+        lifecycle::plan_ttl_expiry_turn_write(write, continuity.generation, continuity.sample)?
+    else {
+        return Ok(None);
+    };
+    let Some(deadline) = turn.deadline else {
+        let (mut charge, cursor_fits) =
+            begin_policy_maintenance_charge(write, budget, maintenance_class)?;
+        if !cursor_fits || !lifecycle::charge_ttl_expiry_turn_write(write, turn, &mut charge)? {
+            return Ok(Some((charge.rows, charge.bytes, false)));
+        }
+        lifecycle::finish_ttl_expiry_turn_write(write, turn)?;
+        return Ok(Some((charge.rows, charge.bytes, true)));
+    };
+    match deadline.kind {
+        lifecycle::TtlDeadlineKind::LivePublication => {
+            let encoded = write
+                .open_table(BLOB_PUBLICATIONS)?
+                .get(deadline.transfer.as_bytes().as_slice())?
+                .map(|value| value.value().to_vec())
+                .ok_or_else(|| {
+                    blob_error(BlobStoreError::SchemaInvariant(
+                        "Blob TTL deadline points to a missing publication",
+                    ))
+                })?;
+            if lifecycle::publication_record_is_retired(&encoded).map_err(blob_error)? {
+                return Err(blob_error(BlobStoreError::SchemaInvariant(
+                    "Blob TTL deadline points to a retired publication",
+                )));
+            }
+            let (mut charge, cursor_fits) =
+                begin_policy_maintenance_charge(write, budget, maintenance_class)?;
+            if !cursor_fits || !lifecycle::charge_ttl_expiry_turn_write(write, turn, &mut charge)? {
+                return Ok(Some((charge.rows, charge.bytes, false)));
+            }
+            let mut operations = MAX_BLOB_OPERATIONS;
+            let Some(plan) = plan_blob_publication_retirement_write(
+                write,
+                limits,
+                deadline.transfer,
+                lifecycle::RetirementReason::Expired,
+                PublicationPressurePreflight::Required,
+                Some(continuity.sample),
+                &mut charge,
+                &mut operations,
+            )?
+            else {
+                return Ok(Some((charge.rows, charge.bytes, false)));
+            };
+            apply_blob_publication_retirement_plan_write(
+                write,
+                limits,
+                plan,
+                PublicationPressureApply::RefreshVariant,
+            )?;
+            lifecycle::finish_ttl_expiry_turn_write(write, turn)?;
+            Ok(Some((charge.rows, charge.bytes, true)))
+        }
+        lifecycle::TtlDeadlineKind::PendingSource => {
+            let authority = authority.ok_or(StoreError::MissionNotBound)?;
+            let encoded = write
+                .open_table(BLOB_PENDING_SOURCES)?
+                .get(deadline.transfer.as_bytes().as_slice())?
+                .map(|value| value.value().to_vec())
+                .ok_or_else(|| {
+                    blob_error(BlobStoreError::SchemaInvariant(
+                        "Blob TTL deadline points to a missing pending source",
+                    ))
+                })?;
+            let pending = decode_pending_blob_source(&encoded)?;
+            let (mut charge, cursor_fits) =
+                begin_policy_maintenance_charge(write, budget, maintenance_class)?;
+            if !cursor_fits
+                || !lifecycle::charge_ttl_expiry_turn_write(write, turn, &mut charge)?
+                || !pressure::preflight_policy_root_mutation_write(
+                    write,
+                    pending.metadata.variant_id,
+                    lifecycle::VariantReferenceOwner::PendingSource,
+                    deadline.transfer,
+                    policy_root_limit(limits)?,
+                    false,
+                    &mut charge,
+                )?
+                || !lifecycle::charge_policy_ttl_deadline_write(
+                    deadline.transfer,
+                    lifecycle::TtlDeadlineKind::PendingSource,
+                    Some(pending.metadata.lifetime),
+                    None,
+                    &mut charge,
+                )?
+                || !lifecycle::charge_variant_reference_counter(&mut charge)?
+                || !lifecycle::charge_lineage_fence_authority_write(
+                    write,
+                    pending.metadata.variant_id,
+                    &mut charge,
+                )?
+            {
+                return Ok(Some((charge.rows, charge.bytes, false)));
+            }
+            let Some(removal_plan) = plan_pending_removal_authority_write(
+                write,
+                authority,
+                deadline.transfer,
+                &pending,
+                &mut charge,
+            )?
+            else {
+                return Ok(Some((charge.rows, charge.bytes, false)));
+            };
+            apply_expired_pending_source_write(
+                write,
+                authority,
+                depot_owner_binding,
+                deadline.transfer,
+                Some(continuity.sample),
+                limits,
+                true,
+                Some(&removal_plan),
+            )?;
+            lifecycle::finish_ttl_expiry_turn_write(write, turn)?;
+            Ok(Some((charge.rows, charge.bytes, true)))
+        }
+    }
 }
 
 fn require_pending_blob_plan(
@@ -14446,6 +16323,126 @@ mod tests {
         (outcome.blob().clone(), operation, intent)
     }
 
+    fn rewrite_live_blob_as_finite_for_retirement_test(
+        store: &Store,
+        stored: &StoredBlob,
+        operation: Option<&BlobOperationKey>,
+        ttl_ms: u64,
+        cumulative_age_ms: u64,
+        checkpoint: CustodySample,
+    ) -> BlobPublicationIntent {
+        // This fixture introduces custody continuity after the durable
+        // publication already exists. Drain the production reanchor pass so
+        // the direct finite rewrite starts from a clean v5 pressure image.
+        {
+            let write = store
+                .database
+                .begin_write()
+                .expect("finite retirement continuity writer");
+            custody::observe_continuity_write(&write, checkpoint)
+                .expect("finite retirement continuity");
+            pressure::synchronize_reanchor_state_write(&write)
+                .expect("start finite retirement pressure reanchor");
+            write.commit().expect("commit finite retirement continuity");
+        }
+        let mut pressure_ready = false;
+        for _ in 0..=MAX_BLOB_OPERATIONS {
+            let write = store
+                .database
+                .begin_write()
+                .expect("finite retirement pressure readiness writer");
+            let ready = pressure::pressure_ready_write(&write)
+                .expect("finite retirement pressure readiness");
+            drop(write);
+            if ready {
+                pressure_ready = true;
+                break;
+            }
+            store
+                .run_blob_maintenance_turn_with_sample(maintenance_budget(64), Some(checkpoint))
+                .expect("drain finite retirement pressure reanchor");
+        }
+        assert!(
+            pressure_ready,
+            "finite retirement fixture must finish the bounded pressure reanchor"
+        );
+        let intent = BlobPublicationIntent::new_with_ttl(
+            stored.header.stamp.dot.publisher,
+            stored.header.topic.clone(),
+            stored.header.scope.clone(),
+            stored.header.priority,
+            stored.blob_id,
+            Some(ttl_ms),
+        )
+        .expect("finite retirement intent");
+        let write = store
+            .database
+            .begin_write()
+            .expect("finite retirement fixture writer");
+        let continuity = custody::observe_continuity_write(&write, checkpoint)
+            .expect("finite retirement continuity");
+        let current = write
+            .open_table(BLOB_PUBLICATIONS)
+            .expect("finite retirement publications")
+            .get(stored.transfer_id.as_bytes().as_slice())
+            .expect("finite retirement publication lookup")
+            .expect("finite retirement publication")
+            .value()
+            .to_vec();
+        let mut metadata = decode_blob_metadata(&current).expect("finite retirement metadata");
+        let old_lifetime = metadata.lifetime;
+        metadata.header.ttl_ms = Some(ttl_ms);
+        metadata.lifetime = BlobLifetime::Finite {
+            ttl_ms,
+            age: custody::LowerBoundAgeCheckpoint {
+                cumulative_age_ms,
+                checkpoint: Some(checkpoint),
+                continuity_generation: continuity.generation(),
+                continuity_lost: false,
+            },
+            provenance: BlobFiniteProvenance::Local,
+        };
+        lifecycle::replace_policy_ttl_deadline_write(
+            &write,
+            stored.transfer_id,
+            lifecycle::TtlDeadlineKind::LivePublication,
+            Some(old_lifetime),
+            Some(metadata.lifetime),
+            store.blob_lifecycle_limits,
+        )
+        .expect("replace finite retirement TTL deadline");
+        let payload = encode_blob_metadata(metadata).expect("finite retirement metadata encode");
+        let replacement = lifecycle::replace_live_publication_payload(&current, &payload)
+            .expect("finite retirement publication replacement");
+        write
+            .open_table(BLOB_PUBLICATIONS)
+            .expect("finite retirement publications")
+            .insert(
+                stored.transfer_id.as_bytes().as_slice(),
+                replacement.as_slice(),
+            )
+            .expect("rewrite finite retirement publication");
+        if let Some(operation) = operation {
+            let active_operation = lifecycle::active_operation_record(
+                &write,
+                &encode_blob_operation_record(BlobOperationRecord {
+                    transfer_id: stored.transfer_id,
+                    intent_digest: intent.digest(),
+                }),
+            )
+            .expect("finite retirement operation encode");
+            write
+                .open_table(BLOB_OPERATIONS)
+                .expect("finite retirement operations")
+                .insert(operation.as_bytes(), active_operation.as_slice())
+                .expect("rewrite finite retirement operation");
+        }
+        pressure::rekey_publication_lifetime_write(&write, stored.transfer_id)
+            .expect("rekey finite retirement pressure authority");
+        write.commit().expect("commit finite retirement fixture");
+        intent
+    }
+
     #[test]
     fn blob_publication_intent_preserves_durable_digest_and_binds_exact_finite_ttl() {
         // Mutation caught: routing durable intent through the new finite
@@ -14731,6 +16728,82 @@ mod tests {
     }
 
     #[test]
+    fn blob_ttl_deadline_projection_reuses_exact_evaluator_across_restart_and_loss() {
+        // Mutations caught: deadline indexing must not invent a second age
+        // calculation, omit same-domain restart time, or schedule an old clock
+        // after continuity loss.
+        let transfer = BlobTransferId::new([0x45; 32]);
+        let lifetime = BlobLifetime::Finite {
+            ttl_ms: 1_000,
+            age: custody::LowerBoundAgeCheckpoint {
+                cumulative_age_ms: 100,
+                checkpoint: Some(CustodySample {
+                    clock_id: [0x46; 16],
+                    tick_ms: 200,
+                }),
+                continuity_generation: 4,
+                continuity_lost: false,
+            },
+            provenance: BlobFiniteProvenance::Local,
+        };
+        let same_domain = custody::LowerBoundContinuity {
+            generation: 4,
+            sample: CustodySample {
+                clock_id: [0x46; 16],
+                tick_ms: 250,
+            },
+        };
+        let deadline = lifecycle::ttl_deadline_for_lifetime(
+            transfer,
+            lifecycle::TtlDeadlineKind::LivePublication,
+            lifetime,
+            Some(same_domain),
+            Some(CustodySample {
+                clock_id: [0x46; 16],
+                tick_ms: 300,
+            }),
+        )
+        .expect("same-domain projection")
+        .expect("known deadline");
+        assert_eq!(deadline.generation, 4);
+        assert_eq!(deadline.deadline.tick_ms, 1_100);
+
+        let later_domain = custody::LowerBoundContinuity {
+            generation: 5,
+            sample: CustodySample {
+                clock_id: [0x47; 16],
+                tick_ms: 10,
+            },
+        };
+        let reanchored = lifecycle::ttl_deadline_for_lifetime(
+            transfer,
+            lifecycle::TtlDeadlineKind::LivePublication,
+            lifetime,
+            Some(later_domain),
+            Some(CustodySample {
+                clock_id: [0x47; 16],
+                tick_ms: 30,
+            }),
+        )
+        .expect("later-domain projection")
+        .expect("later lower-bound deadline");
+        assert_eq!(reanchored.generation, 5);
+        assert_eq!(reanchored.deadline.clock_id, [0x47; 16]);
+        assert_eq!(reanchored.deadline.tick_ms, 930);
+        assert!(
+            lifecycle::ttl_deadline_for_lifetime(
+                transfer,
+                lifecycle::TtlDeadlineKind::LivePublication,
+                lifetime,
+                None,
+                None,
+            )
+            .expect("missing sample is conservative")
+            .is_none()
+        );
+    }
+
+    #[test]
     fn finite_blob_metadata_and_pending_source_round_trip_exact_lifetime_state() {
         let sealed = b"finite pending source".to_vec();
         let transfer_id = BlobTransferId::new(Sha256::digest(&sealed).into());
@@ -14849,6 +16922,94 @@ mod tests {
             clock_id: [0x65; 16],
             tick_ms: 9_000,
         };
+        let expired_duplicate_root = BlobTestRoot::new("verified-finite-expired-duplicate");
+        let expired_duplicate =
+            Store::open_for_mission(&expired_duplicate_root.database, services.authority)
+                .expect("expired duplicate target");
+        let expired_duplicate_policy = expired_duplicate
+            .control_policy_snapshot()
+            .expect("expired duplicate policy");
+        let live_duplicate_admission = VerifiedFiniteBlobAdmission::for_test(
+            proof.blob.envelope_id(),
+            u64::try_from(proof.sealed.len()).expect("live duplicate source length"),
+            proof.blob.item_id(),
+            proof.blob.blob_id(),
+            proof.blob.priority(),
+            5_000,
+            700,
+            receiver_sample,
+        );
+        assert_eq!(
+            expired_duplicate
+                .stage_verified_blob_source_with_lifetime(
+                    &expired_duplicate_policy,
+                    &proof.blob,
+                    &proof.sealed,
+                    &plan,
+                    Some(live_duplicate_admission),
+                )
+                .expect("stage live duplicate fixture"),
+            BlobSourceStageOutcome::Inserted
+        );
+        let expiry_proving_duplicate = VerifiedFiniteBlobAdmission::for_test(
+            proof.blob.envelope_id(),
+            u64::try_from(proof.sealed.len()).expect("expiry duplicate source length"),
+            proof.blob.item_id(),
+            proof.blob.blob_id(),
+            proof.blob.priority(),
+            5_000,
+            5_000,
+            CustodySample {
+                clock_id: receiver_sample.clock_id,
+                tick_ms: 9_100,
+            },
+        );
+        assert_eq!(
+            expired_duplicate
+                .stage_verified_blob_source_with_lifetime(
+                    &expired_duplicate_policy,
+                    &proof.blob,
+                    &proof.sealed,
+                    &plan,
+                    Some(expiry_proving_duplicate),
+                )
+                .expect("merge expiry-proving pending duplicate"),
+            BlobSourceStageOutcome::Duplicate
+        );
+        assert!(
+            expired_duplicate
+                .pending_blob_source(transfer)
+                .expect("expired duplicate pending lookup")
+                .is_none(),
+            "an expiry-proving duplicate must atomically remove the pending root"
+        );
+        {
+            let read = expired_duplicate
+                .database
+                .begin_read()
+                .expect("expired duplicate authority read");
+            assert!(
+                read.open_table(pressure::BLOB_PRESSURE_PENDING_ROOTS)
+                    .expect("expired duplicate pressure roots")
+                    .get(transfer.as_bytes().as_slice())
+                    .expect("expired duplicate pressure lookup")
+                    .is_none()
+            );
+            assert!(
+                read.open_table(lifecycle::BLOB_VARIANT_REFERENCES)
+                    .expect("expired duplicate references")
+                    .is_empty()
+                    .expect("expired duplicate reference count")
+            );
+            assert_eq!(
+                read.open_table(lifecycle::BLOB_LINEAGE_FENCES)
+                    .expect("expired duplicate lineage fences")
+                    .len()
+                    .expect("expired duplicate lineage count"),
+                1,
+                "logical expiry preserves the permanent lineage witness"
+            );
+        }
         let admission = VerifiedFiniteBlobAdmission::for_test(
             proof.blob.envelope_id(),
             u64::try_from(proof.sealed.len()).expect("finite source length"),
@@ -14875,6 +17036,32 @@ mod tests {
         let policy = target
             .control_policy_snapshot()
             .expect("finite target policy");
+        let before_expired_admission = blob_current_admission_digest(&target);
+        let expired_admission = VerifiedFiniteBlobAdmission::for_test(
+            proof.blob.envelope_id(),
+            u64::try_from(proof.sealed.len()).expect("expired finite source length"),
+            proof.blob.item_id(),
+            proof.blob.blob_id(),
+            proof.blob.priority(),
+            5_000,
+            5_000,
+            receiver_sample,
+        );
+        assert!(matches!(
+            target.stage_verified_blob_source_with_lifetime(
+                &policy,
+                &proof.blob,
+                &proof.sealed,
+                &plan,
+                Some(expired_admission),
+            ),
+            Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+        ));
+        assert_eq!(
+            blob_current_admission_digest(&target),
+            before_expired_admission,
+            "an exact-expired new source must not consume any durable Blob authority"
+        );
         assert_eq!(
             target
                 .stage_verified_blob_source_with_lifetime(
@@ -14907,8 +17094,8 @@ mod tests {
         assert_eq!(pending_lifetime(&target), expected);
         let before_pending_duplicate_stats = target.blob_stats().expect("pending duplicate stats");
         let pending_later_sample = CustodySample {
-            clock_id: [0x66; 16],
-            tick_ms: 100,
+            clock_id: receiver_sample.clock_id,
+            tick_ms: 9_100,
         };
         let pending_later_admission = VerifiedFiniteBlobAdmission::for_test(
             proof.blob.envelope_id(),
@@ -14937,8 +17124,8 @@ mod tests {
             age: custody::LowerBoundAgeCheckpoint {
                 cumulative_age_ms: 1_200,
                 checkpoint: Some(pending_later_sample),
-                continuity_generation: 2,
-                continuity_lost: true,
+                continuity_generation: 1,
+                continuity_lost: false,
             },
             provenance: BlobFiniteProvenance::NetworkV1 {
                 semantic_version: 8,
@@ -14979,7 +17166,7 @@ mod tests {
                     .unwrap();
             assert_eq!(pending.authenticated_source_binding, binding);
             assert_eq!(pressure.authenticated_source_binding, binding);
-            assert_eq!(pressure.expiry, pressure::PressureExpiry::Finite(3_900));
+            assert_eq!(pressure.expiry, pressure::PressureExpiry::Finite(12_900));
         }
         let before_pending_mismatch = blob_current_admission_digest(&target);
         let pending_mismatch = VerifiedFiniteBlobAdmission::for_test(
@@ -15292,6 +17479,11 @@ mod tests {
         // Mutation caught: promotion must copy the pending lifetime exactly;
         // it cannot restart custody age at publication acceptance.
         assert_eq!(publication_lifetime(&target), pending_merged);
+        {
+            let write = target.database.begin_write().unwrap();
+            pressure::require_publication_write(&write, transfer)
+                .expect("promoted pressure root uses target generation");
+        }
 
         let later_sample = CustodySample {
             clock_id: [0x67; 16],
@@ -15307,24 +17499,68 @@ mod tests {
             1_700,
             later_sample,
         );
-        assert_eq!(
-            target
-                .stage_verified_blob_source_with_lifetime(
+        let first_carrier = BlobCarrierObjectId::new(
+            plan.carrier_id(0)
+                .expect("accepted duplicate first carrier")
+                .wire_bytes(),
+        )
+        .expect("accepted duplicate carrier object");
+        let first_carrier_total = plan
+            .carrier_total_len(first_carrier.as_bytes())
+            .expect("accepted duplicate carrier total");
+        let first_range_len = usize::try_from(
+            first_carrier_total
+                .min(u64::try_from(MAX_BLOB_NETWORK_RANGE_BYTES).expect("carrier range bound")),
+        )
+        .expect("accepted duplicate range length");
+        let (reached_send, reached_receive) = std::sync::mpsc::sync_channel(0);
+        let (release_send, release_receive) = std::sync::mpsc::sync_channel(0);
+        target.set_blob_carrier_range_post_read_gate(reached_send, release_receive);
+        let (duplicate_outcome, admitted_range) = std::thread::scope(|scope| {
+            let served = scope.spawn(|| {
+                target.read_completed_blob_carrier_range_with_policy(
                     &policy,
-                    &proof.blob,
-                    &proof.sealed,
+                    &depot_completion,
+                    &lineage,
+                    transfer,
+                    first_carrier,
+                    0,
+                    first_range_len,
                     &plan,
-                    Some(later_admission),
                 )
-                .expect("merge accepted finite duplicate"),
+            });
+            reached_receive
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("finite range reached admitted post-read boundary");
+            let duplicate = target.stage_verified_blob_source_with_lifetime(
+                &policy,
+                &proof.blob,
+                &proof.sealed,
+                &plan,
+                Some(later_admission),
+            );
+            release_send
+                .send(())
+                .expect("release finite admitted range");
+            let served = served.join().expect("join finite admitted range");
+            (duplicate, served)
+        });
+        assert_eq!(
+            duplicate_outcome.expect("merge accepted finite duplicate"),
             BlobSourceStageOutcome::Duplicate
+        );
+        assert!(
+            admitted_range
+                .expect("admitted range survives lifetime merge")
+                .is_some(),
+            "an admitted range may finish after authenticated age advances"
         );
         let merged = BlobLifetime::Finite {
             ttl_ms: 5_000,
             age: custody::LowerBoundAgeCheckpoint {
                 cumulative_age_ms: 1_700,
                 checkpoint: Some(later_sample),
-                continuity_generation: 3,
+                continuity_generation: 2,
                 continuity_lost: true,
             },
             provenance: BlobFiniteProvenance::NetworkV1 {
@@ -15335,6 +17571,30 @@ mod tests {
         // Mutation caught: returning Duplicate before committing the accepted
         // branch would discard both the maximum age and sticky continuity loss.
         assert_eq!(publication_lifetime(&target), merged);
+        assert!(matches!(
+            target.get_blob(transfer),
+            Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+        ));
+        assert!(
+            target
+                .blob_source_projection(transfer)
+                .expect("indeterminate merged duplicate projection")
+                .is_none(),
+            "an authority-updating duplicate must not restore application or transfer visibility"
+        );
+        assert!(matches!(
+            target.read_completed_blob_carrier_range_with_policy(
+                &policy,
+                &depot_completion,
+                &lineage,
+                transfer,
+                first_carrier,
+                0,
+                first_range_len,
+                &plan,
+            ),
+            Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+        ));
 
         let (lineage_key, original_lineage_fence) = {
             let write = target
@@ -15423,6 +17683,275 @@ mod tests {
         let reopened = Store::open_for_mission(&target_root.database, services.authority)
             .expect("reopen promoted finite source");
         assert_eq!(publication_lifetime(&reopened), merged);
+        let accepted_expiry_admission = VerifiedFiniteBlobAdmission::for_test(
+            proof.blob.envelope_id(),
+            u64::try_from(proof.sealed.len()).expect("accepted expiry source length"),
+            proof.blob.item_id(),
+            proof.blob.blob_id(),
+            proof.blob.priority(),
+            5_000,
+            5_000,
+            CustodySample {
+                clock_id: later_sample.clock_id,
+                tick_ms: 300,
+            },
+        );
+        assert_eq!(
+            reopened
+                .stage_verified_blob_source_with_lifetime(
+                    &policy,
+                    &proof.blob,
+                    &proof.sealed,
+                    &plan,
+                    Some(accepted_expiry_admission),
+                )
+                .expect("merge expiry-proving accepted duplicate"),
+            BlobSourceStageOutcome::Duplicate
+        );
+        assert!(matches!(
+            reopened.get_blob(transfer),
+            Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+        ));
+        let read = reopened
+            .database
+            .begin_read()
+            .expect("accepted duplicate retirement read");
+        let encoded = read
+            .open_table(BLOB_PUBLICATIONS)
+            .expect("accepted duplicate publications")
+            .get(transfer.as_bytes().as_slice())
+            .expect("accepted duplicate lookup")
+            .expect("accepted duplicate retirement row")
+            .value()
+            .to_vec();
+        assert!(matches!(
+            lifecycle::publication_retirement(&encoded)
+                .expect("accepted duplicate retirement decode"),
+            Some((lifecycle::RetirementReason::Expired, _, _))
+        ));
+        drop(read);
+        let before_retained_replay = blob_current_admission_digest(&reopened);
+        let retained_replay_admission = VerifiedFiniteBlobAdmission::for_test(
+            proof.blob.envelope_id(),
+            u64::try_from(proof.sealed.len()).expect("retained replay source length"),
+            proof.blob.item_id(),
+            proof.blob.blob_id(),
+            proof.blob.priority(),
+            5_000,
+            5_000,
+            CustodySample {
+                clock_id: later_sample.clock_id,
+                tick_ms: 300,
+            },
+        );
+        assert_eq!(
+            reopened
+                .stage_verified_blob_source_with_lifetime(
+                    &policy,
+                    &proof.blob,
+                    &proof.sealed,
+                    &plan,
+                    Some(retained_replay_admission),
+                )
+                .expect("exact replay while retirement evidence is retained"),
+            BlobSourceStageOutcome::Duplicate
+        );
+        assert_eq!(
+            blob_current_admission_digest(&reopened),
+            before_retained_replay,
+            "a permanent exact replay must not mutate retained retirement authority"
+        );
+
+        set_maintenance_next_class(
+            &reopened,
+            lifecycle::BlobMaintenanceClass::ExpiredRetirementRecords,
+        );
+        let retention_elapsed = CustodySample {
+            clock_id: later_sample.clock_id,
+            tick_ms: 300 + lifecycle::DEFAULT_BLOB_RETIREMENT_RETENTION_MS,
+        };
+        let expiry = reopened
+            .run_blob_maintenance_turn_with_sample(
+                contact_expiry_retirement_budget(BlobLifecycleLimits::default())
+                    .expect("bounded evidence-expiry budget"),
+                Some(retention_elapsed),
+            )
+            .expect("expire retained publication evidence");
+        assert!(expiry.rows_examined >= 6);
+        assert!(
+            reopened
+                .database
+                .begin_read()
+                .expect("post-expiry publication read")
+                .open_table(BLOB_PUBLICATIONS)
+                .expect("post-expiry publication table")
+                .get(transfer.as_bytes().as_slice())
+                .expect("post-expiry publication lookup")
+                .is_none(),
+            "retained publication evidence must be absent for the permanent-fence replay case"
+        );
+        drop(reopened);
+
+        let post_expiry = Store::open_for_mission(&target_root.database, services.authority)
+            .expect("reopen after retained publication evidence expiry");
+        let exact_post_expiry_admission = VerifiedFiniteBlobAdmission::for_test(
+            proof.blob.envelope_id(),
+            u64::try_from(proof.sealed.len()).expect("post-expiry replay source length"),
+            proof.blob.item_id(),
+            proof.blob.blob_id(),
+            proof.blob.priority(),
+            5_000,
+            5_000,
+            retention_elapsed,
+        );
+        let before_post_expiry_replay = blob_current_admission_digest(&post_expiry);
+        assert_eq!(
+            post_expiry
+                .stage_verified_blob_source_with_lifetime(
+                    &policy,
+                    &proof.blob,
+                    &proof.sealed,
+                    &plan,
+                    Some(exact_post_expiry_admission),
+                )
+                .expect("exact replay after publication evidence expiry and reopen"),
+            BlobSourceStageOutcome::Duplicate
+        );
+        assert_eq!(
+            blob_current_admission_digest(&post_expiry),
+            before_post_expiry_replay,
+            "permanent replay authority must classify an exact replay without mutation"
+        );
+
+        let resealed = services
+            .publisher
+            .seal_blob_manifest(proof.blob.header(), &proof.manifest_bytes)
+            .expect("re-seal finite replay representation")
+            .bytes;
+        let rerouted = services
+            .reader
+            .verify_blob(&resealed)
+            .expect("verify finite replay representation route");
+        let (represented, represented_manifest) = match services
+            .reader
+            .verify_blob_content(rerouted, &resealed)
+            .expect("verify finite replay representation content")
+        {
+            BlobContentVerification::ContentVerified {
+                blob,
+                manifest_bytes,
+            } => (blob, manifest_bytes),
+            BlobContentVerification::RouteOnly(_) => panic!("member unexpectedly route-only"),
+        };
+        assert_eq!(represented.item_id(), proof.blob.item_id());
+        assert_ne!(represented.envelope_id(), proof.blob.envelope_id());
+        let represented_plan = represented
+            .transfer_plan(&represented_manifest)
+            .expect("finite represented replay plan");
+        let represented_admission = VerifiedFiniteBlobAdmission::for_test(
+            represented.envelope_id(),
+            u64::try_from(resealed.len()).expect("represented replay source length"),
+            represented.item_id(),
+            represented.blob_id(),
+            represented.priority(),
+            5_000,
+            5_000,
+            retention_elapsed,
+        );
+        let before_representation_conflict = blob_current_admission_digest(&post_expiry);
+        assert!(matches!(
+            post_expiry.stage_verified_blob_source_with_lifetime(
+                &policy,
+                &represented,
+                &resealed,
+                &represented_plan,
+                Some(represented_admission),
+            ),
+            Err(StoreError::Blob(
+                BlobStoreError::SourceRepresentationConflict
+            ))
+        ));
+        assert_eq!(
+            blob_current_admission_digest(&post_expiry),
+            before_representation_conflict,
+            "a permanent representation conflict must not mutate authority"
+        );
+
+        let equivocation_plaintext = b"finite same-dot replay with different semantics";
+        let equivocation_prepared = prepared_blob(equivocation_plaintext);
+        let equivocation_finished = finish_variant(
+            &source,
+            &services.publisher,
+            &equivocation_prepared,
+            equivocation_plaintext,
+            1,
+        )
+        .expect("finish finite replay equivocation variant");
+        let equivocation_header = proof
+            .reservation
+            .header(
+                Priority::Immediate,
+                equivocation_finished.route_commitment(),
+                u64::try_from(equivocation_finished.manifest_bytes().len())
+                    .expect("finite equivocation manifest length"),
+                1,
+            )
+            .expect("finite equivocation header");
+        assert_eq!(equivocation_header.ttl_ms, Some(5_000));
+        let equivocation_sealed = services
+            .publisher
+            .seal_blob_manifest(&equivocation_header, equivocation_finished.manifest_bytes())
+            .expect("seal finite replay equivocation")
+            .bytes;
+        let equivocation_route = services
+            .reader
+            .verify_blob(&equivocation_sealed)
+            .expect("verify finite replay equivocation route");
+        let (equivocation_blob, equivocation_manifest) = match services
+            .reader
+            .verify_blob_content(equivocation_route, &equivocation_sealed)
+            .expect("verify finite replay equivocation content")
+        {
+            BlobContentVerification::ContentVerified {
+                blob,
+                manifest_bytes,
+            } => (blob, manifest_bytes),
+            BlobContentVerification::RouteOnly(_) => panic!("member unexpectedly route-only"),
+        };
+        assert_ne!(equivocation_blob.item_id(), proof.blob.item_id());
+        assert_eq!(
+            equivocation_blob.header().stamp.dot,
+            proof.blob.header().stamp.dot
+        );
+        let equivocation_plan = equivocation_blob
+            .transfer_plan(&equivocation_manifest)
+            .expect("finite equivocation replay plan");
+        let equivocation_admission = VerifiedFiniteBlobAdmission::for_test(
+            equivocation_blob.envelope_id(),
+            u64::try_from(equivocation_sealed.len()).expect("equivocation source length"),
+            equivocation_blob.item_id(),
+            equivocation_blob.blob_id(),
+            equivocation_blob.priority(),
+            5_000,
+            5_000,
+            retention_elapsed,
+        );
+        let before_equivocation = blob_current_admission_digest(&post_expiry);
+        assert!(matches!(
+            post_expiry.stage_verified_blob_source_with_lifetime(
+                &policy,
+                &equivocation_blob,
+                &equivocation_sealed,
+                &equivocation_plan,
+                Some(equivocation_admission),
+            ),
+            Err(StoreError::CausalEquivocation { .. })
+        ));
+        assert_eq!(
+            blob_current_admission_digest(&post_expiry),
+            before_equivocation,
+            "permanent publisher-dot equivocation must not mutate authority"
+        );
     }
 
     #[test]
@@ -15489,6 +18018,32 @@ mod tests {
             provenance,
         };
         assert!(merge_blob_lifetime(stored, mismatched, None, None).is_err());
+    }
+
+    #[test]
+    fn blob_contact_expiry_retirement_budget_is_structurally_bounded() {
+        let budget = contact_expiry_retirement_budget(BlobLifecycleLimits::default())
+            .expect("bounded contact retirement budget");
+        assert!(budget.rows() > MAX_BLOB_POLICY_RETIREMENT_ROWS);
+        assert_eq!(budget.files(), 1);
+        assert!(budget.bytes() > MAX_BLOB_POLICY_RETIREMENT_BYTES);
+        assert_ne!(budget.rows(), u64::MAX);
+        assert_ne!(budget.bytes(), u64::MAX);
+        let larger_limits = BlobLifecycleLimits::new(
+            BlobLifecycleLimits::default().max_lineage_rows(),
+            BlobLifecycleLimits::default().max_lineage_bytes(),
+            BlobLifecycleLimits::default().max_replay_rows(),
+            BlobLifecycleLimits::default().max_replay_bytes(),
+            BlobLifecycleLimits::default().max_publication_rows() + 1,
+        )
+        .unwrap();
+        assert!(
+            contact_expiry_retirement_budget(larger_limits)
+                .unwrap()
+                .rows()
+                > budget.rows(),
+            "contact retirement proof follows the store's configured authority cap"
+        );
     }
 
     #[test]
@@ -16963,11 +19518,11 @@ mod tests {
             "carrier range pre/post checks cannot clone source-envelope bytes"
         );
 
-        let accepted = target
+        let accepted_blob = target
             .get_blob(before.source.transfer_id)
             .expect("load accepted range source")
-            .expect("accepted range source")
-            .acceptance_marker;
+            .expect("accepted range source");
+        let accepted = accepted_blob.acceptance_marker;
         let (reached_send, reached_receive) = std::sync::mpsc::sync_channel(0);
         let (release_send, release_receive) = std::sync::mpsc::sync_channel(0);
         target.set_blob_carrier_range_post_read_gate(reached_send, release_receive);
@@ -17041,6 +19596,103 @@ mod tests {
             after_fault_io.authenticated_read_opens,
             before_fault_io.authenticated_read_opens + 1
         );
+
+        let expiry_checkpoint = CustodySample {
+            clock_id: [0xba; 16],
+            tick_ms: 100,
+        };
+        rewrite_live_blob_as_finite_for_retirement_test(
+            &target,
+            &accepted_blob,
+            None,
+            100,
+            50,
+            expiry_checkpoint,
+        );
+        let (reached_send, reached_receive) = std::sync::mpsc::sync_channel(0);
+        let (release_send, release_receive) = std::sync::mpsc::sync_channel(0);
+        target.set_blob_carrier_range_post_read_gate(reached_send, release_receive);
+        let admitted_range = std::thread::scope(|scope| {
+            let served = scope.spawn(|| {
+                target.read_completed_blob_carrier_range_with_policy(
+                    &policy,
+                    &depot_completion,
+                    &lineage,
+                    before.source.transfer_id,
+                    first,
+                    0,
+                    MAX_BLOB_NETWORK_RANGE_BYTES,
+                    &plan,
+                )
+            });
+            reached_receive
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("range reached its admitted post-read boundary");
+            let write = target
+                .database
+                .begin_write()
+                .expect("admitted range retirement write");
+            custody::observe_continuity_write(
+                &write,
+                CustodySample {
+                    clock_id: expiry_checkpoint.clock_id,
+                    tick_ms: 150,
+                },
+            )
+            .expect("advance admitted range to exact expiry");
+            let mut charge = MaintenanceCharge {
+                budget: maintenance_budget(64),
+                rows: 0,
+                bytes: 0,
+                identities: BTreeMap::new(),
+            };
+            let mut remaining_operations = MAX_BLOB_OPERATIONS;
+            let retirement = plan_blob_publication_retirement_write(
+                &write,
+                target.blob_lifecycle_limits,
+                before.source.transfer_id,
+                lifecycle::RetirementReason::Expired,
+                PublicationPressurePreflight::Required,
+                Some(CustodySample {
+                    clock_id: expiry_checkpoint.clock_id,
+                    tick_ms: 150,
+                }),
+                &mut charge,
+                &mut remaining_operations,
+            )
+            .expect("plan admitted range retirement")
+            .expect("admitted range retirement plan");
+            apply_blob_publication_retirement_plan_write(
+                &write,
+                target.blob_lifecycle_limits,
+                retirement,
+                PublicationPressureApply::RefreshVariant,
+            )
+            .expect("apply admitted range retirement");
+            write.commit().expect("commit admitted range retirement");
+            release_send
+                .send(())
+                .expect("release admitted range post-read boundary");
+            served
+                .join()
+                .expect("join admitted range")
+                .expect("admitted range may finish after retirement")
+                .expect("admitted range bytes remain available")
+        });
+        assert_eq!(admitted_range, range);
+        assert!(matches!(
+            target.read_completed_blob_carrier_range_with_policy(
+                &policy,
+                &depot_completion,
+                &lineage,
+                before.source.transfer_id,
+                first,
+                0,
+                MAX_BLOB_NETWORK_RANGE_BYTES,
+                &plan,
+            ),
+            Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+        ));
         drop(target);
         let reopened = Store::open_for_mission(&target_root.database, services.authority)
             .expect("reopen target");
@@ -17049,7 +19701,7 @@ mod tests {
                 .completed_blob_sender_inventory_with_policy(&policy)
                 .expect("reopened sender inventory")
                 .len(),
-            1
+            0
         );
     }
 
@@ -18380,6 +21032,8 @@ mod tests {
                     lifecycle::BLOB_OPERATION_OWNERS.name(),
                     lifecycle::BLOB_DELIVERY_OWNERS.name(),
                     lifecycle::BLOB_RETENTION_DEADLINES.name(),
+                    lifecycle::BLOB_TTL_DEADLINES.name(),
+                    lifecycle::BLOB_TTL_EXPIRY_CURSORS.name(),
                     lifecycle::BLOB_RETIREMENT_RESOLVERS.name(),
                 ]
                 .contains(&name.as_str())
@@ -18580,11 +21234,31 @@ mod tests {
         }
     }
 
+    fn downgrade_blob_policy_to_v4_for_test(path: &Path) {
+        let database = Database::open(path).expect("raw Blob policy-v4 database");
+        let write = database.begin_write().expect("raw Blob policy-v4 write");
+        pressure::downgrade_pressure_v5_to_v4_for_test(&write)
+            .expect("downgrade pressure-v5 to v4");
+        lifecycle::downgrade_lifecycle_v5_to_v4_for_test(&write)
+            .expect("downgrade lifecycle-v5 to v4");
+        write.commit().expect("commit Blob policy-v4 predecessor");
+    }
+
     fn strip_blob_lifecycle_schema_for_test(path: &Path) {
         let database = Database::open(path).expect("raw lifecycle predecessor database");
         let write = database
             .begin_write()
             .expect("raw lifecycle predecessor write");
+        if write
+            .list_tables()
+            .expect("predecessor pressure table names")
+            .any(|table| table.name() == pressure::BLOB_PRESSURE_REANCHOR_CURSORS.name())
+        {
+            lifecycle::TEST_BLOB_LIFECYCLE_MIGRATION_DISABLED.set(true);
+            let downgrade = pressure::downgrade_pressure_v5_to_v4_for_test(&write);
+            lifecycle::TEST_BLOB_LIFECYCLE_MIGRATION_DISABLED.set(false);
+            downgrade.expect("downgrade pressure before stripping lifecycle");
+        }
         let existing = write
             .list_tables()
             .expect("predecessor table names")
@@ -18614,6 +21288,16 @@ mod tests {
             write
                 .delete_table(lifecycle::BLOB_MAINTENANCE_CURSORS)
                 .expect("delete lifecycle cursors");
+        }
+        if existing.contains(lifecycle::BLOB_TTL_DEADLINES.name()) {
+            write
+                .delete_table(lifecycle::BLOB_TTL_DEADLINES)
+                .expect("delete lifecycle TTL deadlines");
+        }
+        if existing.contains(lifecycle::BLOB_TTL_EXPIRY_CURSORS.name()) {
+            write
+                .delete_table(lifecycle::BLOB_TTL_EXPIRY_CURSORS)
+                .expect("delete lifecycle TTL cursors");
         }
         if existing.contains(lifecycle::BLOB_OPERATION_OWNERS.name()) {
             write
@@ -18707,6 +21391,7 @@ mod tests {
     }
 
     fn downgrade_blob_lifecycle_to_v3_for_test(path: &Path) {
+        downgrade_blob_policy_to_v4_for_test(path);
         let database = Database::open(path).expect("raw lifecycle-v3 database");
         let write = database.begin_write().expect("raw lifecycle-v3 write");
         let rows = write
@@ -18752,6 +21437,7 @@ mod tests {
     }
 
     fn downgrade_blob_lifecycle_to_v1_for_test(path: &Path) {
+        downgrade_blob_policy_to_v4_for_test(path);
         let database = Database::open(path).expect("raw lifecycle-v1 database");
         let write = database.begin_write().expect("raw lifecycle-v1 write");
         write
@@ -18854,6 +21540,7 @@ mod tests {
     }
 
     fn downgrade_blob_lifecycle_to_v2_for_test(path: &Path) {
+        downgrade_blob_policy_to_v4_for_test(path);
         let database = Database::open(path).expect("raw lifecycle-v2 database");
         let write = database.begin_write().expect("raw lifecycle-v2 write");
         let deadline_rows = write
@@ -18955,6 +21642,8 @@ mod tests {
             lifecycle::BLOB_OPERATION_OWNERS.name(),
             lifecycle::BLOB_DELIVERY_OWNERS.name(),
             lifecycle::BLOB_RETENTION_DEADLINES.name(),
+            lifecycle::BLOB_TTL_DEADLINES.name(),
+            lifecycle::BLOB_TTL_EXPIRY_CURSORS.name(),
             lifecycle::BLOB_RETIREMENT_RESOLVERS.name(),
         ]
         .into_iter()
@@ -20369,6 +23058,20 @@ mod tests {
             .expect("local finite store");
         let finite_plaintext = b"local finite operation identity".to_vec();
         let finite_prepared = prepared_blob(&finite_plaintext);
+        let finite_checkpoint = CustodySample {
+            clock_id: [0x62; 16],
+            tick_ms: 1_000,
+        };
+        let finite_generation = {
+            let write = finite_store
+                .database
+                .begin_write()
+                .expect("local finite continuity writer");
+            let continuity = custody::observe_continuity_write(&write, finite_checkpoint)
+                .expect("local finite continuity");
+            write.commit().expect("commit local finite continuity");
+            continuity.generation()
+        };
         let finite_proof = prepare_blob_proof_with_lifetime(
             &finite_store,
             &mut services,
@@ -20380,11 +23083,8 @@ mod tests {
         );
         let finite_age = custody::LowerBoundAgeCheckpoint {
             cumulative_age_ms: 250,
-            checkpoint: Some(CustodySample {
-                clock_id: [0x62; 16],
-                tick_ms: 1_000,
-            }),
-            continuity_generation: 1,
+            checkpoint: Some(finite_checkpoint),
+            continuity_generation: finite_generation,
             continuity_lost: false,
         };
         let finite_operation =
@@ -21227,13 +23927,26 @@ mod tests {
             .insert(services.publisher.identity().as_slice(), encoded.as_slice())
             .expect("revoke fixture publisher");
         write.commit().expect("commit fixture revocation");
-        set_maintenance_next_class(
+        drive_maintenance_class_until(
             &store,
             lifecycle::BlobMaintenanceClass::ExpiredPublicationsAndPendingSources,
-        );
-        store
-            .run_blob_maintenance_turn_with_sample(maintenance_budget(64), Some(sample))
-            .expect("retire canonical fixture publication");
+            Some(sample),
+            |store| {
+                let read = store.database.begin_read().expect("fixture progress read");
+                let publication = read
+                    .open_table(BLOB_PUBLICATIONS)
+                    .expect("fixture progress publications")
+                    .get(transfer.as_bytes().as_slice())
+                    .expect("read fixture progress publication")
+                    .expect("fixture progress publication exists")
+                    .value()
+                    .to_vec();
+                lifecycle::publication_retirement(&publication)
+                    .expect("decode fixture progress publication")
+                    .is_some()
+            },
+        )
+        .expect("retire canonical fixture publication");
         let read = store.database.begin_read().expect("retired fixture read");
         let publication = read
             .open_table(BLOB_PUBLICATIONS)
@@ -21773,6 +24486,85 @@ mod tests {
     }
 
     #[test]
+    fn blob_ordinary_open_activates_exact_v5_policy_pair_after_authority_is_complete() {
+        // Mutations caught: activating only one half of the lifecycle/pressure
+        // pair, or omitting one of the persisted v5 deadline/reanchor tables.
+        let root = BlobTestRoot::new("blob-policy-v5-active");
+        let services = blob_services(0xd8);
+        drop(
+            Store::open_for_mission(&root.database, services.authority)
+                .expect("open ordinary Blob policy store"),
+        );
+        let database = Database::open(&root.database).expect("ordinary Blob policy database");
+        let read = database.begin_read().expect("ordinary Blob policy read");
+        assert_eq!(
+            read.open_table(lifecycle::BLOB_LIFECYCLE_METADATA)
+                .expect("lifecycle metadata")
+                .get("schema_version")
+                .expect("lifecycle version lookup")
+                .expect("lifecycle version")
+                .value(),
+            5
+        );
+        assert_eq!(
+            read.open_table(pressure::BLOB_PRESSURE_METADATA)
+                .expect("pressure metadata")
+                .get(pressure::PRESSURE_SCHEMA_VERSION_FIELD)
+                .expect("pressure version lookup")
+                .expect("pressure version")
+                .value(),
+            5
+        );
+        let tables = read
+            .list_tables()
+            .expect("ordinary Blob policy tables")
+            .map(|table| table.name().to_owned())
+            .collect::<BTreeSet<_>>();
+        assert!(tables.contains(lifecycle::BLOB_TTL_DEADLINES.name()));
+        assert!(tables.contains(lifecycle::BLOB_TTL_EXPIRY_CURSORS.name()));
+        assert!(tables.contains(pressure::BLOB_PRESSURE_REANCHOR_CURSORS.name()));
+    }
+
+    #[test]
+    fn blob_policy_pairing_rejects_v4_with_historical_pressure_and_historical_with_v4() {
+        // Mutations caught: a boolean current/not-current comparison accepts
+        // lifecycle-v3 + pressure-v4, while loose predecessor handling can
+        // accept lifecycle-v4 + pressure-v3. Both mixed pairs must fail closed.
+        for (case, lifecycle_version, pressure_version) in
+            [("v4-pressure-v3", 4, 3), ("v3-pressure-v4", 3, 4)]
+        {
+            let root = BlobTestRoot::new(case);
+            let services = blob_services(if lifecycle_version == 4 { 0xd9 } else { 0xda });
+            drop(
+                Store::open_for_mission(&root.database, services.authority)
+                    .expect("create policy-pair fixture"),
+            );
+            let database = Database::open(&root.database).expect("policy-pair database");
+            let write = database.begin_write().expect("policy-pair writer");
+            write
+                .open_table(lifecycle::BLOB_LIFECYCLE_METADATA)
+                .expect("lifecycle metadata")
+                .insert("schema_version", lifecycle_version)
+                .expect("set lifecycle version");
+            write
+                .open_table(pressure::BLOB_PRESSURE_METADATA)
+                .expect("pressure metadata")
+                .insert(pressure::PRESSURE_SCHEMA_VERSION_FIELD, pressure_version)
+                .expect("set pressure version");
+            write.commit().expect("commit mixed policy pair");
+            drop(database);
+            assert!(
+                Store::inspect_existing(&root.database).is_err(),
+                "read-only inspection accepted mixed pair {case}"
+            );
+            assert!(
+                Store::open_for_mission(&root.database, services.authority).is_err(),
+                "writable open accepted mixed pair {case}"
+            );
+        }
+    }
+
+    #[test]
     fn finite_lifetime_schema_v3_to_v4_is_read_only_safe_atomic_and_idempotent() {
         let root = BlobTestRoot::new("finite-lifetime-v3-migration");
         let source_root = BlobTestRoot::new("finite-lifetime-v3-pending-source");
@@ -21805,6 +24597,16 @@ mod tests {
             .expect("migration pending source store");
         let target = Store::open_for_mission(&root.database, services.authority)
             .expect("migration pending target store");
+        let staging_plaintext = b"finite migration exact unpublished staging".to_vec();
+        let staging_prepared = prepared_blob(&staging_plaintext);
+        finish_variant(
+            &target,
+            &services.publisher,
+            &staging_prepared,
+            &staging_plaintext,
+            1,
+        )
+        .expect("stage migration unpublished variant");
         let pending_plaintext = b"finite migration pending v2 authority".to_vec();
         let pending_prepared = prepared_blob(&pending_plaintext);
         let pending_access =
@@ -21838,16 +24640,6 @@ mod tests {
                 &pending_plan,
             )
             .expect("stage migration pending source");
-        let staging_plaintext = b"finite migration exact unpublished staging".to_vec();
-        let staging_prepared = prepared_blob(&staging_plaintext);
-        finish_variant(
-            &target,
-            &services.publisher,
-            &staging_prepared,
-            &staging_plaintext,
-            1,
-        )
-        .expect("stage migration unpublished variant");
         drop(target);
         drop(source);
         downgrade_blob_lifecycle_to_v3_for_test(&root.database);
@@ -22704,6 +25496,9 @@ mod tests {
                 .delete_table(pressure::BLOB_PRESSURE_VARIANTS)
                 .expect("variant pressure index");
             write
+                .delete_table(pressure::BLOB_PRESSURE_REANCHOR_CURSORS)
+                .expect("pressure reanchor cursors");
+            write
                 .delete_table(BLOB_ACCEPTANCE_ORDER)
                 .expect("acceptance order");
             write
@@ -22718,6 +25513,18 @@ mod tests {
             write
                 .delete_table(super::super::blob_subscription::BLOB_DELIVERY_CURSORS)
                 .expect("delivery cursors");
+            write
+                .delete_table(super::super::blob_subscription::BLOB_RETIREMENT_DELIVERIES)
+                .expect("retirement deliveries");
+            write
+                .delete_table(super::super::blob_subscription::BLOB_RETIREMENT_DELIVERY_ORDER)
+                .expect("retirement delivery order");
+            write
+                .delete_table(super::super::blob_subscription::BLOB_RETIREMENT_ACKNOWLEDGEMENTS)
+                .expect("retirement acknowledgements");
+            write
+                .delete_table(super::super::blob_subscription::BLOB_RETIREMENT_DELIVERY_OWNERS)
+                .expect("retirement delivery owners");
             {
                 let mut metadata = write.open_table(METADATA).expect("metadata");
                 for field in blob_global_metadata_fields() {
@@ -22729,6 +25536,10 @@ mod tests {
                     super::super::blob_subscription::BLOB_ACKNOWLEDGEMENT_COUNT,
                     super::super::blob_subscription::BLOB_DELIVERY_CURSOR_COUNT,
                     super::super::blob_subscription::BLOB_SELECTOR_GENERATION,
+                    super::super::blob_subscription::BLOB_RETIREMENT_DELIVERY_COUNT,
+                    super::super::blob_subscription::BLOB_RETIREMENT_DELIVERY_ORDER_COUNT,
+                    super::super::blob_subscription::BLOB_RETIREMENT_ACKNOWLEDGEMENT_COUNT,
+                    super::super::blob_subscription::BLOB_RETIREMENT_DELIVERY_OWNER_COUNT,
                 ] {
                     metadata
                         .remove(field)
@@ -22782,6 +25593,12 @@ mod tests {
             write
                 .delete_table(lifecycle::BLOB_RETIREMENT_RESOLVERS)
                 .expect("delete orphan retirement resolvers");
+            write
+                .delete_table(lifecycle::BLOB_TTL_DEADLINES)
+                .expect("delete orphan TTL deadlines");
+            write
+                .delete_table(lifecycle::BLOB_TTL_EXPIRY_CURSORS)
+                .expect("delete orphan TTL expiry cursors");
             write.commit().expect("commit absent lifecycle schema");
         }
         assert!(matches!(
@@ -22925,6 +25742,7 @@ mod tests {
     fn predecessor_blob_schema_requires_writable_network_and_pressure_migration() {
         let mut services = blob_services(0xc1);
         let remove_network_tables = |path: &Path| {
+            downgrade_blob_policy_to_v4_for_test(path);
             let database = Database::open(path).expect("raw predecessor database");
             let write = database.begin_write().expect("predecessor schema write");
             write
@@ -25125,6 +27943,1368 @@ mod tests {
     }
 
     #[test]
+    fn blob_expired_retirement_is_atomic_shared_root_safe_and_lease_independent() {
+        let root = BlobTestRoot::new("expired-retirement-shared-lease");
+        let mut services = blob_services(0xe0);
+        let plaintext = b"expired publication retirement keeps physical custody separate".to_vec();
+        let prepared = prepared_blob(&plaintext);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("expired retirement store");
+        let (first, first_operation, _) = publish_blob(
+            &store,
+            &mut services,
+            &prepared,
+            &plaintext,
+            1,
+            b"expired-shared-first",
+        );
+        let (second, second_operation, _) = publish_blob(
+            &store,
+            &mut services,
+            &prepared,
+            &plaintext,
+            1,
+            b"expired-shared-second",
+        );
+        assert_eq!(first.variant_id, second.variant_id);
+        let checkpoint = CustodySample {
+            clock_id: [0xe1; 16],
+            tick_ms: 100,
+        };
+        let first_intent = rewrite_live_blob_as_finite_for_retirement_test(
+            &store,
+            &first,
+            Some(&first_operation),
+            100,
+            50,
+            checkpoint,
+        );
+        let second_intent = rewrite_live_blob_as_finite_for_retirement_test(
+            &store,
+            &second,
+            Some(&second_operation),
+            150,
+            50,
+            checkpoint,
+        );
+        let policy = store.control_policy_snapshot().expect("expired policy");
+        let subscription = store
+            .create_blob_subscription_with_policy(
+                &policy,
+                &BlobSubscriptionKey::new(b"expired-retirement-delivery".to_vec())
+                    .expect("expired subscription key"),
+                BlobSubscriptionSpec {
+                    topic: blob_topic(),
+                    scope: blob_scope(),
+                    include_descendant_scopes: false,
+                },
+            )
+            .expect("expired subscription");
+        let poll = store
+            .prepare_blob_subscription_poll_with_policy(&policy, subscription.id, 2, 16)
+            .expect("expired delivery poll");
+        let page = store
+            .commit_blob_subscription_poll_with_policy(
+                &policy,
+                &poll,
+                &all_blob_subscription_candidates_deliverable(&poll),
+            )
+            .expect("expired delivery page");
+        let first_delivery = page
+            .deliveries
+            .iter()
+            .find(|delivery| delivery.semantic_id == first.semantic_id)
+            .expect("first pending delivery")
+            .clone();
+        let lease = store
+            .test_acquire_blob_lease(first.variant_id, lease::BlobLeaseKind::ApplicationPageRead)
+            .expect("bounded page lease");
+
+        let retire = |stored: &StoredBlob, sample: CustodySample| -> Result<(), StoreError> {
+            let write = store
+                .database
+                .begin_write()
+                .expect("expired retirement writer");
+            let mut charge = MaintenanceCharge {
+                budget: maintenance_budget(64),
+                rows: 0,
+                bytes: 0,
+                identities: BTreeMap::new(),
+            };
+            let mut remaining_operations = MAX_BLOB_OPERATIONS;
+            let plan = plan_blob_publication_retirement_write(
+                &write,
+                store.blob_lifecycle_limits,
+                stored.transfer_id,
+                lifecycle::RetirementReason::Expired,
+                PublicationPressurePreflight::Required,
+                Some(sample),
+                &mut charge,
+                &mut remaining_operations,
+            )?
+            .ok_or_else(|| blob_error(BlobStoreError::InvalidMaintenanceBudget))?;
+            apply_blob_publication_retirement_plan_write(
+                &write,
+                store.blob_lifecycle_limits,
+                plan,
+                PublicationPressureApply::RefreshVariant,
+            )?;
+            Ok(write.commit()?)
+        };
+
+        let before_early_retirement = blob_current_admission_digest(&store);
+        assert!(matches!(
+            retire(
+                &first,
+                CustodySample {
+                    clock_id: checkpoint.clock_id,
+                    tick_ms: 149,
+                },
+            ),
+            Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
+                "Blob expiry retirement candidate is not provably expired"
+            )))
+        ));
+        assert_eq!(
+            blob_current_admission_digest(&store),
+            before_early_retirement,
+            "a live finite candidate must roll back the complete retirement unit"
+        );
+        retire(
+            &first,
+            CustodySample {
+                clock_id: checkpoint.clock_id,
+                tick_ms: 150,
+            },
+        )
+        .expect("retire first exact-expiry publication");
+        assert!(matches!(
+            store.blob_for_operation_with_policy(
+                &policy,
+                &BlobOperationRequest::new(&first_operation, &first_intent),
+            ),
+            Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+        ));
+        assert!(matches!(
+            store.acknowledge_blob_delivery_with_policy(
+                &policy,
+                subscription.id,
+                first.semantic_id,
+                first_delivery.token,
+            ),
+            Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+        ));
+        assert!(
+            store
+                .get_blob(second.transfer_id)
+                .expect("shared live publication")
+                .is_some(),
+            "retiring one shared publication must retain the other root"
+        );
+        {
+            let read = store.database.begin_read().expect("shared retirement read");
+            assert!(
+                !deletion::variant_has_deletion_manifest_read(&read, first.variant_id)
+                    .expect("shared deletion manifest lookup")
+            );
+        }
+
+        retire(
+            &second,
+            CustodySample {
+                clock_id: checkpoint.clock_id,
+                tick_ms: 200,
+            },
+        )
+        .expect("retire final exact-expiry publication");
+        assert!(matches!(
+            store.blob_for_operation_with_policy(
+                &policy,
+                &BlobOperationRequest::new(&second_operation, &second_intent),
+            ),
+            Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+        ));
+        {
+            let read = store.database.begin_read().expect("final retirement read");
+            assert!(
+                !deletion::variant_has_deletion_manifest_read(&read, first.variant_id)
+                    .expect("lease-delayed deletion manifest lookup"),
+                "logical retirement must not wait for or combine with DeletePending admission"
+            );
+            for stored in [&first, &second] {
+                let encoded = read
+                    .open_table(BLOB_PUBLICATIONS)
+                    .expect("retired publications")
+                    .get(stored.transfer_id.as_bytes().as_slice())
+                    .expect("retired publication lookup")
+                    .expect("retired publication row")
+                    .value()
+                    .to_vec();
+                assert!(matches!(
+                    lifecycle::publication_retirement(&encoded).expect("decode retirement"),
+                    Some((lifecycle::RetirementReason::Expired, _, _))
+                ));
+            }
+        }
+        drop(lease);
+        drop(store);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("reopen expired retirement store");
+        for stored in [&first, &second] {
+            assert!(matches!(
+                store.get_blob(stored.transfer_id),
+                Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+            ));
+        }
+        assert!(matches!(
+            store.blob_for_operation_with_policy(
+                &policy,
+                &BlobOperationRequest::new(&second_operation, &second_intent),
+            ),
+            Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+        ));
+        set_maintenance_next_class(
+            &store,
+            lifecycle::BlobMaintenanceClass::UnreferencedCompletedVariants,
+        );
+        store
+            .run_blob_maintenance_turn_with_sample(maintenance_budget(64), Some(checkpoint))
+            .expect("admit deferred deletion manifest");
+        let read = store.database.begin_read().expect("deferred deletion read");
+        assert!(
+            deletion::variant_has_deletion_manifest_read(&read, first.variant_id)
+                .expect("deferred deletion manifest")
+        );
+    }
+
+    #[test]
+    fn blob_expired_pending_removal_is_atomic_hidden_and_lease_independent() {
+        let source_root = BlobTestRoot::new("expired-pending-source");
+        let target_root = BlobTestRoot::new("expired-pending-target");
+        let mut services = blob_services(0xe2);
+        let source = Store::open_for_mission(&source_root.database, services.authority)
+            .expect("expired pending source store");
+        let target = Store::open_for_mission(&target_root.database, services.authority)
+            .expect("expired pending target store");
+        let plaintext = b"expired pending source never promotes or remains schedulable".to_vec();
+        let prepared = prepared_blob(&plaintext);
+        let proof = prepare_blob_proof_with_lifetime(
+            &source,
+            &mut services,
+            &prepared,
+            &plaintext,
+            1,
+            Priority::Immediate,
+            Some(100),
+        );
+        let plan = proof
+            .blob
+            .transfer_plan(&proof.manifest_bytes)
+            .expect("expired pending transfer plan");
+        let transfer = BlobTransferId::new(proof.blob.envelope_id());
+        let variant = proof.completion.variant_id();
+        let checkpoint = CustodySample {
+            clock_id: [0xe3; 16],
+            tick_ms: 100,
+        };
+        let admission = VerifiedFiniteBlobAdmission::for_test(
+            proof.blob.envelope_id(),
+            u64::try_from(proof.sealed.len()).expect("expired pending source length"),
+            proof.blob.item_id(),
+            proof.blob.blob_id(),
+            proof.blob.priority(),
+            100,
+            50,
+            checkpoint,
+        );
+        let policy = target
+            .control_policy_snapshot()
+            .expect("expired pending policy");
+        assert_eq!(
+            target
+                .stage_verified_blob_source_with_lifetime(
+                    &policy,
+                    &proof.blob,
+                    &proof.sealed,
+                    &plan,
+                    Some(admission),
+                )
+                .expect("stage expired pending source"),
+            BlobSourceStageOutcome::Inserted
+        );
+        let lease = target
+            .test_acquire_blob_lease(variant, lease::BlobLeaseKind::InternalChunkWork)
+            .expect("expired pending bounded lease");
+
+        let remove = |sample: CustodySample| -> Result<(), StoreError> {
+            let write = target
+                .database
+                .begin_write()
+                .expect("expired pending writer");
+            apply_expired_pending_source_write(
+                &write,
+                services.authority,
+                target.blob_depot_owner_binding,
+                transfer,
+                Some(sample),
+                target.blob_lifecycle_limits,
+                false,
+                None,
+            )?;
+            Ok(write.commit()?)
+        };
+        let before_early_removal = blob_current_admission_digest(&target);
+        assert!(matches!(
+            remove(CustodySample {
+                clock_id: checkpoint.clock_id,
+                tick_ms: 149,
+            }),
+            Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
+                "Blob pending expiry candidate is not provably expired"
+            )))
+        ));
+        assert_eq!(
+            blob_current_admission_digest(&target),
+            before_early_removal,
+            "a live pending source must roll back the complete removal unit"
+        );
+        remove(CustodySample {
+            clock_id: checkpoint.clock_id,
+            tick_ms: 150,
+        })
+        .expect("remove exact-expiry pending source");
+        assert!(
+            target
+                .pending_blob_source(transfer)
+                .expect("expired pending exact lookup")
+                .is_none()
+        );
+        assert!(
+            target
+                .pending_blob_source_inventory_with_policy(&policy)
+                .expect("expired pending inventory")
+                .is_empty()
+        );
+        {
+            let read = target
+                .database
+                .begin_read()
+                .expect("expired pending retirement read");
+            assert!(
+                !deletion::variant_has_deletion_manifest_read(&read, variant)
+                    .expect("expired pending manifest lookup"),
+                "pending logical removal must not wait for or combine with DeletePending"
+            );
+        }
+        drop(lease);
+        drop(target);
+        let target = Store::open_for_mission(&target_root.database, services.authority)
+            .expect("reopen expired pending target");
+        assert!(target.pending_blob_source(transfer).unwrap().is_none());
+        set_maintenance_next_class(
+            &target,
+            lifecycle::BlobMaintenanceClass::UnreferencedLocalImportStaging,
+        );
+        target
+            .run_blob_maintenance_turn_with_sample(maintenance_budget(64), Some(checkpoint))
+            .expect("admit pending deferred deletion manifest");
+        let read = target
+            .database
+            .begin_read()
+            .expect("pending deferred deletion read");
+        assert!(
+            deletion::variant_has_deletion_manifest_read(&read, variant)
+                .expect("pending deferred deletion manifest")
+        );
+    }
+
+    #[test]
+    fn blob_exact_expiry_is_withheld_at_live_pending_and_delivery_boundaries() {
+        let target_root = BlobTestRoot::new("expiry-visibility-target");
+        let mut services = blob_services(0xe4);
+        let target = Store::open_for_mission(&target_root.database, services.authority)
+            .expect("expiry visibility target");
+        let checkpoint = CustodySample {
+            clock_id: [0xe5; 16],
+            tick_ms: 100,
+        };
+
+        let live_plaintext = b"finite live visibility stops at the exact boundary".to_vec();
+        let live_prepared = prepared_blob(&live_plaintext);
+        let (live, live_operation, _) = publish_blob(
+            &target,
+            &mut services,
+            &live_prepared,
+            &live_plaintext,
+            1,
+            b"expiry-visibility-live",
+        );
+        rewrite_live_blob_as_finite_for_retirement_test(
+            &target,
+            &live,
+            Some(&live_operation),
+            100,
+            50,
+            checkpoint,
+        );
+
+        let pending_plaintext = b"finite pending visibility stops at the exact boundary".to_vec();
+        let pending_prepared = prepared_blob(&pending_plaintext);
+        let pending_proof = prepare_blob_proof_with_lifetime(
+            &target,
+            &mut services,
+            &pending_prepared,
+            &pending_plaintext,
+            1,
+            Priority::Immediate,
+            Some(100),
+        );
+        let pending_plan = pending_proof
+            .blob
+            .transfer_plan(&pending_proof.manifest_bytes)
+            .expect("expiry visibility pending plan");
+        let pending_transfer = BlobTransferId::new(pending_proof.blob.envelope_id());
+        let pending_admission = VerifiedFiniteBlobAdmission::for_test(
+            pending_proof.blob.envelope_id(),
+            u64::try_from(pending_proof.sealed.len()).expect("pending visibility source length"),
+            pending_proof.blob.item_id(),
+            pending_proof.blob.blob_id(),
+            pending_proof.blob.priority(),
+            100,
+            50,
+            checkpoint,
+        );
+        let policy = target
+            .control_policy_snapshot()
+            .expect("expiry visibility policy");
+        assert_eq!(
+            target
+                .stage_verified_blob_source_with_lifetime(
+                    &policy,
+                    &pending_proof.blob,
+                    &pending_proof.sealed,
+                    &pending_plan,
+                    Some(pending_admission),
+                )
+                .expect("stage expiry visibility pending source"),
+            BlobSourceStageOutcome::Inserted
+        );
+        let pending_carrier = {
+            let mut depot = target.blob_depot().expect("expiry visibility source depot");
+            CoreBlobStore::begin_blob_with_lineage(
+                &mut depot,
+                pending_plan.manifest(),
+                pending_plan.physical_lineage(),
+            )
+            .expect("activate expiry visibility plan");
+            pending_plan
+                .build_carrier(&mut depot, 0)
+                .expect("build expiry visibility carrier")
+        };
+        let pending_object = BlobCarrierObjectId::new(pending_carrier.object_id().wire_bytes())
+            .expect("expiry visibility carrier object");
+        let pending_total =
+            u64::try_from(pending_carrier.bytes().len()).expect("expiry visibility carrier length");
+        let pending_first_range_len = pending_carrier
+            .bytes()
+            .len()
+            .min(MAX_BLOB_NETWORK_RANGE_BYTES);
+        assert!(matches!(
+            target
+                .append_blob_carrier_prefix_with_policy(
+                    &policy,
+                    pending_transfer,
+                    pending_object,
+                    pending_total,
+                    0,
+                    &pending_carrier.bytes()[..pending_first_range_len],
+                )
+                .expect("append pre-expiry carrier range"),
+            BlobCarrierAppendOutcome::Appended(_)
+        ));
+        let subscription = target
+            .create_blob_subscription_with_policy(
+                &policy,
+                &BlobSubscriptionKey::new(b"expiry-visibility-subscription".to_vec())
+                    .expect("expiry visibility subscription key"),
+                BlobSubscriptionSpec {
+                    topic: blob_topic(),
+                    scope: blob_scope(),
+                    include_descendant_scopes: false,
+                },
+            )
+            .expect("expiry visibility subscription");
+        assert!(target.get_blob(live.transfer_id).unwrap().is_some());
+        assert!(
+            target
+                .pending_blob_source(pending_transfer)
+                .unwrap()
+                .is_some()
+        );
+        let admitted_read_plan = target
+            .prepare_blob_read_with_policy(
+                &policy,
+                &live.header.topic,
+                &live.header.scope,
+                live.blob_id,
+            )
+            .expect("pre-expiry read plan");
+        let admitted_delivery_plan = target
+            .prepare_blob_subscription_poll_with_policy(&policy, subscription.id, 2, 16)
+            .expect("pre-expiry subscription plan");
+        assert!(!admitted_delivery_plan.candidates().is_empty());
+
+        let local_plaintext = b"finite local commit stops at the exact boundary".to_vec();
+        let local_prepared = prepared_blob(&local_plaintext);
+        let local_proof = prepare_blob_proof_with_lifetime(
+            &target,
+            &mut services,
+            &local_prepared,
+            &local_plaintext,
+            1,
+            Priority::Immediate,
+            Some(100),
+        );
+        let local_operation = BlobOperationKey::new(b"expiry-visibility-local-commit".to_vec())
+            .expect("expiry visibility local operation");
+        let local_intent = BlobPublicationIntent::new_with_ttl(
+            services.publisher.identity(),
+            blob_topic(),
+            blob_scope(),
+            Priority::Immediate,
+            local_prepared.id(),
+            Some(100),
+        )
+        .expect("expiry visibility local intent");
+        let local_request = BlobOperationRequest::new(&local_operation, &local_intent);
+        let local_age = custody::LowerBoundAgeCheckpoint {
+            cumulative_age_ms: 50,
+            checkpoint: Some(checkpoint),
+            continuity_generation: custody::lower_bound_continuity_read(
+                &target
+                    .database
+                    .begin_read()
+                    .expect("local commit continuity read"),
+            )
+            .expect("read local commit continuity")
+            .expect("local commit continuity")
+            .generation,
+            continuity_lost: false,
+        };
+
+        let promotion_plaintext = b"finite pending promotion stops at the exact boundary".to_vec();
+        let promotion_prepared = prepared_blob(&promotion_plaintext);
+        let promotion_proof = prepare_blob_proof_with_lifetime(
+            &target,
+            &mut services,
+            &promotion_prepared,
+            &promotion_plaintext,
+            1,
+            Priority::Immediate,
+            Some(100),
+        );
+        let promotion_plan = promotion_proof
+            .blob
+            .transfer_plan(&promotion_proof.manifest_bytes)
+            .expect("expiry visibility promotion plan");
+        let promotion_transfer = BlobTransferId::new(promotion_proof.blob.envelope_id());
+        let promotion_admission = VerifiedFiniteBlobAdmission::for_test(
+            promotion_proof.blob.envelope_id(),
+            u64::try_from(promotion_proof.sealed.len())
+                .expect("promotion visibility source length"),
+            promotion_proof.blob.item_id(),
+            promotion_proof.blob.blob_id(),
+            promotion_proof.blob.priority(),
+            100,
+            50,
+            checkpoint,
+        );
+        assert_eq!(
+            target
+                .stage_verified_blob_source_with_lifetime(
+                    &policy,
+                    &promotion_proof.blob,
+                    &promotion_proof.sealed,
+                    &promotion_plan,
+                    Some(promotion_admission),
+                )
+                .expect("stage expiry visibility promotion source"),
+            BlobSourceStageOutcome::Inserted
+        );
+        let promotion_carriers = {
+            let mut depot = target
+                .blob_depot()
+                .expect("expiry visibility promotion carrier depot");
+            CoreBlobStore::begin_blob_with_lineage(
+                &mut depot,
+                promotion_plan.manifest(),
+                promotion_plan.physical_lineage(),
+            )
+            .expect("activate expiry visibility promotion plan");
+            (0..promotion_plan.manifest().chunk_count())
+                .map(|index| {
+                    promotion_plan
+                        .build_carrier(&mut depot, index)
+                        .expect("build expiry visibility promotion carrier")
+                })
+                .collect::<Vec<_>>()
+        };
+        for carrier in &promotion_carriers {
+            let object = BlobCarrierObjectId::new(carrier.object_id().wire_bytes())
+                .expect("expiry visibility promotion carrier object");
+            let total = u64::try_from(carrier.bytes().len())
+                .expect("expiry visibility promotion carrier length");
+            for (range_index, range) in carrier
+                .bytes()
+                .chunks(MAX_BLOB_NETWORK_RANGE_BYTES)
+                .enumerate()
+            {
+                let offset = u64::try_from(range_index * MAX_BLOB_NETWORK_RANGE_BYTES)
+                    .expect("expiry visibility promotion carrier offset");
+                target
+                    .append_blob_carrier_prefix_with_policy(
+                        &policy,
+                        promotion_transfer,
+                        object,
+                        total,
+                        offset,
+                        range,
+                    )
+                    .expect("append expiry visibility promotion carrier");
+            }
+            target
+                .commit_complete_blob_carrier_with_policy(
+                    &policy,
+                    promotion_transfer,
+                    object,
+                    &promotion_plan,
+                )
+                .expect("commit expiry visibility promotion carrier");
+        }
+        let promotion_completion = target
+            .completed_pending_blob_with_policy(
+                &policy,
+                promotion_transfer,
+                &promotion_proof.blob,
+                &promotion_proof.manifest_bytes,
+                &promotion_plan,
+            )
+            .expect("complete pre-expiry promotion source");
+        let promotion_content_completion = {
+            let depot = target
+                .blob_depot_for_authenticated_read(&promotion_completion)
+                .expect("pre-expiry promotion content depot");
+            let mut service = services
+                .reader
+                .blob_service_with_store(&blob_scope(), &blob_topic(), 1, depot)
+                .expect("pre-expiry promotion content service");
+            service
+                .verify_blob_content_completion(
+                    &promotion_proof.blob,
+                    &promotion_proof.manifest_bytes,
+                )
+                .expect("verify pre-expiry promotion content")
+        };
+        let promotion_lineage = services
+            .reader
+            .verify_current_blob_lineage(&promotion_proof.blob)
+            .expect("verify pre-expiry promotion lineage");
+
+        let write = target
+            .database
+            .begin_write()
+            .expect("advance expiry visibility continuity");
+        custody::observe_continuity_write(
+            &write,
+            CustodySample {
+                clock_id: checkpoint.clock_id,
+                tick_ms: 150,
+            },
+        )
+        .expect("observe exact expiry boundary");
+        write.commit().expect("commit exact expiry continuity");
+
+        assert!(matches!(
+            target.get_blob(live.transfer_id),
+            Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+        ));
+        assert!(matches!(
+            target.blob_by_semantic_id(live.semantic_id),
+            Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+        ));
+        assert!(matches!(
+            target.prepare_blob_read_with_policy(
+                &policy,
+                &live.header.topic,
+                &live.header.scope,
+                live.blob_id,
+            ),
+            Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+        ));
+        assert!(matches!(
+            target.require_blob_read_plan_with_policy(&policy, &admitted_read_plan),
+            Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+        ));
+        assert!(matches!(
+            target.commit_blob_subscription_poll_with_policy(
+                &policy,
+                &admitted_delivery_plan,
+                &all_blob_subscription_candidates_deliverable(&admitted_delivery_plan),
+            ),
+            Err(StoreError::BlobSubscriptionPlanChanged)
+        ));
+        assert!(
+            target
+                .blob_inventory()
+                .expect("expired inventory")
+                .is_empty()
+        );
+        assert!(
+            target
+                .blob_source_projection(live.transfer_id)
+                .expect("expired live source projection")
+                .is_none()
+        );
+        assert!(
+            target
+                .pending_blob_source(pending_transfer)
+                .expect("expired pending exact lookup")
+                .is_none()
+        );
+        assert!(
+            target
+                .blob_source_projection(pending_transfer)
+                .expect("expired pending source projection")
+                .is_none()
+        );
+        assert!(
+            target
+                .completed_blob_sender_inventory_with_policy(&policy)
+                .expect("expired completed sender inventory")
+                .is_empty()
+        );
+        assert!(
+            target
+                .pending_blob_source_inventory_with_policy(&policy)
+                .expect("expired pending sender inventory")
+                .is_empty()
+        );
+        assert!(
+            target
+                .pending_blob_transfer_progress_with_policy(&policy)
+                .expect("expired pending transfer progress")
+                .pending
+                .is_empty()
+        );
+        assert!(
+            target
+                .next_pending_blob_source_with_policy(&policy, None)
+                .expect("expired next pending source")
+                .is_none()
+        );
+        assert!(
+            target
+                .prepare_blob_subscription_poll_with_policy(&policy, subscription.id, 2, 16)
+                .expect("expired subscription poll")
+                .candidates()
+                .is_empty()
+        );
+        let before_rejected_units = blob_current_admission_digest(&target);
+        assert!(matches!(
+            target.commit_reserved_local_finite_blob_once_with_policy(
+                &local_proof.policy,
+                &local_request,
+                &local_proof.reservation,
+                &local_proof.blob,
+                &local_proof.sealed,
+                &local_proof.completion,
+                local_age,
+            ),
+            Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+        ));
+        assert!(matches!(
+            target.apply_verified_blob_with_policy(
+                &policy,
+                &promotion_plan,
+                &promotion_lineage,
+                &promotion_completion,
+                &promotion_content_completion,
+            ),
+            Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+        ));
+        assert!(
+            target
+                .blob_carrier_prefix_status(pending_transfer, pending_object)
+                .expect("expired carrier status")
+                .is_none()
+        );
+        assert!(
+            target
+                .complete_blob_carrier_bytes(pending_transfer, pending_object)
+                .expect("expired complete carrier bytes")
+                .is_none()
+        );
+        assert!(matches!(
+            target.pending_blob_carrier_work_with_policy(&policy, pending_transfer, &pending_plan,),
+            Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+        ));
+        assert!(matches!(
+            target.append_blob_carrier_prefix_with_policy(
+                &policy,
+                pending_transfer,
+                pending_object,
+                pending_total,
+                0,
+                &pending_carrier.bytes()[..pending_first_range_len],
+            ),
+            Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+        ));
+        assert!(matches!(
+            target.commit_complete_blob_carrier_with_policy(
+                &policy,
+                pending_transfer,
+                pending_object,
+                &pending_plan,
+            ),
+            Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+        ));
+        assert!(matches!(
+            target.completed_pending_blob_with_policy(
+                &policy,
+                pending_transfer,
+                &pending_proof.blob,
+                &pending_proof.manifest_bytes,
+                &pending_plan,
+            ),
+            Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+        ));
+        assert_eq!(
+            blob_current_admission_digest(&target),
+            before_rejected_units,
+            "expired carrier units must fail without durable mutation"
+        );
+
+        let indeterminate_plaintext =
+            b"finite live visibility stops after continuity loss".to_vec();
+        let indeterminate_prepared = prepared_blob(&indeterminate_plaintext);
+        let (indeterminate, indeterminate_operation, _) = publish_blob(
+            &target,
+            &mut services,
+            &indeterminate_prepared,
+            &indeterminate_plaintext,
+            1,
+            b"expiry-visibility-indeterminate",
+        );
+        let indeterminate_checkpoint = CustodySample {
+            clock_id: checkpoint.clock_id,
+            tick_ms: 150,
+        };
+        rewrite_live_blob_as_finite_for_retirement_test(
+            &target,
+            &indeterminate,
+            Some(&indeterminate_operation),
+            100,
+            50,
+            indeterminate_checkpoint,
+        );
+        assert!(
+            target
+                .get_blob(indeterminate.transfer_id)
+                .expect("continuous finite source")
+                .is_some()
+        );
+        let write = target
+            .database
+            .begin_write()
+            .expect("indeterminate continuity write");
+        custody::observe_continuity_write(
+            &write,
+            CustodySample {
+                clock_id: [0xe6; 16],
+                tick_ms: 1,
+            },
+        )
+        .expect("lose finite continuity");
+        write.commit().expect("commit continuity loss");
+        assert!(matches!(
+            target.get_blob(indeterminate.transfer_id),
+            Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+        ));
+        assert!(
+            target
+                .blob_source_projection(indeterminate.transfer_id)
+                .expect("indeterminate source projection")
+                .is_none(),
+            "continuity loss must withhold a not-yet-provably-expired source"
+        );
+    }
+
+    #[test]
+    fn blob_v5_deadline_scheduler_retires_live_then_pending_at_exact_tick() {
+        // Mutations caught: the runtime wake deadline must come from the
+        // dedicated v5 index, and the alternating bounded selector must
+        // commit Expired retirement/removal rather than falling back to the
+        // arbitrary transfer scan or pressure eviction semantics.
+        let root = BlobTestRoot::new("v5-deadline-scheduler");
+        let mut services = blob_services(0xe7);
+        let store =
+            Store::open_for_mission(&root.database, services.authority).expect("v5 deadline store");
+        let checkpoint = CustodySample {
+            clock_id: [0xe8; 16],
+            tick_ms: 100,
+        };
+        let continuity = {
+            let write = store
+                .database
+                .begin_write()
+                .expect("v5 deadline continuity writer");
+            let continuity = custody::observe_continuity_write(&write, checkpoint)
+                .expect("v5 deadline continuity");
+            pressure::synchronize_reanchor_state_write(&write)
+                .expect("v5 deadline pressure target");
+            write.commit().expect("commit v5 deadline continuity");
+            continuity
+        };
+
+        let live_plaintext = b"v5 deadline live root".to_vec();
+        let live_prepared = prepared_blob(&live_plaintext);
+        let live_proof = prepare_blob_proof_with_lifetime(
+            &store,
+            &mut services,
+            &live_prepared,
+            &live_plaintext,
+            1,
+            Priority::Immediate,
+            Some(100),
+        );
+        let live_operation =
+            BlobOperationKey::new(b"v5-deadline-live".to_vec()).expect("live operation");
+        let live_intent = BlobPublicationIntent::new_with_ttl(
+            services.publisher.identity(),
+            blob_topic(),
+            blob_scope(),
+            Priority::Immediate,
+            live_prepared.id(),
+            Some(100),
+        )
+        .expect("live finite intent");
+        let live = store
+            .commit_reserved_local_finite_blob_once_with_policy(
+                &live_proof.policy,
+                &BlobOperationRequest::new(&live_operation, &live_intent),
+                &live_proof.reservation,
+                &live_proof.blob,
+                &live_proof.sealed,
+                &live_proof.completion,
+                custody::LowerBoundAgeCheckpoint {
+                    cumulative_age_ms: 50,
+                    checkpoint: Some(checkpoint),
+                    continuity_generation: continuity.generation(),
+                    continuity_lost: false,
+                },
+            )
+            .expect("commit v5 finite live root")
+            .blob()
+            .clone();
+
+        let pending_plaintext = b"v5 deadline pending root".to_vec();
+        let pending_prepared = prepared_blob(&pending_plaintext);
+        let pending_proof = prepare_blob_proof_with_lifetime(
+            &store,
+            &mut services,
+            &pending_prepared,
+            &pending_plaintext,
+            1,
+            Priority::Immediate,
+            Some(100),
+        );
+        let pending_plan = pending_proof
+            .blob
+            .transfer_plan(&pending_proof.manifest_bytes)
+            .expect("v5 pending plan");
+        let pending_transfer = BlobTransferId::new(pending_proof.blob.envelope_id());
+        assert_eq!(
+            store
+                .stage_verified_blob_source_with_lifetime(
+                    &live_proof.policy,
+                    &pending_proof.blob,
+                    &pending_proof.sealed,
+                    &pending_plan,
+                    Some(VerifiedFiniteBlobAdmission::for_test(
+                        pending_proof.blob.envelope_id(),
+                        u64::try_from(pending_proof.sealed.len())
+                            .expect("v5 pending source length"),
+                        pending_proof.blob.item_id(),
+                        pending_proof.blob.blob_id(),
+                        pending_proof.blob.priority(),
+                        100,
+                        50,
+                        checkpoint,
+                    )),
+                )
+                .expect("stage v5 finite pending root"),
+            BlobSourceStageOutcome::Inserted
+        );
+
+        let deadline = CustodySample {
+            clock_id: checkpoint.clock_id,
+            tick_ms: 150,
+        };
+        assert_eq!(
+            store
+                .nearest_blob_retention_deadline(checkpoint)
+                .expect("nearest v5 TTL deadline"),
+            Some(deadline)
+        );
+
+        // Advance the shared continuity authority before measuring the exact
+        // bounded unit, so the one-short probes cannot commit clock state.
+        {
+            let write = store.database.begin_write().unwrap();
+            custody::observe_continuity_write(&write, deadline).unwrap();
+            synchronize_blob_policy_generation_write(&write).unwrap();
+            write.commit().unwrap();
+        }
+
+        let measure_expiry_unit = || {
+            let write = store.database.begin_write().unwrap();
+            let cursor = lifecycle::load_maintenance_cursor(&write).unwrap();
+            let measured = apply_one_blob_ttl_expiry_write(
+                &write,
+                store.blob_lifecycle_limits,
+                store.mission_authority,
+                store.blob_depot_owner_binding,
+                BlobMaintenanceBudget::new(512, 1, 2 * 1024 * 1024).unwrap(),
+                cursor.class,
+            )
+            .unwrap()
+            .expect("due TTL unit");
+            assert!(measured.2, "measurement budget must fit the whole unit");
+            drop(write);
+            (measured.0, measured.1)
+        };
+
+        set_maintenance_next_class(
+            &store,
+            lifecycle::BlobMaintenanceClass::ExpiredPublicationsAndPendingSources,
+        );
+        let (live_rows, live_bytes) = measure_expiry_unit();
+        assert!(live_rows > 1 && live_bytes > 1);
+        let before_live_short = blob_current_admission_digest(&store);
+        for short in [
+            BlobMaintenanceBudget::new(live_rows - 1, 1, live_bytes).unwrap(),
+            BlobMaintenanceBudget::new(live_rows, 1, live_bytes - 1).unwrap(),
+        ] {
+            let deferred = store
+                .run_blob_maintenance_turn(short)
+                .expect("defer one-short live expiry");
+            assert!(deferred.class_has_more_work);
+            assert_eq!(blob_current_admission_digest(&store), before_live_short);
+        }
+        let live_progress = store
+            .run_blob_maintenance_turn(maintenance_budget(64))
+            .expect("retire due v5 live root");
+        assert_eq!(
+            live_progress.class,
+            lifecycle::BlobMaintenanceClass::ExpiredPublicationsAndPendingSources
+        );
+        assert!(matches!(
+            store.get_blob(live.transfer_id),
+            Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+        ));
+        assert_eq!(
+            store
+                .nearest_blob_retention_deadline(deadline)
+                .expect("remaining v5 TTL deadline"),
+            Some(deadline)
+        );
+
+        set_maintenance_next_class(
+            &store,
+            lifecycle::BlobMaintenanceClass::ExpiredPublicationsAndPendingSources,
+        );
+        let (pending_rows, pending_bytes) = measure_expiry_unit();
+        assert!(pending_rows > 1 && pending_bytes > 1);
+        let before_pending_short = blob_current_admission_digest(&store);
+        for short in [
+            BlobMaintenanceBudget::new(pending_rows - 1, 1, pending_bytes).unwrap(),
+            BlobMaintenanceBudget::new(pending_rows, 1, pending_bytes - 1).unwrap(),
+        ] {
+            let deferred = store
+                .run_blob_maintenance_turn(short)
+                .expect("defer one-short pending expiry");
+            assert!(deferred.class_has_more_work);
+            assert_eq!(blob_current_admission_digest(&store), before_pending_short);
+        }
+        let pending_progress = store
+            .run_blob_maintenance_turn(maintenance_budget(64))
+            .expect("remove due v5 pending root");
+        assert_eq!(
+            pending_progress.class,
+            lifecycle::BlobMaintenanceClass::ExpiredPublicationsAndPendingSources
+        );
+        assert!(
+            store
+                .pending_blob_source(pending_transfer)
+                .expect("removed v5 pending root")
+                .is_none()
+        );
+        let read = store.database.begin_read().expect("v5 retirement read");
+        let current_continuity = custody::lower_bound_continuity_read(&read)
+            .expect("read v5 deadline continuity")
+            .expect("v5 deadline continuity exists");
+        assert_eq!(
+            lifecycle::nearest_ttl_deadline_read(&read, current_continuity)
+                .expect("drained v5 TTL index"),
+            None
+        );
+        assert!(
+            store
+                .nearest_blob_retention_deadline(deadline)
+                .expect("retained retirement wake deadline")
+                .is_some_and(|retained| retained.tick_ms > deadline.tick_ms),
+            "the public scheduler must move from TTL work to retained evidence cleanup"
+        );
+        let encoded = read
+            .open_table(BLOB_PUBLICATIONS)
+            .expect("v5 retirement publications")
+            .get(live.transfer_id.as_bytes().as_slice())
+            .expect("v5 retirement lookup")
+            .expect("v5 retained retirement")
+            .value()
+            .to_vec();
+        assert!(matches!(
+            lifecycle::publication_retirement(&encoded).expect("decode v5 retirement"),
+            Some((lifecycle::RetirementReason::Expired, _, _))
+        ));
+        drop(read);
+        drop(store);
+        Store::open_for_mission(&root.database, services.authority)
+            .expect("reopen drained v5 deadline store");
+    }
+
+    #[test]
+    fn blob_v5_read_only_inspection_accepts_lagging_clean_pressure_target_byte_stably() {
+        // Mutations caught: classifying a shared custody observation as Blob
+        // corruption before the next Blob writer can establish its fenced
+        // pass, or letting read-only inspection repair durable state.
+        let root = BlobTestRoot::new("v5-read-only-pressure-lag");
+        let services = blob_services(0xe9);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("v5 pressure-lag store");
+        let write = store.database.begin_write().unwrap();
+        custody::observe_continuity_write(
+            &write,
+            CustodySample {
+                clock_id: [0xea; 16],
+                tick_ms: 10,
+            },
+        )
+        .expect("advance shared custody outside Blob");
+        write.commit().unwrap();
+        drop(store);
+        let before = blob_current_admission_digest_path(&root.database);
+        Store::inspect_existing(&root.database)
+            .expect("read-only inspect accepts unsynchronized Blob pressure");
+        assert_eq!(blob_current_admission_digest_path(&root.database), before);
+
+        let sync_root = BlobTestRoot::new("v5-pressure-sync-budget");
+        let store = Store::open_for_mission(&sync_root.database, services.authority)
+            .expect("policy sync budget store");
+        let write = store.database.begin_write().expect("advance sync custody");
+        custody::observe_continuity_write(
+            &write,
+            CustodySample {
+                clock_id: [0xeb; 16],
+                tick_ms: 10,
+            },
+        )
+        .expect("advance policy sync custody");
+        write.commit().expect("commit policy sync custody");
+        set_maintenance_next_class(
+            &store,
+            lifecycle::BlobMaintenanceClass::ExpiredPublicationsAndPendingSources,
+        );
+        let (exact_rows, exact_bytes) = {
+            let write = store.database.begin_write().expect("sync charge write");
+            let plan =
+                plan_blob_policy_generation_sync_write(&write).expect("plan lagging policy sync");
+            assert!(plan.needed());
+            let (mut charge, cursor_fits) = begin_policy_maintenance_charge(
+                &write,
+                maintenance_budget(u64::MAX),
+                lifecycle::BlobMaintenanceClass::ExpiredPublicationsAndPendingSources,
+            )
+            .expect("charge sync dispatcher");
+            assert!(cursor_fits);
+            assert!(
+                charge_blob_policy_generation_sync_write(&write, plan, &mut charge)
+                    .expect("charge lagging policy sync")
+            );
+            (charge.rows, charge.bytes)
+        };
+        assert_eq!(
+            exact_rows, 8,
+            "two dispatcher rows plus six pressure sync rows"
+        );
+        let before_sync = blob_complete_logical_digest(&store);
+        let short = store
+            .run_blob_maintenance_turn(
+                lifecycle::BlobMaintenanceBudget::new(exact_rows - 1, 1, exact_bytes)
+                    .expect("row-short sync budget"),
+            )
+            .expect("row-short sync refusal");
+        assert!(short.rows_examined < exact_rows);
+        assert_eq!(blob_complete_logical_digest(&store), before_sync);
+        let short = store
+            .run_blob_maintenance_turn(
+                lifecycle::BlobMaintenanceBudget::new(exact_rows, 1, exact_bytes - 1)
+                    .expect("byte-short sync budget"),
+            )
+            .expect("byte-short sync refusal");
+        assert!(short.bytes_examined < exact_bytes);
+        assert_eq!(blob_complete_logical_digest(&store), before_sync);
+        let exact = store
+            .run_blob_maintenance_turn(
+                lifecycle::BlobMaintenanceBudget::new(exact_rows, 1, exact_bytes)
+                    .expect("exact sync budget"),
+            )
+            .expect("exact lagging policy sync");
+        assert_eq!(
+            (exact.rows_examined, exact.bytes_examined),
+            (exact_rows, exact_bytes)
+        );
+        assert_ne!(blob_complete_logical_digest(&store), before_sync);
+
+        // A second independent custody advance can race a pass that is
+        // already dirty.  Read-only inspection must accept that structurally
+        // valid lag without repairing it, pressure remains gated, and the
+        // next writable open restarts both fenced phases at the new target.
+        let dirty_root = BlobTestRoot::new("v5-read-only-dirty-pressure-lag");
+        let mut dirty_services = blob_services(0xec);
+        let dirty_store = Store::open_for_mission(&dirty_root.database, dirty_services.authority)
+            .expect("dirty pressure-lag store");
+        let first_checkpoint = CustodySample {
+            clock_id: [0xec; 16],
+            tick_ms: 10,
+        };
+        let first_continuity = {
+            let write = dirty_store.database.begin_write().unwrap();
+            let continuity = custody::observe_continuity_write(&write, first_checkpoint).unwrap();
+            pressure::synchronize_reanchor_state_write(&write).unwrap();
+            write.commit().unwrap();
+            continuity
+        };
+        let plaintext = b"finite root retained across dirty read-only lag".to_vec();
+        let prepared = prepared_blob(&plaintext);
+        let proof = prepare_blob_proof_with_lifetime(
+            &dirty_store,
+            &mut dirty_services,
+            &prepared,
+            &plaintext,
+            1,
+            Priority::Immediate,
+            Some(1_000),
+        );
+        let plan = proof.blob.transfer_plan(&proof.manifest_bytes).unwrap();
+        dirty_store
+            .stage_verified_blob_source_with_lifetime(
+                &proof.policy,
+                &proof.blob,
+                &proof.sealed,
+                &plan,
+                Some(VerifiedFiniteBlobAdmission::for_test(
+                    proof.blob.envelope_id(),
+                    u64::try_from(proof.sealed.len()).unwrap(),
+                    proof.blob.item_id(),
+                    proof.blob.blob_id(),
+                    proof.blob.priority(),
+                    1_000,
+                    0,
+                    first_checkpoint,
+                )),
+            )
+            .expect("stage dirty-lag finite root");
+        let second_generation = {
+            let write = dirty_store.database.begin_write().unwrap();
+            let continuity = custody::observe_continuity_write(
+                &write,
+                CustodySample {
+                    clock_id: [0xed; 16],
+                    tick_ms: 20,
+                },
+            )
+            .unwrap();
+            assert!(continuity.generation() > first_continuity.generation());
+            write.commit().unwrap();
+            continuity.generation()
+        };
+        set_maintenance_next_class(
+            &dirty_store,
+            lifecycle::BlobMaintenanceClass::ExpiredPublicationsAndPendingSources,
+        );
+        dirty_store
+            .run_blob_maintenance_turn(maintenance_budget(64))
+            .expect("establish dirty fenced pass");
+        {
+            let read = dirty_store.database.begin_read().unwrap();
+            let metadata = read.open_table(pressure::BLOB_PRESSURE_METADATA).unwrap();
+            assert_eq!(
+                metadata
+                    .get("reanchor_target_generation")
+                    .unwrap()
+                    .unwrap()
+                    .value(),
+                second_generation
+            );
+            assert_eq!(metadata.get("reanchor_dirty").unwrap().unwrap().value(), 1);
+        }
+        let current_generation = {
+            let write = dirty_store.database.begin_write().unwrap();
+            let continuity = custody::observe_continuity_write(
+                &write,
+                CustodySample {
+                    clock_id: [0xee; 16],
+                    tick_ms: 30,
+                },
+            )
+            .unwrap();
+            assert!(continuity.generation() > second_generation);
+            write.commit().unwrap();
+            continuity.generation()
+        };
+        {
+            let write = dirty_store.database.begin_write().unwrap();
+            assert!(!pressure::pressure_ready_write(&write).unwrap());
+        }
+        drop(dirty_store);
+        let before_dirty_inspect = blob_current_admission_digest_path(&dirty_root.database);
+        Store::inspect_existing(&dirty_root.database)
+            .expect("read-only inspect accepts a lagging dirty fenced pass");
+        assert_eq!(
+            blob_current_admission_digest_path(&dirty_root.database),
+            before_dirty_inspect
+        );
+        let dirty_store = Store::open_for_mission(&dirty_root.database, dirty_services.authority)
+            .expect("writable open restarts dirty fenced pass");
+        let read = dirty_store.database.begin_read().unwrap();
+        let metadata = read.open_table(pressure::BLOB_PRESSURE_METADATA).unwrap();
+        assert_eq!(
+            metadata
+                .get("reanchor_target_generation")
+                .unwrap()
+                .unwrap()
+                .value(),
+            current_generation
+        );
+        assert_eq!(metadata.get("reanchor_dirty").unwrap().unwrap().value(), 1);
+        drop(metadata);
+        drop(read);
+        let write = dirty_store.database.begin_write().unwrap();
+        assert!(!pressure::pressure_ready_write(&write).unwrap());
+    }
+
+    #[test]
     fn blob_policy_invalidation_retires_live_publication_and_reopens() {
         // Break caught: omitting the policy-invalid retirement branch leaves
         // revoked source bytes readable and the operation bound to live state.
@@ -25160,13 +29340,28 @@ mod tests {
         );
         store
             .run_blob_maintenance_turn_with_sample(
-                maintenance_budget(64),
+                maintenance_budget(128),
                 Some(CustodySample {
                     clock_id: [0xe2; 16],
                     tick_ms: 100,
                 }),
             )
             .expect("retire revoked publication");
+        for _ in 0..3 {
+            if matches!(
+                store.get_blob(stored.transfer_id),
+                Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+            ) {
+                break;
+            }
+            set_maintenance_next_class(
+                &store,
+                lifecycle::BlobMaintenanceClass::ExpiredPublicationsAndPendingSources,
+            );
+            store
+                .run_blob_maintenance_turn(maintenance_budget(128))
+                .expect("retire revoked publication after policy synchronization");
+        }
 
         assert!(matches!(
             store.get_blob(stored.transfer_id),
@@ -25283,13 +29478,13 @@ mod tests {
             clock_id,
             tick_ms: 100,
         };
-        set_maintenance_next_class(
+        drive_maintenance_class_until(
             &store,
             lifecycle::BlobMaintenanceClass::ExpiredPublicationsAndPendingSources,
-        );
-        store
-            .run_blob_maintenance_turn_with_sample(maintenance_budget(64), Some(retired_at))
-            .expect("retire revoked publication");
+            Some(retired_at),
+            |store| retired_publication_age_for_test(store, stored.transfer_id).is_some(),
+        )
+        .expect("retire revoked publication");
 
         let retain_for_ms = 3_888_000_000;
         set_maintenance_next_class(
@@ -25644,13 +29839,17 @@ mod tests {
             clock_id: [0xe7; 16],
             tick_ms: 500,
         };
-        set_maintenance_next_class(
+        let reanchored = drive_maintenance_class_until(
             &store,
             lifecycle::BlobMaintenanceClass::ExpiredRetirementRecords,
-        );
-        let reanchored = store
-            .run_blob_maintenance_turn_with_sample(maintenance_budget(64), Some(changed))
-            .expect("durably reanchor one retirement record");
+            Some(changed),
+            |store| {
+                retired_publication_age_for_test(store, fixture.transfer)
+                    .and_then(lifecycle::RetirementAge::checkpoint_sample)
+                    == Some(changed)
+            },
+        )
+        .expect("durably reanchor one retirement record");
         assert_eq!(
             reanchored.class,
             lifecycle::BlobMaintenanceClass::ExpiredRetirementRecords
@@ -25668,25 +29867,26 @@ mod tests {
 
         let reopened = Store::open_for_mission(&root.database, services.authority)
             .expect("reopen durably reanchored retirement fixture");
-        set_maintenance_next_class(
+        let elapsed = CustodySample {
+            clock_id: changed.clock_id,
+            tick_ms: changed.tick_ms + 3_888_000_000,
+        };
+        drive_maintenance_class_until(
             &reopened,
             lifecycle::BlobMaintenanceClass::ExpiredRetirementRecords,
-        );
-        reopened
-            .run_blob_maintenance_turn_with_sample(
-                maintenance_budget(64),
-                Some(CustodySample {
-                    clock_id: changed.clock_id,
-                    tick_ms: changed.tick_ms + 3_888_000_000,
-                }),
-            )
-            .expect("expire reanchored publication after a full new-domain interval");
+            Some(elapsed),
+            |store| {
+                store
+                    .blob_gc_status(Some(elapsed))
+                    .expect("reanchored expiry progress status")
+                    .retained_publication_records
+                    == 0
+            },
+        )
+        .expect("expire reanchored publication after a full new-domain interval");
         assert_eq!(
             reopened
-                .blob_gc_status(Some(CustodySample {
-                    clock_id: changed.clock_id,
-                    tick_ms: changed.tick_ms + 3_888_000_000,
-                }))
+                .blob_gc_status(Some(elapsed))
                 .expect("post-reanchor expiry status")
                 .retained_publication_records,
             0
@@ -25725,13 +29925,13 @@ mod tests {
             .insert(services.publisher.identity().as_slice(), encoded.as_slice())
             .expect("revoke unknown-clock publisher");
         write.commit().expect("commit unknown-clock revocation");
-        set_maintenance_next_class(
+        drive_maintenance_class_until(
             &store,
             lifecycle::BlobMaintenanceClass::ExpiredPublicationsAndPendingSources,
-        );
-        store
-            .run_blob_maintenance_turn_with_sample(maintenance_budget(64), None)
-            .expect("retire publication without a clock sample");
+            None,
+            |store| retired_publication_age_for_test(store, stored.transfer_id).is_some(),
+        )
+        .expect("retire publication without a clock sample");
         let write = store
             .database
             .begin_write()
@@ -25764,15 +29964,20 @@ mod tests {
             clock_id: [0xe9; 16],
             tick_ms: 700,
         };
-        for _ in 0..2 {
-            set_maintenance_next_class(
-                &store,
-                lifecycle::BlobMaintenanceClass::ExpiredRetirementRecords,
-            );
-            store
-                .run_blob_maintenance_turn_with_sample(maintenance_budget(64), Some(anchor))
-                .expect("anchor one unknown-clock retirement record");
-        }
+        drive_maintenance_class_until(
+            &store,
+            lifecycle::BlobMaintenanceClass::ExpiredRetirementRecords,
+            Some(anchor),
+            |store| {
+                retired_publication_age_for_test(store, stored.transfer_id)
+                    .and_then(lifecycle::RetirementAge::checkpoint_sample)
+                    == Some(anchor)
+                    && retired_operation_age_for_test(store, &operation)
+                        .and_then(lifecycle::RetirementAge::checkpoint_sample)
+                        == Some(anchor)
+            },
+        )
+        .expect("anchor unknown-clock retirement records");
         assert_eq!(
             store
                 .blob_gc_status(Some(anchor))
@@ -25789,15 +29994,18 @@ mod tests {
             clock_id: anchor.clock_id,
             tick_ms: anchor.tick_ms + 3_888_000_000,
         };
-        for _ in 0..2 {
-            set_maintenance_next_class(
-                &store,
-                lifecycle::BlobMaintenanceClass::ExpiredRetirementRecords,
-            );
-            store
-                .run_blob_maintenance_turn_with_sample(maintenance_budget(64), Some(elapsed))
-                .expect("expire one anchored retirement record");
-        }
+        drive_maintenance_class_until(
+            &store,
+            lifecycle::BlobMaintenanceClass::ExpiredRetirementRecords,
+            Some(elapsed),
+            |store| {
+                let status = store
+                    .blob_gc_status(Some(elapsed))
+                    .expect("unknown-clock expiry progress status");
+                status.retained_publication_records == 0 && status.retained_operation_records == 0
+            },
+        )
+        .expect("expire anchored retirement records");
         let status = store
             .blob_gc_status(Some(elapsed))
             .expect("expired unknown-clock status");
@@ -25850,13 +30058,41 @@ mod tests {
             tick_ms: 100,
         };
         let retention_deadline = retired_at.tick_ms + 3_888_000_000;
-        set_maintenance_next_class(
+        drive_maintenance_class_until(
             &store,
             lifecycle::BlobMaintenanceClass::ExpiredPublicationsAndPendingSources,
+            Some(retired_at),
+            |store| retired_publication_age_for_test(store, first.transfer_id).is_some(),
+        )
+        .expect("retire reusable publication");
+        let retired_policy = store
+            .control_policy_snapshot()
+            .expect("retired operation policy");
+        assert_eq!(
+            store
+                .blob_operation_retry_with_policy(
+                    &retired_policy,
+                    &BlobOperationRequest::new(&operation, &intent),
+                )
+                .expect("typed retired operation retry"),
+            BlobOperationRetry::Retired(lifecycle::RetirementReason::Invalidated)
         );
-        store
-            .run_blob_maintenance_turn_with_sample(maintenance_budget(64), Some(retired_at))
-            .expect("retire reusable publication");
+        let lifetime_conflict = BlobPublicationIntent::new_with_ttl(
+            intent.publisher(),
+            intent.topic().clone(),
+            intent.scope().clone(),
+            intent.priority(),
+            intent.blob_id(),
+            Some(1),
+        )
+        .expect("lifetime-conflicting intent");
+        assert!(matches!(
+            store.blob_operation_retry_with_policy(
+                &retired_policy,
+                &BlobOperationRequest::new(&operation, &lifetime_conflict),
+            ),
+            Err(StoreError::Blob(BlobStoreError::OperationConflict))
+        ));
         set_maintenance_next_class(
             &store,
             lifecycle::BlobMaintenanceClass::ExpiredRetirementRecords,
@@ -26026,19 +30262,16 @@ mod tests {
             .insert(services.publisher.identity().as_slice(), encoded.as_slice())
             .expect("revoke delivery publisher");
         write.commit().expect("commit delivery revocation");
-        set_maintenance_next_class(
+        drive_maintenance_class_until(
             &store,
             lifecycle::BlobMaintenanceClass::ExpiredPublicationsAndPendingSources,
-        );
-        store
-            .run_blob_maintenance_turn_with_sample(
-                maintenance_budget(64),
-                Some(CustodySample {
-                    clock_id: [0xe4; 16],
-                    tick_ms: 100,
-                }),
-            )
-            .expect("retire delivered publication");
+            Some(CustodySample {
+                clock_id: [0xe4; 16],
+                tick_ms: 100,
+            }),
+            |store| retired_publication_age_for_test(store, stored.transfer_id).is_some(),
+        )
+        .expect("retire delivered publication");
 
         let poll = store
             .prepare_blob_subscription_poll_with_policy(&policy, pending_subscription.id, 1, 8)
@@ -26100,6 +30333,490 @@ mod tests {
                 .expect("completed acknowledgement survives reopen"),
             BlobDeliveryAck::AlreadyAcknowledged
         );
+    }
+
+    #[test]
+    fn blob_retirement_delivery_v3_poll_ack_and_expiry_matrix() {
+        // Production mutations caught: retirement must not reuse content-token
+        // dispatch, expose attempt-1 seed state, acknowledge a future/cross-
+        // binding token, or retain notice/receipt authority after evidence GC.
+        let root = BlobTestRoot::new("retirement-delivery-v3-matrix");
+        let mut services = blob_services(0xc3);
+        let plaintext = b"retirement notice has no content authority".to_vec();
+        let prepared = prepared_blob(&plaintext);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("retirement-v3 store");
+        let stored = publish_blob(
+            &store,
+            &mut services,
+            &prepared,
+            &plaintext,
+            1,
+            b"retirement-v3-operation",
+        )
+        .0;
+        let policy = store
+            .control_policy_snapshot()
+            .expect("retirement-v3 policy");
+        let subscription = store
+            .create_blob_subscription_with_policy(
+                &policy,
+                &BlobSubscriptionKey::new(b"retirement-v3-subscription".to_vec())
+                    .expect("retirement-v3 key"),
+                BlobSubscriptionSpec {
+                    topic: blob_topic(),
+                    scope: blob_scope(),
+                    include_descendant_scopes: false,
+                },
+            )
+            .expect("retirement-v3 subscription");
+        let content_plan = store
+            .prepare_blob_subscription_poll_with_policy(&policy, subscription.id, 1, 8)
+            .expect("retirement-v3 content plan");
+        let content = store
+            .commit_blob_subscription_poll_with_policy(
+                &policy,
+                &content_plan,
+                &all_blob_subscription_candidates_deliverable(&content_plan),
+            )
+            .expect("retirement-v3 content delivery")
+            .deliveries
+            .remove(0);
+        let removable_subscription = store
+            .create_blob_subscription_with_policy(
+                &policy,
+                &BlobSubscriptionKey::new(b"retirement-v3-removable".to_vec())
+                    .expect("removable subscription key"),
+                BlobSubscriptionSpec {
+                    topic: blob_topic(),
+                    scope: blob_scope(),
+                    include_descendant_scopes: false,
+                },
+            )
+            .expect("removable retirement subscription");
+        let removable_plan = store
+            .prepare_blob_subscription_poll_with_policy(&policy, removable_subscription.id, 1, 8)
+            .expect("removable content plan");
+        store
+            .commit_blob_subscription_poll_with_policy(
+                &policy,
+                &removable_plan,
+                &all_blob_subscription_candidates_deliverable(&removable_plan),
+            )
+            .expect("removable content delivery");
+
+        let write = store
+            .database
+            .begin_write()
+            .expect("retirement-v3 revocation");
+        let encoded =
+            encode_revocation_index(services.authority, 1, ControlTransferId::new([0xc3; 32]));
+        write
+            .open_table(CONTROL_REVOCATIONS)
+            .expect("retirement-v3 revocations")
+            .insert(services.publisher.identity().as_slice(), encoded.as_slice())
+            .expect("revoke retirement-v3 publisher");
+        write.commit().expect("commit retirement-v3 revocation");
+        let retired_at = CustodySample {
+            clock_id: [0xc4; 16],
+            tick_ms: 100,
+        };
+        {
+            let write = store
+                .database
+                .begin_write()
+                .expect("corrupt retirement subtype accounting");
+            write
+                .open_table(METADATA)
+                .expect("retirement subtype metadata")
+                .insert(BLOB_RETIREMENT_DELIVERY_COUNT, 1)
+                .expect("corrupt retirement delivery count");
+            write.commit().expect("commit subtype corruption");
+        }
+        assert!(matches!(
+            drive_maintenance_class_until(
+                &store,
+                lifecycle::BlobMaintenanceClass::ExpiredPublicationsAndPendingSources,
+                Some(retired_at),
+                |_| false,
+            ),
+            Err(StoreError::AccountingMismatch {
+                field: BLOB_RETIREMENT_DELIVERY_COUNT,
+                durable: 1,
+                reconstructed: 0,
+            })
+        ));
+        assert!(
+            store
+                .get_blob(stored.transfer_id)
+                .expect("failed retirement lookup")
+                .is_some()
+        );
+        {
+            let write = store
+                .database
+                .begin_write()
+                .expect("repair test-only retirement subtype accounting");
+            write
+                .open_table(METADATA)
+                .expect("retirement subtype metadata")
+                .insert(BLOB_RETIREMENT_DELIVERY_COUNT, 0)
+                .expect("restore retirement delivery count");
+            write.commit().expect("commit subtype restoration");
+        }
+        set_maintenance_next_class(
+            &store,
+            lifecycle::BlobMaintenanceClass::ExpiredPublicationsAndPendingSources,
+        );
+        store
+            .run_blob_maintenance_turn_with_sample(maintenance_budget(128), Some(retired_at))
+            .expect("retire retirement-v3 publication");
+        let retirement_generation = {
+            let read = store
+                .database
+                .begin_read()
+                .expect("retirement generation read");
+            blob_subscription_retirement_generation_read(&read, stored.transfer_id)
+                .expect("retirement generation")
+                .expect("retired publication")
+        };
+        drop(store);
+
+        // Recreate the accepted embedded-v2 predecessor exactly. Read-only
+        // inspection must stay byte-stable; the next writable open migrates
+        // the seed attempt, order row, and inverse owner atomically to v3.
+        {
+            let database = Database::open(&root.database).expect("retirement predecessor database");
+            let write = database
+                .begin_write()
+                .expect("retirement predecessor write");
+            for table in [
+                BLOB_RETIREMENT_DELIVERIES,
+                BLOB_RETIREMENT_DELIVERY_ORDER,
+                BLOB_RETIREMENT_ACKNOWLEDGEMENTS,
+                BLOB_RETIREMENT_DELIVERY_OWNERS,
+            ] {
+                write
+                    .delete_table(table)
+                    .expect("delete v3 retirement table");
+            }
+            let mut retired = Vec::with_capacity(41);
+            retired.push(2);
+            retired.extend_from_slice(stored.semantic_id.as_bytes());
+            retired.extend_from_slice(&retirement_generation.to_be_bytes());
+            let mut cursor = vec![1];
+            cursor.extend_from_slice(&stored.acceptance_marker.to_be_bytes());
+            cursor.extend_from_slice(&1u64.to_be_bytes());
+            cursor.extend_from_slice(&1u64.to_be_bytes());
+            cursor.extend_from_slice(&0u64.to_be_bytes());
+            cursor.extend_from_slice(&0u64.to_be_bytes());
+            for subscription_id in [subscription.id, removable_subscription.id] {
+                let mut pending_key = [0u8; 40];
+                pending_key[..32].copy_from_slice(subscription_id.as_bytes());
+                pending_key[32..].copy_from_slice(&stored.acceptance_marker.to_be_bytes());
+                write
+                    .open_table(BLOB_SUBSCRIPTION_PENDING)
+                    .expect("predecessor pending")
+                    .insert(pending_key.as_slice(), retired.as_slice())
+                    .expect("insert predecessor retired delivery");
+                let mut cursor_key = [0u8; 64];
+                cursor_key[..32].copy_from_slice(subscription_id.as_bytes());
+                cursor_key[32..].copy_from_slice(stored.semantic_id.as_bytes());
+                write
+                    .open_table(BLOB_DELIVERY_CURSORS)
+                    .expect("predecessor cursors")
+                    .insert(cursor_key.as_slice(), cursor.as_slice())
+                    .expect("insert predecessor cursor");
+                lifecycle::insert_delivery_owner(&write, stored.transfer_id, &pending_key)
+                    .expect("insert predecessor delivery owner");
+            }
+            write
+                .open_table(CONTROL_REVOCATIONS)
+                .expect("predecessor revocations")
+                .remove(services.publisher.identity().as_slice())
+                .expect("remove synthetic revocation before strict inspection");
+            {
+                let mut metadata = write.open_table(METADATA).expect("predecessor metadata");
+                metadata
+                    .insert(BLOB_DELIVERY_CURSOR_COUNT, 2)
+                    .expect("restore predecessor cursor count");
+                for field in [
+                    BLOB_RETIREMENT_DELIVERY_COUNT,
+                    BLOB_RETIREMENT_DELIVERY_ORDER_COUNT,
+                    BLOB_RETIREMENT_ACKNOWLEDGEMENT_COUNT,
+                    BLOB_RETIREMENT_DELIVERY_OWNER_COUNT,
+                ] {
+                    metadata
+                        .remove(field)
+                        .expect("remove v3 retirement counter");
+                }
+            }
+            write.commit().expect("commit retirement predecessor");
+        }
+        let predecessor_digest = blob_database_digest(&root.database);
+        let inspected = Store::inspect_existing(&root.database)
+            .expect("read-only inspect embedded-v2 retirement predecessor");
+        assert_eq!(inspected.blob_subscription_stats.pending_deliveries, 2);
+        assert_eq!(blob_database_digest(&root.database), predecessor_digest);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("atomically migrate embedded-v2 retirement delivery");
+        assert_eq!(
+            store
+                .blob_subscription_stats()
+                .expect("audited migrated retirement stats")
+                .pending_deliveries,
+            2
+        );
+        let mut content_key = [0u8; 64];
+        content_key[..32].copy_from_slice(subscription.id.as_bytes());
+        content_key[32..].copy_from_slice(stored.semantic_id.as_bytes());
+        let mut content_receipt = vec![1];
+        content_receipt.extend_from_slice(&stored.acceptance_marker.to_be_bytes());
+        content_receipt.extend_from_slice(&1u64.to_be_bytes());
+        content_receipt.extend_from_slice(&1u64.to_be_bytes());
+        let mut content_cursor = vec![1];
+        content_cursor.extend_from_slice(&stored.acceptance_marker.to_be_bytes());
+        content_cursor.extend_from_slice(&1u64.to_be_bytes());
+        content_cursor.extend_from_slice(&1u64.to_be_bytes());
+        content_cursor.extend_from_slice(&1u64.to_be_bytes());
+        content_cursor.extend_from_slice(&1u64.to_be_bytes());
+        {
+            let write = store
+                .database
+                .begin_write()
+                .expect("cross-family corruption write");
+            write
+                .open_table(BLOB_DELIVERY_ACKNOWLEDGEMENTS)
+                .expect("content acknowledgements")
+                .insert(content_key.as_slice(), content_receipt.as_slice())
+                .expect("insert content receipt beside v3 primary");
+            write
+                .open_table(BLOB_DELIVERY_CURSORS)
+                .expect("content cursors")
+                .insert(content_key.as_slice(), content_cursor.as_slice())
+                .expect("insert content cursor beside v3 primary");
+            let mut metadata = write.open_table(METADATA).expect("cross-family metadata");
+            metadata
+                .insert(BLOB_ACKNOWLEDGEMENT_COUNT, 1)
+                .expect("account content receipt");
+            metadata
+                .insert(BLOB_DELIVERY_CURSOR_COUNT, 1)
+                .expect("account content cursor");
+            drop(metadata);
+            write.commit().expect("commit cross-family corruption");
+        }
+        assert!(matches!(
+            store.blob_subscription_stats(),
+            Err(StoreError::BlobInvariant(
+                "Blob delivery identity exists in both content and retirement ledgers"
+            ))
+        ));
+        {
+            let write = store
+                .database
+                .begin_write()
+                .expect("write-audit cross-family corruption");
+            assert!(matches!(
+                crate::blob_subscription::audit_blob_subscription_tables(&write),
+                Err(StoreError::BlobInvariant(
+                    "Blob delivery identity exists in both content and retirement ledgers"
+                ))
+            ));
+        }
+        {
+            let write = store
+                .database
+                .begin_write()
+                .expect("repair cross-family test corruption");
+            write
+                .open_table(BLOB_DELIVERY_ACKNOWLEDGEMENTS)
+                .expect("content acknowledgements")
+                .remove(content_key.as_slice())
+                .expect("remove contradictory content receipt");
+            write
+                .open_table(BLOB_DELIVERY_CURSORS)
+                .expect("content cursors")
+                .remove(content_key.as_slice())
+                .expect("remove contradictory content cursor");
+            let mut metadata = write.open_table(METADATA).expect("cross-family metadata");
+            metadata
+                .insert(BLOB_ACKNOWLEDGEMENT_COUNT, 0)
+                .expect("restore content receipt count");
+            metadata
+                .insert(BLOB_DELIVERY_CURSOR_COUNT, 0)
+                .expect("restore content cursor count");
+            drop(metadata);
+            write.commit().expect("commit cross-family repair");
+        }
+        assert!(
+            store
+                .remove_blob_subscription_with_policy(&policy, removable_subscription.id)
+                .expect("remove subscription with retirement notice")
+                .removed
+        );
+        assert_eq!(
+            store
+                .blob_subscription_stats()
+                .expect("audited post-removal retirement stats")
+                .pending_deliveries,
+            1
+        );
+        assert!(matches!(
+            store.acknowledge_blob_delivery_with_policy(
+                &policy,
+                subscription.id,
+                stored.semantic_id,
+                content.token,
+            ),
+            Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+        ));
+
+        let plan = store
+            .prepare_blob_retirement_poll_with_policy(&policy, subscription.id, 1)
+            .expect("prepare first retirement notice");
+        let first = store
+            .commit_blob_retirement_poll_with_policy(&policy, &plan)
+            .expect("commit first retirement notice")
+            .deliveries
+            .remove(0);
+        assert_eq!(first.semantic_id, stored.semantic_id);
+        assert_eq!(first.acceptance_marker, stored.acceptance_marker);
+        assert_eq!(first.reason, lifecycle::RetirementReason::Invalidated);
+        assert_eq!(first.attempt, 2);
+        assert_eq!(first.token.as_bytes()[0], 2);
+        assert!(matches!(
+            store.acknowledge_blob_delivery_with_policy(
+                &policy,
+                subscription.id,
+                stored.semantic_id,
+                first.token,
+            ),
+            Err(StoreError::InvalidBlobDeliveryToken)
+        ));
+        assert!(matches!(
+            store.acknowledge_blob_retirement_with_policy(
+                &policy,
+                subscription.id,
+                stored.semantic_id,
+                content.token,
+            ),
+            Err(StoreError::InvalidBlobDeliveryToken)
+        ));
+
+        let before_invalid = blob_complete_logical_digest(&store);
+        let seed = crate::blob_subscription::blob_retirement_delivery_token(
+            subscription.id,
+            stored.semantic_id,
+            first.subscription_incarnation,
+            first.retirement_generation,
+            1,
+        );
+        assert!(
+            store
+                .acknowledge_blob_retirement_with_policy(
+                    &policy,
+                    subscription.id,
+                    stored.semantic_id,
+                    seed,
+                )
+                .is_err()
+        );
+        assert_eq!(blob_complete_logical_digest(&store), before_invalid);
+
+        let second_plan = store
+            .prepare_blob_retirement_poll_with_policy(&policy, subscription.id, 1)
+            .expect("prepare second retirement notice");
+        let second = store
+            .commit_blob_retirement_poll_with_policy(&policy, &second_plan)
+            .expect("commit second retirement notice")
+            .deliveries
+            .remove(0);
+        assert_eq!(second.attempt, 3);
+        assert_eq!(second.retirement_generation, first.retirement_generation);
+        assert_eq!(
+            store
+                .acknowledge_blob_retirement_with_policy(
+                    &policy,
+                    subscription.id,
+                    stored.semantic_id,
+                    first.token,
+                )
+                .expect("acknowledge earlier issued retirement attempt"),
+            BlobDeliveryAck::Acknowledged
+        );
+        assert_eq!(
+            store
+                .acknowledge_blob_retirement_with_policy(
+                    &policy,
+                    subscription.id,
+                    stored.semantic_id,
+                    first.token,
+                )
+                .expect("retry issued retirement attempt"),
+            BlobDeliveryAck::AlreadyAcknowledged
+        );
+        let future = crate::blob_subscription::blob_retirement_delivery_token(
+            subscription.id,
+            stored.semantic_id,
+            first.subscription_incarnation,
+            first.retirement_generation,
+            4,
+        );
+        let before_future = blob_complete_logical_digest(&store);
+        assert!(
+            store
+                .acknowledge_blob_retirement_with_policy(
+                    &policy,
+                    subscription.id,
+                    stored.semantic_id,
+                    future,
+                )
+                .is_err()
+        );
+        assert_eq!(blob_complete_logical_digest(&store), before_future);
+        assert!(
+            store
+                .acknowledge_blob_retirement_with_policy(
+                    &policy,
+                    BlobSubscriptionId::from_bytes([0xff; 32]),
+                    stored.semantic_id,
+                    first.token,
+                )
+                .is_err()
+        );
+
+        set_maintenance_next_class(
+            &store,
+            lifecycle::BlobMaintenanceClass::ExpiredRetirementRecords,
+        );
+        store
+            .run_blob_maintenance_turn_with_sample(
+                maintenance_budget(128),
+                Some(CustodySample {
+                    clock_id: retired_at.clock_id,
+                    tick_ms: retired_at.tick_ms + lifecycle::DEFAULT_BLOB_RETIREMENT_RETENTION_MS,
+                }),
+            )
+            .expect("expire retirement-v3 evidence");
+        let empty_plan = store
+            .prepare_blob_retirement_poll_with_policy(&policy, subscription.id, 1)
+            .expect("prepare after retirement evidence expiry");
+        assert!(
+            store
+                .commit_blob_retirement_poll_with_policy(&policy, &empty_plan)
+                .expect("commit empty retirement poll")
+                .deliveries
+                .is_empty()
+        );
+        assert!(matches!(
+            store.acknowledge_blob_retirement_with_policy(
+                &policy,
+                subscription.id,
+                stored.semantic_id,
+                first.token,
+            ),
+            Err(StoreError::BlobDeliveryNotFound)
+        ));
     }
 
     #[test]
@@ -26201,17 +30918,18 @@ mod tests {
             clock_id,
             tick_ms: 100,
         };
-        set_maintenance_next_class(
+        drive_maintenance_class_until(
             &store,
             lifecycle::BlobMaintenanceClass::ExpiredPublicationsAndPendingSources,
-        );
-        store
-            .run_blob_maintenance_turn_with_sample(maintenance_budget(64), Some(retired_at))
-            .expect("retire delivery publication");
+            Some(retired_at),
+            |store| retired_publication_age_for_test(store, stored.transfer_id).is_some(),
+        )
+        .expect("retire delivery publication");
         // This fixture has one pending delivery plus its inverse owner row,
         // one acknowledgement, and one cursor per subscription. Together
         // with the compact publication/index/deadline rows, a short budget
         // must reject the entire expiry unit before the first removal.
+        let before_short_expiry = blob_complete_logical_digest(&store);
         let write = store
             .database
             .begin_write()
@@ -26244,12 +30962,26 @@ mod tests {
         assert_eq!(
             write
                 .open_table(crate::blob_subscription::BLOB_SUBSCRIPTION_PENDING)
-                .expect("pending deliveries after short budget")
+                .expect("content deliveries after short budget")
                 .len()
-                .expect("pending delivery count after short budget"),
+                .expect("content delivery count after short budget"),
+            0,
+            "publication retirement already converted content delivery authority"
+        );
+        assert_eq!(
+            write
+                .open_table(crate::blob_subscription::BLOB_RETIREMENT_DELIVERIES)
+                .expect("retirement deliveries after short budget")
+                .len()
+                .expect("retirement delivery count after short budget"),
             1
         );
         drop(write);
+        assert_eq!(
+            blob_complete_logical_digest(&store),
+            before_short_expiry,
+            "a rejected delivery-ledger expiry unit must be byte-identical"
+        );
         set_maintenance_next_class(
             &store,
             lifecycle::BlobMaintenanceClass::ExpiredRetirementRecords,
@@ -26639,6 +31371,12 @@ mod tests {
             .expect("commit retired delivery contradiction");
 
         assert!(matches!(
+            store.blob_subscription_stats(),
+            Err(StoreError::BlobInvariant(
+                "current Blob subscription ledger contains predecessor retirement state"
+            ))
+        ));
+        assert!(matches!(
             store.acknowledge_blob_delivery_with_policy(
                 &policy,
                 subscription.id,
@@ -26877,9 +31615,32 @@ mod tests {
                 .expect("prime maximum-fanout custody checkpoint");
             deletion::checkpoint_blob_deletion_ages_write(&write, retired_at, u64::MAX, u64::MAX)
                 .expect("prime maximum-fanout custody checkpoint");
+            custody::observe_continuity_write(&write, retired_at)
+                .expect("prime maximum-fanout continuity");
+            synchronize_blob_policy_generation_write(&write)
+                .expect("prime maximum-fanout policy generation");
             write
                 .commit()
                 .expect("commit maximum-fanout custody checkpoint");
+        }
+        loop {
+            let write = store.database.begin_write().unwrap();
+            if pressure::pressure_ready_write(&write).unwrap() {
+                break;
+            }
+            let progress = apply_one_blob_policy_reanchor_write(
+                &write,
+                store.blob_lifecycle_limits,
+                store.mission_authority,
+                store.blob_depot_owner_binding,
+                maintenance_budget(u64::MAX),
+                Some(retired_at),
+                lifecycle::BlobMaintenanceClass::ExpiredPublicationsAndPendingSources,
+            )
+            .unwrap()
+            .expect("prime maximum-fanout reanchor turn");
+            assert!(progress.2);
+            write.commit().unwrap();
         }
         let (corrupt_delivery_key, corrupt_delivery) = {
             let write = store
@@ -26906,13 +31667,12 @@ mod tests {
         };
         let before_small = blob_complete_logical_digest(&store);
         let small = store
-            .run_blob_maintenance_turn_with_sample(
+            .run_blob_maintenance_turn(
                 lifecycle::BlobMaintenanceBudget::new(32, 1, 2 * 1024 * 1024)
                     .expect("materially small delivery budget"),
-                Some(retired_at),
             )
             .expect("small retirement does not reach late delivery corruption");
-        assert_eq!(small.rows_examined, 32);
+        assert!((1..=32).contains(&small.rows_examined));
         assert!(small.bytes_examined <= 2 * 1024 * 1024);
         assert_eq!(blob_complete_logical_digest(&store), before_small);
         {
@@ -26949,7 +31709,16 @@ mod tests {
                     .expect("unbounded test charge"),
                 rows: page.rows_examined,
                 bytes: page.bytes,
+                identities: page.identities.clone(),
             };
+            assert!(
+                lifecycle::charge_maintenance_cursor_write(
+                    &write,
+                    lifecycle::BlobMaintenanceClass::ExpiredPublicationsAndPendingSources,
+                    &mut charge,
+                )
+                .expect("charge maximum-fanout cursor")
+            );
             assert!(
                 invalidated_blob_publication_retirement_charge_write(
                     &write,
@@ -26964,19 +31733,18 @@ mod tests {
         };
         assert_eq!(
             exact_retirement_rows,
-            12 + 1 + 10 + 2 + 4 + 2 * crate::blob_subscription::MAX_BLOB_SUBSCRIPTIONS,
-            "one-operation maximum-fanout retirement charges the source bytes and every other unique durable row"
+            12 + 8 + 1 + 10 + 2 + 4 + 6 * crate::blob_subscription::MAX_BLOB_SUBSCRIPTIONS,
+            "one-operation maximum-fanout retirement charges source, lifecycle, pressure, and delivery authority"
         );
         let before_short = blob_complete_logical_digest(&store);
         let short = store
-            .run_blob_maintenance_turn_with_sample(
+            .run_blob_maintenance_turn(
                 lifecycle::BlobMaintenanceBudget::new(
                     exact_retirement_rows - 1,
                     1,
                     exact_retirement_bytes,
                 )
                 .expect("one-row-short retirement budget"),
-                Some(retired_at),
             )
             .expect("one-row-short retirement is ordinary bounded progress");
         assert!(short.rows_examined < exact_retirement_rows);
@@ -26986,14 +31754,13 @@ mod tests {
             "one-row-short budget must not mutate any retirement authority"
         );
         let short = store
-            .run_blob_maintenance_turn_with_sample(
+            .run_blob_maintenance_turn(
                 lifecycle::BlobMaintenanceBudget::new(
                     exact_retirement_rows,
                     1,
                     exact_retirement_bytes - 1,
                 )
                 .expect("one-byte-short retirement budget"),
-                Some(retired_at),
             )
             .expect("one-byte-short retirement is ordinary bounded progress");
         assert!(short.bytes_examined < exact_retirement_bytes);
@@ -27008,14 +31775,13 @@ mod tests {
             lifecycle::BlobMaintenanceClass::ExpiredPublicationsAndPendingSources,
         );
         let retired = store
-            .run_blob_maintenance_turn_with_sample(
+            .run_blob_maintenance_turn(
                 lifecycle::BlobMaintenanceBudget::new(
                     exact_retirement_rows,
                     1,
                     exact_retirement_bytes,
                 )
                 .expect("exact maximum-fanout retirement budget"),
-                Some(retired_at),
             )
             .expect("atomic maximum-fanout retirement");
         assert_eq!(retired.rows_examined, exact_retirement_rows);
@@ -27026,8 +31792,18 @@ mod tests {
             )
             .expect("retired fanout owners")
             .len(),
-            usize::try_from(crate::blob_subscription::MAX_BLOB_SUBSCRIPTIONS)
-                .expect("bounded fanout fits usize")
+            0
+        );
+        assert_eq!(
+            store
+                .database
+                .begin_read()
+                .expect("retirement fanout owner read")
+                .open_table(BLOB_RETIREMENT_DELIVERY_OWNERS)
+                .expect("retirement fanout owners")
+                .len()
+                .expect("retirement fanout owner count"),
+            crate::blob_subscription::MAX_BLOB_SUBSCRIPTIONS
         );
         let write = store
             .database
@@ -27301,9 +32077,32 @@ mod tests {
                 .expect("prime maximum-operation custody checkpoint");
             deletion::checkpoint_blob_deletion_ages_write(&write, retired_at, u64::MAX, u64::MAX)
                 .expect("prime maximum-operation custody checkpoint");
+            custody::observe_continuity_write(&write, retired_at)
+                .expect("prime maximum-operation continuity");
+            synchronize_blob_policy_generation_write(&write)
+                .expect("prime maximum-operation policy generation");
             write
                 .commit()
                 .expect("commit maximum-operation custody checkpoint");
+        }
+        loop {
+            let write = store.database.begin_write().unwrap();
+            if pressure::pressure_ready_write(&write).unwrap() {
+                break;
+            }
+            let progress = apply_one_blob_policy_reanchor_write(
+                &write,
+                store.blob_lifecycle_limits,
+                store.mission_authority,
+                store.blob_depot_owner_binding,
+                maintenance_budget(u64::MAX),
+                Some(retired_at),
+                lifecycle::BlobMaintenanceClass::ExpiredPublicationsAndPendingSources,
+            )
+            .unwrap()
+            .expect("prime maximum-operation reanchor turn");
+            assert!(progress.2);
+            write.commit().unwrap();
         }
         set_maintenance_next_class(
             &store,
@@ -27337,7 +32136,7 @@ mod tests {
                 .expect("commit missing maximum-operation acceptance order");
             value
         };
-        let discovery_bytes = {
+        let discovery = {
             let write = store
                 .database
                 .begin_write()
@@ -27354,7 +32153,120 @@ mod tests {
                 1,
             )
             .expect("maximum-operation discovery charge page")
-            .bytes
+        };
+        let content_key = blob_content_key(
+            &stored.header.topic,
+            &stored.header.scope,
+            stored.blob_id,
+            stored.semantic_id,
+        )
+        .expect("maximum-operation content key");
+        let dot_key = accepted_dot_key(stored.header.stamp.dot);
+        let frontier_key = causal_frontier_key(
+            &stored.header.topic,
+            &stored.header.scope,
+            stored.header.stamp.dot.publisher,
+        )
+        .expect("maximum-operation frontier key");
+        let expected_discovery_identities = [
+            MaintenanceRowIdentity::new(BLOB_PUBLICATIONS.name(), stored.transfer_id.as_bytes()),
+            MaintenanceRowIdentity::new(BLOB_IMPORTS.name(), stored.variant_id.as_bytes()),
+            MaintenanceRowIdentity::new(
+                lifecycle::BLOB_LINEAGE_FENCES.name(),
+                stored.variant_id.as_bytes(),
+            ),
+            MaintenanceRowIdentity::new(
+                lifecycle::BLOB_VARIANT_REFERENCES.name(),
+                variant_reference_key(
+                    stored.variant_id,
+                    lifecycle::VariantReferenceOwner::Publication,
+                    stored.transfer_id,
+                ),
+            ),
+            MaintenanceRowIdentity::new(BLOB_BYTES.name(), stored.transfer_id.as_bytes()),
+            MaintenanceRowIdentity::new(
+                BLOB_ACCEPTANCE_MARKERS.name(),
+                stored.transfer_id.as_bytes(),
+            ),
+            MaintenanceRowIdentity::new(BLOB_SEMANTIC_ITEMS.name(), stored.semantic_id.as_bytes()),
+            MaintenanceRowIdentity::new(BLOB_CONTENT_INDEX.name(), content_key),
+            MaintenanceRowIdentity::new(lifecycle::BLOB_REPLAY_FENCES.name(), dot_key),
+            MaintenanceRowIdentity::new(ACCEPTED_DOTS.name(), dot_key),
+            MaintenanceRowIdentity::new(
+                PUBLISHER_HIGH_WATER.name(),
+                stored.header.stamp.dot.publisher.as_slice(),
+            ),
+            MaintenanceRowIdentity::new(CAUSAL_FRONTIER.name(), frontier_key),
+        ]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+        assert_eq!(discovery.rows_examined, 12);
+        assert_eq!(
+            discovery
+                .identities
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            expected_discovery_identities,
+            "the acceptance-order boundary starts from the independently enumerated publication page"
+        );
+        let discovery_rows = discovery.rows_examined;
+        let discovery_bytes = discovery.bytes;
+        let discovery_identities = discovery.identities;
+        let acceptance_order_identity = MaintenanceRowIdentity::new(
+            crate::blob_subscription::BLOB_ACCEPTANCE_ORDER.name(),
+            acceptance_marker.to_be_bytes(),
+        );
+        let exact_acceptance_rows = {
+            let write = store
+                .database
+                .begin_write()
+                .expect("enumerate acceptance-order preflight identities");
+            let mut charge = MaintenanceCharge {
+                budget: lifecycle::BlobMaintenanceBudget::new(u64::MAX, 1, u64::MAX)
+                    .expect("unbounded test-only identity enumeration"),
+                rows: discovery_rows,
+                bytes: discovery_bytes,
+                identities: discovery_identities.clone(),
+            };
+            assert!(matches!(
+                invalidated_blob_publication_retirement_charge_write(
+                    &write,
+                    store.blob_lifecycle_limits,
+                    stored.transfer_id,
+                    Some(retired_at),
+                    &mut charge,
+                ),
+                Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
+                    "Blob retirement candidate is missing its acceptance-order row"
+                )))
+            ));
+            let added = charge
+                .identities
+                .keys()
+                .filter(|identity| !discovery_identities.contains_key(*identity))
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                added
+                    .iter()
+                    .map(|identity| identity.table.as_str())
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from([
+                    "aster.blob-chunks.v1",
+                    "aster.blob-lifecycle-metadata.v1",
+                    "aster.blob-pressure-content-publications.v1",
+                    "aster.blob-pressure-publication-roots.v1",
+                    "aster.blob-pressure-publications.v1",
+                    "aster.blob-pressure-variant-summaries.v1",
+                    "aster.blob-pressure-variants.v1",
+                    "aster.semantic-blob-acceptance-order.v1",
+                ]),
+                "the explicit pre-acceptance plan stages each contribute one unique row"
+            );
+            assert_eq!(added.len(), 8);
+            assert!(added.contains(&acceptance_order_identity));
+            charge.rows
         };
         let before_acceptance_short = blob_complete_logical_digest(&store);
         {
@@ -27363,10 +32275,15 @@ mod tests {
                 .begin_write()
                 .expect("byte-short acceptance-order charge write");
             let mut charge = MaintenanceCharge {
-                budget: lifecycle::BlobMaintenanceBudget::new(13, 1, discovery_bytes)
-                    .expect("byte-short acceptance-order budget"),
-                rows: 12,
+                budget: lifecycle::BlobMaintenanceBudget::new(
+                    exact_acceptance_rows - 1,
+                    1,
+                    u64::MAX,
+                )
+                .expect("byte-short acceptance-order budget"),
+                rows: discovery_rows,
                 bytes: discovery_bytes,
+                identities: discovery_identities.clone(),
             };
             assert!(
                 !invalidated_blob_publication_retirement_charge_write(
@@ -27378,8 +32295,8 @@ mod tests {
                 )
                 .expect("byte-short budget must not inspect acceptance order")
             );
-            assert_eq!(charge.rows, 12);
-            assert_eq!(charge.bytes, discovery_bytes);
+            assert_eq!(charge.rows, exact_acceptance_rows - 1);
+            assert!(!charge.identities.contains_key(&acceptance_order_identity));
         }
         assert_eq!(
             blob_complete_logical_digest(&store),
@@ -27392,10 +32309,11 @@ mod tests {
                 .begin_write()
                 .expect("acceptance-order-admitting charge write");
             let mut charge = MaintenanceCharge {
-                budget: lifecycle::BlobMaintenanceBudget::new(14, 1, u64::MAX)
+                budget: lifecycle::BlobMaintenanceBudget::new(exact_acceptance_rows, 1, u64::MAX)
                     .expect("acceptance-order-admitting budget"),
-                rows: 12,
+                rows: discovery_rows,
                 bytes: discovery_bytes,
+                identities: discovery_identities,
             };
             assert!(matches!(
                 invalidated_blob_publication_retirement_charge_write(
@@ -27503,7 +32421,16 @@ mod tests {
                     .expect("unbounded test charge"),
                 rows: page.rows_examined,
                 bytes: page.bytes,
+                identities: page.identities,
             };
+            assert!(
+                lifecycle::charge_maintenance_cursor_write(
+                    &write,
+                    lifecycle::BlobMaintenanceClass::ExpiredPublicationsAndPendingSources,
+                    &mut charge,
+                )
+                .expect("charge maximum-operation maintenance cursor")
+            );
             assert!(
                 invalidated_blob_publication_retirement_charge_write(
                     &write,
@@ -27518,8 +32445,8 @@ mod tests {
         };
         assert_eq!(
             exact_rows,
-            12 + 1 + 10 + 2 + 4 * MAX_BLOB_OPERATIONS,
-            "maximum aliases charge source bytes plus each operation, owner, resolver, and deadline"
+            12 + 2 + 1 + 10 + 2 + 6 + 4 * MAX_BLOB_OPERATIONS,
+            "maximum aliases charge both maintenance cursors, source bytes, six distinct pressure rows, and each operation, owner, resolver, and deadline"
         );
         let before = blob_complete_logical_digest(&store);
         let before_usage = store
@@ -28448,6 +33375,18 @@ mod tests {
             write
                 .delete_table(super::super::blob_subscription::BLOB_DELIVERY_CURSORS)
                 .expect("delete cursors");
+            write
+                .delete_table(super::super::blob_subscription::BLOB_RETIREMENT_DELIVERIES)
+                .expect("delete retirement deliveries");
+            write
+                .delete_table(super::super::blob_subscription::BLOB_RETIREMENT_DELIVERY_ORDER)
+                .expect("delete retirement order");
+            write
+                .delete_table(super::super::blob_subscription::BLOB_RETIREMENT_ACKNOWLEDGEMENTS)
+                .expect("delete retirement acknowledgements");
+            write
+                .delete_table(super::super::blob_subscription::BLOB_RETIREMENT_DELIVERY_OWNERS)
+                .expect("delete retirement owners");
             {
                 let mut metadata = write.open_table(METADATA).expect("metadata");
                 for field in [
@@ -28456,6 +33395,10 @@ mod tests {
                     super::super::blob_subscription::BLOB_ACKNOWLEDGEMENT_COUNT,
                     super::super::blob_subscription::BLOB_DELIVERY_CURSOR_COUNT,
                     super::super::blob_subscription::BLOB_SELECTOR_GENERATION,
+                    super::super::blob_subscription::BLOB_RETIREMENT_DELIVERY_COUNT,
+                    super::super::blob_subscription::BLOB_RETIREMENT_DELIVERY_ORDER_COUNT,
+                    super::super::blob_subscription::BLOB_RETIREMENT_ACKNOWLEDGEMENT_COUNT,
+                    super::super::blob_subscription::BLOB_RETIREMENT_DELIVERY_OWNER_COUNT,
                 ] {
                     metadata.remove(field).expect("remove extension metadata");
                 }
@@ -28683,6 +33626,31 @@ mod tests {
         value
     }
 
+    fn maintenance_cursor_charge_for_test(
+        store: &Store,
+        class: lifecycle::BlobMaintenanceClass,
+    ) -> (u64, u64) {
+        let read = store
+            .database
+            .begin_read()
+            .expect("maintenance cursor charge read");
+        let cursors = read
+            .open_table(lifecycle::BLOB_MAINTENANCE_CURSORS)
+            .expect("maintenance cursor charge table");
+        let bytes = [0, class.cursor_key()]
+            .into_iter()
+            .map(|key| {
+                let value = cursors
+                    .get(key)
+                    .expect("maintenance cursor charge lookup")
+                    .expect("maintenance cursor charge row");
+                u64::try_from(std::mem::size_of::<u8>() + value.value().len())
+                    .expect("maintenance cursor charge bytes")
+            })
+            .sum();
+        (2, bytes)
+    }
+
     fn set_maintenance_next_class(store: &Store, class: lifecycle::BlobMaintenanceClass) {
         let write = store
             .database
@@ -28694,6 +33662,138 @@ mod tests {
             .insert(0, [1, class.cursor_key()].as_slice())
             .expect("set maintenance next class");
         write.commit().expect("commit maintenance next class");
+    }
+
+    fn drive_maintenance_class_until(
+        store: &Store,
+        class: lifecycle::BlobMaintenanceClass,
+        first_sample: Option<CustodySample>,
+        mut complete: impl FnMut(&Store) -> bool,
+    ) -> Result<BlobMaintenanceProgress, StoreError> {
+        // A new continuity generation is one bounded synchronization unit,
+        // followed by bounded fenced reanchor units for the roots captured by
+        // that pass before the selected expiry/invalidation unit. Keep the
+        // fixture honest about that dispatcher contract instead of assuming
+        // one call performs them all.
+        let root_count = {
+            let read = store
+                .database
+                .begin_read()
+                .expect("maintenance driver root-count read");
+            read.open_table(pressure::BLOB_PRESSURE_PUBLICATION_ROOTS)
+                .expect("maintenance driver publication roots")
+                .len()
+                .expect("maintenance driver publication-root count")
+                .checked_add(
+                    read.open_table(pressure::BLOB_PRESSURE_PENDING_ROOTS)
+                        .expect("maintenance driver pending roots")
+                        .len()
+                        .expect("maintenance driver pending-root count"),
+                )
+                .expect("maintenance driver root count")
+        };
+        // One generation-sync unit, at most one unit per captured root, two
+        // pressure phase-completion units, two TTL phase-completion units,
+        // and the intended class unit.
+        let max_turns = root_count
+            .checked_add(6)
+            .expect("maintenance driver turn bound");
+        let mut sample = first_sample;
+        for _ in 0..max_turns {
+            set_maintenance_next_class(store, class);
+            let progress = store
+                .run_blob_maintenance_turn_with_sample(maintenance_budget(128), sample.take())?;
+            if complete(store) {
+                return Ok(progress);
+            }
+        }
+        panic!(
+            "maintenance fixture did not reach its intended bounded unit in {max_turns} turns; policy state: {:?}",
+            blob_policy_maintenance_state_for_test(store)
+        );
+    }
+
+    fn blob_policy_maintenance_state_for_test(store: &Store) -> (bool, bool, bool) {
+        let write = store
+            .database
+            .begin_write()
+            .expect("maintenance policy-ready transaction");
+        let sync_needed = plan_blob_policy_generation_sync_write(&write)
+            .expect("maintenance policy sync plan")
+            .needed();
+        let pressure_ready =
+            pressure::pressure_ready_write(&write).expect("maintenance pressure readiness");
+        let ttl_turn_pending = if sync_needed {
+            true
+        } else {
+            custody::lower_bound_continuity_write(&write)
+                .expect("maintenance continuity")
+                .is_some_and(|continuity| {
+                    lifecycle::plan_ttl_expiry_turn_write(
+                        &write,
+                        continuity.generation,
+                        continuity.sample,
+                    )
+                    .expect("maintenance TTL expiry plan")
+                    .is_some()
+                })
+        };
+        drop(write);
+        (sync_needed, pressure_ready, ttl_turn_pending)
+    }
+
+    fn blob_policy_ready_for_maintenance_test(store: &Store) -> bool {
+        blob_policy_maintenance_state_for_test(store) == (false, true, false)
+    }
+
+    fn synchronize_blob_policy_for_maintenance_test(store: &Store) {
+        if blob_policy_ready_for_maintenance_test(store) {
+            return;
+        }
+        drive_maintenance_class_until(
+            store,
+            lifecycle::BlobMaintenanceClass::ExpiredPublicationsAndPendingSources,
+            None,
+            blob_policy_ready_for_maintenance_test,
+        )
+        .expect("synchronize Blob policy before maintenance fixture");
+    }
+
+    fn retired_publication_age_for_test(
+        store: &Store,
+        transfer: BlobTransferId,
+    ) -> Option<lifecycle::RetirementAge> {
+        let read = store
+            .database
+            .begin_read()
+            .expect("retired publication read");
+        let encoded = read
+            .open_table(BLOB_PUBLICATIONS)
+            .expect("retired publications")
+            .get(transfer.as_bytes().as_slice())
+            .expect("retired publication lookup")?
+            .value()
+            .to_vec();
+        lifecycle::publication_retirement(&encoded)
+            .expect("decode retired publication")
+            .map(|(_, _, age)| age)
+    }
+
+    fn retired_operation_age_for_test(
+        store: &Store,
+        operation: &BlobOperationKey,
+    ) -> Option<lifecycle::RetirementAge> {
+        let read = store.database.begin_read().expect("retired operation read");
+        let encoded = read
+            .open_table(BLOB_OPERATIONS)
+            .expect("retired operations")
+            .get(operation.as_bytes())
+            .expect("retired operation lookup")?
+            .value()
+            .to_vec();
+        lifecycle::operation_retirement(&encoded)
+            .expect("decode retired operation")
+            .map(|(_, _, _, _, age)| age)
     }
 
     fn set_maintenance_cursor(
@@ -30272,6 +35372,10 @@ mod tests {
             BLOB_ACKNOWLEDGEMENT_COUNT,
             BLOB_DELIVERY_CURSOR_COUNT,
             BLOB_SELECTOR_GENERATION,
+            BLOB_RETIREMENT_DELIVERY_COUNT,
+            BLOB_RETIREMENT_DELIVERY_ORDER_COUNT,
+            BLOB_RETIREMENT_ACKNOWLEDGEMENT_COUNT,
+            BLOB_RETIREMENT_DELIVERY_OWNER_COUNT,
         ] {
             let value = read
                 .open_table(METADATA)
@@ -30313,6 +35417,22 @@ mod tests {
                 BLOB_DELIVERY_ACKNOWLEDGEMENTS,
             ),
             (b"delivery-cursors".as_slice(), BLOB_DELIVERY_CURSORS),
+            (
+                b"retirement-deliveries".as_slice(),
+                BLOB_RETIREMENT_DELIVERIES,
+            ),
+            (
+                b"retirement-delivery-order".as_slice(),
+                BLOB_RETIREMENT_DELIVERY_ORDER,
+            ),
+            (
+                b"retirement-acknowledgements".as_slice(),
+                BLOB_RETIREMENT_ACKNOWLEDGEMENTS,
+            ),
+            (
+                b"retirement-delivery-owners".as_slice(),
+                BLOB_RETIREMENT_DELIVERY_OWNERS,
+            ),
             (
                 b"variant-references".as_slice(),
                 lifecycle::BLOB_VARIANT_REFERENCES,
@@ -31338,6 +36458,7 @@ mod tests {
             budget: lifecycle::BlobMaintenanceBudget::new(u64::MAX, 1, u64::MAX).unwrap(),
             rows: 0,
             bytes: 0,
+            identities: BTreeMap::new(),
         };
         let plan = deletion::plan_variant_admission_write(
             &write,
@@ -31398,6 +36519,7 @@ mod tests {
             budget: lifecycle::BlobMaintenanceBudget::new(u64::MAX, 1, u64::MAX).unwrap(),
             rows: 0,
             bytes: 0,
+            identities: BTreeMap::new(),
         };
         let plan = deletion::plan_variant_admission_write(
             &write,
@@ -31481,6 +36603,7 @@ mod tests {
             budget: lifecycle::BlobMaintenanceBudget::new(22, 1, u64::MAX).unwrap(),
             rows: 0,
             bytes: 0,
+            identities: BTreeMap::new(),
         };
         assert!(
             deletion::plan_variant_admission_write(
@@ -31888,9 +37011,36 @@ mod tests {
                 index == 1,
             );
         }
+        synchronize_blob_policy_for_maintenance_test(&store);
+        let exact_rows = {
+            let read = store
+                .database
+                .begin_read()
+                .expect("maintenance fairness identity read");
+            let referenced = read
+                .open_table(lifecycle::BLOB_VARIANT_REFERENCES)
+                .expect("maintenance fairness references")
+                .len()
+                .expect("maintenance fairness reference count");
+            assert_eq!(referenced, 10);
+            // The complete import page owns import+lineage+reference for each
+            // referenced variant and import+lineage for both unreferenced
+            // variants. Exact short-unit rollback is covered by the dedicated
+            // import-evidence and manifest-plan budget tests below.
+            referenced
+                .checked_mul(3)
+                .and_then(|rows| rows.checked_add(2 * 2))
+                .expect("maintenance fairness row bound")
+        };
+        assert_eq!(exact_rows, 34);
+        set_maintenance_next_class(
+            &store,
+            lifecycle::BlobMaintenanceClass::ExpiredPublicationsAndPendingSources,
+        );
 
-        let budget = maintenance_budget(1);
+        let budget = maintenance_budget(exact_rows);
         let mut selected = Vec::new();
+        let mut rows = Vec::new();
         let mut first_class_more = 0;
         for _ in 0..12 {
             let progress = store
@@ -31905,6 +37055,7 @@ mod tests {
                 first_class_more += usize::from(progress.class_has_more_work);
             }
             selected.push(progress.class);
+            rows.push(progress.rows_examined);
         }
         assert_eq!(
             selected,
@@ -31918,6 +37069,7 @@ mod tests {
             first_class_more, 2,
             "continuous first-class rows must not prevent later-class turns"
         );
+        assert_eq!(rows, [14, 10, 34, 34, 18, 2, 14, 10, 34, 34, 18, 1]);
     }
 
     #[test]
@@ -31973,6 +37125,7 @@ mod tests {
             let prepared = prepared_blob(&plaintext);
             publish_blob(&store, &mut services, &prepared, &plaintext, 1, key);
         }
+        synchronize_blob_policy_for_maintenance_test(&store);
         {
             let write = store
                 .database
@@ -32018,7 +37171,7 @@ mod tests {
         }
 
         let progress = store
-            .run_blob_maintenance_turn(maintenance_budget(2))
+            .run_blob_maintenance_turn(maintenance_budget(4))
             .expect("resume strictly after removed row");
         assert_eq!(
             progress.class,
@@ -32039,11 +37192,11 @@ mod tests {
 
         for _ in 0..5 {
             store
-                .run_blob_maintenance_turn(maintenance_budget(2))
+                .run_blob_maintenance_turn(maintenance_budget(4))
                 .expect("rotate to operation class");
         }
         let wrapped = store
-            .run_blob_maintenance_turn(maintenance_budget(2))
+            .run_blob_maintenance_turn(maintenance_budget(4))
             .expect("wrap operation cursor");
         assert_eq!(
             wrapped.class,
@@ -32080,6 +37233,7 @@ mod tests {
             1,
             true,
         );
+        synchronize_blob_policy_for_maintenance_test(&store);
         let (carrier_key, carrier_bytes, supporting_bytes) = {
             let read = store.database.begin_read().expect("carrier evidence read");
             let carriers = read
@@ -32091,7 +37245,6 @@ mod tests {
                 .next()
                 .expect("carrier row exists")
                 .expect("carrier row");
-            let carrier_key = key.value().to_vec();
             let carrier_bytes =
                 maintenance_entry_bytes(key.value(), value.value()).expect("carrier encoded bytes");
             let pending = read
@@ -32137,7 +37290,7 @@ mod tests {
             let reference_bytes = maintenance_entry_bytes(&reference_key, reference.value())
                 .expect("reference encoded bytes");
             (
-                carrier_key,
+                key.value().to_vec(),
                 carrier_bytes,
                 pending_bytes + import_bytes + lineage_bytes + reference_bytes,
             )
@@ -32145,10 +37298,55 @@ mod tests {
         let mut after_pending = vec![MAINTENANCE_PRIMARY_SOURCE_TAG];
         after_pending.extend_from_slice(transfer.as_bytes());
         let encoded_after_pending = maintenance_cursor_value(Some(&after_pending));
+        set_maintenance_cursor(
+            &store,
+            lifecycle::BlobMaintenanceClass::InvalidPendingWork,
+            Some(&after_pending),
+        );
+        let (cursor_rows, cursor_bytes) = maintenance_cursor_charge_for_test(
+            &store,
+            lifecycle::BlobMaintenanceClass::InvalidPendingWork,
+        );
+        let exact_rows = 5 + cursor_rows;
+        let exact_bytes = carrier_bytes + supporting_bytes + cursor_bytes;
+
+        {
+            let write = store
+                .database
+                .begin_write()
+                .expect("carrier exact charge transaction");
+            let page = bounded_composite_maintenance_page(
+                &write,
+                BLOB_PENDING_SOURCES,
+                MaintenanceRowKind::Pending,
+                BLOB_CARRIER_PREFIXES,
+                MaintenanceRowKind::Carrier,
+                Some(&after_pending),
+                BlobMaintenanceBudget::new(u64::MAX, 1, u64::MAX)
+                    .expect("unbounded carrier charge budget"),
+            )
+            .expect("carrier exact evidence page");
+            let mut charge = MaintenanceCharge {
+                budget: BlobMaintenanceBudget::new(u64::MAX, 1, u64::MAX)
+                    .expect("unbounded carrier charge budget"),
+                rows: page.rows_examined,
+                bytes: page.bytes,
+                identities: page.identities,
+            };
+            assert!(
+                lifecycle::charge_maintenance_cursor_write(
+                    &write,
+                    lifecycle::BlobMaintenanceClass::InvalidPendingWork,
+                    &mut charge,
+                )
+                .expect("charge exact carrier cursor")
+            );
+            assert_eq!((charge.rows, charge.bytes), (exact_rows, exact_bytes));
+        }
 
         for budget in [
-            BlobMaintenanceBudget::new(4, 1, u64::MAX).expect("row-limited budget"),
-            BlobMaintenanceBudget::new(5, 1, carrier_bytes + supporting_bytes - 1)
+            BlobMaintenanceBudget::new(exact_rows - 1, 1, u64::MAX).expect("row-limited budget"),
+            BlobMaintenanceBudget::new(exact_rows, 1, exact_bytes - 1)
                 .expect("byte-limited budget"),
         ] {
             set_maintenance_cursor(
@@ -32186,27 +37384,42 @@ mod tests {
         );
         let admitted = store
             .run_blob_maintenance_turn(
-                BlobMaintenanceBudget::new(5, 1, carrier_bytes + supporting_bytes)
+                BlobMaintenanceBudget::new(exact_rows, 1, exact_bytes)
                     .expect("exact carrier evidence budget"),
             )
             .expect("exact carrier evidence budget admits the row");
-        assert_eq!(admitted.rows_examined, 5);
+        assert_eq!(admitted.rows_examined, exact_rows);
         assert_eq!(
-            admitted.bytes_examined,
-            carrier_bytes + supporting_bytes,
-            "progress charges the carrier, pending row, and decoded authority evidence"
+            admitted.bytes_examined, exact_bytes,
+            "progress charges carrier authority and both dispatcher cursor identities"
         );
+        assert!(admitted.class_has_more_work);
         let mut expected_position = vec![MAINTENANCE_SECONDARY_SOURCE_TAG];
         expected_position.extend_from_slice(&carrier_key);
         let read = store.database.begin_read().expect("read advanced cursor");
+        let cursors = read
+            .open_table(lifecycle::BLOB_MAINTENANCE_CURSORS)
+            .expect("maintenance cursors");
         assert_eq!(
-            read.open_table(lifecycle::BLOB_MAINTENANCE_CURSORS)
-                .expect("maintenance cursors")
+            cursors
                 .get(2)
                 .expect("invalid-pending cursor")
                 .expect("invalid-pending cursor exists")
                 .value(),
-            maintenance_cursor_value(Some(&expected_position))
+            maintenance_cursor_value(Some(&expected_position)),
+            "the precharged cursor budget reserves bounded progress at the carrier"
+        );
+        assert_eq!(
+            cursors
+                .get(0)
+                .expect("next-class cursor")
+                .expect("next-class cursor exists")
+                .value(),
+            [
+                1,
+                lifecycle::BlobMaintenanceClass::UnreferencedLocalImportStaging.cursor_key()
+            ],
+            "bounded source progress still advances six-class fairness"
         );
     }
 
@@ -32229,6 +37442,7 @@ mod tests {
             1,
             b"maintenance-publication-evidence-budget",
         );
+        synchronize_blob_policy_for_maintenance_test(&store);
 
         let exact_bytes = {
             let read = store
@@ -32296,9 +37510,22 @@ mod tests {
                 + u64_entry!(CAUSAL_FRONTIER, &frontier_key)
         };
         let unset_cursor = maintenance_cursor_value(None);
+        set_maintenance_cursor(
+            &store,
+            lifecycle::BlobMaintenanceClass::ExpiredPublicationsAndPendingSources,
+            None,
+        );
+        let (cursor_rows, cursor_bytes) = maintenance_cursor_charge_for_test(
+            &store,
+            lifecycle::BlobMaintenanceClass::ExpiredPublicationsAndPendingSources,
+        );
+        let exact_rows = 12 + cursor_rows;
+        let exact_bytes = exact_bytes + cursor_bytes;
         for budget in [
-            BlobMaintenanceBudget::new(11, 1, exact_bytes).expect("one-row-short budget"),
-            BlobMaintenanceBudget::new(12, 1, exact_bytes - 1).expect("one-byte-short budget"),
+            BlobMaintenanceBudget::new(exact_rows - 1, 1, exact_bytes)
+                .expect("one-row-short budget"),
+            BlobMaintenanceBudget::new(exact_rows, 1, exact_bytes - 1)
+                .expect("one-byte-short budget"),
         ] {
             set_maintenance_cursor(
                 &store,
@@ -32334,11 +37561,11 @@ mod tests {
         );
         let admitted = store
             .run_blob_maintenance_turn(
-                BlobMaintenanceBudget::new(12, 1, exact_bytes)
+                BlobMaintenanceBudget::new(exact_rows, 1, exact_bytes)
                     .expect("exact publication evidence budget"),
             )
             .expect("exact publication evidence budget admits the row");
-        assert_eq!(admitted.rows_examined, 12);
+        assert_eq!(admitted.rows_examined, exact_rows);
         assert_eq!(admitted.bytes_examined, exact_bytes);
         let mut expected_position = vec![MAINTENANCE_PRIMARY_SOURCE_TAG];
         expected_position.extend_from_slice(publication.transfer_id.as_bytes());
@@ -32374,6 +37601,7 @@ mod tests {
             1,
             false,
         );
+        synchronize_blob_policy_for_maintenance_test(&store);
         let exact_bytes = {
             let read = store.database.begin_read().expect("pending evidence read");
             let pending = read
@@ -32428,9 +37656,15 @@ mod tests {
                 MAINTENANCE_PRIMARY_SOURCE_TAG,
             ),
         ] {
+            set_maintenance_cursor(&store, class, None);
+            let (cursor_rows, cursor_bytes) = maintenance_cursor_charge_for_test(&store, class);
+            let exact_rows = 4 + cursor_rows;
+            let exact_unit_bytes = exact_bytes + cursor_bytes;
             for budget in [
-                BlobMaintenanceBudget::new(3, 1, exact_bytes).expect("one-row-short pending"),
-                BlobMaintenanceBudget::new(4, 1, exact_bytes - 1).expect("one-byte-short pending"),
+                BlobMaintenanceBudget::new(exact_rows - 1, 1, exact_unit_bytes)
+                    .expect("one-row-short pending"),
+                BlobMaintenanceBudget::new(exact_rows, 1, exact_unit_bytes - 1)
+                    .expect("one-byte-short pending"),
             ] {
                 set_maintenance_cursor(&store, class, None);
                 let progress = store
@@ -32455,11 +37689,12 @@ mod tests {
             set_maintenance_cursor(&store, class, None);
             let progress = store
                 .run_blob_maintenance_turn(
-                    BlobMaintenanceBudget::new(4, 1, exact_bytes).expect("exact pending evidence"),
+                    BlobMaintenanceBudget::new(exact_rows, 1, exact_unit_bytes)
+                        .expect("exact pending evidence"),
                 )
                 .expect("exact pending evidence progress");
-            assert_eq!(progress.rows_examined, 4);
-            assert_eq!(progress.bytes_examined, exact_bytes);
+            assert_eq!(progress.rows_examined, exact_rows);
+            assert_eq!(progress.bytes_examined, exact_unit_bytes);
             assert_eq!(progress.files_examined, 0);
             let mut expected_position = vec![tag];
             expected_position.extend_from_slice(transfer.as_bytes());
@@ -32651,6 +37886,7 @@ mod tests {
             1,
             b"maintenance-operation-evidence",
         );
+        synchronize_blob_policy_for_maintenance_test(&store);
         let exact_bytes = {
             let read = store
                 .database
@@ -32677,9 +37913,15 @@ mod tests {
                 .expect("publication bytes")
         };
         let class = lifecycle::BlobMaintenanceClass::ExpiredRetirementRecords;
+        set_maintenance_cursor(&store, class, None);
+        let (cursor_rows, cursor_bytes) = maintenance_cursor_charge_for_test(&store, class);
+        let exact_rows = 2 + cursor_rows;
+        let exact_bytes = exact_bytes + cursor_bytes;
         for budget in [
-            BlobMaintenanceBudget::new(1, 1, exact_bytes).expect("one-row-short operation"),
-            BlobMaintenanceBudget::new(2, 1, exact_bytes - 1).expect("one-byte-short operation"),
+            BlobMaintenanceBudget::new(exact_rows - 1, 1, exact_bytes)
+                .expect("one-row-short operation"),
+            BlobMaintenanceBudget::new(exact_rows, 1, exact_bytes - 1)
+                .expect("one-byte-short operation"),
         ] {
             set_maintenance_cursor(&store, class, None);
             let progress = store
@@ -32704,10 +37946,11 @@ mod tests {
         set_maintenance_cursor(&store, class, None);
         let progress = store
             .run_blob_maintenance_turn(
-                BlobMaintenanceBudget::new(2, 1, exact_bytes).expect("exact operation evidence"),
+                BlobMaintenanceBudget::new(exact_rows, 1, exact_bytes)
+                    .expect("exact operation evidence"),
             )
             .expect("exact operation evidence progress");
-        assert_eq!(progress.rows_examined, 2);
+        assert_eq!(progress.rows_examined, exact_rows);
         assert_eq!(progress.bytes_examined, exact_bytes);
         assert_eq!(progress.files_examined, 0);
         let read = store
@@ -32919,6 +38162,7 @@ mod tests {
             1,
             b"maintenance-contradiction-operation",
         );
+        synchronize_blob_policy_for_maintenance_test(&store);
         {
             let write = store
                 .database
@@ -32948,7 +38192,7 @@ mod tests {
         let before = blob_current_admission_digest(&store);
         assert_blob_schema_invariant(
             &store
-                .run_blob_maintenance_turn(maintenance_budget(4))
+                .run_blob_maintenance_turn(maintenance_budget(6))
                 .expect_err("structural contradiction fails maintenance"),
         );
         assert_eq!(blob_current_admission_digest(&store), before);
@@ -35015,7 +40259,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .value(),
-            4
+            5
         );
     }
 
@@ -35826,6 +41070,587 @@ mod tests {
     }
 
     #[test]
+    fn blob_pressure_retires_an_expired_finite_candidate_as_expired() {
+        // Mutation caught: v5 expiry-first pressure ordering must not convert
+        // a provably expired finite root into an eviction tombstone merely
+        // because capacity recovery selected the bounded unit.
+        let root = BlobTestRoot::new("pressure-expired-finite-reason");
+        let mut services = blob_services(0xb7);
+        let plaintext = b"shared content keeps pressure expiry metadata-only".to_vec();
+        let prepared = prepared_blob(&plaintext);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("expired finite pressure store");
+        let low_proof = prepare_blob_proof_with_priority(
+            &store,
+            &mut services,
+            &prepared,
+            &plaintext,
+            1,
+            Priority::Routine,
+        );
+        let (low_outcome, low_operation, _) =
+            commit_blob_proof(&store, &services, &low_proof, b"pressure-expired-low");
+        let low = low_outcome.blob().clone();
+        let high_proof = prepare_blob_proof_with_priority(
+            &store,
+            &mut services,
+            &prepared,
+            &plaintext,
+            1,
+            Priority::Immediate,
+        );
+        let high = commit_blob_proof(&store, &services, &high_proof, b"pressure-expired-high")
+            .0
+            .blob()
+            .clone();
+        assert_eq!(low.variant_id, high.variant_id);
+        let checkpoint = CustodySample {
+            clock_id: [0xb8; 16],
+            tick_ms: 100,
+        };
+        rewrite_live_blob_as_finite_for_retirement_test(
+            &store,
+            &low,
+            Some(&low_operation),
+            100,
+            50,
+            checkpoint,
+        );
+        let deadline = CustodySample {
+            clock_id: checkpoint.clock_id,
+            tick_ms: 150,
+        };
+        let write = store
+            .database
+            .begin_write()
+            .expect("persist pressure expiry continuity");
+        custody::observe_continuity_write(&write, deadline)
+            .expect("advance pressure expiry continuity");
+        synchronize_blob_policy_generation_write(&write)
+            .expect("synchronize pressure expiry policy");
+        write.commit().expect("commit pressure expiry continuity");
+
+        let recovery = store
+            .run_blob_pressure_recovery(
+                pressure::BlobCapacityRecoveryDemand::new(
+                    pressure::BlobCapacityPartition::AggregateItems,
+                    Priority::Immediate,
+                    1,
+                )
+                .expect("expired finite pressure demand"),
+                pressure::BlobPressureRecoveryBudget::new(
+                    MAX_BLOB_POLICY_RETIREMENT_ROWS,
+                    MAX_BLOB_POLICY_RETIREMENT_BYTES,
+                    2,
+                    4,
+                    1,
+                )
+                .expect("expired finite pressure budget"),
+                None,
+            )
+            .expect("recover expired finite pressure root");
+        assert_eq!(recovery.evicted_transfer_ids(), &[low.transfer_id]);
+        assert!(store.get_blob(high.transfer_id).unwrap().is_some());
+        let read = store.database.begin_read().expect("expired pressure read");
+        let encoded = read
+            .open_table(BLOB_PUBLICATIONS)
+            .expect("expired pressure publications")
+            .get(low.transfer_id.as_bytes().as_slice())
+            .expect("expired pressure lookup")
+            .expect("retained expired pressure publication")
+            .value()
+            .to_vec();
+        assert_eq!(
+            lifecycle::publication_retirement(&encoded)
+                .expect("decode expired pressure retirement")
+                .expect("expired pressure retirement exists")
+                .0,
+            lifecycle::RetirementReason::Expired
+        );
+        assert!(
+            !deletion::variant_has_deletion_manifest_read(&read, low.variant_id)
+                .expect("shared expired pressure manifest")
+        );
+    }
+
+    #[test]
+    fn blob_pressure_observes_discontinuous_sample_before_candidate_selection() {
+        // Break caught: selecting from a clean clock-A pressure index before
+        // observing clock B can retire the A-ranked root as Evicted even though
+        // the generation change must first establish a fenced reanchor pass.
+        let root = BlobTestRoot::new("pressure-sample-before-selection");
+        let mut services = blob_services(0xba);
+        let plaintext = b"shared pressure content crosses one clock discontinuity".to_vec();
+        let prepared = prepared_blob(&plaintext);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("pressure discontinuity store");
+        let low_proof = prepare_blob_proof_with_priority(
+            &store,
+            &mut services,
+            &prepared,
+            &plaintext,
+            1,
+            Priority::Routine,
+        );
+        let (low_outcome, low_operation, _) =
+            commit_blob_proof(&store, &services, &low_proof, b"pressure-clock-a-low");
+        let low = low_outcome.blob().clone();
+        let high_proof = prepare_blob_proof_with_priority(
+            &store,
+            &mut services,
+            &prepared,
+            &plaintext,
+            1,
+            Priority::Immediate,
+        );
+        let high = commit_blob_proof(&store, &services, &high_proof, b"pressure-clock-a-high")
+            .0
+            .blob()
+            .clone();
+        assert_eq!(low.variant_id, high.variant_id);
+        let clock_a = CustodySample {
+            clock_id: [0xba; 16],
+            tick_ms: 100,
+        };
+        rewrite_live_blob_as_finite_for_retirement_test(
+            &store,
+            &low,
+            Some(&low_operation),
+            100,
+            50,
+            clock_a,
+        );
+        let clock_b = CustodySample {
+            clock_id: [0xbb; 16],
+            tick_ms: 1,
+        };
+        let demand = pressure::BlobCapacityRecoveryDemand::new(
+            pressure::BlobCapacityPartition::AggregateItems,
+            Priority::Immediate,
+            1,
+        )
+        .expect("pressure discontinuity demand");
+        let pressure_budget = |rows, bytes| {
+            pressure::BlobPressureRecoveryBudget::new(rows, bytes, 2, 4, 1)
+                .expect("pressure discontinuity budget")
+        };
+        let publication_is_live = |transfer: BlobTransferId| {
+            let read = store
+                .database
+                .begin_read()
+                .expect("pressure discontinuity publication read");
+            let encoded = read
+                .open_table(BLOB_PUBLICATIONS)
+                .expect("pressure discontinuity publications")
+                .get(transfer.as_bytes().as_slice())
+                .expect("pressure discontinuity publication lookup")
+                .expect("pressure discontinuity publication exists")
+                .value()
+                .to_vec();
+            lifecycle::publication_retirement(&encoded)
+                .expect("decode pressure discontinuity publication")
+                .is_none()
+        };
+        let before_continuity = {
+            let read = store
+                .database
+                .begin_read()
+                .expect("clock-A continuity read");
+            custody::lower_bound_continuity_read(&read)
+                .expect("clock-A continuity")
+                .expect("clock-A continuity exists")
+        };
+        let (sync_rows, sync_bytes) = {
+            let write = store
+                .database
+                .begin_write()
+                .expect("pressure sync charge writer");
+            custody::observe_continuity_write(&write, clock_b).expect("project clock-B continuity");
+            let plan = plan_blob_policy_generation_sync_write(&write)
+                .expect("plan pressure discontinuity sync");
+            assert!(plan.reset_pressure_reanchor);
+            let mut charge = MaintenanceCharge::new(maintenance_budget(u64::MAX), 0, 0);
+            assert!(
+                charge_blob_policy_generation_sync_write(&write, plan, &mut charge)
+                    .expect("charge pressure discontinuity sync")
+            );
+            (charge.rows, charge.bytes)
+        };
+        assert!(sync_rows > 0 && sync_bytes > 0);
+        let before_short = blob_complete_logical_digest(&store);
+        for budget in [
+            pressure_budget(sync_rows - 1, sync_bytes),
+            pressure_budget(sync_rows, sync_bytes - 1),
+        ] {
+            let short = store
+                .run_blob_pressure_recovery(demand, budget, Some(clock_b))
+                .expect("bounded pressure sync refusal");
+            assert!(short.evicted_transfer_ids().is_empty());
+            assert_eq!(blob_complete_logical_digest(&store), before_short);
+            let read = store
+                .database
+                .begin_read()
+                .expect("short pressure continuity read");
+            assert_eq!(
+                custody::lower_bound_continuity_read(&read).expect("short pressure continuity"),
+                Some(before_continuity)
+            );
+        }
+
+        let synchronized = store
+            .run_blob_pressure_recovery(
+                demand,
+                pressure_budget(sync_rows, sync_bytes),
+                Some(clock_b),
+            )
+            .expect("observe and synchronize pressure discontinuity");
+        assert!(synchronized.evicted_transfer_ids().is_empty());
+        assert!(publication_is_live(low.transfer_id));
+        assert!(store.get_blob(high.transfer_id).unwrap().is_some());
+        {
+            let read = store
+                .database
+                .begin_read()
+                .expect("synchronized pressure read");
+            let continuity = custody::lower_bound_continuity_read(&read)
+                .expect("synchronized continuity")
+                .expect("synchronized continuity exists");
+            assert_eq!(continuity.generation, before_continuity.generation + 1);
+            assert_eq!(continuity.sample, clock_b);
+            let metadata = read
+                .open_table(pressure::BLOB_PRESSURE_METADATA)
+                .expect("synchronized pressure metadata");
+            assert_eq!(
+                metadata
+                    .get("reanchor_target_generation")
+                    .expect("pressure target read")
+                    .expect("pressure target exists")
+                    .value(),
+                continuity.generation
+            );
+            assert_eq!(
+                metadata
+                    .get("reanchor_dirty")
+                    .expect("pressure dirty read")
+                    .expect("pressure dirty exists")
+                    .value(),
+                1
+            );
+        }
+        let gated = store
+            .run_blob_pressure_recovery(
+                demand,
+                pressure_budget(
+                    MAX_BLOB_POLICY_RETIREMENT_ROWS,
+                    MAX_BLOB_POLICY_RETIREMENT_BYTES,
+                ),
+                Some(clock_b),
+            )
+            .expect("dirty pressure remains gated");
+        assert!(gated.evicted_transfer_ids().is_empty());
+        assert!(publication_is_live(low.transfer_id));
+
+        synchronize_blob_policy_for_maintenance_test(&store);
+        let recovered = store
+            .run_blob_pressure_recovery(
+                demand,
+                pressure_budget(
+                    MAX_BLOB_POLICY_RETIREMENT_ROWS,
+                    MAX_BLOB_POLICY_RETIREMENT_BYTES,
+                ),
+                Some(clock_b),
+            )
+            .expect("same-generation pressure recovery");
+        assert_eq!(recovered.evicted_transfer_ids(), &[low.transfer_id]);
+        assert!(store.get_blob(high.transfer_id).unwrap().is_some());
+    }
+
+    fn assert_expired_final_publication_pressure_is_lease_independent(
+        label: &str,
+        partition: pressure::BlobCapacityPartition,
+        expected_recovered_units: u64,
+    ) {
+        let root = BlobTestRoot::new(label);
+        let mut services = blob_services(0xbc);
+        let plaintext = format!("{label} finite final pressure root").into_bytes();
+        let prepared = prepared_blob(&plaintext);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("finite final pressure store");
+        let proof = prepare_blob_proof_with_priority(
+            &store,
+            &mut services,
+            &prepared,
+            &plaintext,
+            1,
+            Priority::Routine,
+        );
+        let (outcome, operation, _) =
+            commit_blob_proof(&store, &services, &proof, label.as_bytes());
+        let stored = outcome.blob().clone();
+        let checkpoint = CustodySample {
+            clock_id: [0xbc; 16],
+            tick_ms: 100,
+        };
+        rewrite_live_blob_as_finite_for_retirement_test(
+            &store,
+            &stored,
+            Some(&operation),
+            100,
+            50,
+            checkpoint,
+        );
+        let deadline = CustodySample {
+            clock_id: checkpoint.clock_id,
+            tick_ms: 150,
+        };
+        {
+            let write = store
+                .database
+                .begin_write()
+                .expect("finite final deadline writer");
+            custody::observe_continuity_write(&write, deadline)
+                .expect("advance finite final deadline");
+            synchronize_blob_policy_generation_write(&write)
+                .expect("synchronize finite final policy");
+            write.commit().expect("commit finite final deadline");
+        }
+        let lease = store
+            .test_acquire_blob_lease(stored.variant_id, lease::BlobLeaseKind::ApplicationPageRead)
+            .expect("active finite final publication lease");
+        let recovery = store
+            .run_blob_pressure_recovery(
+                pressure::BlobCapacityRecoveryDemand::new(partition, Priority::Immediate, 1)
+                    .expect("finite final pressure demand"),
+                pressure::BlobPressureRecoveryBudget::new(
+                    MAX_BLOB_PRESSURE_FINAL_ROOT_ROWS,
+                    MAX_BLOB_PRESSURE_FINAL_ROOT_BYTES,
+                    1,
+                    2,
+                    0,
+                )
+                .expect("finite final pressure budget"),
+                None,
+            )
+            .expect("finite final pressure recovery");
+        assert_eq!(recovery.evicted_transfer_ids(), &[stored.transfer_id]);
+        assert_eq!(recovery.recovered_units(), expected_recovered_units);
+        assert_eq!(recovery.deficit_met(), expected_recovered_units >= 1);
+        {
+            let read = store
+                .database
+                .begin_read()
+                .expect("finite final retirement read");
+            let encoded = read
+                .open_table(BLOB_PUBLICATIONS)
+                .expect("finite final publications")
+                .get(stored.transfer_id.as_bytes().as_slice())
+                .expect("finite final publication lookup")
+                .expect("finite final retained retirement")
+                .value()
+                .to_vec();
+            assert!(matches!(
+                lifecycle::publication_retirement(&encoded)
+                    .expect("decode finite final retirement"),
+                Some((lifecycle::RetirementReason::Expired, _, _))
+            ));
+            assert!(
+                !deletion::variant_has_deletion_manifest_read(&read, stored.variant_id)
+                    .expect("finite final manifest before maintenance")
+            );
+        }
+        drop(lease);
+        drop(store);
+
+        let reopened = Store::open_for_mission(&root.database, services.authority)
+            .expect("reopen finite final retirement");
+        assert!(matches!(
+            reopened.get_blob(stored.transfer_id),
+            Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+        ));
+        {
+            let read = reopened.database.begin_read().unwrap();
+            assert!(
+                !deletion::variant_has_deletion_manifest_read(&read, stored.variant_id)
+                    .expect("reopened finite final manifest before maintenance")
+            );
+        }
+        drive_maintenance_class_until(
+            &reopened,
+            lifecycle::BlobMaintenanceClass::UnreferencedCompletedVariants,
+            Some(deadline),
+            |store| {
+                let read = store.database.begin_read().expect("later manifest read");
+                deletion::variant_has_deletion_manifest_read(&read, stored.variant_id)
+                    .expect("later manifest state")
+            },
+        )
+        .expect("later finite final manifest admission");
+    }
+
+    #[test]
+    fn blob_pressure_expired_final_publication_retires_with_active_lease() {
+        assert_expired_final_publication_pressure_is_lease_independent(
+            "pressure-expired-final-publication",
+            pressure::BlobCapacityPartition::AggregateItems,
+            1,
+        );
+    }
+
+    #[test]
+    fn blob_pressure_expired_final_variant_retires_with_active_lease() {
+        assert_expired_final_publication_pressure_is_lease_independent(
+            "pressure-expired-final-variant",
+            pressure::BlobCapacityPartition::DepotVariants,
+            0,
+        );
+    }
+
+    #[test]
+    fn blob_pressure_expired_final_pending_retires_with_active_lease() {
+        let source_root = BlobTestRoot::new("pressure-expired-pending-source");
+        let target_root = BlobTestRoot::new("pressure-expired-pending-target");
+        let mut services = blob_services(0xbd);
+        let source = Store::open_for_mission(&source_root.database, services.authority)
+            .expect("finite pending source store");
+        let target = Store::open_for_mission(&target_root.database, services.authority)
+            .expect("finite pending target store");
+        let checkpoint = CustodySample {
+            clock_id: [0xbd; 16],
+            tick_ms: 100,
+        };
+        let continuity = {
+            let write = target
+                .database
+                .begin_write()
+                .expect("finite pending continuity writer");
+            let continuity = custody::observe_continuity_write(&write, checkpoint)
+                .expect("finite pending continuity");
+            pressure::synchronize_reanchor_state_write(&write)
+                .expect("finite pending pressure target");
+            write.commit().expect("commit finite pending continuity");
+            continuity
+        };
+        let plaintext = b"finite pending final root waits for later deletion".to_vec();
+        let prepared = prepared_blob(&plaintext);
+        let proof = prepare_blob_proof_with_lifetime(
+            &source,
+            &mut services,
+            &prepared,
+            &plaintext,
+            1,
+            Priority::Routine,
+            Some(100),
+        );
+        let plan = proof
+            .blob
+            .transfer_plan(&proof.manifest_bytes)
+            .expect("finite pending plan");
+        let policy = target
+            .control_policy_snapshot()
+            .expect("finite pending policy");
+        let transfer = BlobTransferId::new(proof.blob.envelope_id());
+        assert_eq!(
+            target
+                .stage_verified_blob_source_with_lifetime(
+                    &policy,
+                    &proof.blob,
+                    &proof.sealed,
+                    &plan,
+                    Some(VerifiedFiniteBlobAdmission::for_test(
+                        proof.blob.envelope_id(),
+                        u64::try_from(proof.sealed.len()).expect("finite pending source length"),
+                        proof.blob.item_id(),
+                        proof.blob.blob_id(),
+                        proof.blob.priority(),
+                        100,
+                        50,
+                        checkpoint,
+                    )),
+                )
+                .expect("stage finite pending root"),
+            BlobSourceStageOutcome::Inserted
+        );
+        let deadline = CustodySample {
+            clock_id: checkpoint.clock_id,
+            tick_ms: 150,
+        };
+        {
+            let write = target
+                .database
+                .begin_write()
+                .expect("finite pending deadline writer");
+            let observed = custody::observe_continuity_write(&write, deadline)
+                .expect("advance finite pending deadline");
+            assert_eq!(observed.generation(), continuity.generation());
+            synchronize_blob_policy_generation_write(&write)
+                .expect("synchronize finite pending policy");
+            write.commit().expect("commit finite pending deadline");
+        }
+        let variant = proof.completion.variant_id();
+        let lease = target
+            .test_acquire_blob_lease(variant, lease::BlobLeaseKind::ApplicationPageRead)
+            .expect("active finite pending lease");
+        let recovery = target
+            .run_blob_pressure_recovery(
+                pressure::BlobCapacityRecoveryDemand::new(
+                    pressure::BlobCapacityPartition::NetworkStagingRows,
+                    Priority::Immediate,
+                    1,
+                )
+                .expect("finite pending pressure demand"),
+                pressure::BlobPressureRecoveryBudget::new(
+                    MAX_BLOB_PRESSURE_FINAL_ROOT_ROWS,
+                    MAX_BLOB_PRESSURE_FINAL_ROOT_BYTES,
+                    1,
+                    1,
+                    0,
+                )
+                .expect("finite pending pressure budget"),
+                None,
+            )
+            .expect("finite pending pressure recovery");
+        assert_eq!(recovery.evicted_transfer_ids(), &[transfer]);
+        assert_eq!(recovery.recovered_units(), 1);
+        assert!(recovery.deficit_met());
+        assert!(target.pending_blob_source(transfer).unwrap().is_none());
+        {
+            let read = target.database.begin_read().unwrap();
+            assert!(
+                !deletion::variant_has_deletion_manifest_read(&read, variant)
+                    .expect("finite pending manifest before maintenance")
+            );
+        }
+        drop(lease);
+        drop(source);
+        drop(target);
+
+        let reopened = Store::open_for_mission(&target_root.database, services.authority)
+            .expect("reopen finite pending retirement");
+        assert!(reopened.pending_blob_source(transfer).unwrap().is_none());
+        {
+            let read = reopened.database.begin_read().unwrap();
+            assert!(
+                !deletion::variant_has_deletion_manifest_read(&read, variant)
+                    .expect("reopened finite pending manifest before maintenance")
+            );
+        }
+        drive_maintenance_class_until(
+            &reopened,
+            lifecycle::BlobMaintenanceClass::UnreferencedLocalImportStaging,
+            Some(deadline),
+            |store| {
+                let read = store
+                    .database
+                    .begin_read()
+                    .expect("later pending manifest read");
+                deletion::variant_has_deletion_manifest_read(&read, variant)
+                    .expect("later pending manifest state")
+            },
+        )
+        .expect("later finite pending manifest admission");
+    }
+
+    #[test]
     fn blob_pressure_final_root_is_lease_fenced_and_commits_deletion_manifest() {
         // Break caught: retiring a final root before fencing readers leaves a
         // live lease over deleting files, while retiring without a manifest
@@ -36000,9 +41825,90 @@ mod tests {
                 &carrier.bytes()[..carrier.bytes().len().min(MAX_BLOB_NETWORK_RANGE_BYTES)],
             )
             .expect("append pressure carrier prefix");
+        // Reproduce the valid crash boundary after the depot chunk commits
+        // but before the redb prefix cleanup commits. Pressure progress sees
+        // the durable chunk; pending removal must still charge and remove the
+        // surviving prefix row.
+        {
+            let mut depot = BlobDepot::open_network_mutation(&target, false)
+                .expect("open crash-shape target depot");
+            CoreBlobStore::begin_blob_with_lineage(
+                &mut depot,
+                plan.manifest(),
+                plan.physical_lineage(),
+            )
+            .expect("activate crash-shape target plan");
+            let verified = plan
+                .verify_carrier(object.as_bytes(), carrier.bytes())
+                .expect("verify crash-shape carrier");
+            plan.install_verified_carrier(&mut depot, &verified)
+                .expect("commit crash-shape carrier without prefix cleanup");
+            CoreBlobStore::finalize_blob(&mut depot, plan.manifest().id(), *plan.manifest_digest())
+                .expect("finalize crash-shape target variant");
+        }
         let before = target.blob_stats().expect("before staging pressure stats");
         assert_eq!(before.pending_sources, 1);
         assert_eq!(before.carrier_prefixes, 1);
+
+        let pending = {
+            let read = target.database.begin_read().unwrap();
+            let encoded = read
+                .open_table(BLOB_PENDING_SOURCES)
+                .unwrap()
+                .get(transfer.as_bytes().as_slice())
+                .unwrap()
+                .unwrap()
+                .value()
+                .to_vec();
+            decode_pending_blob_source(&encoded).unwrap()
+        };
+        let (exact_rows, exact_bytes) = {
+            let write = target.database.begin_write().unwrap();
+            let mut charge = MaintenanceCharge::new(
+                lifecycle::BlobMaintenanceBudget::new(u64::MAX, 1, u64::MAX).unwrap(),
+                0,
+                0,
+            );
+            let authority = plan_pending_removal_authority_write(
+                &write,
+                services.authority,
+                transfer,
+                &pending,
+                &mut charge,
+            )
+            .unwrap()
+            .expect("exact crash-shape pending-removal authority");
+            assert_eq!(authority.prefixes.len(), 1);
+            assert!(charge.identities.contains_key(&MaintenanceRowIdentity::new(
+                "aster.pending-blob-carrier-prefixes.v1",
+                blob_carrier_prefix_key(transfer, object),
+            )));
+            (charge.rows, charge.bytes)
+        };
+        assert_eq!(
+            exact_rows, 5,
+            "pending row, retained prefix, and three staging metadata rows"
+        );
+        let before_short = blob_complete_logical_digest(&target);
+        for budget in [
+            lifecycle::BlobMaintenanceBudget::new(exact_rows - 1, 1, exact_bytes).unwrap(),
+            lifecycle::BlobMaintenanceBudget::new(exact_rows, 1, exact_bytes - 1).unwrap(),
+        ] {
+            let write = target.database.begin_write().unwrap();
+            let mut charge = MaintenanceCharge::new(budget, 0, 0);
+            assert!(
+                plan_pending_removal_authority_write(
+                    &write,
+                    services.authority,
+                    transfer,
+                    &pending,
+                    &mut charge,
+                )
+                .unwrap()
+                .is_none()
+            );
+        }
+        assert_eq!(blob_complete_logical_digest(&target), before_short);
 
         let recovered = target
             .run_blob_pressure_recovery(
@@ -36574,7 +42480,7 @@ mod tests {
         assert!(recovery.evicted_transfer_ids().is_empty());
         assert_eq!(
             recovery.rows_examined(),
-            5,
+            4,
             "two selection rows, the selected publication, and root plus-one proof"
         );
         assert_eq!(blob_complete_logical_digest(&store), before);

@@ -100,7 +100,7 @@ struct AdmittedFile<'a> {
     admission: &'a AtomicBool,
     max_len: u64,
     #[cfg(test)]
-    pass_two_gate: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
+    pass_two_gate: Option<LivePublishPassTwoTestGate>,
     #[cfg(test)]
     expected_len: u64,
     #[cfg(test)]
@@ -109,6 +109,12 @@ struct AdmittedFile<'a> {
     fail_retry_rewind: bool,
     #[cfg(test)]
     start_zero_seeks: u8,
+}
+
+#[cfg(test)]
+struct LivePublishPassTwoTestGate {
+    reached: std::sync::mpsc::SyncSender<()>,
+    release: std::sync::mpsc::Receiver<()>,
 }
 
 struct LivePublishContext<'a> {
@@ -166,12 +172,24 @@ impl Read for AdmittedFile<'_> {
                     .expected_len
                     .saturating_add(u64::from(SELECTED_BLOB_CHUNK_SIZE))
         {
-            let (reached, release) = self
+            let gate = self
                 .pass_two_gate
                 .take()
                 .expect("present live Blob pass-two gate");
-            reached.wait();
-            release.wait();
+            gate.reached.send(()).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "live Blob pass-two observer stopped",
+                )
+            })?;
+            gate.release
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .map_err(|error| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("live Blob pass-two release deadline: {error}"),
+                    )
+                })?;
         }
         if output.is_empty() {
             return Ok(0);
@@ -1200,7 +1218,7 @@ pub struct SelectedBlobNode {
     #[cfg(test)]
     final_read_gate: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
     #[cfg(test)]
-    live_publish_pass_two_gate: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
+    live_publish_pass_two_gate: Option<LivePublishPassTwoTestGate>,
     #[cfg(test)]
     live_publish_retry_rewind_failure: bool,
     #[cfg(test)]
@@ -1374,10 +1392,10 @@ impl SelectedBlobNode {
     #[cfg(test)]
     fn set_live_publish_pass_two_gate(
         &mut self,
-        reached: Arc<std::sync::Barrier>,
-        release: Arc<std::sync::Barrier>,
+        reached: std::sync::mpsc::SyncSender<()>,
+        release: std::sync::mpsc::Receiver<()>,
     ) {
-        self.live_publish_pass_two_gate = Some((reached, release));
+        self.live_publish_pass_two_gate = Some(LivePublishPassTwoTestGate { reached, release });
     }
 
     #[cfg(test)]
@@ -4046,6 +4064,36 @@ mod tests {
             .expect("open selected Blob node")
     }
 
+    fn prime_blob_policy_for_pressure(node: &SelectedBlobNode) {
+        const BLOB_MAINTENANCE_CLASSES: u64 = 6;
+        const POLICY_SETUP_AND_COMPLETION_UNITS: u64 = 6;
+        let stats = node.store.blob_stats().expect("pressure priming stats");
+        let root_count = stats
+            .publications
+            .checked_add(stats.pending_sources)
+            .expect("pressure priming root count fits u64");
+        let bound = BLOB_MAINTENANCE_CLASSES
+            .checked_mul(
+                root_count
+                    .checked_add(POLICY_SETUP_AND_COMPLETION_UNITS)
+                    .expect("pressure priming unit count fits u64"),
+            )
+            .expect("pressure priming turn bound fits u64");
+        let sample = node
+            .custody_clock
+            .sample()
+            .expect("sample pressure priming custody clock");
+        for _ in 0..bound {
+            node.store
+                .run_blob_maintenance_turn_with_sample(
+                    BlobMaintenanceBudget::new(64, 16, 128 * 1024 * 1024)
+                        .expect("pressure priming maintenance budget"),
+                    Some(sample),
+                )
+                .expect("prime Blob policy before pressure retry");
+        }
+    }
+
     fn selected_node_with_lifecycle_limits_and_clock(
         root: &TestRoot,
         limits: aster_redb_store::BlobLifecycleLimits,
@@ -5223,6 +5271,7 @@ mod tests {
             node.source_route_cache.has_blob_claim_for_test(evicted),
             "completed fixture starts with an authenticated cache claim"
         );
+        prime_blob_policy_for_pressure(&node);
         let attempts_before = node.publish_attempts;
         let mut incoming = request(b"blob/local-pressure/high");
         incoming.priority = Priority::Flash;
@@ -5267,6 +5316,7 @@ mod tests {
         node.publish(low, &mut Cursor::new(vec![0x33; 128]))
             .expect("publish one-chunk lower-priority fixture");
         let evicted = node.store.blob_inventory().expect("low inventory")[0];
+        prime_blob_policy_for_pressure(&node);
         let attempts_before = node.publish_attempts;
         let mut incoming = request(b"blob/local-pressure/exact-chunk-high");
         incoming.priority = Priority::Flash;
@@ -5305,6 +5355,7 @@ mod tests {
         node.publish(low, &mut Cursor::new(vec![0x81; 128]))
             .expect("publish actual-plan fixture");
         let evicted = node.store.blob_inventory().expect("fixture inventory")[0];
+        prime_blob_policy_for_pressure(&node);
         node.injected_capacity_failures
             .push_back(StoreError::ItemLimitExceeded {
                 current: 1,
@@ -5338,6 +5389,7 @@ mod tests {
         low.priority = Priority::Routine;
         node.publish(low, &mut Cursor::new(vec![0x83; 128]))
             .expect("publish second-invariant fixture");
+        prime_blob_policy_for_pressure(&node);
         node.injected_capacity_failures.extend([
             StoreError::ItemLimitExceeded {
                 current: 1,
@@ -5380,6 +5432,7 @@ mod tests {
         node.publish(low, &mut Cursor::new(vec![0x35; 128]))
             .expect("publish stateful lower-priority fixture");
         let low = node.store.blob_inventory().expect("stateful low inventory")[0];
+        prime_blob_policy_for_pressure(&node);
         let attempts_before = node.publish_attempts;
         let mut incoming = request(b"blob/local-pressure/stateful-incoming");
         incoming.priority = Priority::Flash;
@@ -5468,17 +5521,20 @@ mod tests {
             .store
             .blob_inventory()
             .expect("live identity inventory")[0];
+        prime_blob_policy_for_pressure(&node);
         let source_path = root.path().join("live-pressure-change.bin");
         let bytes = vec![0x3b; SELECTED_BLOB_CHUNK_SIZE as usize + 17];
         fs::write(&source_path, &bytes).expect("write live pressure source");
         let source = fs::File::open(&source_path).expect("open live pressure source");
-        let reached = Arc::new(std::sync::Barrier::new(2));
-        let release = Arc::new(std::sync::Barrier::new(2));
-        node.set_live_publish_pass_two_gate(Arc::clone(&reached), Arc::clone(&release));
+        let (reached_sender, reached_receiver) = std::sync::mpsc::sync_channel(1);
+        let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(1);
+        node.set_live_publish_pass_two_gate(reached_sender, release_receiver);
         let mutate_path = source_path.clone();
         let changed_offset = u64::from(SELECTED_BLOB_CHUNK_SIZE) + 7;
         let mutator = std::thread::spawn(move || {
-            reached.wait();
+            reached_receiver
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("live pressure retry reaches pass-two mutation gate");
             let mut file = fs::OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -5488,7 +5544,9 @@ mod tests {
                 .expect("seek live retry mutation");
             file.write_all(&[0x3c]).expect("mutate live retry source");
             file.sync_data().expect("sync live retry mutation");
-            release.wait();
+            release_sender
+                .send(())
+                .expect("release live pressure pass-two retry");
         });
         let attempts_before = node.publish_attempts;
         let mut incoming = request(b"blob/live-pressure/identity-incoming");
@@ -5685,6 +5743,7 @@ mod tests {
             .parent()
             .expect("physical-failure variant directory")
             .to_path_buf();
+        prime_blob_policy_for_pressure(&node);
         fs::set_permissions(&variant_directory, fs::Permissions::from_mode(0o500))
             .expect("make variant directory non-writable");
         let attempts_before = node.publish_attempts;
@@ -5819,7 +5878,29 @@ mod tests {
             clock_id,
             tick_ms: retirement_tick,
         };
-        for _ in 0..8 {
+        const BLOB_MAINTENANCE_CLASSES: u64 = 6;
+        const POLICY_SETUP_AND_COMPLETION_UNITS: u64 = 6;
+        let initial_stats = node
+            .store
+            .blob_stats()
+            .expect("pre-retirement lifecycle-capacity stats");
+        let finite_root_count = initial_stats
+            .publications
+            .checked_add(initial_stats.pending_sources)
+            .expect("finite root count fits u64");
+        assert_eq!(finite_root_count, 1, "fixture has one finite root");
+        let maintenance_turn_bound = BLOB_MAINTENANCE_CLASSES
+            .checked_mul(
+                finite_root_count
+                    .checked_add(POLICY_SETUP_AND_COMPLETION_UNITS)
+                    .expect("policy unit count fits u64"),
+            )
+            .expect("maintenance turn bound fits u64");
+        let mut retained_status = node
+            .store
+            .blob_gc_status(Some(retired_at))
+            .expect("initial lifecycle-capacity status");
+        for _ in 0..maintenance_turn_bound {
             node.store
                 .run_blob_maintenance_turn_with_sample(
                     BlobMaintenanceBudget::new(64, 16, 128 * 1024 * 1024)
@@ -5827,23 +5908,17 @@ mod tests {
                     Some(retired_at),
                 )
                 .expect("retire stale lifecycle-capacity publication");
-            if node
+            retained_status = node
                 .store
                 .blob_gc_status(Some(retired_at))
-                .expect("retired lifecycle-capacity status")
-                .retained_publication_records
-                == 1
-            {
+                .expect("retired lifecycle-capacity status");
+            if retained_status.retained_publication_records == 1 {
                 break;
             }
         }
         assert_eq!(
-            node.store
-                .blob_gc_status(Some(retired_at))
-                .expect("retained lifecycle-capacity status")
-                .retained_publication_records,
-            1,
-            "the publication cap is occupied by one due retired record"
+            retained_status.retained_publication_records, 1,
+            "the publication cap is occupied by one due retired record after at most {maintenance_turn_bound} turns; final status: {retained_status:?}"
         );
         let error = node
             .publish(
@@ -6238,21 +6313,23 @@ mod tests {
         let bytes = payload(2 * SELECTED_BLOB_CHUNK_SIZE as usize + 31);
         fs::write(&source_path, &bytes).expect("write mutable live source");
         let source = fs::File::open(&source_path).expect("open mutable live source");
-        let reached = Arc::new(std::sync::Barrier::new(2));
-        let release = Arc::new(std::sync::Barrier::new(2));
+        let (reached_sender, reached_receiver) = std::sync::mpsc::sync_channel(1);
+        let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(1);
         let mut node = SelectedBlobNode::open_unprotected_reference_with_options(
             root.path(),
             root.mission_path(),
             options,
         )
         .expect("open bounded live Blob node");
-        node.set_live_publish_pass_two_gate(Arc::clone(&reached), Arc::clone(&release));
+        node.set_live_publish_pass_two_gate(reached_sender, release_receiver);
 
         let mutate_path = source_path.clone();
         let changed_offset = u64::from(SELECTED_BLOB_CHUNK_SIZE) + 17;
         let changed_byte = bytes[usize::try_from(changed_offset).expect("mutation offset")] ^ 0x80;
         let mutator = std::thread::spawn(move || {
-            reached.wait();
+            reached_receiver
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("live publish reaches pass-two mutation gate");
             let mut file = fs::OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -6263,7 +6340,9 @@ mod tests {
             file.write_all(&[changed_byte])
                 .expect("mutate later plaintext chunk");
             file.sync_data().expect("sync later plaintext mutation");
-            release.wait();
+            release_sender
+                .send(())
+                .expect("release live publish pass-two retry");
         });
 
         let error = node

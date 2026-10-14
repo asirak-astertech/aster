@@ -7,6 +7,7 @@ use redb::{
 use sha2::{Digest, Sha256};
 
 use super::{BlobSemanticId, BlobStoreError, BlobStoreStats, BlobTransferId, StoreError, depot};
+use crate::custody;
 
 #[cfg(test)]
 thread_local! {
@@ -151,13 +152,21 @@ pub(crate) const BLOB_DELIVERY_OWNERS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.blob-delivery-owners.v1");
 pub(crate) const BLOB_RETENTION_DEADLINES: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.blob-retention-deadlines.v1");
+pub(crate) const BLOB_TTL_DEADLINES: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("aster.blob-ttl-deadlines.v1");
+pub(crate) const BLOB_TTL_EXPIRY_CURSORS: TableDefinition<u8, &[u8]> =
+    TableDefinition::new("aster.blob-ttl-expiry-cursors.v1");
 /// Exact point-resolution authority for every retained publication and
 /// operation, including records created before a custody clock is available.
 pub(crate) const BLOB_RETIREMENT_RESOLVERS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.blob-retirement-resolvers.v1");
 
 const BLOB_LIFECYCLE_SCHEMA_VERSION_FIELD: &str = "schema_version";
-const BLOB_LIFECYCLE_SCHEMA_VERSION: u64 = 4;
+// Ordinary store opens remain on the fully maintained v4 authority until all
+// Task-4 mutation, retirement and maintenance paths can maintain v5 atomically.
+const ACTIVE_BLOB_LIFECYCLE_SCHEMA_VERSION: u64 = 5;
+const PREVIOUS_BLOB_LIFECYCLE_SCHEMA_VERSION: u64 = 4;
+const BLOB_LIFECYCLE_SCHEMA_VERSION: u64 = 5;
 const BLOB_LINEAGE_ROWS: &str = "lineage_rows";
 const BLOB_LINEAGE_BYTES: &str = "lineage_bytes";
 const BLOB_REPLAY_ROWS: &str = "replay_rows";
@@ -167,11 +176,12 @@ const BLOB_REFERENCE_ROWS: &str = "reference_rows";
 const BLOB_OPERATION_OWNER_ROWS: &str = "operation_owner_rows";
 const BLOB_DELIVERY_OWNER_ROWS: &str = "delivery_owner_rows";
 const BLOB_DEADLINE_ROWS: &str = "deadline_rows";
+const BLOB_TTL_DEADLINE_ROWS: &str = "ttl_deadline_rows";
 const BLOB_RETIREMENT_RESOLVER_ROWS: &str = "retirement_resolver_rows";
 const BLOB_RETIRED_PUBLICATION_ROWS: &str = "retired_publication_rows";
 const BLOB_RETIRED_OPERATION_ROWS: &str = "retired_operation_rows";
 const BLOB_NEXT_RETIREMENT_GENERATION: &str = "next_retirement_generation";
-const BLOB_LIFECYCLE_METADATA_FIELDS: [&str; 14] = [
+const BLOB_LIFECYCLE_V4_METADATA_FIELDS: [&str; 14] = [
     BLOB_LIFECYCLE_SCHEMA_VERSION_FIELD,
     BLOB_LINEAGE_ROWS,
     BLOB_LINEAGE_BYTES,
@@ -182,6 +192,23 @@ const BLOB_LIFECYCLE_METADATA_FIELDS: [&str; 14] = [
     BLOB_OPERATION_OWNER_ROWS,
     BLOB_DELIVERY_OWNER_ROWS,
     BLOB_DEADLINE_ROWS,
+    BLOB_RETIREMENT_RESOLVER_ROWS,
+    BLOB_RETIRED_PUBLICATION_ROWS,
+    BLOB_RETIRED_OPERATION_ROWS,
+    BLOB_NEXT_RETIREMENT_GENERATION,
+];
+const BLOB_LIFECYCLE_METADATA_FIELDS: [&str; 15] = [
+    BLOB_LIFECYCLE_SCHEMA_VERSION_FIELD,
+    BLOB_LINEAGE_ROWS,
+    BLOB_LINEAGE_BYTES,
+    BLOB_REPLAY_ROWS,
+    BLOB_REPLAY_BYTES,
+    BLOB_PUBLICATION_ROWS,
+    BLOB_REFERENCE_ROWS,
+    BLOB_OPERATION_OWNER_ROWS,
+    BLOB_DELIVERY_OWNER_ROWS,
+    BLOB_DEADLINE_ROWS,
+    BLOB_TTL_DEADLINE_ROWS,
     BLOB_RETIREMENT_RESOLVER_ROWS,
     BLOB_RETIRED_PUBLICATION_ROWS,
     BLOB_RETIRED_OPERATION_ROWS,
@@ -257,6 +284,1096 @@ pub(crate) enum RetirementReason {
     Expired,
     Invalidated,
     Evicted,
+}
+
+const TTL_DEADLINE_VERSION: u8 = 1;
+const TTL_DEADLINE_KEY_BYTES: usize = 1 + 8 + 16 + 1 + 8 + 32;
+const TTL_EXPIRY_CYCLE_VERSION: u8 = 1;
+const TTL_EXPIRY_CYCLE_IDLE: u8 = 0;
+const TTL_EXPIRY_CYCLE_ACTIVE: u8 = 1;
+const TTL_EXPIRY_CYCLE_NO_POSITION: u8 = 0;
+const TTL_EXPIRY_CYCLE_POSITION: u8 = 1;
+const TTL_EXPIRY_NEXT_PHASE_KEY: u8 = 0;
+const TTL_EXPIRY_LIVE_CYCLE_KEY: u8 = 1;
+const TTL_EXPIRY_PENDING_CYCLE_KEY: u8 = 2;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TtlDeadlineKind {
+    LivePublication,
+    PendingSource,
+}
+
+impl TtlDeadlineKind {
+    pub(crate) const fn tag(self) -> u8 {
+        match self {
+            Self::LivePublication => 1,
+            Self::PendingSource => 2,
+        }
+    }
+
+    fn decode(tag: u8) -> Result<Self, StoreError> {
+        match tag {
+            1 => Ok(Self::LivePublication),
+            2 => Ok(Self::PendingSource),
+            _ => Err(cursor_invariant(
+                "Blob TTL deadline has an unknown root kind",
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TtlDeadline {
+    pub(crate) generation: u64,
+    pub(crate) deadline: CustodySample,
+    pub(crate) kind: TtlDeadlineKind,
+    pub(crate) transfer: BlobTransferId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TtlExpiryCycle {
+    pub(crate) end_key: [u8; TTL_DEADLINE_KEY_BYTES],
+    pub(crate) position: Option<[u8; TTL_DEADLINE_KEY_BYTES]>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TtlExpiryPhase {
+    Live,
+    Pending,
+}
+
+impl TtlExpiryPhase {
+    const fn tag(self) -> u8 {
+        match self {
+            Self::Live => 1,
+            Self::Pending => 2,
+        }
+    }
+
+    const fn cycle_key(self) -> u8 {
+        match self {
+            Self::Live => TTL_EXPIRY_LIVE_CYCLE_KEY,
+            Self::Pending => TTL_EXPIRY_PENDING_CYCLE_KEY,
+        }
+    }
+
+    const fn next(self) -> Self {
+        match self {
+            Self::Live => Self::Pending,
+            Self::Pending => Self::Live,
+        }
+    }
+
+    fn decode(tag: u8) -> Result<Self, StoreError> {
+        match tag {
+            1 => Ok(Self::Live),
+            2 => Ok(Self::Pending),
+            _ => Err(cursor_invariant("Blob TTL expiry phase is unknown")),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TtlExpiryState {
+    pub(crate) next_phase: TtlExpiryPhase,
+    pub(crate) live: Option<TtlExpiryCycle>,
+    pub(crate) pending: Option<TtlExpiryCycle>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TtlExpiryTurn {
+    pub(crate) deadline: Option<TtlDeadline>,
+    captured_end_key: Option<[u8; TTL_DEADLINE_KEY_BYTES]>,
+    observed_other_cycle: bool,
+    other_probe_key: Option<[u8; TTL_DEADLINE_KEY_BYTES]>,
+    phase: TtlExpiryPhase,
+    next_cycle: Option<TtlExpiryCycle>,
+}
+
+pub(crate) fn ttl_deadline_key(
+    deadline: TtlDeadline,
+) -> Result<[u8; TTL_DEADLINE_KEY_BYTES], StoreError> {
+    if deadline.generation == 0 || deadline.deadline.clock_id == [0; 16] {
+        return Err(cursor_invariant(
+            "Blob TTL deadline has invalid continuity authority",
+        ));
+    }
+    let mut key = [0u8; TTL_DEADLINE_KEY_BYTES];
+    key[0] = TTL_DEADLINE_VERSION;
+    key[1..9].copy_from_slice(&deadline.generation.to_be_bytes());
+    key[9..25].copy_from_slice(&deadline.deadline.clock_id);
+    key[25] = deadline.kind.tag();
+    key[26..34].copy_from_slice(&deadline.deadline.tick_ms.to_be_bytes());
+    key[34..].copy_from_slice(deadline.transfer.as_bytes());
+    Ok(key)
+}
+
+pub(crate) fn ttl_deadline_for_lifetime(
+    transfer: BlobTransferId,
+    kind: TtlDeadlineKind,
+    lifetime: super::BlobLifetime,
+    continuity: Option<super::custody::LowerBoundContinuity>,
+    sample: Option<CustodySample>,
+) -> Result<Option<TtlDeadline>, StoreError> {
+    let deadline = match super::evaluate_blob_lifetime(lifetime, continuity, sample)? {
+        super::BlobLifetimeEvaluation::Durable
+        | super::BlobLifetimeEvaluation::FiniteExpired { .. } => None,
+        super::BlobLifetimeEvaluation::FiniteLive { deadline, .. } => Some(deadline),
+        super::BlobLifetimeEvaluation::FiniteIndeterminate { deadline, .. } => deadline,
+    };
+    deadline
+        .map(|deadline| {
+            let continuity = continuity
+                .ok_or_else(|| cursor_invariant("Blob TTL deadline lacks continuity authority"))?;
+            if deadline.clock_id != continuity.sample.clock_id {
+                return Err(cursor_invariant(
+                    "Blob TTL deadline differs from its continuity authority",
+                ));
+            }
+            Ok(TtlDeadline {
+                generation: continuity.generation,
+                deadline,
+                kind,
+                transfer,
+            })
+        })
+        .transpose()
+}
+
+fn project_lifetime_for_v5(
+    lifetime: super::BlobLifetime,
+    continuity: Option<custody::LowerBoundContinuity>,
+) -> Result<super::BlobLifetime, StoreError> {
+    let super::BlobLifetime::Finite {
+        ttl_ms,
+        age,
+        provenance,
+    } = lifetime
+    else {
+        return Ok(super::BlobLifetime::Durable);
+    };
+    let sample = continuity.map(|authority| authority.sample);
+    // Keep the shared evaluator as the overflow/canonicality authority, then
+    // persist the exact checkpoint projection from which v5 indexes derive.
+    let _ = super::evaluate_blob_lifetime(lifetime, continuity, sample)?;
+    Ok(super::BlobLifetime::Finite {
+        ttl_ms,
+        age: custody::project_lower_bound_age(age, continuity, sample),
+        provenance,
+    })
+}
+
+fn lifecycle_v5_enabled_write(write: &redb::WriteTransaction) -> Result<bool, StoreError> {
+    #[cfg(test)]
+    if TEST_BLOB_LIFECYCLE_MIGRATION_DISABLED.get() {
+        return Ok(false);
+    }
+    let version = write
+        .open_table(BLOB_LIFECYCLE_METADATA)?
+        .get(BLOB_LIFECYCLE_SCHEMA_VERSION_FIELD)?
+        .map(|value| value.value())
+        .ok_or_else(|| cursor_invariant("Blob lifecycle schema version is missing"))?;
+    match version {
+        BLOB_LIFECYCLE_SCHEMA_VERSION => Ok(true),
+        1 | 2 | 3 | PREVIOUS_BLOB_LIFECYCLE_SCHEMA_VERSION => Ok(false),
+        _ => Err(cursor_invariant("Blob lifecycle schema version is unknown")),
+    }
+}
+
+pub(crate) fn project_lifetime_for_policy_write(
+    write: &redb::WriteTransaction,
+    lifetime: super::BlobLifetime,
+) -> Result<super::BlobLifetime, StoreError> {
+    if !lifecycle_v5_enabled_write(write)? {
+        return Ok(lifetime);
+    }
+    project_lifetime_for_v5(lifetime, custody::lower_bound_continuity_write(write)?)
+}
+
+pub(crate) fn project_lifetime_for_policy_read(
+    read: &redb::ReadTransaction,
+    lifetime: super::BlobLifetime,
+) -> Result<super::BlobLifetime, StoreError> {
+    let version = read
+        .open_table(BLOB_LIFECYCLE_METADATA)?
+        .get(BLOB_LIFECYCLE_SCHEMA_VERSION_FIELD)?
+        .map(|value| value.value())
+        .ok_or_else(|| cursor_invariant("Blob lifecycle schema version is missing"))?;
+    if version != BLOB_LIFECYCLE_SCHEMA_VERSION {
+        return Ok(lifetime);
+    }
+    project_lifetime_for_v5(lifetime, custody::lower_bound_continuity_read(read)?)
+}
+
+pub(crate) fn replace_policy_ttl_deadline_write(
+    write: &redb::WriteTransaction,
+    transfer: BlobTransferId,
+    kind: TtlDeadlineKind,
+    old_lifetime: Option<super::BlobLifetime>,
+    new_lifetime: Option<super::BlobLifetime>,
+    limits: BlobLifecycleLimits,
+) -> Result<(), StoreError> {
+    if !lifecycle_v5_enabled_write(write)? {
+        return Ok(());
+    }
+    let max_rows = limits
+        .max_publication_rows()
+        .checked_add(super::MAX_BLOB_NETWORK_STAGING_ROWS)
+        .ok_or(StoreError::ItemCountAccountingOverflow)?;
+    replace_ttl_deadline_write(write, transfer, kind, old_lifetime, new_lifetime, max_rows)
+}
+
+/// Atomically moves one finite deadline between pending and live root classes
+/// without transiently consuming a second row at the exact combined cap.
+pub(crate) fn move_policy_ttl_deadline_kind_write(
+    write: &redb::WriteTransaction,
+    transfer: BlobTransferId,
+    lifetime: super::BlobLifetime,
+    from: TtlDeadlineKind,
+    to: TtlDeadlineKind,
+) -> Result<(), StoreError> {
+    if !lifecycle_v5_enabled_write(write)? || from == to {
+        return Ok(());
+    }
+    let old = stored_ttl_deadline(transfer, from, lifetime)?;
+    let new = stored_ttl_deadline(transfer, to, lifetime)?;
+    match (old, new) {
+        (None, None) => Ok(()),
+        (Some(old), Some(new)) => {
+            let old_key = ttl_deadline_key(old)?;
+            let new_key = ttl_deadline_key(new)?;
+            let deadlines = write.open_table(BLOB_TTL_DEADLINES)?;
+            let old_value = deadlines
+                .get(old_key.as_slice())?
+                .ok_or_else(|| cursor_invariant("Blob TTL deadline predecessor is missing"))?;
+            if !old_value.value().is_empty() || deadlines.get(new_key.as_slice())?.is_some() {
+                return Err(cursor_invariant(
+                    "Blob TTL deadline kind move is contradictory",
+                ));
+            }
+            drop(old_value);
+            drop(deadlines);
+            let mut deadlines = write.open_table(BLOB_TTL_DEADLINES)?;
+            deadlines.remove(old_key.as_slice())?;
+            deadlines.insert(new_key.as_slice(), &[] as &[u8])?;
+            Ok(())
+        }
+        _ => Err(cursor_invariant(
+            "Blob TTL deadline kind move changed finite indexability",
+        )),
+    }
+}
+
+/// Preflights every dedicated TTL authority row changed by one lifetime
+/// replacement.  Successor keys are charged separately because inserting the
+/// new ordered row is an independent bounded write.
+pub(crate) fn charge_policy_ttl_deadline_write(
+    transfer: BlobTransferId,
+    kind: TtlDeadlineKind,
+    old_lifetime: Option<super::BlobLifetime>,
+    new_lifetime: Option<super::BlobLifetime>,
+    charge: &mut super::MaintenanceCharge,
+) -> Result<bool, StoreError> {
+    charge_policy_ttl_deadline_write_with_counter(
+        transfer,
+        kind,
+        old_lifetime,
+        new_lifetime,
+        true,
+        charge,
+    )
+}
+
+pub(crate) fn charge_policy_ttl_deadline_write_with_counter(
+    transfer: BlobTransferId,
+    kind: TtlDeadlineKind,
+    old_lifetime: Option<super::BlobLifetime>,
+    new_lifetime: Option<super::BlobLifetime>,
+    charge_counter: bool,
+    charge: &mut super::MaintenanceCharge,
+) -> Result<bool, StoreError> {
+    let old_key = old_lifetime
+        .map(|lifetime| stored_ttl_deadline(transfer, kind, lifetime))
+        .transpose()?
+        .flatten()
+        .map(ttl_deadline_key)
+        .transpose()?;
+    let new_key = new_lifetime
+        .map(|lifetime| stored_ttl_deadline(transfer, kind, lifetime))
+        .transpose()?
+        .flatten()
+        .map(ttl_deadline_key)
+        .transpose()?;
+    if old_key == new_key {
+        return Ok(true);
+    }
+    if let Some(old_key) = old_key
+        && !charge.charge_row(
+            super::MaintenanceRowIdentity::new("aster.blob-ttl-deadlines.v1", old_key.as_slice()),
+            0,
+        )?
+    {
+        return Ok(false);
+    }
+    if let Some(new_key) = new_key
+        && !charge.charge_row(
+            super::MaintenanceRowIdentity::new("aster.blob-ttl-deadlines.v1", new_key.as_slice()),
+            0,
+        )?
+    {
+        return Ok(false);
+    }
+    if charge_counter {
+        charge_ttl_deadline_counter(charge)
+    } else {
+        Ok(true)
+    }
+}
+
+pub(crate) fn charge_ttl_deadline_counter(
+    charge: &mut super::MaintenanceCharge,
+) -> Result<bool, StoreError> {
+    charge.charge_row(
+        super::MaintenanceRowIdentity::new(
+            "aster.blob-lifecycle-metadata.v1",
+            BLOB_TTL_DEADLINE_ROWS.as_bytes(),
+        ),
+        std::mem::size_of::<u64>(),
+    )
+}
+
+/// Preflights the selected cycle row and alternating-phase row advanced by a
+/// completed expiry unit.
+pub(crate) fn charge_ttl_expiry_turn_write(
+    write: &redb::WriteTransaction,
+    turn: TtlExpiryTurn,
+    charge: &mut super::MaintenanceCharge,
+) -> Result<bool, StoreError> {
+    let cursors = write.open_table(BLOB_TTL_EXPIRY_CURSORS)?;
+    let cycle = cursors
+        .get(turn.phase.cycle_key())?
+        .ok_or_else(|| cursor_invariant("Blob TTL expiry cycle is missing"))?;
+    if !charge.charge_row(
+        super::MaintenanceRowIdentity::new(
+            "aster.blob-ttl-expiry-cursors.v1",
+            [turn.phase.cycle_key()],
+        ),
+        cycle.value().len(),
+    )? {
+        return Ok(false);
+    }
+    let phase = cursors
+        .get(TTL_EXPIRY_NEXT_PHASE_KEY)?
+        .ok_or_else(|| cursor_invariant("Blob TTL expiry phase is missing"))?;
+    if !charge.charge_row(
+        super::MaintenanceRowIdentity::new(
+            "aster.blob-ttl-expiry-cursors.v1",
+            [TTL_EXPIRY_NEXT_PHASE_KEY],
+        ),
+        phase.value().len(),
+    )? {
+        return Ok(false);
+    }
+    if turn.observed_other_cycle {
+        let other = cursors
+            .get(turn.phase.next().cycle_key())?
+            .ok_or_else(|| cursor_invariant("Blob TTL other expiry cycle is missing"))?;
+        if !charge.charge_row(
+            super::MaintenanceRowIdentity::new(
+                "aster.blob-ttl-expiry-cursors.v1",
+                [turn.phase.next().cycle_key()],
+            ),
+            other.value().len(),
+        )? {
+            return Ok(false);
+        }
+    }
+    if let Some(key) = turn.other_probe_key
+        && !charge.charge_row(
+            super::MaintenanceRowIdentity::new("aster.blob-ttl-deadlines.v1", key),
+            0,
+        )?
+    {
+        return Ok(false);
+    }
+    turn.captured_end_key.map_or(Ok(true), |key| {
+        charge.charge_row(
+            super::MaintenanceRowIdentity::new("aster.blob-ttl-deadlines.v1", key),
+            0,
+        )
+    })
+}
+
+pub(crate) fn charge_ttl_expiry_sync_state_write(
+    write: &redb::WriteTransaction,
+    charge: &mut super::MaintenanceCharge,
+) -> Result<bool, StoreError> {
+    let cursors = write.open_table(BLOB_TTL_EXPIRY_CURSORS)?;
+    for key in [
+        TTL_EXPIRY_NEXT_PHASE_KEY,
+        TTL_EXPIRY_LIVE_CYCLE_KEY,
+        TTL_EXPIRY_PENDING_CYCLE_KEY,
+    ] {
+        let value = cursors
+            .get(key)?
+            .ok_or_else(|| cursor_invariant("Blob TTL expiry synchronization row is missing"))?;
+        if !charge.charge_row(
+            super::MaintenanceRowIdentity::new("aster.blob-ttl-expiry-cursors.v1", [key]),
+            value.value().len(),
+        )? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+pub(crate) fn decode_ttl_deadline_key(key: &[u8]) -> Result<TtlDeadline, StoreError> {
+    let key: [u8; TTL_DEADLINE_KEY_BYTES] = key
+        .try_into()
+        .map_err(|_| cursor_invariant("Blob TTL deadline key has an invalid length"))?;
+    if key[0] != TTL_DEADLINE_VERSION {
+        return Err(cursor_invariant(
+            "Blob TTL deadline key has an unknown version",
+        ));
+    }
+    let deadline = TtlDeadline {
+        generation: u64::from_be_bytes(key[1..9].try_into().expect("generation bytes")),
+        deadline: CustodySample {
+            clock_id: key[9..25].try_into().expect("clock bytes"),
+            tick_ms: u64::from_be_bytes(key[26..34].try_into().expect("tick bytes")),
+        },
+        kind: TtlDeadlineKind::decode(key[25])?,
+        transfer: BlobTransferId::new(key[34..].try_into().expect("transfer bytes")),
+    };
+    if deadline.generation == 0 || deadline.deadline.clock_id == [0; 16] {
+        return Err(cursor_invariant(
+            "Blob TTL deadline key has invalid continuity authority",
+        ));
+    }
+    if ttl_deadline_key(deadline)? != key {
+        return Err(cursor_invariant("Blob TTL deadline key is not canonical"));
+    }
+    Ok(deadline)
+}
+
+pub(crate) fn insert_ttl_deadline_write(
+    write: &redb::WriteTransaction,
+    deadline: TtlDeadline,
+) -> Result<(), StoreError> {
+    let key = ttl_deadline_key(deadline)?;
+    let empty: &[u8] = &[];
+    let mut deadlines = write.open_table(BLOB_TTL_DEADLINES)?;
+    let previous = deadlines.insert(key.as_slice(), empty)?;
+    if previous.is_some_and(|value| !value.value().is_empty()) {
+        return Err(cursor_invariant("Blob TTL deadline value is not empty"));
+    }
+    Ok(())
+}
+
+fn stored_ttl_deadline(
+    transfer: BlobTransferId,
+    kind: TtlDeadlineKind,
+    lifetime: super::BlobLifetime,
+) -> Result<Option<TtlDeadline>, StoreError> {
+    super::validate_blob_lifetime(lifetime)?;
+    let super::BlobLifetime::Finite { ttl_ms, age, .. } = lifetime else {
+        return Ok(None);
+    };
+    let Some(checkpoint) = age.checkpoint else {
+        return Ok(None);
+    };
+    // Every active finite root with trusted clock authority remains indexed,
+    // including one already due but not yet retired by its bounded
+    // maintenance unit. A predecessor migration can discover an already-due
+    // root; anchoring that case at its persisted checkpoint makes it
+    // immediately selectable without inventing cross-domain elapsed time.
+    let tick_ms = if age.cumulative_age_ms >= ttl_ms {
+        checkpoint.tick_ms
+    } else {
+        checkpoint
+            .tick_ms
+            .checked_add(ttl_ms - age.cumulative_age_ms)
+            .ok_or_else(|| cursor_invariant("Blob TTL deadline arithmetic overflowed"))?
+    };
+    Ok(Some(TtlDeadline {
+        generation: age.continuity_generation,
+        deadline: CustodySample {
+            clock_id: checkpoint.clock_id,
+            tick_ms,
+        },
+        kind,
+        transfer,
+    }))
+}
+
+/// Atomically replaces the exact dedicated TTL deadline derived from one
+/// authoritative root lifetime and maintains its bounded metadata count.
+pub(crate) fn replace_ttl_deadline_write(
+    write: &redb::WriteTransaction,
+    transfer: BlobTransferId,
+    kind: TtlDeadlineKind,
+    old_lifetime: Option<super::BlobLifetime>,
+    new_lifetime: Option<super::BlobLifetime>,
+    max_rows: u64,
+) -> Result<(), StoreError> {
+    let old = old_lifetime
+        .map(|lifetime| stored_ttl_deadline(transfer, kind, lifetime))
+        .transpose()?
+        .flatten();
+    let new = new_lifetime
+        .map(|lifetime| stored_ttl_deadline(transfer, kind, lifetime))
+        .transpose()?
+        .flatten();
+    let old_key = old.map(ttl_deadline_key).transpose()?;
+    let new_key = new.map(ttl_deadline_key).transpose()?;
+
+    let metadata = write.open_table(BLOB_LIFECYCLE_METADATA)?;
+    let current = metadata
+        .get(BLOB_TTL_DEADLINE_ROWS)?
+        .map(|value| value.value())
+        .ok_or_else(|| cursor_invariant("Blob TTL deadline row count is missing"))?;
+    drop(metadata);
+    let next = current
+        .checked_sub(u64::from(old_key.is_some() && old_key != new_key))
+        .and_then(|count| count.checked_add(u64::from(new_key.is_some() && old_key != new_key)))
+        .ok_or_else(|| cursor_invariant("Blob TTL deadline row count underflows or overflows"))?;
+    if next > max_rows {
+        return Err(cursor_invariant("Blob TTL deadline row limit is exceeded"));
+    }
+
+    let deadlines = write.open_table(BLOB_TTL_DEADLINES)?;
+    if let Some(old_key) = old_key {
+        let old_value = deadlines
+            .get(old_key.as_slice())?
+            .ok_or_else(|| cursor_invariant("Blob TTL deadline predecessor is missing"))?;
+        if !old_value.value().is_empty() {
+            return Err(cursor_invariant("Blob TTL deadline value is not empty"));
+        }
+    }
+    if old_key != new_key
+        && let Some(new_key) = new_key
+        && deadlines.get(new_key.as_slice())?.is_some()
+    {
+        return Err(cursor_invariant(
+            "Blob TTL deadline successor already exists",
+        ));
+    }
+    drop(deadlines);
+
+    if old_key != new_key {
+        let mut deadlines = write.open_table(BLOB_TTL_DEADLINES)?;
+        if let Some(old_key) = old_key {
+            deadlines.remove(old_key.as_slice())?;
+        }
+        if let Some(new_key) = new_key {
+            deadlines.insert(new_key.as_slice(), &[] as &[u8])?;
+        }
+        drop(deadlines);
+        write
+            .open_table(BLOB_LIFECYCLE_METADATA)?
+            .insert(BLOB_TTL_DEADLINE_ROWS, next)?;
+    }
+    Ok(())
+}
+
+fn ttl_deadline_range_key(
+    generation: u64,
+    sample: CustodySample,
+    kind: TtlDeadlineKind,
+    transfer: [u8; 32],
+) -> Result<[u8; TTL_DEADLINE_KEY_BYTES], StoreError> {
+    ttl_deadline_key(TtlDeadline {
+        generation,
+        deadline: sample,
+        kind,
+        transfer: BlobTransferId::new(transfer),
+    })
+}
+
+pub(crate) fn capture_ttl_due_end_write(
+    write: &redb::WriteTransaction,
+    generation: u64,
+    sample: CustodySample,
+    kind: TtlDeadlineKind,
+) -> Result<Option<[u8; TTL_DEADLINE_KEY_BYTES]>, StoreError> {
+    use std::ops::Bound::Included;
+
+    let start = ttl_deadline_range_key(
+        generation,
+        CustodySample {
+            clock_id: sample.clock_id,
+            tick_ms: 0,
+        },
+        kind,
+        [0; 32],
+    )?;
+    let end = ttl_deadline_range_key(generation, sample, kind, [0xff; 32])?;
+    let table = write.open_table(BLOB_TTL_DEADLINES)?;
+    let row = table
+        .range::<&[u8]>((Included(start.as_slice()), Included(end.as_slice())))?
+        .next_back()
+        .transpose()?;
+    row.map(|(key, value)| {
+        if !value.value().is_empty() {
+            return Err(cursor_invariant("Blob TTL deadline value is not empty"));
+        }
+        let key: [u8; TTL_DEADLINE_KEY_BYTES] = key
+            .value()
+            .try_into()
+            .map_err(|_| cursor_invariant("Blob TTL deadline key has an invalid length"))?;
+        decode_ttl_deadline_key(&key)?;
+        Ok(key)
+    })
+    .transpose()
+}
+
+pub(crate) fn nearest_ttl_deadline_read(
+    read: &redb::ReadTransaction,
+    continuity: super::custody::LowerBoundContinuity,
+) -> Result<Option<CustodySample>, StoreError> {
+    use std::ops::Bound::Included;
+
+    let version = read
+        .open_table(BLOB_LIFECYCLE_METADATA)?
+        .get(BLOB_LIFECYCLE_SCHEMA_VERSION_FIELD)?
+        .map(|value| value.value())
+        .ok_or_else(|| cursor_invariant("Blob lifecycle schema version is missing"))?;
+    if version != BLOB_LIFECYCLE_SCHEMA_VERSION {
+        return Ok(None);
+    }
+    let deadlines = read.open_table(BLOB_TTL_DEADLINES)?;
+    let mut nearest = None;
+    for kind in [
+        TtlDeadlineKind::LivePublication,
+        TtlDeadlineKind::PendingSource,
+    ] {
+        let start = ttl_deadline_range_key(
+            continuity.generation,
+            CustodySample {
+                clock_id: continuity.sample.clock_id,
+                tick_ms: 0,
+            },
+            kind,
+            [0; 32],
+        )?;
+        let end = ttl_deadline_range_key(
+            continuity.generation,
+            CustodySample {
+                clock_id: continuity.sample.clock_id,
+                tick_ms: u64::MAX,
+            },
+            kind,
+            [0xff; 32],
+        )?;
+        if let Some((key, value)) = deadlines
+            .range::<&[u8]>((Included(start.as_slice()), Included(end.as_slice())))?
+            .next()
+            .transpose()?
+        {
+            if !value.value().is_empty() {
+                return Err(cursor_invariant("Blob TTL deadline value is not empty"));
+            }
+            let deadline = decode_ttl_deadline_key(key.value())?;
+            nearest = Some(nearest.map_or(deadline.deadline, |current: CustodySample| {
+                if deadline.deadline.tick_ms < current.tick_ms {
+                    deadline.deadline
+                } else {
+                    current
+                }
+            }));
+        }
+    }
+    Ok(nearest)
+}
+
+pub(crate) fn next_ttl_due_in_cycle_write(
+    write: &redb::WriteTransaction,
+    cycle: &TtlExpiryCycle,
+) -> Result<Option<TtlDeadline>, StoreError> {
+    use std::ops::Bound::{Excluded, Included};
+
+    let end = decode_ttl_deadline_key(&cycle.end_key)?;
+    if let Some(position) = cycle.position {
+        let position_deadline = decode_ttl_deadline_key(&position)?;
+        if position_deadline.generation != end.generation
+            || position_deadline.deadline.clock_id != end.deadline.clock_id
+            || position_deadline.kind != end.kind
+            || position > cycle.end_key
+        {
+            return Err(cursor_invariant(
+                "Blob TTL expiry cycle position exceeds or crosses its fence",
+            ));
+        }
+    }
+    let start = ttl_deadline_range_key(
+        end.generation,
+        CustodySample {
+            clock_id: end.deadline.clock_id,
+            tick_ms: 0,
+        },
+        end.kind,
+        [0; 32],
+    )?;
+    let table = write.open_table(BLOB_TTL_DEADLINES)?;
+    let row = match cycle.position.as_ref() {
+        Some(position) => table
+            .range::<&[u8]>((
+                Excluded(position.as_slice()),
+                Included(cycle.end_key.as_slice()),
+            ))?
+            .next()
+            .transpose()?,
+        None => table
+            .range::<&[u8]>((
+                Included(start.as_slice()),
+                Included(cycle.end_key.as_slice()),
+            ))?
+            .next()
+            .transpose()?,
+    };
+    row.map(|(key, value)| {
+        if !value.value().is_empty() {
+            return Err(cursor_invariant("Blob TTL deadline value is not empty"));
+        }
+        decode_ttl_deadline_key(key.value())
+    })
+    .transpose()
+}
+
+pub(crate) fn encode_ttl_expiry_cycle(cycle: Option<&TtlExpiryCycle>) -> Vec<u8> {
+    let Some(cycle) = cycle else {
+        return vec![TTL_EXPIRY_CYCLE_VERSION, TTL_EXPIRY_CYCLE_IDLE];
+    };
+    let mut encoded = Vec::with_capacity(
+        3 + TTL_DEADLINE_KEY_BYTES + cycle.position.map_or(0, |_| TTL_DEADLINE_KEY_BYTES),
+    );
+    encoded.push(TTL_EXPIRY_CYCLE_VERSION);
+    encoded.push(TTL_EXPIRY_CYCLE_ACTIVE);
+    encoded.extend_from_slice(&cycle.end_key);
+    encoded.push(if cycle.position.is_some() {
+        TTL_EXPIRY_CYCLE_POSITION
+    } else {
+        TTL_EXPIRY_CYCLE_NO_POSITION
+    });
+    if let Some(position) = cycle.position {
+        encoded.extend_from_slice(&position);
+    }
+    encoded
+}
+
+pub(crate) fn decode_ttl_expiry_cycle(
+    encoded: &[u8],
+) -> Result<Option<TtlExpiryCycle>, StoreError> {
+    if encoded == [TTL_EXPIRY_CYCLE_VERSION, TTL_EXPIRY_CYCLE_IDLE] {
+        return Ok(None);
+    }
+    if encoded.len() < 3 + TTL_DEADLINE_KEY_BYTES
+        || encoded[0] != TTL_EXPIRY_CYCLE_VERSION
+        || encoded[1] != TTL_EXPIRY_CYCLE_ACTIVE
+    {
+        return Err(cursor_invariant(
+            "Blob TTL expiry cycle has a noncanonical encoding",
+        ));
+    }
+    let end_key: [u8; TTL_DEADLINE_KEY_BYTES] = encoded[2..2 + TTL_DEADLINE_KEY_BYTES]
+        .try_into()
+        .expect("checked TTL cycle end length");
+    let end = decode_ttl_deadline_key(&end_key)?;
+    let position: Option<[u8; TTL_DEADLINE_KEY_BYTES]> = match encoded[2 + TTL_DEADLINE_KEY_BYTES] {
+        TTL_EXPIRY_CYCLE_NO_POSITION if encoded.len() == 3 + TTL_DEADLINE_KEY_BYTES => None,
+        TTL_EXPIRY_CYCLE_POSITION if encoded.len() == 3 + (2 * TTL_DEADLINE_KEY_BYTES) => Some(
+            encoded[3 + TTL_DEADLINE_KEY_BYTES..]
+                .try_into()
+                .expect("checked TTL cycle position length"),
+        ),
+        _ => {
+            return Err(cursor_invariant(
+                "Blob TTL expiry cycle has a noncanonical position",
+            ));
+        }
+    };
+    if let Some(position) = position {
+        let decoded = decode_ttl_deadline_key(&position)?;
+        if decoded.generation != end.generation
+            || decoded.deadline.clock_id != end.deadline.clock_id
+            || decoded.kind != end.kind
+            || position > end_key
+        {
+            return Err(cursor_invariant(
+                "Blob TTL expiry cycle position exceeds or crosses its fence",
+            ));
+        }
+    }
+    Ok(Some(TtlExpiryCycle { end_key, position }))
+}
+
+fn decode_ttl_expiry_phase(encoded: &[u8]) -> Result<TtlExpiryPhase, StoreError> {
+    let [version, phase] = encoded else {
+        return Err(cursor_invariant(
+            "Blob TTL expiry phase has an invalid length",
+        ));
+    };
+    if *version != TTL_EXPIRY_CYCLE_VERSION {
+        return Err(cursor_invariant(
+            "Blob TTL expiry phase has an unknown version",
+        ));
+    }
+    TtlExpiryPhase::decode(*phase)
+}
+
+fn load_ttl_expiry_state(
+    cursors: &impl ReadableTable<u8, &'static [u8]>,
+) -> Result<TtlExpiryState, StoreError> {
+    if cursors.len()? != 3 {
+        return Err(cursor_invariant(
+            "Blob TTL expiry cursor set is incomplete or contains unknown rows",
+        ));
+    }
+    let next_phase = cursors
+        .get(TTL_EXPIRY_NEXT_PHASE_KEY)?
+        .ok_or_else(|| cursor_invariant("Blob TTL expiry phase is missing"))?;
+    let live = cursors
+        .get(TTL_EXPIRY_LIVE_CYCLE_KEY)?
+        .ok_or_else(|| cursor_invariant("Blob TTL live cycle is missing"))?;
+    let pending = cursors
+        .get(TTL_EXPIRY_PENDING_CYCLE_KEY)?
+        .ok_or_else(|| cursor_invariant("Blob TTL pending cycle is missing"))?;
+    let state = TtlExpiryState {
+        next_phase: decode_ttl_expiry_phase(next_phase.value())?,
+        live: decode_ttl_expiry_cycle(live.value())?,
+        pending: decode_ttl_expiry_cycle(pending.value())?,
+    };
+    for (phase, cycle) in [
+        (TtlExpiryPhase::Live, state.live),
+        (TtlExpiryPhase::Pending, state.pending),
+    ] {
+        if cycle.is_some_and(|cycle| {
+            decode_ttl_deadline_key(&cycle.end_key)
+                .is_ok_and(|deadline| deadline.kind.tag() != phase.tag())
+        }) {
+            return Err(cursor_invariant(
+                "Blob TTL expiry cycle belongs to the wrong phase",
+            ));
+        }
+    }
+    Ok(state)
+}
+
+pub(crate) fn initialize_ttl_expiry_cursors(
+    write: &redb::WriteTransaction,
+) -> Result<(), StoreError> {
+    let mut cursors = write.open_table(BLOB_TTL_EXPIRY_CURSORS)?;
+    if cursors.len()? != 0 {
+        load_ttl_expiry_state(&cursors)?;
+        return Ok(());
+    }
+    cursors.insert(
+        TTL_EXPIRY_NEXT_PHASE_KEY,
+        [TTL_EXPIRY_CYCLE_VERSION, TtlExpiryPhase::Live.tag()].as_slice(),
+    )?;
+    let idle = encode_ttl_expiry_cycle(None);
+    cursors.insert(TTL_EXPIRY_LIVE_CYCLE_KEY, idle.as_slice())?;
+    cursors.insert(TTL_EXPIRY_PENDING_CYCLE_KEY, idle.as_slice())?;
+    Ok(())
+}
+
+pub(crate) fn load_ttl_expiry_state_write(
+    write: &redb::WriteTransaction,
+) -> Result<TtlExpiryState, StoreError> {
+    load_ttl_expiry_state(&write.open_table(BLOB_TTL_EXPIRY_CURSORS)?)
+}
+
+/// Invalidates both fenced due cycles when custody continuity moves to a new
+/// generation or clock domain.  Resetting the pair atomically prevents one
+/// class from continuing a stale scan after the other observes the restart.
+pub(crate) fn synchronize_ttl_expiry_cycles_write(
+    write: &redb::WriteTransaction,
+    generation: u64,
+    sample: CustodySample,
+) -> Result<(), StoreError> {
+    if !lifecycle_v5_enabled_write(write)? {
+        return Ok(());
+    }
+    if ttl_expiry_cycles_need_sync_write(write, generation, sample)? {
+        let idle = encode_ttl_expiry_cycle(None);
+        let mut cursors = write.open_table(BLOB_TTL_EXPIRY_CURSORS)?;
+        cursors.insert(TTL_EXPIRY_LIVE_CYCLE_KEY, idle.as_slice())?;
+        cursors.insert(TTL_EXPIRY_PENDING_CYCLE_KEY, idle.as_slice())?;
+    }
+    Ok(())
+}
+
+pub(crate) fn ttl_expiry_cycles_need_sync_write(
+    write: &redb::WriteTransaction,
+    generation: u64,
+    sample: CustodySample,
+) -> Result<bool, StoreError> {
+    if !lifecycle_v5_enabled_write(write)? {
+        return Ok(false);
+    }
+    let state = load_ttl_expiry_state_write(write)?;
+    [state.live, state.pending]
+        .into_iter()
+        .flatten()
+        .try_fold(false, |stale, cycle| {
+            let end = decode_ttl_deadline_key(&cycle.end_key)?;
+            Ok::<_, StoreError>(
+                stale || end.generation != generation || end.deadline.clock_id != sample.clock_id,
+            )
+        })
+}
+
+pub(crate) fn store_ttl_expiry_turn(
+    write: &redb::WriteTransaction,
+    selected: TtlExpiryPhase,
+    cycle: Option<&TtlExpiryCycle>,
+) -> Result<(), StoreError> {
+    let cursors = write.open_table(BLOB_TTL_EXPIRY_CURSORS)?;
+    let current_phase = decode_ttl_expiry_phase(
+        cursors
+            .get(TTL_EXPIRY_NEXT_PHASE_KEY)?
+            .ok_or_else(|| cursor_invariant("Blob TTL expiry phase is missing"))?
+            .value(),
+    )?;
+    if current_phase != selected {
+        return Err(cursor_invariant(
+            "Blob TTL expiry turn does not match its persisted phase",
+        ));
+    }
+    decode_ttl_expiry_cycle(
+        cursors
+            .get(selected.cycle_key())?
+            .ok_or_else(|| cursor_invariant("Blob TTL selected expiry cycle is missing"))?
+            .value(),
+    )?;
+    drop(cursors);
+    if let Some(cycle) = cycle {
+        let deadline = decode_ttl_deadline_key(&cycle.end_key)?;
+        let expected = match selected {
+            TtlExpiryPhase::Live => TtlDeadlineKind::LivePublication,
+            TtlExpiryPhase::Pending => TtlDeadlineKind::PendingSource,
+        };
+        if deadline.kind != expected {
+            return Err(cursor_invariant(
+                "Blob TTL expiry turn stores a cross-phase cycle",
+            ));
+        }
+        decode_ttl_expiry_cycle(&encode_ttl_expiry_cycle(Some(cycle)))?;
+    }
+    let mut cursors = write.open_table(BLOB_TTL_EXPIRY_CURSORS)?;
+    cursors.insert(
+        selected.cycle_key(),
+        encode_ttl_expiry_cycle(cycle).as_slice(),
+    )?;
+    cursors.insert(
+        TTL_EXPIRY_NEXT_PHASE_KEY,
+        [TTL_EXPIRY_CYCLE_VERSION, selected.next().tag()].as_slice(),
+    )?;
+    Ok(())
+}
+
+/// Selects at most one already-due finite root from the persisted fenced
+/// cycle for the next alternating live/pending phase. An empty phase still
+/// advances the alternating scheduler in this transaction.
+pub(crate) fn plan_ttl_expiry_turn_write(
+    write: &redb::WriteTransaction,
+    generation: u64,
+    sample: CustodySample,
+) -> Result<Option<TtlExpiryTurn>, StoreError> {
+    if !lifecycle_v5_enabled_write(write)? {
+        return Ok(None);
+    }
+    let cursors = write.open_table(BLOB_TTL_EXPIRY_CURSORS)?;
+    let phase = decode_ttl_expiry_phase(
+        cursors
+            .get(TTL_EXPIRY_NEXT_PHASE_KEY)?
+            .ok_or_else(|| cursor_invariant("Blob TTL expiry phase is missing"))?
+            .value(),
+    )?;
+    let kind = match phase {
+        TtlExpiryPhase::Live => TtlDeadlineKind::LivePublication,
+        TtlExpiryPhase::Pending => TtlDeadlineKind::PendingSource,
+    };
+    let persisted_cycle = decode_ttl_expiry_cycle(
+        cursors
+            .get(phase.cycle_key())?
+            .ok_or_else(|| cursor_invariant("Blob TTL selected expiry cycle is missing"))?
+            .value(),
+    )?;
+    drop(cursors);
+    let cycle = match persisted_cycle {
+        Some(cycle) => Some(cycle),
+        None => capture_ttl_due_end_write(write, generation, sample, kind)?.map(|end_key| {
+            TtlExpiryCycle {
+                end_key,
+                position: None,
+            }
+        }),
+    };
+    let Some(cycle) = cycle else {
+        let other_phase = phase.next();
+        let other_kind = match other_phase {
+            TtlExpiryPhase::Live => TtlDeadlineKind::LivePublication,
+            TtlExpiryPhase::Pending => TtlDeadlineKind::PendingSource,
+        };
+        let other_cycle = decode_ttl_expiry_cycle(
+            write
+                .open_table(BLOB_TTL_EXPIRY_CURSORS)?
+                .get(other_phase.cycle_key())?
+                .ok_or_else(|| cursor_invariant("Blob TTL other expiry cycle is missing"))?
+                .value(),
+        )?;
+        let other_probe_key = match other_cycle {
+            Some(cycle) => next_ttl_due_in_cycle_write(write, &cycle)?
+                .map(ttl_deadline_key)
+                .transpose()?,
+            None => capture_ttl_due_end_write(write, generation, sample, other_kind)?,
+        };
+        if other_probe_key.is_none() {
+            return Ok(None);
+        }
+        return Ok(Some(TtlExpiryTurn {
+            deadline: None,
+            captured_end_key: None,
+            observed_other_cycle: true,
+            other_probe_key,
+            phase,
+            next_cycle: None,
+        }));
+    };
+    let Some(deadline) = next_ttl_due_in_cycle_write(write, &cycle)? else {
+        return Ok(Some(TtlExpiryTurn {
+            deadline: None,
+            captured_end_key: None,
+            observed_other_cycle: false,
+            other_probe_key: None,
+            phase,
+            next_cycle: None,
+        }));
+    };
+    let selected_key = ttl_deadline_key(deadline)?;
+    let next_cycle = (selected_key != cycle.end_key).then_some(TtlExpiryCycle {
+        end_key: cycle.end_key,
+        position: Some(selected_key),
+    });
+    Ok(Some(TtlExpiryTurn {
+        deadline: Some(deadline),
+        captured_end_key: (persisted_cycle.is_none() && selected_key != cycle.end_key)
+            .then_some(cycle.end_key),
+        observed_other_cycle: false,
+        other_probe_key: None,
+        phase,
+        next_cycle,
+    }))
+}
+
+/// Commits the cursor half of an expiry unit after the caller has atomically
+/// retired or removed the selected root in the same write transaction.
+pub(crate) fn finish_ttl_expiry_turn_write(
+    write: &redb::WriteTransaction,
+    turn: TtlExpiryTurn,
+) -> Result<(), StoreError> {
+    store_ttl_expiry_turn(write, turn.phase, turn.next_cycle.as_ref())
 }
 
 impl RetirementReason {
@@ -776,6 +1893,7 @@ pub(crate) struct BlobLifecycleUsage {
     pub(crate) operation_owner_rows: u64,
     pub(crate) delivery_owner_rows: u64,
     pub(crate) deadline_rows: u64,
+    pub(crate) ttl_deadline_rows: u64,
     pub(crate) retirement_resolver_rows: u64,
     pub(crate) retired_publication_rows: u64,
     pub(crate) retired_operation_rows: u64,
@@ -799,6 +1917,7 @@ enum LifecycleSchemaState {
     V1,
     V2,
     V3,
+    V4,
     Current,
 }
 
@@ -824,6 +1943,7 @@ struct ExpectedLifecycleImage {
     operation_owners: BTreeMap<Vec<u8>, Vec<u8>>,
     delivery_owners: BTreeMap<Vec<u8>, Vec<u8>>,
     deadlines: BTreeMap<Vec<u8>, Vec<u8>>,
+    ttl_deadlines: BTreeMap<Vec<u8>, Vec<u8>>,
     retirement_resolvers: BTreeMap<Vec<u8>, Vec<u8>>,
     operation_bytes: u64,
     usage: BlobLifecycleUsage,
@@ -857,7 +1977,7 @@ fn lifecycle_v2_table_names() -> [&'static str; 8] {
     ]
 }
 
-fn lifecycle_table_names() -> [&'static str; 9] {
+fn lifecycle_v4_table_names() -> [&'static str; 9] {
     [
         BLOB_LIFECYCLE_METADATA.name(),
         BLOB_VARIANT_REFERENCES.name(),
@@ -868,6 +1988,22 @@ fn lifecycle_table_names() -> [&'static str; 9] {
         BLOB_DELIVERY_OWNERS.name(),
         BLOB_RETENTION_DEADLINES.name(),
         BLOB_RETIREMENT_RESOLVERS.name(),
+    ]
+}
+
+fn lifecycle_table_names() -> [&'static str; 11] {
+    [
+        BLOB_LIFECYCLE_METADATA.name(),
+        BLOB_VARIANT_REFERENCES.name(),
+        BLOB_LINEAGE_FENCES.name(),
+        BLOB_REPLAY_FENCES.name(),
+        BLOB_MAINTENANCE_CURSORS.name(),
+        BLOB_OPERATION_OWNERS.name(),
+        BLOB_DELIVERY_OWNERS.name(),
+        BLOB_RETENTION_DEADLINES.name(),
+        BLOB_RETIREMENT_RESOLVERS.name(),
+        BLOB_TTL_DEADLINES.name(),
+        BLOB_TTL_EXPIRY_CURSORS.name(),
     ]
 }
 
@@ -899,6 +2035,14 @@ fn lifecycle_schema_state(
                     .all(|name| normal.contains(*name)) =>
         {
             Ok(LifecycleSchemaState::V2)
+        }
+        count
+            if count == lifecycle_v4_table_names().len()
+                && lifecycle_v4_table_names()
+                    .iter()
+                    .all(|name| normal.contains(*name)) =>
+        {
+            Ok(LifecycleSchemaState::V4)
         }
         count if count == names.len() => Ok(LifecycleSchemaState::Current),
         _ => Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
@@ -1064,7 +2208,27 @@ fn publication_encoding_from_schema(schema: LifecycleSchemaState) -> Publication
         LifecycleSchemaState::V2 | LifecycleSchemaState::V3 => {
             PublicationEncodingGeneration::LifecycleV2OrV3
         }
-        LifecycleSchemaState::Current => PublicationEncodingGeneration::Current,
+        LifecycleSchemaState::V4 | LifecycleSchemaState::Current => {
+            PublicationEncodingGeneration::Current
+        }
+    }
+}
+
+fn resolve_lifecycle_schema_version(
+    table_state: LifecycleSchemaState,
+    version: u64,
+) -> Result<LifecycleSchemaState, StoreError> {
+    match (table_state, version) {
+        (LifecycleSchemaState::V4, 3) => Ok(LifecycleSchemaState::V3),
+        (LifecycleSchemaState::V4, PREVIOUS_BLOB_LIFECYCLE_SCHEMA_VERSION) => {
+            Ok(LifecycleSchemaState::V4)
+        }
+        (LifecycleSchemaState::Current, BLOB_LIFECYCLE_SCHEMA_VERSION) => {
+            Ok(LifecycleSchemaState::Current)
+        }
+        _ => Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
+            "Blob lifecycle schema version contradicts its table group",
+        ))),
     }
 }
 
@@ -1098,20 +2262,18 @@ pub(crate) fn publication_encoding_migration_read(
     {
         return Ok(PublicationEncodingGeneration::RawCurrent);
     }
-    if schema == LifecycleSchemaState::Current {
-        schema = match read
+    if matches!(
+        schema,
+        LifecycleSchemaState::V4 | LifecycleSchemaState::Current
+    ) {
+        let version = read
             .open_table(BLOB_LIFECYCLE_METADATA)?
             .get(BLOB_LIFECYCLE_SCHEMA_VERSION_FIELD)?
             .map(|value| value.value())
-        {
-            Some(3) => LifecycleSchemaState::V3,
-            Some(BLOB_LIFECYCLE_SCHEMA_VERSION) => LifecycleSchemaState::Current,
-            _ => {
-                return Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
-                    "Blob lifecycle schema version is unknown",
-                )));
-            }
-        };
+            .ok_or(StoreError::Blob(BlobStoreError::SchemaInvariant(
+                "Blob lifecycle metadata lacks its schema version",
+            )))?;
+        schema = resolve_lifecycle_schema_version(schema, version)?;
     }
     Ok(publication_encoding_from_schema(schema))
 }
@@ -1124,20 +2286,18 @@ pub(crate) fn publication_encoding_migration_write(
     if schema == LifecycleSchemaState::Legacy && TEST_BLOB_LIFECYCLE_MIGRATION_DISABLED.get() {
         return Ok(PublicationEncodingGeneration::RawCurrent);
     }
-    if schema == LifecycleSchemaState::Current {
-        schema = match write
+    if matches!(
+        schema,
+        LifecycleSchemaState::V4 | LifecycleSchemaState::Current
+    ) {
+        let version = write
             .open_table(BLOB_LIFECYCLE_METADATA)?
             .get(BLOB_LIFECYCLE_SCHEMA_VERSION_FIELD)?
             .map(|value| value.value())
-        {
-            Some(3) => LifecycleSchemaState::V3,
-            Some(BLOB_LIFECYCLE_SCHEMA_VERSION) => LifecycleSchemaState::Current,
-            _ => {
-                return Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
-                    "Blob lifecycle schema version is unknown",
-                )));
-            }
-        };
+            .ok_or(StoreError::Blob(BlobStoreError::SchemaInvariant(
+                "Blob lifecycle metadata lacks its schema version",
+            )))?;
+        schema = resolve_lifecycle_schema_version(schema, version)?;
     }
     Ok(publication_encoding_from_schema(schema))
 }
@@ -1160,6 +2320,23 @@ pub(crate) fn publication_encoding_read(
             "Blob lifecycle schema version is unknown",
         ))),
     }
+}
+
+pub(crate) fn lifecycle_generation_is_current_read(
+    read: &redb::ReadTransaction,
+) -> Result<bool, StoreError> {
+    if !read
+        .list_tables()?
+        .any(|table| table.name() == BLOB_LIFECYCLE_METADATA.name())
+    {
+        return Ok(false);
+    }
+    Ok(matches!(
+        read.open_table(BLOB_LIFECYCLE_METADATA)?
+            .get(BLOB_LIFECYCLE_SCHEMA_VERSION_FIELD)?
+            .map(|value| value.value()),
+        Some(BLOB_LIFECYCLE_SCHEMA_VERSION)
+    ))
 }
 
 pub(crate) fn publication_record_is_retired(bytes: &[u8]) -> Result<bool, BlobStoreError> {
@@ -1440,7 +2617,7 @@ fn admission_schema_is_current(write: &redb::WriteTransaction) -> Result<bool, S
     if metadata
         .get(BLOB_LIFECYCLE_SCHEMA_VERSION_FIELD)?
         .map(|value| value.value())
-        == Some(BLOB_LIFECYCLE_SCHEMA_VERSION)
+        == Some(ACTIVE_BLOB_LIFECYCLE_SCHEMA_VERSION)
     {
         Ok(true)
     } else {
@@ -1470,7 +2647,7 @@ fn lifecycle_counter(
     if metadata
         .get(BLOB_LIFECYCLE_SCHEMA_VERSION_FIELD)?
         .map(|value| value.value())
-        != Some(BLOB_LIFECYCLE_SCHEMA_VERSION)
+        != Some(ACTIVE_BLOB_LIFECYCLE_SCHEMA_VERSION)
     {
         return Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
             "Blob lifecycle schema version is missing or unknown",
@@ -1494,7 +2671,7 @@ fn active_operation_count_from_metadata(
         .ok_or(StoreError::Blob(BlobStoreError::SchemaInvariant(
             "Blob lifecycle schema version is missing or unknown",
         )))?;
-    if schema != BLOB_LIFECYCLE_SCHEMA_VERSION {
+    if schema != ACTIVE_BLOB_LIFECYCLE_SCHEMA_VERSION {
         return Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
             "Blob lifecycle schema cannot account for retired operations",
         )));
@@ -1594,6 +2771,49 @@ pub(crate) fn require_lineage_fence(
         )));
     }
     Ok(())
+}
+
+pub(crate) fn charge_variant_reference_counter(
+    charge: &mut super::MaintenanceCharge,
+) -> Result<bool, StoreError> {
+    charge.charge_row(
+        super::MaintenanceRowIdentity::new(
+            "aster.blob-lifecycle-metadata.v1",
+            BLOB_REFERENCE_ROWS.as_bytes(),
+        ),
+        std::mem::size_of::<u64>(),
+    )
+}
+
+pub(crate) fn charge_lineage_fence_authority_write(
+    write: &redb::WriteTransaction,
+    variant: super::BlobVariantId,
+    charge: &mut super::MaintenanceCharge,
+) -> Result<bool, StoreError> {
+    let fences = write.open_table(BLOB_LINEAGE_FENCES)?;
+    let encoded = fences
+        .get(variant.as_bytes().as_slice())?
+        .ok_or(StoreError::Blob(BlobStoreError::SchemaInvariant(
+            "retained Blob variant is missing its lineage fence",
+        )))?;
+    if !charge.charge_row(
+        super::MaintenanceRowIdentity::new("aster.blob-lineage-fences.v1", variant.as_bytes()),
+        encoded.value().len(),
+    )? {
+        return Ok(false);
+    }
+    for field in [BLOB_LINEAGE_ROWS, BLOB_LINEAGE_BYTES] {
+        if !charge.charge_row(
+            super::MaintenanceRowIdentity::new(
+                "aster.blob-lifecycle-metadata.v1",
+                field.as_bytes(),
+            ),
+            std::mem::size_of::<u64>(),
+        )? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Point-checks or installs one permanent physical-lineage fence in the
@@ -2695,7 +3915,13 @@ pub(crate) fn policy_retirement_accounting_charge_write(
         field: &'static str,
         charge: &mut super::MaintenanceCharge,
     ) -> Result<Option<u64>, StoreError> {
-        if !charge.charge(field.as_bytes(), std::mem::size_of::<u64>())? {
+        if !charge.charge_row(
+            super::MaintenanceRowIdentity::new(
+                "aster.blob-lifecycle-metadata.v1",
+                field.as_bytes(),
+            ),
+            std::mem::size_of::<u64>(),
+        )? {
             return Ok(None);
         }
         lifecycle_counter(write, field).map(Some)
@@ -2780,7 +4006,13 @@ pub(crate) fn policy_retirement_authority_charge_write(
     charge: &mut super::MaintenanceCharge,
 ) -> Result<bool, StoreError> {
     let resolver_key = retirement_resolver_key(owner);
-    if !charge.charge(resolver_key.as_slice(), value.len())? {
+    if !charge.charge_row(
+        super::MaintenanceRowIdentity::new(
+            "aster.blob-retirement-resolvers.v1",
+            resolver_key.as_slice(),
+        ),
+        value.len(),
+    )? {
         return Ok(false);
     }
     if write
@@ -2794,7 +4026,13 @@ pub(crate) fn policy_retirement_authority_charge_write(
     }
     if let Some(deadline) = deadline {
         let deadline_key = retention_deadline_key(deadline, owner);
-        if !charge.charge(deadline_key.as_slice(), 0)? {
+        if !charge.charge_row(
+            super::MaintenanceRowIdentity::new(
+                "aster.blob-retention-deadlines.v1",
+                deadline_key.as_slice(),
+            ),
+            0,
+        )? {
             return Ok(false);
         }
         if write
@@ -3165,6 +4403,8 @@ fn reconstruct_expected_image(
     imports: Vec<depot::AuditedLifecycleImport>,
     owner_binding: [u8; 32],
     schema: LifecycleSchemaState,
+    continuity: Option<custody::LowerBoundContinuity>,
+    project_lifetimes_for_v5: bool,
 ) -> Result<ExpectedLifecycleImage, StoreError> {
     let mut expected = ExpectedLifecycleImage {
         publications: BTreeMap::new(),
@@ -3181,6 +4421,7 @@ fn reconstruct_expected_image(
             "multiple Blob deliveries claim one inverse owner key",
         )?,
         deadlines: BTreeMap::new(),
+        ttl_deadlines: BTreeMap::new(),
         retirement_resolvers: BTreeMap::new(),
         operation_bytes: 0,
         usage: BlobLifecycleUsage::default(),
@@ -3239,7 +4480,9 @@ fn reconstruct_expected_image(
                     "predecessor Blob publication is missing its lifecycle wrapper",
                 )));
             }
-            LifecycleSchemaState::Current if !publication_is_current(encoded) => {
+            LifecycleSchemaState::V4 | LifecycleSchemaState::Current
+                if !publication_is_current(encoded) =>
+            {
                 return Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
                     "current Blob publication is missing its lifecycle wrapper",
                 )));
@@ -3255,7 +4498,10 @@ fn reconstruct_expected_image(
         }
         if matches!(
             schema,
-            LifecycleSchemaState::V2 | LifecycleSchemaState::V3 | LifecycleSchemaState::Current
+            LifecycleSchemaState::V2
+                | LifecycleSchemaState::V3
+                | LifecycleSchemaState::V4
+                | LifecycleSchemaState::Current
         ) && encoded.get(1).copied() == Some(PUBLICATION_STATE_RETIRED_TAG)
         {
             if let Some((_, payload)) =
@@ -3320,7 +4566,22 @@ fn reconstruct_expected_image(
         } else {
             encoded
         };
-        let publication = super::decode_blob_metadata(publication_payload)?;
+        let mut publication = super::decode_blob_metadata(publication_payload)?;
+        if project_lifetimes_for_v5 {
+            publication.lifetime = project_lifetime_for_v5(publication.lifetime, continuity)?;
+        }
+        if let Some(deadline) = stored_ttl_deadline(
+            transfer,
+            TtlDeadlineKind::LivePublication,
+            publication.lifetime,
+        )? {
+            insert_unique(
+                &mut expected.ttl_deadlines,
+                ttl_deadline_key(deadline)?.to_vec(),
+                Vec::new(),
+                "multiple live Blob publications claim one TTL deadline",
+            )?;
+        }
         let intent = super::BlobPublicationIntent::new_with_ttl(
             publication.header.stamp.dot.publisher,
             publication.header.topic.clone(),
@@ -3385,12 +4646,16 @@ fn reconstruct_expected_image(
             Vec::new(),
             "multiple Blob publications claim one variant reference",
         )?;
-        let wrapped = match schema {
+        let mut wrapped = match schema {
             LifecycleSchemaState::Legacy => wrap_publication(encoded)?,
             LifecycleSchemaState::V1 => wrap_v1_publication(encoded)?,
             LifecycleSchemaState::V2 | LifecycleSchemaState::V3 => upgrade_v3_publication(encoded)?,
-            LifecycleSchemaState::Current => encoded.to_vec(),
+            LifecycleSchemaState::V4 | LifecycleSchemaState::Current => encoded.to_vec(),
         };
+        if project_lifetimes_for_v5 {
+            let payload = super::encode_blob_metadata(publication)?;
+            wrapped = replace_live_publication_payload(&wrapped, &payload)?;
+        }
         insert_unique(
             &mut expected.publications,
             key.value().to_vec(),
@@ -3410,7 +4675,10 @@ fn reconstruct_expected_image(
         let transfer = super::parse_blob_transfer_id("pending Blob source table", &key)?;
         let mut pending = super::decode_pending_blob_source_for_encoding(
             &value,
-            if schema == LifecycleSchemaState::Current {
+            if matches!(
+                schema,
+                LifecycleSchemaState::V4 | LifecycleSchemaState::Current
+            ) {
                 super::PendingBlobEncodingGeneration::Current
             } else {
                 super::PendingBlobEncodingGeneration::Predecessor
@@ -3439,6 +4707,27 @@ fn reconstruct_expected_image(
                 "pending Blob source conflicts with its physical lineage",
             )));
         }
+        if project_lifetimes_for_v5 {
+            pending.metadata.lifetime =
+                project_lifetime_for_v5(pending.metadata.lifetime, continuity)?;
+            pending.authenticated_source_binding =
+                super::pending_blob_authenticated_source_binding(
+                    &pending.metadata,
+                    &pending.sealed,
+                )?;
+        }
+        if let Some(deadline) = stored_ttl_deadline(
+            transfer,
+            TtlDeadlineKind::PendingSource,
+            pending.metadata.lifetime,
+        )? {
+            insert_unique(
+                &mut expected.ttl_deadlines,
+                ttl_deadline_key(deadline)?.to_vec(),
+                Vec::new(),
+                "multiple pending Blob sources claim one TTL deadline",
+            )?;
+        }
         insert_unique(
             &mut expected.references,
             variant_reference_key(
@@ -3449,7 +4738,11 @@ fn reconstruct_expected_image(
             Vec::new(),
             "multiple pending Blob sources claim one variant reference",
         )?;
-        let upgraded = if schema == LifecycleSchemaState::Current {
+        let upgraded = if !project_lifetimes_for_v5
+            && matches!(
+                schema,
+                LifecycleSchemaState::V4 | LifecycleSchemaState::Current
+            ) {
             value
         } else {
             super::encode_pending_blob_source(&pending)?
@@ -3470,7 +4763,10 @@ fn reconstruct_expected_image(
         super::BlobOperationKey::new(key.value().to_vec())?;
         if matches!(
             schema,
-            LifecycleSchemaState::V2 | LifecycleSchemaState::V3 | LifecycleSchemaState::Current
+            LifecycleSchemaState::V2
+                | LifecycleSchemaState::V3
+                | LifecycleSchemaState::V4
+                | LifecycleSchemaState::Current
         ) && encoded.get(1).copied() == Some(OPERATION_STATE_RETIRED_TAG)
         {
             if encoded.first().copied() != Some(CURRENT_OPERATION_RECORD_VERSION) {
@@ -3542,7 +4838,10 @@ fn reconstruct_expected_image(
                     "Blob predecessor operation is not canonical",
                 )));
             }
-            LifecycleSchemaState::V2 | LifecycleSchemaState::V3 | LifecycleSchemaState::Current
+            LifecycleSchemaState::V2
+            | LifecycleSchemaState::V3
+            | LifecycleSchemaState::V4
+            | LifecycleSchemaState::Current
                 if encoded.first().copied() != Some(CURRENT_OPERATION_RECORD_VERSION) =>
             {
                 return Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
@@ -3553,9 +4852,10 @@ fn reconstruct_expected_image(
         }
         let wrapped = match schema {
             LifecycleSchemaState::Legacy | LifecycleSchemaState::V1 => wrap_operation(encoded)?,
-            LifecycleSchemaState::V2 | LifecycleSchemaState::V3 | LifecycleSchemaState::Current => {
-                encoded.to_vec()
-            }
+            LifecycleSchemaState::V2
+            | LifecycleSchemaState::V3
+            | LifecycleSchemaState::V4
+            | LifecycleSchemaState::Current => encoded.to_vec(),
         };
         expected.operation_bytes = expected
             .operation_bytes
@@ -3580,6 +4880,8 @@ fn reconstruct_expected_image(
         .map_err(|_| StoreError::ItemCountAccountingOverflow)?;
     expected.usage.deadline_rows = u64::try_from(expected.deadlines.len())
         .map_err(|_| StoreError::ItemCountAccountingOverflow)?;
+    expected.usage.ttl_deadline_rows = u64::try_from(expected.ttl_deadlines.len())
+        .map_err(|_| StoreError::ItemCountAccountingOverflow)?;
     expected.usage.retirement_resolver_rows = u64::try_from(expected.retirement_resolvers.len())
         .map_err(|_| StoreError::ItemCountAccountingOverflow)?;
     Ok(expected)
@@ -3590,7 +4892,12 @@ fn audit_metadata(
     mut usage: BlobLifecycleUsage,
     schema_version: u64,
 ) -> Result<BlobLifecycleUsage, StoreError> {
-    if metadata.len()? != BLOB_LIFECYCLE_METADATA_FIELDS.len() as u64 {
+    let expected_fields = if schema_version != BLOB_LIFECYCLE_SCHEMA_VERSION {
+        BLOB_LIFECYCLE_V4_METADATA_FIELDS.len()
+    } else {
+        BLOB_LIFECYCLE_METADATA_FIELDS.len()
+    };
+    if metadata.len()? != expected_fields as u64 {
         return Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
             "Blob lifecycle accounting metadata is incomplete",
         )));
@@ -3621,6 +4928,16 @@ fn audit_metadata(
                 "Blob lifecycle accounting metadata disagrees with exact rows",
             )));
         }
+    }
+    if schema_version == BLOB_LIFECYCLE_SCHEMA_VERSION
+        && metadata
+            .get(BLOB_TTL_DEADLINE_ROWS)?
+            .map(|value| value.value())
+            != Some(usage.ttl_deadline_rows)
+    {
+        return Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
+            "Blob lifecycle TTL deadline accounting disagrees with exact rows",
+        )));
     }
     let allocated_generation = metadata
         .get(BLOB_NEXT_RETIREMENT_GENERATION)?
@@ -3877,6 +5194,7 @@ fn audit_current_rows(
     operation_owners: &impl ReadableTable<&'static [u8], &'static [u8]>,
     delivery_owners: &impl ReadableTable<&'static [u8], &'static [u8]>,
     deadlines: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    ttl_deadlines: Option<BTreeMap<Vec<u8>, Vec<u8>>>,
     retirement_resolvers: Option<BTreeMap<Vec<u8>, Vec<u8>>>,
     expected: &ExpectedLifecycleImage,
     owner_binding: [u8; 32],
@@ -3991,6 +5309,18 @@ fn audit_current_rows(
         .map_err(|_| StoreError::ItemCountAccountingOverflow)?;
     actual_usage.deadline_rows = u64::try_from(actual_deadlines.len())
         .map_err(|_| StoreError::ItemCountAccountingOverflow)?;
+    if let Some(ttl_deadlines) = ttl_deadlines.as_ref() {
+        for (key, value) in ttl_deadlines {
+            decode_ttl_deadline_key(key)?;
+            if !value.is_empty() {
+                return Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
+                    "Blob TTL deadline value is not empty",
+                )));
+            }
+        }
+        actual_usage.ttl_deadline_rows = u64::try_from(ttl_deadlines.len())
+            .map_err(|_| StoreError::ItemCountAccountingOverflow)?;
+    }
     if let Some(resolvers) = retirement_resolvers.as_ref() {
         actual_usage.retirement_resolver_rows =
             u64::try_from(resolvers.len()).map_err(|_| StoreError::ItemCountAccountingOverflow)?;
@@ -4008,6 +5338,9 @@ fn audit_current_rows(
         || actual_operation_owners != expected.operation_owners
         || actual_delivery_owners != expected.delivery_owners
         || actual_deadlines != expected.deadlines
+        || ttl_deadlines
+            .as_ref()
+            .is_some_and(|actual| actual != &expected.ttl_deadlines)
         || retirement_resolvers
             .as_ref()
             .is_some_and(|actual| actual != &expected.retirement_resolvers)
@@ -4033,6 +5366,11 @@ fn audit_current_rows(
     match schema_version {
         2 => audit_v2_metadata(metadata, actual_usage),
         3 => audit_metadata(metadata, actual_usage, 3),
+        PREVIOUS_BLOB_LIFECYCLE_SCHEMA_VERSION => audit_metadata(
+            metadata,
+            actual_usage,
+            PREVIOUS_BLOB_LIFECYCLE_SCHEMA_VERSION,
+        ),
         BLOB_LIFECYCLE_SCHEMA_VERSION => {
             audit_metadata(metadata, actual_usage, BLOB_LIFECYCLE_SCHEMA_VERSION)
         }
@@ -4040,6 +5378,19 @@ fn audit_current_rows(
             "Blob lifecycle schema version is unknown",
         ))),
     }
+}
+
+fn table_map(
+    table: &impl ReadableTable<&'static [u8], &'static [u8]>,
+) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, StoreError> {
+    table
+        .iter()?
+        .map(|row| {
+            let (key, value) = row?;
+            Ok((key.value().to_vec(), value.value().to_vec()))
+        })
+        .collect::<Result<_, redb::StorageError>>()
+        .map_err(StoreError::from)
 }
 
 fn preflight_migration_limits(
@@ -4077,6 +5428,56 @@ fn preflight_migration_limits(
     Ok(())
 }
 
+fn finalize_v5_migration_image(
+    mut image: ExpectedLifecycleImage,
+    continuity: Option<custody::LowerBoundContinuity>,
+) -> Result<ExpectedLifecycleImage, StoreError> {
+    image.ttl_deadlines.clear();
+    for (key, encoded) in &mut image.publications {
+        if publication_record_is_retired(encoded).map_err(StoreError::Blob)? {
+            continue;
+        }
+        let transfer = super::parse_blob_transfer_id("Blob publication table", key)?;
+        let mut metadata = super::decode_blob_metadata(encoded)?;
+        metadata.lifetime = project_lifetime_for_v5(metadata.lifetime, continuity)?;
+        if let Some(deadline) = stored_ttl_deadline(
+            transfer,
+            TtlDeadlineKind::LivePublication,
+            metadata.lifetime,
+        )? {
+            insert_unique(
+                &mut image.ttl_deadlines,
+                ttl_deadline_key(deadline)?.to_vec(),
+                Vec::new(),
+                "multiple live Blob publications claim one TTL deadline",
+            )?;
+        }
+        let payload = super::encode_blob_metadata(metadata)?;
+        *encoded = replace_live_publication_payload(encoded, &payload)?;
+    }
+    for (key, encoded) in &mut image.pending_sources {
+        let transfer = super::parse_blob_transfer_id("Blob pending source table", key)?;
+        let mut pending = super::decode_pending_blob_source(encoded)?;
+        pending.metadata.lifetime = project_lifetime_for_v5(pending.metadata.lifetime, continuity)?;
+        if let Some(deadline) = stored_ttl_deadline(
+            transfer,
+            TtlDeadlineKind::PendingSource,
+            pending.metadata.lifetime,
+        )? {
+            insert_unique(
+                &mut image.ttl_deadlines,
+                ttl_deadline_key(deadline)?.to_vec(),
+                Vec::new(),
+                "multiple pending Blob sources claim one TTL deadline",
+            )?;
+        }
+        *encoded = super::encode_pending_blob_source(&pending)?;
+    }
+    image.usage.ttl_deadline_rows = u64::try_from(image.ttl_deadlines.len())
+        .map_err(|_| StoreError::ItemCountAccountingOverflow)?;
+    Ok(image)
+}
+
 /// Reconstructs and preflights a complete predecessor image, or strictly
 /// audits an already-current lifecycle schema without repairing it.
 pub(crate) fn stage_blob_lifecycle_migration_write(
@@ -4086,7 +5487,10 @@ pub(crate) fn stage_blob_lifecycle_migration_write(
     stats: &mut BlobStoreStats,
 ) -> Result<Option<BlobLifecycleMigration>, StoreError> {
     let mut schema = lifecycle_schema_state_write(write)?;
-    if schema == LifecycleSchemaState::Current {
+    if matches!(
+        schema,
+        LifecycleSchemaState::V4 | LifecycleSchemaState::Current
+    ) {
         let version = write
             .open_table(BLOB_LIFECYCLE_METADATA)?
             .get(BLOB_LIFECYCLE_SCHEMA_VERSION_FIELD)?
@@ -4094,15 +5498,7 @@ pub(crate) fn stage_blob_lifecycle_migration_write(
             .ok_or(StoreError::Blob(BlobStoreError::SchemaInvariant(
                 "Blob lifecycle metadata lacks its schema version",
             )))?;
-        schema = match version {
-            3 => LifecycleSchemaState::V3,
-            BLOB_LIFECYCLE_SCHEMA_VERSION => LifecycleSchemaState::Current,
-            _ => {
-                return Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
-                    "Blob lifecycle schema version is unknown",
-                )));
-            }
-        };
+        schema = resolve_lifecycle_schema_version(schema, version)?;
     }
     #[cfg(test)]
     if schema == LifecycleSchemaState::Legacy && TEST_BLOB_LIFECYCLE_MIGRATION_DISABLED.get() {
@@ -4120,6 +5516,7 @@ pub(crate) fn stage_blob_lifecycle_migration_write(
             Ok((key.value().to_vec(), value.value().to_vec()))
         })
         .collect::<Result<Vec<_>, redb::StorageError>>()?;
+    let continuity = custody::lower_bound_continuity_write(write)?;
     let mut expected = reconstruct_expected_image(
         &publications,
         &source_bytes,
@@ -4129,6 +5526,8 @@ pub(crate) fn stage_blob_lifecycle_migration_write(
         depot::audited_lifecycle_imports_write(write)?,
         owner_binding,
         schema,
+        continuity,
+        false,
     )?;
     if schema == LifecycleSchemaState::V1 {
         merge_v1_retained_lineages(
@@ -4159,7 +5558,8 @@ pub(crate) fn stage_blob_lifecycle_migration_write(
                 )));
             }
             expected.usage.apply_to_stats(stats);
-            Ok(Some(BlobLifecycleMigration { image: expected }))
+            let image = finalize_v5_migration_image(expected, continuity)?;
+            Ok(Some(BlobLifecycleMigration { image }))
         }
         LifecycleSchemaState::V2 => {
             let upgraded_publications = std::mem::take(&mut expected.publications);
@@ -4179,6 +5579,7 @@ pub(crate) fn stage_blob_lifecycle_migration_write(
                 &write.open_table(BLOB_OPERATION_OWNERS)?,
                 &write.open_table(BLOB_DELIVERY_OWNERS)?,
                 &write.open_table(BLOB_RETENTION_DEADLINES)?,
+                None,
                 None,
                 &expected,
                 owner_binding,
@@ -4204,7 +5605,8 @@ pub(crate) fn stage_blob_lifecycle_migration_write(
                 u64::try_from(expected.retirement_resolvers.len())
                     .map_err(|_| StoreError::ItemCountAccountingOverflow)?;
             expected.usage.apply_to_stats(stats);
-            Ok(Some(BlobLifecycleMigration { image: expected }))
+            let image = finalize_v5_migration_image(expected, continuity)?;
+            Ok(Some(BlobLifecycleMigration { image }))
         }
         LifecycleSchemaState::V3 => {
             let upgraded_publications = std::mem::take(&mut expected.publications);
@@ -4224,6 +5626,7 @@ pub(crate) fn stage_blob_lifecycle_migration_write(
                 &write.open_table(BLOB_OPERATION_OWNERS)?,
                 &write.open_table(BLOB_DELIVERY_OWNERS)?,
                 &write.open_table(BLOB_RETENTION_DEADLINES)?,
+                None,
                 Some(collect_retirement_resolvers(
                     &write.open_table(BLOB_RETIREMENT_RESOLVERS)?,
                 )?),
@@ -4235,9 +5638,10 @@ pub(crate) fn stage_blob_lifecycle_migration_write(
             expected.publications = upgraded_publications;
             expected.usage = actual_usage;
             expected.usage.apply_to_stats(stats);
-            Ok(Some(BlobLifecycleMigration { image: expected }))
+            let image = finalize_v5_migration_image(expected, continuity)?;
+            Ok(Some(BlobLifecycleMigration { image }))
         }
-        LifecycleSchemaState::Current => {
+        LifecycleSchemaState::V4 => {
             if u64::try_from(expected.publications.len())
                 .map_err(|_| StoreError::ItemCountAccountingOverflow)?
                 != publications.len()?
@@ -4258,6 +5662,42 @@ pub(crate) fn stage_blob_lifecycle_migration_write(
                 &write.open_table(BLOB_OPERATION_OWNERS)?,
                 &write.open_table(BLOB_DELIVERY_OWNERS)?,
                 &write.open_table(BLOB_RETENTION_DEADLINES)?,
+                None,
+                Some(collect_retirement_resolvers(
+                    &write.open_table(BLOB_RETIREMENT_RESOLVERS)?,
+                )?),
+                &expected,
+                owner_binding,
+                PREVIOUS_BLOB_LIFECYCLE_SCHEMA_VERSION,
+            )?;
+            preflight_migration_limits(actual_usage, limits)?;
+            actual_usage.apply_to_stats(stats);
+            let image = finalize_v5_migration_image(expected, continuity)?;
+            Ok(Some(BlobLifecycleMigration { image }))
+        }
+        LifecycleSchemaState::Current => {
+            if u64::try_from(expected.publications.len())
+                .map_err(|_| StoreError::ItemCountAccountingOverflow)?
+                != publications.len()?
+                || u64::try_from(expected.operations.len())
+                    .map_err(|_| StoreError::ItemCountAccountingOverflow)?
+                    != operations.len()?
+            {
+                return Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
+                    "Blob lifecycle wrappers are not bidirectionally complete",
+                )));
+            }
+            load_ttl_expiry_state_write(write)?;
+            let actual_usage = audit_current_rows(
+                &write.open_table(BLOB_LIFECYCLE_METADATA)?,
+                &write.open_table(BLOB_VARIANT_REFERENCES)?,
+                &write.open_table(BLOB_LINEAGE_FENCES)?,
+                &write.open_table(BLOB_REPLAY_FENCES)?,
+                &write.open_table(BLOB_MAINTENANCE_CURSORS)?,
+                &write.open_table(BLOB_OPERATION_OWNERS)?,
+                &write.open_table(BLOB_DELIVERY_OWNERS)?,
+                &write.open_table(BLOB_RETENTION_DEADLINES)?,
+                Some(table_map(&write.open_table(BLOB_TTL_DEADLINES)?)?),
                 Some(collect_retirement_resolvers(
                     &write.open_table(BLOB_RETIREMENT_RESOLVERS)?,
                 )?),
@@ -4282,7 +5722,10 @@ pub(crate) fn inspect_blob_lifecycle_read(
         .map(|table| table.name().to_owned())
         .collect::<BTreeSet<_>>();
     let mut schema = lifecycle_schema_state_read(read)?;
-    if schema == LifecycleSchemaState::Current {
+    if matches!(
+        schema,
+        LifecycleSchemaState::V4 | LifecycleSchemaState::Current
+    ) {
         let version = read
             .open_table(BLOB_LIFECYCLE_METADATA)?
             .get(BLOB_LIFECYCLE_SCHEMA_VERSION_FIELD)?
@@ -4290,15 +5733,7 @@ pub(crate) fn inspect_blob_lifecycle_read(
             .ok_or(StoreError::Blob(BlobStoreError::SchemaInvariant(
                 "Blob lifecycle metadata lacks its schema version",
             )))?;
-        schema = match version {
-            3 => LifecycleSchemaState::V3,
-            BLOB_LIFECYCLE_SCHEMA_VERSION => LifecycleSchemaState::Current,
-            _ => {
-                return Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
-                    "Blob lifecycle schema version is unknown",
-                )));
-            }
-        };
+        schema = resolve_lifecycle_schema_version(schema, version)?;
     }
     let pending_rows = if normal.contains(super::BLOB_PENDING_SOURCES.name()) {
         read.open_table(super::BLOB_PENDING_SOURCES)?
@@ -4321,6 +5756,8 @@ pub(crate) fn inspect_blob_lifecycle_read(
         depot::audited_lifecycle_imports_read(read)?,
         owner_binding,
         schema,
+        custody::lower_bound_continuity_read(read)?,
+        false,
     )?;
     if schema == LifecycleSchemaState::V1 {
         merge_v1_retained_lineages(
@@ -4340,8 +5777,14 @@ pub(crate) fn inspect_blob_lifecycle_read(
     }
     if matches!(
         schema,
-        LifecycleSchemaState::V2 | LifecycleSchemaState::V3 | LifecycleSchemaState::Current
+        LifecycleSchemaState::V2
+            | LifecycleSchemaState::V3
+            | LifecycleSchemaState::V4
+            | LifecycleSchemaState::Current
     ) {
+        if schema == LifecycleSchemaState::Current {
+            load_ttl_expiry_state(&read.open_table(BLOB_TTL_EXPIRY_CURSORS)?)?;
+        }
         if matches!(schema, LifecycleSchemaState::V2 | LifecycleSchemaState::V3) {
             expected.publications = read
                 .open_table(super::BLOB_PUBLICATIONS)?
@@ -4361,9 +5804,14 @@ pub(crate) fn inspect_blob_lifecycle_read(
             &read.open_table(BLOB_OPERATION_OWNERS)?,
             &read.open_table(BLOB_DELIVERY_OWNERS)?,
             &read.open_table(BLOB_RETENTION_DEADLINES)?,
+            if schema == LifecycleSchemaState::Current {
+                Some(table_map(&read.open_table(BLOB_TTL_DEADLINES)?)?)
+            } else {
+                None
+            },
             if matches!(
                 schema,
-                LifecycleSchemaState::V3 | LifecycleSchemaState::Current
+                LifecycleSchemaState::V3 | LifecycleSchemaState::V4 | LifecycleSchemaState::Current
             ) {
                 Some(collect_retirement_resolvers(
                     &read.open_table(BLOB_RETIREMENT_RESOLVERS)?,
@@ -4375,6 +5823,8 @@ pub(crate) fn inspect_blob_lifecycle_read(
             owner_binding,
             if schema == LifecycleSchemaState::Current {
                 BLOB_LIFECYCLE_SCHEMA_VERSION
+            } else if schema == LifecycleSchemaState::V4 {
+                PREVIOUS_BLOB_LIFECYCLE_SCHEMA_VERSION
             } else if schema == LifecycleSchemaState::V3 {
                 3
             } else {
@@ -4391,7 +5841,7 @@ impl BlobLifecycleMigration {
         for (field, value) in [
             (
                 BLOB_LIFECYCLE_SCHEMA_VERSION_FIELD,
-                BLOB_LIFECYCLE_SCHEMA_VERSION,
+                ACTIVE_BLOB_LIFECYCLE_SCHEMA_VERSION,
             ),
             (BLOB_LINEAGE_ROWS, self.image.usage.lineage_rows),
             (BLOB_LINEAGE_BYTES, self.image.usage.lineage_bytes),
@@ -4408,6 +5858,7 @@ impl BlobLifecycleMigration {
                 self.image.usage.delivery_owner_rows,
             ),
             (BLOB_DEADLINE_ROWS, self.image.usage.deadline_rows),
+            (BLOB_TTL_DEADLINE_ROWS, self.image.usage.ttl_deadline_rows),
             (
                 BLOB_RETIREMENT_RESOLVER_ROWS,
                 self.image.usage.retirement_resolver_rows,
@@ -4429,6 +5880,7 @@ impl BlobLifecycleMigration {
         }
         drop(metadata);
         initialize_maintenance_cursors(write)?;
+        initialize_ttl_expiry_cursors(write)?;
 
         let mut lineages = write.open_table(BLOB_LINEAGE_FENCES)?;
         for (key, value) in &self.image.lineages {
@@ -4468,6 +5920,19 @@ impl BlobLifecycleMigration {
             deadlines.insert(key.as_slice(), value.as_slice())?;
         }
         drop(deadlines);
+        let existing_ttl_deadline_keys = write
+            .open_table(BLOB_TTL_DEADLINES)?
+            .iter()?
+            .map(|row| row.map(|(key, _)| key.value().to_vec()))
+            .collect::<Result<Vec<_>, redb::StorageError>>()?;
+        let mut ttl_deadlines = write.open_table(BLOB_TTL_DEADLINES)?;
+        for key in existing_ttl_deadline_keys {
+            ttl_deadlines.remove(key.as_slice())?;
+        }
+        for (key, value) in &self.image.ttl_deadlines {
+            ttl_deadlines.insert(key.as_slice(), value.as_slice())?;
+        }
+        drop(ttl_deadlines);
         let mut resolvers = write.open_table(BLOB_RETIREMENT_RESOLVERS)?;
         for (key, value) in &self.image.retirement_resolvers {
             resolvers.insert(key.as_slice(), value.as_slice())?;
@@ -4510,6 +5975,21 @@ impl BlobLifecycleMigration {
         )?;
         Ok(())
     }
+}
+
+#[cfg(test)]
+pub(crate) fn downgrade_lifecycle_v5_to_v4_for_test(
+    write: &redb::WriteTransaction,
+) -> Result<(), StoreError> {
+    write.delete_table(BLOB_TTL_DEADLINES)?;
+    write.delete_table(BLOB_TTL_EXPIRY_CURSORS)?;
+    let mut metadata = write.open_table(BLOB_LIFECYCLE_METADATA)?;
+    metadata.insert(
+        BLOB_LIFECYCLE_SCHEMA_VERSION_FIELD,
+        PREVIOUS_BLOB_LIFECYCLE_SCHEMA_VERSION,
+    )?;
+    metadata.remove(BLOB_TTL_DEADLINE_ROWS)?;
+    Ok(())
 }
 
 /// Durable maintenance classes in the approved eligibility order.
@@ -4808,6 +6288,26 @@ pub(crate) fn load_maintenance_cursor_read(
     })
 }
 
+pub(crate) fn charge_maintenance_cursor_write(
+    write: &redb::WriteTransaction,
+    selected: BlobMaintenanceClass,
+    charge: &mut super::MaintenanceCharge,
+) -> Result<bool, StoreError> {
+    let cursors = write.open_table(BLOB_MAINTENANCE_CURSORS)?;
+    for key in [selected.cursor_key(), MAINTENANCE_NEXT_CLASS_KEY] {
+        let value = cursors
+            .get(key)?
+            .ok_or_else(|| cursor_invariant("Blob maintenance cursor is missing"))?;
+        if !charge.charge_row(
+            super::MaintenanceRowIdentity::new("aster.blob-maintenance-cursors.v1", [key]),
+            value.value().len(),
+        )? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 pub(crate) fn advance_maintenance_cursor(
     write: &redb::WriteTransaction,
     selected: BlobMaintenanceClass,
@@ -4840,7 +6340,7 @@ pub(crate) fn require_maintenance_accounting(
         || metadata
             .get(BLOB_LIFECYCLE_SCHEMA_VERSION_FIELD)?
             .map(|value| value.value())
-            != Some(BLOB_LIFECYCLE_SCHEMA_VERSION)
+            != Some(ACTIVE_BLOB_LIFECYCLE_SCHEMA_VERSION)
     {
         return Err(cursor_invariant(
             "Blob lifecycle accounting metadata is incomplete or unknown",
@@ -4987,6 +6487,7 @@ mod tests {
             &write.open_table(BLOB_OPERATION_OWNERS)?,
             &write.open_table(BLOB_DELIVERY_OWNERS)?,
             &write.open_table(BLOB_RETENTION_DEADLINES)?,
+            Some(table_map(&write.open_table(BLOB_TTL_DEADLINES)?)?),
             Some(collect_retirement_resolvers(
                 &write.open_table(BLOB_RETIREMENT_RESOLVERS)?,
             )?),
@@ -5033,6 +6534,837 @@ mod tests {
                 BlobLifecycleLimits::new(limits.0, limits.1, limits.2, limits.3, limits.4).is_err()
             );
         }
+    }
+
+    #[test]
+    fn blob_ttl_deadline_index_orders_due_roots_by_kind_tick_identity_and_fences_cycle() {
+        // Mutations caught: reusing the retention index, ordering tick before
+        // root kind, scanning a transfer table, or letting a later insertion
+        // extend an already captured due cycle.
+        let sequence = NEXT_RETIREMENT_AUDIT_DB.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "aster-blob-ttl-deadline-index-{}-{sequence}.redb",
+            std::process::id()
+        ));
+        let database = Database::create(&path).expect("create TTL deadline database");
+        let clock_id = [0x61; 16];
+        let generation = 7;
+        let live_early = TtlDeadline {
+            generation,
+            deadline: CustodySample {
+                clock_id,
+                tick_ms: 100,
+            },
+            kind: TtlDeadlineKind::LivePublication,
+            transfer: BlobTransferId::new([0x10; 32]),
+        };
+        let live_fence = TtlDeadline {
+            generation,
+            deadline: CustodySample {
+                clock_id,
+                tick_ms: 110,
+            },
+            kind: TtlDeadlineKind::LivePublication,
+            transfer: BlobTransferId::new([0x20; 32]),
+        };
+        let pending_due = TtlDeadline {
+            generation,
+            deadline: CustodySample {
+                clock_id,
+                tick_ms: 90,
+            },
+            kind: TtlDeadlineKind::PendingSource,
+            transfer: BlobTransferId::new([0x30; 32]),
+        };
+        let live_later = TtlDeadline {
+            generation,
+            deadline: CustodySample {
+                clock_id,
+                tick_ms: 120,
+            },
+            kind: TtlDeadlineKind::LivePublication,
+            transfer: BlobTransferId::new([0x40; 32]),
+        };
+
+        let write = database.begin_write().expect("deadline write");
+        for deadline in [live_early, live_fence, pending_due, live_later] {
+            insert_ttl_deadline_write(&write, deadline).expect("insert deadline");
+        }
+        let fence = capture_ttl_due_end_write(
+            &write,
+            generation,
+            CustodySample {
+                clock_id,
+                tick_ms: 115,
+            },
+            TtlDeadlineKind::LivePublication,
+        )
+        .expect("capture live fence")
+        .expect("live due fence");
+        assert_eq!(decode_ttl_deadline_key(&fence).unwrap(), live_fence);
+        let cycle = TtlExpiryCycle {
+            end_key: fence,
+            position: None,
+        };
+        assert_eq!(
+            next_ttl_due_in_cycle_write(&write, &cycle)
+                .expect("first due")
+                .expect("live due row"),
+            live_early
+        );
+
+        let after_first = TtlExpiryCycle {
+            end_key: fence,
+            position: Some(ttl_deadline_key(live_early).expect("early key")),
+        };
+        let inserted_after_capture = TtlDeadline {
+            generation,
+            deadline: CustodySample {
+                clock_id,
+                tick_ms: 112,
+            },
+            kind: TtlDeadlineKind::LivePublication,
+            transfer: BlobTransferId::new([0x50; 32]),
+        };
+        insert_ttl_deadline_write(&write, inserted_after_capture).expect("insert after fence");
+        assert_eq!(
+            next_ttl_due_in_cycle_write(&write, &after_first)
+                .expect("second due")
+                .expect("fenced due row"),
+            live_fence,
+            "a greater key inserted after capture must wait for the next cycle"
+        );
+        assert_eq!(
+            capture_ttl_due_end_write(
+                &write,
+                generation,
+                CustodySample {
+                    clock_id,
+                    tick_ms: 115,
+                },
+                TtlDeadlineKind::PendingSource,
+            )
+            .unwrap()
+            .map(|key| decode_ttl_deadline_key(&key).unwrap()),
+            Some(pending_due),
+            "pending has an independent due range"
+        );
+        write.commit().expect("commit deadline fixture");
+        drop(database);
+        std::fs::remove_file(path).expect("remove TTL deadline database");
+    }
+
+    #[test]
+    fn blob_ttl_expiry_cycle_codec_rejects_cross_prefix_and_position_after_fence() {
+        // Mutations caught: a restart must not resume a live cursor in the
+        // pending/generation/clock range or beyond its captured end fence.
+        let base = TtlDeadline {
+            generation: 9,
+            deadline: CustodySample {
+                clock_id: [0x71; 16],
+                tick_ms: 200,
+            },
+            kind: TtlDeadlineKind::LivePublication,
+            transfer: BlobTransferId::new([0x20; 32]),
+        };
+        let end_key = ttl_deadline_key(base).expect("end key");
+        let position = ttl_deadline_key(TtlDeadline {
+            deadline: CustodySample {
+                tick_ms: 190,
+                ..base.deadline
+            },
+            transfer: BlobTransferId::new([0x10; 32]),
+            ..base
+        })
+        .expect("position key");
+        let cycle = TtlExpiryCycle {
+            end_key,
+            position: Some(position),
+        };
+        let encoded = encode_ttl_expiry_cycle(Some(&cycle));
+        assert_eq!(decode_ttl_expiry_cycle(&encoded).unwrap(), Some(cycle));
+        assert_eq!(decode_ttl_expiry_cycle(&[1, 0]).unwrap(), None);
+
+        let mut cross_kind = encoded.clone();
+        cross_kind[2 + 25] = TtlDeadlineKind::PendingSource.tag();
+        assert!(decode_ttl_expiry_cycle(&cross_kind).is_err());
+        let mut after_fence = encoded;
+        let position_offset = 2 + 66 + 1;
+        after_fence[position_offset + 26..position_offset + 34]
+            .copy_from_slice(&201u64.to_be_bytes());
+        assert!(decode_ttl_expiry_cycle(&after_fence).is_err());
+    }
+
+    #[test]
+    fn blob_ttl_expiry_cursor_persists_independent_fenced_cycles_and_alternating_phase() {
+        // Mutations caught: one composite cursor can starve pending work, and
+        // an in-memory phase reset can repeatedly favor live work after reopen.
+        let sequence = NEXT_RETIREMENT_AUDIT_DB.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "aster-blob-ttl-expiry-cursor-{}-{sequence}.redb",
+            std::process::id()
+        ));
+        let database = Database::create(&path).expect("create TTL cursor database");
+        let write = database.begin_write().expect("TTL cursor initialize");
+        initialize_ttl_expiry_cursors(&write).expect("initialize TTL cursors");
+        let initial = load_ttl_expiry_state_write(&write).expect("initial TTL cursor state");
+        assert_eq!(initial.next_phase, TtlExpiryPhase::Live);
+        assert_eq!(initial.live, None);
+        assert_eq!(initial.pending, None);
+
+        let live_end = ttl_deadline_key(TtlDeadline {
+            generation: 3,
+            deadline: CustodySample {
+                clock_id: [0x81; 16],
+                tick_ms: 100,
+            },
+            kind: TtlDeadlineKind::LivePublication,
+            transfer: BlobTransferId::new([0x31; 32]),
+        })
+        .unwrap();
+        let live = TtlExpiryCycle {
+            end_key: live_end,
+            position: None,
+        };
+        store_ttl_expiry_turn(&write, TtlExpiryPhase::Live, Some(&live))
+            .expect("persist live cycle");
+        let after_live = load_ttl_expiry_state_write(&write).unwrap();
+        assert_eq!(after_live.next_phase, TtlExpiryPhase::Pending);
+        assert_eq!(after_live.live, Some(live));
+        assert_eq!(after_live.pending, None);
+        write.commit().expect("commit live cursor");
+
+        let write = database.begin_write().expect("TTL cursor reopen write");
+        let reopened = load_ttl_expiry_state_write(&write).expect("reopened TTL cursor state");
+        assert_eq!(
+            reopened, after_live,
+            "restart must preserve phase and live fence"
+        );
+        let pending_end = ttl_deadline_key(TtlDeadline {
+            generation: 3,
+            deadline: CustodySample {
+                clock_id: [0x81; 16],
+                tick_ms: 90,
+            },
+            kind: TtlDeadlineKind::PendingSource,
+            transfer: BlobTransferId::new([0x41; 32]),
+        })
+        .unwrap();
+        let pending = TtlExpiryCycle {
+            end_key: pending_end,
+            position: Some(pending_end),
+        };
+        store_ttl_expiry_turn(&write, TtlExpiryPhase::Pending, Some(&pending))
+            .expect("persist pending cycle");
+        let after_pending = load_ttl_expiry_state_write(&write).unwrap();
+        assert_eq!(after_pending.next_phase, TtlExpiryPhase::Live);
+        assert_eq!(after_pending.live, Some(live));
+        assert_eq!(after_pending.pending, Some(pending));
+        assert!(store_ttl_expiry_turn(&write, TtlExpiryPhase::Pending, None).is_err());
+        write.commit().expect("commit pending cursor");
+        drop(database);
+        std::fs::remove_file(path).expect("remove TTL cursor database");
+    }
+
+    #[test]
+    fn blob_ttl_expiry_turn_selects_only_fenced_due_roots_and_alternates_kind() {
+        // Mutations caught: selecting arbitrary transfer order instead of the
+        // dedicated due index, resetting the fence after every root, or
+        // allowing a continuously nonempty live class to starve pending work.
+        let sequence = NEXT_RETIREMENT_AUDIT_DB.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "aster-blob-ttl-expiry-turn-{}-{sequence}.redb",
+            std::process::id()
+        ));
+        let database = Database::create(&path).expect("create TTL turn database");
+        let generation = 5;
+        let clock_id = [0x85; 16];
+        let sample = CustodySample {
+            clock_id,
+            tick_ms: 100,
+        };
+        let live_first = TtlDeadline {
+            generation,
+            deadline: CustodySample {
+                clock_id,
+                tick_ms: 80,
+            },
+            kind: TtlDeadlineKind::LivePublication,
+            transfer: BlobTransferId::new([0x10; 32]),
+        };
+        let live_fence = TtlDeadline {
+            deadline: CustodySample {
+                clock_id,
+                tick_ms: 90,
+            },
+            transfer: BlobTransferId::new([0x20; 32]),
+            ..live_first
+        };
+        let pending = TtlDeadline {
+            deadline: CustodySample {
+                clock_id,
+                tick_ms: 70,
+            },
+            kind: TtlDeadlineKind::PendingSource,
+            transfer: BlobTransferId::new([0x30; 32]),
+            ..live_first
+        };
+
+        let write = database.begin_write().unwrap();
+        write
+            .open_table(BLOB_LIFECYCLE_METADATA)
+            .unwrap()
+            .insert(
+                BLOB_LIFECYCLE_SCHEMA_VERSION_FIELD,
+                BLOB_LIFECYCLE_SCHEMA_VERSION,
+            )
+            .unwrap();
+        initialize_ttl_expiry_cursors(&write).unwrap();
+        for deadline in [live_first, live_fence, pending] {
+            insert_ttl_deadline_write(&write, deadline).unwrap();
+        }
+        let first = plan_ttl_expiry_turn_write(&write, generation, sample)
+            .unwrap()
+            .expect("first live due root");
+        assert_eq!(first.deadline, Some(live_first));
+        let mut exact_charge = super::super::MaintenanceCharge {
+            budget: BlobMaintenanceBudget::new(3, 1, 72).unwrap(),
+            rows: 0,
+            bytes: 0,
+            identities: std::collections::BTreeMap::new(),
+        };
+        assert!(charge_ttl_expiry_turn_write(&write, first, &mut exact_charge).unwrap());
+        assert_eq!((exact_charge.rows, exact_charge.bytes), (3, 72));
+        let mut short_charge = super::super::MaintenanceCharge {
+            budget: BlobMaintenanceBudget::new(2, 1, 72).unwrap(),
+            rows: 0,
+            bytes: 0,
+            identities: std::collections::BTreeMap::new(),
+        };
+        assert!(!charge_ttl_expiry_turn_write(&write, first, &mut short_charge).unwrap());
+        finish_ttl_expiry_turn_write(&write, first).unwrap();
+
+        let second = plan_ttl_expiry_turn_write(&write, generation, sample)
+            .unwrap()
+            .expect("pending due root");
+        assert_eq!(second.deadline, Some(pending));
+        finish_ttl_expiry_turn_write(&write, second).unwrap();
+
+        let third = plan_ttl_expiry_turn_write(&write, generation, sample)
+            .unwrap()
+            .expect("second fenced live root");
+        assert_eq!(third.deadline, Some(live_fence));
+        finish_ttl_expiry_turn_write(&write, third).unwrap();
+        assert_eq!(
+            load_ttl_expiry_state_write(&write).unwrap().next_phase,
+            TtlExpiryPhase::Pending
+        );
+        drop(write);
+        drop(database);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn blob_ttl_empty_phase_charges_other_cycle_and_due_probe_before_progress() {
+        let sequence = NEXT_RETIREMENT_AUDIT_DB.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "aster-blob-ttl-empty-phase-charge-{}-{sequence}.redb",
+            std::process::id()
+        ));
+        let database = Database::create(&path).unwrap();
+        let generation = 11;
+        let sample = CustodySample {
+            clock_id: [0x8f; 16],
+            tick_ms: 100,
+        };
+        let pending = TtlDeadline {
+            generation,
+            deadline: CustodySample {
+                clock_id: sample.clock_id,
+                tick_ms: 90,
+            },
+            kind: TtlDeadlineKind::PendingSource,
+            transfer: BlobTransferId::new([0x44; 32]),
+        };
+        let write = database.begin_write().unwrap();
+        write
+            .open_table(BLOB_LIFECYCLE_METADATA)
+            .unwrap()
+            .insert(
+                BLOB_LIFECYCLE_SCHEMA_VERSION_FIELD,
+                BLOB_LIFECYCLE_SCHEMA_VERSION,
+            )
+            .unwrap();
+        initialize_ttl_expiry_cursors(&write).unwrap();
+        insert_ttl_deadline_write(&write, pending).unwrap();
+        let turn = plan_ttl_expiry_turn_write(&write, generation, sample)
+            .unwrap()
+            .expect("empty live phase advances toward due pending work");
+        assert_eq!(turn.deadline, None);
+        let before = load_ttl_expiry_state_write(&write).unwrap();
+        let (exact_rows, exact_bytes) = {
+            let mut charge = super::super::MaintenanceCharge::new(
+                BlobMaintenanceBudget::new(u64::MAX, 1, u64::MAX).unwrap(),
+                0,
+                0,
+            );
+            assert!(charge_ttl_expiry_turn_write(&write, turn, &mut charge).unwrap());
+            assert_eq!(
+                charge.rows, 4,
+                "phase, both cycle rows, and the other phase due probe are authoritative"
+            );
+            (charge.rows, charge.bytes)
+        };
+        for budget in [
+            BlobMaintenanceBudget::new(exact_rows - 1, 1, exact_bytes).unwrap(),
+            BlobMaintenanceBudget::new(exact_rows, 1, exact_bytes - 1).unwrap(),
+        ] {
+            let mut charge = super::super::MaintenanceCharge::new(budget, 0, 0);
+            assert!(!charge_ttl_expiry_turn_write(&write, turn, &mut charge).unwrap());
+            assert_eq!(load_ttl_expiry_state_write(&write).unwrap(), before);
+        }
+        finish_ttl_expiry_turn_write(&write, turn).unwrap();
+        assert_eq!(
+            plan_ttl_expiry_turn_write(&write, generation, sample)
+                .unwrap()
+                .unwrap()
+                .deadline,
+            Some(pending)
+        );
+        drop(write);
+        drop(database);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn blob_ttl_persisted_cycle_eof_charges_only_selected_cycle_and_phase() {
+        let sequence = NEXT_RETIREMENT_AUDIT_DB.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "aster-blob-ttl-persisted-eof-charge-{}-{sequence}.redb",
+            std::process::id()
+        ));
+        let database = Database::create(&path).unwrap();
+        let generation = 12;
+        let sample = CustodySample {
+            clock_id: [0x9f; 16],
+            tick_ms: 100,
+        };
+        let first = TtlDeadline {
+            generation,
+            deadline: CustodySample {
+                clock_id: sample.clock_id,
+                tick_ms: 80,
+            },
+            kind: TtlDeadlineKind::LivePublication,
+            transfer: BlobTransferId::new([0x10; 32]),
+        };
+        let fence = TtlDeadline {
+            deadline: CustodySample {
+                clock_id: sample.clock_id,
+                tick_ms: 90,
+            },
+            transfer: BlobTransferId::new([0x20; 32]),
+            ..first
+        };
+        let write = database.begin_write().unwrap();
+        write
+            .open_table(BLOB_LIFECYCLE_METADATA)
+            .unwrap()
+            .insert(
+                BLOB_LIFECYCLE_SCHEMA_VERSION_FIELD,
+                BLOB_LIFECYCLE_SCHEMA_VERSION,
+            )
+            .unwrap();
+        initialize_ttl_expiry_cursors(&write).unwrap();
+        insert_ttl_deadline_write(&write, first).unwrap();
+        insert_ttl_deadline_write(&write, fence).unwrap();
+        let first_turn = plan_ttl_expiry_turn_write(&write, generation, sample)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first_turn.deadline, Some(first));
+        finish_ttl_expiry_turn_write(&write, first_turn).unwrap();
+        store_ttl_expiry_turn(&write, TtlExpiryPhase::Pending, None).unwrap();
+        write
+            .open_table(BLOB_TTL_DEADLINES)
+            .unwrap()
+            .remove(ttl_deadline_key(fence).unwrap().as_slice())
+            .unwrap();
+
+        let eof = plan_ttl_expiry_turn_write(&write, generation, sample)
+            .unwrap()
+            .expect("persisted live cycle reaches fenced EOF");
+        assert_eq!(eof.deadline, None);
+        let before = load_ttl_expiry_state_write(&write).unwrap();
+        let (exact_rows, exact_bytes) = {
+            let mut charge = super::super::MaintenanceCharge::new(
+                BlobMaintenanceBudget::new(u64::MAX, 1, u64::MAX).unwrap(),
+                0,
+                0,
+            );
+            assert!(charge_ttl_expiry_turn_write(&write, eof, &mut charge).unwrap());
+            assert_eq!(charge.rows, 2, "selected cycle and phase only");
+            (charge.rows, charge.bytes)
+        };
+        for budget in [
+            BlobMaintenanceBudget::new(exact_rows - 1, 1, exact_bytes).unwrap(),
+            BlobMaintenanceBudget::new(exact_rows, 1, exact_bytes - 1).unwrap(),
+        ] {
+            let mut charge = super::super::MaintenanceCharge::new(budget, 0, 0);
+            assert!(!charge_ttl_expiry_turn_write(&write, eof, &mut charge).unwrap());
+            assert_eq!(load_ttl_expiry_state_write(&write).unwrap(), before);
+        }
+        finish_ttl_expiry_turn_write(&write, eof).unwrap();
+        assert_ne!(load_ttl_expiry_state_write(&write).unwrap(), before);
+        drop(write);
+        drop(database);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn blob_ttl_expiry_generation_change_invalidates_both_fenced_cycles() {
+        // Mutations caught: retaining either prior-generation fence after a
+        // continuity restart, selecting stale due work, or resetting only the
+        // phase selected by the current turn.
+        let sequence = NEXT_RETIREMENT_AUDIT_DB.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "aster-blob-ttl-expiry-generation-{}-{sequence}.redb",
+            std::process::id()
+        ));
+        let database = Database::create(&path).expect("create TTL generation database");
+        let old_generation = 5;
+        let old_clock = [0x91; 16];
+        let current_generation = 6;
+        let current_sample = CustodySample {
+            clock_id: [0x92; 16],
+            tick_ms: 200,
+        };
+        let live = TtlDeadline {
+            generation: old_generation,
+            deadline: CustodySample {
+                clock_id: old_clock,
+                tick_ms: 80,
+            },
+            kind: TtlDeadlineKind::LivePublication,
+            transfer: BlobTransferId::new([0x93; 32]),
+        };
+        let pending = TtlDeadline {
+            kind: TtlDeadlineKind::PendingSource,
+            transfer: BlobTransferId::new([0x94; 32]),
+            ..live
+        };
+
+        let write = database.begin_write().unwrap();
+        write
+            .open_table(BLOB_LIFECYCLE_METADATA)
+            .unwrap()
+            .insert(
+                BLOB_LIFECYCLE_SCHEMA_VERSION_FIELD,
+                BLOB_LIFECYCLE_SCHEMA_VERSION,
+            )
+            .unwrap();
+        initialize_ttl_expiry_cursors(&write).unwrap();
+        for deadline in [live, pending] {
+            insert_ttl_deadline_write(&write, deadline).unwrap();
+        }
+        {
+            let mut cursors = write.open_table(BLOB_TTL_EXPIRY_CURSORS).unwrap();
+            for (key, deadline) in [
+                (TTL_EXPIRY_LIVE_CYCLE_KEY, live),
+                (TTL_EXPIRY_PENDING_CYCLE_KEY, pending),
+            ] {
+                let cycle = TtlExpiryCycle {
+                    end_key: ttl_deadline_key(deadline).unwrap(),
+                    position: None,
+                };
+                cursors
+                    .insert(key, encode_ttl_expiry_cycle(Some(&cycle)).as_slice())
+                    .unwrap();
+            }
+        }
+
+        synchronize_ttl_expiry_cycles_write(&write, current_generation, current_sample).unwrap();
+        assert!(
+            plan_ttl_expiry_turn_write(&write, current_generation, current_sample)
+                .unwrap()
+                .is_none(),
+            "a prior-generation due row must not survive cycle synchronization"
+        );
+        let state = load_ttl_expiry_state_write(&write).unwrap();
+        assert!(state.live.is_none() && state.pending.is_none());
+        assert_eq!(state.next_phase, TtlExpiryPhase::Live);
+        drop(write);
+        drop(database);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn blob_ttl_deadline_mutation_rekeys_exact_root_and_counter_atomically() {
+        // Mutations caught: leaving the prior deadline behind after an age
+        // checkpoint update, inserting the successor without updating the
+        // bounded counter, or silently repairing a missing predecessor row.
+        let sequence = NEXT_RETIREMENT_AUDIT_DB.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "aster-blob-ttl-deadline-mutation-{}-{sequence}.redb",
+            std::process::id()
+        ));
+        let database = Database::create(&path).expect("create TTL mutation database");
+        let transfer = BlobTransferId::new([0x51; 32]);
+        let first = super::super::BlobLifetime::Finite {
+            ttl_ms: 1_000,
+            age: custody::LowerBoundAgeCheckpoint {
+                cumulative_age_ms: 100,
+                checkpoint: Some(CustodySample {
+                    clock_id: [0x52; 16],
+                    tick_ms: 200,
+                }),
+                continuity_generation: 7,
+                continuity_lost: false,
+            },
+            provenance: super::super::BlobFiniteProvenance::Local,
+        };
+        let second = super::super::BlobLifetime::Finite {
+            ttl_ms: 1_000,
+            age: custody::LowerBoundAgeCheckpoint {
+                cumulative_age_ms: 400,
+                checkpoint: Some(CustodySample {
+                    clock_id: [0x52; 16],
+                    tick_ms: 500,
+                }),
+                continuity_generation: 7,
+                continuity_lost: false,
+            },
+            provenance: super::super::BlobFiniteProvenance::Local,
+        };
+
+        let write = database.begin_write().expect("TTL mutation writer");
+        write
+            .open_table(BLOB_LIFECYCLE_METADATA)
+            .unwrap()
+            .insert(BLOB_TTL_DEADLINE_ROWS, 0)
+            .unwrap();
+        replace_ttl_deadline_write(
+            &write,
+            transfer,
+            TtlDeadlineKind::LivePublication,
+            None,
+            Some(first),
+            4,
+        )
+        .expect("insert first deadline");
+        assert_eq!(
+            write.open_table(BLOB_TTL_DEADLINES).unwrap().len().unwrap(),
+            1
+        );
+        assert_eq!(
+            write
+                .open_table(BLOB_LIFECYCLE_METADATA)
+                .unwrap()
+                .get(BLOB_TTL_DEADLINE_ROWS)
+                .unwrap()
+                .unwrap()
+                .value(),
+            1
+        );
+
+        replace_ttl_deadline_write(
+            &write,
+            transfer,
+            TtlDeadlineKind::LivePublication,
+            Some(first),
+            Some(second),
+            4,
+        )
+        .expect("re-key exact deadline");
+        let rows = write
+            .open_table(BLOB_TTL_DEADLINES)
+            .unwrap()
+            .iter()
+            .unwrap()
+            .map(|row| decode_ttl_deadline_key(row.unwrap().0.value()))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].deadline.tick_ms, 1_100);
+        assert_eq!(rows[0].generation, 7);
+
+        replace_ttl_deadline_write(
+            &write,
+            transfer,
+            TtlDeadlineKind::LivePublication,
+            Some(second),
+            None,
+            4,
+        )
+        .expect("remove deadline");
+        assert_eq!(
+            write.open_table(BLOB_TTL_DEADLINES).unwrap().len().unwrap(),
+            0
+        );
+        assert_eq!(
+            write
+                .open_table(BLOB_LIFECYCLE_METADATA)
+                .unwrap()
+                .get(BLOB_TTL_DEADLINE_ROWS)
+                .unwrap()
+                .unwrap()
+                .value(),
+            0
+        );
+
+        assert!(
+            replace_ttl_deadline_write(
+                &write,
+                transfer,
+                TtlDeadlineKind::LivePublication,
+                Some(second),
+                None,
+                4,
+            )
+            .is_err(),
+            "a missing predecessor deadline must fail instead of repairing accounting"
+        );
+        write.commit().expect("commit TTL mutation fixture");
+        drop(database);
+        std::fs::remove_file(path).expect("remove TTL mutation database");
+    }
+
+    #[test]
+    fn blob_ttl_deadline_policy_hook_is_v5_only_and_projects_before_indexing() {
+        // Mutations caught: creating v5 authority while a v4 store is active,
+        // or indexing a fresh continuity generation without persisting the
+        // matching projected lifetime.
+        let sequence = NEXT_RETIREMENT_AUDIT_DB.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "aster-blob-ttl-policy-hook-{}-{sequence}.redb",
+            std::process::id()
+        ));
+        let database = Database::create(&path).expect("create TTL policy database");
+        let lifetime = super::super::BlobLifetime::Finite {
+            ttl_ms: 1_000,
+            age: custody::LowerBoundAgeCheckpoint {
+                cumulative_age_ms: 100,
+                checkpoint: Some(CustodySample {
+                    clock_id: [0x62; 16],
+                    tick_ms: 200,
+                }),
+                continuity_generation: 2,
+                continuity_lost: false,
+            },
+            provenance: super::super::BlobFiniteProvenance::Local,
+        };
+        let continuity = custody::LowerBoundContinuity {
+            generation: 1,
+            sample: CustodySample {
+                clock_id: [0x63; 16],
+                tick_ms: 50,
+            },
+        };
+        let write = database.begin_write().unwrap();
+        write.open_table(custody::CUSTODY_CONTINUITY).unwrap();
+        custody::observe_continuity_write(&write, continuity.sample).unwrap();
+        write
+            .open_table(BLOB_LIFECYCLE_METADATA)
+            .unwrap()
+            .insert(BLOB_LIFECYCLE_SCHEMA_VERSION_FIELD, 4)
+            .unwrap();
+        assert_eq!(
+            project_lifetime_for_policy_write(&write, lifetime).unwrap(),
+            lifetime
+        );
+        replace_policy_ttl_deadline_write(
+            &write,
+            BlobTransferId::new([0x64; 32]),
+            TtlDeadlineKind::PendingSource,
+            None,
+            Some(lifetime),
+            BlobLifecycleLimits::DEFAULT,
+        )
+        .unwrap();
+        assert!(
+            !write
+                .list_tables()
+                .unwrap()
+                .any(|table| table.name() == BLOB_TTL_DEADLINES.name())
+        );
+
+        {
+            let mut metadata = write.open_table(BLOB_LIFECYCLE_METADATA).unwrap();
+            metadata
+                .insert(BLOB_LIFECYCLE_SCHEMA_VERSION_FIELD, 5)
+                .unwrap();
+            metadata.insert(BLOB_TTL_DEADLINE_ROWS, 0).unwrap();
+        }
+        let projected = project_lifetime_for_policy_write(&write, lifetime).unwrap();
+        let super::super::BlobLifetime::Finite { age, .. } = projected else {
+            panic!("finite policy lifetime became durable");
+        };
+        assert_eq!(age.checkpoint, Some(continuity.sample));
+        assert_eq!(age.continuity_generation, continuity.generation);
+        replace_policy_ttl_deadline_write(
+            &write,
+            BlobTransferId::new([0x64; 32]),
+            TtlDeadlineKind::PendingSource,
+            None,
+            Some(projected),
+            BlobLifecycleLimits::DEFAULT,
+        )
+        .unwrap();
+        let deadline = {
+            let deadlines = write.open_table(BLOB_TTL_DEADLINES).unwrap();
+            let deadline = deadlines.iter().unwrap().next().unwrap().unwrap();
+            decode_ttl_deadline_key(deadline.0.value()).unwrap()
+        };
+        assert_eq!(deadline.generation, 1);
+        drop(write);
+        drop(database);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn blob_v5_projection_persists_cross_generation_age_authority_used_by_deadline() {
+        // Mutation caught: deriving a v5 deadline from a projected lifetime
+        // while retaining the stale source lifetime allows every reopen to
+        // re-anchor from the old continuity generation.
+        let lifetime = super::super::BlobLifetime::Finite {
+            ttl_ms: 1_000,
+            age: custody::LowerBoundAgeCheckpoint {
+                cumulative_age_ms: 200,
+                checkpoint: Some(CustodySample {
+                    clock_id: [0x91; 16],
+                    tick_ms: 50,
+                }),
+                continuity_generation: 3,
+                continuity_lost: false,
+            },
+            provenance: super::super::BlobFiniteProvenance::Local,
+        };
+        let continuity = custody::LowerBoundContinuity {
+            generation: 4,
+            sample: CustodySample {
+                clock_id: [0x92; 16],
+                tick_ms: 80,
+            },
+        };
+        let projected = project_lifetime_for_v5(lifetime, Some(continuity))
+            .expect("cross-generation v5 projection");
+        let super::super::BlobLifetime::Finite { age, .. } = projected else {
+            panic!("finite lifetime became durable");
+        };
+        assert_eq!(age.cumulative_age_ms, 200);
+        assert_eq!(age.checkpoint, Some(continuity.sample));
+        assert_eq!(age.continuity_generation, continuity.generation);
+        assert!(age.continuity_lost);
+        let deadline = ttl_deadline_for_lifetime(
+            BlobTransferId::new([0x93; 32]),
+            TtlDeadlineKind::LivePublication,
+            projected,
+            Some(continuity),
+            Some(continuity.sample),
+        )
+        .expect("deadline from persisted projection")
+        .expect("sticky lower-bound deadline");
+        assert_eq!(deadline.generation, continuity.generation);
+        assert_eq!(deadline.deadline.tick_ms, 880);
     }
 
     #[test]
@@ -5476,6 +7808,7 @@ mod tests {
                 (BLOB_OPERATION_OWNER_ROWS, 0),
                 (BLOB_DELIVERY_OWNER_ROWS, 0),
                 (BLOB_DEADLINE_ROWS, 2),
+                (BLOB_TTL_DEADLINE_ROWS, 0),
                 (BLOB_RETIREMENT_RESOLVER_ROWS, 2),
                 (BLOB_RETIRED_PUBLICATION_ROWS, 1),
                 (BLOB_RETIRED_OPERATION_ROWS, 1),
@@ -5500,6 +7833,8 @@ mod tests {
             Vec::new(),
             [0x73; 32],
             LifecycleSchemaState::Current,
+            None,
+            true,
         )
         .expect("reconstruct retired authority");
         assert_eq!(expected.usage.retired_publication_rows, 1);
@@ -5575,6 +7910,8 @@ mod tests {
             Vec::new(),
             [0x73; 32],
             LifecycleSchemaState::Current,
+            None,
+            true,
         )
         .expect("reconstruct reopened retired authority");
         assert_eq!(expected.usage.deadline_rows, 2);
@@ -5593,6 +7930,10 @@ mod tests {
             &read
                 .open_table(BLOB_RETENTION_DEADLINES)
                 .expect("deadlines"),
+            Some(
+                table_map(&read.open_table(BLOB_TTL_DEADLINES).expect("TTL deadlines"))
+                    .expect("collect TTL deadlines"),
+            ),
             Some(
                 collect_retirement_resolvers(
                     &read
@@ -5686,6 +8027,27 @@ mod tests {
         assert!(validate_class_position(class, &chunk).is_err());
         assert!(validate_class_position(class, &[MAINTENANCE_DELETION_MANIFEST_TAG; 32]).is_err());
         assert!(validate_class_position(class, &[MAINTENANCE_DELETION_CHUNK_TAG; 40]).is_err());
+    }
+
+    #[test]
+    fn blob_lifecycle_v5_shape_distinguishes_v4_and_current_without_losing_history() {
+        let v4 = lifecycle_v4_table_names()
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+        let v5 = lifecycle_table_names()
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(PREVIOUS_BLOB_LIFECYCLE_SCHEMA_VERSION, 4);
+        assert_eq!(BLOB_LIFECYCLE_SCHEMA_VERSION, 5);
+        assert_eq!(BLOB_LIFECYCLE_V4_METADATA_FIELDS.len(), 14);
+        assert!(BLOB_LIFECYCLE_METADATA_FIELDS.contains(&BLOB_TTL_DEADLINE_ROWS));
+        assert!(v5.contains(BLOB_TTL_DEADLINES.name()));
+        assert!(v5.contains(BLOB_TTL_EXPIRY_CURSORS.name()));
+        assert!(!v4.contains(BLOB_TTL_DEADLINES.name()));
+        assert!(!v4.contains(BLOB_TTL_EXPIRY_CURSORS.name()));
     }
 
     mod blob_lifecycle_budget {

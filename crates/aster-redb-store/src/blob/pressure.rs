@@ -17,11 +17,28 @@ const PRESSURE_CANDIDATE_COMPLETED: u8 = 1;
 const PRESSURE_EXPIRY_EXPIRED_FINITE: u8 = 0;
 const PRESSURE_EXPIRY_FINITE: u8 = 1;
 const PRESSURE_EXPIRY_DURABLE: u8 = 2;
-const PRESSURE_SCHEMA_VERSION: u64 = 4;
+// Ordinary store opens remain on v4 until all Task-4 writers and retirement
+// paths maintain the v5 expiry authority transactionally.
+const ACTIVE_PRESSURE_SCHEMA_VERSION: u64 = 5;
+const PRESSURE_V4_SCHEMA_VERSION: u64 = 4;
+const PRESSURE_SCHEMA_VERSION: u64 = 5;
 pub(crate) const PREVIOUS_PRESSURE_SCHEMA_VERSION: u64 = 3;
 pub(crate) const PRESSURE_SCHEMA_VERSION_FIELD: &str = "schema_version";
 pub(super) const NEXT_PENDING_ACCEPTANCE_ORDER: &str = "next_pending_acceptance_order";
+const REANCHOR_TARGET_GENERATION: &str = "reanchor_target_generation";
+const REANCHOR_DIRTY: &str = "reanchor_dirty";
+const REANCHOR_NEXT_PHASE: &str = "reanchor_next_phase";
 const PRESSURE_CONTENT_DOMAIN: &[u8] = b"aster/blob-pressure-content/v1";
+
+const fn pressure_v5_metadata_fields() -> [&'static str; 5] {
+    [
+        PRESSURE_SCHEMA_VERSION_FIELD,
+        NEXT_PENDING_ACCEPTANCE_ORDER,
+        REANCHOR_TARGET_GENERATION,
+        REANCHOR_DIRTY,
+        REANCHOR_NEXT_PHASE,
+    ]
+}
 
 /// Fixed-width canonical identity for one per-content pressure partition.
 ///
@@ -538,6 +555,527 @@ pub(crate) const BLOB_PRESSURE_PENDING_SOURCES: TableDefinition<PressurePendingI
     TableDefinition::new("aster.blob-pressure-pending-sources.v1");
 pub(crate) const BLOB_PRESSURE_VARIANTS: TableDefinition<PressureVariantIndexKey, &[u8]> =
     TableDefinition::new("aster.blob-pressure-variants.v1");
+pub(crate) const BLOB_PRESSURE_REANCHOR_CURSORS: TableDefinition<u8, &[u8]> =
+    TableDefinition::new("aster.blob-pressure-reanchor-cursors.v1");
+
+const PRESSURE_REANCHOR_CURSOR_VERSION: u8 = 1;
+const PRESSURE_REANCHOR_EMPTY_COMPLETE_TAG: u8 = 0;
+const PRESSURE_REANCHOR_ACTIVE_TAG: u8 = 1;
+const PRESSURE_REANCHOR_COMPLETE_TAG: u8 = 2;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PressureReanchorCursor {
+    EmptyComplete,
+    Active {
+        end_transfer: BlobTransferId,
+        position: Option<BlobTransferId>,
+    },
+    Complete {
+        end_transfer: BlobTransferId,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PressureReanchorRoot {
+    Publication,
+    Pending,
+}
+
+impl PressureReanchorRoot {
+    const fn phase(self) -> u64 {
+        match self {
+            Self::Publication => 1,
+            Self::Pending => 2,
+        }
+    }
+
+    const fn cursor_key(self) -> u8 {
+        self.phase() as u8
+    }
+
+    const fn next_phase(self) -> u64 {
+        match self {
+            Self::Publication => 2,
+            Self::Pending => 1,
+        }
+    }
+
+    fn decode(phase: u64) -> Result<Self, StoreError> {
+        match phase {
+            1 => Ok(Self::Publication),
+            2 => Ok(Self::Pending),
+            _ => Err(pressure_corruption(
+                "Blob pressure reanchor phase is invalid",
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PressureReanchorTurn {
+    pub(crate) root: PressureReanchorRoot,
+    pub(crate) transfer: Option<BlobTransferId>,
+    next_cursor: PressureReanchorCursor,
+}
+
+fn encode_reanchor_cursor(cursor: PressureReanchorCursor) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(67);
+    encoded.push(PRESSURE_REANCHOR_CURSOR_VERSION);
+    match cursor {
+        PressureReanchorCursor::EmptyComplete => {
+            encoded.push(PRESSURE_REANCHOR_EMPTY_COMPLETE_TAG);
+        }
+        PressureReanchorCursor::Active {
+            end_transfer,
+            position,
+        } => {
+            encoded.push(PRESSURE_REANCHOR_ACTIVE_TAG);
+            encoded.extend_from_slice(end_transfer.as_bytes());
+            if let Some(position) = position {
+                encoded.push(1);
+                encoded.extend_from_slice(position.as_bytes());
+            } else {
+                encoded.push(0);
+            }
+        }
+        PressureReanchorCursor::Complete { end_transfer } => {
+            encoded.push(PRESSURE_REANCHOR_COMPLETE_TAG);
+            encoded.extend_from_slice(end_transfer.as_bytes());
+        }
+    }
+    encoded
+}
+
+fn decode_reanchor_cursor(bytes: &[u8]) -> Result<PressureReanchorCursor, StoreError> {
+    if bytes.first().copied() != Some(PRESSURE_REANCHOR_CURSOR_VERSION) {
+        return Err(pressure_corruption(
+            "Blob pressure reanchor cursor has an unknown version",
+        ));
+    }
+    match bytes {
+        [
+            PRESSURE_REANCHOR_CURSOR_VERSION,
+            PRESSURE_REANCHOR_EMPTY_COMPLETE_TAG,
+        ] => Ok(PressureReanchorCursor::EmptyComplete),
+        [
+            PRESSURE_REANCHOR_CURSOR_VERSION,
+            PRESSURE_REANCHOR_ACTIVE_TAG,
+            end @ ..,
+        ] if end.len() == 33 && end[32] == 0 => Ok(PressureReanchorCursor::Active {
+            end_transfer: BlobTransferId::new(end[..32].try_into().expect("fixed transfer")),
+            position: None,
+        }),
+        [
+            PRESSURE_REANCHOR_CURSOR_VERSION,
+            PRESSURE_REANCHOR_ACTIVE_TAG,
+            body @ ..,
+        ] if body.len() == 65 && body[32] == 1 => {
+            let end_transfer = BlobTransferId::new(body[..32].try_into().expect("fixed transfer"));
+            let position = BlobTransferId::new(body[33..].try_into().expect("fixed transfer"));
+            if position.as_bytes() > end_transfer.as_bytes() {
+                return Err(pressure_corruption(
+                    "Blob pressure reanchor cursor exceeds its captured end fence",
+                ));
+            }
+            Ok(PressureReanchorCursor::Active {
+                end_transfer,
+                position: Some(position),
+            })
+        }
+        [
+            PRESSURE_REANCHOR_CURSOR_VERSION,
+            PRESSURE_REANCHOR_COMPLETE_TAG,
+            end @ ..,
+        ] if end.len() == 32 => Ok(PressureReanchorCursor::Complete {
+            end_transfer: BlobTransferId::new(end.try_into().expect("fixed transfer")),
+        }),
+        _ => Err(pressure_corruption(
+            "Blob pressure reanchor cursor is not canonical",
+        )),
+    }
+}
+
+fn reanchor_fence_write(
+    write: &redb::WriteTransaction,
+    root: PressureReanchorRoot,
+) -> Result<PressureReanchorCursor, StoreError> {
+    let last = match root {
+        PressureReanchorRoot::Publication => write
+            .open_table(BLOB_PRESSURE_PUBLICATION_ROOTS)?
+            .iter()?
+            .next_back()
+            .transpose()?
+            .map(|(key, _)| key.value().to_vec()),
+        PressureReanchorRoot::Pending => write
+            .open_table(BLOB_PRESSURE_PENDING_ROOTS)?
+            .iter()?
+            .next_back()
+            .transpose()?
+            .map(|(key, _)| key.value().to_vec()),
+    };
+    last.map_or(Ok(PressureReanchorCursor::EmptyComplete), |key| {
+        let transfer = BlobTransferId::new(key.as_slice().try_into().map_err(|_| {
+            pressure_corruption("Blob pressure root key is not a transfer identifier")
+        })?);
+        Ok(PressureReanchorCursor::Active {
+            end_transfer: transfer,
+            position: None,
+        })
+    })
+}
+
+/// Restarts the persisted fenced reanchor pass whenever custody continuity
+/// advances to a new generation. Roots admitted after these fences are
+/// required to be target-normalized by their ordinary mutation transaction.
+pub(crate) fn synchronize_reanchor_state_write(
+    write: &redb::WriteTransaction,
+) -> Result<(), StoreError> {
+    let metadata = write.open_table(BLOB_PRESSURE_METADATA)?;
+    let version = metadata
+        .get(PRESSURE_SCHEMA_VERSION_FIELD)?
+        .map(|value| value.value())
+        .ok_or_else(|| pressure_corruption("Blob pressure schema version is missing"))?;
+    if version != PRESSURE_SCHEMA_VERSION {
+        return Ok(());
+    }
+    let target = metadata
+        .get(REANCHOR_TARGET_GENERATION)?
+        .map(|value| value.value())
+        .ok_or_else(|| pressure_corruption("Blob pressure reanchor target is missing"))?;
+    drop(metadata);
+    let current = crate::custody::lower_bound_continuity_write(write)?
+        .map_or(0, |continuity| continuity.generation);
+    if target == current {
+        return Ok(());
+    }
+
+    let live = reanchor_fence_write(write, PressureReanchorRoot::Publication)?;
+    let pending = reanchor_fence_write(write, PressureReanchorRoot::Pending)?;
+    let dirty = !matches!(live, PressureReanchorCursor::EmptyComplete)
+        || !matches!(pending, PressureReanchorCursor::EmptyComplete);
+    {
+        let mut metadata = write.open_table(BLOB_PRESSURE_METADATA)?;
+        metadata.insert(REANCHOR_TARGET_GENERATION, current)?;
+        metadata.insert(REANCHOR_DIRTY, u64::from(dirty))?;
+        metadata.insert(REANCHOR_NEXT_PHASE, 1)?;
+    }
+    let mut cursors = write.open_table(BLOB_PRESSURE_REANCHOR_CURSORS)?;
+    cursors.insert(1, encode_reanchor_cursor(live).as_slice())?;
+    cursors.insert(2, encode_reanchor_cursor(pending).as_slice())?;
+    Ok(())
+}
+
+pub(crate) fn reanchor_state_needs_sync_write(
+    write: &redb::WriteTransaction,
+) -> Result<bool, StoreError> {
+    let metadata = write.open_table(BLOB_PRESSURE_METADATA)?;
+    if metadata
+        .get(PRESSURE_SCHEMA_VERSION_FIELD)?
+        .map(|value| value.value())
+        != Some(PRESSURE_SCHEMA_VERSION)
+    {
+        return Ok(false);
+    }
+    let target = metadata
+        .get(REANCHOR_TARGET_GENERATION)?
+        .map(|value| value.value())
+        .ok_or_else(|| pressure_corruption("Blob pressure reanchor target is missing"))?;
+    drop(metadata);
+    let current = crate::custody::lower_bound_continuity_write(write)?
+        .map_or(0, |continuity| continuity.generation);
+    Ok(target != current)
+}
+
+pub(crate) fn charge_reanchor_sync_state_write(
+    write: &redb::WriteTransaction,
+    charge: &mut super::MaintenanceCharge,
+) -> Result<bool, StoreError> {
+    let metadata = write.open_table(BLOB_PRESSURE_METADATA)?;
+    for field in [
+        PRESSURE_SCHEMA_VERSION_FIELD,
+        REANCHOR_TARGET_GENERATION,
+        REANCHOR_DIRTY,
+        REANCHOR_NEXT_PHASE,
+    ] {
+        let value = metadata.get(field)?.ok_or_else(|| {
+            pressure_corruption("Blob pressure synchronization metadata is missing")
+        })?;
+        if !charge.charge_row(
+            super::MaintenanceRowIdentity::new("aster.blob-pressure-metadata.v1", field.as_bytes()),
+            std::mem::size_of_val(&value.value()),
+        )? {
+            return Ok(false);
+        }
+    }
+    drop(metadata);
+    let cursors = write.open_table(BLOB_PRESSURE_REANCHOR_CURSORS)?;
+    for key in [1u8, 2u8] {
+        let value = cursors.get(key)?.ok_or_else(|| {
+            pressure_corruption("Blob pressure synchronization cursor is missing")
+        })?;
+        if !charge.charge_row(
+            super::MaintenanceRowIdentity::new("aster.blob-pressure-reanchor-cursors.v1", [key]),
+            value.value().len(),
+        )? {
+            return Ok(false);
+        }
+    }
+    drop(cursors);
+    for (root, table_name) in [
+        (
+            PressureReanchorRoot::Publication,
+            "aster.blob-pressure-publication-roots.v1",
+        ),
+        (
+            PressureReanchorRoot::Pending,
+            "aster.blob-pressure-pending-roots.v1",
+        ),
+    ] {
+        let last = match root {
+            PressureReanchorRoot::Publication => write
+                .open_table(BLOB_PRESSURE_PUBLICATION_ROOTS)?
+                .iter()?
+                .next_back()
+                .transpose()?
+                .map(|(key, value)| (key.value().to_vec(), value.value().len())),
+            PressureReanchorRoot::Pending => write
+                .open_table(BLOB_PRESSURE_PENDING_ROOTS)?
+                .iter()?
+                .next_back()
+                .transpose()?
+                .map(|(key, value)| (key.value().to_vec(), value.value().len())),
+        };
+        if let Some((key, value_len)) = last
+            && !charge.charge_row(
+                super::MaintenanceRowIdentity::new(table_name, key),
+                value_len,
+            )?
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn next_reanchor_transfer_write(
+    write: &redb::WriteTransaction,
+    root: PressureReanchorRoot,
+    cursor: PressureReanchorCursor,
+) -> Result<Option<BlobTransferId>, StoreError> {
+    use std::ops::Bound::{Excluded, Included, Unbounded};
+
+    let PressureReanchorCursor::Active {
+        end_transfer,
+        position,
+    } = cursor
+    else {
+        return Ok(None);
+    };
+    let lower = position.as_ref().map_or(Unbounded, |position| {
+        Excluded(position.as_bytes().as_slice())
+    });
+    let upper = Included(end_transfer.as_bytes().as_slice());
+    let key = match root {
+        PressureReanchorRoot::Publication => write
+            .open_table(BLOB_PRESSURE_PUBLICATION_ROOTS)?
+            .range::<&[u8]>((lower, upper))?
+            .next()
+            .transpose()?
+            .map(|(key, _)| key.value().to_vec()),
+        PressureReanchorRoot::Pending => write
+            .open_table(BLOB_PRESSURE_PENDING_ROOTS)?
+            .range::<&[u8]>((lower, upper))?
+            .next()
+            .transpose()?
+            .map(|(key, _)| key.value().to_vec()),
+    };
+    key.map(|key| {
+        Ok(BlobTransferId::new(key.as_slice().try_into().map_err(
+            |_| pressure_corruption("Blob pressure root key is not a transfer identifier"),
+        )?))
+    })
+    .transpose()
+}
+
+fn reanchor_cursor_write(
+    write: &redb::WriteTransaction,
+    root: PressureReanchorRoot,
+) -> Result<PressureReanchorCursor, StoreError> {
+    let cursors = write.open_table(BLOB_PRESSURE_REANCHOR_CURSORS)?;
+    decode_reanchor_cursor(
+        cursors
+            .get(root.cursor_key())?
+            .ok_or_else(|| pressure_corruption("Blob pressure reanchor cursor is missing"))?
+            .value(),
+    )
+}
+
+fn store_reanchor_progress_write(
+    write: &redb::WriteTransaction,
+    root: PressureReanchorRoot,
+    cursor: PressureReanchorCursor,
+) -> Result<(), StoreError> {
+    write
+        .open_table(BLOB_PRESSURE_REANCHOR_CURSORS)?
+        .insert(root.cursor_key(), encode_reanchor_cursor(cursor).as_slice())?;
+    let other = match root {
+        PressureReanchorRoot::Publication => PressureReanchorRoot::Pending,
+        PressureReanchorRoot::Pending => PressureReanchorRoot::Publication,
+    };
+    let other_cursor = reanchor_cursor_write(write, other)?;
+    let complete = |cursor| {
+        matches!(
+            cursor,
+            PressureReanchorCursor::EmptyComplete | PressureReanchorCursor::Complete { .. }
+        )
+    };
+    let mut metadata = write.open_table(BLOB_PRESSURE_METADATA)?;
+    if complete(cursor) && complete(other_cursor) {
+        metadata.insert(REANCHOR_DIRTY, 0)?;
+        metadata.insert(REANCHOR_NEXT_PHASE, 1)?;
+        drop(metadata);
+        let empty = encode_reanchor_cursor(PressureReanchorCursor::EmptyComplete);
+        let mut cursors = write.open_table(BLOB_PRESSURE_REANCHOR_CURSORS)?;
+        cursors.insert(1, empty.as_slice())?;
+        cursors.insert(2, empty.as_slice())?;
+    } else {
+        metadata.insert(REANCHOR_NEXT_PHASE, root.next_phase())?;
+    }
+    Ok(())
+}
+
+pub(crate) fn plan_reanchor_turn_write(
+    write: &redb::WriteTransaction,
+) -> Result<Option<PressureReanchorTurn>, StoreError> {
+    let metadata = write.open_table(BLOB_PRESSURE_METADATA)?;
+    if metadata
+        .get(PRESSURE_SCHEMA_VERSION_FIELD)?
+        .map(|value| value.value())
+        != Some(PRESSURE_SCHEMA_VERSION)
+        || metadata.get(REANCHOR_DIRTY)?.map(|value| value.value()) != Some(1)
+    {
+        return Ok(None);
+    }
+    let root = PressureReanchorRoot::decode(
+        metadata
+            .get(REANCHOR_NEXT_PHASE)?
+            .map(|value| value.value())
+            .ok_or_else(|| pressure_corruption("Blob pressure reanchor phase is missing"))?,
+    )?;
+    drop(metadata);
+    let cursor = reanchor_cursor_write(write, root)?;
+    let Some(transfer) = next_reanchor_transfer_write(write, root, cursor)? else {
+        let completed = match cursor {
+            PressureReanchorCursor::Active { end_transfer, .. } => {
+                PressureReanchorCursor::Complete { end_transfer }
+            }
+            complete => complete,
+        };
+        return Ok(Some(PressureReanchorTurn {
+            root,
+            transfer: None,
+            next_cursor: completed,
+        }));
+    };
+    let PressureReanchorCursor::Active { end_transfer, .. } = cursor else {
+        return Err(pressure_corruption(
+            "Blob pressure reanchor selected from a completed cursor",
+        ));
+    };
+    let next_cursor = if transfer == end_transfer {
+        PressureReanchorCursor::Complete { end_transfer }
+    } else {
+        PressureReanchorCursor::Active {
+            end_transfer,
+            position: Some(transfer),
+        }
+    };
+    Ok(Some(PressureReanchorTurn {
+        root,
+        transfer: Some(transfer),
+        next_cursor,
+    }))
+}
+
+pub(crate) fn finish_reanchor_turn_write(
+    write: &redb::WriteTransaction,
+    turn: PressureReanchorTurn,
+) -> Result<(), StoreError> {
+    let metadata = write.open_table(BLOB_PRESSURE_METADATA)?;
+    if metadata.get(REANCHOR_DIRTY)?.map(|value| value.value()) != Some(1)
+        || metadata
+            .get(REANCHOR_NEXT_PHASE)?
+            .map(|value| value.value())
+            != Some(turn.root.phase())
+    {
+        return Err(pressure_corruption(
+            "Blob pressure reanchor state changed before its unit committed",
+        ));
+    }
+    drop(metadata);
+    store_reanchor_progress_write(write, turn.root, turn.next_cursor)
+}
+
+/// Preflights the persisted progress rows changed when a reanchor unit commits.
+pub(crate) fn charge_reanchor_turn_write(
+    write: &redb::WriteTransaction,
+    turn: PressureReanchorTurn,
+    charge: &mut super::MaintenanceCharge,
+) -> Result<bool, StoreError> {
+    let cursors = write.open_table(BLOB_PRESSURE_REANCHOR_CURSORS)?;
+    let other = match turn.root {
+        PressureReanchorRoot::Publication => PressureReanchorRoot::Pending,
+        PressureReanchorRoot::Pending => PressureReanchorRoot::Publication,
+    };
+    for key in [turn.root.cursor_key(), other.cursor_key()] {
+        let value = cursors
+            .get(key)?
+            .ok_or_else(|| pressure_corruption("Blob pressure reanchor cursor is missing"))?;
+        if !charge.charge_row(
+            super::MaintenanceRowIdentity::new("aster.blob-pressure-reanchor-cursors.v1", [key]),
+            value.value().len(),
+        )? {
+            return Ok(false);
+        }
+    }
+    drop(cursors);
+    for field in [
+        PRESSURE_SCHEMA_VERSION_FIELD,
+        REANCHOR_DIRTY,
+        REANCHOR_NEXT_PHASE,
+    ] {
+        if !charge.charge_row(
+            super::MaintenanceRowIdentity::new("aster.blob-pressure-metadata.v1", field.as_bytes()),
+            std::mem::size_of::<u64>(),
+        )? {
+            return Ok(false);
+        }
+    }
+    if let Some(transfer) = turn.transfer {
+        let encoded = match turn.root {
+            PressureReanchorRoot::Publication => write
+                .open_table(BLOB_PRESSURE_PUBLICATION_ROOTS)?
+                .get(transfer.as_bytes().as_slice())?
+                .map(|value| value.value().to_vec()),
+            PressureReanchorRoot::Pending => write
+                .open_table(BLOB_PRESSURE_PENDING_ROOTS)?
+                .get(transfer.as_bytes().as_slice())?
+                .map(|value| value.value().to_vec()),
+        }
+        .ok_or_else(|| pressure_corruption("Blob pressure reanchor root disappeared"))?;
+        let table = match turn.root {
+            PressureReanchorRoot::Publication => "aster.blob-pressure-publication-roots.v1",
+            PressureReanchorRoot::Pending => "aster.blob-pressure-pending-roots.v1",
+        };
+        if !charge.charge_row(
+            super::MaintenanceRowIdentity::new(table, transfer.as_bytes()),
+            encoded.len(),
+        )? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
 
 const PRESSURE_PENDING_INDEX_LEN: usize = 68;
 const PRESSURE_VARIANT_INDEX_LEN: usize = 84;
@@ -748,14 +1286,73 @@ pub(crate) struct PressurePublicationKey {
 }
 
 pub(crate) fn encode_publication_key(key: PressurePublicationKey) -> Vec<u8> {
+    encode_publication_key_for_generation(key, false)
+}
+
+fn expiry_indexes_active_write(write: &redb::WriteTransaction) -> Result<bool, StoreError> {
+    let version = write
+        .open_table(BLOB_PRESSURE_METADATA)?
+        .get(PRESSURE_SCHEMA_VERSION_FIELD)?
+        .map(|value| value.value())
+        .ok_or_else(|| pressure_corruption("Blob pressure schema version is missing"))?;
+    match version {
+        PRESSURE_SCHEMA_VERSION => Ok(true),
+        2 | PREVIOUS_PRESSURE_SCHEMA_VERSION | PRESSURE_V4_SCHEMA_VERSION => Ok(false),
+        _ => Err(pressure_corruption(
+            "Blob pressure schema version is unknown",
+        )),
+    }
+}
+
+fn expiry_indexes_active_read(read: &redb::ReadTransaction) -> Result<bool, StoreError> {
+    let version = read
+        .open_table(BLOB_PRESSURE_METADATA)?
+        .get(PRESSURE_SCHEMA_VERSION_FIELD)?
+        .map(|value| value.value())
+        .ok_or_else(|| pressure_corruption("Blob pressure schema version is missing"))?;
+    match version {
+        PRESSURE_SCHEMA_VERSION => Ok(true),
+        2 | PREVIOUS_PRESSURE_SCHEMA_VERSION | PRESSURE_V4_SCHEMA_VERSION => Ok(false),
+        _ => Err(pressure_corruption(
+            "Blob pressure schema version is unknown",
+        )),
+    }
+}
+
+fn publication_index_key_write(
+    write: &redb::WriteTransaction,
+    key: PressurePublicationKey,
+) -> Result<Vec<u8>, StoreError> {
+    Ok(encode_publication_key_for_generation(
+        key,
+        expiry_indexes_active_write(write)?,
+    ))
+}
+
+fn publication_index_key_read(
+    read: &redb::ReadTransaction,
+    key: PressurePublicationKey,
+) -> Result<Vec<u8>, StoreError> {
+    Ok(encode_publication_key_for_generation(
+        key,
+        expiry_indexes_active_read(read)?,
+    ))
+}
+
+fn encode_publication_key_for_generation(
+    key: PressurePublicationKey,
+    activate_expiry: bool,
+) -> Vec<u8> {
     let mut output = Vec::with_capacity(52);
     output.push(PRESSURE_RECORD_VERSION);
     output.push(key.priority as u8);
     output.push(PRESSURE_CANDIDATE_COMPLETED);
-    // Task 3 persists authoritative expiry on roots and summaries but does
-    // not activate it as a pressure-selection discriminator. Task 4 can
-    // replace this projection and atomically re-key the indexes.
-    PressureExpiry::Durable.encode(&mut output);
+    if activate_expiry {
+        key.expiry
+    } else {
+        PressureExpiry::Durable
+    }
+    .encode(&mut output);
     output.extend_from_slice(&key.acceptance_order.to_be_bytes());
     output.extend_from_slice(key.transfer_id.as_bytes());
     output
@@ -967,11 +1564,50 @@ pub(crate) fn encode_pending_index_key(
     root: PressurePendingRoot,
     transfer_id: BlobTransferId,
 ) -> [u8; PRESSURE_PENDING_INDEX_LEN] {
+    encode_pending_index_key_for_generation(root, transfer_id, false)
+}
+
+fn pending_index_key_write(
+    write: &redb::WriteTransaction,
+    root: PressurePendingRoot,
+    transfer_id: BlobTransferId,
+) -> Result<[u8; PRESSURE_PENDING_INDEX_LEN], StoreError> {
+    Ok(encode_pending_index_key_for_generation(
+        root,
+        transfer_id,
+        expiry_indexes_active_write(write)?,
+    ))
+}
+
+fn pending_index_key_read(
+    read: &redb::ReadTransaction,
+    root: PressurePendingRoot,
+    transfer_id: BlobTransferId,
+) -> Result<[u8; PRESSURE_PENDING_INDEX_LEN], StoreError> {
+    Ok(encode_pending_index_key_for_generation(
+        root,
+        transfer_id,
+        expiry_indexes_active_read(read)?,
+    ))
+}
+
+fn encode_pending_index_key_for_generation(
+    root: PressurePendingRoot,
+    transfer_id: BlobTransferId,
+    activate_expiry: bool,
+) -> [u8; PRESSURE_PENDING_INDEX_LEN] {
     let mut output = [0u8; PRESSURE_PENDING_INDEX_LEN];
     output[0] = PRESSURE_RECORD_VERSION;
     output[1] = root.priority as u8;
     output[2] = 0; // incomplete
-    encode_fixed_expiry(PressureExpiry::Durable, &mut output[3..12]);
+    encode_fixed_expiry(
+        if activate_expiry {
+            root.expiry
+        } else {
+            PressureExpiry::Durable
+        },
+        &mut output[3..12],
+    );
     output[12..20].copy_from_slice(&root.completion.numerator.to_be_bytes());
     output[20..28].copy_from_slice(&root.completion.denominator.to_be_bytes());
     output[28..36].copy_from_slice(&root.acceptance_order.to_be_bytes());
@@ -983,11 +1619,50 @@ pub(crate) fn encode_variant_index_key(
     summary: PressureVariantSummary,
     variant_id: BlobVariantId,
 ) -> [u8; PRESSURE_VARIANT_INDEX_LEN] {
+    encode_variant_index_key_for_generation(summary, variant_id, false)
+}
+
+fn variant_index_key_write(
+    write: &redb::WriteTransaction,
+    summary: PressureVariantSummary,
+    variant_id: BlobVariantId,
+) -> Result<[u8; PRESSURE_VARIANT_INDEX_LEN], StoreError> {
+    Ok(encode_variant_index_key_for_generation(
+        summary,
+        variant_id,
+        expiry_indexes_active_write(write)?,
+    ))
+}
+
+fn variant_index_key_read(
+    read: &redb::ReadTransaction,
+    summary: PressureVariantSummary,
+    variant_id: BlobVariantId,
+) -> Result<[u8; PRESSURE_VARIANT_INDEX_LEN], StoreError> {
+    Ok(encode_variant_index_key_for_generation(
+        summary,
+        variant_id,
+        expiry_indexes_active_read(read)?,
+    ))
+}
+
+fn encode_variant_index_key_for_generation(
+    summary: PressureVariantSummary,
+    variant_id: BlobVariantId,
+    activate_expiry: bool,
+) -> [u8; PRESSURE_VARIANT_INDEX_LEN] {
     let mut output = [0u8; PRESSURE_VARIANT_INDEX_LEN];
     output[0] = PRESSURE_RECORD_VERSION;
     output[1] = summary.effective_priority as u8;
     output[2] = u8::from(summary.finalized);
-    encode_fixed_expiry(PressureExpiry::Durable, &mut output[3..12]);
+    encode_fixed_expiry(
+        if activate_expiry {
+            summary.final_reference_expiry
+        } else {
+            PressureExpiry::Durable
+        },
+        &mut output[3..12],
+    );
     output[12..20].copy_from_slice(&summary.committed_progress.numerator.to_be_bytes());
     output[20..28].copy_from_slice(&summary.committed_progress.denominator.to_be_bytes());
     output[28..36].copy_from_slice(&summary.minimum_root_acceptance_order.to_be_bytes());
@@ -1179,14 +1854,17 @@ fn select_publication_from_row(
                     "Blob pressure publication root escaped its exact content partition",
                 ));
             }
-            encode_content_publication_key(&root, publication.transfer_id)?
+            content_publication_index_key_read(read, &root, publication.transfer_id)?
         }
-        None => encode_publication_key(PressurePublicationKey {
-            priority: root.priority,
-            expiry: root.expiry,
-            acceptance_order: root.acceptance_order,
-            transfer_id: publication.transfer_id,
-        }),
+        None => publication_index_key_read(
+            read,
+            PressurePublicationKey {
+                priority: root.priority,
+                expiry: root.expiry,
+                acceptance_order: root.acceptance_order,
+                transfer_id: publication.transfer_id,
+            },
+        )?,
     };
     if root.priority != publication.priority || expected != key {
         return Err(pressure_corruption(
@@ -1285,7 +1963,7 @@ fn select_pending_source_read(
         return Ok((None, false));
     }
     let root = decode_pending_root(encoded.value())?;
-    if encode_pending_index_key(root, entry.transfer_id) != key_bytes {
+    if pending_index_key_read(read, root, entry.transfer_id)? != key_bytes {
         return Err(pressure_corruption(
             "Blob pressure pending index contradicts its root",
         ));
@@ -1335,7 +2013,7 @@ fn select_variant_read(
         return Ok((None, false));
     }
     let actual = decode_variant_summary(encoded.value())?;
-    if actual != summary || encode_variant_index_key(actual, variant) != key_bytes {
+    if actual != summary || variant_index_key_read(read, actual, variant)? != key_bytes {
         return Err(pressure_corruption(
             "Blob pressure variant index contradicts its summary",
         ));
@@ -1352,6 +2030,9 @@ pub(crate) fn select_pressure_candidate_read(
     budget: BlobPressureRecoveryBudget,
 ) -> Result<PressureSelection, StoreError> {
     let mut charge = PressureSelectionCharge::new(budget);
+    if !pressure_ready_read(read)? {
+        return Ok(charge.finish(None, true));
+    }
     let (candidate, proven) = match demand.partition {
         BlobCapacityPartition::AggregateItems | BlobCapacityPartition::AggregateBytes => {
             select_global_publication_read(read, demand.incoming_priority, &mut charge)?
@@ -1372,6 +2053,85 @@ pub(crate) fn select_pressure_candidate_read(
         }
     };
     Ok(charge.finish(candidate, proven))
+}
+
+fn pressure_ready_read(read: &redb::ReadTransaction) -> Result<bool, StoreError> {
+    let metadata = read.open_table(BLOB_PRESSURE_METADATA)?;
+    let version = metadata
+        .get(PRESSURE_SCHEMA_VERSION_FIELD)?
+        .map(|value| value.value())
+        .ok_or_else(|| pressure_corruption("Blob pressure schema version is missing"))?;
+    if version != PRESSURE_SCHEMA_VERSION {
+        return match version {
+            2 | PREVIOUS_PRESSURE_SCHEMA_VERSION | PRESSURE_V4_SCHEMA_VERSION => Ok(true),
+            _ => Err(pressure_corruption(
+                "Blob pressure schema version is unknown",
+            )),
+        };
+    }
+    let dirty = metadata
+        .get(REANCHOR_DIRTY)?
+        .map(|value| value.value())
+        .ok_or_else(|| pressure_corruption("Blob pressure reanchor dirty flag is missing"))?;
+    if dirty == 1 {
+        return Ok(false);
+    }
+    if dirty != 0 {
+        return Err(pressure_corruption(
+            "Blob pressure reanchor dirty flag is invalid",
+        ));
+    }
+    let target = metadata
+        .get(REANCHOR_TARGET_GENERATION)?
+        .map(|value| value.value())
+        .ok_or_else(|| pressure_corruption("Blob pressure reanchor target is missing"))?;
+    let current = crate::custody::lower_bound_continuity_read(read)?
+        .map_or(0, |continuity| continuity.generation);
+    if target != current {
+        // A continuity observation can commit independently of the next Blob
+        // write.  Read-side pressure must therefore fail closed until that
+        // write establishes the fenced dirty pass; it is not store corruption.
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+pub(crate) fn pressure_ready_write(write: &redb::WriteTransaction) -> Result<bool, StoreError> {
+    let metadata = write.open_table(BLOB_PRESSURE_METADATA)?;
+    let version = metadata
+        .get(PRESSURE_SCHEMA_VERSION_FIELD)?
+        .map(|value| value.value())
+        .ok_or_else(|| pressure_corruption("Blob pressure schema version is missing"))?;
+    if version != PRESSURE_SCHEMA_VERSION {
+        return match version {
+            2 | PREVIOUS_PRESSURE_SCHEMA_VERSION | PRESSURE_V4_SCHEMA_VERSION => Ok(true),
+            _ => Err(pressure_corruption(
+                "Blob pressure schema version is unknown",
+            )),
+        };
+    }
+    let dirty = metadata
+        .get(REANCHOR_DIRTY)?
+        .map(|value| value.value())
+        .ok_or_else(|| pressure_corruption("Blob pressure reanchor dirty flag is missing"))?;
+    if dirty == 1 {
+        return Ok(false);
+    }
+    if dirty != 0 {
+        return Err(pressure_corruption(
+            "Blob pressure reanchor dirty flag is invalid",
+        ));
+    }
+    let target = metadata
+        .get(REANCHOR_TARGET_GENERATION)?
+        .map(|value| value.value())
+        .ok_or_else(|| pressure_corruption("Blob pressure reanchor target is missing"))?;
+    let current = crate::custody::lower_bound_continuity_write(write)?
+        .map_or(0, |continuity| continuity.generation);
+    if target != current {
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 fn compare_index_prefix(left: &[u8], right: &[u8]) -> Ordering {
@@ -1437,16 +2197,51 @@ pub(crate) fn encode_content_publication_key(
     root: &PressurePublicationRoot,
     transfer_id: BlobTransferId,
 ) -> Result<Vec<u8>, StoreError> {
+    encode_content_publication_key_for_generation(root, transfer_id, false)
+}
+
+fn content_publication_index_key_write(
+    write: &redb::WriteTransaction,
+    root: &PressurePublicationRoot,
+    transfer_id: BlobTransferId,
+) -> Result<Vec<u8>, StoreError> {
+    encode_content_publication_key_for_generation(
+        root,
+        transfer_id,
+        expiry_indexes_active_write(write)?,
+    )
+}
+
+fn content_publication_index_key_read(
+    read: &redb::ReadTransaction,
+    root: &PressurePublicationRoot,
+    transfer_id: BlobTransferId,
+) -> Result<Vec<u8>, StoreError> {
+    encode_content_publication_key_for_generation(
+        root,
+        transfer_id,
+        expiry_indexes_active_read(read)?,
+    )
+}
+
+fn encode_content_publication_key_for_generation(
+    root: &PressurePublicationRoot,
+    transfer_id: BlobTransferId,
+    activate_expiry: bool,
+) -> Result<Vec<u8>, StoreError> {
     let identity = pressure_content_identity(&root.topic, &root.scope, root.blob_id)?;
     let mut digest = Sha256::new();
     digest.update(PRESSURE_CONTENT_DOMAIN);
     digest.update(&identity);
-    let global = encode_publication_key(PressurePublicationKey {
-        priority: root.priority,
-        expiry: root.expiry,
-        acceptance_order: root.acceptance_order,
-        transfer_id,
-    });
+    let global = encode_publication_key_for_generation(
+        PressurePublicationKey {
+            priority: root.priority,
+            expiry: root.expiry,
+            acceptance_order: root.acceptance_order,
+            transfer_id,
+        },
+        activate_expiry,
+    );
     let mut output = Vec::with_capacity(1 + 32 + identity.len() + global.len() - 1);
     output.push(PRESSURE_RECORD_VERSION);
     output.extend_from_slice(&digest.finalize());
@@ -1641,6 +2436,7 @@ impl<'a> PressureCursor<'a> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PressureSchemaState {
     Predecessor,
+    V4,
     Current,
 }
 
@@ -1653,7 +2449,338 @@ struct PressureImage {
     content_publications: BTreeMap<Vec<u8>, Vec<u8>>,
     pending_sources: BTreeMap<[u8; PRESSURE_PENDING_INDEX_LEN], Vec<u8>>,
     variants: BTreeMap<[u8; PRESSURE_VARIANT_INDEX_LEN], Vec<u8>>,
+    finite_publication_generations: BTreeMap<Vec<u8>, u64>,
+    finite_pending_generations: BTreeMap<Vec<u8>, u64>,
     next_pending_acceptance_order: u64,
+    reanchor_target_generation: u64,
+    reanchor_dirty: bool,
+    reanchor_next_phase: u8,
+    reanchor_live_cursor: Vec<u8>,
+    reanchor_pending_cursor: Vec<u8>,
+}
+
+fn prepare_reanchor_image(
+    write: &redb::WriteTransaction,
+    image: &mut PressureImage,
+) -> Result<(), StoreError> {
+    let continuity = crate::custody::lower_bound_continuity_write(write)?;
+    prepare_reanchor_image_from_continuity(image, continuity)
+}
+
+fn prepare_reanchor_image_from_continuity(
+    image: &mut PressureImage,
+    continuity: Option<crate::custody::LowerBoundContinuity>,
+) -> Result<(), StoreError> {
+    image.reanchor_target_generation = continuity.map_or(0, |value| value.generation);
+    image.reanchor_next_phase = 1;
+    let has_finite = image
+        .publication_roots
+        .values()
+        .try_fold(false, |finite, value| {
+            Ok::<_, StoreError>(
+                finite || decode_publication_root(value)?.expiry != PressureExpiry::Durable,
+            )
+        })?
+        || image
+            .pending_roots
+            .values()
+            .try_fold(false, |finite, value| {
+                Ok::<_, StoreError>(
+                    finite || decode_pending_root(value)?.expiry != PressureExpiry::Durable,
+                )
+            })?;
+    image.reanchor_dirty = has_finite && continuity.is_none();
+    let cursor = |rows: &BTreeMap<Vec<u8>, Vec<u8>>| {
+        rows.last_key_value()
+            .map_or(PressureReanchorCursor::EmptyComplete, |(key, _)| {
+                PressureReanchorCursor::Active {
+                    end_transfer: BlobTransferId::new(
+                        key.as_slice()
+                            .try_into()
+                            .expect("pressure root transfer key"),
+                    ),
+                    position: None,
+                }
+            })
+    };
+    image.reanchor_live_cursor = encode_reanchor_cursor(if image.reanchor_dirty {
+        cursor(&image.publication_roots)
+    } else {
+        PressureReanchorCursor::EmptyComplete
+    });
+    image.reanchor_pending_cursor = encode_reanchor_cursor(if image.reanchor_dirty {
+        cursor(&image.pending_roots)
+    } else {
+        PressureReanchorCursor::EmptyComplete
+    });
+    Ok(())
+}
+
+#[cfg(test)]
+mod reanchor_codec_tests {
+    use super::*;
+
+    #[test]
+    fn pressure_v5_reanchor_cursors_are_fenced_independent_and_canonical() {
+        let end = BlobTransferId::new([0x70; 32]);
+        let position = BlobTransferId::new([0x60; 32]);
+        let active = PressureReanchorCursor::Active {
+            end_transfer: end,
+            position: Some(position),
+        };
+        let complete = PressureReanchorCursor::Complete { end_transfer: end };
+
+        assert_eq!(
+            decode_reanchor_cursor(&encode_reanchor_cursor(active)).unwrap(),
+            active
+        );
+        assert_eq!(
+            decode_reanchor_cursor(&encode_reanchor_cursor(complete)).unwrap(),
+            complete
+        );
+        assert!(decode_reanchor_cursor(&[1, 1]).is_err());
+        assert!(
+            decode_reanchor_cursor(&encode_reanchor_cursor(PressureReanchorCursor::Active {
+                end_transfer: position,
+                position: Some(end),
+            }))
+            .is_err()
+        );
+
+        assert_eq!(PRESSURE_V4_SCHEMA_VERSION, 4);
+        assert_eq!(PRESSURE_SCHEMA_VERSION, 5);
+        assert_eq!(pressure_v5_metadata_fields().len(), 5);
+        assert!(pressure_v5_metadata_fields().contains(&REANCHOR_TARGET_GENERATION));
+        assert!(pressure_v5_metadata_fields().contains(&REANCHOR_DIRTY));
+        assert!(pressure_v5_metadata_fields().contains(&REANCHOR_NEXT_PHASE));
+    }
+
+    #[test]
+    fn pressure_v5_image_is_clean_with_valid_continuity_and_canonical_dirty_without_it() {
+        // Mutations caught: marking every finite migration dirty unnecessarily
+        // gates a fully projected image, while missing continuity must retain a
+        // fenced dirty pass instead of pretending the image is clean.
+        let transfer = BlobTransferId::new([0x81; 32]);
+        let root = PressurePublicationRoot {
+            variant_id: BlobVariantId::from_bytes([0x82; 32]),
+            semantic_id: BlobSemanticId::new([0x83; 32]),
+            priority: Priority::Routine,
+            acceptance_order: 1,
+            expiry: PressureExpiry::Finite(900),
+            topic: Topic::new("ttl-reanchor").expect("topic"),
+            scope: Scope::new("mission/ttl-reanchor").expect("scope"),
+            blob_id: BlobId::from_bytes([0x84; 32]),
+        };
+        let mut image = PressureImage::default();
+        image.publication_roots.insert(
+            transfer.as_bytes().to_vec(),
+            encode_publication_root(&root).expect("publication root"),
+        );
+        let continuity = crate::custody::LowerBoundContinuity {
+            generation: 7,
+            sample: aster_mesh::CustodySample {
+                clock_id: [0x85; 16],
+                tick_ms: 100,
+            },
+        };
+
+        prepare_reanchor_image_from_continuity(&mut image, Some(continuity))
+            .expect("valid-continuity image");
+        assert_eq!(image.reanchor_target_generation, continuity.generation);
+        assert!(!image.reanchor_dirty);
+        assert_eq!(
+            decode_reanchor_cursor(&image.reanchor_live_cursor).unwrap(),
+            PressureReanchorCursor::EmptyComplete
+        );
+        assert_eq!(
+            decode_reanchor_cursor(&image.reanchor_pending_cursor).unwrap(),
+            PressureReanchorCursor::EmptyComplete
+        );
+
+        prepare_reanchor_image_from_continuity(&mut image, None).expect("missing-continuity image");
+        assert_eq!(image.reanchor_target_generation, 0);
+        assert!(image.reanchor_dirty);
+        assert!(matches!(
+            decode_reanchor_cursor(&image.reanchor_live_cursor).unwrap(),
+            PressureReanchorCursor::Active { end_transfer, position: None }
+                if end_transfer == transfer
+        ));
+        assert_eq!(
+            decode_reanchor_cursor(&image.reanchor_pending_cursor).unwrap(),
+            PressureReanchorCursor::EmptyComplete
+        );
+    }
+
+    #[test]
+    fn pressure_v5_dirty_audit_rejects_generation_mismatch_and_completed_pass() {
+        // Mutations caught: dirty previously bypassed all target/cursor
+        // invariants, allowing a mismatched generation or a fully completed
+        // pass to remain pressure-eligible forever.
+        let path = std::env::temp_dir().join(format!(
+            "aster-pressure-v5-dirty-audit-{}.redb",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let database = redb::Database::create(&path).expect("dirty audit database");
+        let write = database.begin_write().expect("dirty audit writer");
+        {
+            let mut metadata = write
+                .open_table(BLOB_PRESSURE_METADATA)
+                .expect("pressure metadata");
+            for (field, value) in [
+                (PRESSURE_SCHEMA_VERSION_FIELD, PRESSURE_SCHEMA_VERSION),
+                (NEXT_PENDING_ACCEPTANCE_ORDER, 1),
+                (REANCHOR_TARGET_GENERATION, 9),
+                (REANCHOR_DIRTY, 1),
+                (REANCHOR_NEXT_PHASE, 1),
+            ] {
+                metadata.insert(field, value).expect("metadata row");
+            }
+        }
+        let empty = encode_reanchor_cursor(PressureReanchorCursor::EmptyComplete);
+        {
+            let mut cursors = write
+                .open_table(BLOB_PRESSURE_REANCHOR_CURSORS)
+                .expect("reanchor cursors");
+            cursors.insert(1, empty.as_slice()).expect("live cursor");
+            cursors.insert(2, empty.as_slice()).expect("pending cursor");
+        }
+        let continuity = crate::custody::LowerBoundContinuity {
+            generation: 7,
+            sample: aster_mesh::CustodySample {
+                clock_id: [0x86; 16],
+                tick_ms: 100,
+            },
+        };
+        assert!(
+            audit_reanchor_state(
+                &write.open_table(BLOB_PRESSURE_METADATA).unwrap(),
+                &write.open_table(BLOB_PRESSURE_REANCHOR_CURSORS).unwrap(),
+                Some(continuity),
+                false,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+            )
+            .is_err(),
+            "dirty target must equal current continuity generation"
+        );
+        write
+            .open_table(BLOB_PRESSURE_METADATA)
+            .unwrap()
+            .insert(REANCHOR_TARGET_GENERATION, continuity.generation)
+            .unwrap();
+        assert!(
+            audit_reanchor_state(
+                &write.open_table(BLOB_PRESSURE_METADATA).unwrap(),
+                &write.open_table(BLOB_PRESSURE_REANCHOR_CURSORS).unwrap(),
+                Some(continuity),
+                false,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+            )
+            .is_err(),
+            "a completed dirty pass must clear atomically"
+        );
+        drop(write);
+        drop(database);
+        std::fs::remove_file(path).expect("remove dirty audit database");
+    }
+
+    #[test]
+    fn pressure_v5_reanchor_audit_rejects_clean_or_cursor_skipped_stale_finite_roots() {
+        let path = std::env::temp_dir().join(format!(
+            "aster-pressure-v5-root-generation-audit-{}.redb",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let database = redb::Database::create(&path).unwrap();
+        let write = database.begin_write().unwrap();
+        {
+            let mut metadata = write.open_table(BLOB_PRESSURE_METADATA).unwrap();
+            for (field, value) in [
+                (PRESSURE_SCHEMA_VERSION_FIELD, PRESSURE_SCHEMA_VERSION),
+                (NEXT_PENDING_ACCEPTANCE_ORDER, 1),
+                (REANCHOR_TARGET_GENERATION, 7),
+                (REANCHOR_DIRTY, 0),
+                (REANCHOR_NEXT_PHASE, 1),
+            ] {
+                metadata.insert(field, value).unwrap();
+            }
+        }
+        let empty = encode_reanchor_cursor(PressureReanchorCursor::EmptyComplete);
+        {
+            let mut cursors = write.open_table(BLOB_PRESSURE_REANCHOR_CURSORS).unwrap();
+            cursors.insert(1, empty.as_slice()).unwrap();
+            cursors.insert(2, empty.as_slice()).unwrap();
+        }
+        let continuity = crate::custody::LowerBoundContinuity {
+            generation: 8,
+            sample: aster_mesh::CustodySample {
+                clock_id: [0x96; 16],
+                tick_ms: 100,
+            },
+        };
+        let mut finite_live = BTreeMap::from([(vec![0x30; 32], 6)]);
+        let finite_pending = BTreeMap::new();
+        assert!(
+            audit_reanchor_state(
+                &write.open_table(BLOB_PRESSURE_METADATA).unwrap(),
+                &write.open_table(BLOB_PRESSURE_REANCHOR_CURSORS).unwrap(),
+                Some(continuity),
+                true,
+                &finite_live,
+                &finite_pending,
+            )
+            .is_err()
+        );
+        finite_live.insert(vec![0x30; 32], 7);
+        audit_reanchor_state(
+            &write.open_table(BLOB_PRESSURE_METADATA).unwrap(),
+            &write.open_table(BLOB_PRESSURE_REANCHOR_CURSORS).unwrap(),
+            Some(continuity),
+            true,
+            &finite_live,
+            &finite_pending,
+        )
+        .expect("clean lag is valid only when every finite root matches target");
+
+        write
+            .open_table(BLOB_PRESSURE_METADATA)
+            .unwrap()
+            .insert(REANCHOR_DIRTY, 1)
+            .unwrap();
+        let live = encode_reanchor_cursor(PressureReanchorCursor::Active {
+            end_transfer: BlobTransferId::new([0x80; 32]),
+            position: Some(BlobTransferId::new([0x40; 32])),
+        });
+        write
+            .open_table(BLOB_PRESSURE_REANCHOR_CURSORS)
+            .unwrap()
+            .insert(1, live.as_slice())
+            .unwrap();
+        for (key, valid) in [
+            (vec![0x30; 32], false),
+            (vec![0x50; 32], true),
+            (vec![0x90; 32], false),
+        ] {
+            finite_live = BTreeMap::from([(key, 6)]);
+            assert_eq!(
+                audit_reanchor_state(
+                    &write.open_table(BLOB_PRESSURE_METADATA).unwrap(),
+                    &write.open_table(BLOB_PRESSURE_REANCHOR_CURSORS).unwrap(),
+                    Some(continuity),
+                    true,
+                    &finite_live,
+                    &finite_pending,
+                )
+                .is_ok(),
+                valid,
+            );
+        }
+        drop(write);
+        drop(database);
+        std::fs::remove_file(path).unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -1686,7 +2813,7 @@ fn note_full_scan_row() {
     );
 }
 
-fn pressure_table_names() -> [&'static str; 8] {
+fn pressure_v4_table_names() -> [&'static str; 8] {
     [
         BLOB_PRESSURE_METADATA.name(),
         BLOB_PRESSURE_PUBLICATION_ROOTS.name(),
@@ -1696,6 +2823,20 @@ fn pressure_table_names() -> [&'static str; 8] {
         BLOB_PRESSURE_CONTENT_PUBLICATIONS.name(),
         BLOB_PRESSURE_PENDING_SOURCES.name(),
         BLOB_PRESSURE_VARIANTS.name(),
+    ]
+}
+
+fn pressure_table_names() -> [&'static str; 9] {
+    [
+        BLOB_PRESSURE_METADATA.name(),
+        BLOB_PRESSURE_PUBLICATION_ROOTS.name(),
+        BLOB_PRESSURE_PENDING_ROOTS.name(),
+        BLOB_PRESSURE_VARIANT_SUMMARIES.name(),
+        BLOB_PRESSURE_PUBLICATIONS.name(),
+        BLOB_PRESSURE_CONTENT_PUBLICATIONS.name(),
+        BLOB_PRESSURE_PENDING_SOURCES.name(),
+        BLOB_PRESSURE_VARIANTS.name(),
+        BLOB_PRESSURE_REANCHOR_CURSORS.name(),
     ]
 }
 
@@ -1717,7 +2858,15 @@ where
     let present = names.iter().filter(|name| normal.contains(**name)).count();
     match present {
         0 => Ok(PressureSchemaState::Predecessor),
-        8 => Ok(PressureSchemaState::Current),
+        count
+            if count == pressure_v4_table_names().len()
+                && pressure_v4_table_names()
+                    .iter()
+                    .all(|name| normal.contains(*name)) =>
+        {
+            Ok(PressureSchemaState::V4)
+        }
+        count if count == names.len() => Ok(PressureSchemaState::Current),
         _ => Err(pressure_corruption(
             "Blob pressure schema is partial and cannot be repaired",
         )),
@@ -1914,6 +3063,7 @@ fn build_pressure_image(
     next_pending_acceptance_order: u64,
     publication_encoding: super::lifecycle::PublicationEncodingGeneration,
     pending_root_encoding: PressurePendingRootEncodingGeneration,
+    activate_expiry_indexes: bool,
 ) -> Result<PressureImage, StoreError> {
     if next_pending_acceptance_order == 0 {
         return Err(pressure_corruption(
@@ -1944,6 +3094,11 @@ fn build_pressure_image(
                 "Blob pressure publication key differs from its metadata",
             ));
         }
+        if let super::BlobLifetime::Finite { age, .. } = metadata.lifetime {
+            image
+                .finite_publication_generations
+                .insert(key.value().to_vec(), age.continuity_generation);
+        }
         let acceptance_order = markers
             .get(key.value())?
             .map(|value| value.value())
@@ -1959,13 +3114,20 @@ fn build_pressure_image(
             blob_id: metadata.blob_id,
         };
         let root_value = encode_publication_root(&root)?;
-        let global_key = encode_publication_key(PressurePublicationKey {
-            priority: root.priority,
-            expiry: root.expiry,
-            acceptance_order,
-            transfer_id: transfer,
-        });
-        let content_key = encode_content_publication_key(&root, transfer)?;
+        let global_key = encode_publication_key_for_generation(
+            PressurePublicationKey {
+                priority: root.priority,
+                expiry: root.expiry,
+                acceptance_order,
+                transfer_id: transfer,
+            },
+            activate_expiry_indexes,
+        );
+        let content_key = encode_content_publication_key_for_generation(
+            &root,
+            transfer,
+            activate_expiry_indexes,
+        )?;
         image
             .publication_roots
             .insert(key.value().to_vec(), root_value);
@@ -2009,13 +3171,19 @@ fn build_pressure_image(
             scope: record.metadata.header.scope.clone(),
             blob_id: record.metadata.blob_id,
         };
+        if let super::BlobLifetime::Finite { age, .. } = record.metadata.lifetime {
+            image
+                .finite_pending_generations
+                .insert(key.value().to_vec(), age.continuity_generation);
+        }
         image.pending_roots.insert(
             key.value().to_vec(),
             encode_pending_root_for_generation(&root, pending_root_encoding)?,
         );
-        image
-            .pending_sources
-            .insert(encode_pending_index_key(root.clone(), source), Vec::new());
+        image.pending_sources.insert(
+            encode_pending_index_key_for_generation(root.clone(), source, activate_expiry_indexes),
+            Vec::new(),
+        );
         variant_roots.entry(root.variant_id).or_default().push((
             root.priority,
             acceptance_order,
@@ -2110,9 +3278,10 @@ fn build_pressure_image(
         image
             .variant_summaries
             .insert(variant.as_bytes().to_vec(), encode_variant_summary(summary));
-        image
-            .variants
-            .insert(encode_variant_index_key(summary, variant), Vec::new());
+        image.variants.insert(
+            encode_variant_index_key_for_generation(summary, variant, activate_expiry_indexes),
+            Vec::new(),
+        );
     }
     Ok(image)
 }
@@ -2196,17 +3365,208 @@ fn audit_image(
     variants: &impl ReadableTable<PressureVariantIndexKey, &'static [u8]>,
     image: &PressureImage,
 ) -> Result<(), StoreError> {
-    if table_map(publication_roots)? != image.publication_roots
-        || table_map(pending_roots)? != image.pending_roots
-        || table_map(variant_summaries)? != image.variant_summaries
-        || table_map(publications)? != image.publications
-        || table_map(content_publications)? != image.content_publications
-        || pending_index_map(pending_sources)? != image.pending_sources
-        || variant_index_map(variants)? != image.variants
+    let actual_pending_roots = table_map(pending_roots)?;
+    if actual_pending_roots != image.pending_roots {
+        if actual_pending_roots.keys().collect::<Vec<_>>()
+            != image.pending_roots.keys().collect::<Vec<_>>()
+        {
+            return Err(pressure_corruption(
+                "Blob pressure pending root identities are contradictory",
+            ));
+        }
+        for (key, actual) in &actual_pending_roots {
+            let expected = image.pending_roots.get(key).expect("matching keys");
+            if actual.len() != expected.len() {
+                return Err(pressure_corruption(
+                    "Blob pressure pending root generations are contradictory",
+                ));
+            }
+            let actual = decode_pending_root(actual)?;
+            let expected = decode_pending_root(expected)?;
+            if actual.authenticated_source_binding != expected.authenticated_source_binding {
+                return Err(pressure_corruption(
+                    "Blob pressure pending root source binding is contradictory",
+                ));
+            }
+            if actual.expiry != expected.expiry {
+                return Err(pressure_corruption(
+                    "Blob pressure pending root expiry is contradictory",
+                ));
+            }
+        }
+        return Err(pressure_corruption(
+            "Blob pressure pending roots are contradictory",
+        ));
+    }
+    for (matches, label) in [
+        (
+            table_map(publication_roots)? == image.publication_roots,
+            "publication roots",
+        ),
+        (
+            table_map(variant_summaries)? == image.variant_summaries,
+            "variant summaries",
+        ),
+        (
+            table_map(publications)? == image.publications,
+            "publication index",
+        ),
+        (
+            table_map(content_publications)? == image.content_publications,
+            "content publication index",
+        ),
+        (
+            pending_index_map(pending_sources)? == image.pending_sources,
+            "pending index",
+        ),
+        (
+            variant_index_map(variants)? == image.variants,
+            "variant index",
+        ),
+    ] {
+        if !matches {
+            return Err(pressure_corruption(match label {
+                "publication roots" => "Blob pressure publication roots are contradictory",
+                "variant summaries" => "Blob pressure variant summaries are contradictory",
+                "publication index" => "Blob pressure publication index is contradictory",
+                "content publication index" => {
+                    "Blob pressure content publication index is contradictory"
+                }
+                "pending index" => "Blob pressure pending index is contradictory",
+                _ => "Blob pressure variant index is contradictory",
+            }));
+        }
+    }
+    Ok(())
+}
+
+fn audit_reanchor_state(
+    metadata: &impl ReadableTable<&'static str, u64>,
+    cursors: &impl ReadableTable<u8, &'static [u8]>,
+    continuity: Option<crate::custody::LowerBoundContinuity>,
+    allow_target_lag: bool,
+    finite_publication_generations: &BTreeMap<Vec<u8>, u64>,
+    finite_pending_generations: &BTreeMap<Vec<u8>, u64>,
+) -> Result<(), StoreError> {
+    if metadata.len()? != pressure_v5_metadata_fields().len() as u64 || cursors.len()? != 2 {
+        return Err(pressure_corruption(
+            "Blob pressure-v5 reanchor metadata is incomplete or contains unknown rows",
+        ));
+    }
+    if metadata
+        .get(PRESSURE_SCHEMA_VERSION_FIELD)?
+        .map(|value| value.value())
+        != Some(PRESSURE_SCHEMA_VERSION)
     {
         return Err(pressure_corruption(
-            "Blob pressure roots, summaries, or indexes are incomplete or contradictory",
+            "Blob pressure schema version is not current",
         ));
+    }
+    let target = metadata
+        .get(REANCHOR_TARGET_GENERATION)?
+        .map(|value| value.value())
+        .ok_or_else(|| pressure_corruption("Blob pressure reanchor target is missing"))?;
+    let dirty = match metadata.get(REANCHOR_DIRTY)?.map(|value| value.value()) {
+        Some(0) => false,
+        Some(1) => true,
+        _ => {
+            return Err(pressure_corruption(
+                "Blob pressure reanchor dirty flag is invalid",
+            ));
+        }
+    };
+    let next_phase = match metadata
+        .get(REANCHOR_NEXT_PHASE)?
+        .map(|value| value.value())
+    {
+        Some(phase @ (1 | 2)) => phase,
+        _ => {
+            return Err(pressure_corruption(
+                "Blob pressure reanchor phase is invalid",
+            ));
+        }
+    };
+    let live = decode_reanchor_cursor(
+        cursors
+            .get(1)?
+            .ok_or_else(|| pressure_corruption("Blob pressure live reanchor cursor is missing"))?
+            .value(),
+    )?;
+    let pending = decode_reanchor_cursor(
+        cursors
+            .get(2)?
+            .ok_or_else(|| pressure_corruption("Blob pressure pending reanchor cursor is missing"))?
+            .value(),
+    )?;
+    let current_generation = continuity.map_or(0, |value| value.generation);
+    if target > current_generation || (target < current_generation && !allow_target_lag) {
+        return Err(pressure_corruption(
+            "Blob pressure reanchor target contradicts durable continuity",
+        ));
+    }
+    let cursor_complete = |cursor| {
+        matches!(
+            cursor,
+            PressureReanchorCursor::EmptyComplete | PressureReanchorCursor::Complete { .. }
+        )
+    };
+    if !dirty {
+        if next_phase != 1
+            || live != PressureReanchorCursor::EmptyComplete
+            || pending != PressureReanchorCursor::EmptyComplete
+        {
+            return Err(pressure_corruption(
+                "clean Blob pressure reanchor state contradicts continuity or cursors",
+            ));
+        }
+        if finite_publication_generations
+            .values()
+            .chain(finite_pending_generations.values())
+            .any(|generation| *generation != target)
+        {
+            return Err(pressure_corruption(
+                "clean Blob pressure reanchor state contains an unnormalized finite root",
+            ));
+        }
+    } else if cursor_complete(live) && cursor_complete(pending) {
+        return Err(pressure_corruption(
+            "dirty Blob pressure reanchor pass is already complete",
+        ));
+    } else {
+        let stale_is_unprocessed = |key: &[u8], generation: u64, cursor| {
+            if generation == target {
+                return true;
+            }
+            if generation > target || key.len() != 32 {
+                return false;
+            }
+            let transfer = BlobTransferId::new(
+                key.try_into()
+                    .expect("finite pressure identity length checked"),
+            );
+            match cursor {
+                PressureReanchorCursor::Active {
+                    end_transfer,
+                    position,
+                } => {
+                    transfer <= end_transfer && position.is_none_or(|position| transfer > position)
+                }
+                PressureReanchorCursor::EmptyComplete | PressureReanchorCursor::Complete { .. } => {
+                    false
+                }
+            }
+        };
+        if finite_publication_generations
+            .iter()
+            .any(|(key, generation)| !stale_is_unprocessed(key, *generation, live))
+            || finite_pending_generations
+                .iter()
+                .any(|(key, generation)| !stale_is_unprocessed(key, *generation, pending))
+        {
+            return Err(pressure_corruption(
+                "dirty Blob pressure reanchor cursor skips an unnormalized finite root",
+            ));
+        }
     }
     Ok(())
 }
@@ -2218,6 +3578,9 @@ fn apply_image(write: &redb::WriteTransaction, image: &PressureImage) -> Result<
         NEXT_PENDING_ACCEPTANCE_ORDER,
         image.next_pending_acceptance_order,
     )?;
+    metadata.insert(REANCHOR_TARGET_GENERATION, image.reanchor_target_generation)?;
+    metadata.insert(REANCHOR_DIRTY, u64::from(image.reanchor_dirty))?;
+    metadata.insert(REANCHOR_NEXT_PHASE, u64::from(image.reanchor_next_phase))?;
     drop(metadata);
     #[cfg(test)]
     if TEST_PRESSURE_MIGRATION_FAULT.get() {
@@ -2225,6 +3588,37 @@ fn apply_image(write: &redb::WriteTransaction, image: &PressureImage) -> Result<
             "injected Blob pressure migration interruption",
         ));
     }
+    apply_index_maps(write, image)?;
+    let mut cursors = write.open_table(BLOB_PRESSURE_REANCHOR_CURSORS)?;
+    cursors.insert(1, image.reanchor_live_cursor.as_slice())?;
+    cursors.insert(2, image.reanchor_pending_cursor.as_slice())?;
+    Ok(())
+}
+
+fn apply_v4_image(write: &redb::WriteTransaction, image: &PressureImage) -> Result<(), StoreError> {
+    let mut metadata = write.open_table(BLOB_PRESSURE_METADATA)?;
+    metadata.insert(
+        PRESSURE_SCHEMA_VERSION_FIELD,
+        ACTIVE_PRESSURE_SCHEMA_VERSION,
+    )?;
+    metadata.insert(
+        NEXT_PENDING_ACCEPTANCE_ORDER,
+        image.next_pending_acceptance_order,
+    )?;
+    drop(metadata);
+    #[cfg(test)]
+    if TEST_PRESSURE_MIGRATION_FAULT.get() {
+        return Err(pressure_corruption(
+            "injected Blob pressure migration interruption",
+        ));
+    }
+    apply_index_maps(write, image)
+}
+
+fn apply_index_maps(
+    write: &redb::WriteTransaction,
+    image: &PressureImage,
+) -> Result<(), StoreError> {
     macro_rules! insert_map {
         ($definition:expr, $rows:expr) => {{
             let mut table = write.open_table($definition)?;
@@ -2257,6 +3651,7 @@ fn apply_image(write: &redb::WriteTransaction, image: &PressureImage) -> Result<
 }
 
 fn replace_image(write: &redb::WriteTransaction, image: &PressureImage) -> Result<(), StoreError> {
+    let has_reanchor_cursors = pressure_schema_state(write)? == PressureSchemaState::Current;
     write.delete_table(BLOB_PRESSURE_PUBLICATION_ROOTS)?;
     write.delete_table(BLOB_PRESSURE_PENDING_ROOTS)?;
     write.delete_table(BLOB_PRESSURE_VARIANT_SUMMARIES)?;
@@ -2264,27 +3659,66 @@ fn replace_image(write: &redb::WriteTransaction, image: &PressureImage) -> Resul
     write.delete_table(BLOB_PRESSURE_CONTENT_PUBLICATIONS)?;
     write.delete_table(BLOB_PRESSURE_PENDING_SOURCES)?;
     write.delete_table(BLOB_PRESSURE_VARIANTS)?;
+    if has_reanchor_cursors {
+        write.delete_table(BLOB_PRESSURE_REANCHOR_CURSORS)?;
+    }
     apply_image(write, image)
 }
 
-fn pressure_generation_is_current_write(
+fn replace_with_v4_image(
     write: &redb::WriteTransaction,
-    state: PressureSchemaState,
-) -> Result<bool, StoreError> {
-    if state == PressureSchemaState::Predecessor {
-        return Ok(false);
+    image: &PressureImage,
+) -> Result<(), StoreError> {
+    let has_reanchor_cursors = pressure_schema_state(write)? == PressureSchemaState::Current;
+    write.delete_table(BLOB_PRESSURE_PUBLICATION_ROOTS)?;
+    write.delete_table(BLOB_PRESSURE_PENDING_ROOTS)?;
+    write.delete_table(BLOB_PRESSURE_VARIANT_SUMMARIES)?;
+    write.delete_table(BLOB_PRESSURE_PUBLICATIONS)?;
+    write.delete_table(BLOB_PRESSURE_CONTENT_PUBLICATIONS)?;
+    write.delete_table(BLOB_PRESSURE_PENDING_SOURCES)?;
+    write.delete_table(BLOB_PRESSURE_VARIANTS)?;
+    if has_reanchor_cursors {
+        write.delete_table(BLOB_PRESSURE_REANCHOR_CURSORS)?;
     }
-    match write
+    apply_v4_image(write, image)
+}
+
+#[cfg(test)]
+pub(crate) fn downgrade_pressure_v5_to_v4_for_test(
+    write: &redb::WriteTransaction,
+) -> Result<(), StoreError> {
+    let next = write
         .open_table(BLOB_PRESSURE_METADATA)?
-        .get(PRESSURE_SCHEMA_VERSION_FIELD)?
+        .get(NEXT_PENDING_ACCEPTANCE_ORDER)?
         .map(|value| value.value())
-    {
-        Some(PRESSURE_SCHEMA_VERSION) => Ok(true),
-        Some(2) | Some(PREVIOUS_PRESSURE_SCHEMA_VERSION) => Ok(false),
-        _ => Err(pressure_corruption(
-            "Blob pressure metadata schema is incomplete or unknown",
-        )),
-    }
+        .ok_or_else(|| pressure_corruption("next pending Blob acceptance order is missing"))?;
+    let image = build_pressure_image(
+        &write.open_table(super::BLOB_PUBLICATIONS)?,
+        &write.open_table(super::BLOB_ACCEPTANCE_MARKERS)?,
+        &write.open_table(super::BLOB_PENDING_SOURCES)?,
+        &write.open_table(super::BLOB_CARRIER_PREFIXES)?,
+        &write.open_table(super::BLOB_IMPORTS)?,
+        &write.open_table(super::BLOB_CHUNKS)?,
+        next,
+        super::lifecycle::publication_encoding_write(write)?,
+        PressurePendingRootEncodingGeneration::PressureV4,
+        false,
+    )?;
+    write.delete_table(BLOB_PRESSURE_PUBLICATION_ROOTS)?;
+    write.delete_table(BLOB_PRESSURE_PENDING_ROOTS)?;
+    write.delete_table(BLOB_PRESSURE_VARIANT_SUMMARIES)?;
+    write.delete_table(BLOB_PRESSURE_PUBLICATIONS)?;
+    write.delete_table(BLOB_PRESSURE_CONTENT_PUBLICATIONS)?;
+    write.delete_table(BLOB_PRESSURE_PENDING_SOURCES)?;
+    write.delete_table(BLOB_PRESSURE_VARIANTS)?;
+    write.delete_table(BLOB_PRESSURE_REANCHOR_CURSORS)?;
+    apply_index_maps(write, &image)?;
+    let mut metadata = write.open_table(BLOB_PRESSURE_METADATA)?;
+    metadata.insert(PRESSURE_SCHEMA_VERSION_FIELD, PRESSURE_V4_SCHEMA_VERSION)?;
+    metadata.remove(REANCHOR_TARGET_GENERATION)?;
+    metadata.remove(REANCHOR_DIRTY)?;
+    metadata.remove(REANCHOR_NEXT_PHASE)?;
+    Ok(())
 }
 
 fn audit_or_migrate_pressure_write_inner(
@@ -2292,30 +3726,24 @@ fn audit_or_migrate_pressure_write_inner(
     lifecycle_was_predecessor: Option<bool>,
 ) -> Result<(), StoreError> {
     let state = pressure_schema_state(write)?;
-    let pressure_is_current = pressure_generation_is_current_write(write, state)?;
-    // An entirely absent pressure group is the legitimate additive-schema
-    // predecessor for either historical lifecycle generation. Only a
-    // complete pressure group carries a generation that can contradict the
-    // lifecycle generation.
-    if state == PressureSchemaState::Current
-        && let Some(lifecycle_was_predecessor) = lifecycle_was_predecessor
-        && lifecycle_was_predecessor == pressure_is_current
-    {
-        return Err(pressure_corruption(
-            "Blob lifecycle and pressure schema generations are mixed",
-        ));
+    if let Some(lifecycle_was_predecessor) = lifecycle_was_predecessor {
+        match (lifecycle_was_predecessor, state) {
+            (false, PressureSchemaState::Current)
+            | (true, PressureSchemaState::Predecessor | PressureSchemaState::V4) => {}
+            _ => {
+                return Err(pressure_corruption(
+                    "Blob lifecycle and pressure schema generations are mixed",
+                ));
+            }
+        }
     }
-    let publication_generation = if pressure_is_current || lifecycle_was_predecessor.is_some() {
-        super::lifecycle::publication_encoding_write(write)?
-    } else {
-        super::lifecycle::publication_encoding_migration_write(write)?
-    };
+    let publication_generation = super::lifecycle::publication_encoding_write(write)?;
     let pending_generation =
         super::pending_blob_encoding_for_publication_encoding(publication_generation);
     let migrated_next = migrate_pending_acceptance_orders(write, pending_generation)?;
     match state {
         PressureSchemaState::Predecessor => {
-            let image = build_pressure_image(
+            let mut image = build_pressure_image(
                 &write.open_table(super::BLOB_PUBLICATIONS)?,
                 &write.open_table(super::BLOB_ACCEPTANCE_MARKERS)?,
                 &write.open_table(super::BLOB_PENDING_SOURCES)?,
@@ -2323,12 +3751,46 @@ fn audit_or_migrate_pressure_write_inner(
                 &write.open_table(super::BLOB_IMPORTS)?,
                 &write.open_table(super::BLOB_CHUNKS)?,
                 migrated_next,
-                super::lifecycle::publication_encoding_migration_write(write)?,
+                super::lifecycle::publication_encoding_write(write)?,
                 PressurePendingRootEncodingGeneration::PressureV4,
+                true,
             )?;
+            prepare_reanchor_image(write, &mut image)?;
             apply_image(write, &image)
         }
         PressureSchemaState::Current => {
+            synchronize_reanchor_state_write(write)?;
+            let metadata = write.open_table(BLOB_PRESSURE_METADATA)?;
+            let next = metadata
+                .get(NEXT_PENDING_ACCEPTANCE_ORDER)?
+                .map(|value| value.value())
+                .ok_or_else(|| {
+                    pressure_corruption("next pending Blob acceptance order is missing")
+                })?;
+            drop(metadata);
+            let image = build_pressure_image(
+                &write.open_table(super::BLOB_PUBLICATIONS)?,
+                &write.open_table(super::BLOB_ACCEPTANCE_MARKERS)?,
+                &write.open_table(super::BLOB_PENDING_SOURCES)?,
+                &write.open_table(super::BLOB_CARRIER_PREFIXES)?,
+                &write.open_table(super::BLOB_IMPORTS)?,
+                &write.open_table(super::BLOB_CHUNKS)?,
+                next,
+                super::lifecycle::publication_encoding_write(write)?,
+                PressurePendingRootEncodingGeneration::PressureV4,
+                true,
+            )?;
+            audit_image_write(write, &image)?;
+            audit_reanchor_state(
+                &write.open_table(BLOB_PRESSURE_METADATA)?,
+                &write.open_table(BLOB_PRESSURE_REANCHOR_CURSORS)?,
+                crate::custody::lower_bound_continuity_write(write)?,
+                false,
+                &image.finite_publication_generations,
+                &image.finite_pending_generations,
+            )
+        }
+        PressureSchemaState::V4 => {
             let metadata = write.open_table(BLOB_PRESSURE_METADATA)?;
             if metadata.len()? != 2 {
                 return Err(pressure_corruption(
@@ -2343,7 +3805,7 @@ fn audit_or_migrate_pressure_write_inner(
                 })?;
             if !matches!(
                 version,
-                2 | PREVIOUS_PRESSURE_SCHEMA_VERSION | PRESSURE_SCHEMA_VERSION
+                2 | PREVIOUS_PRESSURE_SCHEMA_VERSION | PRESSURE_V4_SCHEMA_VERSION
             ) {
                 return Err(pressure_corruption(
                     "Blob pressure metadata schema is incomplete or unknown",
@@ -2364,18 +3826,33 @@ fn audit_or_migrate_pressure_write_inner(
                 &write.open_table(super::BLOB_IMPORTS)?,
                 &write.open_table(super::BLOB_CHUNKS)?,
                 next,
-                if version == PRESSURE_SCHEMA_VERSION {
+                if version == PRESSURE_V4_SCHEMA_VERSION {
                     super::lifecycle::publication_encoding_write(write)?
                 } else {
                     super::lifecycle::publication_encoding_migration_write(write)?
                 },
-                PressurePendingRootEncodingGeneration::PressureV4,
+                if version == PRESSURE_V4_SCHEMA_VERSION {
+                    PressurePendingRootEncodingGeneration::PressureV4
+                } else {
+                    PressurePendingRootEncodingGeneration::PressureV3
+                },
+                false,
             )?;
-            if version != PRESSURE_SCHEMA_VERSION {
-                replace_image(write, &image)
-            } else {
-                audit_image_write(write, &image)
-            }
+            audit_image_write(write, &image)?;
+            let mut current = build_pressure_image(
+                &write.open_table(super::BLOB_PUBLICATIONS)?,
+                &write.open_table(super::BLOB_ACCEPTANCE_MARKERS)?,
+                &write.open_table(super::BLOB_PENDING_SOURCES)?,
+                &write.open_table(super::BLOB_CARRIER_PREFIXES)?,
+                &write.open_table(super::BLOB_IMPORTS)?,
+                &write.open_table(super::BLOB_CHUNKS)?,
+                next,
+                super::lifecycle::publication_encoding_write(write)?,
+                PressurePendingRootEncodingGeneration::PressureV4,
+                true,
+            )?;
+            prepare_reanchor_image(write, &mut current)?;
+            replace_image(write, &current)
         }
     }
 }
@@ -2408,24 +3885,55 @@ pub(crate) fn audit_or_migrate_pressure_after_lifecycle_write(
 pub(crate) fn require_pressure_consistent_write(
     write: &redb::WriteTransaction,
 ) -> Result<(), StoreError> {
-    if pressure_schema_state(write)? != PressureSchemaState::Current {
-        return Err(pressure_corruption(
+    match pressure_schema_state(write)? {
+        PressureSchemaState::V4 | PressureSchemaState::Current => {
+            audit_or_migrate_pressure_write(write)
+        }
+        _ => Err(pressure_corruption(
             "Blob pressure transition requires the current pressure schema",
-        ));
+        )),
     }
-    audit_or_migrate_pressure_write(write)
 }
 
 pub(crate) fn inspect_pressure_read(
     read: &redb::ReadTransaction,
     lifecycle_is_current: bool,
 ) -> Result<(), StoreError> {
-    if pressure_schema_state(read)? == PressureSchemaState::Predecessor {
+    let state = pressure_schema_state(read)?;
+    if state == PressureSchemaState::Predecessor {
         return Err(pressure_corruption(
             "Blob pressure predecessor schema requires writable migration",
         ));
     }
     let metadata = read.open_table(BLOB_PRESSURE_METADATA)?;
+    if state == PressureSchemaState::Current {
+        let next = metadata
+            .get(NEXT_PENDING_ACCEPTANCE_ORDER)?
+            .map(|value| value.value())
+            .ok_or_else(|| pressure_corruption("next pending Blob acceptance order is missing"))?;
+        drop(metadata);
+        let image = build_pressure_image(
+            &read.open_table(super::BLOB_PUBLICATIONS)?,
+            &read.open_table(super::BLOB_ACCEPTANCE_MARKERS)?,
+            &read.open_table(super::BLOB_PENDING_SOURCES)?,
+            &read.open_table(super::BLOB_CARRIER_PREFIXES)?,
+            &read.open_table(super::BLOB_IMPORTS)?,
+            &read.open_table(super::BLOB_CHUNKS)?,
+            next,
+            super::lifecycle::publication_encoding_read(read)?,
+            PressurePendingRootEncodingGeneration::PressureV4,
+            true,
+        )?;
+        audit_image_read(read, &image)?;
+        return audit_reanchor_state(
+            &read.open_table(BLOB_PRESSURE_METADATA)?,
+            &read.open_table(BLOB_PRESSURE_REANCHOR_CURSORS)?,
+            crate::custody::lower_bound_continuity_read(read)?,
+            true,
+            &image.finite_publication_generations,
+            &image.finite_pending_generations,
+        );
+    }
     if metadata.len()? != 2 {
         return Err(pressure_corruption(
             "Blob pressure metadata schema is incomplete or unknown",
@@ -2439,13 +3947,13 @@ pub(crate) fn inspect_pressure_read(
         })?;
     if !matches!(
         version,
-        2 | PREVIOUS_PRESSURE_SCHEMA_VERSION | PRESSURE_SCHEMA_VERSION
+        2 | PREVIOUS_PRESSURE_SCHEMA_VERSION | PRESSURE_V4_SCHEMA_VERSION
     ) {
         return Err(pressure_corruption(
             "Blob pressure metadata schema is incomplete or unknown",
         ));
     }
-    if lifecycle_is_current != (version == PRESSURE_SCHEMA_VERSION) {
+    if lifecycle_is_current != (version == ACTIVE_PRESSURE_SCHEMA_VERSION) {
         return Err(pressure_corruption(
             "Blob lifecycle and pressure schema generations are mixed",
         ));
@@ -2463,18 +3971,20 @@ pub(crate) fn inspect_pressure_read(
         &read.open_table(super::BLOB_IMPORTS)?,
         &read.open_table(super::BLOB_CHUNKS)?,
         next,
-        if version == PRESSURE_SCHEMA_VERSION {
+        if version == ACTIVE_PRESSURE_SCHEMA_VERSION {
             super::lifecycle::publication_encoding_read(read)?
         } else {
             super::lifecycle::publication_encoding_migration_read(read)?
         },
-        if version == PRESSURE_SCHEMA_VERSION {
+        if version == PRESSURE_V4_SCHEMA_VERSION {
             PressurePendingRootEncodingGeneration::PressureV4
         } else {
             PressurePendingRootEncodingGeneration::PressureV3
         },
+        false,
     )?;
-    audit_image_read(read, &image)
+    audit_image_read(read, &image)?;
+    Ok(())
 }
 
 /// Allocates one pending-source order only for a source that is not yet staged.
@@ -2578,7 +4088,7 @@ pub(super) fn insert_pending_source_write(
     write
         .open_table(BLOB_PRESSURE_PENDING_ROOTS)?
         .insert(transfer.as_bytes().as_slice(), encoded.as_slice())?;
-    let pending_key = encode_pending_index_key(root.clone(), transfer);
+    let pending_key = pending_index_key_write(write, root.clone(), transfer)?;
     if write
         .open_table(BLOB_PRESSURE_PENDING_SOURCES)?
         .insert(&pending_key, &[] as &[u8])?
@@ -2643,7 +4153,7 @@ pub(super) fn require_pending_source_write(
             "pending Blob pressure root contradicts its source",
         ));
     }
-    let key = encode_pending_index_key(root, transfer);
+    let key = pending_index_key_write(write, root, transfer)?;
     if write
         .open_table(BLOB_PRESSURE_PENDING_SOURCES)?
         .get(&key)?
@@ -2670,7 +4180,7 @@ pub(super) fn rekey_pending_source_lifetime_write(
     let old = decode_pending_root(&old_encoded)?;
     if write
         .open_table(BLOB_PRESSURE_PENDING_SOURCES)?
-        .remove(&encode_pending_index_key(old.clone(), transfer))?
+        .remove(&pending_index_key_write(write, old.clone(), transfer)?)?
         .as_ref()
         .is_none_or(|value| !value.value().is_empty())
     {
@@ -2713,7 +4223,10 @@ pub(super) fn rekey_pending_source_lifetime_write(
         .insert(transfer.as_bytes().as_slice(), encoded.as_slice())?;
     if write
         .open_table(BLOB_PRESSURE_PENDING_SOURCES)?
-        .insert(&encode_pending_index_key(updated, transfer), &[] as &[u8])?
+        .insert(
+            &pending_index_key_write(write, updated, transfer)?,
+            &[] as &[u8],
+        )?
         .is_some()
     {
         return Err(pressure_corruption(
@@ -2770,19 +4283,22 @@ pub(super) fn rekey_publication_lifetime_write(
         .map(|value| value.value().to_vec())
         .ok_or_else(|| pressure_corruption("publication lacks its pressure root"))?;
     let old = decode_publication_root(&encoded)?;
-    let old_global = encode_publication_key(PressurePublicationKey {
-        priority: old.priority,
-        expiry: old.expiry,
-        acceptance_order: old.acceptance_order,
-        transfer_id: transfer,
-    });
+    let old_global = publication_index_key_write(
+        write,
+        PressurePublicationKey {
+            priority: old.priority,
+            expiry: old.expiry,
+            acceptance_order: old.acceptance_order,
+            transfer_id: transfer,
+        },
+    )?;
     if write
         .open_table(BLOB_PRESSURE_PUBLICATIONS)?
         .remove(old_global.as_slice())?
         .is_none()
         || write
             .open_table(BLOB_PRESSURE_CONTENT_PUBLICATIONS)?
-            .remove(encode_content_publication_key(&old, transfer)?.as_slice())?
+            .remove(content_publication_index_key_write(write, &old, transfer)?.as_slice())?
             .is_none()
     {
         return Err(pressure_corruption(
@@ -2794,12 +4310,15 @@ pub(super) fn rekey_publication_lifetime_write(
     write
         .open_table(BLOB_PRESSURE_PUBLICATION_ROOTS)?
         .insert(transfer.as_bytes().as_slice(), updated_encoded.as_slice())?;
-    let global = encode_publication_key(PressurePublicationKey {
-        priority: updated.priority,
-        expiry: updated.expiry,
-        acceptance_order: updated.acceptance_order,
-        transfer_id: transfer,
-    });
+    let global = publication_index_key_write(
+        write,
+        PressurePublicationKey {
+            priority: updated.priority,
+            expiry: updated.expiry,
+            acceptance_order: updated.acceptance_order,
+            transfer_id: transfer,
+        },
+    )?;
     if write
         .open_table(BLOB_PRESSURE_PUBLICATIONS)?
         .insert(global.as_slice(), &[] as &[u8])?
@@ -2807,7 +4326,7 @@ pub(super) fn rekey_publication_lifetime_write(
         || write
             .open_table(BLOB_PRESSURE_CONTENT_PUBLICATIONS)?
             .insert(
-                encode_content_publication_key(&updated, transfer)?.as_slice(),
+                content_publication_index_key_write(write, &updated, transfer)?.as_slice(),
                 &[] as &[u8],
             )?
             .is_some()
@@ -2834,12 +4353,15 @@ fn require_publication_root_write(
             "publication pressure root contradicts authoritative state",
         ));
     }
-    let global = encode_publication_key(PressurePublicationKey {
-        priority: expected.priority,
-        expiry: expected.expiry,
-        acceptance_order: expected.acceptance_order,
-        transfer_id: transfer,
-    });
+    let global = publication_index_key_write(
+        write,
+        PressurePublicationKey {
+            priority: expected.priority,
+            expiry: expected.expiry,
+            acceptance_order: expected.acceptance_order,
+            transfer_id: transfer,
+        },
+    )?;
     if write
         .open_table(BLOB_PRESSURE_PUBLICATIONS)?
         .get(global.as_slice())?
@@ -2847,7 +4369,7 @@ fn require_publication_root_write(
         .is_none_or(|value| !value.value().is_empty())
         || write
             .open_table(BLOB_PRESSURE_CONTENT_PUBLICATIONS)?
-            .get(encode_content_publication_key(expected, transfer)?.as_slice())?
+            .get(content_publication_index_key_write(write, expected, transfer)?.as_slice())?
             .as_ref()
             .is_none_or(|value| !value.value().is_empty())
     {
@@ -2934,7 +4456,10 @@ pub(crate) fn bounded_variant_references_write(
             break;
         };
         let (key, value) = row?;
-        if !charge.charge(key.value(), value.value().len())? {
+        if !charge.charge_row(
+            super::MaintenanceRowIdentity::new("aster.blob-variant-references.v1", key.value()),
+            value.value().len(),
+        )? {
             return Ok(None);
         }
         if key.value().len() != 65
@@ -3046,7 +4571,7 @@ fn require_variant_references_write(
     if actual != expected
         || write
             .open_table(BLOB_PRESSURE_VARIANTS)?
-            .get(&encode_variant_index_key(actual, variant))?
+            .get(&variant_index_key_write(write, actual, variant)?)?
             .as_ref()
             .is_none_or(|value| !value.value().is_empty())
     {
@@ -3069,7 +4594,13 @@ fn bounded_publication_root_write(
     let encoded = publications
         .get(transfer.as_bytes().as_slice())?
         .ok_or_else(|| pressure_corruption("Blob pressure publication is missing"))?;
-    if !charge.charge(transfer.as_bytes(), encoded.value().len())? {
+    if !charge.charge_row(
+        super::MaintenanceRowIdentity::new(
+            "aster.semantic-blob-publications.v1",
+            transfer.as_bytes(),
+        ),
+        encoded.value().len(),
+    )? {
         return Ok(None);
     }
     let encoded_bytes = encoded.value().to_vec();
@@ -3087,7 +4618,10 @@ fn bounded_publication_root_write(
             "Blob pressure publication key differs from its metadata",
         ));
     }
-    if !charge.charge(transfer.as_bytes(), std::mem::size_of::<u64>())? {
+    if !charge.charge_row(
+        super::MaintenanceRowIdentity::new("aster.semantic-blob-markers.v1", transfer.as_bytes()),
+        std::mem::size_of::<u64>(),
+    )? {
         return Ok(None);
     }
     let acceptance_order = write
@@ -3109,7 +4643,13 @@ fn bounded_publication_root_write(
     let encoded_root = roots
         .get(transfer.as_bytes().as_slice())?
         .ok_or_else(|| pressure_corruption("publication lacks its pressure root"))?;
-    if !charge.charge(transfer.as_bytes(), encoded_root.value().len())? {
+    if !charge.charge_row(
+        super::MaintenanceRowIdentity::new(
+            "aster.blob-pressure-publication-roots.v1",
+            transfer.as_bytes(),
+        ),
+        encoded_root.value().len(),
+    )? {
         return Ok(None);
     }
     if decode_publication_root(encoded_root.value())? != root {
@@ -3119,13 +4659,22 @@ fn bounded_publication_root_write(
     }
     drop(encoded_root);
     drop(roots);
-    let global = encode_publication_key(PressurePublicationKey {
-        priority: root.priority,
-        expiry: root.expiry,
-        acceptance_order: root.acceptance_order,
-        transfer_id: transfer,
-    });
-    if !charge.charge(global.as_slice(), 0)? {
+    let global = publication_index_key_write(
+        write,
+        PressurePublicationKey {
+            priority: root.priority,
+            expiry: root.expiry,
+            acceptance_order: root.acceptance_order,
+            transfer_id: transfer,
+        },
+    )?;
+    if !charge.charge_row(
+        super::MaintenanceRowIdentity::new(
+            "aster.blob-pressure-publications.v1",
+            global.as_slice(),
+        ),
+        0,
+    )? {
         return Ok(None);
     }
     if write
@@ -3138,8 +4687,14 @@ fn bounded_publication_root_write(
             "publication pressure root lacks its exact indexes",
         ));
     }
-    let content = encode_content_publication_key(&root, transfer)?;
-    if !charge.charge(content.as_slice(), 0)? {
+    let content = content_publication_index_key_write(write, &root, transfer)?;
+    if !charge.charge_row(
+        super::MaintenanceRowIdentity::new(
+            "aster.blob-pressure-content-publications.v1",
+            content.as_slice(),
+        ),
+        0,
+    )? {
         return Ok(None);
     }
     if write
@@ -3170,7 +4725,13 @@ fn bounded_pending_progress_write(
     let import = imports
         .get(record.metadata.variant_id.as_bytes().as_slice())?
         .ok_or_else(|| pressure_corruption("pending Blob pressure root lacks its depot import"))?;
-    if !charge.charge(record.metadata.variant_id.as_bytes(), import.value().len())? {
+    if !charge.charge_row(
+        super::MaintenanceRowIdentity::new(
+            "aster.blob-imports.v1",
+            record.metadata.variant_id.as_bytes(),
+        ),
+        import.value().len(),
+    )? {
         return Ok(None);
     }
     let import_bytes = import.value().to_vec();
@@ -3188,7 +4749,10 @@ fn bounded_pending_progress_write(
         key[..32].copy_from_slice(record.metadata.variant_id.as_bytes());
         key[32..].copy_from_slice(&carrier.index.to_be_bytes());
         if let Some(state) = chunks.get(key.as_slice())? {
-            if !charge.charge(key.as_slice(), state.value().len())? {
+            if !charge.charge_row(
+                super::MaintenanceRowIdentity::new("aster.blob-chunks.v1", key.as_slice()),
+                state.value().len(),
+            )? {
                 return Ok(None);
             }
             if super::depot::deletion_chunk_projection(&import, carrier.index, state.value())?
@@ -3203,7 +4767,13 @@ fn bounded_pending_progress_write(
         }
         let prefix_key = super::blob_carrier_prefix_key(source, carrier.object);
         if let Some(prefix) = prefixes.get(prefix_key.as_slice())? {
-            if !charge.charge(prefix_key.as_slice(), prefix.value().len())? {
+            if !charge.charge_row(
+                super::MaintenanceRowIdentity::new(
+                    "aster.pending-blob-carrier-prefixes.v1",
+                    prefix_key.as_slice(),
+                ),
+                prefix.value().len(),
+            )? {
                 return Ok(None);
             }
             let prefix = super::decode_blob_carrier_prefix(prefix.value())?;
@@ -3233,7 +4803,13 @@ fn bounded_pending_root_write(
     let encoded = roots
         .get(transfer.as_bytes().as_slice())?
         .ok_or_else(|| pressure_corruption("pending Blob source lacks its pressure root"))?;
-    if !charge.charge(transfer.as_bytes(), encoded.value().len())? {
+    if !charge.charge_row(
+        super::MaintenanceRowIdentity::new(
+            "aster.blob-pressure-pending-roots.v1",
+            transfer.as_bytes(),
+        ),
+        encoded.value().len(),
+    )? {
         return Ok(None);
     }
     let root = decode_pending_root(encoded.value())?;
@@ -3258,8 +4834,14 @@ fn bounded_pending_root_write(
             "pending Blob pressure root contradicts its source",
         ));
     }
-    let key = encode_pending_index_key(root.clone(), transfer);
-    if !charge.charge(key.as_slice(), 0)? {
+    let key = pending_index_key_write(write, root.clone(), transfer)?;
+    if !charge.charge_row(
+        super::MaintenanceRowIdentity::new(
+            "aster.blob-pressure-pending-sources.v1",
+            key.as_slice(),
+        ),
+        0,
+    )? {
         return Ok(None);
     }
     if write
@@ -3284,7 +4866,10 @@ fn bounded_variant_progress_write(
     let import = imports
         .get(variant.as_bytes().as_slice())?
         .ok_or_else(|| pressure_corruption("Blob pressure root lacks its depot import"))?;
-    if !charge.charge(variant.as_bytes(), import.value().len())? {
+    if !charge.charge_row(
+        super::MaintenanceRowIdentity::new("aster.blob-imports.v1", variant.as_bytes()),
+        import.value().len(),
+    )? {
         return Ok(None);
     }
     let import_bytes = import.value().to_vec();
@@ -3303,7 +4888,10 @@ fn bounded_variant_progress_write(
         std::ops::Bound::Included(last.as_slice()),
     ))? {
         let (key, value) = row?;
-        if !charge.charge(key.value(), value.value().len())? {
+        if !charge.charge_row(
+            super::MaintenanceRowIdentity::new("aster.blob-chunks.v1", key.value()),
+            value.value().len(),
+        )? {
             return Ok(None);
         }
         chunk_rows = chunk_rows
@@ -3366,7 +4954,13 @@ pub(crate) fn require_variant_with_references_bounded_write(
                 let pending_guard = pending_sources
                     .get(transfer.as_bytes().as_slice())?
                     .ok_or_else(|| pressure_corruption("variant reference lacks pending source"))?;
-                if !charge.charge(transfer.as_bytes(), pending_guard.value().len())? {
+                if !charge.charge_row(
+                    super::MaintenanceRowIdentity::new(
+                        "aster.pending-blob-sources.v1",
+                        transfer.as_bytes(),
+                    ),
+                    pending_guard.value().len(),
+                )? {
                     return Ok(false);
                 }
                 let pending = super::decode_pending_blob_source(pending_guard.value())?;
@@ -3394,7 +4988,13 @@ pub(crate) fn require_variant_with_references_bounded_write(
     let encoded = summaries
         .get(variant.as_bytes().as_slice())?
         .ok_or_else(|| pressure_corruption("rooted Blob variant lacks pressure summary"))?;
-    if !charge.charge(variant.as_bytes(), encoded.value().len())? {
+    if !charge.charge_row(
+        super::MaintenanceRowIdentity::new(
+            "aster.blob-pressure-variant-summaries.v1",
+            variant.as_bytes(),
+        ),
+        encoded.value().len(),
+    )? {
         return Ok(false);
     }
     let actual = decode_variant_summary(encoded.value())?;
@@ -3417,8 +5017,11 @@ pub(crate) fn require_variant_with_references_bounded_write(
             "Blob pressure variant summary contradicts its bounded roots",
         ));
     }
-    let key = encode_variant_index_key(actual, variant);
-    if !charge.charge(key.as_slice(), 0)? {
+    let key = variant_index_key_write(write, actual, variant)?;
+    if !charge.charge_row(
+        super::MaintenanceRowIdentity::new("aster.blob-pressure-variants.v1", key.as_slice()),
+        0,
+    )? {
         return Ok(false);
     }
     if write
@@ -3432,6 +5035,157 @@ pub(crate) fn require_variant_with_references_bounded_write(
         ));
     }
     Ok(true)
+}
+
+/// Preflights the complete pressure/lifecycle authority consulted and changed
+/// by one TTL or generation-reanchor unit. Existing ordered rows are charged
+/// by the bounded audit above; re-key successors are charged independently.
+pub(crate) fn preflight_policy_root_mutation_write(
+    write: &redb::WriteTransaction,
+    variant: BlobVariantId,
+    owner: super::lifecycle::VariantReferenceOwner,
+    transfer: BlobTransferId,
+    root_limit: u64,
+    rekey: bool,
+    charge: &mut super::MaintenanceCharge,
+) -> Result<bool, StoreError> {
+    let Some(references) = bounded_variant_references_write(write, variant, root_limit, charge)?
+    else {
+        return Ok(false);
+    };
+    if !references.contains(&(owner, transfer)) {
+        return Err(pressure_corruption(
+            "selected Blob policy root lacks its lifecycle reference",
+        ));
+    }
+    if !require_variant_with_references_bounded_write(write, variant, &references, charge)? {
+        return Ok(false);
+    }
+
+    if !rekey {
+        let remaining = references
+            .iter()
+            .copied()
+            .filter(|candidate| *candidate != (owner, transfer))
+            .collect::<Vec<_>>();
+        if !remaining.is_empty() {
+            let successor = variant_summary_for_references_write(write, variant, &remaining)?;
+            let successor_key = variant_index_key_write(write, successor, variant)?;
+            if !charge.charge_row(
+                super::MaintenanceRowIdentity::new(
+                    "aster.blob-pressure-variants.v1",
+                    successor_key.as_slice(),
+                ),
+                0,
+            )? {
+                return Ok(false);
+            }
+        }
+        return Ok(true);
+    }
+    // A rekey retains the root, so it always writes one successor variant
+    // index. The exact successor publication/pending keys are charged below.
+    if !charge.charge_lengths(PRESSURE_VARIANT_INDEX_LEN, 0)? {
+        return Ok(false);
+    }
+    match owner {
+        super::lifecycle::VariantReferenceOwner::Publication => {
+            let encoded = write
+                .open_table(BLOB_PRESSURE_PUBLICATION_ROOTS)?
+                .get(transfer.as_bytes().as_slice())?
+                .map(|value| value.value().to_vec())
+                .ok_or_else(|| pressure_corruption("publication lacks its pressure root"))?;
+            let root = decode_publication_root(&encoded)?;
+            let global = publication_index_key_write(
+                write,
+                PressurePublicationKey {
+                    priority: root.priority,
+                    expiry: root.expiry,
+                    acceptance_order: root.acceptance_order,
+                    transfer_id: transfer,
+                },
+            )?;
+            let content = content_publication_index_key_write(write, &root, transfer)?;
+            if !charge.charge_lengths(global.len(), 0)?
+                || !charge.charge_lengths(content.len(), 0)?
+            {
+                return Ok(false);
+            }
+        }
+        super::lifecycle::VariantReferenceOwner::PendingSource => {
+            if !charge.charge_lengths(PRESSURE_PENDING_INDEX_LEN, 0)? {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn variant_summary_for_references_write(
+    write: &redb::WriteTransaction,
+    variant: BlobVariantId,
+    references: &[(super::lifecycle::VariantReferenceOwner, BlobTransferId)],
+) -> Result<PressureVariantSummary, StoreError> {
+    let mut effective_priority = Priority::Routine;
+    let mut minimum_order = u64::MAX;
+    let mut publication_roots = 0u64;
+    let mut pending_roots = 0u64;
+    let mut final_reference_expiry = PressureExpiry::ExpiredFinite;
+    for &(owner, transfer) in references {
+        let (priority, order, expiry) = match owner {
+            super::lifecycle::VariantReferenceOwner::Publication => {
+                let encoded = write
+                    .open_table(BLOB_PRESSURE_PUBLICATION_ROOTS)?
+                    .get(transfer.as_bytes().as_slice())?
+                    .map(|value| value.value().to_vec())
+                    .ok_or_else(|| {
+                        pressure_corruption("variant publication lacks pressure root")
+                    })?;
+                let root = decode_publication_root(&encoded)?;
+                if root.variant_id != variant {
+                    return Err(pressure_corruption(
+                        "variant publication pressure root is contradictory",
+                    ));
+                }
+                publication_roots = publication_roots
+                    .checked_add(1)
+                    .ok_or(StoreError::ItemCountAccountingOverflow)?;
+                (root.priority, root.acceptance_order, root.expiry)
+            }
+            super::lifecycle::VariantReferenceOwner::PendingSource => {
+                let encoded = write
+                    .open_table(BLOB_PRESSURE_PENDING_ROOTS)?
+                    .get(transfer.as_bytes().as_slice())?
+                    .map(|value| value.value().to_vec())
+                    .ok_or_else(|| {
+                        pressure_corruption("variant pending source lacks pressure root")
+                    })?;
+                let root = decode_pending_root(&encoded)?;
+                if root.variant_id != variant {
+                    return Err(pressure_corruption(
+                        "variant pending pressure root is contradictory",
+                    ));
+                }
+                pending_roots = pending_roots
+                    .checked_add(1)
+                    .ok_or(StoreError::ItemCountAccountingOverflow)?;
+                (root.priority, root.acceptance_order, root.expiry)
+            }
+        };
+        effective_priority = effective_priority.max(priority);
+        minimum_order = minimum_order.min(order);
+        final_reference_expiry = latest_expiry(final_reference_expiry, expiry);
+    }
+    let (committed_progress, finalized) = variant_progress_write(write, variant)?;
+    Ok(PressureVariantSummary {
+        effective_priority,
+        minimum_root_acceptance_order: minimum_order,
+        committed_progress,
+        finalized,
+        publication_roots,
+        pending_roots,
+        final_reference_expiry,
+    })
 }
 
 pub(crate) fn require_variant_write(
@@ -3461,7 +5215,7 @@ fn add_root_to_variant_summary_without_references(
     if let Some(old) = old
         && write
             .open_table(BLOB_PRESSURE_VARIANTS)?
-            .remove(&encode_variant_index_key(old, variant))?
+            .remove(&variant_index_key_write(write, old, variant)?)?
             .as_ref()
             .is_none_or(|value| !value.value().is_empty())
     {
@@ -3503,7 +5257,10 @@ fn add_root_to_variant_summary_without_references(
         .insert(variant.as_bytes().as_slice(), encoded.as_slice())?;
     if write
         .open_table(BLOB_PRESSURE_VARIANTS)?
-        .insert(&encode_variant_index_key(summary, variant), &[] as &[u8])?
+        .insert(
+            &variant_index_key_write(write, summary, variant)?,
+            &[] as &[u8],
+        )?
         .is_some()
     {
         return Err(pressure_corruption(
@@ -3525,7 +5282,7 @@ fn refresh_variant_summary(
         .map(|value| decode_variant_summary(value.value()))
         .transpose()?;
     if let Some(old) = old {
-        let old_key = encode_variant_index_key(old, variant);
+        let old_key = variant_index_key_write(write, old, variant)?;
         if write
             .open_table(BLOB_PRESSURE_VARIANTS)?
             .remove(&old_key)?
@@ -3622,7 +5379,10 @@ fn refresh_variant_summary(
         .insert(variant.as_bytes().as_slice(), encoded.as_slice())?;
     if write
         .open_table(BLOB_PRESSURE_VARIANTS)?
-        .insert(&encode_variant_index_key(summary, variant), &[] as &[u8])?
+        .insert(
+            &variant_index_key_write(write, summary, variant)?,
+            &[] as &[u8],
+        )?
         .is_some()
     {
         return Err(pressure_corruption(
@@ -3667,7 +5427,7 @@ pub(crate) fn reconcile_variant_write(
                         "pending pressure root contradicts authoritative state",
                     ));
                 }
-                let old_key = encode_pending_index_key(old, transfer);
+                let old_key = pending_index_key_write(write, old, transfer)?;
                 if write
                     .open_table(BLOB_PRESSURE_PENDING_SOURCES)?
                     .remove(&old_key)?
@@ -3701,7 +5461,10 @@ pub(crate) fn reconcile_variant_write(
                     .insert(transfer.as_bytes().as_slice(), encoded.as_slice())?;
                 if write
                     .open_table(BLOB_PRESSURE_PENDING_SOURCES)?
-                    .insert(&encode_pending_index_key(expected, transfer), &[] as &[u8])?
+                    .insert(
+                        &pending_index_key_write(write, expected, transfer)?,
+                        &[] as &[u8],
+                    )?
                     .is_some()
                 {
                     return Err(pressure_corruption("pending pressure index is duplicated"));
@@ -3730,12 +5493,15 @@ fn insert_publication_root_write(
     write
         .open_table(BLOB_PRESSURE_PUBLICATION_ROOTS)?
         .insert(transfer.as_bytes().as_slice(), encoded.as_slice())?;
-    let global = encode_publication_key(PressurePublicationKey {
-        priority: root.priority,
-        expiry: root.expiry,
-        acceptance_order: root.acceptance_order,
-        transfer_id: transfer,
-    });
+    let global = publication_index_key_write(
+        write,
+        PressurePublicationKey {
+            priority: root.priority,
+            expiry: root.expiry,
+            acceptance_order: root.acceptance_order,
+            transfer_id: transfer,
+        },
+    )?;
     if write
         .open_table(BLOB_PRESSURE_PUBLICATIONS)?
         .insert(global.as_slice(), &[] as &[u8])?
@@ -3743,7 +5509,7 @@ fn insert_publication_root_write(
         || write
             .open_table(BLOB_PRESSURE_CONTENT_PUBLICATIONS)?
             .insert(
-                encode_content_publication_key(&root, transfer)?.as_slice(),
+                content_publication_index_key_write(write, &root, transfer)?.as_slice(),
                 &[] as &[u8],
             )?
             .is_some()
@@ -3789,7 +5555,7 @@ fn remove_pending_root_write(
     if root.variant_id != variant
         || write
             .open_table(BLOB_PRESSURE_PENDING_SOURCES)?
-            .remove(&encode_pending_index_key(root, transfer))?
+            .remove(&pending_index_key_write(write, root, transfer)?)?
             .as_ref()
             .is_none_or(|value| !value.value().is_empty())
     {
@@ -3858,12 +5624,15 @@ pub(crate) fn remove_publication_root_write(
         .map(|value| value.value().to_vec())
         .ok_or_else(|| pressure_corruption("removed publication lacks pressure root"))?;
     let root = decode_publication_root(&encoded)?;
-    let global = encode_publication_key(PressurePublicationKey {
-        priority: root.priority,
-        expiry: root.expiry,
-        acceptance_order: root.acceptance_order,
-        transfer_id: transfer,
-    });
+    let global = publication_index_key_write(
+        write,
+        PressurePublicationKey {
+            priority: root.priority,
+            expiry: root.expiry,
+            acceptance_order: root.acceptance_order,
+            transfer_id: transfer,
+        },
+    )?;
     if root.variant_id != variant
         || write
             .open_table(BLOB_PRESSURE_PUBLICATIONS)?
@@ -3872,7 +5641,7 @@ pub(crate) fn remove_publication_root_write(
             .is_none_or(|value| !value.value().is_empty())
         || write
             .open_table(BLOB_PRESSURE_CONTENT_PUBLICATIONS)?
-            .remove(encode_content_publication_key(&root, transfer)?.as_slice())?
+            .remove(content_publication_index_key_write(write, &root, transfer)?.as_slice())?
             .as_ref()
             .is_none_or(|value| !value.value().is_empty())
     {
@@ -3913,7 +5682,7 @@ pub(crate) fn remove_drained_variant_write(
         .ok_or_else(|| pressure_corruption("final Blob root lacks its pressure summary"))?;
     if write
         .open_table(BLOB_PRESSURE_VARIANTS)?
-        .remove(&encode_variant_index_key(summary, variant))?
+        .remove(&variant_index_key_write(write, summary, variant)?)?
         .as_ref()
         .is_none_or(|value| !value.value().is_empty())
     {
@@ -3933,15 +5702,20 @@ mod tests {
     use redb::ReadableDatabase;
 
     use super::{
-        PRESSURE_EXPIRY_DURABLE, PRESSURE_RECORD_VERSION, PressureExpiry, PressureFraction,
-        PressurePendingRoot, PressurePendingRootEncodingGeneration, PressurePublicationKey,
-        PressurePublicationRoot, PressureVariantSummary, compare_pressure_fraction,
+        BLOB_PRESSURE_METADATA, BLOB_PRESSURE_PENDING_ROOTS, BLOB_PRESSURE_PUBLICATION_ROOTS,
+        BLOB_PRESSURE_REANCHOR_CURSORS, NEXT_PENDING_ACCEPTANCE_ORDER, PRESSURE_EXPIRY_DURABLE,
+        PRESSURE_RECORD_VERSION, PRESSURE_SCHEMA_VERSION, PRESSURE_SCHEMA_VERSION_FIELD,
+        PRESSURE_V4_SCHEMA_VERSION, PressureExpiry, PressureFraction, PressurePendingRoot,
+        PressurePendingRootEncodingGeneration, PressurePublicationKey, PressurePublicationRoot,
+        PressureReanchorCursor, PressureReanchorRoot, PressureVariantSummary, REANCHOR_DIRTY,
+        REANCHOR_NEXT_PHASE, REANCHOR_TARGET_GENERATION, compare_pressure_fraction,
         decode_content_publication_key, decode_pending_index_key, decode_pending_root,
         decode_pending_root_for_generation, decode_publication_key, decode_publication_root,
         decode_variant_index_key, decode_variant_summary, encode_content_publication_key,
         encode_pending_index_key, encode_pending_root, encode_pending_root_for_generation,
-        encode_publication_key, encode_publication_root, encode_variant_index_key,
-        encode_variant_summary,
+        encode_publication_key, encode_publication_root, encode_reanchor_cursor,
+        encode_variant_index_key, encode_variant_summary, finish_reanchor_turn_write,
+        plan_reanchor_turn_write, pressure_ready_write, synchronize_reanchor_state_write,
     };
     use crate::StoreError;
     use crate::blob::{BlobSemanticId, BlobTransferId, BlobVariantId};
@@ -3955,6 +5729,15 @@ mod tests {
             std::process::id()
         ));
         let database = redb::Database::create(&path).expect("pressure test database");
+        // Direct index fixtures model the exact neutral predecessor unless a
+        // test explicitly replaces this row with a complete v5 gate image.
+        let write = database.begin_write().expect("pressure fixture writer");
+        write
+            .open_table(BLOB_PRESSURE_METADATA)
+            .expect("pressure fixture metadata")
+            .insert(PRESSURE_SCHEMA_VERSION_FIELD, PRESSURE_V4_SCHEMA_VERSION)
+            .expect("pressure fixture schema");
+        write.commit().expect("commit pressure fixture schema");
         (path, database)
     }
 
@@ -4048,6 +5831,237 @@ mod tests {
         let mut unknown = minimum_bytes;
         unknown[0] = PRESSURE_RECORD_VERSION.wrapping_add(1);
         assert!(decode_publication_key(&unknown).is_err());
+    }
+
+    #[test]
+    fn pressure_index_encoding_activates_expiry_only_for_exact_v5_schema() {
+        // Mutations caught: keeping ordinary v5 mutations on the neutral v4
+        // key encoding, or enabling expiry ordering for a predecessor image.
+        let (path, database) = pressure_database("schema-selected-expiry-index");
+        let key = PressurePublicationKey {
+            priority: Priority::Routine,
+            expiry: PressureExpiry::Finite(900),
+            acceptance_order: 7,
+            transfer_id: BlobTransferId::new([0x7a; 32]),
+        };
+        let write = database.begin_write().expect("pressure schema writer");
+        {
+            let mut metadata = write.open_table(BLOB_PRESSURE_METADATA).unwrap();
+            metadata
+                .insert(PRESSURE_SCHEMA_VERSION_FIELD, PRESSURE_V4_SCHEMA_VERSION)
+                .unwrap();
+            metadata.insert(NEXT_PENDING_ACCEPTANCE_ORDER, 1).unwrap();
+        }
+        assert_eq!(
+            decode_publication_key(&super::publication_index_key_write(&write, key).unwrap())
+                .unwrap()
+                .expiry,
+            PressureExpiry::Durable
+        );
+        write
+            .open_table(BLOB_PRESSURE_METADATA)
+            .unwrap()
+            .insert(PRESSURE_SCHEMA_VERSION_FIELD, PRESSURE_SCHEMA_VERSION)
+            .unwrap();
+        assert_eq!(
+            decode_publication_key(&super::publication_index_key_write(&write, key).unwrap())
+                .unwrap()
+                .expiry,
+            PressureExpiry::Finite(900)
+        );
+        drop(write);
+        drop(database);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn pressure_v5_dirty_gate_returns_no_candidate_before_index_access() {
+        // Mutation caught: pressure selection must not inspect or mutate a
+        // partially re-anchored index and report a false recovery candidate.
+        let (path, database) = pressure_database("dirty-selection-gate");
+        let write = database.begin_write().unwrap();
+        {
+            let mut metadata = write.open_table(BLOB_PRESSURE_METADATA).unwrap();
+            for (field, value) in [
+                (PRESSURE_SCHEMA_VERSION_FIELD, PRESSURE_SCHEMA_VERSION),
+                (NEXT_PENDING_ACCEPTANCE_ORDER, 1),
+                (super::REANCHOR_TARGET_GENERATION, 0),
+                (super::REANCHOR_DIRTY, 1),
+                (super::REANCHOR_NEXT_PHASE, 1),
+            ] {
+                metadata.insert(field, value).unwrap();
+            }
+        }
+        write.commit().unwrap();
+        let read = database.begin_read().unwrap();
+        let demand = super::BlobCapacityRecoveryDemand::new(
+            super::BlobCapacityPartition::AggregateItems,
+            Priority::Immediate,
+            1,
+        )
+        .unwrap();
+        let selection = super::select_pressure_candidate_read(
+            &read,
+            demand,
+            super::BlobPressureRecoveryBudget::new(1, 1, 1, 1, 1).unwrap(),
+        )
+        .expect("dirty pressure gate");
+        assert_eq!(selection.candidate(), None);
+        assert!(selection.proven());
+        assert_eq!(selection.rows_examined(), 0);
+        drop(read);
+        drop(database);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn pressure_v5_reanchor_pass_uses_fenced_alternating_root_scans() {
+        // Mutations caught: clearing dirty after an unfenced/partial pass,
+        // repeatedly favoring publication roots, or scanning a target-normalized
+        // root inserted beyond the captured high-water.
+        let (path, database) = pressure_database("reanchor-fenced-alternating-pass");
+        let write = database.begin_write().unwrap();
+        write
+            .open_table(crate::custody::CUSTODY_CONTINUITY)
+            .unwrap();
+        crate::custody::observe_continuity_write(
+            &write,
+            aster_mesh::CustodySample {
+                clock_id: [0xa1; 16],
+                tick_ms: 10,
+            },
+        )
+        .unwrap();
+        {
+            let mut metadata = write.open_table(BLOB_PRESSURE_METADATA).unwrap();
+            metadata
+                .insert(PRESSURE_SCHEMA_VERSION_FIELD, PRESSURE_SCHEMA_VERSION)
+                .unwrap();
+            metadata.insert(NEXT_PENDING_ACCEPTANCE_ORDER, 1).unwrap();
+            metadata.insert(REANCHOR_TARGET_GENERATION, 0).unwrap();
+            metadata.insert(REANCHOR_DIRTY, 0).unwrap();
+            metadata.insert(REANCHOR_NEXT_PHASE, 1).unwrap();
+        }
+        {
+            let empty = encode_reanchor_cursor(PressureReanchorCursor::EmptyComplete);
+            let mut cursors = write.open_table(BLOB_PRESSURE_REANCHOR_CURSORS).unwrap();
+            cursors.insert(1, empty.as_slice()).unwrap();
+            cursors.insert(2, empty.as_slice()).unwrap();
+        }
+        let root = PressurePublicationRoot {
+            variant_id: BlobVariantId::from_bytes([0xb1; 32]),
+            semantic_id: BlobSemanticId::new([0xb2; 32]),
+            priority: Priority::default(),
+            acceptance_order: 1,
+            expiry: PressureExpiry::Finite(50),
+            topic: Topic::new("ttl-reanchor").unwrap(),
+            scope: Scope::new("mission/ttl-reanchor").unwrap(),
+            blob_id: BlobId::from_bytes([0xb3; 32]),
+        };
+        let encoded_root = encode_publication_root(&root).unwrap();
+        for transfer in [
+            BlobTransferId::new([0x10; 32]),
+            BlobTransferId::new([0x20; 32]),
+        ] {
+            write
+                .open_table(BLOB_PRESSURE_PUBLICATION_ROOTS)
+                .unwrap()
+                .insert(transfer.as_bytes().as_slice(), encoded_root.as_slice())
+                .unwrap();
+        }
+        let pending_root = PressurePendingRoot {
+            variant_id: BlobVariantId::from_bytes([0xc1; 32]),
+            authenticated_source_binding: [0xc2; 32],
+            priority: Priority::default(),
+            acceptance_order: 1,
+            completion: PressureFraction::new(0, 1).unwrap(),
+            expiry: PressureExpiry::Finite(40),
+            topic: Topic::new("ttl-reanchor").unwrap(),
+            scope: Scope::new("mission/ttl-reanchor").unwrap(),
+            blob_id: BlobId::from_bytes([0xc3; 32]),
+        };
+        write
+            .open_table(BLOB_PRESSURE_PENDING_ROOTS)
+            .unwrap()
+            .insert(
+                BlobTransferId::new([0x30; 32]).as_bytes().as_slice(),
+                encode_pending_root(&pending_root).unwrap().as_slice(),
+            )
+            .unwrap();
+
+        synchronize_reanchor_state_write(&write).unwrap();
+        let first = plan_reanchor_turn_write(&write)
+            .unwrap()
+            .expect("live root");
+        assert_eq!(first.root, PressureReanchorRoot::Publication);
+        assert_eq!(first.transfer, Some(BlobTransferId::new([0x10; 32])));
+        let (exact_rows, exact_bytes) = {
+            let mut charge = crate::blob::MaintenanceCharge::new(
+                crate::blob::lifecycle::BlobMaintenanceBudget::new(u64::MAX, 1, u64::MAX).unwrap(),
+                0,
+                0,
+            );
+            assert!(super::charge_reanchor_turn_write(&write, first, &mut charge).unwrap());
+            assert_eq!(
+                charge.rows, 6,
+                "two cursors, schema/dirty/phase metadata, and the selected root"
+            );
+            assert!(
+                !charge
+                    .identities
+                    .contains_key(&crate::blob::MaintenanceRowIdentity::new(
+                        "aster.blob-pressure-metadata.v1",
+                        REANCHOR_TARGET_GENERATION.as_bytes(),
+                    ))
+            );
+            (charge.rows, charge.bytes)
+        };
+        for budget in [
+            crate::blob::lifecycle::BlobMaintenanceBudget::new(exact_rows - 1, 1, exact_bytes)
+                .unwrap(),
+            crate::blob::lifecycle::BlobMaintenanceBudget::new(exact_rows, 1, exact_bytes - 1)
+                .unwrap(),
+        ] {
+            let mut charge = crate::blob::MaintenanceCharge::new(budget, 0, 0);
+            assert!(!super::charge_reanchor_turn_write(&write, first, &mut charge).unwrap());
+            assert_eq!(plan_reanchor_turn_write(&write).unwrap(), Some(first));
+        }
+        finish_reanchor_turn_write(&write, first).unwrap();
+
+        write
+            .open_table(BLOB_PRESSURE_PUBLICATION_ROOTS)
+            .unwrap()
+            .insert(
+                BlobTransferId::new([0x40; 32]).as_bytes().as_slice(),
+                encoded_root.as_slice(),
+            )
+            .unwrap();
+        let second = plan_reanchor_turn_write(&write)
+            .unwrap()
+            .expect("pending root");
+        assert_eq!(second.root, PressureReanchorRoot::Pending);
+        assert_eq!(second.transfer, Some(BlobTransferId::new([0x30; 32])));
+        finish_reanchor_turn_write(&write, second).unwrap();
+        write
+            .open_table(BLOB_PRESSURE_PUBLICATION_ROOTS)
+            .unwrap()
+            .remove(BlobTransferId::new([0x20; 32]).as_bytes().as_slice())
+            .unwrap();
+        let final_progress = plan_reanchor_turn_write(&write)
+            .unwrap()
+            .expect("final fenced scan completion");
+        assert_eq!(final_progress.root, PressureReanchorRoot::Publication);
+        assert_eq!(final_progress.transfer, None);
+        assert!(
+            !pressure_ready_write(&write).unwrap(),
+            "planning final EOF must not clear the persisted dirty gate"
+        );
+        finish_reanchor_turn_write(&write, final_progress).unwrap();
+        assert!(plan_reanchor_turn_write(&write).unwrap().is_none());
+        assert!(pressure_ready_write(&write).unwrap());
+        drop(write);
+        drop(database);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

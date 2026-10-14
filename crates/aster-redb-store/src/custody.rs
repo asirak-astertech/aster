@@ -2961,6 +2961,50 @@ fn continuity_write(
         .transpose()
 }
 
+/// Decodes the durable lower-bound continuity authority without observing a
+/// new sample or mutating custody state.
+pub(crate) fn lower_bound_continuity_read(
+    read: &redb::ReadTransaction,
+) -> Result<Option<LowerBoundContinuity>, StoreError> {
+    if !read
+        .list_tables()?
+        .any(|table| table.name() == CUSTODY_CONTINUITY.name())
+    {
+        return Ok(None);
+    }
+    read.open_table(CUSTODY_CONTINUITY)?
+        .get(CUSTODY_CONTINUITY_KEY)?
+        .map(|value| {
+            let continuity = decode_continuity(value.value()).map_err(StoreError::from)?;
+            Ok(LowerBoundContinuity {
+                generation: continuity.generation,
+                sample: continuity.sample,
+            })
+        })
+        .transpose()
+}
+
+/// Decodes the durable lower-bound continuity authority from an existing
+/// writer without observing a new sample or mutating custody state. Schema
+/// migration uses this form because redb cannot open a read transaction while
+/// the atomic migration writer is active.
+pub(crate) fn lower_bound_continuity_write(
+    write: &redb::WriteTransaction,
+) -> Result<Option<LowerBoundContinuity>, StoreError> {
+    if !write
+        .list_tables()?
+        .any(|table| table.name() == CUSTODY_CONTINUITY.name())
+    {
+        return Ok(None);
+    }
+    continuity_write(write).map(|continuity| {
+        continuity.map(|continuity| LowerBoundContinuity {
+            generation: continuity.generation,
+            sample: continuity.sample,
+        })
+    })
+}
+
 /// Returns whether a maintenance pass must enter the single-writer queue to
 /// preserve an observed local elapsed-clock continuity sample.
 pub(crate) fn continuity_sample_requires_write_read(
@@ -10509,9 +10553,130 @@ pub(crate) fn retired_event_receipt_read(
 #[cfg(test)]
 mod lower_bound_index_tests {
     use super::*;
+    use redb::Database;
 
     const CLOCK_A: [u8; 16] = [0xa1; 16];
     const CLOCK_B: [u8; 16] = [0xb2; 16];
+
+    #[test]
+    fn lower_bound_continuity_write_does_not_create_absent_custody_schema() {
+        let path = std::env::temp_dir().join(format!(
+            "aster-lower-bound-continuity-absent-{}.redb",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let database = Database::create(&path).expect("create empty continuity database");
+        let write = database.begin_write().expect("empty continuity writer");
+        assert_eq!(
+            lower_bound_continuity_write(&write).expect("absent continuity"),
+            None
+        );
+        drop(write);
+        assert!(
+            !database
+                .begin_read()
+                .expect("empty continuity read")
+                .list_tables()
+                .expect("empty continuity tables")
+                .any(|table| table.name() == CUSTODY_CONTINUITY.name()),
+            "decode-only migration access must not create an independently absent custody group"
+        );
+        drop(database);
+        std::fs::remove_file(path).expect("remove empty continuity database");
+    }
+
+    #[test]
+    fn lower_bound_continuity_read_accepts_absent_legacy_custody_schema() {
+        // Mutation caught: read-only Blob inspection of a pre-custody store
+        // must interpret missing continuity authority as None, not fail while
+        // attempting to open a table that never existed.
+        let path = std::env::temp_dir().join(format!(
+            "aster-lower-bound-continuity-read-absent-{}.redb",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let database = Database::create(&path).expect("create legacy continuity database");
+        let read = database.begin_read().expect("legacy continuity reader");
+        assert_eq!(
+            lower_bound_continuity_read(&read).expect("absent read continuity"),
+            None
+        );
+        assert!(
+            !read
+                .list_tables()
+                .expect("legacy continuity tables")
+                .any(|table| table.name() == CUSTODY_CONTINUITY.name())
+        );
+        drop(read);
+        drop(database);
+        std::fs::remove_file(path).expect("remove legacy continuity database");
+    }
+
+    #[test]
+    fn lower_bound_continuity_read_is_decode_only_and_preserves_restart_high_water() {
+        // Mutation caught: Blob read admission must see the durable continuity
+        // high-water without opening a writer or observing a new sample.
+        let path = std::env::temp_dir().join(format!(
+            "aster-lower-bound-continuity-read-{}.redb",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let database = Database::create(&path).expect("create continuity database");
+        let expected = ContinuityRecord {
+            generation: 7,
+            sample: CustodySample {
+                clock_id: CLOCK_A,
+                tick_ms: 123,
+            },
+        };
+        let write = database.begin_write().expect("continuity write");
+        write
+            .open_table(CUSTODY_CONTINUITY)
+            .expect("continuity table")
+            .insert(
+                CUSTODY_CONTINUITY_KEY,
+                encode_continuity(expected).as_slice(),
+            )
+            .expect("insert continuity");
+        write.commit().expect("commit continuity");
+
+        let read = database.begin_read().expect("continuity read");
+        assert_eq!(
+            lower_bound_continuity_read(&read).expect("decode continuity"),
+            Some(LowerBoundContinuity {
+                generation: expected.generation,
+                sample: expected.sample,
+            })
+        );
+        drop(read);
+        let write = database.begin_write().expect("continuity decode writer");
+        assert_eq!(
+            lower_bound_continuity_write(&write).expect("decode continuity from writer"),
+            Some(LowerBoundContinuity {
+                generation: expected.generation,
+                sample: expected.sample,
+            })
+        );
+        drop(write);
+        let verify = database.begin_read().expect("verify continuity read");
+        assert_eq!(
+            decode_continuity(
+                verify
+                    .open_table(CUSTODY_CONTINUITY)
+                    .expect("continuity table")
+                    .get(CUSTODY_CONTINUITY_KEY)
+                    .expect("continuity lookup")
+                    .expect("continuity row")
+                    .value()
+            )
+            .expect("canonical continuity"),
+            expected,
+            "read accessor must be byte-stable and non-mutating"
+        );
+        drop(verify);
+        drop(database);
+        std::fs::remove_file(path).expect("remove continuity database");
+    }
 
     fn finite_record(
         cumulative_age_ms: u64,

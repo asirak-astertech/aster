@@ -14156,8 +14156,7 @@ pub async fn run_node_with_forwarding(
 #[derive(Clone)]
 struct BlobMaintenanceTestGate {
     starts: Arc<std::sync::atomic::AtomicUsize>,
-    first_reached: Arc<std::sync::Barrier>,
-    first_release: Arc<std::sync::Barrier>,
+    first_block: Option<BlobMaintenanceTestBlockGate>,
     schedule_observations: Option<mpsc::UnboundedSender<BlobMaintenanceScheduleObservation>>,
     completed_progress: Option<mpsc::UnboundedSender<BlobMaintenanceProgress>>,
     block_periodic: bool,
@@ -14167,6 +14166,13 @@ struct BlobMaintenanceTestGate {
     worker_constructed: Arc<AtomicBool>,
     worker_reached: Option<mpsc::UnboundedSender<()>>,
     worker_release: Option<Arc<tokio::sync::Notify>>,
+}
+
+#[cfg(all(test, unix))]
+#[derive(Clone)]
+struct BlobMaintenanceTestBlockGate {
+    reached: mpsc::UnboundedSender<()>,
+    release: Arc<StdMutex<std::sync::mpsc::Receiver<()>>>,
 }
 
 #[cfg(all(test, unix))]
@@ -14198,9 +14204,20 @@ impl BlobMaintenanceTestGate {
     }
 
     fn enter(&self) {
-        if self.starts.fetch_add(1, Ordering::AcqRel) == 0 && self.block_periodic {
-            self.first_reached.wait();
-            self.first_release.wait();
+        if self.starts.fetch_add(1, Ordering::AcqRel) == 0
+            && self.block_periodic
+            && let Some(block) = self.first_block.as_ref()
+        {
+            block
+                .reached
+                .send(())
+                .expect("periodic maintenance gate observer remains live");
+            block
+                .release
+                .lock()
+                .expect("lock periodic maintenance release gate")
+                .recv_timeout(Duration::from_secs(10))
+                .expect("periodic maintenance release deadline");
         }
     }
 
@@ -29549,20 +29566,52 @@ mod tests {
             clock_id,
             tick_ms: 100,
         };
-        let retirement = store
-            .run_blob_maintenance_turn_with_sample(
-                blob_maintenance_runtime_budget(),
-                Some(retired_at),
+        const BLOB_MAINTENANCE_CLASSES: u64 = 6;
+        const POLICY_SETUP_AND_COMPLETION_UNITS: u64 = 6;
+        let initial_stats = store.blob_stats().expect("deadline fixture Blob stats");
+        let root_count = initial_stats
+            .publications
+            .checked_add(initial_stats.pending_sources)
+            .expect("deadline fixture root count fits u64");
+        assert_eq!(root_count, 1, "deadline fixture has one Blob root");
+        let maintenance_turn_bound = BLOB_MAINTENANCE_CLASSES
+            .checked_mul(
+                root_count
+                    .checked_add(POLICY_SETUP_AND_COMPLETION_UNITS)
+                    .expect("deadline policy unit count fits u64"),
             )
-            .expect("retire deadline Blob");
+            .expect("deadline maintenance turn bound fits u64");
+        let mut retirement = None;
+        for _ in 0..maintenance_turn_bound {
+            let progress = store
+                .run_blob_maintenance_turn_with_sample(
+                    blob_maintenance_runtime_budget(),
+                    Some(retired_at),
+                )
+                .expect("retire deadline Blob");
+            retirement = Some(progress);
+            if matches!(
+                store.get_blob(source),
+                Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+            ) {
+                break;
+            }
+        }
+        let retirement = retirement.expect("deadline maintenance bound is nonzero");
         assert_eq!(
             retirement.class,
             aster_redb_store::BlobMaintenanceClass::ExpiredPublicationsAndPendingSources
         );
-        assert!(matches!(
-            store.get_blob(source),
-            Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
-        ));
+        let final_status = store
+            .blob_gc_status(Some(retired_at))
+            .expect("deadline post-retirement status");
+        assert!(
+            matches!(
+                store.get_blob(source),
+                Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+            ),
+            "deadline source must retire within {maintenance_turn_bound} turns; final progress: {retirement:?}; final status: {final_status:?}"
+        );
         let retention_deadline = retired_at.tick_ms + 3_888_000_000;
         drop(store);
 
@@ -29625,8 +29674,7 @@ mod tests {
                     blob_worker_fatal_on_shutdown: false,
                     blob_maintenance_gate: Some(BlobMaintenanceTestGate {
                         starts: starts.clone(),
-                        first_reached: Arc::new(Barrier::new(1)),
-                        first_release: Arc::new(Barrier::new(1)),
+                        first_block: None,
                         schedule_observations: Some(schedule_sender),
                         completed_progress: Some(progress_sender),
                         block_periodic: false,
@@ -29788,8 +29836,7 @@ mod tests {
         let worker_constructed = Arc::new(AtomicBool::new(false));
         let gate = BlobMaintenanceTestGate {
             starts: Arc::new(AtomicUsize::new(0)),
-            first_reached: Arc::new(Barrier::new(1)),
-            first_release: Arc::new(Barrier::new(1)),
+            first_block: None,
             schedule_observations: None,
             completed_progress: None,
             block_periodic: false,
@@ -29887,8 +29934,8 @@ mod tests {
         let (before_loop_release, release_loop) = oneshot::channel();
         let (zeroization_queued, _zeroization_observer) = oneshot::channel();
         let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let first_reached = Arc::new(Barrier::new(2));
-        let first_release = Arc::new(Barrier::new(2));
+        let (first_reached_sender, mut first_reached_receiver) = mpsc::unbounded_channel();
+        let (first_release_sender, first_release_receiver) = std_mpsc::sync_channel(1);
         let (schedule_sender, mut schedule_receiver) = mpsc::unbounded_channel();
         let (worker_reached_sender, mut worker_reached_receiver) = mpsc::unbounded_channel();
         let worker_release = Arc::new(tokio::sync::Notify::new());
@@ -29921,8 +29968,10 @@ mod tests {
                     blob_worker_fatal_on_shutdown: false,
                     blob_maintenance_gate: Some(BlobMaintenanceTestGate {
                         starts: starts.clone(),
-                        first_reached: first_reached.clone(),
-                        first_release: first_release.clone(),
+                        first_block: Some(BlobMaintenanceTestBlockGate {
+                            reached: first_reached_sender,
+                            release: Arc::new(StdMutex::new(first_release_receiver)),
+                        }),
                         schedule_observations: Some(schedule_sender),
                         completed_progress: None,
                         block_periodic: true,
@@ -29997,14 +30046,10 @@ mod tests {
             .await
             .expect("Blob operation response deadline")
             .expect("Blob operation task");
-        let reached = first_reached.clone();
-        timeout(
-            Duration::from_secs(10),
-            tokio::task::spawn_blocking(move || reached.wait()),
-        )
-        .await
-        .expect("periodic maintenance reaches blocking gate")
-        .expect("maintenance gate waiter");
+        timeout(Duration::from_secs(10), first_reached_receiver.recv())
+            .await
+            .expect("periodic maintenance reaches blocking gate deadline")
+            .expect("periodic maintenance reaches blocking gate");
 
         shutdown_sender
             .try_send(())
@@ -30017,9 +30062,8 @@ mod tests {
         .await
         .is_ok();
         let starts_while_blocked = starts.load(Ordering::Acquire);
-        let release = first_release.clone();
-        tokio::task::spawn_blocking(move || release.wait())
-            .await
+        first_release_sender
+            .send(())
             .expect("release periodic maintenance");
         timeout(Duration::from_secs(10), actor)
             .await
@@ -44331,6 +44375,7 @@ mod tests {
         let source_cache = test_event_route_cache(&source_store, &source_mission.credentials);
         let receiver_cache = test_event_route_cache(&receiver_store, &receiver.credentials);
         assert!(receiver_cache.has_blob_claim_for_test(evicted));
+        prime_remote_blob_policy_for_pressure(&receiver_store);
 
         let mut fetched_ranges = 0usize;
         for _ in 0..16 {
@@ -44522,6 +44567,7 @@ mod tests {
         receiver_cache
             .insert_pending_blob_completion(&receiver_verifier, memo)
             .expect("restore actual pending memo into active cache");
+        prime_remote_blob_policy_for_pressure(&receiver_store);
         let incoming = publish_test_blob_with_priority(
             &source_store,
             &mut source_verifier,
@@ -44806,6 +44852,7 @@ mod tests {
         );
         let source_cache = test_event_route_cache(&source_store, &source_mission.credentials);
         let receiver_cache = test_event_route_cache(&receiver_store, &receiver.credentials);
+        prime_remote_blob_policy_for_pressure(&receiver_store);
 
         for _ in 0..16 {
             let _ = blob_contact_test_pair_with_caches(
@@ -44966,6 +45013,7 @@ mod tests {
             evicted,
             &evicted_sealed,
         );
+        prime_remote_blob_policy_for_pressure(&receiver_store);
 
         for _ in 0..16 {
             let _ = blob_contact_test_pair_with_caches(
@@ -45074,6 +45122,7 @@ mod tests {
         );
         let source_cache = test_event_route_cache(&source_store, &source_mission.credentials);
         let receiver_cache = test_event_route_cache(&receiver_store, &receiver.credentials);
+        prime_remote_blob_policy_for_pressure(&receiver_store);
 
         let (receiver_result, _) = blob_contact_test_pair_with_caches_results(
             Arc::clone(&source_store),
@@ -45181,6 +45230,7 @@ mod tests {
             evicted,
             &evicted_sealed,
         );
+        prime_remote_blob_policy_for_pressure(&receiver_store);
 
         let mut receiver_error = None;
         for _ in 0..16 {
@@ -45284,6 +45334,7 @@ mod tests {
         );
         let source_cache = test_event_route_cache(&source_store, &source_mission.credentials);
         let receiver_cache = test_event_route_cache(&receiver_store, &receiver.credentials);
+        prime_remote_blob_policy_for_pressure(&receiver_store);
 
         let mut receiver_error = None;
         for _ in 0..16 {
@@ -46606,6 +46657,37 @@ mod tests {
         (client_receipt, server_receipt, server_cache, client_cache)
     }
 
+    const BLOB_CONTACT_TEST_CLIENT_CLOCK_ID: [u8; 16] = [0xb2; 16];
+
+    fn prime_remote_blob_policy_for_pressure(store: &Store) {
+        const BLOB_MAINTENANCE_CLASSES: u64 = 6;
+        const POLICY_SETUP_AND_COMPLETION_UNITS: u64 = 6;
+        let stats = store.blob_stats().expect("remote pressure priming stats");
+        let root_count = stats
+            .publications
+            .checked_add(stats.pending_sources)
+            .expect("remote pressure priming root count fits u64");
+        let bound = BLOB_MAINTENANCE_CLASSES
+            .checked_mul(
+                root_count
+                    .checked_add(POLICY_SETUP_AND_COMPLETION_UNITS)
+                    .expect("remote pressure priming unit count fits u64"),
+            )
+            .expect("remote pressure priming turn bound fits u64");
+        let sample = CustodySample {
+            clock_id: BLOB_CONTACT_TEST_CLIENT_CLOCK_ID,
+            tick_ms: 0,
+        };
+        for _ in 0..bound {
+            store
+                .run_blob_maintenance_turn_with_sample(
+                    blob_maintenance_runtime_budget(),
+                    Some(sample),
+                )
+                .expect("prime remote Blob policy before pressure retry");
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn blob_contact_test_pair_with_caches(
         server_store: Arc<Store>,
@@ -46737,7 +46819,11 @@ mod tests {
                             policy_lock: Arc::new(RwLock::new(())),
                             emission_policy: client_policy,
                             emission_snapshot: snapshot,
-                            custody_clock: NodeCustodyClock::injected([0xb2; 16], 0, 0),
+                            custody_clock: NodeCustodyClock::injected(
+                                BLOB_CONTACT_TEST_CLIENT_CLOCK_ID,
+                                0,
+                                0,
+                            ),
                             event_route_cache: client_cache,
                             event_bridge: client_bridge,
                             mutable_interests: client_interests,
