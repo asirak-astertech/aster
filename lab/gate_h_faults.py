@@ -1039,7 +1039,9 @@ def formal_feature_graph(
         set(
             re.findall(
                 r"(?i)\b(?:legacy-single-contact-service|legacy-lab|libp2p|iroh)[a-z0-9_-]*\b",
-                stdout,
+                # Cargo's package display includes the checkout path. It is not
+                # a dependency/feature token (e.g. a worktree named iroh-in-ci).
+                re.sub(r" \([^\r\n]*\)(?= features=\[)", "", stdout),
             )
         )
     )

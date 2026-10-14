@@ -52,12 +52,12 @@ mandatory-access-control profile. The manual operator procedure is
 
 | Check | Runner | Purpose |
 | --- | --- | --- |
-| `quality` | `ubuntu-24.04` | Runs the exact-source Python process contract, Rust and Go formatting, Apache-2.0-only project-license and package checks, exact 348-row implementation-requirements traceability, the selected-node dependency boundary, vendored netlink source-equivalence and 13-test compatibility gates, the retained-libp2p-oracle boundary, selected live-Event, live-mutable, live-State-subscription, live-Record-subscription, live-Blob, and live-Blob-subscription receipt checker tests, real-process smokes, C ABI build and C/C++ header checks, Rust/Python conformance, Python/Go binding tests, and lab-controller tests. |
+| `quality` | `ubuntu-24.04` | Runs the exact-source Python process contract, Rust and Go formatting, Apache-2.0-only project-license and package checks, exact 348-row implementation-requirements traceability, the selected-node dependency boundary, vendored netlink source-equivalence and 13-test compatibility gates, selected live-Event, live-mutable, live-State-subscription, live-Record-subscription, live-Blob, and live-Blob-subscription receipt checker tests, real-process smokes, C ABI build and C/C++ header checks, Rust/Python conformance, Python/Go binding tests, and lab-controller tests. |
 | `Rust Clippy` | `ubuntu-24.04` | Runs locked Clippy for every workspace target and feature, with warnings denied. |
 | `Rust tests (1/2)` and `Rust tests (2/2)` | `ubuntu-24.04` | Run two disjoint nextest partitions covering the complete locked, all-feature Rust workspace suite. Partition 1 also runs all workspace doctests with Cargo. Both start independently of Clippy and use the existing resource wrapper. |
 | `macOS tests` | `macos-14` | Runs all Rust workspace tests on the supported Apple runner with Rust 1.97.1. |
 | `Rust 1.91 MSRV` | `ubuntu-24.04` | Checks every workspace target and feature with the declared minimum supported Rust version. |
-| `dependency policy` | `ubuntu-24.04` | Enforces the retained-libp2p-oracle boundary, applies `deny.toml` to the root and fuzz dependency graphs, and audits both lockfiles against a freshly downloaded RustSec database. |
+| `dependency policy` | `ubuntu-24.04` | Applies `deny.toml` to the root and fuzz dependency graphs, and audits both lockfiles against a freshly downloaded RustSec database. |
 | `age reference interoperability` | `ubuntu-24.04` | Installs exact `govulncheck` v1.6.0, runs `mise run age-reference-audit`, then runs `mise run age-reference-interop`: the Go oracle's reachable vulnerability and compiled-module license gates must pass before exact reference Go `filippo.io/age` v1.3.1 and the Rust provider exchange classic-X25519 artifacts in both directions, compare recovered plaintext, and agree on the recipient. |
 | `bounded fuzz smoke` | `ubuntu-24.04` | Runs all nine fixed 10,000-case hostile-input campaigns with the pinned nightly toolchain and `cargo-fuzz`: semantic wire decode, fragment decode, reference-envelope inspection, selected mechanics-frame decode, selected Negentropy, classical-profile decode, systemd credential decode, systemd admin-record decode, and systemd backup decode. |
 | `required` | `ubuntu-24.04` | Fails unless every validation lane completed successfully; this is the branch-protection check. |
@@ -1659,38 +1659,36 @@ is a visible stakeholder deviation from the frozen OSI-only requirement, not a
 claim of outside-counsel review or requirements credit. Passing this gate does
 not by itself authorize a release or declare browser-WASM supported.
 
-An advisory-independent retained-oracle gate separately parses locked,
-offline, all-feature Cargo metadata. It requires
-`aster-libp2p-provider` to remain unpublished and allows no dependency consumer
-other than `aster-lab`'s optional `libp2p-candidate` feature. It also rejects
-default or aliased activation, renamed or remote provider dependencies, and
-local intermediary consumers outside the workspace. The provider remains
-directly buildable as a workspace test package so explicit and workspace-wide
-validation can exercise the retained oracle without activating it in a default
-or shipping consumer. Mutation tests cover each escape route in both the
-primary and dependency-policy lanes.
+[Decision 0045](../decisions/0045-remove-libp2p-test-oracle.md) supersedes
+Decision 0029's retention policy. The experimental provider and only its lab
+integration are removed; the rest of `aster-lab` remains.
 
-The root lockfile also contains `hickory-proto` and `hickory-resolver` 0.25.2
-because the `libp2p` 0.56.0 aggregate manifest exposes DNS and mDNS as optional
-features. Aster disables libp2p default features and enables neither optional
-feature, so neither Hickory package is present in the resolved workspace graph,
-including with every Aster workspace feature and target enabled. They are also
-absent from the independent fuzz graph. The raw-lock tools cannot represent
-that reachability distinction, so only the root raw-lock `cargo audit` command
-narrowly ignores `RUSTSEC-2026-0118` and `RUSTSEC-2026-0119`. Feature-aware
-`cargo deny` sees neither inactive package and carries no Hickory ignore.
+The provider removal also removes the optional Hickory 0.25.2 lock entries.
+The root audit no longer ignores `RUSTSEC-2026-0118` or `RUSTSEC-2026-0119`.
+The dependency-exception scope gate now requires only the retained safe
+`hickory-proto` 0.26.1 lock entry and still rejects vulnerable active Hickory.
+The unrelated age advisory disposition, exact license exceptions, and netlink
+patch remain unchanged.
 
-This is a lock-only tooling disposition, not a runtime vulnerability waiver or
-admission of DNS, mDNS, or Hickory. Before either ignore can be used,
-`tools/check-dependency-exception-scope.sh` requires the affected lock-only
-package set to remain exactly `hickory-proto`/`hickory-resolver` 0.25.2 and
-permits the separately resolved, fixed 0.26.1 versions used by Iroh. It proves
-that the affected 0.25.2 versions are absent from the full workspace and fuzz
-dependency graphs. Its adversarial regression injects an active vulnerable
-Hickory version and requires the gate to fail. Package/version drift or future
-feature activation therefore blocks CI before the audit suppression is
-applied. Remove both ignores when the aggregate libp2p lock no longer contains
-the affected optional versions.
+Current-stack regressions in `aster-node::runtime::tests` exercise production
+mission-authenticated contacts over persistent direct-loopback Iroh endpoints:
+`current_stack_near_two_mib_events_each_direction` sends two Events each way,
+each with `MAX_OBJECT_BYTES - 11 * 1024` plaintext bytes. The measured envelope
+overhead is checked to be above 10 KiB and at most 11 KiB; every sealed Event
+must fit the existing object bound. Exact source bytes and authenticated
+plaintext are checked at the receiver. This is near-two-MiB payload volume per
+direction, not two exact one-MiB plaintext Events or throughput evidence.
+`current_stack_exact_64_kib_event_after_fresh_auth_reconnect` completes and
+closes a contact, retains both endpoint identities and addresses, rejects a
+fresh contact with the wrong expected mission identity without insertion, then
+reauthenticates and delivers exact 64-KiB Events each way. Contacts do not overlap.
+Existing resource tests remain; no replay scenario or telemetry is added.
+
+The manual runtime-volume diagnostic and its workflow are preserved byte for
+byte under `archive/diagnostics/runtime-volume/`; its active workflow and CI
+caller are removed. The archived telemetry patch is historical, not a current
+execution recipe or a port to the selected runtime. These changes grant no
+requirements, target-resource, interoperability, or release credit.
 
 The age interoperability lane keeps its independent Go module in
 `tools/age-reference/go.mod` and `go.sum`. Its acquisition step canonicalizes
@@ -1830,7 +1828,7 @@ cargo install --locked cargo-deny --version 0.20.2
 cargo install --locked cargo-audit --version 0.22.2
 cargo deny fetch all
 CARGO_NET_OFFLINE=true sh ./tools/check-dependency-exception-scope.sh
-cargo audit --ignore RUSTSEC-2026-0118 --ignore RUSTSEC-2026-0119 --file Cargo.lock
+cargo audit --file Cargo.lock
 cargo deny --locked --offline check
 cargo deny --manifest-path fuzz/Cargo.toml --config deny.toml --locked --offline check
 cargo audit --no-fetch --file fuzz/Cargo.lock

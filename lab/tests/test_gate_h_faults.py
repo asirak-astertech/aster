@@ -1522,6 +1522,31 @@ class GateHFaultTests(unittest.TestCase):
             ).decode()
             self.assertIsNone(faults.cargo_reported_test_executable(command))
 
+    def test_formal_graph_ignores_checkout_paths_but_rejects_provider_tokens(self):
+        graph = (
+            "aster-lab v0.1.0 (/checkout/iroh-in-ci/libp2p/crates/aster-lab) features=[gate-h]\n"
+            "└── aster-host v0.1.0 (/checkout/iroh-in-ci/crates/aster-host) features=[gate-h-formal]\n"
+        )
+        for extra, passed in (
+            ("", True),
+            ("└── iroh v1.3.0 features=[]\n", False),
+            ("└── libp2p-core v0.1.0 features=[]\n", False),
+            ('└── aster-host feature "legacy-lab"\n', False),
+        ):
+            with self.subTest(extra=extra), mock.patch.object(
+                faults,
+                "run_provenance_command",
+                return_value={
+                    "returncode": 0,
+                    "timed_out": False,
+                    "execution_error": None,
+                    "stdout": faults.complete_stream((graph + extra).encode()),
+                    "stderr": faults.complete_stream(b""),
+                },
+            ):
+                result = faults.formal_feature_graph(Path("cargo"), {})
+                self.assertEqual(result["passed"], passed)
+
     def test_static_ownership_checks_are_exact_rg_assertions_and_pass(self):
         freeze = {"source_files": []}
         for relative in faults.SOURCE_PATHS:
