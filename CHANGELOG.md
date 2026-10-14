@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Required `BlobRangesStreamV1` for bounded, receipt-free multi-range Blob
+  carrier turns and incremental durable-prefix recovery. Protocol draft.3 removes
+  legacy Blob transfer: both peers must support profile 3. Stored data is unchanged.
+
 - Optional `before_acceptance_marker` filter for `QueryEvents` RPC call
 - `asterctl unsubscribe` command to remove an Event subscription by ID.
 - subsriptions option for asterctl to get Event subscriptions list

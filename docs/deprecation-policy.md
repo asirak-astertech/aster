@@ -35,8 +35,13 @@ confirmation, and hybrid-authentication bound, so an unauthenticated on-path
 rewrite fails.
 
 Semantic version `7` inherits every semantic-v6 lane and adds a mandatory
-post-handshake per-lane transfer-profile exchange. Every lane must retain
-`LegacyV6`; Event directions may select `EventPagesV1` for exact durable,
+post-handshake per-lane transfer-profile exchange. Protocol draft.3 requires
+`BlobRangesStreamV1` for selected Blob transfer, removing its legacy fallback.
+An incompatible offer fails the authenticated profile exchange, and older
+semantic Blob carrier attempts fail before carrier IO; both endpoints must
+upgrade. Stored source, manifest, and durable-prefix formats are unchanged.
+Historical vector IDs retain their bytes; new stream-only vectors use new IDs.
+Other lanes retain `LegacyV6`; Event directions may select `EventPagesV1` for exact durable,
 finite-TTL, tombstone, route-only, mixed, and bounded blind ReceiveOnly
 traffic. Semantic-v7 page frames are invalid in v1-v6 sessions, and v7
 does not reinterpret any v1-v6 byte or stable object.
