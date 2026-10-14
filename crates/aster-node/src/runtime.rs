@@ -38,7 +38,8 @@ use aster_iroh::{
     PreparedNearbyDiscoveryBrowser,
 };
 use aster_mesh::{
-    BlobContentVerification, BlobCustodyClaimV1, BlobError, BlobId, BlobPhysicalLineage,
+    AuthenticatedBlobCustodyContactV1, BlobContentVerification, BlobCustodyClaimV1,
+    BlobCustodyDirectionV1, BlobCustodyTransferId, BlobError, BlobId, BlobPhysicalLineage,
     ContentVerifiedBlobEnvelope, ContentVerifiedEventEnvelope, CustodyClaims, CustodyError,
     CustodyExpectation, CustodyHop, CustodySample, CustodyTransferClaims, CustodyTransferId,
     EventContentVerification, EventRouteLineage, MAX_CUSTODY_WRAPPER_BYTES,
@@ -60,11 +61,11 @@ use aster_redb_store::{
     ApplyOutcome, BlobCapacityGcTarget, BlobCarrierAppendOutcome, BlobCarrierCommitOutcome,
     BlobCarrierFetchCursor, BlobCarrierObjectId, BlobCarrierPrefixStatus, BlobDepotCompletion,
     BlobDepotLimits, BlobLeaseLimits, BlobLifecycleLimits, BlobMaintenanceBudget,
-    BlobMaintenanceProgress, BlobSourceProjection, BlobSourceRetention, BlobSourceStageOutcome,
-    BlobStoreError, BlobTransferId, BlobVariantId, ControlOutcome, ControlPolicySnapshot,
-    ControlRejectionReason, ControlTransferId, CustodyObjectKey, CustodyPeerApplyDisposition,
-    CustodyPeerApplyEvidence, CustodyPeerSelectorRevision, CustodyPolicyRevision,
-    CustodyPressureDemand, CustodyQuota, CustodyReconciliationEvidence,
+    BlobMaintenanceProgress, BlobSemanticId, BlobSourceProjection, BlobSourceRetention,
+    BlobSourceStageOutcome, BlobStoreError, BlobTransferId, BlobVariantId, ControlOutcome,
+    ControlPolicySnapshot, ControlRejectionReason, ControlTransferId, CustodyObjectKey,
+    CustodyPeerApplyDisposition, CustodyPeerApplyEvidence, CustodyPeerSelectorRevision,
+    CustodyPolicyRevision, CustodyPressureDemand, CustodyQuota, CustodyReconciliationEvidence,
     CustodyReconciliationSelection, CustodySendAuthorization, CustodySenderProjection,
     CustodyStoreError, CustodyUsage, EventOnceOutcome, EventOperationAuditProgress,
     EventOperationAuditState, EventOperationAuditStatus, EventOperationKey, EventOperationLimits,
@@ -76,8 +77,9 @@ use aster_redb_store::{
     MAX_CUSTODY_RETIREMENTS, MAX_EVENT_PAGE, MAX_MUTABLE_TRANSFER_CURSOR_PEERS,
     MAX_NETWORK_BLOB_BYTES, MAX_NETWORK_BLOB_CHUNKS, MAX_ROUTE_CACHE_ITEMS,
     MutableTransferCursorClass, MutableTransferCursorMode, NumberedEventOperationRequest,
-    NumberedEventPublishOutcome, RecordSenderProjection, RecordTransferId, RejectedControl,
-    ReservedEventOnceCommit, RouteCacheOutcome, ScopeRekeyPublicationIntent, StateSenderProjection,
+    NumberedEventPublishOutcome, PendingBlobSource, PreparedBlobCustodySend,
+    RecordSenderProjection, RecordTransferId, RejectedControl, ReservedEventOnceCommit,
+    RetainedBlobSource, RouteCacheOutcome, ScopeRekeyPublicationIntent, StateSenderProjection,
     StateTransferId, Store, StoreBackingIdentity, StoreError, StoreInspection, StoreLimits,
     StoreZeroizationState, StoredControl, StoredControlEffect, StoredEvent, StoredEventTransfer,
     StoredRecord, StoredState, TransferLease, ZeroizationArtifact, ZeroizationIntent,
@@ -104,7 +106,9 @@ mod blob_progress_test;
 mod convergence_test;
 
 #[cfg(test)]
-use crate::event_pages::{TransferProfileId, empty_set_commitment};
+use crate::event_pages::empty_set_commitment;
+#[cfg(test)]
+use crate::mission::initiate_over_iroh_metered_for_semantic_version;
 #[cfg(feature = "nearby-discovery")]
 use crate::mission::{initiate_discovered_over_iroh_metered, respond_discovered_over_iroh_metered};
 use crate::{
@@ -129,10 +133,11 @@ use crate::{
         ChangeTurnFinishedV1, ChangeTurnHeaderV1, EventPagePackingState, EventPageScheduleLimits,
         EventPageSchedulePosition, EventTurnPlanV1, LaneId, LocalEventSendDifference,
         MAX_CHANGE_PAGE_CODEC_BYTES, MAX_EVENT_TURN_PLAN_CODEC_BYTES, NegotiatedTransferProfiles,
-        SEMANTIC_PROTOCOL_V7, SEMANTIC_PROTOCOL_V8, TransferProfileOfferV1, blind_set_commitment,
-        build_local_event_send_plan_with_limits, negotiate_transfer_profiles_for_semantic_version,
-        pack_event_page_entry, schedule_digest, transfer_profile_digest,
-        validate_remote_event_page_budget, validate_remote_event_send_plan,
+        SEMANTIC_PROTOCOL_V7, SEMANTIC_PROTOCOL_V8, TransferProfileId, TransferProfileOfferV1,
+        blind_set_commitment, build_local_event_send_plan_with_limits,
+        negotiate_transfer_profiles_for_semantic_version, pack_event_page_entry, schedule_digest,
+        transfer_profile_digest, validate_remote_event_page_budget,
+        validate_remote_event_send_plan,
     },
     format_node_id, format_path_field, format_receipt_field,
     frame::{
@@ -2510,7 +2515,276 @@ tokio::task_local! {
     static TEST_RECONCILIATION_EXCHANGES_BEFORE_DEFER: std::cell::Cell<Option<usize>>;
     static TEST_CUSTODY_PREOPEN_RACES: std::cell::RefCell<Vec<TestCustodyPreopenRace>>;
     static TEST_TRANSFER_PROFILE_OFFER: std::cell::RefCell<Option<TransferProfileOfferV1>>;
+    static TEST_SEMANTIC_VERSION: std::cell::Cell<Option<u16>>;
     static TEST_PREACCOUNTED_CONTACT_ITEMS: std::cell::Cell<usize>;
+    static TEST_BLOB_FINALIZATION_DELAY_MS: std::cell::Cell<Option<u64>>;
+    static TEST_BLOB_RECEIVE_FAULT: std::cell::Cell<Option<TestBlobReceiveFault>>;
+    static TEST_BLOB_SETTLEMENT_HARNESS: TestBlobSettlementHarness;
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TestBlobSettlementKind {
+    ApplyResult,
+    FetchResult,
+    FetchResultAck,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TestBlobSettlementObservation {
+    kind: TestBlobSettlementKind,
+    id: MutableTransferId,
+    disposition: MutableApplyDisposition,
+    emitted_digest: Option<[u8; 32]>,
+    authority_digest: Option<[u8; 32]>,
+    logical_digest: [u8; 32],
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TestBlobSettlementMutation {
+    MissingDigest,
+    ReplaceDigest([u8; 32]),
+    CorruptProtectedDisposition,
+    ReplaceDisposition(MutableApplyDisposition),
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TestBlobSettlementFault {
+    kind: TestBlobSettlementKind,
+    mutation: TestBlobSettlementMutation,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct TestBlobSettlementState {
+    fault: Option<TestBlobSettlementFault>,
+    observations: Vec<TestBlobSettlementObservation>,
+    corrupt_next_protected: bool,
+    transfer_capacity: Option<usize>,
+    cas_mismatch_after_successes: Option<(usize, [u8; 32])>,
+    successful_cas: usize,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Default)]
+struct TestBlobSettlementHarness(Arc<StdMutex<TestBlobSettlementState>>);
+
+#[cfg(test)]
+impl TestBlobSettlementHarness {
+    fn with_fault(fault: TestBlobSettlementFault) -> Self {
+        Self(Arc::new(StdMutex::new(TestBlobSettlementState {
+            fault: Some(fault),
+            ..TestBlobSettlementState::default()
+        })))
+    }
+
+    fn with_cas_mismatch(after_successes: usize, competing: [u8; 32]) -> Self {
+        Self(Arc::new(StdMutex::new(TestBlobSettlementState {
+            transfer_capacity: Some(3),
+            cas_mismatch_after_successes: Some((after_successes, competing)),
+            ..TestBlobSettlementState::default()
+        })))
+    }
+
+    fn with_transfer_capacity(capacity: usize) -> Self {
+        Self(Arc::new(StdMutex::new(TestBlobSettlementState {
+            transfer_capacity: Some(capacity),
+            ..TestBlobSettlementState::default()
+        })))
+    }
+
+    fn observations(&self) -> Vec<TestBlobSettlementObservation> {
+        self.0
+            .lock()
+            .expect("settlement harness lock")
+            .observations
+            .clone()
+    }
+}
+
+#[cfg(test)]
+fn observe_and_fault_test_blob_settlement(
+    store: &Store,
+    frame: Frame,
+    authority_digest: Option<[u8; 32]>,
+) -> Frame {
+    let (kind, id, disposition, emitted_digest) = match &frame {
+        Frame::MutableApplyResult {
+            id,
+            disposition,
+            custody_digest,
+            ..
+        } => (
+            TestBlobSettlementKind::ApplyResult,
+            *id,
+            *disposition,
+            *custody_digest,
+        ),
+        Frame::MutableFetchResult {
+            id,
+            disposition,
+            custody_digest,
+            ..
+        } => (
+            TestBlobSettlementKind::FetchResult,
+            *id,
+            *disposition,
+            *custody_digest,
+        ),
+        Frame::MutableFetchResultAck {
+            id,
+            disposition,
+            custody_digest,
+            ..
+        } => (
+            TestBlobSettlementKind::FetchResultAck,
+            *id,
+            *disposition,
+            *custody_digest,
+        ),
+        _ => return frame,
+    };
+    let replacement = TEST_BLOB_SETTLEMENT_HARNESS
+        .try_with(|harness| {
+            let mut state = harness.0.lock().expect("settlement harness lock");
+            state.observations.push(TestBlobSettlementObservation {
+                kind,
+                id,
+                disposition,
+                emitted_digest,
+                authority_digest,
+                logical_digest: store.test_blob_logical_digest(),
+            });
+            let Some(fault) = state.fault.filter(|fault| fault.kind == kind) else {
+                return None;
+            };
+            state.fault = None;
+            match fault.mutation {
+                TestBlobSettlementMutation::CorruptProtectedDisposition => {
+                    state.corrupt_next_protected = true;
+                    None
+                }
+                mutation => match &frame {
+                    Frame::MutableApplyResult {
+                        direction,
+                        id,
+                        disposition,
+                        custody_digest,
+                    } => Some(Frame::MutableApplyResult {
+                        direction: *direction,
+                        id: *id,
+                        disposition: match mutation {
+                            TestBlobSettlementMutation::ReplaceDisposition(value) => value,
+                            _ => *disposition,
+                        },
+                        custody_digest: match mutation {
+                            TestBlobSettlementMutation::MissingDigest => None,
+                            TestBlobSettlementMutation::ReplaceDigest(value) => Some(value),
+                            _ => *custody_digest,
+                        },
+                    }),
+                    Frame::MutableFetchResult {
+                        direction,
+                        id,
+                        disposition,
+                        custody_digest,
+                    } => Some(Frame::MutableFetchResult {
+                        direction: *direction,
+                        id: *id,
+                        disposition: match mutation {
+                            TestBlobSettlementMutation::ReplaceDisposition(value) => value,
+                            _ => *disposition,
+                        },
+                        custody_digest: match mutation {
+                            TestBlobSettlementMutation::MissingDigest => None,
+                            TestBlobSettlementMutation::ReplaceDigest(value) => Some(value),
+                            _ => *custody_digest,
+                        },
+                    }),
+                    Frame::MutableFetchResultAck {
+                        direction,
+                        id,
+                        disposition,
+                        custody_digest,
+                    } => Some(Frame::MutableFetchResultAck {
+                        direction: *direction,
+                        id: *id,
+                        disposition: match mutation {
+                            TestBlobSettlementMutation::ReplaceDisposition(value) => value,
+                            _ => *disposition,
+                        },
+                        custody_digest: match mutation {
+                            TestBlobSettlementMutation::MissingDigest => None,
+                            TestBlobSettlementMutation::ReplaceDigest(value) => Some(value),
+                            _ => *custody_digest,
+                        },
+                    }),
+                    _ => None,
+                },
+            }
+        })
+        .ok()
+        .flatten();
+    replacement.unwrap_or(frame)
+}
+
+#[cfg(test)]
+fn corrupt_test_blob_settlement_protection(frame: &Frame, protected: &mut [u8]) {
+    let kind = match frame {
+        Frame::MutableApplyResult { .. } => TestBlobSettlementKind::ApplyResult,
+        Frame::MutableFetchResult { .. } => TestBlobSettlementKind::FetchResult,
+        Frame::MutableFetchResultAck { .. } => TestBlobSettlementKind::FetchResultAck,
+        _ => return,
+    };
+    let corrupt = TEST_BLOB_SETTLEMENT_HARNESS
+        .try_with(|harness| {
+            let mut state = harness.0.lock().expect("settlement harness lock");
+            let corrupt = state.corrupt_next_protected
+                && state
+                    .observations
+                    .last()
+                    .is_some_and(|observation| observation.kind == kind);
+            state.corrupt_next_protected &= !corrupt;
+            corrupt
+        })
+        .unwrap_or(false);
+    if corrupt {
+        let last = protected
+            .last_mut()
+            .expect("protected settlement frame is non-empty");
+        *last ^= 1;
+    }
+}
+
+#[cfg(test)]
+fn test_mutable_transfer_capacity_override() -> Option<usize> {
+    TEST_BLOB_SETTLEMENT_HARNESS
+        .try_with(|harness| {
+            harness
+                .0
+                .lock()
+                .expect("settlement harness lock")
+                .transfer_capacity
+        })
+        .ok()
+        .flatten()
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TestBlobReceiveFault {
+    Missing,
+    Tampered,
+    CrossSession,
+    CrossDirection,
+    CrossExchange,
+    CrossTransfer,
+    CrossLength,
+    ImmutableMismatch,
+    Replay,
 }
 
 #[cfg(test)]
@@ -6908,11 +7182,53 @@ struct AuthenticatedBlobRouteClaim {
 
 impl AuthenticatedBlobRouteClaim {
     fn from_verified(
+        store: &Store,
         verified: &ContentVerifiedBlobEnvelope,
         sealed: &[u8],
         projection: &BlobSourceProjection,
         retention: BlobSourceRetention,
         depot_completion: Option<BlobDepotCompletion>,
+    ) -> Result<Self, NodeError> {
+        Self::from_verified_with_contact_mode(
+            store,
+            verified,
+            sealed,
+            projection,
+            retention,
+            depot_completion,
+            None,
+        )
+    }
+
+    fn from_verified_for_contact(
+        store: &Store,
+        verified: &ContentVerifiedBlobEnvelope,
+        sealed: &[u8],
+        projection: &BlobSourceProjection,
+        retention: BlobSourceRetention,
+        depot_completion: Option<BlobDepotCompletion>,
+        blob_contact_mode: BlobContactMode,
+    ) -> Result<Self, NodeError> {
+        Self::from_verified_with_contact_mode(
+            store,
+            verified,
+            sealed,
+            projection,
+            retention,
+            depot_completion,
+            Some(blob_contact_mode),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_verified_with_contact_mode(
+        store: &Store,
+        verified: &ContentVerifiedBlobEnvelope,
+        sealed: &[u8],
+        projection: &BlobSourceProjection,
+        retention: BlobSourceRetention,
+        depot_completion: Option<BlobDepotCompletion>,
+        blob_contact_mode: Option<BlobContactMode>,
     ) -> Result<Self, NodeError> {
         verified.verify_exact_sealed(sealed)?;
         if matches!(retention, BlobSourceRetention::Completed { .. }) != depot_completion.is_some()
@@ -6921,7 +7237,19 @@ impl AuthenticatedBlobRouteClaim {
                 "authenticated Blob source retention differs from its finalized depot proof".into(),
             ));
         }
-        if !projection.matches_verified(verified, sealed)? {
+        let matches = match blob_contact_mode {
+            Some(blob_contact_mode) => retained_blob_source_matches_verified_for_contact(
+                store,
+                projection,
+                retention,
+                verified,
+                sealed,
+                blob_contact_mode,
+            )?,
+            None => store
+                .retained_blob_source_matches_verified(projection, retention, verified, sealed)?,
+        };
+        if !matches {
             return Err(NodeError::Protocol(
                 "authenticated Blob source differs from its verified durable metadata".into(),
             ));
@@ -6992,6 +7320,26 @@ impl AuthenticatedBlobRouteClaim {
             && self.chunk_size == projection.chunk_size
             && self.chunk_count == projection.chunk_count
             && self.metadata_fingerprint == projection.metadata_fingerprint
+    }
+
+    fn projection(&self) -> BlobSourceProjection {
+        BlobSourceProjection {
+            transfer_id: self.transfer_id,
+            semantic_id: BlobSemanticId::new(self.semantic_id),
+            publisher: self.source_publisher,
+            topic: self.topic.clone(),
+            scope: self.scope.clone(),
+            epoch: self.key_epoch,
+            sealed_len: self.exact_len,
+            route_lineage: *self.route_lineage.binding(),
+            physical_lineage: *self.physical_lineage.binding(),
+            manifest_digest: self.manifest_digest,
+            blob_id: self.blob_id,
+            total_len: self.total_len,
+            chunk_size: self.chunk_size,
+            chunk_count: self.chunk_count,
+            metadata_fingerprint: self.metadata_fingerprint,
+        }
     }
 
     fn matches_verified(&self, verified: &ContentVerifiedBlobEnvelope, sealed: &[u8]) -> bool {
@@ -7317,6 +7665,34 @@ enum TestBlobContactFault {
     StageCapacityThenRetryCoherence = 17,
     AppendCapacityThenRetryCoherence = 18,
     PromotionCapacityThenRetryCoherence = 19,
+    PendingLifetimeExpiry = 20,
+    PendingLifetimeDiscontinuity = 21,
+    ServiceLifetimeExpiry = 22,
+    ServiceLifetimeDiscontinuity = 23,
+    CompletionLifetimeExpiry = 24,
+    CompletionLifetimeDiscontinuity = 25,
+    PromotionLifetimeExpiry = 26,
+    PromotionLifetimeDiscontinuity = 27,
+    OutboundLoadLifetimeExpiry = 28,
+    OutboundLoadLifetimeDiscontinuity = 29,
+    ServiceLoadLifetimeExpiry = 30,
+    ServiceLoadLifetimeDiscontinuity = 31,
+    PostPromotionLoadLifetimeExpiry = 32,
+    PostPromotionLoadLifetimeDiscontinuity = 33,
+    PendingCacheRepairLifetimeExpiry = 34,
+    PendingCacheRepairLifetimeDiscontinuity = 35,
+    PostStageLifetimeExpiry = 36,
+    PostStageLifetimeDiscontinuity = 37,
+    FinalComparisonLifetimeExpiry = 38,
+    FinalComparisonLifetimeDiscontinuity = 39,
+    CompletedPostStageCapabilityLifetimeExpiry = 40,
+    CompletedPostStageCapabilityLifetimeDiscontinuity = 41,
+    CompletedPostStageFinalComparisonLifetimeExpiry = 42,
+    CompletedPostStageFinalComparisonLifetimeDiscontinuity = 43,
+    CompletedCacheRepairCapabilityLifetimeExpiry = 44,
+    CompletedCacheRepairCapabilityLifetimeDiscontinuity = 45,
+    CompletedCacheRepairFinalComparisonLifetimeExpiry = 46,
+    CompletedCacheRepairFinalComparisonLifetimeDiscontinuity = 47,
 }
 
 #[cfg(test)]
@@ -7346,6 +7722,7 @@ struct TestBlobContactFaultState {
     fault: AtomicU8,
     fired: AtomicBool,
     result_frames_after_fault: AtomicU64,
+    logical_digest_after_fault: StdMutex<Option<[u8; 32]>>,
 }
 
 #[cfg(test)]
@@ -7355,6 +7732,7 @@ impl TestBlobContactFaultState {
             fault: AtomicU8::new(fault as u8),
             fired: AtomicBool::new(false),
             result_frames_after_fault: AtomicU64::new(0),
+            logical_digest_after_fault: StdMutex::new(None),
         }
     }
 
@@ -7410,6 +7788,20 @@ impl TestBlobContactFaultState {
             self.result_frames_after_fault
                 .fetch_add(1, Ordering::AcqRel);
         }
+    }
+
+    fn record_logical_digest_after_fault(&self, digest: [u8; 32]) {
+        *self
+            .logical_digest_after_fault
+            .lock()
+            .expect("test Blob contact fault digest lock") = Some(digest);
+    }
+
+    fn logical_digest_after_fault(&self) -> Option<[u8; 32]> {
+        *self
+            .logical_digest_after_fault
+            .lock()
+            .expect("test Blob contact fault digest lock")
     }
 }
 
@@ -7956,7 +8348,6 @@ impl AuthenticatedEventRouteCache {
                 && existing.manifest_digest == claim.manifest_digest
                 && existing.blob_id == claim.blob_id
                 && existing.variant_id == claim.variant_id
-                && existing.metadata_fingerprint == claim.metadata_fingerprint
                 && existing.total_len == claim.total_len
                 && existing.chunk_size == claim.chunk_size
                 && existing.chunk_count == claim.chunk_count;
@@ -7973,6 +8364,13 @@ impl AuthenticatedEventRouteCache {
                                 .into(),
                         ))
                     } else {
+                        // Finite age checkpointing deliberately rewrites only
+                        // the lifetime-bearing metadata fingerprint. The
+                        // incoming claim was freshly authenticated against the
+                        // exact retained bytes and immutable projection, so
+                        // advance this cache proof without treating a normal
+                        // custody checkpoint as source corruption.
+                        existing.metadata_fingerprint = claim.metadata_fingerprint;
                         Ok(())
                     }
                 }
@@ -8439,6 +8837,13 @@ impl AuthenticatedEventRouteCache {
         self.blob_contact_fault
             .as_ref()
             .is_some_and(|state| state.fire(fault))
+    }
+
+    #[cfg(test)]
+    fn record_test_blob_logical_digest_after_fault(&self, digest: [u8; 32]) {
+        if let Some(state) = self.blob_contact_fault.as_ref() {
+            state.record_logical_digest_after_fault(digest);
+        }
     }
 
     #[cfg(test)]
@@ -9456,6 +9861,7 @@ fn try_authenticate_blob_source(
         )?),
     };
     AuthenticatedBlobRouteClaim::from_verified(
+        store,
         &blob,
         sealed,
         projection,
@@ -9473,6 +9879,46 @@ fn authenticate_blob_source(
     retention: BlobSourceRetention,
     startup_completions: Option<&mut BTreeMap<BlobVariantId, BlobDepotCompletion>>,
 ) -> Result<AuthenticatedBlobRouteClaim, NodeError> {
+    authenticate_blob_source_with_contact_mode(
+        store,
+        verifier,
+        sealed,
+        projection,
+        retention,
+        startup_completions,
+        None,
+    )
+}
+
+fn authenticate_blob_source_for_contact(
+    store: &Store,
+    verifier: &mut ReferenceEnvelopeSealer,
+    sealed: &[u8],
+    projection: &BlobSourceProjection,
+    retention: BlobSourceRetention,
+    blob_contact_mode: BlobContactMode,
+) -> Result<AuthenticatedBlobRouteClaim, NodeError> {
+    authenticate_blob_source_with_contact_mode(
+        store,
+        verifier,
+        sealed,
+        projection,
+        retention,
+        None,
+        Some(blob_contact_mode),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn authenticate_blob_source_with_contact_mode(
+    store: &Store,
+    verifier: &mut ReferenceEnvelopeSealer,
+    sealed: &[u8],
+    projection: &BlobSourceProjection,
+    retention: BlobSourceRetention,
+    startup_completions: Option<&mut BTreeMap<BlobVariantId, BlobDepotCompletion>>,
+    blob_contact_mode: Option<BlobContactMode>,
+) -> Result<AuthenticatedBlobRouteClaim, NodeError> {
     let route = verifier.verify_blob(sealed)?;
     let BlobContentVerification::ContentVerified {
         blob,
@@ -9485,23 +9931,58 @@ fn authenticate_blob_source(
     };
     let depot_completion = match retention {
         BlobSourceRetention::Pending => None,
-        BlobSourceRetention::Completed { .. } => Some(blob_completion_capability(
+        BlobSourceRetention::Completed { .. } => Some(match blob_contact_mode {
+            Some(blob_contact_mode) => blob_completion_capability_for_contact(
+                store,
+                projection,
+                retention,
+                &blob,
+                &manifest_bytes,
+                sealed,
+                blob_contact_mode,
+            )?,
+            None => blob_completion_capability(
+                store,
+                projection,
+                retention,
+                &blob,
+                &manifest_bytes,
+                sealed,
+                startup_completions,
+            )?,
+        }),
+    };
+    #[cfg(test)]
+    if matches!(retention, BlobSourceRetention::Completed { .. })
+        && blob_contact_mode == Some(BlobContactMode::CustodyV1)
+        && let Ok(cache) = CONTACT_EVENT_ROUTE_CACHE.try_with(Arc::clone)
+    {
+        observe_test_blob_lifetime_fault(
             store,
+            &cache,
+            TestBlobContactFault::CompletedCacheRepairFinalComparisonLifetimeExpiry,
+            TestBlobContactFault::CompletedCacheRepairFinalComparisonLifetimeDiscontinuity,
+        )?;
+    }
+    match blob_contact_mode {
+        Some(blob_contact_mode) => AuthenticatedBlobRouteClaim::from_verified_for_contact(
+            store,
+            &blob,
+            sealed,
             projection,
             retention,
+            depot_completion,
+            blob_contact_mode,
+        ),
+        None => AuthenticatedBlobRouteClaim::from_verified(
+            store,
             &blob,
-            &manifest_bytes,
             sealed,
-            startup_completions,
-        )?),
-    };
-    AuthenticatedBlobRouteClaim::from_verified(
-        &blob,
-        sealed,
-        projection,
-        retention,
-        depot_completion,
-    )
+            projection,
+            retention,
+            depot_completion,
+        ),
+    }
 }
 
 fn blob_completion_capability(
@@ -9537,6 +10018,30 @@ fn blob_completion_capability(
         .map_err(NodeError::from)
 }
 
+fn blob_completion_capability_for_contact(
+    store: &Store,
+    projection: &BlobSourceProjection,
+    retention: BlobSourceRetention,
+    blob: &ContentVerifiedBlobEnvelope,
+    manifest_bytes: &[u8],
+    sealed: &[u8],
+    blob_contact_mode: BlobContactMode,
+) -> Result<BlobDepotCompletion, NodeError> {
+    match blob_contact_mode {
+        BlobContactMode::DurableOnly => {
+            store.completed_retained_blob(projection, retention, blob, manifest_bytes, sealed)
+        }
+        BlobContactMode::CustodyV1 => store.custody_v1_completed_retained_blob(
+            projection,
+            retention,
+            blob,
+            manifest_bytes,
+            sealed,
+        ),
+    }
+    .map_err(NodeError::from)
+}
+
 fn retained_blob_sealed(
     store: &Store,
     projection: &BlobSourceProjection,
@@ -9556,6 +10061,27 @@ fn retained_blob_sealed(
                 NodeError::Protocol("pending Blob projection lost its source row".into())
             }),
     }
+}
+
+fn retained_blob_sealed_for_sender_cache_repair(
+    store: &Store,
+    projection: &BlobSourceProjection,
+    retention: BlobSourceRetention,
+    blob_contact_mode: BlobContactMode,
+) -> Result<Vec<u8>, NodeError> {
+    if retention == BlobSourceRetention::Pending && blob_contact_mode == BlobContactMode::CustodyV1
+    {
+        return store
+            .custody_v1_pending_blob_source(projection.transfer_id)?
+            .map(|pending| pending.sealed)
+            .ok_or_else(|| {
+                NodeError::Protocol("pending Blob projection lost its source row".into())
+            });
+    }
+    // Startup/general local evidence and legacy durable contacts retain the
+    // established all-visible exact-load behavior. Only negotiated custody
+    // repair needs the strict typed lifetime/provenance outcome.
+    retained_blob_sealed(store, projection, retention)
 }
 
 fn load_route_verified_transfer(
@@ -11109,13 +11635,23 @@ fn repair_blob_sender_cache_miss(
     verifier: &mut ReferenceEnvelopeSealer,
     cache: &AuthenticatedEventRouteCache,
     expected: &BlobSourceProjection,
+    blob_contact_mode: BlobContactMode,
 ) -> Result<Option<AuthenticatedBlobRouteClaim>, NodeError> {
     if !blob_projection_fits_network_bound(expected) {
         return Ok(None);
     }
     (|| -> Result<Option<AuthenticatedBlobRouteClaim>, NodeError> {
         let _lifecycle = cache.lock_blob_lifecycle()?;
-        let Some(retained) = store.blob_source_projection(expected.transfer_id)? else {
+        let retained = match blob_source_projection_for_contact(
+            store,
+            expected.transfer_id,
+            blob_contact_mode,
+        ) {
+            Ok(retained) => retained,
+            Err(error) if blob_contact_policy_transition_error(&error) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let Some(retained) = retained else {
             // The compact inventory raced an exact source retirement before
             // an authenticated claim was recovered. Withholding is ordinary.
             return Ok(None);
@@ -11125,25 +11661,56 @@ fn repair_blob_sender_cache_miss(
                 "Blob sender cache repair crossed state-neutral source projections".into(),
             ));
         }
-        if let Some(claim) = cache.get_blob(verifier, expected.transfer_id)? {
-            if !claim.matches_projection(&retained.source) {
-                return Err(NodeError::Protocol(
-                    "Blob sender cache repair conflicts with its authenticated cache claim".into(),
-                ));
-            }
-            if claim.matches_retention(retained.retention) {
-                return Ok(Some(claim));
-            }
+        if let Some(claim) = cache.get_blob(verifier, expected.transfer_id)?
+            && claim.matches_projection(&retained.source)
+            && claim.matches_retention(retained.retention)
+        {
+            return Ok(Some(claim));
         }
-        let sealed = retained_blob_sealed(store, &retained.source, retained.retention)?;
-        let claim = authenticate_blob_source(
+        #[cfg(test)]
+        if retained.retention == BlobSourceRetention::Pending
+            && blob_contact_mode == BlobContactMode::CustodyV1
+        {
+            observe_test_blob_lifetime_fault(
+                store,
+                cache,
+                TestBlobContactFault::PendingCacheRepairLifetimeExpiry,
+                TestBlobContactFault::PendingCacheRepairLifetimeDiscontinuity,
+            )?;
+        }
+        let sealed = match retained_blob_sealed_for_sender_cache_repair(
+            store,
+            &retained.source,
+            retained.retention,
+            blob_contact_mode,
+        ) {
+            Ok(sealed) => sealed,
+            Err(error) if node_blob_contact_policy_transition_error(&error) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        #[cfg(test)]
+        if matches!(retained.retention, BlobSourceRetention::Completed { .. })
+            && blob_contact_mode == BlobContactMode::CustodyV1
+        {
+            observe_and_retire_test_blob_lifetime_fault(
+                store,
+                cache,
+                TestBlobContactFault::CompletedCacheRepairCapabilityLifetimeExpiry,
+                TestBlobContactFault::CompletedCacheRepairCapabilityLifetimeDiscontinuity,
+            )?;
+        }
+        let claim = match authenticate_blob_source_for_contact(
             store,
             verifier,
             &sealed,
             &retained.source,
             retained.retention,
-            None,
-        )?;
+            blob_contact_mode,
+        ) {
+            Ok(claim) => claim,
+            Err(error) if node_blob_contact_policy_transition_error(&error) => return Ok(None),
+            Err(error) => return Err(error),
+        };
         cache.record_mutable_source_verification();
         cache.insert_blob(verifier, claim.clone())?;
         Ok(Some(claim))
@@ -11151,11 +11718,12 @@ fn repair_blob_sender_cache_miss(
     .map_err(|error| fatal_blob_coherence("Blob sender cache repair", error))
 }
 
-fn cached_mutable_sender_snapshot(
+fn cached_mutable_sender_snapshot_with_blob_mode(
     store: &Store,
     policy: &ControlPolicySnapshot,
     verifier: &mut ReferenceEnvelopeSealer,
     class: MutableClass,
+    blob_contact_mode: BlobContactMode,
 ) -> Result<AuthenticatedMutableSenderSnapshot, NodeError> {
     let cache_result = match CONTACT_EVENT_ROUTE_CACHE.try_with(Arc::clone) {
         Ok(cache) => cache.require_binding(verifier).map(|()| cache),
@@ -11272,12 +11840,40 @@ fn cached_mutable_sender_snapshot(
         MutableClass::Blob => {
             (|| -> Result<(), NodeError> {
                 let mut retained = Vec::new();
-                store
-                    .visit_retained_blob_sources(Some(policy), |item| retained.push(item.clone()))?;
+                match blob_contact_mode {
+                    BlobContactMode::DurableOnly => {
+                        store.visit_durable_retained_blob_sources(Some(policy), |item| {
+                            retained.push(item.clone());
+                        })?
+                    }
+                    BlobContactMode::CustodyV1 => {
+                        store.visit_custody_v1_retained_blob_sources(Some(policy), |item| {
+                            retained.push(item.clone());
+                        })?
+                    }
+                }
                 for item in retained {
                     let projection = item.source;
                     let retention = item.retention;
                     let id = projection.transfer_id;
+                    #[cfg(test)]
+                    if blob_contact_mode == BlobContactMode::CustodyV1
+                        && matches!(retention, BlobSourceRetention::Completed { .. })
+                        && [
+                            TestBlobContactFault::CompletedPostStageCapabilityLifetimeExpiry,
+                            TestBlobContactFault::CompletedPostStageCapabilityLifetimeDiscontinuity,
+                            TestBlobContactFault::CompletedPostStageFinalComparisonLifetimeExpiry,
+                            TestBlobContactFault::CompletedPostStageFinalComparisonLifetimeDiscontinuity,
+                        ]
+                        .into_iter()
+                        .any(|fault| cache.test_blob_contact_fault_pending(fault))
+                    {
+                        // Model a receiver snapshot taken immediately before
+                        // another path completes this exact source. The fault
+                        // remains pending for the real completed post-stage
+                        // capability/final-comparison boundary.
+                        continue;
+                    }
                     if !blob_projection_fits_network_bound(&projection) {
                         // Projection-only bounds are checked before any exact
                         // source-row load, byte clone, cryptographic open, or
@@ -11288,17 +11884,17 @@ fn cached_mutable_sender_snapshot(
                     let cached = cache.get_blob(verifier, id)?;
                     let claim = if let Some(claim) = cached
                         && claim.matches_retention(retention)
+                        && claim.matches_projection(&projection)
                     {
-                        if !claim.matches_projection(&projection) {
-                            return Err(NodeError::Protocol(
-                                "Blob sender projection conflicts with its authenticated cache claim"
-                                    .into(),
-                            ));
-                        }
                         claim
                     } else {
-                        let Some(claim) =
-                            repair_blob_sender_cache_miss(store, verifier, &cache, &projection)?
+                        let Some(claim) = repair_blob_sender_cache_miss(
+                            store,
+                            verifier,
+                            &cache,
+                            &projection,
+                            blob_contact_mode,
+                        )?
                         else {
                             continue;
                         };
@@ -11363,6 +11959,32 @@ fn cached_mutable_sender_snapshot(
     } else {
         AuthenticatedMutableSenderSnapshot::new(class, claims)
     }
+}
+
+#[cfg(test)]
+fn cached_mutable_sender_snapshot(
+    store: &Store,
+    policy: &ControlPolicySnapshot,
+    verifier: &mut ReferenceEnvelopeSealer,
+    class: MutableClass,
+) -> Result<AuthenticatedMutableSenderSnapshot, NodeError> {
+    cached_mutable_sender_snapshot_with_blob_mode(
+        store,
+        policy,
+        verifier,
+        class,
+        BlobContactMode::DurableOnly,
+    )
+}
+
+fn cached_mutable_sender_snapshot_for_contact(
+    store: &Store,
+    policy: &ControlPolicySnapshot,
+    verifier: &mut ReferenceEnvelopeSealer,
+    class: MutableClass,
+    blob_contact_mode: BlobContactMode,
+) -> Result<AuthenticatedMutableSenderSnapshot, NodeError> {
+    cached_mutable_sender_snapshot_with_blob_mode(store, policy, verifier, class, blob_contact_mode)
 }
 
 fn mutable_inventory(
@@ -11447,6 +12069,7 @@ fn mutable_inventory(
     Ok(InventorySnapshot::new(authorized))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn load_verified_mutable_for_peer(
     store: &Store,
     verifier: &mut ReferenceEnvelopeSealer,
@@ -11455,6 +12078,7 @@ fn load_verified_mutable_for_peer(
     peer: NodeId,
     commitments: &[[u8; 32]],
     interest: MutableReceiveInterest<'_>,
+    blob_contact_mode: BlobContactMode,
 ) -> Result<Vec<u8>, NodeError> {
     if let MutableTransferId::Blob(transfer_id) = id {
         let claim = snapshot
@@ -11517,18 +12141,27 @@ fn load_verified_mutable_for_peer(
         let _lifecycle = cache
             .lock_blob_lifecycle()
             .map_err(|error| fatal_blob_coherence("outbound Blob lifecycle lock", error))?;
-        let retained = store
-            .blob_source_projection(transfer_id)
-            .map_err(NodeError::from)
-            .map_err(|error| fatal_blob_coherence("outbound Blob durable projection", error))?
-            .ok_or_else(|| {
-                NodeError::FatalBlobCoherence(
-                    "outbound authenticated Blob lost its durable projection".into(),
-                )
-            })?;
+        let retained =
+            match blob_source_projection_for_contact(store, transfer_id, blob_contact_mode) {
+                Ok(Some(retained)) => retained,
+                Ok(None) => {
+                    return Err(NodeError::FatalBlobCoherence(
+                        "outbound authenticated Blob lost its retained projection".into(),
+                    ));
+                }
+                Err(error) if blob_contact_policy_transition_error(&error) => {
+                    return Err(NodeError::CustodySendSkipped);
+                }
+                Err(error) => {
+                    return Err(fatal_blob_coherence(
+                        "outbound Blob retained projection",
+                        error.into(),
+                    ));
+                }
+            };
         if retained.retention != claim.retention || !claim.matches_projection(&retained.source) {
             return Err(NodeError::FatalBlobCoherence(
-                "outbound Blob durable projection differs from its contact claim".into(),
+                "outbound Blob retained projection differs from its contact claim".into(),
             ));
         }
         if !cache
@@ -11540,16 +12173,31 @@ fn load_verified_mutable_for_peer(
             ));
         }
         #[cfg(test)]
+        observe_test_blob_lifetime_fault(
+            store,
+            &cache,
+            TestBlobContactFault::OutboundLoadLifetimeExpiry,
+            TestBlobContactFault::OutboundLoadLifetimeDiscontinuity,
+        )?;
+        #[cfg(test)]
         cache.record_blob_source_row_load();
-        let stored = store
-            .get_blob(transfer_id)
-            .map_err(NodeError::from)
-            .map_err(|error| fatal_blob_coherence("outbound Blob source load", error))?
-            .ok_or_else(|| {
-                NodeError::FatalBlobCoherence(
+        let stored = match store.get_blob(transfer_id) {
+            Ok(Some(stored)) => stored,
+            Ok(None) => {
+                return Err(NodeError::FatalBlobCoherence(
                     "outbound authenticated Blob lost its exact source row".into(),
-                )
-            })?;
+                ));
+            }
+            Err(error) if blob_contact_policy_transition_error(&error) => {
+                return Err(NodeError::CustodySendSkipped);
+            }
+            Err(error) => {
+                return Err(fatal_blob_coherence(
+                    "outbound Blob source load",
+                    error.into(),
+                ));
+            }
+        };
         #[cfg(test)]
         if cache.fire_test_blob_contact_fault(TestBlobContactFault::SenderSealedMismatch) {
             return Err(NodeError::FatalBlobCoherence(
@@ -11710,6 +12358,205 @@ fn load_verified_mutable_for_peer(
     Ok(sealed)
 }
 
+struct LoadedContactMutableSource {
+    bytes: Vec<u8>,
+    finite_blob: Option<ContentVerifiedBlobEnvelope>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_verified_mutable_for_contact_peer(
+    store: &Store,
+    verifier: &mut ReferenceEnvelopeSealer,
+    snapshot: &AuthenticatedMutableSenderSnapshot,
+    id: MutableTransferId,
+    peer: NodeId,
+    commitments: &[[u8; 32]],
+    interest: MutableReceiveInterest<'_>,
+    blob_contact_mode: BlobContactMode,
+) -> Result<LoadedContactMutableSource, NodeError> {
+    let bytes = load_verified_mutable_for_peer(
+        store,
+        verifier,
+        snapshot,
+        id,
+        peer,
+        commitments,
+        interest,
+        blob_contact_mode,
+    )?;
+    let finite_blob = if let MutableTransferId::Blob(_) = id
+        && blob_contact_mode.finite_transfer_enabled()
+    {
+        let route = verifier.verify_blob(&bytes)?;
+        let BlobContentVerification::ContentVerified { blob, .. } =
+            verifier.verify_blob_content(route, &bytes)?
+        else {
+            return Err(NodeError::Protocol(
+                "outbound Blob custody source lost its exact content grant".into(),
+            ));
+        };
+        blob.ttl_ms().map(|_| blob)
+    } else {
+        None
+    };
+    Ok(LoadedContactMutableSource { bytes, finite_blob })
+}
+
+const fn blob_custody_direction(direction: EventDirection) -> BlobCustodyDirectionV1 {
+    match direction {
+        EventDirection::ToSessionInitiator => BlobCustodyDirectionV1::ToSessionInitiator,
+        EventDirection::ToSessionResponder => BlobCustodyDirectionV1::ToSessionResponder,
+    }
+}
+
+fn blob_custody_exchange_id(
+    session: [u8; 32],
+    direction: EventDirection,
+    transfer: BlobTransferId,
+) -> u64 {
+    let mut digest = Sha256::new();
+    digest.update(b"ASTER/v8-blob-source-exchange/v1\0");
+    digest.update(session);
+    digest.update([match direction {
+        EventDirection::ToSessionInitiator => 1,
+        EventDirection::ToSessionResponder => 2,
+    }]);
+    digest.update(transfer.as_bytes());
+    u64::from_be_bytes(digest.finalize()[..8].try_into().expect("SHA-256 prefix"))
+}
+
+struct PreparedOutboundBlobClaim {
+    claim: BlobCustodyClaimV1,
+    digest: [u8; 32],
+    blob: ContentVerifiedBlobEnvelope,
+    finalization: PreparedBlobCustodySend,
+}
+
+fn authorize_outbound_blob_claim(
+    store: &Store,
+    guard: &EventLaneGuard,
+    mission: &MissionSession,
+    snapshot: &AuthenticatedMutableSenderSnapshot,
+    id: MutableTransferId,
+    direction: EventDirection,
+    loaded: &LoadedContactMutableSource,
+) -> Result<Option<PreparedOutboundBlobClaim>, NodeError> {
+    let Some(blob) = loaded.finite_blob.as_ref() else {
+        return Ok(None);
+    };
+    let MutableTransferId::Blob(transfer) = id else {
+        return Err(NodeError::Protocol(
+            "finite Blob custody authority crossed mutable classes".into(),
+        ));
+    };
+    let route = snapshot.blob_claim(transfer).ok_or_else(|| {
+        NodeError::Protocol("finite Blob source lacks its authenticated snapshot claim".into())
+    })?;
+    let sample = contact_custody_sample()?.ok_or_else(|| {
+        NodeError::Protocol("finite Blob send lacks a local custody sample".into())
+    })?;
+    let exact_len = u64::try_from(loaded.bytes.len())
+        .map_err(|_| NodeError::Protocol("finite Blob source length exceeds u64".into()))?;
+    let finalization_charge_ms = custody_finalization_charge_ms(exact_len)?;
+    let context = mission.mint_blob_custody_send_context(
+        blob_custody_direction(direction),
+        blob_custody_exchange_id(mission.session_id(), direction, transfer),
+        finalization_charge_ms,
+    )?;
+    let Some(send) = store.authorize_finite_blob_send_with_policy(
+        guard.policy(),
+        &route.projection(),
+        route.retention,
+        blob,
+        &loaded.bytes,
+        context,
+        sample,
+    )?
+    else {
+        return Err(NodeError::CustodySendSkipped);
+    };
+    let (claim, finalization) = send.into_claim(blob, &loaded.bytes).map_err(|error| {
+        NodeError::Protocol(format!("invalid outbound Blob custody claim: {error}"))
+    })?;
+    // This claim was just minted by the consumed Store send authority. The
+    // receive path takes its digest only from `VerifiedBlobCustodyClaimV1`;
+    // raw decoded peer syntax never reaches this outbound construction path.
+    let digest = claim.digest();
+    Ok(Some(PreparedOutboundBlobClaim {
+        claim,
+        digest,
+        blob: blob.clone(),
+        finalization,
+    }))
+}
+
+fn finalize_outbound_blob_claim(
+    store: &Store,
+    guard: &EventLaneGuard,
+    frame: &Frame,
+    prepared: Option<PreparedOutboundBlobClaim>,
+) -> Result<(), NodeError> {
+    let Some(prepared) = prepared else {
+        require_contact_policy_current()?;
+        return Ok(());
+    };
+    let (bytes, claim) = match frame {
+        Frame::MutableOffer { bytes, claim, .. } | Frame::MutableObject { bytes, claim, .. } => {
+            (bytes, claim.as_ref())
+        }
+        _ => {
+            return Err(NodeError::Protocol(
+                "finite Blob finalization crossed source frame kinds".into(),
+            ));
+        }
+    };
+    if claim != Some(&prepared.claim) {
+        return Err(NodeError::Protocol(
+            "finite Blob finalization claim differs from sealed frame".into(),
+        ));
+    }
+    #[cfg(test)]
+    apply_test_blob_finalization_delay()?;
+    guard.check(store)?;
+    let sample = contact_custody_sample()?.ok_or_else(|| {
+        NodeError::Protocol("final finite Blob send lacks a carrier-adjacent clock sample".into())
+    })?;
+    if !store.finalize_finite_blob_send_with_policy(
+        guard.policy(),
+        prepared.finalization,
+        &prepared.blob,
+        bytes,
+        sample,
+    )? {
+        return Err(NodeError::CustodySendSkipped);
+    }
+    // This remains the last synchronous operation before the carrier's
+    // `write_all` path, matching Event custody finalization.
+    require_contact_policy_current()?;
+    Ok(())
+}
+
+#[cfg(test)]
+fn apply_test_blob_finalization_delay() -> Result<(), NodeError> {
+    let delay_ms = TEST_BLOB_FINALIZATION_DELAY_MS
+        .try_with(|delay| delay.replace(None))
+        .ok()
+        .flatten();
+    let Some(delay_ms) = delay_ms else {
+        return Ok(());
+    };
+    CONTACT_EMISSION_GUARD
+        .try_with(|guard| {
+            let current = guard.custody_clock.sample()?;
+            let delayed = current.tick_ms.checked_add(delay_ms).ok_or_else(|| {
+                NodeError::Protocol("Blob finalization test delay overflowed".into())
+            })?;
+            guard.custody_clock.set_injected_tick(delayed)
+        })
+        .map_err(|_| NodeError::Protocol("Blob finalization test hook lacks a clock".into()))??;
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 struct MutablePeerAdmission<'a> {
     peer: NodeId,
@@ -11761,6 +12608,116 @@ fn fire_test_blob_contact_fault(fault: TestBlobContactFault) -> bool {
     CONTACT_EVENT_ROUTE_CACHE
         .try_with(|cache| cache.fire_test_blob_contact_fault(fault))
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+fn test_blob_lifetime_fault_sample(
+    cache: &AuthenticatedEventRouteCache,
+    expiry: TestBlobContactFault,
+    discontinuity: TestBlobContactFault,
+) -> Result<Option<(TestBlobContactFault, CustodySample)>, NodeError> {
+    let fault = if cache.test_blob_contact_fault_pending(expiry) {
+        expiry
+    } else if cache.test_blob_contact_fault_pending(discontinuity) {
+        discontinuity
+    } else {
+        return Ok(None);
+    };
+    let mut sample = contact_custody_sample()?.ok_or_else(|| {
+        NodeError::Protocol("finite Blob lifetime fault lacks its contact custody sample".into())
+    })?;
+    if fault == expiry {
+        sample.tick_ms = sample.tick_ms.checked_add(1_000_000).ok_or_else(|| {
+            NodeError::Protocol("finite Blob lifetime fault sample overflowed".into())
+        })?;
+    } else {
+        sample.clock_id[0] ^= 0x80;
+    }
+    Ok(Some((fault, sample)))
+}
+
+#[cfg(test)]
+fn observe_test_blob_lifetime_fault(
+    store: &Store,
+    cache: &AuthenticatedEventRouteCache,
+    expiry: TestBlobContactFault,
+    discontinuity: TestBlobContactFault,
+) -> Result<bool, NodeError> {
+    let Some((fault, sample)) = test_blob_lifetime_fault_sample(cache, expiry, discontinuity)?
+    else {
+        return Ok(false);
+    };
+    store.test_observe_blob_custody_sample(sample)?;
+    if !cache.fire_test_blob_contact_fault(fault) {
+        return Err(NodeError::FatalBlobCoherence(
+            "finite Blob lifetime fault was consumed before its boundary".into(),
+        ));
+    }
+    cache.record_test_blob_logical_digest_after_fault(store.test_blob_logical_digest());
+    Ok(true)
+}
+
+#[cfg(test)]
+fn observe_and_retire_test_blob_lifetime_fault(
+    store: &Store,
+    cache: &AuthenticatedEventRouteCache,
+    expiry: TestBlobContactFault,
+    discontinuity: TestBlobContactFault,
+) -> Result<bool, NodeError> {
+    let retire = cache.test_blob_contact_fault_pending(expiry);
+    if !observe_test_blob_lifetime_fault(store, cache, expiry, discontinuity)? {
+        return Ok(false);
+    }
+    if !retire {
+        // Clock-domain discontinuity is indeterminate and therefore invisible,
+        // but it is not terminal retirement authority.
+        return Ok(true);
+    }
+    for _ in 0..8 {
+        if store.blob_stats()?.publications == 0 {
+            cache.record_test_blob_logical_digest_after_fault(store.test_blob_logical_digest());
+            return Ok(true);
+        }
+        store.run_blob_maintenance_turn(blob_maintenance_runtime_budget())?;
+    }
+    Err(NodeError::FatalBlobCoherence(
+        "finite Blob completed-source fault did not retire its publication".into(),
+    ))
+}
+
+#[cfg(test)]
+fn schedule_test_blob_completion_lifetime_fault(
+    store: &Store,
+    cache: &AuthenticatedEventRouteCache,
+) -> Result<Option<TestBlobContactFault>, NodeError> {
+    let Some((fault, sample)) = test_blob_lifetime_fault_sample(
+        cache,
+        TestBlobContactFault::CompletionLifetimeExpiry,
+        TestBlobContactFault::CompletionLifetimeDiscontinuity,
+    )?
+    else {
+        return Ok(None);
+    };
+    store.test_schedule_blob_carrier_post_install_custody_sample(sample);
+    Ok(Some(fault))
+}
+
+#[cfg(test)]
+fn finish_test_blob_completion_lifetime_fault(
+    store: &Store,
+    cache: &AuthenticatedEventRouteCache,
+    scheduled: Option<TestBlobContactFault>,
+) -> Result<(), NodeError> {
+    let Some(fault) = scheduled else {
+        return Ok(());
+    };
+    if !cache.fire_test_blob_contact_fault(fault) {
+        return Err(NodeError::FatalBlobCoherence(
+            "finite Blob completion lifetime fault was consumed before its boundary".into(),
+        ));
+    }
+    cache.record_test_blob_logical_digest_after_fault(store.test_blob_logical_digest());
+    Ok(())
 }
 
 pub(crate) fn cache_authenticated_state_route_claim(
@@ -11843,6 +12800,7 @@ pub(crate) fn cache_authenticated_blob_route_claim(
         sealed,
     )?;
     let claim = AuthenticatedBlobRouteClaim::from_verified(
+        store,
         blob,
         sealed,
         &retained.source,
@@ -11906,7 +12864,7 @@ fn cache_committed_record_route_claim(
     cache.insert_mutable(verifier, claim)
 }
 
-fn cache_staged_blob_after_durable_transition(
+fn cache_staged_blob_after_transition(
     store: &Store,
     verifier: &mut ReferenceEnvelopeSealer,
     cache: &AuthenticatedEventRouteCache,
@@ -11921,31 +12879,147 @@ fn cache_staged_blob_after_durable_transition(
             "injected post-stage authenticated Blob cache failure".into(),
         ));
     }
-    (|| -> Result<(), NodeError> {
-        let projection = store.blob_source_projection(expected)?.ok_or_else(|| {
+    #[cfg(test)]
+    observe_test_blob_lifetime_fault(
+        store,
+        cache,
+        TestBlobContactFault::PostStageLifetimeExpiry,
+        TestBlobContactFault::PostStageLifetimeDiscontinuity,
+    )?;
+    let transition = (|| -> Result<(), NodeError> {
+        let blob_contact_mode = if blob.ttl_ms().is_some() {
+            BlobContactMode::CustodyV1
+        } else {
+            BlobContactMode::DurableOnly
+        };
+        let projection = match blob_contact_mode {
+            BlobContactMode::CustodyV1 => store.custody_v1_blob_source_projection(expected)?,
+            BlobContactMode::DurableOnly => store.blob_source_projection(expected)?,
+        }
+        .ok_or_else(|| {
             NodeError::Protocol("staged Blob admission lost its state-neutral projection".into())
         })?;
+        #[cfg(test)]
+        if matches!(projection.retention, BlobSourceRetention::Completed { .. })
+            && blob.ttl_ms().is_some()
+        {
+            observe_and_retire_test_blob_lifetime_fault(
+                store,
+                cache,
+                TestBlobContactFault::CompletedPostStageCapabilityLifetimeExpiry,
+                TestBlobContactFault::CompletedPostStageCapabilityLifetimeDiscontinuity,
+            )?;
+        }
         let depot_completion = match projection.retention {
             BlobSourceRetention::Pending => None,
-            BlobSourceRetention::Completed { .. } => Some(store.completed_retained_blob(
+            BlobSourceRetention::Completed { .. } => Some(blob_completion_capability_for_contact(
+                store,
                 &projection.source,
                 projection.retention,
                 blob,
                 manifest_bytes,
                 sealed,
+                blob_contact_mode,
             )?),
         };
-        let claim = AuthenticatedBlobRouteClaim::from_verified(
+        #[cfg(test)]
+        observe_test_blob_lifetime_fault(
+            store,
+            cache,
+            TestBlobContactFault::FinalComparisonLifetimeExpiry,
+            TestBlobContactFault::FinalComparisonLifetimeDiscontinuity,
+        )?;
+        #[cfg(test)]
+        if matches!(projection.retention, BlobSourceRetention::Completed { .. })
+            && blob.ttl_ms().is_some()
+        {
+            observe_test_blob_lifetime_fault(
+                store,
+                cache,
+                TestBlobContactFault::CompletedPostStageFinalComparisonLifetimeExpiry,
+                TestBlobContactFault::CompletedPostStageFinalComparisonLifetimeDiscontinuity,
+            )?;
+        }
+        let claim = AuthenticatedBlobRouteClaim::from_verified_for_contact(
+            store,
             blob,
             sealed,
             &projection.source,
             projection.retention,
             depot_completion,
+            blob_contact_mode,
         )?;
         cache.record_mutable_source_verification();
         cache.insert_blob(verifier, claim)
-    })()
-    .map_err(|error| fatal_blob_coherence("post-stage authenticated cache transition", error))
+    })();
+    match transition {
+        Ok(()) => Ok(()),
+        Err(error) if node_blob_contact_policy_transition_error(&error) => Err(error),
+        Err(error) => Err(fatal_blob_coherence(
+            "post-stage authenticated cache transition",
+            error,
+        )),
+    }
+}
+
+struct ReceivedBlobCustody {
+    claim: BlobCustodyClaimV1,
+    authority: AuthenticatedBlobCustodyContactV1,
+    expected_exchange_id: u64,
+}
+
+#[cfg(test)]
+fn take_test_blob_receive_replay() -> bool {
+    TEST_BLOB_RECEIVE_FAULT
+        .try_with(|fault| {
+            if fault.get() == Some(TestBlobReceiveFault::Replay) {
+                fault.set(None);
+                true
+            } else {
+                false
+            }
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+fn apply_test_blob_receive_fault(
+    custody: Option<ReceivedBlobCustody>,
+) -> Result<Option<ReceivedBlobCustody>, NodeError> {
+    let fault = TEST_BLOB_RECEIVE_FAULT
+        .try_with(|fault| fault.replace(None))
+        .ok()
+        .flatten();
+    let Some(fault) = fault else {
+        return Ok(custody);
+    };
+    if fault == TestBlobReceiveFault::Missing {
+        return Ok(None);
+    }
+    if fault == TestBlobReceiveFault::Replay {
+        return Err(NodeError::Protocol(
+            "Blob replay test hook missed the protected-open boundary".into(),
+        ));
+    }
+    let mut custody = custody.ok_or_else(|| {
+        NodeError::Protocol("Blob claim fault test hook lacks opened custody".into())
+    })?;
+    let mut encoded = custody.claim.encode();
+    match fault {
+        TestBlobReceiveFault::Missing | TestBlobReceiveFault::Replay => unreachable!(),
+        TestBlobReceiveFault::Tampered => encoded[207] ^= 1,
+        TestBlobReceiveFault::CrossSession => encoded[14] ^= 1,
+        TestBlobReceiveFault::CrossDirection => {
+            encoded[54] = if encoded[54] == 1 { 2 } else { 1 };
+        }
+        TestBlobReceiveFault::CrossExchange => encoded[53] ^= 1,
+        TestBlobReceiveFault::CrossTransfer => encoded[55] ^= 1,
+        TestBlobReceiveFault::CrossLength => encoded[94] ^= 1,
+        TestBlobReceiveFault::ImmutableMismatch => encoded[95] ^= 1,
+    }
+    custody.claim = BlobCustodyClaimV1::decode(&encoded)
+        .map_err(|error| NodeError::Protocol(format!("invalid injected Blob claim: {error}")))?;
+    Ok(Some(custody))
 }
 
 fn accept_received_mutable(
@@ -11955,15 +13029,15 @@ fn accept_received_mutable(
     admission: MutablePeerAdmission<'_>,
     id: MutableTransferId,
     sealed: &[u8],
-    blob_claim: Option<&BlobCustodyClaimV1>,
-) -> Result<MutableApplyDisposition, NodeError> {
+    blob_custody: Option<ReceivedBlobCustody>,
+) -> Result<(MutableApplyDisposition, Option<[u8; 32]>), NodeError> {
     guard.check(store)?;
     if sealed.len() > MAX_OBJECT_BYTES {
         return Err(NodeError::Protocol(
             "received mutable source object exceeds the selected transfer bound".into(),
         ));
     }
-    if id.class() != MutableClass::Blob && blob_claim.is_some() {
+    if id.class() != MutableClass::Blob && blob_custody.is_some() {
         return Err(NodeError::Protocol(
             "Blob custody claim crossed mutable classes".into(),
         ));
@@ -12018,7 +13092,7 @@ fn accept_received_mutable(
                             *committed,
                         )?;
                     }
-                    mutable_apply_disposition(outcome)
+                    mutable_apply_disposition(outcome).map(|disposition| (disposition, None))
                 }
                 StateContentVerification::RouteOnly(_) => Err(NodeError::Protocol(
                     "State receive interest lacks a content grant".into(),
@@ -12074,7 +13148,7 @@ fn accept_received_mutable(
                             *committed,
                         )?;
                     }
-                    mutable_apply_disposition(outcome)
+                    mutable_apply_disposition(outcome).map(|disposition| (disposition, None))
                 }
                 RecordContentVerification::RouteOnly(_) => Err(NodeError::Protocol(
                     "Record receive interest lacks a content grant".into(),
@@ -12121,12 +13195,7 @@ fn accept_received_mutable(
                     "Blob receive interest lacks the exact current content grant".into(),
                 ));
             };
-            require_blob_claim_presence(blob.ttl_ms(), blob_claim.is_some())?;
-            if blob.ttl_ms().is_some() {
-                return Err(NodeError::Protocol(
-                    "finite Blob custody admission is not active".into(),
-                ));
-            }
+            require_blob_claim_presence(blob.ttl_ms(), blob_custody.is_some())?;
             verifier.verify_current_blob_lineage(&blob)?;
             let plan = blob.transfer_plan(&manifest_bytes).map_err(|error| {
                 NodeError::Protocol(format!("received Blob transfer plan is invalid: {error}"))
@@ -12148,6 +13217,38 @@ fn accept_received_mutable(
                     BlobTransferId::new(blob.envelope_id()),
                 ));
             }
+            let finite_admission = match blob_custody {
+                Some(custody) => {
+                    let verified = custody
+                        .claim
+                        .verify_authenticated_source(
+                            custody.authority,
+                            custody.expected_exchange_id,
+                            BlobCustodyTransferId::from_exact_hash(blob.envelope_id()),
+                            &blob,
+                            sealed,
+                            custody.claim.prior_cumulative_age_ms(),
+                            custody.claim.sender_sample(),
+                            custody.claim.hop_delta_ms(),
+                        )
+                        .map_err(|error| {
+                            NodeError::Protocol(format!(
+                                "invalid authenticated Blob custody claim: {error}"
+                            ))
+                        })?;
+                    let verified_digest = verified.digest();
+                    let receiver_sample = contact_custody_sample()?.ok_or_else(|| {
+                        NodeError::Protocol(
+                            "finite Blob receive lacks a local custody sample".into(),
+                        )
+                    })?;
+                    Some((verified, receiver_sample, verified_digest))
+                }
+                None => None,
+            };
+            let verified_digest = finite_admission
+                .as_ref()
+                .map(|(_, _, verified_digest)| *verified_digest);
             #[cfg(test)]
             let outcome = if cache
                 .fire_test_blob_contact_fault(TestBlobContactFault::StageCoherence)
@@ -12164,14 +13265,33 @@ fn accept_received_mutable(
                         limit: 1,
                     },
                 ))
+            } else if let Some((verified, receiver_sample, _)) = finite_admission {
+                store.stage_verified_finite_blob_source_with_policy(
+                    guard.policy(),
+                    &blob,
+                    sealed,
+                    &plan,
+                    verified,
+                    receiver_sample,
+                )
             } else {
                 store.stage_verified_blob_source_with_policy(guard.policy(), &blob, sealed, &plan)
             };
             #[cfg(not(test))]
-            let outcome =
-                store.stage_verified_blob_source_with_policy(guard.policy(), &blob, sealed, &plan);
+            let outcome = if let Some((verified, receiver_sample, _)) = finite_admission {
+                store.stage_verified_finite_blob_source_with_policy(
+                    guard.policy(),
+                    &blob,
+                    sealed,
+                    &plan,
+                    verified,
+                    receiver_sample,
+                )
+            } else {
+                store.stage_verified_blob_source_with_policy(guard.policy(), &blob, sealed, &plan)
+            };
             let outcome = match outcome {
-                Err(error) if blob_apply_capacity_error(&error) => {
+                Err(error) if blob_apply_capacity_error(&error) && blob.ttl_ms().is_none() => {
                     let original = error;
                     let recovered = recover_blob_capacity_after_cleanup(
                         store,
@@ -12245,7 +13365,7 @@ fn accept_received_mutable(
                 }
             };
             if disposition != MutableApplyDisposition::DeferredCapacity {
-                cache_staged_blob_after_durable_transition(
+                cache_staged_blob_after_transition(
                     store,
                     verifier,
                     &cache,
@@ -12273,9 +13393,28 @@ fn accept_received_mutable(
                     store, verifier, &cache, &claim, &lifecycle,
                 )?;
             }
-            Ok(disposition)
+            Ok((disposition, verified_digest))
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn accept_received_mutable_for_contact(
+    store: &Store,
+    guard: &EventLaneGuard,
+    verifier: &mut ReferenceEnvelopeSealer,
+    admission: MutablePeerAdmission<'_>,
+    id: MutableTransferId,
+    bytes: &[u8],
+    custody: Option<ReceivedBlobCustody>,
+    blob_contact_mode: BlobContactMode,
+) -> Result<(MutableApplyDisposition, Option<[u8; 32]>), NodeError> {
+    if custody.is_some() && !blob_contact_mode.finite_transfer_enabled() {
+        return Err(NodeError::Protocol(
+            "Blob custody authority arrived outside negotiated profile 3".into(),
+        ));
+    }
+    accept_received_mutable(store, guard, verifier, admission, id, bytes, custody)
 }
 
 fn require_blob_claim_presence(
@@ -20355,6 +21494,7 @@ struct DirectedMutableLane<'a> {
     semantic_version: u16,
     class: MutableClass,
     direction: EventDirection,
+    blob_contact_mode: BlobContactMode,
 }
 
 #[derive(Clone, Copy)]
@@ -20396,10 +21536,56 @@ impl MutableReceiveInterest<'_> {
 }
 
 #[derive(Clone, Copy)]
+struct MutableClassesContact<'a> {
+    guard: &'a EventLaneGuard,
+    interests: &'a MutableSourceInterests,
+    blob_contact_mode: BlobContactMode,
+}
+
+#[derive(Clone, Copy)]
 struct MutableClassContact<'a> {
     guard: &'a EventLaneGuard,
     interests: &'a MutableSourceInterests,
     class: MutableClass,
+    blob_contact_mode: BlobContactMode,
+}
+
+/// Authenticated Blob contact mode derived only from the completed semantic
+/// and transfer-profile negotiation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BlobContactMode {
+    DurableOnly,
+    CustodyV1,
+}
+
+impl BlobContactMode {
+    const fn finite_transfer_enabled(self) -> bool {
+        matches!(self, Self::CustodyV1)
+    }
+
+    fn from_authenticated_profiles(
+        semantic_version: u16,
+        profiles: Option<&V7TransferProfiles>,
+    ) -> Result<Self, NodeError> {
+        if semantic_version < SEMANTIC_PROTOCOL_V7 {
+            if profiles.is_some() {
+                return Err(NodeError::Protocol(
+                    "legacy semantic contact unexpectedly negotiated transfer profiles".into(),
+                ));
+            }
+            return Ok(Self::DurableOnly);
+        }
+        let profile = profiles
+            .and_then(|profiles| profiles.negotiated.profile(LaneId::Blob))
+            .ok_or_else(|| NodeError::Protocol("Blob lane has no authenticated profile".into()))?;
+        match (semantic_version, profile) {
+            (_, TransferProfileId::LegacyV6) => Ok(Self::DurableOnly),
+            (SEMANTIC_PROTOCOL_V8, TransferProfileId::BlobCustodyV1) => Ok(Self::CustodyV1),
+            _ => Err(NodeError::Protocol(
+                "Blob lane selected an incompatible semantic/profile pair".into(),
+            )),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -20561,6 +21747,52 @@ fn advance_mutable_transfer_cursor(
             *id.as_bytes(),
         )
         .map_err(NodeError::from)
+}
+
+fn settle_mutable_transfer_cursor(
+    store: &Store,
+    peer: NodeId,
+    class: MutableClass,
+    direction: EventDirection,
+    expected: &mut Option<[u8; 32]>,
+    id: MutableTransferId,
+) -> Result<(), NodeError> {
+    #[cfg(test)]
+    TEST_BLOB_SETTLEMENT_HARNESS
+        .try_with(|harness| {
+            let mut state = harness.0.lock().expect("settlement harness lock");
+            if let Some((after_successes, competing)) = state.cas_mismatch_after_successes
+                && state.successful_cas == after_successes
+            {
+                if !advance_mutable_transfer_cursor(
+                    store,
+                    peer,
+                    class,
+                    direction,
+                    *expected,
+                    MutableTransferId::Blob(BlobTransferId::new(competing)),
+                )? {
+                    return Err(NodeError::Protocol(
+                        "test competing mutable cursor advance failed".into(),
+                    ));
+                }
+                state.cas_mismatch_after_successes = None;
+            }
+            Ok(())
+        })
+        .unwrap_or(Ok(()))?;
+    if !advance_mutable_transfer_cursor(store, peer, class, direction, *expected, id)? {
+        return Err(NodeError::Protocol(
+            "mutable transfer cursor changed before exact settlement".into(),
+        ));
+    }
+    *expected = Some(*id.as_bytes());
+    #[cfg(test)]
+    let _ = TEST_BLOB_SETTLEMENT_HARNESS.try_with(|harness| {
+        let mut state = harness.0.lock().expect("settlement harness lock");
+        state.successful_cas += 1;
+    });
+    Ok(())
 }
 
 const fn mutable_lane_fetch_result_exchanges(direction: EventDirection) -> usize {
@@ -21011,6 +22243,34 @@ fn acknowledge_mutable_fetch_result(
     }
 }
 
+fn require_mutable_apply_result(
+    frame: Frame,
+    class: MutableClass,
+    direction: EventDirection,
+    pending_id: MutableTransferId,
+    verified_digest: Option<[u8; 32]>,
+) -> Result<MutableApplyDisposition, NodeError> {
+    match frame {
+        Frame::MutableApplyResult {
+            direction: response_direction,
+            id,
+            disposition,
+            custody_digest,
+        } if response_direction == direction && id.class() == class && id == pending_id => {
+            if class == MutableClass::Blob {
+                require_blob_custody_digest(verified_digest, custody_digest)?;
+            }
+            Ok(disposition)
+        }
+        Frame::MutableApplyResult { .. } => Err(NodeError::Protocol(
+            "mutable apply result crossed classes, directions, or identifiers".into(),
+        )),
+        _ => Err(NodeError::Protocol(
+            "mutable offer received another acknowledgement".into(),
+        )),
+    }
+}
+
 fn require_mutable_fetch_result_ack(
     frame: Frame,
     direction: EventDirection,
@@ -21043,6 +22303,38 @@ fn require_mutable_fetch_result_ack(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn settle_mutable_apply_result(
+    store: &Store,
+    peer: NodeId,
+    class: MutableClass,
+    direction: EventDirection,
+    expected: &mut Option<[u8; 32]>,
+    id: MutableTransferId,
+    frame: Frame,
+    verified_digest: Option<[u8; 32]>,
+) -> Result<MutableApplyDisposition, NodeError> {
+    let disposition = require_mutable_apply_result(frame, class, direction, id, verified_digest)?;
+    settle_mutable_transfer_cursor(store, peer, class, direction, expected, id)?;
+    Ok(disposition)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn settle_mutable_fetch_result_ack(
+    store: &Store,
+    peer: NodeId,
+    class: MutableClass,
+    direction: EventDirection,
+    expected: &mut Option<[u8; 32]>,
+    id: MutableTransferId,
+    disposition: MutableApplyDisposition,
+    frame: Frame,
+    verified_digest: Option<[u8; 32]>,
+) -> Result<(), NodeError> {
+    require_mutable_fetch_result_ack(frame, direction, id, disposition, verified_digest)?;
+    settle_mutable_transfer_cursor(store, peer, class, direction, expected, id)
+}
+
 #[derive(Debug, Default)]
 struct MutableFetchSettlement {
     pending: Option<(MutableTransferId, Option<[u8; 32]>)>,
@@ -21050,13 +22342,17 @@ struct MutableFetchSettlement {
 }
 
 impl MutableFetchSettlement {
-    fn begin(&mut self, id: MutableTransferId) -> Result<(), NodeError> {
+    fn begin(
+        &mut self,
+        id: MutableTransferId,
+        verified_digest: Option<[u8; 32]>,
+    ) -> Result<(), NodeError> {
         if self.pending.is_some() {
             return Err(NodeError::Protocol(
                 "a second mutable fetch preceded settlement of the pending fetch".into(),
             ));
         }
-        self.pending = Some((id, None));
+        self.pending = Some((id, verified_digest));
         Ok(())
     }
 
@@ -21290,6 +22586,7 @@ async fn sync_mutable_reconciliation_lane(
         semantic_version,
         class,
         direction,
+        blob_contact_mode: _,
     } = lane;
     guard.check(store)?;
     let inventory = match direction {
@@ -21477,6 +22774,10 @@ fn mutable_transfer_capacity(
     if global == 0 {
         return Ok(0);
     }
+    #[cfg(test)]
+    if let Some(capacity) = test_mutable_transfer_capacity_override() {
+        return Ok(global.min(capacity));
+    }
     let (future_exchanges, future_bytes) =
         mutable_future_reserve(semantic_version, class, direction)?;
     let fetch_result_exchanges = mutable_lane_fetch_result_exchanges(direction);
@@ -21522,10 +22823,170 @@ fn store_blob_object_id(object: BlobObjectId) -> Result<BlobCarrierObjectId, Nod
     BlobCarrierObjectId::new(*object.as_bytes()).map_err(|error| StoreError::Blob(error).into())
 }
 
+fn blob_source_projection_for_contact(
+    store: &Store,
+    source: BlobTransferId,
+    mode: BlobContactMode,
+) -> Result<Option<RetainedBlobSource>, StoreError> {
+    match mode {
+        BlobContactMode::DurableOnly => store.durable_contact_blob_source_projection(source),
+        BlobContactMode::CustodyV1 => store.custody_v1_blob_source_projection(source),
+    }
+}
+
+fn pending_blob_source_for_contact(
+    store: &Store,
+    source: BlobTransferId,
+    mode: BlobContactMode,
+) -> Result<Option<PendingBlobSource>, StoreError> {
+    match mode {
+        BlobContactMode::DurableOnly => store.durable_contact_pending_blob_source(source),
+        BlobContactMode::CustodyV1 => store.custody_v1_pending_blob_source(source),
+    }
+}
+
+fn retained_blob_source_matches_verified_for_contact(
+    store: &Store,
+    projection: &BlobSourceProjection,
+    retention: BlobSourceRetention,
+    blob: &ContentVerifiedBlobEnvelope,
+    sealed: &[u8],
+    mode: BlobContactMode,
+) -> Result<bool, StoreError> {
+    match mode {
+        BlobContactMode::DurableOnly => {
+            store.retained_blob_source_matches_verified(projection, retention, blob, sealed)
+        }
+        BlobContactMode::CustodyV1 => store
+            .custody_v1_retained_blob_source_matches_verified(projection, retention, blob, sealed),
+    }
+}
+
+fn next_pending_blob_source_for_contact(
+    store: &Store,
+    policy: &ControlPolicySnapshot,
+    after: Option<BlobTransferId>,
+    mode: BlobContactMode,
+) -> Result<Option<BlobSourceProjection>, StoreError> {
+    match mode {
+        BlobContactMode::DurableOnly => {
+            store.next_durable_pending_blob_source_with_policy(policy, after)
+        }
+        BlobContactMode::CustodyV1 => store.next_pending_blob_source_with_policy(policy, after),
+    }
+}
+
+fn pending_blob_carrier_work_for_contact(
+    store: &Store,
+    policy: &ControlPolicySnapshot,
+    source: BlobTransferId,
+    plan: &VerifiedBlobTransferPlan,
+    mode: BlobContactMode,
+) -> Result<Vec<BlobCarrierPrefixStatus>, StoreError> {
+    match mode {
+        BlobContactMode::DurableOnly => {
+            store.durable_pending_blob_carrier_work_with_policy(policy, source, plan)
+        }
+        BlobContactMode::CustodyV1 => {
+            store.pending_blob_carrier_work_with_policy(policy, source, plan)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_blob_carrier_prefix_for_contact(
+    store: &Store,
+    policy: &ControlPolicySnapshot,
+    source: BlobTransferId,
+    object: BlobCarrierObjectId,
+    total_len: u64,
+    offset: u64,
+    bytes: &[u8],
+    mode: BlobContactMode,
+) -> Result<BlobCarrierAppendOutcome, StoreError> {
+    match mode {
+        BlobContactMode::DurableOnly => store.append_durable_blob_carrier_prefix_with_policy(
+            policy, source, object, total_len, offset, bytes,
+        ),
+        BlobContactMode::CustodyV1 => store.append_blob_carrier_prefix_with_policy(
+            policy, source, object, total_len, offset, bytes,
+        ),
+    }
+}
+
+fn commit_complete_blob_carrier_for_contact(
+    store: &Store,
+    policy: &ControlPolicySnapshot,
+    source: BlobTransferId,
+    object: BlobCarrierObjectId,
+    plan: &VerifiedBlobTransferPlan,
+    mode: BlobContactMode,
+) -> Result<BlobCarrierCommitOutcome, StoreError> {
+    match mode {
+        BlobContactMode::DurableOnly => {
+            store.commit_complete_durable_blob_carrier_with_policy(policy, source, object, plan)
+        }
+        BlobContactMode::CustodyV1 => {
+            store.commit_complete_blob_carrier_with_policy(policy, source, object, plan)
+        }
+    }
+}
+
+fn completed_pending_blob_for_contact(
+    store: &Store,
+    policy: &ControlPolicySnapshot,
+    source: BlobTransferId,
+    blob: &ContentVerifiedBlobEnvelope,
+    manifest_bytes: &[u8],
+    plan: &VerifiedBlobTransferPlan,
+    mode: BlobContactMode,
+) -> Result<BlobDepotCompletion, StoreError> {
+    match mode {
+        BlobContactMode::DurableOnly => store.completed_durable_pending_blob_with_policy(
+            policy,
+            source,
+            blob,
+            manifest_bytes,
+            plan,
+        ),
+        BlobContactMode::CustodyV1 => {
+            store.completed_pending_blob_with_policy(policy, source, blob, manifest_bytes, plan)
+        }
+    }
+}
+
+fn apply_verified_blob_for_contact(
+    store: &Store,
+    policy: &ControlPolicySnapshot,
+    plan: &VerifiedBlobTransferPlan,
+    lineage: &aster_mesh::CurrentBlobLineage,
+    depot_completion: &BlobDepotCompletion,
+    content_completion: &VerifiedBlobContentCompletion,
+    mode: BlobContactMode,
+) -> Result<ApplyOutcome, StoreError> {
+    match mode {
+        BlobContactMode::DurableOnly => store.apply_verified_durable_blob_with_policy(
+            policy,
+            plan,
+            lineage,
+            depot_completion,
+            content_completion,
+        ),
+        BlobContactMode::CustodyV1 => store.apply_verified_blob_with_policy(
+            policy,
+            plan,
+            lineage,
+            depot_completion,
+            content_completion,
+        ),
+    }
+}
+
 fn load_pending_blob_plan(
     store: &Store,
     verifier: &mut ReferenceEnvelopeSealer,
     source: BlobTransferId,
+    blob_contact_mode: BlobContactMode,
 ) -> Result<
     Option<(
         ContentVerifiedBlobEnvelope,
@@ -21539,10 +23000,16 @@ fn load_pending_blob_plan(
     let _lifecycle = cache
         .lock_blob_lifecycle()
         .map_err(|error| fatal_blob_coherence("pending Blob plan lifecycle lock", error))?;
-    let retained = store
-        .blob_source_projection(source)
-        .map_err(NodeError::from)
-        .map_err(|error| fatal_blob_coherence("pending Blob plan durable projection", error))?;
+    let retained = match blob_source_projection_for_contact(store, source, blob_contact_mode) {
+        Ok(retained) => retained,
+        Err(error) if blob_contact_policy_transition_error(&error) => return Err(error.into()),
+        Err(error) => {
+            return Err(fatal_blob_coherence(
+                "pending Blob plan contact projection",
+                error.into(),
+            ));
+        }
+    };
     let claim = cache
         .get_blob(verifier, source)
         .map_err(|error| fatal_blob_coherence("pending Blob plan cache claim", error))?;
@@ -21571,15 +23038,21 @@ fn load_pending_blob_plan(
             "pending Blob plan conflicts with its authenticated cache claim".into(),
         ));
     }
-    let pending = store
-        .pending_blob_source(source)
-        .map_err(NodeError::from)
-        .map_err(|error| fatal_blob_coherence("pending Blob exact source load", error))?
-        .ok_or_else(|| {
-            NodeError::FatalBlobCoherence(
+    let pending = match pending_blob_source_for_contact(store, source, blob_contact_mode) {
+        Ok(Some(pending)) => pending,
+        Ok(None) => {
+            return Err(NodeError::FatalBlobCoherence(
                 "authenticated pending Blob lost its exact durable source row".into(),
-            )
-        })?;
+            ));
+        }
+        Err(error) if blob_contact_policy_transition_error(&error) => return Err(error.into()),
+        Err(error) => {
+            return Err(fatal_blob_coherence(
+                "pending Blob exact source load",
+                error.into(),
+            ));
+        }
+    };
     let route = verifier
         .verify_blob(&pending.sealed)
         .map_err(NodeError::from)
@@ -21601,13 +23074,24 @@ fn load_pending_blob_plan(
             "pending Blob source lost its exact content grant".into(),
         ));
     };
-    if !retained
-        .source
-        .matches_verified(&blob, &pending.sealed)
-        .map_err(NodeError::from)
-        .map_err(|error| fatal_blob_coherence("pending Blob durable source projection", error))?
-        || !claim.matches_verified(&blob, &pending.sealed)
-    {
+    let exact_source_matches = match retained_blob_source_matches_verified_for_contact(
+        store,
+        &retained.source,
+        retained.retention,
+        &blob,
+        &pending.sealed,
+        blob_contact_mode,
+    ) {
+        Ok(matches) => matches,
+        Err(error) if blob_contact_policy_transition_error(&error) => return Err(error.into()),
+        Err(error) => {
+            return Err(fatal_blob_coherence(
+                "pending Blob exact source projection",
+                error.into(),
+            ));
+        }
+    };
+    if !exact_source_matches || !claim.matches_verified(&blob, &pending.sealed) {
         return Err(NodeError::FatalBlobCoherence(
             "pending Blob source differs from its durable/cache authentication claims".into(),
         ));
@@ -21632,16 +23116,27 @@ fn pending_blob_claim_is_current(
     store: &Store,
     verifier: &mut ReferenceEnvelopeSealer,
     projection: &BlobSourceProjection,
+    blob_contact_mode: BlobContactMode,
 ) -> Result<bool, NodeError> {
     let cache = contact_mutable_route_cache(verifier)
         .map_err(|error| fatal_blob_coherence("pending Blob cache binding", error))?;
     let lifecycle = cache
         .lock_blob_lifecycle()
         .map_err(|error| fatal_blob_coherence("pending Blob lifecycle lock", error))?;
-    let retained = store
-        .blob_source_projection(projection.transfer_id)
-        .map_err(NodeError::from)
-        .map_err(|error| fatal_blob_coherence("pending Blob durable projection", error))?;
+    let retained = match blob_source_projection_for_contact(
+        store,
+        projection.transfer_id,
+        blob_contact_mode,
+    ) {
+        Ok(retained) => retained,
+        Err(error) if blob_contact_policy_transition_error(&error) => return Ok(false),
+        Err(error) => {
+            return Err(fatal_blob_coherence(
+                "pending Blob contact projection",
+                error.into(),
+            ));
+        }
+    };
     let Some(retained) = retained else {
         if cache
             .get_blob(verifier, projection.transfer_id)
@@ -21719,7 +23214,8 @@ fn reconcile_blob_cache_after_successful_pending_abort(
     }
     (|| -> Result<(), NodeError> {
         cache.remove_pending_blob(verifier, aborted_claim)?;
-        let Some(retained) = store.blob_source_projection(aborted_claim.transfer_id)? else {
+        let Some(retained) = store.durable_blob_source_projection(aborted_claim.transfer_id)?
+        else {
             return Ok(());
         };
         let sealed = retained_blob_sealed(store, &retained.source, retained.retention)?;
@@ -21788,7 +23284,7 @@ fn cleanup_ineligible_pending_blobs(
     (|| -> Result<usize, NodeError> {
         cache.require_binding(verifier)?;
         let mut retained = BTreeMap::new();
-        store.visit_pending_blob_sources(None, |projection| {
+        store.visit_durable_pending_blob_sources(None, |projection| {
             cache.record_pending_blob_cleanup_source_visit();
             retained.insert(projection.transfer_id, projection.clone());
         })?;
@@ -21797,9 +23293,17 @@ fn cleanup_ineligible_pending_blobs(
         let mut removed = 0usize;
         for transfer_id in candidates {
             let lifecycle = cache.lock_blob_lifecycle()?;
-            let current = store.blob_source_projection(transfer_id)?;
+            let current = store.durable_blob_source_projection(transfer_id)?;
             let cached = cache.get_blob(verifier, transfer_id)?;
             let Some(current) = current else {
+                if cached.is_some()
+                    && store.retained_blob_source_is_contact_ineligible(transfer_id)?
+                {
+                    // The general local cache deliberately retains finite
+                    // evidence. Durable-only cleanup must neither evaluate its
+                    // age nor reinterpret its contact omission as retirement.
+                    continue;
+                }
                 if cached.is_some() {
                     return Err(NodeError::Protocol(
                         "retired pending Blob cleanup source left a cache claim".into(),
@@ -21992,10 +23496,10 @@ pub(crate) fn recover_blob_capacity_after_cleanup(
     #[cfg(test)]
     cache.record_blob_capacity_recovery_attempt();
     let budget = blob_capacity_recovery_budget();
-    store.run_blob_capacity_gc_for(target, budget, custody_sample)?;
+    store.run_durable_blob_capacity_gc_for(target, budget, custody_sample)?;
     #[cfg(test)]
     cache.record_blob_admission_trace(TestBlobAdmissionTrace::RoutineCleanupComplete);
-    let recovery = store.run_blob_pressure_recovery_after_cleanup(
+    let recovery = store.run_durable_blob_pressure_recovery_after_cleanup(
         error,
         incoming_priority,
         content,
@@ -22036,9 +23540,14 @@ fn blob_contact_policy_transition_error(error: &StoreError) -> bool {
                 BlobStoreError::PublisherRevoked(_)
                     | BlobStoreError::KeyEpochStale { .. }
                     | BlobStoreError::KeyEpochNotActive { .. }
+                    | BlobStoreError::ExpiredOrRetired
                     | BlobStoreError::ReadPlanChanged
             )
     )
+}
+
+fn node_blob_contact_policy_transition_error(error: &NodeError) -> bool {
+    matches!(error, NodeError::Store(error) if blob_contact_policy_transition_error(error))
 }
 
 fn blob_stage_ordinary_contact_error(error: &StoreError) -> bool {
@@ -22127,13 +23636,14 @@ fn blob_terminal_content_error(error: &BlobError) -> bool {
     )
 }
 
-fn cache_promoted_blob_after_durable_transition(
+fn cache_promoted_blob_after_contact_transition(
     store: &Store,
     verifier: &ReferenceEnvelopeSealer,
     cache: &AuthenticatedEventRouteCache,
     source: BlobTransferId,
     blob: &ContentVerifiedBlobEnvelope,
     depot_completion: BlobDepotCompletion,
+    blob_contact_mode: BlobContactMode,
 ) -> Result<(), NodeError> {
     #[cfg(test)]
     if cache.fire_test_blob_contact_fault(TestBlobContactFault::PostPromotion) {
@@ -22141,11 +23651,13 @@ fn cache_promoted_blob_after_durable_transition(
             "injected post-promotion authenticated Blob cache failure".into(),
         ));
     }
-    (|| -> Result<(), NodeError> {
-        let projection = store.blob_source_projection(source)?.ok_or_else(|| {
-            NodeError::Protocol("promoted Blob lost its state-neutral projection".into())
-        })?;
-        let claim = AuthenticatedBlobRouteClaim::from_verified(
+    let transition = (|| -> Result<(), NodeError> {
+        let projection = blob_source_projection_for_contact(store, source, blob_contact_mode)?
+            .ok_or_else(|| {
+                NodeError::Protocol("promoted Blob lost its state-neutral projection".into())
+            })?;
+        let claim = AuthenticatedBlobRouteClaim::from_verified_for_contact(
+            store,
             blob,
             &store
                 .get_blob(source)?
@@ -22154,10 +23666,46 @@ fn cache_promoted_blob_after_durable_transition(
             &projection.source,
             projection.retention,
             Some(depot_completion),
+            blob_contact_mode,
         )?;
         cache.insert_blob(verifier, claim)
-    })()
-    .map_err(|error| fatal_blob_coherence("post-promotion authenticated cache transition", error))
+    })();
+    match transition {
+        Ok(()) => Ok(()),
+        Err(error) if node_blob_contact_policy_transition_error(&error) => {
+            let claim = cache
+                .get_blob(verifier, source)
+                .map_err(|cache_error| {
+                    fatal_blob_coherence(
+                        "post-promotion lifetime-withheld cache lookup",
+                        cache_error,
+                    )
+                })?
+                .ok_or_else(|| {
+                    NodeError::FatalBlobCoherence(
+                        "post-promotion lifetime withholding lost its pending cache claim".into(),
+                    )
+                })?;
+            if claim.retention != BlobSourceRetention::Pending {
+                return Err(NodeError::FatalBlobCoherence(
+                    "post-promotion lifetime withholding found a non-pending cache claim".into(),
+                ));
+            }
+            cache
+                .remove_pending_blob(verifier, &claim)
+                .map_err(|cache_error| {
+                    fatal_blob_coherence(
+                        "post-promotion lifetime-withheld cache removal",
+                        cache_error,
+                    )
+                })?;
+            Err(error)
+        }
+        Err(error) => Err(fatal_blob_coherence(
+            "post-promotion authenticated cache transition",
+            error,
+        )),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -22171,6 +23719,7 @@ fn recover_and_finalize_pending_blob(
     plan: &VerifiedBlobTransferPlan,
     work: &mut Vec<BlobCarrierPrefixStatus>,
     scheduler: Option<(NodeId, Option<BlobCarrierFetchCursor>)>,
+    blob_contact_mode: BlobContactMode,
 ) -> Result<Option<PendingBlobRecoveryDisposition>, NodeError> {
     guard.check(store)?;
     let cache = contact_mutable_route_cache(verifier)
@@ -22187,23 +23736,32 @@ fn recover_and_finalize_pending_blob(
             });
         }
         #[cfg(test)]
+        let completion_lifetime_fault =
+            schedule_test_blob_completion_lifetime_fault(store, &cache)?;
+        #[cfg(test)]
         let committed = if fire_test_blob_contact_fault(TestBlobContactFault::CommitLeaseCapacity) {
             Err(StoreError::Blob(BlobStoreError::LeaseCapacity))
         } else {
-            store.commit_complete_blob_carrier_with_policy(
+            commit_complete_blob_carrier_for_contact(
+                store,
                 guard.policy(),
                 source,
                 status.object(),
                 plan,
+                blob_contact_mode,
             )
         };
         #[cfg(not(test))]
-        let committed = store.commit_complete_blob_carrier_with_policy(
+        let committed = commit_complete_blob_carrier_for_contact(
+            store,
             guard.policy(),
             source,
             status.object(),
             plan,
+            blob_contact_mode,
         );
+        #[cfg(test)]
+        finish_test_blob_completion_lifetime_fault(store, &cache, completion_lifetime_fault)?;
         drop(lifecycle);
         match committed {
             Ok(BlobCarrierCommitOutcome::Committed | BlobCarrierCommitOutcome::Duplicate) => {}
@@ -22243,9 +23801,10 @@ fn recover_and_finalize_pending_blob(
     let cached_memo = (|| -> Result<Option<PendingBlobCompletionMemo>, NodeError> {
         let _lifecycle = cache.lock_blob_lifecycle()?;
         guard.check(store)?;
-        let retained = store.blob_source_projection(source)?.ok_or_else(|| {
-            NodeError::Protocol("pending Blob completion lost its durable projection".into())
-        })?;
+        let retained = blob_source_projection_for_contact(store, source, blob_contact_mode)?
+            .ok_or_else(|| {
+                NodeError::Protocol("pending Blob completion lost its contact projection".into())
+            })?;
         let claim = cache.get_blob(verifier, source)?.ok_or_else(|| {
             NodeError::Protocol("pending Blob completion lost its authenticated claim".into())
         })?;
@@ -22272,6 +23831,7 @@ fn recover_and_finalize_pending_blob(
     })();
     let cached_memo = match cached_memo {
         Ok(memo) => memo,
+        Err(error) if node_blob_contact_policy_transition_error(&error) => return Err(error),
         Err(error) => {
             advance_terminal_blob_source_cursor(store, plan, source, scheduler)?;
             abort_pending_blob_with_cached_claim(store, verifier, source)?;
@@ -22294,12 +23854,14 @@ fn recover_and_finalize_pending_blob(
     } else {
         #[cfg(test)]
         cache.record_pending_blob_full_completion_verification();
-        let depot_completion = match store.completed_pending_blob_with_policy(
+        let depot_completion = match completed_pending_blob_for_contact(
+            store,
             guard.policy(),
             source,
             blob,
             manifest_bytes,
             plan,
+            blob_contact_mode,
         ) {
             Ok(completion) => completion,
             Err(error) if blob_pending_completion_ordinary_error(&error) => {
@@ -22375,9 +23937,10 @@ fn recover_and_finalize_pending_blob(
     let lifecycle = cache.lock_blob_lifecycle()?;
     guard.check(store)?;
     let completion_memo_result = (|| -> Result<PendingBlobCompletionMemo, NodeError> {
-        let retained = store.blob_source_projection(source)?.ok_or_else(|| {
-            NodeError::Protocol("pending Blob final gate lost its durable projection".into())
-        })?;
+        let retained = blob_source_projection_for_contact(store, source, blob_contact_mode)?
+            .ok_or_else(|| {
+                NodeError::Protocol("pending Blob final gate lost its contact projection".into())
+            })?;
         let claim = cache.get_blob(verifier, source)?.ok_or_else(|| {
             NodeError::Protocol("pending Blob final gate lost its authenticated claim".into())
         })?;
@@ -22407,6 +23970,9 @@ fn recover_and_finalize_pending_blob(
     })();
     if let Err(error) = completion_memo_result {
         drop(lifecycle);
+        if node_blob_contact_policy_transition_error(&error) {
+            return Err(error);
+        }
         advance_terminal_blob_source_cursor(store, plan, source, scheduler)?;
         abort_pending_blob_with_cached_claim(store, verifier, source)?;
         return Err(fatal_blob_coherence(
@@ -22425,6 +23991,12 @@ fn recover_and_finalize_pending_blob(
     {
         cache.record_blob_promotion_attempt();
         cache.record_blob_admission_trace(TestBlobAdmissionTrace::Promotion(source));
+        observe_test_blob_lifetime_fault(
+            store,
+            &cache,
+            TestBlobContactFault::PromotionLifetimeExpiry,
+            TestBlobContactFault::PromotionLifetimeDiscontinuity,
+        )?;
     }
     #[cfg(test)]
     let outcome = if cache
@@ -22435,21 +24007,25 @@ fn recover_and_finalize_pending_blob(
             limit: 1,
         }))
     } else {
-        store.apply_verified_blob_with_policy(
+        apply_verified_blob_for_contact(
+            store,
             guard.policy(),
             plan,
             &lineage,
             &depot_completion,
             &content_completion,
+            blob_contact_mode,
         )
     };
     #[cfg(not(test))]
-    let outcome = store.apply_verified_blob_with_policy(
+    let outcome = apply_verified_blob_for_contact(
+        store,
         guard.policy(),
         plan,
         &lineage,
         &depot_completion,
         &content_completion,
+        blob_contact_mode,
     );
     let outcome = match outcome {
         Err(error) if blob_publication_capacity_error(&error) => {
@@ -22480,21 +24056,25 @@ fn recover_and_finalize_pending_blob(
                         "injected Blob promotion retry coherence failure",
                     )))
                 } else {
-                    store.apply_verified_blob_with_policy(
+                    apply_verified_blob_for_contact(
+                        store,
                         guard.policy(),
                         plan,
                         &lineage,
                         &depot_completion,
                         &content_completion,
+                        blob_contact_mode,
                     )
                 };
                 #[cfg(not(test))]
-                let retry = store.apply_verified_blob_with_policy(
+                let retry = apply_verified_blob_for_contact(
+                    store,
                     guard.policy(),
                     plan,
                     &lineage,
                     &depot_completion,
                     &content_completion,
+                    blob_contact_mode,
                 );
                 match retry {
                     Ok(outcome) => Ok(outcome),
@@ -22536,13 +24116,21 @@ fn recover_and_finalize_pending_blob(
             ));
         }
     };
-    cache_promoted_blob_after_durable_transition(
+    #[cfg(test)]
+    observe_test_blob_lifetime_fault(
+        store,
+        &cache,
+        TestBlobContactFault::PostPromotionLoadLifetimeExpiry,
+        TestBlobContactFault::PostPromotionLoadLifetimeDiscontinuity,
+    )?;
+    cache_promoted_blob_after_contact_transition(
         store,
         verifier,
         &cache,
         source,
         blob,
         depot_completion,
+        blob_contact_mode,
     )?;
     Ok(Some(PendingBlobRecoveryDisposition::Apply(
         if outcome.inserted() {
@@ -22589,6 +24177,7 @@ struct BlobRangeCandidate {
 
 struct PendingBlobContactWork {
     source: BlobTransferId,
+    projection: BlobSourceProjection,
     blob: ContentVerifiedBlobEnvelope,
     manifest_bytes: Vec<u8>,
     plan: VerifiedBlobTransferPlan,
@@ -22602,12 +24191,24 @@ fn selected_pending_blob_contact_work(
     verifier: &mut ReferenceEnvelopeSealer,
     local_interest: &BlobInterest,
     after: Option<BlobTransferId>,
+    blob_contact_mode: BlobContactMode,
 ) -> Result<Option<PendingBlobContactWork>, NodeError> {
     guard.check(store)?;
-    let Some(projection) = store.next_pending_blob_source_with_policy(guard.policy(), after)?
+    let Some(projection) =
+        next_pending_blob_source_for_contact(store, guard.policy(), after, blob_contact_mode)?
     else {
         return Ok(None);
     };
+    #[cfg(test)]
+    {
+        let cache = contact_mutable_route_cache(verifier)?;
+        observe_test_blob_lifetime_fault(
+            store,
+            &cache,
+            TestBlobContactFault::PendingLifetimeExpiry,
+            TestBlobContactFault::PendingLifetimeDiscontinuity,
+        )?;
+    }
     let selector = local_interest
         .selector(&projection.topic, &projection.scope)
         .filter(|selector| selector.epoch() == projection.epoch);
@@ -22616,26 +24217,28 @@ fn selected_pending_blob_contact_work(
         // pending source outside that exact set can never become eligible, so
         // retire the one cursor-selected source under the same authenticated
         // lifecycle instead of letting it starve every later source.
-        if pending_blob_claim_is_current(store, verifier, &projection)? {
+        if pending_blob_claim_is_current(store, verifier, &projection, blob_contact_mode)? {
             abort_pending_blob_with_cached_claim(store, verifier, projection.transfer_id)?;
         }
         return Ok(None);
     }
     let selector = selector.expect("checked exact pending Blob selector");
     let proof = *selector.content_proof();
-    if !pending_blob_claim_is_current(store, verifier, &projection)? {
+    if !pending_blob_claim_is_current(store, verifier, &projection, blob_contact_mode)? {
         return Ok(None);
     }
     let Some((blob, manifest_bytes, plan)) =
-        load_pending_blob_plan(store, verifier, projection.transfer_id)?
+        load_pending_blob_plan(store, verifier, projection.transfer_id, blob_contact_mode)?
     else {
         return Ok(None);
     };
     verifier.verify_current_blob_lineage(&blob)?;
-    let carriers = match store.pending_blob_carrier_work_with_policy(
+    let carriers = match pending_blob_carrier_work_for_contact(
+        store,
         guard.policy(),
         projection.transfer_id,
         &plan,
+        blob_contact_mode,
     ) {
         Ok(work) => work,
         Err(error) if blob_contact_policy_transition_error(&error) => return Err(error.into()),
@@ -22653,6 +24256,7 @@ fn selected_pending_blob_contact_work(
     }
     Ok(Some(PendingBlobContactWork {
         source: projection.transfer_id,
+        projection,
         blob,
         manifest_bytes,
         plan,
@@ -22676,11 +24280,14 @@ fn select_blob_range_candidate(
         .or_else(|| candidates.first().copied())
 }
 
-fn blob_carrier_remaining(store: &Store, guard: &EventLaneGuard) -> Result<usize, NodeError> {
+fn blob_carrier_remaining(
+    store: &Store,
+    guard: &EventLaneGuard,
+    blob_contact_mode: BlobContactMode,
+) -> Result<usize, NodeError> {
     guard.check(store)?;
     Ok(usize::from(
-        store
-            .next_pending_blob_source_with_policy(guard.policy(), None)?
+        next_pending_blob_source_for_contact(store, guard.policy(), None, blob_contact_mode)?
             .is_some(),
     ))
 }
@@ -22704,6 +24311,7 @@ async fn sync_blob_carrier_lane(
     mission: &mut MissionSession,
     verifier: &mut ReferenceEnvelopeSealer,
     guard: &EventLaneGuard,
+    blob_contact_mode: BlobContactMode,
     lane_direction: EventDirection,
     local_interest: &BlobInterest,
     _peer_interest: &BlobInterest,
@@ -22720,6 +24328,7 @@ async fn sync_blob_carrier_lane(
         verifier,
         local_interest,
         cursor.map(|cursor| cursor.source()),
+        blob_contact_mode,
     )?;
     let candidate = if let Some(work) = selected.as_mut() {
         match recover_and_finalize_pending_blob(
@@ -22732,6 +24341,7 @@ async fn sync_blob_carrier_lane(
             &work.plan,
             &mut work.carriers,
             Some((peer, cursor)),
+            blob_contact_mode,
         )? {
             Some(PendingBlobRecoveryDisposition::DeferredLease) => {
                 receipt.blob_deferred = receipt.blob_deferred.saturating_add(1);
@@ -22803,6 +24413,28 @@ async fn sync_blob_carrier_lane(
         }
         let object_id = frame_blob_object_id(candidate.object)?;
         guard.check(store)?;
+        let selected_projection =
+            selected
+                .as_ref()
+                .map(|work| &work.projection)
+                .ok_or_else(|| {
+                    NodeError::FatalBlobCoherence(
+                        "Blob range request lost its selected source authority".into(),
+                    )
+                })?;
+        let retained = blob_source_projection_for_contact(
+            store,
+            selected_projection.transfer_id,
+            blob_contact_mode,
+        )?;
+        if retained.as_ref().is_none_or(|retained| {
+            retained.retention != BlobSourceRetention::Pending
+                || retained.source != *selected_projection
+        }) {
+            return Err(NodeError::Protocol(
+                "Blob range request source lost current contact eligibility".into(),
+            ));
+        }
         let response = request_mission_frame(
             connection,
             mission,
@@ -22898,23 +24530,27 @@ async fn sync_blob_carrier_lane(
                             },
                         ))
                     } else {
-                        store.append_blob_carrier_prefix_with_policy(
+                        append_blob_carrier_prefix_for_contact(
+                            store,
                             guard.policy(),
                             candidate.source,
                             candidate.object,
                             candidate.total_len,
                             candidate.offset,
                             &bytes,
+                            blob_contact_mode,
                         )
                     };
                 #[cfg(not(test))]
-                let appended = store.append_blob_carrier_prefix_with_policy(
+                let appended = append_blob_carrier_prefix_for_contact(
+                    store,
                     guard.policy(),
                     candidate.source,
                     candidate.object,
                     candidate.total_len,
                     candidate.offset,
                     &bytes,
+                    blob_contact_mode,
                 );
                 let appended = match appended {
                     Err(error) if blob_apply_capacity_error(&error) => {
@@ -22957,23 +24593,27 @@ async fn sync_blob_carrier_lane(
                                     "injected Blob carrier append retry coherence failure",
                                 )))
                             } else {
-                                store.append_blob_carrier_prefix_with_policy(
+                                append_blob_carrier_prefix_for_contact(
+                                    store,
                                     guard.policy(),
                                     candidate.source,
                                     candidate.object,
                                     candidate.total_len,
                                     candidate.offset,
                                     &bytes,
+                                    blob_contact_mode,
                                 )
                             };
                             #[cfg(not(test))]
-                            let retry = store.append_blob_carrier_prefix_with_policy(
+                            let retry = append_blob_carrier_prefix_for_contact(
+                                store,
                                 guard.policy(),
                                 candidate.source,
                                 candidate.object,
                                 candidate.total_len,
                                 candidate.offset,
                                 &bytes,
+                                blob_contact_mode,
                             );
                             match retry {
                                 Ok(outcome) => Ok(outcome),
@@ -23019,6 +24659,7 @@ async fn sync_blob_carrier_lane(
                                     &work.plan,
                                     &mut work.carriers,
                                     Some((peer, cursor)),
+                                    blob_contact_mode,
                                 )?,
                                 Some(
                                     PendingBlobRecoveryDisposition::DeferredLease
@@ -23075,6 +24716,7 @@ async fn sync_blob_carrier_lane(
                                     &work.plan,
                                     &mut work.carriers,
                                     Some((peer, cursor)),
+                                    blob_contact_mode,
                                 )?,
                                 Some(
                                     PendingBlobRecoveryDisposition::DeferredLease
@@ -23170,15 +24812,16 @@ async fn sync_blob_carrier_lane(
                 "Blob range result acknowledgement differs".into(),
             ));
         }
-        // Every settled attempt consumes its durable source turn, including
-        // Unavailable and typed capacity deferral. The cursor is scheduling
-        // evidence, not carrier-byte progress; advancing prevents one peer or
-        // source from starving later bounded work.
-        let _ = store.compare_and_advance_blob_carrier_fetch_cursor(
-            peer,
-            cursor,
-            BlobCarrierFetchCursor::new(candidate.source, candidate.object),
-        )?;
+        // An unavailable unit retains its exact durable turn: expected
+        // lifetime invisibility is not evidence that a later source/object
+        // was settled. Other typed outcomes remain scheduling evidence.
+        if apply_disposition != BlobRangeApplyDisposition::Unavailable {
+            let _ = store.compare_and_advance_blob_carrier_fetch_cursor(
+                peer,
+                cursor,
+                BlobCarrierFetchCursor::new(candidate.source, candidate.object),
+            )?;
+        }
         if matches!(
             apply_disposition,
             BlobRangeApplyDisposition::Partial | BlobRangeApplyDisposition::Complete
@@ -23189,7 +24832,7 @@ async fn sync_blob_carrier_lane(
                 .ok_or_else(|| NodeError::Protocol("Blob fetched range count overflow".into()))?;
         }
     }
-    let remaining = blob_carrier_remaining(store, guard)?;
+    let remaining = blob_carrier_remaining(store, guard, blob_contact_mode)?;
     let remaining_wire = u64::try_from(remaining)
         .map_err(|_| NodeError::Protocol("Blob remaining count exceeds u64".into()))?;
     if !exchange_preserves_reserve(
@@ -23245,6 +24888,7 @@ fn serve_verified_blob_range(
     offset: u64,
     requested_len: u32,
     proof: &[u8; crate::frame::BLOB_CONTENT_PROOF_BYTES],
+    blob_contact_mode: BlobContactMode,
 ) -> Result<Option<Vec<u8>>, NodeError> {
     guard.check(store)?;
     if !canonical_blob_network_range(total_len, offset, requested_len) {
@@ -23311,15 +24955,28 @@ fn serve_verified_blob_range(
         return Ok(None);
     }
 
-    let retained = store
-        .blob_source_projection(source)
-        .map_err(NodeError::from)
-        .map_err(|error| fatal_blob_coherence("served Blob durable projection", error))?
-        .ok_or_else(|| {
-            NodeError::FatalBlobCoherence(
-                "served authenticated Blob lost its durable projection".into(),
-            )
-        })?;
+    #[cfg(test)]
+    observe_test_blob_lifetime_fault(
+        store,
+        &cache,
+        TestBlobContactFault::ServiceLifetimeExpiry,
+        TestBlobContactFault::ServiceLifetimeDiscontinuity,
+    )?;
+    let retained = match blob_source_projection_for_contact(store, source, blob_contact_mode) {
+        Ok(retained) => retained,
+        Err(error) if blob_contact_policy_transition_error(&error) => return Ok(None),
+        Err(error) => {
+            return Err(fatal_blob_coherence(
+                "served Blob contact projection",
+                error.into(),
+            ));
+        }
+    }
+    .ok_or_else(|| {
+        NodeError::FatalBlobCoherence(
+            "served authenticated Blob lost its durable projection".into(),
+        )
+    })?;
     if retained.retention != claim.retention || !claim.matches_projection(&retained.source) {
         return Err(NodeError::FatalBlobCoherence(
             "served Blob durable projection differs from its authenticated claim".into(),
@@ -23331,15 +24988,28 @@ fn serve_verified_blob_range(
     if !current {
         return Ok(None);
     }
-    let stored = store
-        .get_blob(source)
-        .map_err(NodeError::from)
-        .map_err(|error| fatal_blob_coherence("served Blob source load", error))?
-        .ok_or_else(|| {
-            NodeError::FatalBlobCoherence(
+    #[cfg(test)]
+    observe_test_blob_lifetime_fault(
+        store,
+        &cache,
+        TestBlobContactFault::ServiceLoadLifetimeExpiry,
+        TestBlobContactFault::ServiceLoadLifetimeDiscontinuity,
+    )?;
+    let stored = match store.get_blob(source) {
+        Ok(Some(stored)) => stored,
+        Ok(None) => {
+            return Err(NodeError::FatalBlobCoherence(
                 "served authenticated Blob lost its exact source row".into(),
-            )
-        })?;
+            ));
+        }
+        Err(error) if blob_contact_policy_transition_error(&error) => return Ok(None),
+        Err(error) => {
+            return Err(fatal_blob_coherence(
+                "served Blob source load",
+                error.into(),
+            ));
+        }
+    };
     if stored.sealed.len() > MAX_BLOB_NETWORK_SOURCE_BYTES || stored.sealed.len() > MAX_OBJECT_BYTES
     {
         return Err(NodeError::FatalBlobCoherence(
@@ -23434,7 +25104,44 @@ fn serve_verified_blob_range(
     let result = if cache.fire_test_blob_contact_fault(TestBlobContactFault::RangeLeaseCapacity) {
         Err(StoreError::Blob(BlobStoreError::LeaseCapacity))
     } else {
-        store.read_completed_blob_carrier_range_with_policy(
+        match blob_contact_mode {
+            BlobContactMode::DurableOnly => store
+                .read_completed_durable_blob_carrier_range_with_policy(
+                    guard.policy(),
+                    &completion,
+                    &lineage,
+                    source,
+                    object,
+                    offset,
+                    usize::try_from(requested_len).expect("u32 fits usize"),
+                    &plan,
+                ),
+            BlobContactMode::CustodyV1 => store.read_completed_blob_carrier_range_with_policy(
+                guard.policy(),
+                &completion,
+                &lineage,
+                source,
+                object,
+                offset,
+                usize::try_from(requested_len).expect("u32 fits usize"),
+                &plan,
+            ),
+        }
+    };
+    #[cfg(not(test))]
+    let result = match blob_contact_mode {
+        BlobContactMode::DurableOnly => store
+            .read_completed_durable_blob_carrier_range_with_policy(
+                guard.policy(),
+                &completion,
+                &lineage,
+                source,
+                object,
+                offset,
+                usize::try_from(requested_len).expect("u32 fits usize"),
+                &plan,
+            ),
+        BlobContactMode::CustodyV1 => store.read_completed_blob_carrier_range_with_policy(
             guard.policy(),
             &completion,
             &lineage,
@@ -23443,19 +25150,8 @@ fn serve_verified_blob_range(
             offset,
             usize::try_from(requested_len).expect("u32 fits usize"),
             &plan,
-        )
+        ),
     };
-    #[cfg(not(test))]
-    let result = store.read_completed_blob_carrier_range_with_policy(
-        guard.policy(),
-        &completion,
-        &lineage,
-        source,
-        object,
-        offset,
-        usize::try_from(requested_len).expect("u32 fits usize"),
-        &plan,
-    );
     #[cfg(test)]
     if result.is_ok() && cache.fire_test_blob_contact_fault(TestBlobContactFault::RangePostcheck) {
         return Err(NodeError::FatalBlobCoherence(
@@ -23465,7 +25161,7 @@ fn serve_verified_blob_range(
     let result = match result {
         Ok(result) => result,
         Err(error) if blob_lease_backpressure_error(&error) => return Ok(None),
-        Err(error) if blob_contact_policy_transition_error(&error) => return Err(error.into()),
+        Err(error) if blob_contact_policy_transition_error(&error) => return Ok(None),
         Err(error) => {
             return Err(fatal_blob_coherence(
                 "served Blob physical range read",
@@ -23496,6 +25192,7 @@ async fn serve_blob_carrier_lane(
     mission: &mut MissionSession,
     verifier: &mut ReferenceEnvelopeSealer,
     guard: &EventLaneGuard,
+    blob_contact_mode: BlobContactMode,
     lane_direction: EventDirection,
     _local_interest: &BlobInterest,
     peer_interest: &BlobInterest,
@@ -23539,6 +25236,7 @@ async fn serve_blob_carrier_lane(
                         offset,
                         requested_len,
                         &content_proof,
+                        blob_contact_mode,
                     )?;
                     #[cfg(test)]
                     record_test_blob_contact_result_frame();
@@ -23667,12 +25365,13 @@ async fn sync_mutable_transfer_lane(
         semantic_version,
         class,
         direction,
+        blob_contact_mode,
     } = lane;
     difference.validate(class)?;
     let peer = mission.peer().mission_id();
     let commitments = mission.peer_route_grant_commitments().to_vec();
     let capacity = mutable_transfer_capacity(receipt, semantic_version, class, direction)?;
-    let cursor = store.mutable_transfer_cursor(
+    let mut cursor = store.mutable_transfer_cursor(
         peer,
         mutable_transfer_cursor_class(class),
         mutable_transfer_cursor_mode(direction),
@@ -23691,7 +25390,7 @@ async fn sync_mutable_transfer_lane(
                     ));
                 }
                 guard.check(store)?;
-                let bytes = load_verified_mutable_for_peer(
+                let loaded = load_verified_mutable_for_contact_peer(
                     store,
                     verifier,
                     source_snapshot,
@@ -23699,40 +25398,67 @@ async fn sync_mutable_transfer_lane(
                     peer,
                     &commitments,
                     receiver_interest,
+                    blob_contact_mode,
                 )?;
-                let response = request_mission_frame(
-                    connection,
-                    mission,
-                    Frame::MutableOffer {
-                        direction,
-                        id,
-                        bytes,
-                        claim: None,
-                    },
-                    receipt,
-                )
-                .await?;
-                let Frame::MutableApplyResult {
-                    direction: response_direction,
-                    id: applied,
-                    disposition,
-                    custody_digest,
-                } = response
-                else {
-                    return Err(NodeError::Protocol(
-                        "mutable offer acknowledgement differs".into(),
-                    ));
-                };
-                if response_direction != direction || applied != id {
-                    return Err(NodeError::Protocol(
-                        "mutable offer acknowledgement crossed lanes".into(),
-                    ));
-                }
-                if class == MutableClass::Blob {
-                    require_blob_custody_digest(None, custody_digest)?;
-                }
-                let _advanced =
-                    advance_mutable_transfer_cursor(store, peer, class, direction, cursor, id)?;
+                let (response, verified_digest) =
+                    if class == MutableClass::Blob && blob_contact_mode.finite_transfer_enabled() {
+                        request_blob_source_offer_frame(
+                            store,
+                            guard,
+                            connection,
+                            mission,
+                            direction,
+                            receipt,
+                            |mission| {
+                                let prepared = authorize_outbound_blob_claim(
+                                    store,
+                                    guard,
+                                    mission,
+                                    source_snapshot,
+                                    id,
+                                    direction,
+                                    &loaded,
+                                )?;
+                                let claim = prepared.as_ref().map(|prepared| prepared.claim);
+                                Ok((
+                                    Frame::MutableOffer {
+                                        direction,
+                                        id,
+                                        bytes: loaded.bytes,
+                                        claim,
+                                    },
+                                    prepared,
+                                ))
+                            },
+                        )
+                        .await?
+                    } else {
+                        (
+                            request_mission_frame(
+                                connection,
+                                mission,
+                                Frame::MutableOffer {
+                                    direction,
+                                    id,
+                                    bytes: loaded.bytes,
+                                    claim: None,
+                                },
+                                receipt,
+                            )
+                            .await?,
+                            None,
+                        )
+                    };
+                let disposition = settle_mutable_apply_result(
+                    store,
+                    peer,
+                    class,
+                    direction,
+                    &mut cursor,
+                    id,
+                    response,
+                    verified_digest,
+                )?;
                 receipt.offered += 1;
                 match disposition {
                     MutableApplyDisposition::Inserted => {}
@@ -23760,13 +25486,28 @@ async fn sync_mutable_transfer_lane(
                     ));
                 }
                 guard.check(store)?;
-                let response = request_mission_frame(
-                    connection,
-                    mission,
-                    Frame::MutableFetch { direction, id },
-                    receipt,
-                )
-                .await?;
+                let (response, opened_custody) =
+                    if class == MutableClass::Blob && blob_contact_mode.finite_transfer_enabled() {
+                        request_blob_source_fetch_frame(
+                            connection,
+                            mission,
+                            direction,
+                            Frame::MutableFetch { direction, id },
+                            receipt,
+                        )
+                        .await?
+                    } else {
+                        (
+                            request_mission_frame(
+                                connection,
+                                mission,
+                                Frame::MutableFetch { direction, id },
+                                receipt,
+                            )
+                            .await?,
+                            None,
+                        )
+                    };
                 let Frame::MutableObject {
                     direction: response_direction,
                     id: received,
@@ -23785,7 +25526,33 @@ async fn sync_mutable_transfer_lane(
                     ));
                 }
                 guard.check(store)?;
-                let disposition = accept_received_mutable(
+                let custody = match (claim, opened_custody) {
+                    (None, None) => None,
+                    (Some(claim), Some((opened, authority))) if claim == opened => {
+                        let MutableTransferId::Blob(transfer) = received else {
+                            return Err(NodeError::Protocol(
+                                "Blob custody authority crossed mutable classes".into(),
+                            ));
+                        };
+                        Some(ReceivedBlobCustody {
+                            claim,
+                            authority,
+                            expected_exchange_id: blob_custody_exchange_id(
+                                mission.session_id(),
+                                direction,
+                                transfer,
+                            ),
+                        })
+                    }
+                    _ => {
+                        return Err(NodeError::Protocol(
+                            "decoded Blob custody claim lacks its exact protected authority".into(),
+                        ));
+                    }
+                };
+                #[cfg(test)]
+                let custody = apply_test_blob_receive_fault(custody)?;
+                let (disposition, verified_digest) = accept_received_mutable_for_contact(
                     store,
                     guard,
                     verifier,
@@ -23796,33 +25563,33 @@ async fn sync_mutable_transfer_lane(
                     },
                     received,
                     &bytes,
-                    claim.as_ref(),
+                    custody,
+                    blob_contact_mode,
                 )?;
                 #[cfg(test)]
                 if class == MutableClass::Blob {
                     record_test_blob_contact_result_frame();
                 }
-                let acknowledgement = request_mission_frame(
-                    connection,
-                    mission,
-                    Frame::MutableFetchResult {
-                        direction,
-                        id: received,
-                        disposition,
-                        custody_digest: None,
-                    },
-                    receipt,
-                )
-                .await?;
-                require_mutable_fetch_result_ack(
-                    acknowledgement,
+                let result = Frame::MutableFetchResult {
                     direction,
+                    id: received,
+                    disposition,
+                    custody_digest: verified_digest,
+                };
+                #[cfg(test)]
+                let result = observe_and_fault_test_blob_settlement(store, result, verified_digest);
+                let acknowledgement =
+                    request_mission_frame(connection, mission, result, receipt).await?;
+                settle_mutable_fetch_result_ack(
+                    store,
+                    peer,
+                    class,
+                    direction,
+                    &mut cursor,
                     received,
                     disposition,
-                    None,
-                )?;
-                let _advanced = advance_mutable_transfer_cursor(
-                    store, peer, class, direction, cursor, received,
+                    acknowledgement,
+                    verified_digest,
                 )?;
                 match disposition {
                     MutableApplyDisposition::Inserted => receipt.inserted += 1,
@@ -23889,6 +25656,7 @@ async fn sync_mutable_class(
         guard,
         interests,
         class,
+        blob_contact_mode,
     } = contact;
     guard.check(store)?;
     let full_class = mutable_class_can_start(receipt, mission.semantic_version(), class)?;
@@ -23929,7 +25697,13 @@ async fn sync_mutable_class(
             _ => None,
         });
     }
-    let source_snapshot = cached_mutable_sender_snapshot(store, guard.policy(), verifier, class)?;
+    let source_snapshot = cached_mutable_sender_snapshot_for_contact(
+        store,
+        guard.policy(),
+        verifier,
+        class,
+        blob_contact_mode,
+    )?;
     let to_responder = DirectedMutableLane {
         guard,
         source_snapshot: &source_snapshot,
@@ -23937,6 +25711,7 @@ async fn sync_mutable_class(
         semantic_version: mission.semantic_version(),
         class,
         direction: EventDirection::ToSessionResponder,
+        blob_contact_mode,
     };
     let outcome = sync_mutable_reconciliation_lane(
         store,
@@ -23967,6 +25742,7 @@ async fn sync_mutable_class(
         semantic_version: mission.semantic_version(),
         class,
         direction: EventDirection::ToSessionInitiator,
+        blob_contact_mode,
     };
     let outcome = sync_mutable_reconciliation_lane(
         store,
@@ -24002,10 +25778,14 @@ async fn sync_mutable_classes(
     connection: &aster_iroh::Connection,
     mission: &mut MissionSession,
     verifier: &mut ReferenceEnvelopeSealer,
-    guard: &EventLaneGuard,
-    interests: &MutableSourceInterests,
+    contact: MutableClassesContact<'_>,
     receipt: &mut PeerReceipt,
 ) -> Result<(), NodeError> {
+    let MutableClassesContact {
+        guard,
+        interests,
+        blob_contact_mode,
+    } = contact;
     if mission.semantic_version() >= MIN_BLOB_NETWORK_SEMANTIC_VERSION {
         let cache = contact_mutable_route_cache(verifier)?;
         cleanup_ineligible_pending_blobs(store, verifier, &cache)?;
@@ -24022,6 +25802,7 @@ async fn sync_mutable_classes(
                 guard,
                 interests,
                 class,
+                blob_contact_mode,
             },
             receipt,
         )
@@ -24041,6 +25822,7 @@ async fn sync_mutable_classes(
             mission,
             verifier,
             guard,
+            blob_contact_mode,
             EventDirection::ToSessionResponder,
             &local,
             &peer,
@@ -24053,6 +25835,7 @@ async fn sync_mutable_classes(
             mission,
             verifier,
             guard,
+            blob_contact_mode,
             EventDirection::ToSessionInitiator,
             &local,
             &peer,
@@ -24740,6 +26523,25 @@ async fn sync_authenticated_session(
     // object operation can reach the carrier before this returns a session.
     let (mut mission, handshake) = match peer.expected_mission() {
         Some(expected) => {
+            #[cfg(test)]
+            if let Ok(Some(semantic_version)) = TEST_SEMANTIC_VERSION.try_with(std::cell::Cell::get)
+            {
+                initiate_over_iroh_metered_for_semantic_version(
+                    connection,
+                    credentials.fresh_bundle()?,
+                    MissionPeerBinding::new(peer.carrier(), expected),
+                    semantic_version,
+                )
+                .await?
+            } else {
+                initiate_over_iroh_metered(
+                    connection,
+                    credentials.fresh_bundle()?,
+                    MissionPeerBinding::new(peer.carrier(), expected),
+                )
+                .await?
+            }
+            #[cfg(not(test))]
             initiate_over_iroh_metered(
                 connection,
                 credentials.fresh_bundle()?,
@@ -24758,6 +26560,10 @@ async fn sync_authenticated_session(
     #[cfg(test)]
     apply_test_preaccounted_contact_items(&mut receipt)?;
     let transfer_profiles = sync_transfer_profiles(connection, &mut mission, &mut receipt).await?;
+    let blob_contact_mode = BlobContactMode::from_authenticated_profiles(
+        mission.semantic_version(),
+        transfer_profiles.as_ref(),
+    )?;
 
     // Replay and reconcile mission controls under the exclusive policy lease.
     // The verifier must not predate this lease: another contact may have
@@ -24794,6 +26600,11 @@ async fn sync_authenticated_session(
         mission.peer().mission_id(),
         receipt.controls_remaining,
     )?;
+    let mutable_contact = MutableClassesContact {
+        guard: &event_guard,
+        interests: &mutable_interests,
+        blob_contact_mode,
+    };
     if mission.semantic_version() < SEMANTIC_PROTOCOL_V7 {
         sync_selected_event_bridge(
             connection,
@@ -24841,8 +26652,7 @@ async fn sync_authenticated_session(
                     connection,
                     &mut mission,
                     &mut event_verifier,
-                    &event_guard,
-                    &mutable_interests,
+                    mutable_contact,
                     &mut receipt,
                 )
                 .await?;
@@ -24922,8 +26732,7 @@ async fn sync_authenticated_session(
                         connection,
                         &mut mission,
                         &mut event_verifier,
-                        &event_guard,
-                        &mutable_interests,
+                        mutable_contact,
                         &mut receipt,
                     )
                     .await?;
@@ -24964,8 +26773,7 @@ async fn sync_authenticated_session(
             connection,
             &mut mission,
             &mut event_verifier,
-            &event_guard,
-            &mutable_interests,
+            mutable_contact,
             &mut receipt,
         )
         .await?;
@@ -25006,8 +26814,7 @@ async fn sync_authenticated_session(
                     connection,
                     &mut mission,
                     &mut event_verifier,
-                    &event_guard,
-                    &mutable_interests,
+                    mutable_contact,
                     &mut receipt,
                 )
                 .await?;
@@ -25155,8 +26962,7 @@ async fn sync_authenticated_session(
             connection,
             &mut mission,
             &mut event_verifier,
-            &event_guard,
-            &mutable_interests,
+            mutable_contact,
             &mut receipt,
         )
         .await?;
@@ -26438,6 +28244,7 @@ async fn serve_mutable_reconciliation_lane(
         semantic_version,
         class,
         direction,
+        blob_contact_mode: _,
     } = lane;
     guard.check(store)?;
     let inventory = match direction {
@@ -26618,6 +28425,7 @@ async fn serve_mutable_transfer_lane(
         semantic_version,
         class,
         direction,
+        blob_contact_mode,
     } = lane;
     let capacity = mutable_transfer_capacity(receipt, semantic_version, class, direction)?;
     let mut authorization =
@@ -26630,11 +28438,25 @@ async fn serve_mutable_transfer_lane(
     loop {
         guard.check(store)?;
         let wire_budget = exchange_wire_budget(receipt)?;
-        let (complete, request_bytes, response_bytes) = respond_mission_frame(
+        let protect_blob_sources =
+            class == MutableClass::Blob && blob_contact_mode.finite_transfer_enabled();
+        let source_request = protect_blob_sources
+            && direction == EventDirection::ToSessionResponder
+            && !authorization.is_consumed();
+        let source_response = protect_blob_sources
+            && direction == EventDirection::ToSessionInitiator
+            && !authorization.is_consumed()
+            && !fetch_settlement.is_pending();
+        let (complete, request_bytes, response_bytes) = respond_mutable_transfer_frame(
+            store,
+            guard,
             connection,
             mission,
             wire_budget,
-            |frame, request_wire_len, _mission| match frame {
+            direction,
+            source_request,
+            source_response,
+            |frame, opened_custody, request_wire_len, mission| match frame {
                 Frame::MutableOffer {
                     direction: request_direction,
                     id,
@@ -26652,7 +28474,34 @@ async fn serve_mutable_transfer_lane(
                         ));
                     }
                     check_account(receipt, request_wire_len, 4_096)?;
-                    let disposition = accept_received_mutable(
+                    let custody = match (claim, opened_custody) {
+                        (None, None) => None,
+                        (Some(claim), Some((opened, authority))) if claim == opened => {
+                            let MutableTransferId::Blob(transfer) = id else {
+                                return Err(NodeError::Protocol(
+                                    "Blob custody authority crossed mutable classes".into(),
+                                ));
+                            };
+                            Some(ReceivedBlobCustody {
+                                claim,
+                                authority,
+                                expected_exchange_id: blob_custody_exchange_id(
+                                    mission.session_id(),
+                                    direction,
+                                    transfer,
+                                ),
+                            })
+                        }
+                        _ => {
+                            return Err(NodeError::Protocol(
+                                "decoded Blob custody claim lacks its exact protected authority"
+                                    .into(),
+                            ));
+                        }
+                    };
+                    #[cfg(test)]
+                    let custody = apply_test_blob_receive_fault(custody)?;
+                    let (disposition, verified_digest) = accept_received_mutable_for_contact(
                         store,
                         guard,
                         verifier,
@@ -26663,7 +28512,8 @@ async fn serve_mutable_transfer_lane(
                         },
                         id,
                         &bytes,
-                        claim.as_ref(),
+                        custody,
+                        blob_contact_mode,
                     )?;
                     match disposition {
                         MutableApplyDisposition::Inserted => receipt.inserted += 1,
@@ -26684,15 +28534,16 @@ async fn serve_mutable_transfer_lane(
                     if class == MutableClass::Blob {
                         record_test_blob_contact_result_frame();
                     }
-                    Ok((
-                        Frame::MutableApplyResult {
-                            direction,
-                            id,
-                            disposition,
-                            custody_digest: None,
-                        },
-                        false,
-                    ))
+                    let response = Frame::MutableApplyResult {
+                        direction,
+                        id,
+                        disposition,
+                        custody_digest: verified_digest,
+                    };
+                    #[cfg(test)]
+                    let response =
+                        observe_and_fault_test_blob_settlement(store, response, verified_digest);
+                    Ok((response, false, None))
                 }
                 Frame::MutableFetch {
                     direction: request_direction,
@@ -26704,7 +28555,7 @@ async fn serve_mutable_transfer_lane(
                 {
                     guard.check(store)?;
                     authorize_transfer_item(authorization.authorize(id), receipt, "mutable fetch")?;
-                    let bytes = load_verified_mutable_for_peer(
+                    let loaded = load_verified_mutable_for_contact_peer(
                         store,
                         verifier,
                         source_snapshot,
@@ -26712,17 +28563,30 @@ async fn serve_mutable_transfer_lane(
                         peer,
                         &commitments,
                         receiver_interest,
+                        blob_contact_mode,
                     )?;
+                    let prepared = authorize_outbound_blob_claim(
+                        store,
+                        guard,
+                        mission,
+                        source_snapshot,
+                        id,
+                        direction,
+                        &loaded,
+                    )?;
+                    let claim = prepared.as_ref().map(|prepared| prepared.claim);
                     receipt.offered += 1;
-                    fetch_settlement.begin(id)?;
+                    fetch_settlement
+                        .begin(id, prepared.as_ref().map(|prepared| prepared.digest))?;
                     Ok((
                         Frame::MutableObject {
                             direction,
                             id,
-                            bytes,
-                            claim: None,
+                            bytes: loaded.bytes,
+                            claim,
                         },
                         false,
+                        prepared,
                     ))
                 }
                 frame @ Frame::MutableFetchResult { .. }
@@ -26730,9 +28594,19 @@ async fn serve_mutable_transfer_lane(
                         && fetch_settlement.is_pending() =>
                 {
                     guard.check(store)?;
+                    #[cfg(test)]
+                    let authority_digest = fetch_settlement
+                        .pending
+                        .and_then(|(_, verified_digest)| verified_digest);
                     let acknowledgement =
                         fetch_settlement.acknowledge(frame, class, direction, receipt)?;
-                    Ok((acknowledgement, false))
+                    #[cfg(test)]
+                    let acknowledgement = observe_and_fault_test_blob_settlement(
+                        store,
+                        acknowledgement,
+                        authority_digest,
+                    );
+                    Ok((acknowledgement, false, None))
                 }
                 frame @ Frame::MutableFinish { .. } => {
                     let exact_remaining = match direction {
@@ -26768,6 +28642,7 @@ async fn serve_mutable_transfer_lane(
                             remaining,
                         },
                         true,
+                        None,
                     ))
                 }
                 _ => Err(NodeError::Protocol(
@@ -26795,6 +28670,7 @@ async fn serve_mutable_class(
         guard,
         interests,
         class,
+        blob_contact_mode,
     } = contact;
     guard.check(store)?;
     let (local_interest, peer_interest) = if class == MutableClass::Blob {
@@ -26816,7 +28692,13 @@ async fn serve_mutable_class(
             OwnedMutableReceiveInterest::StateOrRecord(peer),
         )
     };
-    let source_snapshot = cached_mutable_sender_snapshot(store, guard.policy(), verifier, class)?;
+    let source_snapshot = cached_mutable_sender_snapshot_for_contact(
+        store,
+        guard.policy(),
+        verifier,
+        class,
+        blob_contact_mode,
+    )?;
     let to_responder = DirectedMutableLane {
         guard,
         source_snapshot: &source_snapshot,
@@ -26824,6 +28706,7 @@ async fn serve_mutable_class(
         semantic_version: mission.semantic_version(),
         class,
         direction: EventDirection::ToSessionResponder,
+        blob_contact_mode,
     };
     let outcome = serve_mutable_reconciliation_lane(
         store,
@@ -26854,6 +28737,7 @@ async fn serve_mutable_class(
         semantic_version: mission.semantic_version(),
         class,
         direction: EventDirection::ToSessionInitiator,
+        blob_contact_mode,
     };
     let outcome = serve_mutable_reconciliation_lane(
         store,
@@ -26889,10 +28773,14 @@ async fn serve_mutable_classes(
     connection: &aster_iroh::Connection,
     mission: &mut MissionSession,
     verifier: &mut ReferenceEnvelopeSealer,
-    guard: &EventLaneGuard,
-    interests: &MutableSourceInterests,
+    contact: MutableClassesContact<'_>,
     receipt: &mut PeerReceipt,
 ) -> Result<(), NodeError> {
+    let MutableClassesContact {
+        guard,
+        interests,
+        blob_contact_mode,
+    } = contact;
     if mission.semantic_version() >= MIN_BLOB_NETWORK_SEMANTIC_VERSION {
         let cache = contact_mutable_route_cache(verifier)?;
         cleanup_ineligible_pending_blobs(store, verifier, &cache)?;
@@ -26909,6 +28797,7 @@ async fn serve_mutable_classes(
                 guard,
                 interests,
                 class,
+                blob_contact_mode,
             },
             receipt,
         )
@@ -26927,6 +28816,7 @@ async fn serve_mutable_classes(
             mission,
             verifier,
             guard,
+            blob_contact_mode,
             EventDirection::ToSessionResponder,
             &local,
             &peer,
@@ -26939,6 +28829,7 @@ async fn serve_mutable_classes(
             mission,
             verifier,
             guard,
+            blob_contact_mode,
             EventDirection::ToSessionInitiator,
             &local,
             &peer,
@@ -26979,6 +28870,10 @@ async fn serve_session(
     apply_test_preaccounted_contact_items(&mut receipt)?;
     let transfer_profiles =
         serve_transfer_profiles(&connection, &mut mission, &mut receipt).await?;
+    let blob_contact_mode = BlobContactMode::from_authenticated_profiles(
+        mission.semantic_version(),
+        transfer_profiles.as_ref(),
+    )?;
     let local_emission = contact_policy_or_normal()?;
     if matches!(local_emission.policy, EventEmissionPolicy::ReceiveOnly)
         && mission.semantic_version() < MIN_CUSTODY_SEMANTIC_VERSION
@@ -27019,6 +28914,11 @@ async fn serve_session(
         mission.peer().mission_id(),
         receipt.controls_remaining,
     )?;
+    let mutable_contact = MutableClassesContact {
+        guard: &event_guard,
+        interests: &mutable_interests,
+        blob_contact_mode,
+    };
     if mission.semantic_version() < SEMANTIC_PROTOCOL_V7 {
         serve_selected_event_bridge(
             &connection,
@@ -27062,8 +28962,7 @@ async fn serve_session(
                     &connection,
                     &mut mission,
                     &mut event_verifier,
-                    &event_guard,
-                    &mutable_interests,
+                    mutable_contact,
                     &mut receipt,
                 )
                 .await?;
@@ -27142,8 +29041,7 @@ async fn serve_session(
                         &connection,
                         &mut mission,
                         &mut event_verifier,
-                        &event_guard,
-                        &mutable_interests,
+                        mutable_contact,
                         &mut receipt,
                     )
                     .await?;
@@ -27184,8 +29082,7 @@ async fn serve_session(
             &connection,
             &mut mission,
             &mut event_verifier,
-            &event_guard,
-            &mutable_interests,
+            mutable_contact,
             &mut receipt,
         )
         .await?;
@@ -27225,8 +29122,7 @@ async fn serve_session(
                     &connection,
                     &mut mission,
                     &mut event_verifier,
-                    &event_guard,
-                    &mutable_interests,
+                    mutable_contact,
                     &mut receipt,
                 )
                 .await?;
@@ -27374,8 +29270,7 @@ async fn serve_session(
             &connection,
             &mut mission,
             &mut event_verifier,
-            &event_guard,
-            &mutable_interests,
+            mutable_contact,
             &mut receipt,
         )
         .await?;
@@ -27583,6 +29478,102 @@ async fn request_mission_frame(
     )
 }
 
+type OpenedBlobCustody = (BlobCustodyClaimV1, AuthenticatedBlobCustodyContactV1);
+
+fn require_opened_blob_custody(
+    frame: &Frame,
+    opened: Option<OpenedBlobCustody>,
+) -> Result<Option<OpenedBlobCustody>, NodeError> {
+    let embedded = match frame {
+        Frame::MutableOffer { claim, .. } | Frame::MutableObject { claim, .. } => claim.as_ref(),
+        _ => {
+            return Err(NodeError::Protocol(
+                "Blob source protection opened a non-source frame".into(),
+            ));
+        }
+    };
+    match (embedded, opened) {
+        (None, None) => Ok(None),
+        (Some(embedded), Some((opened, authority))) if embedded == &opened => {
+            Ok(Some((opened, authority)))
+        }
+        _ => Err(NodeError::Protocol(
+            "protected Blob source claim differs from the decoded source frame".into(),
+        )),
+    }
+}
+
+async fn request_blob_source_offer_frame<F>(
+    store: &Store,
+    guard: &EventLaneGuard,
+    connection: &aster_iroh::Connection,
+    mission: &mut MissionSession,
+    direction: EventDirection,
+    receipt: &mut PeerReceipt,
+    build_immediately_before_send: F,
+) -> Result<(Frame, Option<[u8; 32]>), NodeError>
+where
+    F: FnOnce(&mut MissionSession) -> Result<(Frame, Option<PreparedOutboundBlobClaim>), NodeError>,
+{
+    require_contact_frame_initiation()?;
+    let wire_budget = exchange_wire_budget(receipt)?;
+    let (request, prepared) = build_immediately_before_send(mission)?;
+    let expected_digest = prepared.as_ref().map(|prepared| prepared.digest);
+    let claim = match &request {
+        Frame::MutableOffer { claim, .. } => claim.as_ref(),
+        _ => {
+            return Err(NodeError::Protocol(
+                "Blob source-offer protection received a non-offer frame".into(),
+            ));
+        }
+    };
+    let plaintext = request.encode_for_semantic_version(mission.semantic_version())?;
+    let protected_request =
+        mission.seal_blob_source_frame(blob_custody_direction(direction), claim, &plaintext)?;
+    let (protected_response, _) = connection
+        .request_with_total_limit_checked(&protected_request, wire_budget, || {
+            require_contact_frame_initiation()
+                .and_then(|_| finalize_outbound_blob_claim(store, guard, &request, prepared))
+        })
+        .await?;
+    let response = mission.open_application_frame(&protected_response)?;
+    let response = Frame::decode_for_semantic_version(&response, mission.semantic_version())?;
+    account(receipt, protected_request.len(), protected_response.len())?;
+    Ok((response, expected_digest))
+}
+
+async fn request_blob_source_fetch_frame(
+    connection: &aster_iroh::Connection,
+    mission: &mut MissionSession,
+    direction: EventDirection,
+    request: Frame,
+    receipt: &mut PeerReceipt,
+) -> Result<(Frame, Option<OpenedBlobCustody>), NodeError> {
+    require_contact_frame_initiation()?;
+    let wire_budget = exchange_wire_budget(receipt)?;
+    let plaintext = request.encode_for_semantic_version(mission.semantic_version())?;
+    let protected_request = mission.seal_application_frame(&plaintext)?;
+    let (protected_response, _) = connection
+        .request_with_total_limit_checked(&protected_request, wire_budget, || {
+            require_contact_frame_initiation()
+        })
+        .await?;
+    let (response, authority) =
+        mission.open_blob_source_frame(blob_custody_direction(direction), &protected_response)?;
+    #[cfg(test)]
+    if take_test_blob_receive_replay() {
+        let _ = mission
+            .open_blob_source_frame(blob_custody_direction(direction), &protected_response)?;
+        return Err(NodeError::Protocol(
+            "replayed Blob source frame unexpectedly reopened".into(),
+        ));
+    }
+    let response = Frame::decode_for_semantic_version(&response, mission.semantic_version())?;
+    let authority = require_opened_blob_custody(&response, authority)?;
+    account(receipt, protected_request.len(), protected_response.len())?;
+    Ok((response, authority))
+}
+
 async fn request_mission_frame_checked<F, T>(
     connection: &aster_iroh::Connection,
     mission: &mut MissionSession,
@@ -27619,7 +29610,10 @@ where
     let wire_budget = exchange_wire_budget(receipt)?;
     let (request, built) = build_immediately_before_send(mission)?;
     let plaintext = request.encode_for_semantic_version(mission.semantic_version())?;
-    let protected_request = mission.seal_application_frame(&plaintext)?;
+    #[allow(unused_mut)]
+    let mut protected_request = mission.seal_application_frame(&plaintext)?;
+    #[cfg(test)]
+    corrupt_test_blob_settlement_protection(&request, &mut protected_request);
     // The carrier invokes this check after QUIC stream acquisition and
     // immediately before invoking its first write. No bidirectional-stream
     // acquisition wait separates this custody/policy recheck from that call.
@@ -27675,6 +29669,126 @@ where
                     application_error = Some(error);
                     Err(CarrierError::Transport(
                         "mission-protected application frame rejected".into(),
+                    ))
+                }
+            }
+        })
+        .await;
+    if let Some(error) = application_error {
+        return Err(error);
+    }
+    let carrier_complete = carrier_result?;
+    let response_len = response_len.ok_or_else(|| {
+        NodeError::Protocol("mission response completed without a protected frame".into())
+    })?;
+    let handler_complete = complete.ok_or_else(|| {
+        NodeError::Protocol("mission response completed without a phase disposition".into())
+    })?;
+    if carrier_complete != handler_complete {
+        return Err(NodeError::Protocol(
+            "carrier and mission phase completion dispositions differ".into(),
+        ));
+    }
+    let request_len = request_len.ok_or_else(|| {
+        NodeError::Protocol("mission response completed without a protected request".into())
+    })?;
+    Ok((carrier_complete, request_len, response_len))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn respond_mutable_transfer_frame<F>(
+    store: &Store,
+    guard: &EventLaneGuard,
+    connection: &aster_iroh::Connection,
+    mission: &mut MissionSession,
+    wire_budget: usize,
+    direction: EventDirection,
+    source_request: bool,
+    source_response: bool,
+    handler: F,
+) -> Result<(bool, usize, usize), NodeError>
+where
+    F: FnOnce(
+        Frame,
+        Option<OpenedBlobCustody>,
+        usize,
+        &mut MissionSession,
+    ) -> Result<(Frame, bool, Option<PreparedOutboundBlobClaim>), NodeError>,
+{
+    let mut application_error = None;
+    let mut request_len = None;
+    let mut response_len = None;
+    let mut complete = None;
+    let carrier_result = connection
+        .respond_once_with_total_limit(wire_budget, |protected_request| {
+            require_contact_policy_current()
+                .map_err(|_| CarrierError::Transport("live emission policy changed".into()))?;
+            request_len = Some(protected_request.len());
+            let handled = (|| -> Result<Vec<u8>, NodeError> {
+                let (plaintext, authority) = if source_request {
+                    let opened = mission.open_blob_source_frame(
+                        blob_custody_direction(direction),
+                        protected_request,
+                    )?;
+                    #[cfg(test)]
+                    if take_test_blob_receive_replay() {
+                        let _ = mission.open_blob_source_frame(
+                            blob_custody_direction(direction),
+                            protected_request,
+                        )?;
+                        return Err(NodeError::Protocol(
+                            "replayed Blob source frame unexpectedly reopened".into(),
+                        ));
+                    }
+                    opened
+                } else {
+                    (mission.open_application_frame(protected_request)?, None)
+                };
+                let frame =
+                    Frame::decode_for_semantic_version(&plaintext, mission.semantic_version())?;
+                let authority = if source_request {
+                    require_opened_blob_custody(&frame, authority)?
+                } else {
+                    None
+                };
+                let (response, session_complete, prepared) =
+                    handler(frame, authority, protected_request.len(), mission)?;
+                require_contact_frame_response(&response)?;
+                let response_plaintext =
+                    response.encode_for_semantic_version(mission.semantic_version())?;
+                #[allow(unused_mut)]
+                let mut protected_response = if source_response {
+                    let claim = match &response {
+                        Frame::MutableObject { claim, .. } => claim.as_ref(),
+                        _ => {
+                            return Err(NodeError::Protocol(
+                                "Blob source response protection received a non-object frame"
+                                    .into(),
+                            ));
+                        }
+                    };
+                    mission.seal_blob_source_frame(
+                        blob_custody_direction(direction),
+                        claim,
+                        &response_plaintext,
+                    )?
+                } else {
+                    mission.seal_application_frame(&response_plaintext)?
+                };
+                #[cfg(test)]
+                corrupt_test_blob_settlement_protection(&response, &mut protected_response);
+                finalize_outbound_blob_claim(store, guard, &response, prepared)?;
+                require_contact_policy_current()?;
+                response_len = Some(protected_response.len());
+                complete = Some(session_complete);
+                Ok(protected_response)
+            })();
+            match handled {
+                Ok(response) => Ok((response, complete.unwrap_or(false))),
+                Err(error) => {
+                    application_error = Some(error);
+                    Err(CarrierError::Transport(
+                        "mission-protected mutable transfer frame rejected".into(),
                     ))
                 }
             }
@@ -31154,8 +33268,8 @@ mod tests {
         let direction = EventDirection::ToSessionInitiator;
         let mut receipt = PeerReceipt::default();
         let mut settlement = MutableFetchSettlement::default();
-        settlement.begin(id).expect("first pending fetch");
-        assert!(settlement.begin(other_id).is_err());
+        settlement.begin(id, None).expect("first pending fetch");
+        assert!(settlement.begin(other_id, None).is_err());
 
         for wrong in [
             Frame::MutableFinish {
@@ -31230,7 +33344,7 @@ mod tests {
                 .is_err()
         );
 
-        settlement.begin(other_id).expect("next fetch");
+        settlement.begin(other_id, None).expect("next fetch");
         let deferred_ack = settlement
             .acknowledge(
                 Frame::MutableFetchResult {
@@ -31477,6 +33591,431 @@ mod tests {
         assert!(require_blob_custody_digest(Some(expected), None).is_err());
         assert!(require_blob_custody_digest(Some(expected), Some(expected)).is_ok());
         assert!(require_blob_custody_digest(Some(expected), Some([0x72; 32])).is_err());
+    }
+
+    #[test]
+    fn blob_wrong_settlement_matrix_preserves_all_cursor_coordinates_and_logical_state() {
+        // Mutation caught: accepting any result/ack tuple other than the exact
+        // direction, transfer, disposition, and verified claim digest could
+        // move a Blob scheduler cursor past an unsettled source.
+        let services = control_test_services([0x73; 32]);
+        let authority = services.member.mission_authority_id();
+        let left_root = root("blob-wrong-settlement-left");
+        let right_root = root("blob-wrong-settlement-right");
+        fs::create_dir_all(&left_root).expect("left settlement root");
+        fs::create_dir_all(&right_root).expect("right settlement root");
+        let left = Store::open_for_mission(left_root.join(STORE_FILE), authority)
+            .expect("left settlement store");
+        let right = Store::open_for_mission(right_root.join(STORE_FILE), authority)
+            .expect("right settlement store");
+        let left_peer = services.other.identity();
+        let right_peer = services.member.identity();
+        let id = MutableTransferId::Blob(BlobTransferId::new([0x74; 32]));
+        let other_id = MutableTransferId::Blob(BlobTransferId::new([0x75; 32]));
+        let exact = [0x76; 32];
+        let stale = [0x77; 32];
+        let cross_exchange = [0x78; 32];
+        let cross_direction = [0x79; 32];
+        let cross_transfer = [0x7a; 32];
+        let direction = EventDirection::ToSessionResponder;
+        let disposition = MutableApplyDisposition::Inserted;
+        let left_digest = left.test_blob_logical_digest();
+        let right_digest = right.test_blob_logical_digest();
+        let mut offer_expected = None;
+
+        for (label, frame, expected_digest) in [
+            (
+                "finite-missing",
+                Frame::MutableApplyResult {
+                    direction,
+                    id,
+                    disposition,
+                    custody_digest: None,
+                },
+                Some(exact),
+            ),
+            (
+                "wrong",
+                Frame::MutableApplyResult {
+                    direction,
+                    id,
+                    disposition,
+                    custody_digest: Some([0x7b; 32]),
+                },
+                Some(exact),
+            ),
+            (
+                "stale-prior-contact",
+                Frame::MutableApplyResult {
+                    direction,
+                    id,
+                    disposition,
+                    custody_digest: Some(stale),
+                },
+                Some(exact),
+            ),
+            (
+                "cross-exchange",
+                Frame::MutableApplyResult {
+                    direction,
+                    id,
+                    disposition,
+                    custody_digest: Some(cross_exchange),
+                },
+                Some(exact),
+            ),
+            (
+                "cross-direction-digest",
+                Frame::MutableApplyResult {
+                    direction,
+                    id,
+                    disposition,
+                    custody_digest: Some(cross_direction),
+                },
+                Some(exact),
+            ),
+            (
+                "cross-transfer-digest",
+                Frame::MutableApplyResult {
+                    direction,
+                    id,
+                    disposition,
+                    custody_digest: Some(cross_transfer),
+                },
+                Some(exact),
+            ),
+            (
+                "cross-direction-field",
+                Frame::MutableApplyResult {
+                    direction: EventDirection::ToSessionInitiator,
+                    id,
+                    disposition,
+                    custody_digest: Some(exact),
+                },
+                Some(exact),
+            ),
+            (
+                "cross-transfer-field",
+                Frame::MutableApplyResult {
+                    direction,
+                    id: other_id,
+                    disposition,
+                    custody_digest: Some(exact),
+                },
+                Some(exact),
+            ),
+            (
+                "durable-extra",
+                Frame::MutableApplyResult {
+                    direction,
+                    id,
+                    disposition,
+                    custody_digest: Some(exact),
+                },
+                None,
+            ),
+        ] {
+            assert!(
+                settle_mutable_apply_result(
+                    &left,
+                    left_peer,
+                    MutableClass::Blob,
+                    direction,
+                    &mut offer_expected,
+                    id,
+                    frame,
+                    expected_digest
+                )
+                .is_err(),
+                "offer/apply accepted {label} settlement"
+            );
+        }
+
+        let fetch_direction = EventDirection::ToSessionInitiator;
+        let mut fetch_expected = None;
+        for (label, digest) in [
+            ("finite-missing", None),
+            ("wrong", Some([0x7b; 32])),
+            ("stale-prior-contact", Some(stale)),
+            ("cross-exchange", Some(cross_exchange)),
+            ("cross-direction", Some(cross_direction)),
+            ("cross-transfer", Some(cross_transfer)),
+        ] {
+            assert!(
+                acknowledge_mutable_fetch_result(
+                    Frame::MutableFetchResult {
+                        direction: fetch_direction,
+                        id,
+                        disposition,
+                        custody_digest: digest,
+                    },
+                    MutableClass::Blob,
+                    fetch_direction,
+                    id,
+                    Some(exact),
+                )
+                .is_err(),
+                "fetch result accepted {label} digest"
+            );
+            assert!(
+                settle_mutable_fetch_result_ack(
+                    &right,
+                    right_peer,
+                    MutableClass::Blob,
+                    fetch_direction,
+                    &mut fetch_expected,
+                    id,
+                    disposition,
+                    Frame::MutableFetchResultAck {
+                        direction: fetch_direction,
+                        id,
+                        disposition,
+                        custody_digest: digest,
+                    },
+                    Some(exact),
+                )
+                .is_err(),
+                "fetch acknowledgement accepted {label} digest"
+            );
+        }
+        assert!(
+            settle_mutable_fetch_result_ack(
+                &right,
+                right_peer,
+                MutableClass::Blob,
+                fetch_direction,
+                &mut fetch_expected,
+                id,
+                disposition,
+                Frame::MutableFetchResultAck {
+                    direction: fetch_direction,
+                    id,
+                    disposition: MutableApplyDisposition::Duplicate,
+                    custody_digest: Some(exact),
+                },
+                Some(exact),
+            )
+            .is_err(),
+            "fetch acknowledgement accepted a wrong disposition"
+        );
+
+        for (store, peer, digest) in [
+            (&left, left_peer, left_digest),
+            (&right, right_peer, right_digest),
+        ] {
+            for mode in [
+                MutableTransferCursorMode::OfferToPeer,
+                MutableTransferCursorMode::FetchFromPeer,
+            ] {
+                assert_eq!(
+                    store
+                        .mutable_transfer_cursor(peer, MutableTransferCursorClass::Blob, mode)
+                        .expect("unchanged settlement cursor"),
+                    None,
+                );
+            }
+            assert_eq!(store.test_blob_logical_digest(), digest);
+        }
+        drop((left, right));
+        fs::remove_dir_all(left_root).expect("left settlement cleanup");
+        fs::remove_dir_all(right_root).expect("right settlement cleanup");
+    }
+
+    #[tokio::test]
+    async fn mutable_blob_cursor_cas_chains_success_and_stops_without_skipping_on_mismatch() {
+        // Mutation caught: a helper-only CAS test cannot prove the live loop
+        // stops before the third item or that a reopened initiator starts its
+        // next selected sequence at the unsettled second item.
+        let services = control_test_services([0x7c; 32]);
+        let authority = services.member.mission_authority_id();
+        let source_state = root("mutable-blob-cursor-cas-source");
+        let first_receiver_state = root("mutable-blob-cursor-cas-first-receiver");
+        let retry_receiver_state = root("mutable-blob-cursor-cas-retry-receiver");
+        for state in [&source_state, &first_receiver_state, &retry_receiver_state] {
+            fs::create_dir_all(state).expect("cursor CAS root");
+        }
+        let source_store = Arc::new(
+            Store::open_for_mission(source_state.join(STORE_FILE), authority)
+                .expect("cursor CAS source store"),
+        );
+        let first_receiver = Arc::new(
+            Store::open_for_mission(first_receiver_state.join(STORE_FILE), authority)
+                .expect("cursor CAS first receiver"),
+        );
+        let mut sealer = open_test_sealer(&services.member);
+        let mut ids = [
+            publish_test_finite_blob(
+                &source_store,
+                &mut sealer,
+                &services.topic,
+                &services.scope,
+                1,
+                b"cursor CAS first",
+                600_000,
+                25,
+                CustodySample {
+                    clock_id: BLOB_CONTACT_TEST_CLIENT_CLOCK_ID,
+                    tick_ms: 0,
+                },
+            ),
+            publish_test_finite_blob(
+                &source_store,
+                &mut sealer,
+                &services.topic,
+                &services.scope,
+                1,
+                b"cursor CAS second",
+                600_000,
+                25,
+                CustodySample {
+                    clock_id: BLOB_CONTACT_TEST_CLIENT_CLOCK_ID,
+                    tick_ms: 0,
+                },
+            ),
+            publish_test_finite_blob(
+                &source_store,
+                &mut sealer,
+                &services.topic,
+                &services.scope,
+                1,
+                b"cursor CAS third",
+                600_000,
+                25,
+                CustodySample {
+                    clock_id: BLOB_CONTACT_TEST_CLIENT_CLOCK_ID,
+                    tick_ms: 0,
+                },
+            ),
+        ];
+        ids.sort();
+        let mut competing = *ids[0].as_bytes();
+        for byte in competing.iter_mut().rev() {
+            if *byte != u8::MAX {
+                *byte += 1;
+                break;
+            }
+            *byte = 0;
+        }
+        assert!(&competing < ids[1].as_bytes());
+        let interests = || {
+            MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
+                services.topic.clone(),
+                services.scope.clone(),
+                false,
+            )])
+        };
+        let first_server_harness = TestBlobSettlementHarness::with_transfer_capacity(3);
+        let first_client_harness = TestBlobSettlementHarness::with_cas_mismatch(1, competing);
+        let (first_client, first_server) = blob_contact_test_pair_with_settlement_harness(
+            first_receiver.clone(),
+            services.other.clone(),
+            interests(),
+            test_event_route_cache(&first_receiver, &services.other),
+            source_store.clone(),
+            services.member.clone(),
+            interests(),
+            test_event_route_cache(&source_store, &services.member),
+            first_server_harness.clone(),
+            first_client_harness.clone(),
+        )
+        .await;
+        assert!(
+            first_client.is_err() || first_server.is_err(),
+            "CAS fault state: {:?}",
+            first_client_harness.0.lock().expect("CAS harness lock")
+        );
+        assert_eq!(
+            first_server_harness
+                .observations()
+                .iter()
+                .filter(|observation| { observation.kind == TestBlobSettlementKind::ApplyResult })
+                .map(|observation| observation.id)
+                .collect::<Vec<_>>(),
+            vec![
+                MutableTransferId::Blob(ids[0]),
+                MutableTransferId::Blob(ids[1]),
+            ],
+            "the production loop settles the first, observes the second mismatch, and never sends the third"
+        );
+        assert!(
+            first_receiver
+                .pending_blob_source(ids[0])
+                .expect("first receiver first source")
+                .is_some()
+        );
+        assert!(
+            first_receiver
+                .pending_blob_source(ids[1])
+                .expect("first receiver second source")
+                .is_some()
+        );
+        assert!(
+            first_receiver
+                .pending_blob_source(ids[2])
+                .expect("first receiver third source")
+                .is_none()
+        );
+        assert_eq!(
+            source_store
+                .mutable_transfer_cursor(
+                    services.other.identity(),
+                    MutableTransferCursorClass::Blob,
+                    MutableTransferCursorMode::OfferToPeer,
+                )
+                .expect("cursor after live mismatch"),
+            Some(competing)
+        );
+
+        drop(source_store);
+        let source_store = Arc::new(
+            Store::open_for_mission(source_state.join(STORE_FILE), authority)
+                .expect("reopened cursor CAS source"),
+        );
+        let retry_receiver = Arc::new(
+            Store::open_for_mission(retry_receiver_state.join(STORE_FILE), authority)
+                .expect("cursor CAS retry receiver"),
+        );
+        let retry_server_harness = TestBlobSettlementHarness::with_transfer_capacity(3);
+        let retry_client_harness = TestBlobSettlementHarness::with_transfer_capacity(3);
+        let (retry_client, retry_server) = blob_contact_test_pair_with_settlement_harness(
+            retry_receiver.clone(),
+            services.other.clone(),
+            interests(),
+            test_event_route_cache(&retry_receiver, &services.other),
+            source_store.clone(),
+            services.member.clone(),
+            interests(),
+            test_event_route_cache(&source_store, &services.member),
+            retry_server_harness.clone(),
+            retry_client_harness,
+        )
+        .await;
+        assert!(
+            retry_client.is_ok() && retry_server.is_ok(),
+            "cursor CAS retry: client={retry_client:?}, server={retry_server:?}"
+        );
+        assert_eq!(
+            retry_server_harness.observations()[0].id,
+            MutableTransferId::Blob(ids[1]),
+            "reopened sender resumes from the unsettled second item"
+        );
+        assert!(
+            retry_receiver
+                .pending_blob_source(ids[1])
+                .expect("retry second source")
+                .is_some()
+        );
+        assert!(
+            retry_receiver
+                .pending_blob_source(ids[2])
+                .expect("retry third source")
+                .is_some()
+        );
+
+        drop((source_store, first_receiver, retry_receiver));
+        fs::remove_dir_all(source_state).expect("cursor CAS source cleanup");
+        fs::remove_dir_all(first_receiver_state).expect("cursor CAS first receiver cleanup");
+        fs::remove_dir_all(retry_receiver_state).expect("cursor CAS retry receiver cleanup");
     }
 
     #[test]
@@ -32468,7 +35007,8 @@ mod tests {
                         &historical_state_source.sealed,
                         None,
                     )
-                    .expect("accept post-startup historical State"),
+                    .expect("accept post-startup historical State")
+                    .0,
                     MutableApplyDisposition::Inserted
                 );
 
@@ -32488,7 +35028,8 @@ mod tests {
                         &historical_state_source.sealed,
                         None,
                     )
-                    .expect("accept duplicate historical State"),
+                    .expect("accept duplicate historical State")
+                    .0,
                     MutableApplyDisposition::Duplicate
                 );
 
@@ -32506,7 +35047,8 @@ mod tests {
                         &historical_record_source.sealed,
                         None,
                     )
-                    .expect("accept post-startup historical Record"),
+                    .expect("accept post-startup historical Record")
+                    .0,
                     MutableApplyDisposition::Inserted
                 );
             })
@@ -43964,6 +46506,121 @@ mod tests {
         )
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "finite Blob fixture keeps authenticated lifetime inputs explicit"
+    )]
+    fn publish_test_finite_blob(
+        store: &Store,
+        sealer: &mut ReferenceEnvelopeSealer,
+        topic: &Topic,
+        scope: &Scope,
+        epoch: u64,
+        plaintext: &[u8],
+        ttl_ms: u64,
+        forwarding_age_ms: u64,
+        sample: CustodySample,
+    ) -> BlobTransferId {
+        let prepared = aster_mesh::prepare_blob(
+            &mut std::io::Cursor::new(plaintext),
+            aster_mesh::SELECTED_BLOB_CHUNK_SIZE,
+            aster_mesh::BlobMetadata::new(Some("application/octet-stream".into()), Vec::new())
+                .expect("finite Blob metadata"),
+        )
+        .expect("prepare finite test Blob");
+        let finished = {
+            let depot = store.blob_depot().expect("finite Blob depot");
+            let mut service = sealer
+                .blob_service_with_store(scope, topic, epoch, depot)
+                .expect("finite Blob service");
+            let manifest = service
+                .install_prepared(&prepared)
+                .expect("install finite prepared Blob");
+            let progress = service
+                .encrypt_some(
+                    &mut std::io::Cursor::new(plaintext),
+                    &manifest,
+                    prepared.chunk_count(),
+                )
+                .expect("encrypt finite test Blob");
+            assert!(progress.complete);
+            service
+                .finish_manifest(&manifest)
+                .expect("finish finite Blob")
+        };
+        let policy = store.control_policy_snapshot().expect("finite Blob policy");
+        let reservation = store
+            .reserve_blob_with_policy(&policy, sealer.identity(), topic, scope)
+            .expect("reserve finite Blob causal dot");
+        let mut header = reservation
+            .header(
+                Priority::Routine,
+                finished.route_commitment(),
+                u64::try_from(finished.manifest_bytes().len()).expect("finite manifest length"),
+                epoch,
+            )
+            .expect("finite Blob header");
+        header.ttl_ms = Some(ttl_ms);
+        let sealed = sealer
+            .seal_blob_manifest(&header, finished.manifest_bytes())
+            .expect("seal finite Blob source");
+        let route = sealer
+            .verify_blob(&sealed.bytes)
+            .expect("verify finite Blob route");
+        let BlobContentVerification::ContentVerified {
+            blob,
+            manifest_bytes,
+        } = sealer
+            .verify_blob_content(route, &sealed.bytes)
+            .expect("verify finite Blob content")
+        else {
+            panic!("publisher lacks finite Blob content grant");
+        };
+        let plan = blob
+            .transfer_plan(&manifest_bytes)
+            .expect("finite Blob transfer plan");
+        assert_eq!(
+            store
+                .test_stage_verified_finite_blob_source_with_policy(
+                    &policy,
+                    &blob,
+                    &sealed.bytes,
+                    &plan,
+                    forwarding_age_ms,
+                    sample,
+                )
+                .expect("stage finite Blob source"),
+            BlobSourceStageOutcome::Inserted
+        );
+        let completion = store
+            .completed_pending_blob_with_policy(
+                &policy,
+                BlobTransferId::new(blob.envelope_id()),
+                &blob,
+                &manifest_bytes,
+                &plan,
+            )
+            .expect("complete finite Blob source");
+        let content = {
+            let depot = store
+                .blob_depot_for_authenticated_read(&completion)
+                .expect("finite authenticated depot");
+            let mut reader = sealer
+                .blob_service_with_store(scope, topic, epoch, depot)
+                .expect("finite Blob content verifier");
+            reader
+                .verify_blob_content_completion(&blob, &manifest_bytes)
+                .expect("finite Blob content completion")
+        };
+        let lineage = sealer
+            .verify_current_blob_lineage(&blob)
+            .expect("finite Blob current lineage");
+        store
+            .apply_verified_blob_with_policy(&policy, &plan, &lineage, &completion, &content)
+            .expect("promote finite Blob source");
+        BlobTransferId::new(blob.envelope_id())
+    }
+
     fn publish_test_blob_with_priority(
         store: &Store,
         sealer: &mut ReferenceEnvelopeSealer,
@@ -44223,14 +46880,17 @@ mod tests {
                 .verify_blob_content_completion(&blob, &manifest_bytes)
                 .expect("memo fixture content completion")
         };
-        let pending_claim = AuthenticatedBlobRouteClaim::from_verified(
+        let mut pending_claim = AuthenticatedBlobRouteClaim::from_verified(
+            &store,
             &blob,
             &stored.sealed,
             &projection.source,
-            BlobSourceRetention::Pending,
-            None,
+            projection.retention,
+            Some(depot_completion.clone()),
         )
         .expect("synthetic pending cache claim");
+        pending_claim.retention = BlobSourceRetention::Pending;
+        pending_claim.depot_completion = None;
         cache
             .insert_blob(&verifier, pending_claim.clone())
             .expect("cache pending claim");
@@ -44274,6 +46934,7 @@ mod tests {
             .insert_blob(
                 &verifier,
                 AuthenticatedBlobRouteClaim::from_verified(
+                    &store,
                     &unrelated_blob,
                     &unrelated_stored.sealed,
                     &unrelated_projection.source,
@@ -45614,6 +48275,7 @@ mod tests {
             .expect("pending test Blob projection");
         assert_eq!(projection.retention, BlobSourceRetention::Pending);
         let claim = AuthenticatedBlobRouteClaim::from_verified(
+            store,
             &blob,
             sealed,
             &projection.source,
@@ -45782,6 +48444,7 @@ mod tests {
             .insert_blob(
                 &completed_verifier,
                 AuthenticatedBlobRouteClaim::from_verified(
+                    &source_store,
                     &blob,
                     &completed.sealed,
                     &projection.source,
@@ -45873,12 +48536,17 @@ mod tests {
             .blob_depot()
             .and_then(|mut depot| depot.completed_blob(&blob_b, &manifest_b))
             .expect("second exact depot completion");
+        let completion_a = store
+            .blob_depot()
+            .and_then(|mut depot| depot.completed_blob(&blob_a, &manifest_a))
+            .expect("first exact depot completion");
         let projection_a = store
             .blob_source_projection(source_a)
             .expect("first projection lookup")
             .expect("first completed projection");
         assert!(matches!(
             AuthenticatedBlobRouteClaim::from_verified(
+                &store,
                 &blob_a,
                 &stored_a.sealed,
                 &projection_a.source,
@@ -45888,23 +48556,31 @@ mod tests {
             Err(NodeError::Protocol(_))
         ));
 
-        let stale_pending = AuthenticatedBlobRouteClaim::from_verified(
+        let mut stale_pending = AuthenticatedBlobRouteClaim::from_verified(
+            &store,
             &blob_a,
             &stored_a.sealed,
             &projection_a.source,
-            BlobSourceRetention::Pending,
-            None,
+            projection_a.retention,
+            Some(completion_a),
         )
         .expect("inject stale pending cache class");
+        stale_pending.retention = BlobSourceRetention::Pending;
+        stale_pending.depot_completion = None;
         let cache = AuthenticatedEventRouteCache::empty_for_store(&verifier, &store)
             .expect("retention repair cache");
         cache
             .insert_blob(&verifier, stale_pending)
             .expect("cache stale pending class");
-        let repaired =
-            repair_blob_sender_cache_miss(&store, &mut verifier, &cache, &projection_a.source)
-                .expect("repair completed cache class")
-                .expect("completed source remains retained");
+        let repaired = repair_blob_sender_cache_miss(
+            &store,
+            &mut verifier,
+            &cache,
+            &projection_a.source,
+            BlobContactMode::DurableOnly,
+        )
+        .expect("repair completed cache class")
+        .expect("completed source remains retained");
         assert!(repaired.matches_retention(projection_a.retention));
         assert!(repaired.depot_completion.is_some());
         let cached = cache
@@ -46033,7 +48709,7 @@ mod tests {
             AuthenticatedEventRouteCache::empty_for_store(&receiver_verifier, &receiver_store)
                 .expect("exhausted stage cache");
         exhausted.blob_capacity = 0;
-        let stage_error = cache_staged_blob_after_durable_transition(
+        let stage_error = cache_staged_blob_after_transition(
             &receiver_store,
             &mut receiver_verifier,
             &exhausted,
@@ -46057,6 +48733,7 @@ mod tests {
             .expect("pending projection lookup")
             .expect("pending projection");
         let pending = AuthenticatedBlobRouteClaim::from_verified(
+            &receiver_store,
             &blob,
             &sealed,
             &projection.source,
@@ -46118,24 +48795,28 @@ mod tests {
             AuthenticatedEventRouteCache::empty_for_store(&source_verifier, &source_store)
                 .expect("promotion cache");
         let mut conflicting_promotion = AuthenticatedBlobRouteClaim::from_verified(
+            &source_store,
             &source_blob,
             &completed.sealed,
             &projection.source,
-            BlobSourceRetention::Pending,
-            None,
+            projection.retention,
+            Some(completion.clone()),
         )
         .expect("inject pre-promotion cache claim");
+        conflicting_promotion.retention = BlobSourceRetention::Pending;
+        conflicting_promotion.depot_completion = None;
         conflicting_promotion.metadata_fingerprint[0] ^= 0x40;
         promotion_cache
             .insert_blob(&source_verifier, conflicting_promotion)
             .expect("cache conflicting pre-promotion claim");
-        let promotion_error = cache_promoted_blob_after_durable_transition(
+        let promotion_error = cache_promoted_blob_after_contact_transition(
             &source_store,
             &source_verifier,
             &promotion_cache,
             source,
             &source_blob,
             completion,
+            BlobContactMode::DurableOnly,
         )
         .expect_err("post-promotion cache failure must be fatal");
         assert!(matches!(promotion_error, NodeError::FatalBlobCoherence(_)));
@@ -46309,6 +48990,7 @@ mod tests {
                     1,
                     1,
                     &proof,
+                    BlobContactMode::DurableOnly,
                 )
             })
             .await
@@ -46345,6 +49027,7 @@ mod tests {
                     peer,
                     &commitments,
                     MutableReceiveInterest::Blob(&peer_interest),
+                    BlobContactMode::DurableOnly,
                 )
             })
             .await
@@ -46368,6 +49051,7 @@ mod tests {
                     0,
                     requested_len,
                     &proof,
+                    BlobContactMode::DurableOnly,
                 )
             })
             .await
@@ -46391,6 +49075,7 @@ mod tests {
                     0,
                     requested_len,
                     &proof,
+                    BlobContactMode::DurableOnly,
                 )
             })
             .await
@@ -46413,6 +49098,7 @@ mod tests {
                     0,
                     requested_len,
                     &proof,
+                    BlobContactMode::DurableOnly,
                 )
             })
             .await
@@ -46434,6 +49120,7 @@ mod tests {
                     peer,
                     &commitments,
                     MutableReceiveInterest::Blob(&peer_interest),
+                    BlobContactMode::DurableOnly,
                 )
             })
             .await
@@ -46745,6 +49432,101 @@ mod tests {
         Result<CompletedPeerContact, NodeError>,
         Result<CompletedPeerContact, NodeError>,
     ) {
+        blob_contact_test_pair_with_caches_results_and_finalization_delays(
+            server_store,
+            server_mission,
+            server_interests,
+            server_cache,
+            client_store,
+            client_mission,
+            client_interests,
+            client_cache,
+            server_bridge,
+            client_bridge,
+            server_reconciliation_exchanges_before_defer,
+            client_reconciliation_exchanges_before_defer,
+            preaccounted_contact_items,
+            None,
+            None,
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn blob_contact_test_pair_with_settlement_harness(
+        server_store: Arc<Store>,
+        server_mission: UnprotectedReferenceMission,
+        server_interests: MutableSourceInterests,
+        server_cache: Arc<AuthenticatedEventRouteCache>,
+        client_store: Arc<Store>,
+        client_mission: UnprotectedReferenceMission,
+        client_interests: MutableSourceInterests,
+        client_cache: Arc<AuthenticatedEventRouteCache>,
+        server_harness: TestBlobSettlementHarness,
+        client_harness: TestBlobSettlementHarness,
+    ) -> (
+        Result<CompletedPeerContact, NodeError>,
+        Result<CompletedPeerContact, NodeError>,
+    ) {
+        blob_contact_test_pair_with_caches_results_and_finalization_delays(
+            server_store,
+            server_mission,
+            server_interests,
+            server_cache,
+            client_store,
+            client_mission,
+            client_interests,
+            client_cache,
+            None,
+            None,
+            None,
+            None,
+            0,
+            None,
+            None,
+            0,
+            0,
+            None,
+            None,
+            Some(server_harness),
+            Some(client_harness),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn blob_contact_test_pair_with_caches_results_and_finalization_delays(
+        server_store: Arc<Store>,
+        server_mission: UnprotectedReferenceMission,
+        server_interests: MutableSourceInterests,
+        server_cache: Arc<AuthenticatedEventRouteCache>,
+        client_store: Arc<Store>,
+        client_mission: UnprotectedReferenceMission,
+        client_interests: MutableSourceInterests,
+        client_cache: Arc<AuthenticatedEventRouteCache>,
+        server_bridge: Option<SelectedEventBridgeHandle>,
+        client_bridge: Option<SelectedEventBridgeHandle>,
+        server_reconciliation_exchanges_before_defer: Option<usize>,
+        client_reconciliation_exchanges_before_defer: Option<usize>,
+        preaccounted_contact_items: usize,
+        server_finalization_delay_ms: Option<u64>,
+        client_finalization_delay_ms: Option<u64>,
+        server_clock_tick_ms: u64,
+        client_clock_tick_ms: u64,
+        server_receive_fault: Option<TestBlobReceiveFault>,
+        client_receive_fault: Option<TestBlobReceiveFault>,
+        server_settlement_harness: Option<TestBlobSettlementHarness>,
+        client_settlement_harness: Option<TestBlobSettlementHarness>,
+    ) -> (
+        Result<CompletedPeerContact, NodeError>,
+        Result<CompletedPeerContact, NodeError>,
+    ) {
         let server = Endpoint::bind(
             aster_iroh::SecretKey::generate(),
             EndpointConfig::direct("127.0.0.1:0".parse().expect("server address")),
@@ -46769,66 +49551,88 @@ mod tests {
                     .accept(&allowed)
                     .await
                     .expect("accept Blob carrier");
-                TEST_PREACCOUNTED_CONTACT_ITEMS
+                TEST_BLOB_SETTLEMENT_HARNESS
                     .scope(
-                        std::cell::Cell::new(preaccounted_contact_items),
-                        with_test_contact_hooks(
-                            server_reconciliation_exchanges_before_defer,
-                            Vec::new(),
-                            serve_connection_with_forwarding(InboundContact {
-                                store: server_store,
-                                connection,
-                                mission: server_mission,
-                                expected_peer: Some(peer),
-                                #[cfg(feature = "nearby-discovery")]
-                                automatic_admission: None,
-                                policy_lock: Arc::new(RwLock::new(())),
-                                emission_policy: server_policy,
-                                custody_clock: NodeCustodyClock::injected([0xb1; 16], 0, 0),
-                                event_route_cache: server_cache,
-                                event_bridge: server_bridge,
-                                mutable_interests: server_interests,
-                            }),
+                        server_settlement_harness.unwrap_or_default(),
+                        TEST_BLOB_RECEIVE_FAULT.scope(
+                            std::cell::Cell::new(server_receive_fault),
+                            TEST_BLOB_FINALIZATION_DELAY_MS.scope(
+                                std::cell::Cell::new(server_finalization_delay_ms),
+                                TEST_PREACCOUNTED_CONTACT_ITEMS.scope(
+                                    std::cell::Cell::new(preaccounted_contact_items),
+                                    with_test_contact_hooks(
+                                        server_reconciliation_exchanges_before_defer,
+                                        Vec::new(),
+                                        serve_connection_with_forwarding(InboundContact {
+                                            store: server_store,
+                                            connection,
+                                            mission: server_mission,
+                                            expected_peer: Some(peer),
+                                            #[cfg(feature = "nearby-discovery")]
+                                            automatic_admission: None,
+                                            policy_lock: Arc::new(RwLock::new(())),
+                                            emission_policy: server_policy,
+                                            custody_clock: NodeCustodyClock::injected(
+                                                [0xb1; 16],
+                                                server_clock_tick_ms,
+                                                0,
+                                            ),
+                                            event_route_cache: server_cache,
+                                            event_bridge: server_bridge,
+                                            mutable_interests: server_interests,
+                                        }),
+                                    ),
+                                ),
+                            ),
                         ),
                     )
                     .await
             }
         });
         let snapshot = client_policy.snapshot().expect("client policy snapshot");
-        let client_receipt = TEST_PREACCOUNTED_CONTACT_ITEMS
+        let client_receipt = TEST_BLOB_SETTLEMENT_HARNESS
             .scope(
-                std::cell::Cell::new(preaccounted_contact_items),
-                with_test_contact_hooks(
-                    client_reconciliation_exchanges_before_defer,
-                    Vec::new(),
-                    sync_once_with_forwarding(
-                        &client,
-                        OutboundContact {
-                            store: client_store,
-                            mission: client_mission,
-                            peer: MissionExpectedPeer {
-                                carrier: ExpectedPeer {
-                                    id: server.id(),
-                                    address: loopback(&server),
-                                },
-                                mission: server_mission_id,
-                            }
-                            .into(),
-                            #[cfg(feature = "nearby-discovery")]
-                            automatic_admission: None,
-                            policy_lock: Arc::new(RwLock::new(())),
-                            emission_policy: client_policy,
-                            emission_snapshot: snapshot,
-                            custody_clock: NodeCustodyClock::injected(
-                                BLOB_CONTACT_TEST_CLIENT_CLOCK_ID,
-                                0,
-                                0,
+                client_settlement_harness.unwrap_or_default(),
+                TEST_BLOB_RECEIVE_FAULT.scope(
+                    std::cell::Cell::new(client_receive_fault),
+                    TEST_BLOB_FINALIZATION_DELAY_MS.scope(
+                        std::cell::Cell::new(client_finalization_delay_ms),
+                        TEST_PREACCOUNTED_CONTACT_ITEMS.scope(
+                            std::cell::Cell::new(preaccounted_contact_items),
+                            with_test_contact_hooks(
+                                client_reconciliation_exchanges_before_defer,
+                                Vec::new(),
+                                sync_once_with_forwarding(
+                                    &client,
+                                    OutboundContact {
+                                        store: client_store,
+                                        mission: client_mission,
+                                        peer: MissionExpectedPeer {
+                                            carrier: ExpectedPeer {
+                                                id: server.id(),
+                                                address: loopback(&server),
+                                            },
+                                            mission: server_mission_id,
+                                        }
+                                        .into(),
+                                        #[cfg(feature = "nearby-discovery")]
+                                        automatic_admission: None,
+                                        policy_lock: Arc::new(RwLock::new(())),
+                                        emission_policy: client_policy,
+                                        emission_snapshot: snapshot,
+                                        custody_clock: NodeCustodyClock::injected(
+                                            BLOB_CONTACT_TEST_CLIENT_CLOCK_ID,
+                                            client_clock_tick_ms,
+                                            0,
+                                        ),
+                                        event_route_cache: client_cache,
+                                        event_bridge: client_bridge,
+                                        mutable_interests: client_interests,
+                                        controlled_relay: None,
+                                    },
+                                ),
                             ),
-                            event_route_cache: client_cache,
-                            event_bridge: client_bridge,
-                            mutable_interests: client_interests,
-                            controlled_relay: None,
-                        },
+                        ),
                     ),
                 ),
             )
@@ -47130,6 +49934,2930 @@ mod tests {
         drop(receiver_store);
         fs::remove_dir_all(source_state).expect("source cleanup");
         fs::remove_dir_all(receiver_state).expect("receiver cleanup");
+    }
+
+    #[test]
+    fn legacy_blob_modes_suppress_finite_while_v8_custody_enables_verified_transfer() {
+        // Mutation caught: deriving finite eligibility from semantic-v8 alone,
+        // or continuing Slice-5A suppression after authenticated profile-3
+        // negotiation, would expose or starve the wrong source set.
+        let negotiated = |semantic_version, offer: TransferProfileOfferV1| {
+            let negotiated =
+                negotiate_transfer_profiles_for_semantic_version(semantic_version, &offer, &offer)
+                    .expect("test transfer profiles negotiate");
+            V7TransferProfiles {
+                negotiated,
+                digest: [0; 32],
+            }
+        };
+        for semantic_version in [
+            MIN_BLOB_NETWORK_SEMANTIC_VERSION,
+            MIN_BLOB_NETWORK_SEMANTIC_VERSION + 1,
+        ] {
+            let mode = BlobContactMode::from_authenticated_profiles(semantic_version, None)
+                .expect("v5-v6 durable-only Blob mode");
+            assert_eq!(mode, BlobContactMode::DurableOnly);
+            assert!(!mode.finite_transfer_enabled());
+        }
+        let v7 = negotiated(
+            SEMANTIC_PROTOCOL_V7,
+            TransferProfileOfferV1::for_semantic_version(SEMANTIC_PROTOCOL_V7)
+                .expect("v7 transfer offer"),
+        );
+        assert_eq!(
+            BlobContactMode::from_authenticated_profiles(SEMANTIC_PROTOCOL_V7, Some(&v7))
+                .expect("v7 Blob mode"),
+            BlobContactMode::DurableOnly
+        );
+        let v8_legacy = negotiated(SEMANTIC_PROTOCOL_V8, TransferProfileOfferV1::legacy_only());
+        assert_eq!(
+            BlobContactMode::from_authenticated_profiles(SEMANTIC_PROTOCOL_V8, Some(&v8_legacy),)
+                .expect("v8 Legacy Blob mode"),
+            BlobContactMode::DurableOnly
+        );
+        let v8_custody = negotiated(
+            SEMANTIC_PROTOCOL_V8,
+            TransferProfileOfferV1::for_semantic_version(SEMANTIC_PROTOCOL_V8)
+                .expect("v8 transfer offer"),
+        );
+        let custody_mode =
+            BlobContactMode::from_authenticated_profiles(SEMANTIC_PROTOCOL_V8, Some(&v8_custody))
+                .expect("v8 custody-capable Blob mode");
+        assert_eq!(custody_mode, BlobContactMode::CustodyV1);
+        assert!(custody_mode.finite_transfer_enabled());
+        assert!(matches!(
+            BlobContactMode::from_authenticated_profiles(
+                SEMANTIC_PROTOCOL_V8 + 1,
+                Some(&v8_custody),
+            ),
+            Err(NodeError::Protocol(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn custody_runtime_inventory_and_exact_load_omit_unsupported_received_provenance() {
+        // Mutation caught: using the all-visible visitor or projection for a
+        // custody contact inventories and reloads finite state whose received
+        // provenance was never admitted under exact semantic-v8/profile-3.
+        let services = control_test_services([0xc7; 32]);
+        let authority = services.member.mission_authority_id();
+        let source_state = root("unsupported-custody-provenance-source");
+        let target_state = root("unsupported-custody-provenance-target");
+        fs::create_dir_all(&source_state).expect("unsupported source root");
+        fs::create_dir_all(&target_state).expect("unsupported target root");
+        let source = Store::open_for_mission(source_state.join(STORE_FILE), authority)
+            .expect("unsupported source store");
+        let target = Store::open_for_mission(target_state.join(STORE_FILE), authority)
+            .expect("unsupported target store");
+        let mut source_verifier = open_test_sealer(&services.member);
+        let transfer = publish_test_finite_blob(
+            &source,
+            &mut source_verifier,
+            &services.topic,
+            &services.scope,
+            1,
+            b"unsupported received finite provenance",
+            600_000,
+            25,
+            CustodySample {
+                clock_id: [0xb1; 16],
+                tick_ms: 0,
+            },
+        );
+        let stored = source
+            .get_blob(transfer)
+            .expect("unsupported source lookup")
+            .expect("unsupported source exists");
+        let mut target_verifier = open_test_sealer(&services.other);
+        let route = target_verifier
+            .verify_blob(&stored.sealed)
+            .expect("unsupported source route verification");
+        let BlobContentVerification::ContentVerified {
+            blob,
+            manifest_bytes,
+        } = target_verifier
+            .verify_blob_content(route, &stored.sealed)
+            .expect("unsupported source content verification")
+        else {
+            panic!("unsupported source lost content grant")
+        };
+        let plan = blob
+            .transfer_plan(&manifest_bytes)
+            .expect("unsupported source transfer plan");
+        let policy = target
+            .control_policy_snapshot()
+            .expect("unsupported target policy");
+        target
+            .test_stage_finite_blob_source_with_network_provenance_for_policy(
+                &policy,
+                &blob,
+                &stored.sealed,
+                &plan,
+                25,
+                CustodySample {
+                    clock_id: BLOB_CONTACT_TEST_CLIENT_CLOCK_ID,
+                    tick_ms: 0,
+                },
+                SEMANTIC_PROTOCOL_V8 + 1,
+                TransferProfileId::BlobCustodyV1 as u16,
+            )
+            .expect("stage unsupported received provenance");
+        let all_visible = target
+            .blob_source_projection(transfer)
+            .expect("all-visible unsupported projection")
+            .expect("unsupported provenance remains locally retained");
+        let digest = target.test_blob_logical_digest();
+        let cache = Arc::new(AuthenticatedEventRouteCache::empty(&target_verifier));
+
+        let snapshot = CONTACT_EVENT_ROUTE_CACHE
+            .scope(Arc::clone(&cache), async {
+                cached_mutable_sender_snapshot_for_contact(
+                    &target,
+                    &policy,
+                    &mut target_verifier,
+                    MutableClass::Blob,
+                    BlobContactMode::CustodyV1,
+                )
+            })
+            .await
+            .expect("custody snapshot omits unsupported provenance");
+        assert!(snapshot.blob_claim(transfer).is_none());
+        let repaired = repair_blob_sender_cache_miss(
+            &target,
+            &mut target_verifier,
+            &cache,
+            &all_visible.source,
+            BlobContactMode::CustodyV1,
+        )
+        .expect("custody exact cache repair omits unsupported provenance");
+        assert!(repaired.is_none());
+        assert!(matches!(
+            blob_source_projection_for_contact(&target, transfer, BlobContactMode::CustodyV1),
+            Err(StoreError::Blob(BlobStoreError::ReadPlanChanged))
+        ));
+        assert_eq!(target.test_blob_logical_digest(), digest);
+
+        drop((source, target));
+        fs::remove_dir_all(source_state).expect("unsupported source cleanup");
+        fs::remove_dir_all(target_state).expect("unsupported target cleanup");
+    }
+
+    #[test]
+    fn startup_restores_authenticated_local_finite_blob_evidence() {
+        // Mutation caught: rebuilding the general local Blob cache from the
+        // contact-only durable projection silently discards authenticated
+        // finite evidence and makes legacy cleanup misclassify it as retired.
+        let services = control_test_services([0xe5; 32]);
+        let state = root("finite-blob-startup-cache");
+        fs::create_dir_all(&state).expect("finite startup state");
+        let store = Store::open_for_mission(
+            state.join(STORE_FILE),
+            services.member.mission_authority_id(),
+        )
+        .expect("finite startup store");
+        let mut sealer = open_test_sealer(&services.member);
+        let finite = publish_test_finite_blob(
+            &store,
+            &mut sealer,
+            &services.topic,
+            &services.scope,
+            1,
+            b"finite local startup evidence",
+            600_000,
+            0,
+            CustodySample {
+                clock_id: BLOB_CONTACT_TEST_CLIENT_CLOCK_ID,
+                tick_ms: 0,
+            },
+        );
+
+        let startup = open_startup_event_verifier_and_cache(&store, &services.member)
+            .expect("finite startup verification");
+        assert!(
+            startup
+                .cache
+                .get_blob(&startup.verifier, finite)
+                .expect("finite startup cache lookup")
+                .is_some(),
+            "visible finite authority must remain authenticated in the local cache"
+        );
+
+        let stored = store
+            .get_blob(finite)
+            .expect("finite startup source lookup")
+            .expect("finite startup source");
+        let route = sealer
+            .verify_blob(&stored.sealed)
+            .expect("finite startup route verification");
+        let BlobContentVerification::ContentVerified {
+            blob,
+            manifest_bytes,
+        } = sealer
+            .verify_blob_content(route, &stored.sealed)
+            .expect("finite startup content verification")
+        else {
+            panic!("finite startup source lost content verification")
+        };
+        let retained = store
+            .blob_source_projection(finite)
+            .expect("finite startup retained projection lookup")
+            .expect("finite startup retained projection");
+        let mut corrupted = retained.source.clone();
+        corrupted.metadata_fingerprint[0] ^= 0x80;
+        let completion = store
+            .completed_retained_blob(
+                &retained.source,
+                retained.retention,
+                &blob,
+                &manifest_bytes,
+                &stored.sealed,
+            )
+            .expect("finite startup completion capability");
+        assert!(matches!(
+            AuthenticatedBlobRouteClaim::from_verified(
+                &store,
+                &blob,
+                &stored.sealed,
+                &corrupted,
+                retained.retention,
+                Some(completion),
+            ),
+            Err(NodeError::Protocol(_))
+        ));
+
+        drop(store);
+        fs::remove_dir_all(state).expect("finite startup cleanup");
+    }
+
+    async fn assert_legacy_blob_contact_omits_finite_and_progresses_durable(semantic_version: u16) {
+        // Mutation caught: building reconciliation inventory from all visible
+        // Blob sources would disclose finite identifiers to a LegacyV6 peer
+        // and could consume bounded work before the durable source progresses.
+        let services = control_test_services([0xe3; 32]);
+        let authority = services.member.mission_authority_id();
+        assert_eq!(services.other.mission_authority_id(), authority);
+        let scope = services.scope.clone();
+        let topic = services.topic.clone();
+        let interests = || {
+            MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
+                topic.clone(),
+                scope.clone(),
+                false,
+            )])
+        };
+        let source_state = root(&format!("v{semantic_version}-legacy-blob-source"));
+        let receiver_state = root(&format!("v{semantic_version}-legacy-blob-receiver"));
+        fs::create_dir_all(&source_state).expect("legacy source state");
+        fs::create_dir_all(&receiver_state).expect("legacy receiver state");
+        let source_store = Arc::new(
+            Store::open_for_mission(source_state.join(STORE_FILE), authority)
+                .expect("legacy source store"),
+        );
+        let receiver_store = Arc::new(
+            Store::open_for_mission(receiver_state.join(STORE_FILE), authority)
+                .expect("legacy receiver store"),
+        );
+        let mut source_sealer = open_test_sealer(&services.member);
+        let sample = CustodySample {
+            clock_id: BLOB_CONTACT_TEST_CLIENT_CLOCK_ID,
+            tick_ms: 0,
+        };
+        let finite = publish_test_finite_blob(
+            &source_store,
+            &mut source_sealer,
+            &topic,
+            &scope,
+            1,
+            b"finite must be omitted from legacy Blob contact",
+            600_000,
+            0,
+            sample,
+        );
+        let durable = publish_test_blob(
+            &source_store,
+            &mut source_sealer,
+            &topic,
+            &scope,
+            1,
+            b"durable must progress despite omitted finite Blob",
+        );
+        source_store
+            .blob_source_projection(finite)
+            .expect("finite source projection")
+            .expect("finite source exists");
+        let source_publications_before = source_store
+            .blob_stats()
+            .expect("legacy source stats before contact")
+            .publications;
+
+        let (receiver_receipt, source_receipt) = with_test_semantic_version(
+            semantic_version,
+            with_test_transfer_profile_offer(
+                TransferProfileOfferV1::legacy_only(),
+                Box::pin(blob_contact_test_pair_with_caches(
+                    source_store.clone(),
+                    services.member.clone(),
+                    interests(),
+                    test_event_route_cache(&source_store, &services.member),
+                    receiver_store.clone(),
+                    services.other.clone(),
+                    interests(),
+                    test_event_route_cache(&receiver_store, &services.other),
+                    None,
+                    None,
+                    None,
+                    None,
+                    0,
+                )),
+            ),
+        )
+        .await;
+
+        assert_eq!(source_receipt.semantic_version, semantic_version);
+        assert!(
+            receiver_store
+                .blob_source_projection(finite)
+                .expect("legacy finite receiver projection")
+                .is_none(),
+            "legacy reconciliation must not disclose or stage finite Blob authority"
+        );
+        assert!(
+            receiver_store
+                .blob_source_projection(durable)
+                .expect("legacy durable receiver projection")
+                .is_some(),
+            "omitted finite work must not starve durable Blob progress: receiver={receiver_receipt:?}, source={source_receipt:?}"
+        );
+        assert_eq!(
+            source_store
+                .blob_stats()
+                .expect("legacy source stats after contact")
+                .publications,
+            source_publications_before,
+            "legacy omission must not retire finite source authority"
+        );
+
+        drop(source_store);
+        drop(receiver_store);
+        fs::remove_dir_all(source_state).expect("legacy source cleanup");
+        fs::remove_dir_all(receiver_state).expect("legacy receiver cleanup");
+    }
+
+    async fn complete_v8_finite_blob_carrier(
+        source_is_server: bool,
+        services: &ControlTestServices,
+        source_store: &Arc<Store>,
+        receiver_store: &Arc<Store>,
+        finite: BlobTransferId,
+        mut fetched_ranges: usize,
+    ) -> usize {
+        let interests = || {
+            MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
+                services.topic.clone(),
+                services.scope.clone(),
+                false,
+            )])
+        };
+        for _ in 0..16 {
+            if receiver_store
+                .pending_blob_source(finite)
+                .expect("custody pending source progress lookup")
+                .is_none()
+            {
+                break;
+            }
+            let (client, server, _, _) = if source_is_server {
+                Box::pin(blob_contact_test_pair(
+                    source_store.clone(),
+                    services.member.clone(),
+                    interests(),
+                    receiver_store.clone(),
+                    services.other.clone(),
+                    interests(),
+                ))
+                .await
+            } else {
+                Box::pin(blob_contact_test_pair(
+                    receiver_store.clone(),
+                    services.other.clone(),
+                    interests(),
+                    source_store.clone(),
+                    services.member.clone(),
+                    interests(),
+                ))
+                .await
+            };
+            fetched_ranges = fetched_ranges.saturating_add(if source_is_server {
+                client.blob_ranges_fetched
+            } else {
+                server.blob_ranges_fetched
+            });
+        }
+        fetched_ranges
+    }
+
+    #[tokio::test]
+    async fn legacy_blob_contact_v5_through_v8_omits_finite_and_progresses_durable() {
+        // Mutation caught: mode-only unit classification can pass while real
+        // handshake negotiation, transport threading, or version-specific
+        // reconciliation still exposes finite work or stalls durable work.
+        for semantic_version in 5..=SEMANTIC_PROTOCOL_V8 {
+            assert_legacy_blob_contact_omits_finite_and_progresses_durable(semantic_version).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn v8_custody_blob_offer_object_and_carrier_promote_exact_publication() {
+        // Mutation caught: leaving profile-3 finite transfer suppressed, using
+        // an unprotected/raw claim, or staging before exact claim verification
+        // would fail one of the two real source directions or admit no finite
+        // pending authority at all.
+        let mut prior_offer_digest = None;
+        let mut prior_fetch_digest = None;
+        for source_is_server in [true, false] {
+            let services = control_test_services(if source_is_server {
+                [0xd1; 32]
+            } else {
+                [0xd2; 32]
+            });
+            let authority = services.member.mission_authority_id();
+            let source_state = root(if source_is_server {
+                "v8-custody-object-source"
+            } else {
+                "v8-custody-offer-source"
+            });
+            let receiver_state = root(if source_is_server {
+                "v8-custody-object-receiver"
+            } else {
+                "v8-custody-offer-receiver"
+            });
+            fs::create_dir_all(&source_state).expect("custody source state");
+            fs::create_dir_all(&receiver_state).expect("custody receiver state");
+            let source_store = Arc::new(
+                Store::open_for_mission(source_state.join(STORE_FILE), authority)
+                    .expect("custody source store"),
+            );
+            let receiver_store = Arc::new(
+                Store::open_for_mission(receiver_state.join(STORE_FILE), authority)
+                    .expect("custody receiver store"),
+            );
+            let mut source_sealer = open_test_sealer(&services.member);
+            let source_clock_id = if source_is_server {
+                [0xb1; 16]
+            } else {
+                BLOB_CONTACT_TEST_CLIENT_CLOCK_ID
+            };
+            let plaintext = vec![if source_is_server { 0xd1 } else { 0xd2 }; 96 * 1024];
+            let finite = publish_test_finite_blob(
+                &source_store,
+                &mut source_sealer,
+                &services.topic,
+                &services.scope,
+                1,
+                &plaintext,
+                600_000,
+                25,
+                CustodySample {
+                    clock_id: source_clock_id,
+                    tick_ms: 0,
+                },
+            );
+            let interests = || {
+                MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
+                    services.topic.clone(),
+                    services.scope.clone(),
+                    false,
+                )])
+            };
+            let server_harness = TestBlobSettlementHarness::default();
+            let client_harness = TestBlobSettlementHarness::default();
+            let contact = if source_is_server {
+                blob_contact_test_pair_with_settlement_harness(
+                    source_store.clone(),
+                    services.member.clone(),
+                    interests(),
+                    test_event_route_cache(&source_store, &services.member),
+                    receiver_store.clone(),
+                    services.other.clone(),
+                    interests(),
+                    test_event_route_cache(&receiver_store, &services.other),
+                    server_harness.clone(),
+                    client_harness.clone(),
+                )
+                .await
+            } else {
+                blob_contact_test_pair_with_settlement_harness(
+                    receiver_store.clone(),
+                    services.other.clone(),
+                    interests(),
+                    test_event_route_cache(&receiver_store, &services.other),
+                    source_store.clone(),
+                    services.member.clone(),
+                    interests(),
+                    test_event_route_cache(&source_store, &services.member),
+                    server_harness.clone(),
+                    client_harness.clone(),
+                )
+                .await
+            };
+            assert!(contact.0.is_ok(), "custody client contact: {:?}", contact.0);
+            assert!(contact.1.is_ok(), "custody server contact: {:?}", contact.1);
+            let observations = server_harness
+                .observations()
+                .into_iter()
+                .chain(client_harness.observations())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                observations.len(),
+                if source_is_server { 2 } else { 1 },
+                "settlement observations: {observations:?}"
+            );
+            assert!(observations.iter().any(|observation| {
+                observation.kind
+                    == if source_is_server {
+                        TestBlobSettlementKind::FetchResult
+                    } else {
+                        TestBlobSettlementKind::ApplyResult
+                    }
+            }));
+            assert_eq!(
+                observations
+                    .iter()
+                    .filter(|observation| {
+                        observation.kind == TestBlobSettlementKind::FetchResultAck
+                    })
+                    .count(),
+                usize::from(source_is_server),
+                "the real fetch lane must expose its acknowledgement boundary"
+            );
+            for observation in &observations {
+                assert_eq!(observation.id, MutableTransferId::Blob(finite));
+                assert_eq!(observation.disposition, MutableApplyDisposition::Inserted);
+                assert!(observation.authority_digest.is_some());
+                assert_eq!(observation.emitted_digest, observation.authority_digest);
+            }
+            let exact_digest = observations[0]
+                .authority_digest
+                .expect("finite settlement authority digest");
+            if source_is_server {
+                prior_fetch_digest = Some(exact_digest);
+                assert!(
+                    observations
+                        .iter()
+                        .all(|observation| { observation.authority_digest == Some(exact_digest) })
+                );
+            } else {
+                prior_offer_digest = Some(exact_digest);
+            }
+            let contact = (
+                contact.0.expect("custody client contact").receipt,
+                contact.1.expect("custody server contact").receipt,
+            );
+            assert!(
+                receiver_store
+                    .blob_source_projection(finite)
+                    .expect("custody receiver projection")
+                    .is_some(),
+                "verified finite source must stage in both offer/object directions: client={:?}, server={:?}",
+                contact.0,
+                contact.1,
+            );
+            assert!(
+                receiver_store
+                    .pending_blob_source(finite)
+                    .expect("custody receiver pending projection")
+                    .is_some(),
+                "one bounded range must leave this multi-range source pending"
+            );
+            let (receiver_receipt, source_receipt) = if source_is_server {
+                (&contact.0, &contact.1)
+            } else {
+                (&contact.1, &contact.0)
+            };
+            assert_eq!(receiver_receipt.inserted, 1);
+            assert_eq!(receiver_receipt.duplicates, 0);
+            assert_eq!(receiver_receipt.blob_ranges_fetched, 1);
+            assert!(receiver_receipt.blob_bytes_fetched > 0);
+            assert_eq!(
+                source_receipt.offered, 2,
+                "the source offers one authenticated source and serves one carrier range"
+            );
+            let source_peer = services.other.identity();
+            let receiver_peer = services.member.identity();
+            let expected = Some(*finite.as_bytes());
+            assert_eq!(
+                source_store
+                    .mutable_transfer_cursor(
+                        source_peer,
+                        MutableTransferCursorClass::Blob,
+                        MutableTransferCursorMode::OfferToPeer,
+                    )
+                    .expect("source offer cursor"),
+                (!source_is_server).then_some(expected).flatten(),
+                "the offer sender advances only after its exact apply result"
+            );
+            assert_eq!(
+                source_store
+                    .mutable_transfer_cursor(
+                        source_peer,
+                        MutableTransferCursorClass::Blob,
+                        MutableTransferCursorMode::FetchFromPeer,
+                    )
+                    .expect("source fetch cursor"),
+                None,
+                "the source never owns the requester fetch cursor in this contact"
+            );
+            assert_eq!(
+                receiver_store
+                    .mutable_transfer_cursor(
+                        receiver_peer,
+                        MutableTransferCursorClass::Blob,
+                        MutableTransferCursorMode::OfferToPeer,
+                    )
+                    .expect("receiver offer cursor"),
+                None,
+                "the receiver never owns the source offer cursor in this contact"
+            );
+            assert_eq!(
+                receiver_store
+                    .mutable_transfer_cursor(
+                        receiver_peer,
+                        MutableTransferCursorClass::Blob,
+                        MutableTransferCursorMode::FetchFromPeer,
+                    )
+                    .expect("receiver fetch cursor"),
+                source_is_server.then_some(expected).flatten(),
+                "the requester advances only after the exact fetch result acknowledgement"
+            );
+            let fetched_ranges = Box::pin(complete_v8_finite_blob_carrier(
+                source_is_server,
+                &services,
+                &source_store,
+                &receiver_store,
+                finite,
+                receiver_receipt.blob_ranges_fetched,
+            ))
+            .await;
+            assert!(
+                fetched_ranges > 1,
+                "finite custody carrier must use multiple bounded ranges"
+            );
+            assert!(
+                receiver_store
+                    .pending_blob_source(finite)
+                    .expect("custody completed pending lookup")
+                    .is_none(),
+                "completed finite carrier must consume its exact pending state"
+            );
+            let completed = receiver_store
+                .blob_source_projection(finite)
+                .expect("custody completed projection lookup")
+                .expect("custody completed projection");
+            assert!(matches!(
+                completed.retention,
+                BlobSourceRetention::Completed { .. }
+            ));
+            assert_eq!(
+                completed.source.semantic_id,
+                source_store
+                    .blob_source_projection(finite)
+                    .expect("custody source projection lookup")
+                    .expect("custody source projection")
+                    .source
+                    .semantic_id,
+                "promotion must retain the exact signed publication identity"
+            );
+            assert!(
+                receiver_store
+                    .blob_carrier_fetch_cursor(services.member.identity())
+                    .expect("custody carrier cursor")
+                    .is_some(),
+                "the receiver must durably retain its settled carrier boundary"
+            );
+            let stored = receiver_store
+                .get_blob(finite)
+                .expect("custody promoted source lookup")
+                .expect("custody promoted source");
+            let mut receiver_verifier = open_test_sealer(&services.other);
+            let route = receiver_verifier
+                .verify_blob(&stored.sealed)
+                .expect("custody promoted route verification");
+            let BlobContentVerification::ContentVerified {
+                blob,
+                manifest_bytes,
+            } = receiver_verifier
+                .verify_blob_content(route, &stored.sealed)
+                .expect("custody promoted content verification")
+            else {
+                panic!("custody promoted source lost its content grant")
+            };
+            let depot = receiver_store
+                .blob_depot_for_authenticated_read(
+                    &receiver_store
+                        .completed_retained_blob(
+                            &completed.source,
+                            completed.retention,
+                            &blob,
+                            &manifest_bytes,
+                            &stored.sealed,
+                        )
+                        .expect("custody promoted completion capability"),
+                )
+                .expect("custody promoted read depot");
+            let mut service = receiver_verifier
+                .blob_service_with_store(&services.scope, &services.topic, 1, depot)
+                .expect("custody promoted Blob service");
+            let mut restored = Vec::new();
+            service
+                .reader_for_verified(&blob)
+                .and_then(|mut reader| reader.stream_into(&mut restored))
+                .expect("custody promoted plaintext read");
+            assert_eq!(restored, plaintext);
+            drop(service);
+            drop(source_store);
+            drop(receiver_store);
+            fs::remove_dir_all(source_state).expect("custody source cleanup");
+            fs::remove_dir_all(receiver_state).expect("custody receiver cleanup");
+        }
+        let prior_offer_digest = prior_offer_digest.expect("prior real offer digest");
+        let prior_fetch_digest = prior_fetch_digest.expect("prior real fetch digest");
+        assert_ne!(prior_offer_digest, prior_fetch_digest);
+    }
+
+    #[tokio::test]
+    async fn finite_blob_lifetime_loss_is_ordinary_at_every_carrier_boundary() {
+        // Mutation caught: interpreting Store-owned expiry or continuity loss
+        // as authenticated-state corruption aborts the retained pending source
+        // and prefix, advances its carrier turn, or terminates the node actor.
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum Boundary {
+            PendingRecheck,
+            Service,
+            PostInstallCompletion,
+            Promotion,
+        }
+
+        let cases = [
+            (
+                "pending-expiry",
+                Boundary::PendingRecheck,
+                TestBlobContactFault::PendingLifetimeExpiry,
+            ),
+            (
+                "pending-discontinuity",
+                Boundary::PendingRecheck,
+                TestBlobContactFault::PendingLifetimeDiscontinuity,
+            ),
+            (
+                "service-expiry",
+                Boundary::Service,
+                TestBlobContactFault::ServiceLifetimeExpiry,
+            ),
+            (
+                "service-discontinuity",
+                Boundary::Service,
+                TestBlobContactFault::ServiceLifetimeDiscontinuity,
+            ),
+            (
+                "completion-expiry",
+                Boundary::PostInstallCompletion,
+                TestBlobContactFault::CompletionLifetimeExpiry,
+            ),
+            (
+                "completion-discontinuity",
+                Boundary::PostInstallCompletion,
+                TestBlobContactFault::CompletionLifetimeDiscontinuity,
+            ),
+            (
+                "promotion-expiry",
+                Boundary::Promotion,
+                TestBlobContactFault::PromotionLifetimeExpiry,
+            ),
+            (
+                "promotion-discontinuity",
+                Boundary::Promotion,
+                TestBlobContactFault::PromotionLifetimeDiscontinuity,
+            ),
+        ];
+
+        for (case_index, (label, boundary, fault)) in cases.into_iter().enumerate() {
+            let services = control_test_services([0x90 + case_index as u8; 32]);
+            let authority = services.member.mission_authority_id();
+            let source_state = root(&format!("finite-lifetime-{label}-source"));
+            let receiver_state = root(&format!("finite-lifetime-{label}-receiver"));
+            fs::create_dir_all(&source_state).expect("lifetime source root");
+            fs::create_dir_all(&receiver_state).expect("lifetime receiver root");
+            let source_store = Arc::new(
+                Store::open_for_mission(source_state.join(STORE_FILE), authority)
+                    .expect("lifetime source store"),
+            );
+            let receiver_store = Arc::new(
+                Store::open_for_mission(receiver_state.join(STORE_FILE), authority)
+                    .expect("lifetime receiver store"),
+            );
+            let mut source_verifier = open_test_sealer(&services.member);
+            let transfer = publish_test_finite_blob(
+                &source_store,
+                &mut source_verifier,
+                &services.topic,
+                &services.scope,
+                1,
+                &vec![0xa0 + case_index as u8; 32 * 1024],
+                600_000,
+                25,
+                CustodySample {
+                    clock_id: [0xb1; 16],
+                    tick_ms: 0,
+                },
+            );
+            let source_stored = source_store
+                .get_blob(transfer)
+                .expect("lifetime source lookup")
+                .expect("lifetime source exists");
+            let source_route = source_verifier
+                .verify_blob(&source_stored.sealed)
+                .expect("lifetime source route verification");
+            let BlobContentVerification::ContentVerified {
+                blob: source_blob,
+                manifest_bytes: source_manifest,
+            } = source_verifier
+                .verify_blob_content(source_route, &source_stored.sealed)
+                .expect("lifetime source content verification")
+            else {
+                panic!("lifetime source lost content grant")
+            };
+            let source_plan = source_blob
+                .transfer_plan(&source_manifest)
+                .expect("lifetime source transfer plan");
+            let interests = || {
+                MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
+                    services.topic.clone(),
+                    services.scope.clone(),
+                    false,
+                )])
+            };
+
+            let (first_receiver, _, _, _) = blob_contact_test_pair(
+                source_store.clone(),
+                services.member.clone(),
+                interests(),
+                receiver_store.clone(),
+                services.other.clone(),
+                interests(),
+            )
+            .await;
+            assert_eq!(
+                first_receiver.blob_ranges_fetched, 1,
+                "{label}: first range"
+            );
+            assert!(
+                receiver_store
+                    .pending_blob_source(transfer)
+                    .expect("lifetime initial pending lookup")
+                    .is_some(),
+                "{label}: multi-range source remains pending"
+            );
+
+            if boundary == Boundary::PostInstallCompletion {
+                let policy = receiver_store
+                    .control_policy_snapshot()
+                    .expect("lifetime completion setup policy");
+                let mut completion_boundary_ready = false;
+                for _ in 0..32 {
+                    let carriers = receiver_store
+                        .pending_blob_carrier_work_with_policy(&policy, transfer, &source_plan)
+                        .expect("lifetime completion setup work");
+                    let cursor = receiver_store
+                        .blob_carrier_fetch_cursor(services.member.identity())
+                        .expect("lifetime completion setup cursor");
+                    let next = cursor
+                        .and_then(|cursor| {
+                            carriers.iter().find(|status| {
+                                (status.source(), status.object())
+                                    > (cursor.source(), cursor.object())
+                            })
+                        })
+                        .or_else(|| carriers.first())
+                        .expect("lifetime completion setup retained work");
+                    if next
+                        .exact_complement()
+                        .is_some_and(|range| range.end == next.total_len())
+                    {
+                        completion_boundary_ready = true;
+                        break;
+                    }
+                    let prepared = blob_contact_test_pair(
+                        source_store.clone(),
+                        services.member.clone(),
+                        interests(),
+                        receiver_store.clone(),
+                        services.other.clone(),
+                        interests(),
+                    )
+                    .await;
+                    assert_eq!(prepared.0.blob_ranges_fetched, 1, "{label}: setup range");
+                }
+                assert!(
+                    completion_boundary_ready,
+                    "{label}: bounded completion setup"
+                );
+            }
+
+            if boundary == Boundary::Promotion {
+                let hold = install_test_blob_contact_fault(
+                    services.other.identity(),
+                    TestBlobContactFault::HoldPromotion,
+                );
+                let source_cache = test_event_route_cache(&source_store, &services.member);
+                let receiver_cache = test_event_route_cache(&receiver_store, &services.other);
+                for _ in 0..32 {
+                    let held = blob_contact_test_pair_with_caches_results(
+                        source_store.clone(),
+                        services.member.clone(),
+                        interests(),
+                        Arc::clone(&source_cache),
+                        receiver_store.clone(),
+                        services.other.clone(),
+                        interests(),
+                        Arc::clone(&receiver_cache),
+                        None,
+                        None,
+                        None,
+                        None,
+                        0,
+                    )
+                    .await;
+                    assert!(held.0.is_ok() && held.1.is_ok(), "{label}: hold promotion");
+                    if hold.fired.load(Ordering::Acquire) {
+                        break;
+                    }
+                }
+                assert!(hold.fired.load(Ordering::Acquire), "{label}: hold fault");
+            }
+
+            let before_stats = receiver_store
+                .blob_stats()
+                .expect("lifetime retained stats before fault");
+            assert_eq!(
+                before_stats.pending_sources, 1,
+                "{label}: retained pending row"
+            );
+            if boundary == Boundary::Promotion {
+                assert_eq!(
+                    before_stats.carrier_prefixes, 0,
+                    "{label}: no prefix after hold"
+                );
+            } else {
+                assert_ne!(before_stats.carrier_prefixes, 0, "{label}: retained prefix");
+            }
+            let carrier_cursor_before = receiver_store
+                .blob_carrier_fetch_cursor(services.member.identity())
+                .expect("lifetime carrier cursor before fault");
+            let receiver_digest_before = receiver_store.test_blob_logical_digest();
+            let fault_identity = if boundary == Boundary::Service {
+                services.member.identity()
+            } else {
+                services.other.identity()
+            };
+            let fault_state = install_test_blob_contact_fault(fault_identity, fault);
+            let receiver_cache = test_event_route_cache(&receiver_store, &services.other);
+            let (client_result, server_result) = blob_contact_test_pair_with_caches_results(
+                source_store.clone(),
+                services.member.clone(),
+                interests(),
+                test_event_route_cache(&source_store, &services.member),
+                receiver_store.clone(),
+                services.other.clone(),
+                interests(),
+                Arc::clone(&receiver_cache),
+                None,
+                None,
+                None,
+                None,
+                0,
+            )
+            .await;
+
+            assert!(
+                fault_state.fired.load(Ordering::Acquire),
+                "{label}: fault fired"
+            );
+            if let Err(error) = &client_result {
+                assert!(
+                    !actor_fatal_contact_error(error, services.other.identity()),
+                    "{label}: client lifetime loss became actor-fatal: {error}"
+                );
+            }
+            if let Err(error) = &server_result {
+                assert!(
+                    !actor_fatal_contact_error(error, services.member.identity()),
+                    "{label}: server lifetime loss became actor-fatal: {error}"
+                );
+            }
+            if matches!(
+                boundary,
+                Boundary::PostInstallCompletion | Boundary::Promotion
+            ) {
+                assert!(
+                    client_result.is_err(),
+                    "{label}: failed completion/promotion must close only this contact"
+                );
+            } else {
+                assert!(
+                    client_result.is_ok() && server_result.is_ok(),
+                    "{label}: omission/unavailability should settle normally: client={client_result:?}, server={server_result:?}"
+                );
+                assert_eq!(
+                    client_result
+                        .as_ref()
+                        .expect("checked successful lifetime contact")
+                        .receipt
+                        .blob_ranges_fetched,
+                    0,
+                    "{label}: lifetime loss cannot open a later range"
+                );
+            }
+
+            let after_stats = receiver_store
+                .blob_stats()
+                .expect("lifetime retained stats after fault");
+            assert_eq!(
+                after_stats.pending_sources, before_stats.pending_sources,
+                "{label}"
+            );
+            assert_eq!(
+                after_stats.carrier_prefixes, before_stats.carrier_prefixes,
+                "{label}"
+            );
+            assert!(
+                receiver_cache.has_blob_claim_for_test(transfer),
+                "{label}: retained pending authority must keep its cache claim"
+            );
+            assert_eq!(
+                receiver_store
+                    .blob_carrier_fetch_cursor(services.member.identity())
+                    .expect("lifetime carrier cursor after fault"),
+                carrier_cursor_before,
+                "{label}: failed unit must not advance the carrier/source cursor"
+            );
+            let fault_digest = fault_state
+                .logical_digest_after_fault()
+                .unwrap_or_else(|| panic!("{label}: fault-boundary logical digest"));
+            if boundary == Boundary::Service {
+                assert_eq!(
+                    source_store.test_blob_logical_digest(),
+                    fault_digest,
+                    "{label}"
+                );
+                assert_eq!(
+                    receiver_store.test_blob_logical_digest(),
+                    receiver_digest_before,
+                    "{label}: unavailable range must not mutate requester state"
+                );
+                assert!(
+                    receiver_store
+                        .pending_blob_source(transfer)
+                        .expect("service-loss requester pending lookup")
+                        .is_some()
+                );
+                assert_eq!(
+                    fault_state
+                        .result_frames_after_fault
+                        .load(Ordering::Acquire),
+                    1,
+                    "{label}: service emits only the ordinary unavailable response"
+                );
+            } else {
+                assert_eq!(
+                    receiver_store.test_blob_logical_digest(),
+                    fault_digest,
+                    "{label}"
+                );
+                assert!(
+                    receiver_store
+                        .pending_blob_source(transfer)
+                        .expect("lifetime-invisible pending lookup")
+                        .is_none(),
+                    "{label}: invisible finite work remains non-forwardable"
+                );
+                assert_eq!(
+                    fault_state
+                        .result_frames_after_fault
+                        .load(Ordering::Acquire),
+                    0,
+                    "{label}: no result/ACK follows the failed boundary"
+                );
+            }
+
+            drop((source_store, receiver_store));
+            fs::remove_dir_all(source_state).expect("lifetime source cleanup");
+            fs::remove_dir_all(receiver_state).expect("lifetime receiver cleanup");
+        }
+    }
+
+    #[tokio::test]
+    async fn finite_blob_late_exact_load_lifetime_loss_is_ordinary() {
+        // Mutation caught: the first contact projection may be visible while a
+        // subsequent exact load observes Store-owned expiry or continuity
+        // loss. Those late transitions withhold this unit; they are not cache
+        // corruption and must not settle a cursor or expose a later item.
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum Window {
+            OutboundLoad,
+            PostStage,
+            FinalComparison,
+            PendingCacheRepair,
+            CompletedPostStageCapability,
+            CompletedPostStageFinalComparison,
+            CompletedCacheRepairCapability,
+            CompletedCacheRepairFinalComparison,
+            ServiceLoad,
+            PostPromotionLoad,
+        }
+
+        let cases = [
+            (
+                "outbound-load-expiry",
+                Window::OutboundLoad,
+                TestBlobContactFault::OutboundLoadLifetimeExpiry,
+            ),
+            (
+                "outbound-load-discontinuity",
+                Window::OutboundLoad,
+                TestBlobContactFault::OutboundLoadLifetimeDiscontinuity,
+            ),
+            (
+                "post-stage-expiry",
+                Window::PostStage,
+                TestBlobContactFault::PostStageLifetimeExpiry,
+            ),
+            (
+                "post-stage-discontinuity",
+                Window::PostStage,
+                TestBlobContactFault::PostStageLifetimeDiscontinuity,
+            ),
+            (
+                "final-comparison-expiry",
+                Window::FinalComparison,
+                TestBlobContactFault::FinalComparisonLifetimeExpiry,
+            ),
+            (
+                "final-comparison-discontinuity",
+                Window::FinalComparison,
+                TestBlobContactFault::FinalComparisonLifetimeDiscontinuity,
+            ),
+            (
+                "pending-cache-repair-expiry",
+                Window::PendingCacheRepair,
+                TestBlobContactFault::PendingCacheRepairLifetimeExpiry,
+            ),
+            (
+                "pending-cache-repair-discontinuity",
+                Window::PendingCacheRepair,
+                TestBlobContactFault::PendingCacheRepairLifetimeDiscontinuity,
+            ),
+            (
+                "completed-post-stage-capability-expiry",
+                Window::CompletedPostStageCapability,
+                TestBlobContactFault::CompletedPostStageCapabilityLifetimeExpiry,
+            ),
+            (
+                "completed-post-stage-capability-discontinuity",
+                Window::CompletedPostStageCapability,
+                TestBlobContactFault::CompletedPostStageCapabilityLifetimeDiscontinuity,
+            ),
+            (
+                "completed-post-stage-final-comparison-expiry",
+                Window::CompletedPostStageFinalComparison,
+                TestBlobContactFault::CompletedPostStageFinalComparisonLifetimeExpiry,
+            ),
+            (
+                "completed-post-stage-final-comparison-discontinuity",
+                Window::CompletedPostStageFinalComparison,
+                TestBlobContactFault::CompletedPostStageFinalComparisonLifetimeDiscontinuity,
+            ),
+            (
+                "completed-cache-repair-capability-expiry",
+                Window::CompletedCacheRepairCapability,
+                TestBlobContactFault::CompletedCacheRepairCapabilityLifetimeExpiry,
+            ),
+            (
+                "completed-cache-repair-capability-discontinuity",
+                Window::CompletedCacheRepairCapability,
+                TestBlobContactFault::CompletedCacheRepairCapabilityLifetimeDiscontinuity,
+            ),
+            (
+                "completed-cache-repair-final-comparison-expiry",
+                Window::CompletedCacheRepairFinalComparison,
+                TestBlobContactFault::CompletedCacheRepairFinalComparisonLifetimeExpiry,
+            ),
+            (
+                "completed-cache-repair-final-comparison-discontinuity",
+                Window::CompletedCacheRepairFinalComparison,
+                TestBlobContactFault::CompletedCacheRepairFinalComparisonLifetimeDiscontinuity,
+            ),
+            (
+                "service-load-expiry",
+                Window::ServiceLoad,
+                TestBlobContactFault::ServiceLoadLifetimeExpiry,
+            ),
+            (
+                "service-load-discontinuity",
+                Window::ServiceLoad,
+                TestBlobContactFault::ServiceLoadLifetimeDiscontinuity,
+            ),
+            (
+                "post-promotion-load-expiry",
+                Window::PostPromotionLoad,
+                TestBlobContactFault::PostPromotionLoadLifetimeExpiry,
+            ),
+            (
+                "post-promotion-load-discontinuity",
+                Window::PostPromotionLoad,
+                TestBlobContactFault::PostPromotionLoadLifetimeDiscontinuity,
+            ),
+        ];
+
+        for (case_index, (label, window, fault)) in cases.into_iter().enumerate() {
+            let services = control_test_services([0xa8 + case_index as u8; 32]);
+            let authority = services.member.mission_authority_id();
+            let source_state = root(&format!("finite-late-lifetime-{label}-source"));
+            let receiver_state = root(&format!("finite-late-lifetime-{label}-receiver"));
+            fs::create_dir_all(&source_state).expect("late lifetime source root");
+            fs::create_dir_all(&receiver_state).expect("late lifetime receiver root");
+            let source_store = Arc::new(
+                Store::open_for_mission(source_state.join(STORE_FILE), authority)
+                    .expect("late lifetime source store"),
+            );
+            let receiver_store = Arc::new(
+                Store::open_for_mission(receiver_state.join(STORE_FILE), authority)
+                    .expect("late lifetime receiver store"),
+            );
+            let mut source_verifier = open_test_sealer(&services.member);
+            let transfer = publish_test_finite_blob(
+                &source_store,
+                &mut source_verifier,
+                &services.topic,
+                &services.scope,
+                1,
+                &vec![0xc0 + case_index as u8; 32 * 1024],
+                600_000,
+                25,
+                CustodySample {
+                    clock_id: [0xb1; 16],
+                    tick_ms: 0,
+                },
+            );
+            let interests = || {
+                MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
+                    services.topic.clone(),
+                    services.scope.clone(),
+                    false,
+                )])
+            };
+
+            let completed_source_window = matches!(
+                window,
+                Window::CompletedPostStageCapability
+                    | Window::CompletedPostStageFinalComparison
+                    | Window::CompletedCacheRepairCapability
+                    | Window::CompletedCacheRepairFinalComparison
+            );
+            if completed_source_window {
+                let (first_receiver, _, _, _) = blob_contact_test_pair(
+                    source_store.clone(),
+                    services.member.clone(),
+                    interests(),
+                    receiver_store.clone(),
+                    services.other.clone(),
+                    interests(),
+                )
+                .await;
+                assert_eq!(
+                    first_receiver.blob_ranges_fetched, 1,
+                    "{label}: first range"
+                );
+                let fetched = Box::pin(complete_v8_finite_blob_carrier(
+                    true,
+                    &services,
+                    &source_store,
+                    &receiver_store,
+                    transfer,
+                    first_receiver.blob_ranges_fetched,
+                ))
+                .await;
+                assert!(fetched > 1, "{label}: completed-source carrier ranges");
+                let completed = receiver_store
+                    .blob_source_projection(transfer)
+                    .expect("late completed-source receiver projection")
+                    .expect("late completed-source receiver row");
+                assert!(matches!(
+                    completed.retention,
+                    BlobSourceRetention::Completed { .. }
+                ));
+                source_store
+                    .reconcile_mutable_transfer_cursor_peers(&[])
+                    .expect("reset completed-source sender cursors");
+                receiver_store
+                    .reconcile_mutable_transfer_cursor_peers(&[])
+                    .expect("reset completed-source receiver cursors");
+            } else if !matches!(
+                window,
+                Window::OutboundLoad | Window::PostStage | Window::FinalComparison
+            ) {
+                let (first_receiver, _, _, _) = blob_contact_test_pair(
+                    source_store.clone(),
+                    services.member.clone(),
+                    interests(),
+                    receiver_store.clone(),
+                    services.other.clone(),
+                    interests(),
+                )
+                .await;
+                assert_eq!(
+                    first_receiver.blob_ranges_fetched, 1,
+                    "{label}: first range"
+                );
+                assert!(
+                    receiver_store
+                        .pending_blob_source(transfer)
+                        .expect("late lifetime initial pending lookup")
+                        .is_some(),
+                    "{label}: initial contact retains pending carrier authority"
+                );
+            }
+
+            if window == Window::PostPromotionLoad {
+                let hold = install_test_blob_contact_fault(
+                    services.other.identity(),
+                    TestBlobContactFault::HoldPromotion,
+                );
+                let source_cache = test_event_route_cache(&source_store, &services.member);
+                let receiver_cache = test_event_route_cache(&receiver_store, &services.other);
+                for _ in 0..32 {
+                    let held = blob_contact_test_pair_with_caches_results(
+                        source_store.clone(),
+                        services.member.clone(),
+                        interests(),
+                        Arc::clone(&source_cache),
+                        receiver_store.clone(),
+                        services.other.clone(),
+                        interests(),
+                        Arc::clone(&receiver_cache),
+                        None,
+                        None,
+                        None,
+                        None,
+                        0,
+                    )
+                    .await;
+                    assert!(
+                        held.0.is_ok() && held.1.is_ok(),
+                        "{label}: promotion hold contact: client={:?}, server={:?}",
+                        held.0,
+                        held.1
+                    );
+                    if hold.fired.load(Ordering::Acquire) {
+                        break;
+                    }
+                }
+                assert!(hold.fired.load(Ordering::Acquire), "{label}: hold fired");
+            }
+
+            if matches!(
+                window,
+                Window::PendingCacheRepair
+                    | Window::CompletedCacheRepairCapability
+                    | Window::CompletedCacheRepairFinalComparison
+            ) {
+                let source_expiry = matches!(
+                    fault,
+                    TestBlobContactFault::PendingCacheRepairLifetimeExpiry
+                        | TestBlobContactFault::CompletedCacheRepairCapabilityLifetimeExpiry
+                        | TestBlobContactFault::CompletedCacheRepairFinalComparisonLifetimeExpiry
+                );
+                let source_sample = if source_expiry {
+                    CustodySample {
+                        clock_id: [0xb1; 16],
+                        tick_ms: 1_000_000,
+                    }
+                } else {
+                    let mut clock_id = [0xb1; 16];
+                    clock_id[0] ^= 0x80;
+                    CustodySample {
+                        clock_id,
+                        tick_ms: 0,
+                    }
+                };
+                source_store
+                    .test_observe_blob_custody_sample(source_sample)
+                    .expect("late cache repair source lifetime observation");
+            }
+
+            let receiver_stats_before = receiver_store
+                .blob_stats()
+                .expect("late lifetime receiver stats before fault");
+            match window {
+                Window::OutboundLoad => {
+                    assert_eq!(receiver_stats_before.pending_sources, 0, "{label}");
+                    assert_eq!(receiver_stats_before.carrier_prefixes, 0, "{label}");
+                }
+                Window::PostStage | Window::FinalComparison => {
+                    assert_eq!(receiver_stats_before.pending_sources, 0, "{label}");
+                    assert_eq!(receiver_stats_before.carrier_prefixes, 0, "{label}");
+                }
+                Window::CompletedPostStageCapability
+                | Window::CompletedPostStageFinalComparison
+                | Window::CompletedCacheRepairCapability
+                | Window::CompletedCacheRepairFinalComparison => {
+                    assert_eq!(receiver_stats_before.pending_sources, 0, "{label}");
+                    assert_eq!(receiver_stats_before.carrier_prefixes, 0, "{label}");
+                    assert_eq!(receiver_stats_before.publications, 1, "{label}");
+                }
+                Window::ServiceLoad => {
+                    assert_eq!(receiver_stats_before.pending_sources, 1, "{label}");
+                    assert_ne!(receiver_stats_before.carrier_prefixes, 0, "{label}");
+                }
+                Window::PendingCacheRepair => {
+                    assert_eq!(receiver_stats_before.pending_sources, 1, "{label}");
+                    assert_ne!(receiver_stats_before.carrier_prefixes, 0, "{label}");
+                }
+                Window::PostPromotionLoad => {
+                    assert_eq!(receiver_stats_before.pending_sources, 1, "{label}");
+                    assert_eq!(receiver_stats_before.carrier_prefixes, 0, "{label}");
+                }
+            }
+            let source_offer_before = source_store
+                .mutable_transfer_cursor(
+                    services.other.identity(),
+                    MutableTransferCursorClass::Blob,
+                    MutableTransferCursorMode::OfferToPeer,
+                )
+                .expect("late lifetime source offer cursor before fault");
+            let receiver_fetch_before = receiver_store
+                .mutable_transfer_cursor(
+                    services.member.identity(),
+                    MutableTransferCursorClass::Blob,
+                    MutableTransferCursorMode::FetchFromPeer,
+                )
+                .expect("late lifetime receiver fetch cursor before fault");
+            let carrier_cursor_before = receiver_store
+                .blob_carrier_fetch_cursor(services.member.identity())
+                .expect("late lifetime carrier cursor before fault");
+            let receiver_digest_before = receiver_store.test_blob_logical_digest();
+            let fault_identity = if matches!(
+                window,
+                Window::PendingCacheRepair
+                    | Window::CompletedCacheRepairCapability
+                    | Window::CompletedCacheRepairFinalComparison
+                    | Window::PostPromotionLoad
+            ) {
+                services.other.identity()
+            } else if matches!(
+                window,
+                Window::PostStage
+                    | Window::FinalComparison
+                    | Window::CompletedPostStageCapability
+                    | Window::CompletedPostStageFinalComparison
+            ) {
+                services.other.identity()
+            } else {
+                services.member.identity()
+            };
+            let fault_state = install_test_blob_contact_fault(fault_identity, fault);
+            let source_cache = test_event_route_cache(&source_store, &services.member);
+            let receiver_cache = if matches!(
+                window,
+                Window::PendingCacheRepair
+                    | Window::CompletedPostStageCapability
+                    | Window::CompletedPostStageFinalComparison
+                    | Window::CompletedCacheRepairCapability
+                    | Window::CompletedCacheRepairFinalComparison
+            ) {
+                let receiver_verifier = open_test_sealer(&services.other);
+                Arc::new(
+                    AuthenticatedEventRouteCache::empty_for_store(
+                        &receiver_verifier,
+                        &receiver_store,
+                    )
+                    .expect("late pending repair empty receiver cache"),
+                )
+            } else {
+                test_event_route_cache(&receiver_store, &services.other)
+            };
+            let (client_result, server_result) = blob_contact_test_pair_with_caches_results(
+                source_store.clone(),
+                services.member.clone(),
+                interests(),
+                Arc::clone(&source_cache),
+                receiver_store.clone(),
+                services.other.clone(),
+                interests(),
+                Arc::clone(&receiver_cache),
+                None,
+                None,
+                None,
+                None,
+                0,
+            )
+            .await;
+
+            assert!(
+                fault_state.fired.load(Ordering::Acquire),
+                "{label}: fault fired"
+            );
+            if let Err(error) = &client_result {
+                assert!(
+                    !actor_fatal_contact_error(error, services.other.identity()),
+                    "{label}: client late lifetime loss became actor-fatal: {error}"
+                );
+            }
+            if let Err(error) = &server_result {
+                assert!(
+                    !actor_fatal_contact_error(error, services.member.identity()),
+                    "{label}: server late lifetime loss became actor-fatal: {error}"
+                );
+            }
+            if matches!(
+                window,
+                Window::PendingCacheRepair
+                    | Window::CompletedCacheRepairCapability
+                    | Window::CompletedCacheRepairFinalComparison
+                    | Window::ServiceLoad
+            ) {
+                assert!(
+                    client_result.is_ok() && server_result.is_ok(),
+                    "{label}: service Unavailable settles normally: client={client_result:?}, server={server_result:?}"
+                );
+                assert_eq!(
+                    client_result
+                        .as_ref()
+                        .expect("checked successful late lifetime contact")
+                        .receipt
+                        .blob_ranges_fetched,
+                    0,
+                    "{label}: no later carrier unit is exposed"
+                );
+            } else {
+                assert!(
+                    client_result.is_err() || server_result.is_err(),
+                    "{label}: withheld exact unit must not be acknowledged"
+                );
+            }
+
+            assert_eq!(
+                source_store
+                    .mutable_transfer_cursor(
+                        services.other.identity(),
+                        MutableTransferCursorClass::Blob,
+                        MutableTransferCursorMode::OfferToPeer,
+                    )
+                    .expect("late lifetime source offer cursor after fault"),
+                source_offer_before,
+                "{label}: failed source unit cannot advance its offer cursor"
+            );
+            assert_eq!(
+                receiver_store
+                    .mutable_transfer_cursor(
+                        services.member.identity(),
+                        MutableTransferCursorClass::Blob,
+                        MutableTransferCursorMode::FetchFromPeer,
+                    )
+                    .expect("late lifetime receiver fetch cursor after fault"),
+                receiver_fetch_before,
+                "{label}: failed source unit cannot advance its fetch cursor"
+            );
+            assert_eq!(
+                receiver_store
+                    .blob_carrier_fetch_cursor(services.member.identity())
+                    .expect("late lifetime carrier cursor after fault"),
+                carrier_cursor_before,
+                "{label}: failed carrier unit cannot advance its carrier cursor"
+            );
+            let fault_digest = fault_state
+                .logical_digest_after_fault()
+                .unwrap_or_else(|| panic!("{label}: late lifetime logical digest"));
+            let receiver_stats_after = receiver_store
+                .blob_stats()
+                .expect("late lifetime receiver stats after fault");
+            match window {
+                Window::OutboundLoad => {
+                    assert_eq!(
+                        source_store.test_blob_logical_digest(),
+                        fault_digest,
+                        "{label}"
+                    );
+                    assert_eq!(
+                        receiver_store.test_blob_logical_digest(),
+                        receiver_digest_before,
+                        "{label}: skipped outbound load cannot mutate the receiver"
+                    );
+                    assert_eq!(receiver_stats_after, receiver_stats_before, "{label}");
+                    assert!(source_cache.has_blob_claim_for_test(transfer), "{label}");
+                    assert!(matches!(
+                        source_store.get_blob(transfer),
+                        Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+                    ));
+                    assert_eq!(
+                        fault_state
+                            .result_frames_after_fault
+                            .load(Ordering::Acquire),
+                        0,
+                        "{label}: skipped exact load emits no result"
+                    );
+                }
+                Window::PostStage | Window::FinalComparison => {
+                    assert_eq!(
+                        receiver_store.test_blob_logical_digest(),
+                        fault_digest,
+                        "{label}: post-stage comparison cannot mutate retained state"
+                    );
+                    assert_eq!(receiver_stats_after.pending_sources, 1, "{label}");
+                    assert_eq!(receiver_stats_after.carrier_prefixes, 0, "{label}");
+                    assert_eq!(receiver_stats_after.publications, 0, "{label}");
+                    assert!(
+                        !receiver_cache.has_blob_claim_for_test(transfer),
+                        "{label}: lifetime-withheld stage cannot cache the source"
+                    );
+                    assert!(matches!(
+                        receiver_store.custody_v1_pending_blob_source(transfer),
+                        Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+                    ));
+                    assert_eq!(
+                        fault_state
+                            .result_frames_after_fault
+                            .load(Ordering::Acquire),
+                        0,
+                        "{label}: no result/ACK follows post-stage withholding"
+                    );
+                }
+                Window::CompletedPostStageCapability
+                | Window::CompletedPostStageFinalComparison => {
+                    assert_eq!(
+                        receiver_store.test_blob_logical_digest(),
+                        fault_digest,
+                        "{label}: completed post-stage withholding cannot mutate after its fault boundary"
+                    );
+                    assert_eq!(receiver_stats_after.pending_sources, 0, "{label}");
+                    assert_eq!(receiver_stats_after.carrier_prefixes, 0, "{label}");
+                    assert_eq!(
+                        receiver_stats_after.publications,
+                        u64::from(
+                            fault
+                                != TestBlobContactFault::CompletedPostStageCapabilityLifetimeExpiry
+                        ),
+                        "{label}: only pre-capability expiry performs deterministic retirement"
+                    );
+                    assert!(
+                        !receiver_cache.has_blob_claim_for_test(transfer),
+                        "{label}: lifetime-withheld completed duplicate cannot cache the source"
+                    );
+                    assert!(matches!(
+                        receiver_store.get_blob(transfer),
+                        Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+                    ));
+                    assert_eq!(
+                        fault_state
+                            .result_frames_after_fault
+                            .load(Ordering::Acquire),
+                        0,
+                        "{label}: no result/ACK follows completed post-stage withholding"
+                    );
+                }
+                Window::ServiceLoad => {
+                    assert_eq!(
+                        source_store.test_blob_logical_digest(),
+                        fault_digest,
+                        "{label}"
+                    );
+                    assert_eq!(
+                        receiver_store.test_blob_logical_digest(),
+                        receiver_digest_before,
+                        "{label}: unavailable exact range cannot mutate the requester"
+                    );
+                    assert_eq!(receiver_stats_after, receiver_stats_before, "{label}");
+                    assert!(receiver_cache.has_blob_claim_for_test(transfer), "{label}");
+                    assert!(
+                        receiver_store
+                            .pending_blob_source(transfer)
+                            .expect("late service requester pending lookup")
+                            .is_some(),
+                        "{label}: requester retains pending source and prefix"
+                    );
+                    assert_eq!(
+                        fault_state
+                            .result_frames_after_fault
+                            .load(Ordering::Acquire),
+                        1,
+                        "{label}: service emits only ordinary Unavailable"
+                    );
+                }
+                Window::PendingCacheRepair => {
+                    assert_eq!(
+                        receiver_store.test_blob_logical_digest(),
+                        fault_digest,
+                        "{label}: cache repair cannot mutate retained pending state"
+                    );
+                    assert_eq!(receiver_stats_after, receiver_stats_before, "{label}");
+                    assert!(
+                        !receiver_cache.has_blob_claim_for_test(transfer),
+                        "{label}: lifetime-withheld repair cannot cache the pending source"
+                    );
+                    assert!(matches!(
+                        receiver_store.custody_v1_pending_blob_source(transfer),
+                        Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+                    ));
+                    assert_eq!(
+                        fault_state
+                            .result_frames_after_fault
+                            .load(Ordering::Acquire),
+                        0,
+                        "{label}: withheld repair emits no Blob result"
+                    );
+                }
+                Window::CompletedCacheRepairCapability
+                | Window::CompletedCacheRepairFinalComparison => {
+                    assert_eq!(
+                        receiver_store.test_blob_logical_digest(),
+                        fault_digest,
+                        "{label}: completed cache repair cannot mutate after its fault boundary"
+                    );
+                    assert_eq!(receiver_stats_after.pending_sources, 0, "{label}");
+                    assert_eq!(receiver_stats_after.carrier_prefixes, 0, "{label}");
+                    assert_eq!(
+                        receiver_stats_after.publications,
+                        u64::from(
+                            fault
+                                != TestBlobContactFault::CompletedCacheRepairCapabilityLifetimeExpiry
+                        ),
+                        "{label}: only pre-capability expiry performs deterministic retirement"
+                    );
+                    assert!(
+                        !receiver_cache.has_blob_claim_for_test(transfer),
+                        "{label}: lifetime-withheld completed repair cannot cache the source"
+                    );
+                    assert!(matches!(
+                        receiver_store.get_blob(transfer),
+                        Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+                    ));
+                    assert_eq!(
+                        fault_state
+                            .result_frames_after_fault
+                            .load(Ordering::Acquire),
+                        0,
+                        "{label}: withheld completed repair emits no Blob result"
+                    );
+                }
+                Window::PostPromotionLoad => {
+                    assert_eq!(
+                        receiver_store.test_blob_logical_digest(),
+                        fault_digest,
+                        "{label}"
+                    );
+                    assert_eq!(receiver_stats_after.pending_sources, 0, "{label}");
+                    assert_eq!(receiver_stats_after.carrier_prefixes, 0, "{label}");
+                    assert_eq!(receiver_stats_after.publications, 1, "{label}");
+                    assert!(
+                        !receiver_cache.has_blob_claim_for_test(transfer),
+                        "{label}: stale pending cache proof is withheld after Store commit"
+                    );
+                    assert!(matches!(
+                        receiver_store.get_blob(transfer),
+                        Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+                    ));
+                    assert_eq!(
+                        fault_state
+                            .result_frames_after_fault
+                            .load(Ordering::Acquire),
+                        0,
+                        "{label}: no success result follows post-commit withholding"
+                    );
+                }
+            }
+
+            drop((source_store, receiver_store));
+            fs::remove_dir_all(source_state).expect("late lifetime source cleanup");
+            fs::remove_dir_all(receiver_state).expect("late lifetime receiver cleanup");
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_blob_settlement_frames_observe_digest_absence() {
+        let services = control_test_services([0xdf; 32]);
+        let authority = services.member.mission_authority_id();
+        let server_state = root("v8-durable-settlement-observation-server");
+        let client_state = root("v8-durable-settlement-observation-client");
+        fs::create_dir_all(&server_state).expect("durable settlement server root");
+        fs::create_dir_all(&client_state).expect("durable settlement client root");
+        let server_store = Arc::new(
+            Store::open_for_mission(server_state.join(STORE_FILE), authority)
+                .expect("durable settlement server store"),
+        );
+        let client_store = Arc::new(
+            Store::open_for_mission(client_state.join(STORE_FILE), authority)
+                .expect("durable settlement client store"),
+        );
+        let mut server_sealer = open_test_sealer(&services.member);
+        let mut client_sealer = open_test_sealer(&services.other);
+        let server_blob = publish_test_blob(
+            &server_store,
+            &mut server_sealer,
+            &services.topic,
+            &services.scope,
+            1,
+            b"durable fetch settlement observation",
+        );
+        let client_blob = publish_test_blob(
+            &client_store,
+            &mut client_sealer,
+            &services.topic,
+            &services.scope,
+            1,
+            b"durable apply settlement observation",
+        );
+        let interests = || {
+            MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
+                services.topic.clone(),
+                services.scope.clone(),
+                false,
+            )])
+        };
+        let server_harness = TestBlobSettlementHarness::default();
+        let client_harness = TestBlobSettlementHarness::default();
+        let durable_contact = blob_contact_test_pair_with_settlement_harness(
+            server_store.clone(),
+            services.member.clone(),
+            interests(),
+            test_event_route_cache(&server_store, &services.member),
+            client_store.clone(),
+            services.other.clone(),
+            interests(),
+            test_event_route_cache(&client_store, &services.other),
+            server_harness.clone(),
+            client_harness.clone(),
+        )
+        .await;
+        assert!(
+            durable_contact.0.is_ok() && durable_contact.1.is_ok(),
+            "durable two-direction settlement: client={:?}, server={:?}",
+            durable_contact.0,
+            durable_contact.1
+        );
+        let durable_observations = server_harness
+            .observations()
+            .into_iter()
+            .chain(client_harness.observations())
+            .collect::<Vec<_>>();
+        assert_eq!(durable_observations.len(), 3);
+        assert!(durable_observations.iter().all(|observation| {
+            observation.authority_digest.is_none() && observation.emitted_digest.is_none()
+        }));
+        assert!(durable_observations.iter().any(|observation| {
+            observation.kind == TestBlobSettlementKind::ApplyResult
+                && observation.id == MutableTransferId::Blob(client_blob)
+        }));
+        assert!(durable_observations.iter().any(|observation| {
+            observation.kind == TestBlobSettlementKind::FetchResult
+                && observation.id == MutableTransferId::Blob(server_blob)
+        }));
+        assert!(durable_observations.iter().any(|observation| {
+            observation.kind == TestBlobSettlementKind::FetchResultAck
+                && observation.id == MutableTransferId::Blob(server_blob)
+        }));
+        drop((server_store, client_store));
+        fs::remove_dir_all(server_state).expect("durable settlement server cleanup");
+        fs::remove_dir_all(client_state).expect("durable settlement client cleanup");
+    }
+
+    #[tokio::test]
+    async fn blob_wrong_settlement_matrix_uses_real_claims_and_production_handlers() {
+        // Mutation caught: a helper-only validator test can pass while a live
+        // call site emits the wrong claim digest/disposition, advances a
+        // cursor, or continues to a later item after rejection.
+        let cases = [
+            (
+                "apply-missing-digest",
+                TestBlobSettlementKind::ApplyResult,
+                TestBlobSettlementMutation::MissingDigest,
+            ),
+            (
+                "apply-stale-real-digest",
+                TestBlobSettlementKind::ApplyResult,
+                TestBlobSettlementMutation::ReplaceDigest([0xa1; 32]),
+            ),
+            (
+                "apply-forged-disposition",
+                TestBlobSettlementKind::ApplyResult,
+                TestBlobSettlementMutation::CorruptProtectedDisposition,
+            ),
+            (
+                "fetch-result-cross-direction-digest",
+                TestBlobSettlementKind::FetchResult,
+                TestBlobSettlementMutation::ReplaceDigest([0xa2; 32]),
+            ),
+            (
+                "fetch-result-forged-disposition",
+                TestBlobSettlementKind::FetchResult,
+                TestBlobSettlementMutation::CorruptProtectedDisposition,
+            ),
+            (
+                "fetch-ack-cross-transfer-digest",
+                TestBlobSettlementKind::FetchResultAck,
+                TestBlobSettlementMutation::ReplaceDigest([0xa3; 32]),
+            ),
+            (
+                "fetch-ack-wrong-disposition",
+                TestBlobSettlementKind::FetchResultAck,
+                TestBlobSettlementMutation::ReplaceDisposition(MutableApplyDisposition::Duplicate),
+            ),
+        ];
+
+        let mut actual_digests = Vec::new();
+        for (case_index, (label, kind, configured_mutation)) in cases.into_iter().enumerate() {
+            let mutation = match configured_mutation {
+                TestBlobSettlementMutation::ReplaceDigest(_) => {
+                    TestBlobSettlementMutation::ReplaceDigest(
+                        *actual_digests
+                            .last()
+                            .expect("wrong digest comes from a prior real verified claim"),
+                    )
+                }
+                mutation => mutation,
+            };
+            let source_is_server = kind != TestBlobSettlementKind::ApplyResult;
+            let services = control_test_services([0xe0 + case_index as u8; 32]);
+            let authority = services.member.mission_authority_id();
+            let source_state = root(&format!("settlement-{label}-source"));
+            let receiver_state = root(&format!("settlement-{label}-receiver"));
+            fs::create_dir_all(&source_state).expect("wrong settlement source root");
+            fs::create_dir_all(&receiver_state).expect("wrong settlement receiver root");
+            let source_store = Arc::new(
+                Store::open_for_mission(source_state.join(STORE_FILE), authority)
+                    .expect("wrong settlement source store"),
+            );
+            let receiver_store = Arc::new(
+                Store::open_for_mission(receiver_state.join(STORE_FILE), authority)
+                    .expect("wrong settlement receiver store"),
+            );
+            let mut source_sealer = open_test_sealer(&services.member);
+            let source_clock_id = if source_is_server {
+                [0xb1; 16]
+            } else {
+                BLOB_CONTACT_TEST_CLIENT_CLOCK_ID
+            };
+            let first = publish_test_finite_blob(
+                &source_store,
+                &mut source_sealer,
+                &services.topic,
+                &services.scope,
+                1,
+                format!("{label}-first").as_bytes(),
+                600_000,
+                25,
+                CustodySample {
+                    clock_id: source_clock_id,
+                    tick_ms: 0,
+                },
+            );
+            let second = publish_test_finite_blob(
+                &source_store,
+                &mut source_sealer,
+                &services.topic,
+                &services.scope,
+                1,
+                format!("{label}-later").as_bytes(),
+                600_000,
+                25,
+                CustodySample {
+                    clock_id: source_clock_id,
+                    tick_ms: 0,
+                },
+            );
+            let mut ordered = [first, second];
+            ordered.sort();
+            let interests = || {
+                MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
+                    services.topic.clone(),
+                    services.scope.clone(),
+                    false,
+                )])
+            };
+            let fault = TestBlobSettlementFault { kind, mutation };
+            let server_harness = if kind == TestBlobSettlementKind::ApplyResult
+                || kind == TestBlobSettlementKind::FetchResultAck
+            {
+                TestBlobSettlementHarness::with_fault(fault)
+            } else {
+                TestBlobSettlementHarness::default()
+            };
+            let client_harness = if kind == TestBlobSettlementKind::FetchResult {
+                TestBlobSettlementHarness::with_fault(fault)
+            } else {
+                TestBlobSettlementHarness::default()
+            };
+            let (client_result, server_result) = if source_is_server {
+                blob_contact_test_pair_with_settlement_harness(
+                    source_store.clone(),
+                    services.member.clone(),
+                    interests(),
+                    test_event_route_cache(&source_store, &services.member),
+                    receiver_store.clone(),
+                    services.other.clone(),
+                    interests(),
+                    test_event_route_cache(&receiver_store, &services.other),
+                    server_harness.clone(),
+                    client_harness.clone(),
+                )
+                .await
+            } else {
+                blob_contact_test_pair_with_settlement_harness(
+                    receiver_store.clone(),
+                    services.other.clone(),
+                    interests(),
+                    test_event_route_cache(&receiver_store, &services.other),
+                    source_store.clone(),
+                    services.member.clone(),
+                    interests(),
+                    test_event_route_cache(&source_store, &services.member),
+                    server_harness.clone(),
+                    client_harness.clone(),
+                )
+                .await
+            };
+            assert!(
+                client_result.is_err() || server_result.is_err(),
+                "{label} must fail through the real protected lane"
+            );
+            let observations = server_harness
+                .observations()
+                .into_iter()
+                .chain(client_harness.observations())
+                .collect::<Vec<_>>();
+            let targeted = observations
+                .iter()
+                .find(|observation| observation.kind == kind)
+                .unwrap_or_else(|| panic!("{label}: targeted production frame observed"));
+            let current_digest = targeted
+                .authority_digest
+                .unwrap_or_else(|| panic!("{label}: verified/minted claim digest"));
+            assert_eq!(targeted.emitted_digest, Some(current_digest));
+            actual_digests.push(current_digest);
+            let staged = observations
+                .iter()
+                .find(|observation| {
+                    observation.kind
+                        == if source_is_server {
+                            TestBlobSettlementKind::FetchResult
+                        } else {
+                            TestBlobSettlementKind::ApplyResult
+                        }
+                })
+                .expect("receiver staging boundary observation");
+            assert_eq!(
+                receiver_store.test_blob_logical_digest(),
+                staged.logical_digest,
+                "{label}: rejection permits only the preceding authenticated stage"
+            );
+            assert!(
+                receiver_store
+                    .pending_blob_source(ordered[0])
+                    .expect("staged source after wrong settlement")
+                    .is_some(),
+                "{label}: legitimate staging precedes the forged settlement"
+            );
+            assert!(
+                receiver_store
+                    .pending_blob_source(ordered[1])
+                    .expect("later source after wrong settlement")
+                    .is_none(),
+                "{label}: no later item may mutate"
+            );
+            for (store, peer) in [
+                (&source_store, services.other.identity()),
+                (&receiver_store, services.member.identity()),
+            ] {
+                for mode in [
+                    MutableTransferCursorMode::OfferToPeer,
+                    MutableTransferCursorMode::FetchFromPeer,
+                ] {
+                    assert_eq!(
+                        store
+                            .mutable_transfer_cursor(peer, MutableTransferCursorClass::Blob, mode,)
+                            .expect("wrong settlement cursor"),
+                        None,
+                        "{label}: all four cursor coordinates remain unchanged"
+                    );
+                }
+            }
+            drop((source_store, receiver_store));
+            fs::remove_dir_all(source_state).expect("wrong settlement source cleanup");
+            fs::remove_dir_all(receiver_state).expect("wrong settlement receiver cleanup");
+        }
+        assert!(
+            actual_digests.windows(2).all(|pair| pair[0] != pair[1]),
+            "each fault originates in a distinct real verified claim context"
+        );
+    }
+
+    #[tokio::test]
+    async fn v8_blob_carrier_adjacent_finalization_rejects_overrun_and_expiry_then_retries() {
+        // Mutation caught: sampling only when the claim is built would let a
+        // delayed sealed offer/object escape after its authenticated age
+        // charge, while reusing the consumed claim would make retry unsafe.
+        for (case, ttl_ms, delay_ms) in [
+            ("overrun", 600_000, MAX_CUSTODY_FINALIZATION_CHARGE_MS + 1),
+            ("expiry", 80, 30),
+        ] {
+            for source_is_server in [true, false] {
+                let services = control_test_services(if source_is_server {
+                    [0xd3; 32]
+                } else {
+                    [0xd4; 32]
+                });
+                let authority = services.member.mission_authority_id();
+                let side = if source_is_server { "object" } else { "offer" };
+                let source_state = root(&format!("v8-final-{case}-{side}-source"));
+                let receiver_state = root(&format!("v8-final-{case}-{side}-receiver"));
+                fs::create_dir_all(&source_state).expect("finalization source state");
+                fs::create_dir_all(&receiver_state).expect("finalization receiver state");
+                let source_store = Arc::new(
+                    Store::open_for_mission(source_state.join(STORE_FILE), authority)
+                        .expect("finalization source store"),
+                );
+                let receiver_store = Arc::new(
+                    Store::open_for_mission(receiver_state.join(STORE_FILE), authority)
+                        .expect("finalization receiver store"),
+                );
+                let source_cache = test_event_route_cache(&source_store, &services.member);
+                let receiver_cache = test_event_route_cache(&receiver_store, &services.other);
+                let source_clock_id = if source_is_server {
+                    [0xb1; 16]
+                } else {
+                    BLOB_CONTACT_TEST_CLIENT_CLOCK_ID
+                };
+                let mut source_sealer = open_test_sealer(&services.member);
+                let finite = publish_test_finite_blob(
+                    &source_store,
+                    &mut source_sealer,
+                    &services.topic,
+                    &services.scope,
+                    1,
+                    b"carrier-adjacent finite Blob source",
+                    ttl_ms,
+                    25,
+                    CustodySample {
+                        clock_id: source_clock_id,
+                        tick_ms: 0,
+                    },
+                );
+                let interests = || {
+                    MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
+                        services.topic.clone(),
+                        services.scope.clone(),
+                        false,
+                    )])
+                };
+                let (
+                    server_store,
+                    server_mission,
+                    server_cache,
+                    client_store,
+                    client_mission,
+                    client_cache,
+                ) = if source_is_server {
+                    (
+                        Arc::clone(&source_store),
+                        services.member.clone(),
+                        Arc::clone(&source_cache),
+                        Arc::clone(&receiver_store),
+                        services.other.clone(),
+                        Arc::clone(&receiver_cache),
+                    )
+                } else {
+                    (
+                        Arc::clone(&receiver_store),
+                        services.other.clone(),
+                        Arc::clone(&receiver_cache),
+                        Arc::clone(&source_store),
+                        services.member.clone(),
+                        Arc::clone(&source_cache),
+                    )
+                };
+                let (client_result, server_result) =
+                    blob_contact_test_pair_with_caches_results_and_finalization_delays(
+                        Arc::clone(&server_store),
+                        server_mission.clone(),
+                        interests(),
+                        Arc::clone(&server_cache),
+                        Arc::clone(&client_store),
+                        client_mission.clone(),
+                        interests(),
+                        Arc::clone(&client_cache),
+                        None,
+                        None,
+                        None,
+                        None,
+                        0,
+                        source_is_server.then_some(delay_ms),
+                        (!source_is_server).then_some(delay_ms),
+                        0,
+                        0,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await;
+                assert!(
+                    client_result.is_err() || server_result.is_err(),
+                    "{case} {side} must abandon the sealed frame"
+                );
+                assert!(
+                    receiver_store
+                        .blob_source_projection(finite)
+                        .expect("rejected finalization receiver projection")
+                        .is_none(),
+                    "{case} {side} must reject before any wire Blob source reaches the peer"
+                );
+                assert!(
+                    receiver_store
+                        .pending_blob_source(finite)
+                        .expect("rejected finalization pending projection")
+                        .is_none()
+                );
+
+                if case == "overrun" {
+                    let (retry_client, retry_server) =
+                        blob_contact_test_pair_with_caches_results_and_finalization_delays(
+                            server_store,
+                            server_mission,
+                            interests(),
+                            server_cache,
+                            client_store,
+                            client_mission,
+                            interests(),
+                            client_cache,
+                            None,
+                            None,
+                            None,
+                            None,
+                            0,
+                            None,
+                            None,
+                            if source_is_server { delay_ms } else { 0 },
+                            if source_is_server { 0 } else { delay_ms },
+                            None,
+                            None,
+                            None,
+                            None,
+                        )
+                        .await;
+                    assert!(
+                        retry_client.is_ok() && retry_server.is_ok(),
+                        "fresh {case} {side} claim must retry safely: client={retry_client:?}, server={retry_server:?}"
+                    );
+                    assert!(
+                        receiver_store
+                            .blob_source_projection(finite)
+                            .expect("retry retained projection")
+                            .is_some(),
+                        "fresh retry must retain the source after the consumed rejected claim; Slice 5D may also complete its bounded carrier"
+                    );
+                }
+                drop(source_store);
+                drop(receiver_store);
+                fs::remove_dir_all(source_state).expect("finalization source cleanup");
+                fs::remove_dir_all(receiver_state).expect("finalization receiver cleanup");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn v8_blob_protected_contact_rejection_matrix_is_receiver_state_neutral() {
+        // Task-2 owns byte-grammar permutations. This real-contact matrix starts
+        // after a successful protected open (except the explicit replay case)
+        // and proves every context rejection precedes durable staging.
+        let faults = [
+            TestBlobReceiveFault::Missing,
+            TestBlobReceiveFault::Tampered,
+            TestBlobReceiveFault::CrossSession,
+            TestBlobReceiveFault::CrossDirection,
+            TestBlobReceiveFault::CrossExchange,
+            TestBlobReceiveFault::CrossTransfer,
+            TestBlobReceiveFault::CrossLength,
+            TestBlobReceiveFault::ImmutableMismatch,
+            TestBlobReceiveFault::Replay,
+        ];
+        for source_is_server in [true, false] {
+            let services = control_test_services(if source_is_server {
+                [0xd5; 32]
+            } else {
+                [0xd6; 32]
+            });
+            let authority = services.member.mission_authority_id();
+            let side = if source_is_server { "object" } else { "offer" };
+            let source_state = root(&format!("v8-negative-{side}-source"));
+            fs::create_dir_all(&source_state).expect("negative source state");
+            let source_store = Arc::new(
+                Store::open_for_mission(source_state.join(STORE_FILE), authority)
+                    .expect("negative source store"),
+            );
+            let source_cache = test_event_route_cache(&source_store, &services.member);
+            let source_clock_id = if source_is_server {
+                [0xb1; 16]
+            } else {
+                BLOB_CONTACT_TEST_CLIENT_CLOCK_ID
+            };
+            let mut source_sealer = open_test_sealer(&services.member);
+            let finite = publish_test_finite_blob(
+                &source_store,
+                &mut source_sealer,
+                &services.topic,
+                &services.scope,
+                1,
+                b"protected Blob rejection matrix source",
+                600_000,
+                25,
+                CustodySample {
+                    clock_id: source_clock_id,
+                    tick_ms: 0,
+                },
+            );
+            let interests = || {
+                MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
+                    services.topic.clone(),
+                    services.scope.clone(),
+                    false,
+                )])
+            };
+            for fault in faults {
+                let receiver_state = root(&format!("v8-negative-{side}-{fault:?}-receiver"));
+                fs::create_dir_all(&receiver_state).expect("negative receiver state");
+                let receiver_path = receiver_state.join(STORE_FILE);
+                let receiver_store = Arc::new(
+                    Store::open_for_mission(&receiver_path, authority)
+                        .expect("negative receiver store"),
+                );
+                let receiver_cache = test_event_route_cache(&receiver_store, &services.other);
+                let receiver_peer = services.member.identity();
+                let blob_digest_before = receiver_store.test_blob_logical_digest();
+                let stats_before = receiver_store.blob_stats().expect("negative stats before");
+                let offer_cursor_before = receiver_store
+                    .mutable_transfer_cursor(
+                        receiver_peer,
+                        MutableTransferCursorClass::Blob,
+                        MutableTransferCursorMode::OfferToPeer,
+                    )
+                    .expect("negative offer cursor before");
+                let fetch_cursor_before = receiver_store
+                    .mutable_transfer_cursor(
+                        receiver_peer,
+                        MutableTransferCursorClass::Blob,
+                        MutableTransferCursorMode::FetchFromPeer,
+                    )
+                    .expect("negative fetch cursor before");
+                let carrier_cursor_before = receiver_store
+                    .blob_carrier_fetch_cursor(receiver_peer)
+                    .expect("negative carrier cursor before");
+
+                let (
+                    server_store,
+                    server_mission,
+                    server_cache,
+                    client_store,
+                    client_mission,
+                    client_cache,
+                ) = if source_is_server {
+                    (
+                        Arc::clone(&source_store),
+                        services.member.clone(),
+                        Arc::clone(&source_cache),
+                        Arc::clone(&receiver_store),
+                        services.other.clone(),
+                        Arc::clone(&receiver_cache),
+                    )
+                } else {
+                    (
+                        Arc::clone(&receiver_store),
+                        services.other.clone(),
+                        Arc::clone(&receiver_cache),
+                        Arc::clone(&source_store),
+                        services.member.clone(),
+                        Arc::clone(&source_cache),
+                    )
+                };
+                let (client_result, server_result) =
+                    blob_contact_test_pair_with_caches_results_and_finalization_delays(
+                        server_store,
+                        server_mission,
+                        interests(),
+                        server_cache,
+                        client_store,
+                        client_mission,
+                        interests(),
+                        client_cache,
+                        None,
+                        None,
+                        None,
+                        None,
+                        0,
+                        None,
+                        None,
+                        0,
+                        0,
+                        (!source_is_server).then_some(fault),
+                        source_is_server.then_some(fault),
+                        None,
+                        None,
+                    )
+                    .await;
+                assert!(
+                    client_result.is_err() || server_result.is_err(),
+                    "{fault:?} {side} must reject the protected source"
+                );
+                assert_eq!(
+                    receiver_store.blob_stats().expect("negative stats after"),
+                    stats_before,
+                    "{fault:?} {side} changed the receiver Blob projection"
+                );
+                assert!(
+                    receiver_store
+                        .blob_source_projection(finite)
+                        .expect("negative source projection")
+                        .is_none()
+                );
+                assert!(
+                    receiver_store
+                        .pending_blob_source(finite)
+                        .expect("negative pending projection")
+                        .is_none()
+                );
+                assert!(!receiver_cache.has_blob_claim_for_test(finite));
+                assert_eq!(
+                    receiver_store
+                        .mutable_transfer_cursor(
+                            receiver_peer,
+                            MutableTransferCursorClass::Blob,
+                            MutableTransferCursorMode::OfferToPeer,
+                        )
+                        .expect("negative offer cursor after"),
+                    offer_cursor_before,
+                );
+                assert_eq!(
+                    receiver_store
+                        .mutable_transfer_cursor(
+                            receiver_peer,
+                            MutableTransferCursorClass::Blob,
+                            MutableTransferCursorMode::FetchFromPeer,
+                        )
+                        .expect("negative fetch cursor after"),
+                    fetch_cursor_before,
+                );
+                assert_eq!(
+                    receiver_store
+                        .blob_carrier_fetch_cursor(receiver_peer)
+                        .expect("negative carrier cursor after"),
+                    carrier_cursor_before,
+                );
+                assert_eq!(
+                    receiver_store.test_blob_logical_digest(),
+                    blob_digest_before,
+                    "{fault:?} {side} changed exact Blob logical state"
+                );
+                drop(receiver_store);
+                fs::remove_dir_all(receiver_state).expect("negative receiver cleanup");
+            }
+            drop(source_store);
+            fs::remove_dir_all(source_state).expect("negative source cleanup");
+        }
+    }
+
+    #[tokio::test]
+    async fn v8_legacy_blob_contact_preserves_withheld_finite_pending_and_progresses_durable_carrier()
+     {
+        // Mutation caught: legacy startup cleanup, carrier scheduling, or
+        // contact-triggered capacity recovery over all visible sources would
+        // resume, rewrite, abort, retire, or promote finite completed/pending
+        // state instead of cleanly deferring and later progressing durable work.
+        let services = control_test_services([0xe4; 32]);
+        let authority = services.member.mission_authority_id();
+        assert_eq!(services.other.mission_authority_id(), authority);
+        let source_state = root("v8-legacy-pending-source");
+        let receiver_state = root("v8-legacy-pending-receiver");
+        fs::create_dir_all(&source_state).expect("legacy pending source state");
+        fs::create_dir_all(&receiver_state).expect("legacy pending receiver state");
+        let source_store = Arc::new(
+            Store::open_for_mission(source_state.join(STORE_FILE), authority)
+                .expect("legacy pending source store"),
+        );
+        let receiver_path = receiver_state.join(STORE_FILE);
+        let receiver_store = Arc::new(
+            Store::open_for_mission(&receiver_path, authority)
+                .expect("legacy pending receiver store"),
+        );
+        let mut source_sealer = open_test_sealer(&services.member);
+        let source_sample = CustodySample {
+            clock_id: [0xb1; 16],
+            tick_ms: 0,
+        };
+        let receiver_sample = CustodySample {
+            clock_id: BLOB_CONTACT_TEST_CLIENT_CLOCK_ID,
+            tick_ms: 0,
+        };
+        let finite = publish_test_finite_blob(
+            &source_store,
+            &mut source_sealer,
+            &services.topic,
+            &services.scope,
+            1,
+            &[0x5c; 96 * 1024],
+            600_000,
+            0,
+            source_sample,
+        );
+        let finite_sealed = source_store
+            .get_blob(finite)
+            .expect("finite legacy source load")
+            .expect("finite legacy source")
+            .sealed;
+        let mut receiver_verifier = open_test_sealer(&services.other);
+        let finite_completed = publish_test_finite_blob(
+            &receiver_store,
+            &mut receiver_verifier,
+            &services.topic,
+            &services.scope,
+            1,
+            b"finite completed capacity sentinel",
+            600_000,
+            0,
+            receiver_sample,
+        );
+        let finite_completed_before = receiver_store
+            .blob_source_projection(finite_completed)
+            .expect("finite completed projection before capacity contact")
+            .expect("finite completed retained before capacity contact");
+        let finite_route = receiver_verifier
+            .verify_blob(&finite_sealed)
+            .expect("verify finite legacy pending route");
+        let BlobContentVerification::ContentVerified {
+            blob: finite_blob,
+            manifest_bytes: finite_manifest,
+        } = receiver_verifier
+            .verify_blob_content(finite_route, &finite_sealed)
+            .expect("verify finite legacy pending content")
+        else {
+            panic!("receiver lacks finite Blob content grant");
+        };
+        let finite_plan = finite_blob
+            .transfer_plan(&finite_manifest)
+            .expect("finite legacy pending plan");
+        let receiver_policy = receiver_store
+            .control_policy_snapshot()
+            .expect("finite legacy receiver policy");
+        assert_eq!(
+            receiver_store
+                .test_stage_verified_finite_blob_source_with_policy(
+                    &receiver_policy,
+                    &finite_blob,
+                    &finite_sealed,
+                    &finite_plan,
+                    0,
+                    receiver_sample,
+                )
+                .expect("stage finite legacy pending source"),
+            BlobSourceStageOutcome::Inserted
+        );
+        let finite_carrier = {
+            let mut depot = source_store.blob_depot().expect("finite source depot");
+            aster_mesh::BlobStore::begin_blob_with_lineage(
+                &mut depot,
+                finite_plan.manifest(),
+                finite_plan.physical_lineage(),
+            )
+            .expect("activate finite source carrier plan");
+            finite_plan
+                .build_carrier(&mut depot, 0)
+                .expect("build finite source carrier")
+        };
+        let finite_object = BlobCarrierObjectId::new(finite_carrier.object_id().wire_bytes())
+            .expect("finite carrier object");
+        let finite_total =
+            u64::try_from(finite_carrier.bytes().len()).expect("finite carrier total length");
+        let finite_prefix_len = finite_carrier
+            .bytes()
+            .len()
+            .min(MAX_BLOB_NETWORK_RANGE_BYTES);
+        assert!(finite_prefix_len < finite_carrier.bytes().len());
+        let finite_prefix_before = match receiver_store
+            .append_blob_carrier_prefix_with_policy(
+                &receiver_policy,
+                finite,
+                finite_object,
+                finite_total,
+                0,
+                &finite_carrier.bytes()[..finite_prefix_len],
+            )
+            .expect("append finite pending prefix before restart")
+        {
+            BlobCarrierAppendOutcome::Appended(status)
+            | BlobCarrierAppendOutcome::Duplicate(status) => status,
+        };
+        drop(receiver_store);
+        let receiver_store = Arc::new(
+            Store::open_for_mission(&receiver_path, authority)
+                .expect("reopen legacy pending receiver store"),
+        );
+        let finite_before = receiver_store
+            .blob_source_projection(finite)
+            .expect("finite pending projection before contact")
+            .expect("finite pending before contact");
+        assert_eq!(finite_before.retention, BlobSourceRetention::Pending);
+
+        let durable = publish_test_blob_with_priority(
+            &source_store,
+            &mut source_sealer,
+            &services.topic,
+            &services.scope,
+            1,
+            Priority::Flash,
+            &[0x6d; 96 * 1024],
+        );
+        let append_fault = install_test_blob_contact_fault(
+            services.other.identity(),
+            TestBlobContactFault::AppendCapacity,
+        );
+        let source_cache = test_event_route_cache(&source_store, &services.member);
+        let receiver_cache = test_event_route_cache(&receiver_store, &services.other);
+        assert!(receiver_cache.has_blob_claim_for_test(finite));
+        assert!(receiver_cache.has_blob_claim_for_test(finite_completed));
+        prime_remote_blob_policy_for_pressure(&receiver_store);
+        let interests = || {
+            MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
+                services.topic.clone(),
+                services.scope.clone(),
+                false,
+            )])
+        };
+        let (receiver_receipt, _) = with_test_transfer_profile_offer(
+            TransferProfileOfferV1::legacy_only(),
+            Box::pin(blob_contact_test_pair_with_caches(
+                source_store.clone(),
+                services.member.clone(),
+                interests(),
+                Arc::clone(&source_cache),
+                receiver_store.clone(),
+                services.other.clone(),
+                interests(),
+                Arc::clone(&receiver_cache),
+                None,
+                None,
+                None,
+                None,
+                0,
+            )),
+        )
+        .await;
+
+        assert!(append_fault.fired.load(Ordering::Acquire));
+        assert!(receiver_cache.has_blob_claim_for_test(finite));
+        assert!(receiver_cache.has_blob_claim_for_test(finite_completed));
+        assert_eq!(
+            receiver_store
+                .blob_source_projection(finite)
+                .expect("finite pending projection after contact")
+                .expect("finite pending retained after contact"),
+            finite_before,
+            "legacy startup cleanup and carrier selection must not mutate withheld finite pending authority"
+        );
+        assert_eq!(
+            receiver_store
+                .blob_carrier_prefix_status(finite, finite_object)
+                .expect("finite pending prefix after legacy contact")
+                .expect("finite pending prefix retained after legacy contact"),
+            finite_prefix_before,
+            "legacy carrier service must not resume or rewrite withheld finite prefix progress"
+        );
+        assert_eq!(
+            receiver_store
+                .blob_source_projection(finite_completed)
+                .expect("finite completed projection after capacity contact")
+                .expect("finite completed retained after capacity contact"),
+            finite_completed_before,
+            "contact capacity recovery must not retire or rewrite finite completed authority"
+        );
+        assert!(
+            receiver_receipt.blob_deferred > 0,
+            "finite-only pressure recovery must cleanly defer the durable append"
+        );
+
+        let (receiver_receipt, _) = with_test_transfer_profile_offer(
+            TransferProfileOfferV1::legacy_only(),
+            Box::pin(blob_contact_test_pair_with_caches(
+                source_store.clone(),
+                services.member.clone(),
+                interests(),
+                source_cache,
+                receiver_store.clone(),
+                services.other.clone(),
+                interests(),
+                receiver_cache,
+                None,
+                None,
+                None,
+                None,
+                0,
+            )),
+        )
+        .await;
+        assert_eq!(
+            receiver_store
+                .blob_source_projection(finite)
+                .expect("finite pending projection after durable retry")
+                .expect("finite pending retained after durable retry"),
+            finite_before
+        );
+        assert_eq!(
+            receiver_store
+                .blob_carrier_prefix_status(finite, finite_object)
+                .expect("finite prefix after durable retry")
+                .expect("finite prefix retained after durable retry"),
+            finite_prefix_before
+        );
+        assert_eq!(
+            receiver_store
+                .blob_source_projection(finite_completed)
+                .expect("finite completed projection after durable retry")
+                .expect("finite completed retained after durable retry"),
+            finite_completed_before
+        );
+        assert!(
+            receiver_store
+                .blob_source_projection(durable)
+                .expect("durable pending projection after contact")
+                .is_some(),
+            "withheld finite pending work must not starve durable source staging"
+        );
+        assert!(receiver_receipt.blob_ranges_fetched > 0);
+        assert!(receiver_receipt.blob_bytes_fetched > 0);
+
+        // Drain only the durable source while repeatedly negotiating the
+        // legacy profile. The pre-existing finite prefix and its exact
+        // lifecycle fingerprint must remain byte-for-byte stable.
+        for _ in 0..16 {
+            let retained = receiver_store
+                .blob_source_projection(durable)
+                .expect("durable legacy convergence projection")
+                .expect("durable legacy convergence source");
+            if matches!(retained.retention, BlobSourceRetention::Completed { .. }) {
+                break;
+            }
+            let (receiver_receipt, _, _, _) = with_test_transfer_profile_offer(
+                TransferProfileOfferV1::legacy_only(),
+                Box::pin(blob_contact_test_pair(
+                    source_store.clone(),
+                    services.member.clone(),
+                    interests(),
+                    receiver_store.clone(),
+                    services.other.clone(),
+                    interests(),
+                )),
+            )
+            .await;
+            assert!(receiver_receipt.blob_ranges_fetched <= 1);
+            assert_eq!(
+                receiver_store
+                    .blob_source_projection(finite)
+                    .expect("finite pending projection during legacy convergence")
+                    .expect("finite pending retained during legacy convergence"),
+                finite_before
+            );
+            assert_eq!(
+                receiver_store
+                    .blob_carrier_prefix_status(finite, finite_object)
+                    .expect("finite prefix during legacy convergence")
+                    .expect("finite prefix retained during legacy convergence"),
+                finite_prefix_before
+            );
+        }
+        assert!(matches!(
+            receiver_store
+                .blob_source_projection(durable)
+                .expect("durable legacy completion projection")
+                .expect("durable legacy completion source")
+                .retention,
+            BlobSourceRetention::Completed { .. }
+        ));
+
+        // Restart after the legacy contacts, then negotiate authenticated v8
+        // custody. Eligibility comes from the durable pending row rather than
+        // an in-memory lease or the preceding contact's profile.
+        drop(receiver_store);
+        let receiver_store = Arc::new(
+            Store::open_for_mission(&receiver_path, authority)
+                .expect("reopen finite pending receiver for custody resume"),
+        );
+        let resumed_policy = receiver_store
+            .control_policy_snapshot()
+            .expect("custody resume receiver policy");
+        assert_eq!(
+            receiver_store
+                .custody_v1_blob_source_projection(finite)
+                .expect("custody resume exact retained projection")
+                .expect("custody resume finite source")
+                .source,
+            finite_before.source
+        );
+        let resume_cursor = receiver_store
+            .blob_carrier_fetch_cursor(services.member.identity())
+            .expect("custody resume cursor");
+        assert_eq!(
+            receiver_store
+                .next_pending_blob_source_with_policy(
+                    &resumed_policy,
+                    resume_cursor.map(|cursor| cursor.source()),
+                )
+                .expect("custody resume pending selection")
+                .map(|projection| projection.transfer_id),
+            Some(finite),
+            "Store custody selection must wrap from the settled durable cursor"
+        );
+        let (resumed, resume_source, _, _) = blob_contact_test_pair(
+            source_store.clone(),
+            services.member.clone(),
+            MutableSourceInterests::default(),
+            receiver_store.clone(),
+            services.other.clone(),
+            interests(),
+        )
+        .await;
+        assert_eq!(
+            resumed
+                .negotiated_transfer_profiles
+                .map(|profiles| profiles[3]),
+            Some(TransferProfileId::BlobCustodyV1 as u16),
+            "resume must negotiate the finite-capable Blob profile"
+        );
+        assert_eq!(resumed.fetched, 0, "resume must not restage the source");
+        assert_eq!(
+            resumed.blob_ranges_fetched, 1,
+            "custody resume receiver={resumed:?} source={resume_source:?}"
+        );
+        assert!(resumed.blob_bytes_fetched > 0);
+        match receiver_store
+            .blob_carrier_prefix_status(finite, finite_object)
+            .expect("finite prefix after custody resume")
+        {
+            Some(status) => assert_eq!(
+                status.prefix_len(),
+                finite_prefix_before.prefix_len()
+                    + u64::try_from(resumed.blob_bytes_fetched)
+                        .expect("resumed finite range length"),
+                "custody resume must append at the exact durable complement"
+            ),
+            None => assert_eq!(
+                finite_total,
+                finite_prefix_before.prefix_len()
+                    + u64::try_from(resumed.blob_bytes_fetched)
+                        .expect("committed resumed finite range length"),
+                "a completed first carrier must consume exactly its remaining complement"
+            ),
+        }
+
+        for _ in 0..16 {
+            let retained = receiver_store
+                .blob_source_projection(finite)
+                .expect("finite custody convergence projection")
+                .expect("finite custody convergence source");
+            if matches!(retained.retention, BlobSourceRetention::Completed { .. }) {
+                break;
+            }
+            let _ = blob_contact_test_pair(
+                source_store.clone(),
+                services.member.clone(),
+                MutableSourceInterests::default(),
+                receiver_store.clone(),
+                services.other.clone(),
+                interests(),
+            )
+            .await;
+        }
+        let finite_completed = receiver_store
+            .blob_source_projection(finite)
+            .expect("finite custody completion projection")
+            .expect("finite custody completion source");
+        assert!(matches!(
+            finite_completed.retention,
+            BlobSourceRetention::Completed { .. }
+        ));
+        assert_eq!(
+            finite_completed.source.metadata_fingerprint, finite_before.source.metadata_fingerprint,
+            "promotion must preserve the exact staged lifecycle/provenance fingerprint"
+        );
+
+        drop(source_store);
+        drop(receiver_store);
+        fs::remove_dir_all(source_state).expect("legacy pending source cleanup");
+        fs::remove_dir_all(receiver_state).expect("legacy pending receiver cleanup");
     }
 
     #[tokio::test]
@@ -48040,6 +53768,7 @@ mod tests {
                     .expect("delayed lifecycle projection lookup")
                     .expect("delayed lifecycle projection");
                 let claim = AuthenticatedBlobRouteClaim::from_verified(
+                    &store,
                     &blob,
                     &sealed,
                     &projection.source,
@@ -48161,6 +53890,7 @@ mod tests {
             &mut receiver_verifier,
             &cache,
             &projection,
+            BlobContactMode::DurableOnly,
         )
         .expect("post-race contact cache check")
         .expect("post-race contact retains exact source");
@@ -48288,6 +54018,15 @@ mod tests {
     {
         TEST_TRANSFER_PROFILE_OFFER
             .scope(std::cell::RefCell::new(Some(offer)), future)
+            .await
+    }
+
+    async fn with_test_semantic_version<F>(semantic_version: u16, future: F) -> F::Output
+    where
+        F: std::future::Future,
+    {
+        TEST_SEMANTIC_VERSION
+            .scope(std::cell::Cell::new(Some(semantic_version)), future)
             .await
     }
 

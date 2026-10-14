@@ -29,11 +29,12 @@ use std::error::Error;
 use std::fmt;
 
 use aster_mesh::{
-    BlobId, BlobRouteCommitment, BlobStore as CoreBlobStore, ContentVerifiedBlobEnvelope,
-    CurrentBlobLineage, MAX_BLOB_CHUNK_SIZE, MAX_BLOB_CHUNKS, MAX_BLOB_MANIFEST_BYTES,
-    MAX_BLOB_MEDIA_TYPE_BYTES, MAX_BLOB_SCHEMA_ID_BYTES,
-    SELECTED_BLOB_CHUNK_SIZE as CORE_SELECTED_BLOB_CHUNK_SIZE, VerifiedBlobContentCompletion,
-    VerifiedBlobCustodyClaimV1, VerifiedBlobTransferPlan,
+    AuthenticatedBlobCustodySendContextV1, BlobCustodyClaimV1, BlobCustodyDirectionV1,
+    BlobCustodyError, BlobCustodyTransferId, BlobId, BlobRouteCommitment,
+    BlobStore as CoreBlobStore, ContentVerifiedBlobEnvelope, CurrentBlobLineage,
+    MAX_BLOB_CHUNK_SIZE, MAX_BLOB_CHUNKS, MAX_BLOB_MANIFEST_BYTES, MAX_BLOB_MEDIA_TYPE_BYTES,
+    MAX_BLOB_SCHEMA_ID_BYTES, SELECTED_BLOB_CHUNK_SIZE as CORE_SELECTED_BLOB_CHUNK_SIZE,
+    VerifiedBlobContentCompletion, VerifiedBlobCustodyClaimV1, VerifiedBlobTransferPlan,
 };
 use redb::{ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle};
 
@@ -926,13 +927,9 @@ pub struct BlobSourceProjection {
 }
 
 impl BlobSourceProjection {
-    /// Re-derives this compact projection from one exact content-verified
-    /// source envelope instead of trusting independently decoded redb fields.
-    ///
-    /// This binds every encoded header field (including the causal counter and
-    /// priority), the physical variant identity, both provider lineages, and
-    /// the sealed length before a runtime cache may use the projection as an
-    /// authentication capability.
+    /// Re-derives a durable projection from one exact content-verified source.
+    /// Finite retained sources must use the Store-side validator so their
+    /// private age and provenance participate in this same fingerprint.
     pub fn matches_verified(
         &self,
         blob: &ContentVerifiedBlobEnvelope,
@@ -942,31 +939,7 @@ impl BlobSourceProjection {
             .map_err(|error| blob_error(BlobStoreError::Verification(error.to_string())))?;
         let sealed_len =
             u64::try_from(sealed.len()).map_err(|_| StoreError::PayloadByteAccountingOverflow)?;
-        let metadata = BlobMetadata {
-            transfer_id: BlobTransferId::new(blob.envelope_id()),
-            semantic_id: BlobSemanticId::new(blob.item_id()),
-            blob_id: blob.blob_id(),
-            variant_id: blob_variant_id(
-                blob.blob_id(),
-                blob.manifest().content_group(),
-                blob.manifest().content_epoch(),
-            ),
-            manifest_digest: *blob.manifest_digest(),
-            route_lineage: Some(*blob.route_lineage().binding()),
-            physical_lineage: Some(*blob.physical_lineage().binding()),
-            lifetime: BlobLifetime::Durable,
-            header: blob.header().clone(),
-        };
-        Ok(self
-            == &blob_source_projection(
-                &metadata,
-                sealed_len,
-                depot::BlobSourceShape {
-                    total_len: blob.manifest().total_len(),
-                    chunk_size: blob.manifest().chunk_size(),
-                    chunk_count: blob.manifest().chunk_count(),
-                },
-            )?)
+        Ok(self == &verified_blob_source_projection(blob, sealed_len, BlobLifetime::Durable)?)
     }
 }
 
@@ -1547,6 +1520,42 @@ impl BlobLifetime {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BlobContactEligibility {
+    AllVisible,
+    DurableOnly,
+    CustodyV1,
+}
+
+impl BlobContactEligibility {
+    const fn admits(self, lifetime: BlobLifetime) -> bool {
+        match (self, lifetime) {
+            (Self::AllVisible, _)
+            | (Self::DurableOnly | Self::CustodyV1, BlobLifetime::Durable) => true,
+            (Self::DurableOnly, BlobLifetime::Finite { .. }) => false,
+            (
+                Self::CustodyV1,
+                BlobLifetime::Finite {
+                    provenance: BlobFiniteProvenance::Local,
+                    ..
+                },
+            ) => true,
+            (
+                Self::CustodyV1,
+                BlobLifetime::Finite {
+                    provenance:
+                        BlobFiniteProvenance::NetworkV1 {
+                            semantic_version: 8,
+                            profile_id,
+                        },
+                    ..
+                },
+            ) => profile_id == aster_mesh::TransferProfileId::BlobCustodyV1 as u16,
+            (Self::CustodyV1, BlobLifetime::Finite { .. }) => false,
+        }
+    }
+}
+
 /// Private projection of the exact Task-2 capability fields needed by the
 /// store transaction. Production construction consumes the opaque verified
 /// capability so decoded claim fields can never authorize network provenance.
@@ -1559,6 +1568,121 @@ struct VerifiedFiniteBlobAdmission {
     ttl_ms: u64,
     forwarding_age_ms: u64,
     receiver_sample: aster_mesh::CustodySample,
+    provenance: BlobFiniteProvenance,
+}
+
+/// Opaque one-use authorization to construct one finite Blob custody claim.
+///
+/// The Store creates this only after transactionally re-reading the exact
+/// retained source and durably checkpointing its lower-bound age. It is not
+/// cloneable and exposes no constructor from caller-selected age or identity.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct VerifiedBlobCustodySend {
+    context: BlobCustodySendContextFields,
+    source_transfer_id: BlobCustodyTransferId,
+    source_len: u64,
+    publication_id: [u8; 32],
+    blob_id: BlobId,
+    priority: Priority,
+    ttl_ms: u64,
+    prior_cumulative_age_ms: u64,
+    sender_sample: aster_mesh::CustodySample,
+    authenticated_age_ms: u64,
+    projection: BlobSourceProjection,
+    retention: BlobSourceRetention,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct BlobCustodySendContextFields {
+    semantic_version: u16,
+    profile_id: u16,
+    session_transcript: [u8; 32],
+    exchange_id: u64,
+    direction: BlobCustodyDirectionV1,
+    finalization_charge_ms: u64,
+}
+
+impl From<AuthenticatedBlobCustodySendContextV1> for BlobCustodySendContextFields {
+    fn from(context: AuthenticatedBlobCustodySendContextV1) -> Self {
+        Self {
+            semantic_version: context.semantic_version(),
+            profile_id: context.profile_id(),
+            session_transcript: context.session_transcript(),
+            exchange_id: context.exchange_id(),
+            direction: context.direction(),
+            finalization_charge_ms: context.finalization_charge_ms(),
+        }
+    }
+}
+
+/// One-use final carrier check for an already sealed finite Blob source frame.
+///
+/// This retains the exact Store checkpoint and authenticated conservative age
+/// bound. It is deliberately non-`Clone` and is consumed immediately before
+/// carrier I/O.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct PreparedBlobCustodySend {
+    context: BlobCustodySendContextFields,
+    checkpoint_sample: aster_mesh::CustodySample,
+    authenticated_age_ms: u64,
+    projection: BlobSourceProjection,
+    retention: BlobSourceRetention,
+}
+
+impl VerifiedBlobCustodySend {
+    /// Consumes the Store authorization to construct one exact Task-2 claim.
+    pub fn into_claim(
+        self,
+        source: &ContentVerifiedBlobEnvelope,
+        exact_source_bytes: &[u8],
+    ) -> Result<(BlobCustodyClaimV1, PreparedBlobCustodySend), BlobCustodyError> {
+        let Self {
+            context,
+            source_transfer_id,
+            source_len,
+            publication_id,
+            blob_id,
+            priority,
+            ttl_ms,
+            prior_cumulative_age_ms,
+            sender_sample,
+            authenticated_age_ms,
+            projection,
+            retention,
+        } = self;
+        let claim = BlobCustodyClaimV1::from_authenticated_source(
+            context.session_transcript,
+            context.exchange_id,
+            context.direction,
+            source_transfer_id,
+            source,
+            exact_source_bytes,
+            prior_cumulative_age_ms,
+            sender_sample,
+            context.finalization_charge_ms,
+        )?;
+        if claim.source_len() != source_len
+            || claim.publication_id() != publication_id
+            || claim.blob_id() != blob_id
+            || claim.priority() != priority
+            || claim.ttl_ms() != ttl_ms
+            || claim.forwarding_age_ms() != authenticated_age_ms
+        {
+            return Err(BlobCustodyError::ContextMismatch);
+        }
+        Ok((
+            claim,
+            PreparedBlobCustodySend {
+                context,
+                checkpoint_sample: sender_sample,
+                authenticated_age_ms,
+                projection,
+                retention,
+            },
+        ))
+    }
 }
 
 impl VerifiedFiniteBlobAdmission {
@@ -1575,10 +1699,14 @@ impl VerifiedFiniteBlobAdmission {
             ttl_ms: verified.ttl_ms(),
             forwarding_age_ms: verified.forwarding_age_ms(),
             receiver_sample,
+            provenance: BlobFiniteProvenance::NetworkV1 {
+                semantic_version: 8,
+                profile_id: aster_mesh::TransferProfileId::BlobCustodyV1 as u16,
+            },
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     #[allow(clippy::too_many_arguments)]
     const fn for_test(
         source_transfer_id: [u8; 32],
@@ -1599,6 +1727,40 @@ impl VerifiedFiniteBlobAdmission {
             ttl_ms,
             forwarding_age_ms,
             receiver_sample,
+            provenance: BlobFiniteProvenance::NetworkV1 {
+                semantic_version: 8,
+                profile_id: aster_mesh::TransferProfileId::BlobCustodyV1 as u16,
+            },
+        }
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    #[allow(clippy::too_many_arguments)]
+    const fn for_test_with_network_provenance(
+        source_transfer_id: [u8; 32],
+        source_len: u64,
+        publication_id: [u8; 32],
+        blob_id: BlobId,
+        priority: Priority,
+        ttl_ms: u64,
+        forwarding_age_ms: u64,
+        receiver_sample: aster_mesh::CustodySample,
+        semantic_version: u16,
+        profile_id: u16,
+    ) -> Self {
+        Self {
+            source_transfer_id,
+            source_len,
+            publication_id,
+            blob_id,
+            priority,
+            ttl_ms,
+            forwarding_age_ms,
+            receiver_sample,
+            provenance: BlobFiniteProvenance::NetworkV1 {
+                semantic_version,
+                profile_id,
+            },
         }
     }
 }
@@ -1629,6 +1791,10 @@ fn validate_blob_lifetime(lifetime: BlobLifetime) -> Result<(), StoreError> {
     else {
         return Ok(());
     };
+    // Preserve well-formed v8+ network provenance as opaque historical data.
+    // Contact authority is deliberately stricter and admits only exact
+    // semantic-v8/BlobCustodyV1; future provenance must remain retainable but
+    // non-forwardable by this runtime.
     if ttl_ms == 0
         || age
             .checkpoint
@@ -1640,8 +1806,7 @@ fn validate_blob_lifetime(lifetime: BlobLifetime) -> Result<(), StoreError> {
             BlobFiniteProvenance::NetworkV1 {
                 semantic_version,
                 profile_id,
-            } if semantic_version != 8
-                || profile_id != aster_mesh::TransferProfileId::BlobCustodyV1 as u16
+            } if semantic_version < 8 || profile_id == 0
         )
     {
         return Err(blob_error(BlobStoreError::SchemaInvariant(
@@ -1819,6 +1984,28 @@ fn blob_lifetime_is_visible_read(
         evaluate_blob_lifetime(lifetime, continuity, sample)?,
         BlobLifetimeEvaluation::Durable | BlobLifetimeEvaluation::FiniteLive { .. }
     ))
+}
+
+fn blob_lifetime_is_visible_for_contact_read(
+    read: &redb::ReadTransaction,
+    lifetime: BlobLifetime,
+    eligibility: BlobContactEligibility,
+) -> Result<bool, StoreError> {
+    if !eligibility.admits(lifetime) {
+        return Ok(false);
+    }
+    blob_lifetime_is_visible_read(read, lifetime)
+}
+
+fn require_blob_contact_eligibility(
+    lifetime: BlobLifetime,
+    eligibility: BlobContactEligibility,
+) -> Result<(), StoreError> {
+    if eligibility.admits(lifetime) {
+        Ok(())
+    } else {
+        Err(blob_error(BlobStoreError::ReadPlanChanged))
+    }
 }
 
 fn blob_lifetime_is_visible_write(
@@ -2542,6 +2729,36 @@ impl Store {
             .expect("Blob carrier-commit post-snapshot gate lock") = Some((reached, release));
     }
 
+    /// Test-only observation of the Store-owned Blob custody clock.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn test_observe_blob_custody_sample(
+        &self,
+        sample: aster_mesh::CustodySample,
+    ) -> Result<(), StoreError> {
+        self.require_live()?;
+        self.require_bound_mission()?;
+        let write = self.database.begin_write()?;
+        enforce_live_write(&write)?;
+        custody::observe_continuity_write(&write, sample)?;
+        write.commit()?;
+        Ok(())
+    }
+
+    /// Test-only deterministic fault seam consumed after physical carrier
+    /// installation and before logical prefix retirement.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn test_schedule_blob_carrier_post_install_custody_sample(
+        &self,
+        sample: aster_mesh::CustodySample,
+    ) {
+        *self
+            .blob_carrier_commit_post_install_sample
+            .lock()
+            .expect("Blob carrier post-install sample lock") = Some(sample);
+    }
+
     /// Returns the dedicated physical limits configured for this handle.
     pub const fn blob_depot_limits(&self) -> BlobDepotLimits {
         self.blob_depot_limits
@@ -2648,6 +2865,45 @@ impl Store {
         manifest_bytes: &[u8],
         plan: &VerifiedBlobTransferPlan,
     ) -> Result<BlobDepotCompletion, StoreError> {
+        self.completed_pending_blob_with_eligibility(
+            policy,
+            source,
+            blob,
+            manifest_bytes,
+            plan,
+            BlobContactEligibility::CustodyV1,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn completed_durable_pending_blob_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        source: BlobTransferId,
+        blob: &ContentVerifiedBlobEnvelope,
+        manifest_bytes: &[u8],
+        plan: &VerifiedBlobTransferPlan,
+    ) -> Result<BlobDepotCompletion, StoreError> {
+        self.completed_pending_blob_with_eligibility(
+            policy,
+            source,
+            blob,
+            manifest_bytes,
+            plan,
+            BlobContactEligibility::DurableOnly,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn completed_pending_blob_with_eligibility(
+        &self,
+        policy: &ControlPolicySnapshot,
+        source: BlobTransferId,
+        blob: &ContentVerifiedBlobEnvelope,
+        manifest_bytes: &[u8],
+        plan: &VerifiedBlobTransferPlan,
+        eligibility: BlobContactEligibility,
+    ) -> Result<BlobDepotCompletion, StoreError> {
         self.require_live()?;
         let authority = self.require_bound_mission()?;
         let mut depot = BlobDepot::open_network_mutation(self, false)?;
@@ -2658,6 +2914,7 @@ impl Store {
             .map(|value| decode_pending_blob_source(value.value()))
             .transpose()?
             .ok_or_else(|| blob_error(BlobStoreError::PendingSourceMissing))?;
+        require_blob_contact_eligibility(pending.metadata.lifetime, eligibility)?;
         require_blob_lifetime_visible_read(&read, pending.metadata.lifetime)?;
         require_pending_matches_verified_source(&pending, blob, &pending.sealed)
             .map_err(|_| blob_error(BlobStoreError::CompletionMismatch))?;
@@ -2696,6 +2953,51 @@ impl Store {
         manifest_bytes: &[u8],
         sealed: &[u8],
     ) -> Result<BlobDepotCompletion, StoreError> {
+        self.completed_retained_blob_with_eligibility(
+            projection,
+            retention,
+            blob,
+            manifest_bytes,
+            sealed,
+            BlobContactEligibility::AllVisible,
+            false,
+        )
+    }
+
+    /// Mints an exact completion capability for a semantic-v8/profile-3
+    /// contact only while the retained completed source remains CustodyV1
+    /// eligible and lifetime-visible in the same Store read snapshot.
+    #[doc(hidden)]
+    pub fn custody_v1_completed_retained_blob(
+        &self,
+        projection: &BlobSourceProjection,
+        retention: BlobSourceRetention,
+        blob: &ContentVerifiedBlobEnvelope,
+        manifest_bytes: &[u8],
+        sealed: &[u8],
+    ) -> Result<BlobDepotCompletion, StoreError> {
+        self.completed_retained_blob_with_eligibility(
+            projection,
+            retention,
+            blob,
+            manifest_bytes,
+            sealed,
+            BlobContactEligibility::CustodyV1,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn completed_retained_blob_with_eligibility(
+        &self,
+        projection: &BlobSourceProjection,
+        retention: BlobSourceRetention,
+        blob: &ContentVerifiedBlobEnvelope,
+        manifest_bytes: &[u8],
+        sealed: &[u8],
+        eligibility: BlobContactEligibility,
+        strict_contact_outcome: bool,
+    ) -> Result<BlobDepotCompletion, StoreError> {
         self.require_live()?;
         self.require_bound_mission()?;
         let acceptance_marker = match retention {
@@ -2706,12 +3008,21 @@ impl Store {
         };
         let mut depot = BlobDepot::open_network_mutation(self, false)?;
         let read = self.database.begin_read()?;
-        let metadata = read
+        let encoded = read
             .open_table(BLOB_PUBLICATIONS)?
             .get(projection.transfer_id.as_bytes().as_slice())?
-            .map(|value| decode_blob_metadata(value.value()))
-            .transpose()?
+            .map(|value| value.value().to_vec())
             .ok_or_else(|| blob_error(BlobStoreError::CompletionMismatch))?;
+        if strict_contact_outcome
+            && lifecycle::publication_record_is_retired(&encoded).map_err(blob_error)?
+        {
+            return Err(blob_error(BlobStoreError::ExpiredOrRetired));
+        }
+        let metadata = decode_blob_metadata(&encoded)?;
+        if strict_contact_outcome {
+            require_blob_contact_eligibility(metadata.lifetime, eligibility)?;
+            require_blob_lifetime_visible_read(&read, metadata.lifetime)?;
+        }
         let bytes = read.open_table(BLOB_BYTES)?;
         let exact_sealed = bytes
             .get(projection.transfer_id.as_bytes().as_slice())?
@@ -2725,13 +3036,15 @@ impl Store {
             .map_err(|_| StoreError::PayloadByteAccountingOverflow)?;
         let shape = durable_blob_source_shape_read(&read, &metadata, true)?;
         let durable_projection = blob_source_projection(&metadata, sealed_len, shape)?;
+        let verified_projection =
+            verified_blob_source_projection(blob, sealed_len, metadata.lifetime)?;
         blob.verify_exact_sealed(sealed)
             .map_err(|error| blob_error(BlobStoreError::Verification(error.to_string())))?;
         if durable_projection != *projection
             || marker != acceptance_marker
             || exact_sealed.value() != sealed
             || BlobTransferId::new(blob.envelope_id()) != projection.transfer_id
-            || !projection.matches_verified(blob, sealed)?
+            || verified_projection != *projection
         {
             return Err(blob_error(BlobStoreError::CompletionMismatch));
         }
@@ -3289,6 +3602,81 @@ impl Store {
         )
     }
 
+    /// Test-fixture-only finite staging seam.
+    ///
+    /// This cannot mint runtime/contact authority. It derives every immutable
+    /// claim field and the positive TTL from an already content-verified exact
+    /// source, fixes provenance to semantic-v8 `BlobCustodyV1`, and delegates
+    /// immediately to the production staging transaction.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn test_stage_verified_finite_blob_source_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        blob: &ContentVerifiedBlobEnvelope,
+        sealed: &[u8],
+        plan: &VerifiedBlobTransferPlan,
+        forwarding_age_ms: u64,
+        receiver_sample: aster_mesh::CustodySample,
+    ) -> Result<BlobSourceStageOutcome, StoreError> {
+        let ttl_ms = blob.ttl_ms().ok_or_else(|| {
+            blob_error(BlobStoreError::InvalidPublication(
+                "finite Blob fixture source is missing its signed TTL",
+            ))
+        })?;
+        let admission = VerifiedFiniteBlobAdmission::for_test(
+            blob.envelope_id(),
+            u64::try_from(sealed.len()).map_err(|_| StoreError::PayloadByteAccountingOverflow)?,
+            blob.item_id(),
+            blob.blob_id(),
+            blob.priority(),
+            ttl_ms,
+            forwarding_age_ms,
+            receiver_sample,
+        );
+        self.stage_verified_blob_source_with_lifetime(policy, blob, sealed, plan, Some(admission))
+    }
+
+    /// Test-only staging seam for retained received-provenance filtering.
+    ///
+    /// Runtime authority cannot call this without the non-default `test-utils`
+    /// feature. Immutable source fields and the signed TTL still come from the
+    /// exact content-verified source; only the private historical contact
+    /// provenance is selected by the fixture.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn test_stage_finite_blob_source_with_network_provenance_for_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        blob: &ContentVerifiedBlobEnvelope,
+        sealed: &[u8],
+        plan: &VerifiedBlobTransferPlan,
+        forwarding_age_ms: u64,
+        receiver_sample: aster_mesh::CustodySample,
+        semantic_version: u16,
+        profile_id: u16,
+    ) -> Result<BlobSourceStageOutcome, StoreError> {
+        let ttl_ms = blob.ttl_ms().ok_or_else(|| {
+            blob_error(BlobStoreError::InvalidPublication(
+                "finite Blob fixture source is missing its signed TTL",
+            ))
+        })?;
+        let admission = VerifiedFiniteBlobAdmission::for_test_with_network_provenance(
+            blob.envelope_id(),
+            u64::try_from(sealed.len()).map_err(|_| StoreError::PayloadByteAccountingOverflow)?,
+            blob.item_id(),
+            blob.blob_id(),
+            blob.priority(),
+            ttl_ms,
+            forwarding_age_ms,
+            receiver_sample,
+            semantic_version,
+            profile_id,
+        );
+        self.stage_verified_blob_source_with_lifetime(policy, blob, sealed, plan, Some(admission))
+    }
+
     fn stage_verified_blob_source_with_lifetime(
         &self,
         policy: &ControlPolicySnapshot,
@@ -3418,10 +3806,7 @@ impl Store {
                     continuity_generation: continuity.generation(),
                     continuity_lost: false,
                 },
-                provenance: BlobFiniteProvenance::NetworkV1 {
-                    semantic_version: 8,
-                    profile_id: aster_mesh::TransferProfileId::BlobCustodyV1 as u16,
-                },
+                provenance: verified.provenance,
             };
             Some(custody::LowerBoundContinuity {
                 generation: continuity.generation(),
@@ -3771,6 +4156,33 @@ impl Store {
         &self,
         source: BlobTransferId,
     ) -> Result<Option<PendingBlobSource>, StoreError> {
+        self.pending_blob_source_with_eligibility(source, BlobContactEligibility::AllVisible, false)
+    }
+
+    /// Loads one exact pending source for a legacy durable contact.
+    #[doc(hidden)]
+    pub fn durable_contact_pending_blob_source(
+        &self,
+        source: BlobTransferId,
+    ) -> Result<Option<PendingBlobSource>, StoreError> {
+        self.pending_blob_source_with_eligibility(source, BlobContactEligibility::DurableOnly, true)
+    }
+
+    /// Loads one exact pending source for a semantic-v8/profile-3 contact.
+    #[doc(hidden)]
+    pub fn custody_v1_pending_blob_source(
+        &self,
+        source: BlobTransferId,
+    ) -> Result<Option<PendingBlobSource>, StoreError> {
+        self.pending_blob_source_with_eligibility(source, BlobContactEligibility::CustodyV1, true)
+    }
+
+    fn pending_blob_source_with_eligibility(
+        &self,
+        source: BlobTransferId,
+        eligibility: BlobContactEligibility,
+        strict_contact_outcome: bool,
+    ) -> Result<Option<PendingBlobSource>, StoreError> {
         self.require_live()?;
         self.require_bound_mission()?;
         let read = self.database.begin_read()?;
@@ -3779,18 +4191,593 @@ impl Store {
             .get(source.as_bytes().as_slice())?
             .map(|value| decode_pending_blob_source(value.value()))
             .transpose()?;
-        match pending {
-            Some(record) if blob_lifetime_is_visible_read(&read, record.metadata.lifetime)? => {
-                Ok(Some(pending_blob_source_projection(record)))
-            }
-            Some(_) | None => Ok(None),
+        let Some(record) = pending else {
+            return Ok(None);
+        };
+        if !eligibility.admits(record.metadata.lifetime) {
+            return if strict_contact_outcome {
+                Err(blob_error(BlobStoreError::ReadPlanChanged))
+            } else {
+                Ok(None)
+            };
         }
+        if !blob_lifetime_is_visible_read(&read, record.metadata.lifetime)? {
+            return if strict_contact_outcome {
+                Err(blob_error(BlobStoreError::ExpiredOrRetired))
+            } else {
+                Ok(None)
+            };
+        }
+        Ok(Some(pending_blob_source_projection(record)))
     }
 
     /// Loads one exact lifecycle-neutral source claim from completed or pending state.
     pub fn blob_source_projection(
         &self,
         source: BlobTransferId,
+    ) -> Result<Option<RetainedBlobSource>, StoreError> {
+        self.blob_source_projection_with_eligibility(
+            source,
+            BlobContactEligibility::AllVisible,
+            false,
+        )
+    }
+
+    /// Loads one exact source eligible for an authenticated semantic-v8
+    /// `BlobCustodyV1` contact. Durable and locally originated finite sources
+    /// remain eligible; received finite sources must retain exact v8/profile-3
+    /// provenance and a currently live lower-bound lifetime.
+    #[doc(hidden)]
+    pub fn custody_v1_blob_source_projection(
+        &self,
+        source: BlobTransferId,
+    ) -> Result<Option<RetainedBlobSource>, StoreError> {
+        self.blob_source_projection_with_eligibility(
+            source,
+            BlobContactEligibility::CustodyV1,
+            true,
+        )
+    }
+
+    /// Revalidates one retained projection against both its exact Store row
+    /// and one content-verified envelope. The retained lifetime (including
+    /// finite age and provenance) remains private, but participates in the
+    /// exact metadata fingerprint comparison.
+    #[doc(hidden)]
+    pub fn retained_blob_source_matches_verified(
+        &self,
+        projection: &BlobSourceProjection,
+        retention: BlobSourceRetention,
+        blob: &ContentVerifiedBlobEnvelope,
+        sealed: &[u8],
+    ) -> Result<bool, StoreError> {
+        self.retained_blob_source_matches_verified_with_eligibility(
+            projection,
+            retention,
+            blob,
+            sealed,
+            BlobContactEligibility::AllVisible,
+            false,
+        )
+    }
+
+    /// Revalidates one retained projection for an authenticated semantic-v8
+    /// `BlobCustodyV1` contact. Exact provenance and finite lifetime visibility
+    /// are checked in the same read snapshot as the retained metadata and
+    /// sealed-byte comparison.
+    #[doc(hidden)]
+    pub fn custody_v1_retained_blob_source_matches_verified(
+        &self,
+        projection: &BlobSourceProjection,
+        retention: BlobSourceRetention,
+        blob: &ContentVerifiedBlobEnvelope,
+        sealed: &[u8],
+    ) -> Result<bool, StoreError> {
+        self.retained_blob_source_matches_verified_with_eligibility(
+            projection,
+            retention,
+            blob,
+            sealed,
+            BlobContactEligibility::CustodyV1,
+            true,
+        )
+    }
+
+    fn retained_blob_source_matches_verified_with_eligibility(
+        &self,
+        projection: &BlobSourceProjection,
+        retention: BlobSourceRetention,
+        blob: &ContentVerifiedBlobEnvelope,
+        sealed: &[u8],
+        eligibility: BlobContactEligibility,
+        strict_contact_outcome: bool,
+    ) -> Result<bool, StoreError> {
+        self.require_live()?;
+        self.require_bound_mission()?;
+        blob.verify_exact_sealed(sealed)
+            .map_err(|error| blob_error(BlobStoreError::Verification(error.to_string())))?;
+        let read = self.database.begin_read()?;
+        let completed_record = read
+            .open_table(BLOB_PUBLICATIONS)?
+            .get(projection.transfer_id.as_bytes().as_slice())?
+            .map(|value| value.value().to_vec());
+        let completed = match completed_record.as_deref() {
+            Some(record)
+                if lifecycle::publication_record_is_retired(record).map_err(blob_error)? =>
+            {
+                None
+            }
+            Some(record) => Some(decode_blob_metadata(record)?),
+            None => None,
+        };
+        let pending = read
+            .open_table(BLOB_PENDING_SOURCES)?
+            .get(projection.transfer_id.as_bytes().as_slice())?
+            .map(|value| decode_pending_blob_source(value.value()))
+            .transpose()?;
+        if completed_record.is_some() && pending.is_some() {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "Blob source is simultaneously pending and completed",
+            )));
+        }
+        if completed_record.is_some() && completed.is_none() {
+            return if strict_contact_outcome {
+                Err(blob_error(BlobStoreError::ExpiredOrRetired))
+            } else {
+                Ok(false)
+            };
+        }
+        let (metadata, exact_sealed, completed) = match (completed, pending, retention) {
+            (Some(metadata), None, BlobSourceRetention::Completed { acceptance_marker }) => {
+                let marker = read
+                    .open_table(BLOB_ACCEPTANCE_MARKERS)?
+                    .get(projection.transfer_id.as_bytes().as_slice())?
+                    .map(|value| value.value());
+                let exact = read
+                    .open_table(BLOB_BYTES)?
+                    .get(projection.transfer_id.as_bytes().as_slice())?
+                    .map(|value| value.value().to_vec());
+                if marker != Some(acceptance_marker) {
+                    return Ok(false);
+                }
+                (metadata, exact, true)
+            }
+            (None, Some(pending), BlobSourceRetention::Pending) => {
+                let exact = Some(pending.sealed.clone());
+                (pending.metadata, exact, false)
+            }
+            _ => return Ok(false),
+        };
+        if !eligibility.admits(metadata.lifetime) {
+            return if strict_contact_outcome {
+                Err(blob_error(BlobStoreError::ReadPlanChanged))
+            } else {
+                Ok(false)
+            };
+        }
+        if strict_contact_outcome && !blob_lifetime_is_visible_read(&read, metadata.lifetime)? {
+            return Err(blob_error(BlobStoreError::ExpiredOrRetired));
+        }
+        let Some(exact_sealed) = exact_sealed else {
+            return Ok(false);
+        };
+        if exact_sealed != sealed {
+            return Ok(false);
+        }
+        let sealed_len =
+            u64::try_from(sealed.len()).map_err(|_| StoreError::PayloadByteAccountingOverflow)?;
+        let shape = durable_blob_source_shape_read(&read, &metadata, completed)?;
+        let stored = blob_source_projection(&metadata, sealed_len, shape)?;
+        let verified = verified_blob_source_projection(blob, sealed_len, metadata.lifetime)?;
+        Ok(stored == *projection && verified == *projection)
+    }
+
+    /// Transactionally authorizes one finite source emission.
+    ///
+    /// The returned capability is one-use and can only construct a claim for
+    /// the exact source whose lower-bound age was checkpointed by this write.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn authorize_finite_blob_send_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        projection: &BlobSourceProjection,
+        retention: BlobSourceRetention,
+        blob: &ContentVerifiedBlobEnvelope,
+        sealed: &[u8],
+        context: AuthenticatedBlobCustodySendContextV1,
+        sender_sample: aster_mesh::CustodySample,
+    ) -> Result<Option<VerifiedBlobCustodySend>, StoreError> {
+        self.authorize_finite_blob_send_fields(
+            policy,
+            projection,
+            retention,
+            blob,
+            sealed,
+            context.into(),
+            sender_sample,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn authorize_finite_blob_send_fields(
+        &self,
+        policy: &ControlPolicySnapshot,
+        projection: &BlobSourceProjection,
+        retention: BlobSourceRetention,
+        blob: &ContentVerifiedBlobEnvelope,
+        sealed: &[u8],
+        context: BlobCustodySendContextFields,
+        sender_sample: aster_mesh::CustodySample,
+    ) -> Result<Option<VerifiedBlobCustodySend>, StoreError> {
+        self.require_live()?;
+        let authority = self.require_bound_mission()?;
+        if context.semantic_version != 8
+            || context.profile_id != aster_mesh::TransferProfileId::BlobCustodyV1 as u16
+            || context.finalization_charge_ms == 0
+        {
+            return Err(blob_error(BlobStoreError::PendingSourceConflict));
+        }
+        blob.verify_exact_sealed(sealed)
+            .map_err(|error| blob_error(BlobStoreError::Verification(error.to_string())))?;
+        let transfer = BlobTransferId::new(blob.envelope_id());
+        if projection.transfer_id != transfer
+            || BlobTransferId::new(Sha256::digest(sealed).into()) != transfer
+        {
+            return Err(blob_error(BlobStoreError::PendingSourceConflict));
+        }
+
+        let write = self.database.begin_write()?;
+        enforce_live_write(&write)?;
+        require_control_policy_write(&write, authority, policy)?;
+        let continuity = custody::observe_continuity_write(&write, sender_sample)?;
+        synchronize_blob_policy_generation_write(&write)?;
+
+        let completed_encoded = write
+            .open_table(BLOB_PUBLICATIONS)?
+            .get(transfer.as_bytes().as_slice())?
+            .map(|value| value.value().to_vec());
+        let pending_encoded = write
+            .open_table(BLOB_PENDING_SOURCES)?
+            .get(transfer.as_bytes().as_slice())?
+            .map(|value| value.value().to_vec());
+        if completed_encoded.is_some() && pending_encoded.is_some() {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "Blob source is simultaneously pending and completed",
+            )));
+        }
+
+        let (mut metadata, exact_sealed, completed, pending) = match retention {
+            BlobSourceRetention::Completed { acceptance_marker } => {
+                let encoded = completed_encoded
+                    .clone()
+                    .ok_or_else(|| blob_error(BlobStoreError::PendingSourceConflict))?;
+                if lifecycle::publication_record_is_retired(&encoded).map_err(blob_error)? {
+                    return Ok(None);
+                }
+                let marker = write
+                    .open_table(BLOB_ACCEPTANCE_MARKERS)?
+                    .get(transfer.as_bytes().as_slice())?
+                    .map(|value| value.value());
+                if marker != Some(acceptance_marker) {
+                    return Ok(None);
+                }
+                let exact = write
+                    .open_table(BLOB_BYTES)?
+                    .get(transfer.as_bytes().as_slice())?
+                    .map(|value| value.value().to_vec())
+                    .ok_or_else(|| blob_error(BlobStoreError::CompletionMismatch))?;
+                (decode_blob_metadata(&encoded)?, exact, true, None)
+            }
+            BlobSourceRetention::Pending => {
+                let encoded = pending_encoded
+                    .ok_or_else(|| blob_error(BlobStoreError::PendingSourceMissing))?;
+                let pending = decode_pending_blob_source(&encoded)?;
+                require_pending_authenticated_source_binding(&pending)?;
+                (
+                    pending.metadata.clone(),
+                    pending.sealed.clone(),
+                    false,
+                    Some((encoded, pending)),
+                )
+            }
+        };
+        if exact_sealed != sealed {
+            return Ok(None);
+        }
+        enforce_blob_policy_write(&write, authority, policy, &metadata.header)?;
+        let BlobLifetime::Finite {
+            ttl_ms, provenance, ..
+        } = metadata.lifetime
+        else {
+            return Err(blob_error(BlobStoreError::InvalidPublication(
+                "durable Blob cannot mint finite custody authority",
+            )));
+        };
+        match provenance {
+            BlobFiniteProvenance::Local => {}
+            BlobFiniteProvenance::NetworkV1 {
+                semantic_version: 8,
+                profile_id,
+            } if profile_id == aster_mesh::TransferProfileId::BlobCustodyV1 as u16 => {}
+            BlobFiniteProvenance::NetworkV1 { .. } => {
+                return Err(blob_error(BlobStoreError::PendingSourceConflict));
+            }
+        }
+        let physical_lineage = metadata
+            .physical_lineage
+            .ok_or_else(|| blob_error(BlobStoreError::PhysicalLineageMigrationRequired))?;
+        let route = metadata.header.blob_route.ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "retained Blob source is missing its authenticated route commitment",
+            ))
+        })?;
+        let shape = depot::blob_source_shape_write(
+            &write,
+            metadata.variant_id,
+            metadata.blob_id,
+            metadata.header.key_epoch,
+            physical_lineage,
+            metadata.manifest_digest,
+            route.chunk_count(),
+            completed,
+        )?;
+        let sealed_len =
+            u64::try_from(sealed.len()).map_err(|_| StoreError::PayloadByteAccountingOverflow)?;
+        let stored_projection = blob_source_projection(&metadata, sealed_len, shape)?;
+        let verified_projection =
+            verified_blob_source_projection(blob, sealed_len, metadata.lifetime)?;
+        if stored_projection != *projection || verified_projection != *projection {
+            return Ok(None);
+        }
+
+        let old_lifetime = metadata.lifetime;
+        let projected = lifecycle::project_lifetime_for_policy_write(&write, old_lifetime)?;
+        let evaluation = evaluate_blob_lifetime(
+            projected,
+            Some(custody::LowerBoundContinuity {
+                generation: continuity.generation(),
+                sample: continuity.sample(),
+            }),
+            Some(continuity.sample()),
+        )?;
+        if projected != old_lifetime {
+            let kind = if completed {
+                lifecycle::TtlDeadlineKind::LivePublication
+            } else {
+                lifecycle::TtlDeadlineKind::PendingSource
+            };
+            lifecycle::replace_policy_ttl_deadline_write(
+                &write,
+                transfer,
+                kind,
+                Some(old_lifetime),
+                Some(projected),
+                self.blob_lifecycle_limits,
+            )?;
+            metadata.lifetime = projected;
+            if completed {
+                let encoded = completed_encoded.expect("completed source encoded above");
+                let payload = encode_blob_metadata(metadata.clone())?;
+                let replacement = lifecycle::replace_live_publication_payload(&encoded, &payload)?;
+                write
+                    .open_table(BLOB_PUBLICATIONS)?
+                    .insert(transfer.as_bytes().as_slice(), replacement.as_slice())?;
+                pressure::rekey_publication_lifetime_write(&write, transfer)?;
+            } else {
+                let (old_encoded, mut pending) = pending.expect("pending source decoded above");
+                pending.metadata = metadata.clone();
+                pending.authenticated_source_binding =
+                    pending_blob_authenticated_source_binding(&pending.metadata, &pending.sealed)?;
+                let replacement = encode_pending_blob_source(&pending)?;
+                if replacement.len() != old_encoded.len() {
+                    return Err(blob_error(BlobStoreError::SchemaInvariant(
+                        "finite send checkpoint changed pending row accounting",
+                    )));
+                }
+                write
+                    .open_table(BLOB_PENDING_SOURCES)?
+                    .insert(transfer.as_bytes().as_slice(), replacement.as_slice())?;
+                pressure::rekey_pending_source_lifetime_write(&write, transfer, &pending)?;
+            }
+        }
+
+        let BlobLifetimeEvaluation::FiniteLive { age_ms, .. } = evaluation else {
+            write.commit()?;
+            return Ok(None);
+        };
+        let checkpointed_projection = blob_source_projection(&metadata, sealed_len, shape)?;
+        let checkpointed_verified =
+            verified_blob_source_projection(blob, sealed_len, metadata.lifetime)?;
+        if checkpointed_projection != checkpointed_verified {
+            return Err(blob_error(BlobStoreError::PendingSourceConflict));
+        }
+        let authenticated_age_ms = age_ms
+            .checked_add(context.finalization_charge_ms)
+            .ok_or_else(|| {
+                blob_error(BlobStoreError::InvalidPublication(
+                    "finite Blob finalization charge overflowed cumulative age",
+                ))
+            })?;
+        if authenticated_age_ms >= ttl_ms {
+            write.commit()?;
+            return Ok(None);
+        }
+        let send = VerifiedBlobCustodySend {
+            context,
+            source_transfer_id: BlobCustodyTransferId::from_exact_hash(blob.envelope_id()),
+            source_len: sealed_len,
+            publication_id: blob.item_id(),
+            blob_id: blob.blob_id(),
+            priority: blob.priority(),
+            ttl_ms,
+            prior_cumulative_age_ms: age_ms,
+            sender_sample: continuity.sample(),
+            authenticated_age_ms,
+            projection: checkpointed_projection,
+            retention,
+        };
+        write.commit()?;
+        Ok(Some(send))
+    }
+
+    /// Rechecks one sealed finite source immediately before carrier I/O.
+    ///
+    /// The prepared capability is consumed. `false` means the sealed frame
+    /// must be abandoned without writing any bytes and cannot be retried
+    /// without obtaining a fresh authorization and constructing a new claim.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn finalize_finite_blob_send_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        prepared: PreparedBlobCustodySend,
+        blob: &ContentVerifiedBlobEnvelope,
+        sealed: &[u8],
+        final_sample: aster_mesh::CustodySample,
+    ) -> Result<bool, StoreError> {
+        let PreparedBlobCustodySend {
+            context,
+            checkpoint_sample,
+            authenticated_age_ms,
+            projection,
+            retention,
+        } = prepared;
+        if final_sample.clock_id != checkpoint_sample.clock_id
+            || final_sample.tick_ms < checkpoint_sample.tick_ms
+        {
+            return Ok(false);
+        }
+        let Some(rechecked) = self.authorize_finite_blob_send_fields(
+            policy,
+            &projection,
+            retention,
+            blob,
+            sealed,
+            context,
+            final_sample,
+        )?
+        else {
+            return Ok(false);
+        };
+        Ok(
+            rechecked.sender_sample.clock_id == checkpoint_sample.clock_id
+                && rechecked.sender_sample.tick_ms >= checkpoint_sample.tick_ms
+                && rechecked.prior_cumulative_age_ms <= authenticated_age_ms,
+        )
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn test_authorize_finite_blob_send_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        projection: &BlobSourceProjection,
+        retention: BlobSourceRetention,
+        blob: &ContentVerifiedBlobEnvelope,
+        sealed: &[u8],
+        sender_sample: aster_mesh::CustodySample,
+        session_transcript: [u8; 32],
+        exchange_id: u64,
+        direction: BlobCustodyDirectionV1,
+        finalization_charge_ms: u64,
+    ) -> Result<Option<VerifiedBlobCustodySend>, StoreError> {
+        self.authorize_finite_blob_send_fields(
+            policy,
+            projection,
+            retention,
+            blob,
+            sealed,
+            BlobCustodySendContextFields {
+                semantic_version: 8,
+                profile_id: aster_mesh::TransferProfileId::BlobCustodyV1 as u16,
+                session_transcript,
+                exchange_id,
+                direction,
+                finalization_charge_ms,
+            },
+            sender_sample,
+        )
+    }
+
+    /// Loads one exact durable-only source claim for legacy contact work.
+    #[doc(hidden)]
+    pub fn durable_blob_source_projection(
+        &self,
+        source: BlobTransferId,
+    ) -> Result<Option<RetainedBlobSource>, StoreError> {
+        self.blob_source_projection_with_eligibility(
+            source,
+            BlobContactEligibility::DurableOnly,
+            false,
+        )
+    }
+
+    /// Loads one exact durable contact source while distinguishing contact
+    /// ineligibility from true row absence.
+    #[doc(hidden)]
+    pub fn durable_contact_blob_source_projection(
+        &self,
+        source: BlobTransferId,
+    ) -> Result<Option<RetainedBlobSource>, StoreError> {
+        self.blob_source_projection_with_eligibility(
+            source,
+            BlobContactEligibility::DurableOnly,
+            true,
+        )
+    }
+
+    /// Reports whether an exact retained source is present but deliberately
+    /// ineligible for a durable-only contact. This raw classification neither
+    /// evaluates finite age nor mutates lifecycle state.
+    #[doc(hidden)]
+    pub fn retained_blob_source_is_contact_ineligible(
+        &self,
+        source: BlobTransferId,
+    ) -> Result<bool, StoreError> {
+        self.require_live()?;
+        self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        let completed_record = read
+            .open_table(BLOB_PUBLICATIONS)?
+            .get(source.as_bytes().as_slice())?
+            .map(|value| value.value().to_vec());
+        let completed_is_retired = completed_record
+            .as_deref()
+            .map(lifecycle::publication_record_is_retired)
+            .transpose()
+            .map_err(blob_error)?
+            .unwrap_or(false);
+        let completed = completed_record
+            .as_deref()
+            .filter(|_| !completed_is_retired)
+            .map(decode_blob_metadata)
+            .transpose()?;
+        let pending = read
+            .open_table(BLOB_PENDING_SOURCES)?
+            .get(source.as_bytes().as_slice())?
+            .map(|value| decode_pending_blob_source(value.value()))
+            .transpose()?;
+        if completed_record.is_some() && pending.is_some() {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "Blob source is simultaneously pending and completed",
+            )));
+        }
+        Ok(completed
+            .map(|metadata| !BlobContactEligibility::DurableOnly.admits(metadata.lifetime))
+            .or_else(|| {
+                pending.map(|record| {
+                    !BlobContactEligibility::DurableOnly.admits(record.metadata.lifetime)
+                })
+            })
+            .unwrap_or(false))
+    }
+
+    fn blob_source_projection_with_eligibility(
+        &self,
+        source: BlobTransferId,
+        eligibility: BlobContactEligibility,
+        strict_contact_outcome: bool,
     ) -> Result<Option<RetainedBlobSource>, StoreError> {
         self.require_live()?;
         self.require_bound_mission()?;
@@ -3821,11 +4808,26 @@ impl Store {
             )));
         }
         if completed_is_retired {
-            return Ok(None);
+            return if strict_contact_outcome {
+                Err(blob_error(BlobStoreError::ExpiredOrRetired))
+            } else {
+                Ok(None)
+            };
         }
         if let Some(metadata) = completed {
+            if !eligibility.admits(metadata.lifetime) {
+                return if strict_contact_outcome {
+                    Err(blob_error(BlobStoreError::ReadPlanChanged))
+                } else {
+                    Ok(None)
+                };
+            }
             if !blob_lifetime_is_visible_read(&read, metadata.lifetime)? {
-                return Ok(None);
+                return if strict_contact_outcome {
+                    Err(blob_error(BlobStoreError::ExpiredOrRetired))
+                } else {
+                    Ok(None)
+                };
             }
             let sealed_len = read
                 .open_table(BLOB_BYTES)?
@@ -3855,8 +4857,19 @@ impl Store {
         }
         pending
             .map(|pending| {
+                if !eligibility.admits(pending.metadata.lifetime) {
+                    return if strict_contact_outcome {
+                        Err(blob_error(BlobStoreError::ReadPlanChanged))
+                    } else {
+                        Ok(None)
+                    };
+                }
                 if !blob_lifetime_is_visible_read(&read, pending.metadata.lifetime)? {
-                    return Ok(None);
+                    return if strict_contact_outcome {
+                        Err(blob_error(BlobStoreError::ExpiredOrRetired))
+                    } else {
+                        Ok(None)
+                    };
                 }
                 let sealed_len = u64::try_from(pending.sealed.len())
                     .map_err(|_| StoreError::PayloadByteAccountingOverflow)?;
@@ -3878,6 +4891,49 @@ impl Store {
     pub fn visit_retained_blob_sources(
         &self,
         policy: Option<&ControlPolicySnapshot>,
+        visitor: impl FnMut(&RetainedBlobSource),
+    ) -> Result<(), StoreError> {
+        self.visit_retained_blob_sources_with_eligibility(
+            policy,
+            BlobContactEligibility::AllVisible,
+            visitor,
+        )
+    }
+
+    /// Visits only durable retained sources for legacy contact authority.
+    #[doc(hidden)]
+    pub fn visit_durable_retained_blob_sources(
+        &self,
+        policy: Option<&ControlPolicySnapshot>,
+        visitor: impl FnMut(&RetainedBlobSource),
+    ) -> Result<(), StoreError> {
+        self.visit_retained_blob_sources_with_eligibility(
+            policy,
+            BlobContactEligibility::DurableOnly,
+            visitor,
+        )
+    }
+
+    /// Visits only sources eligible for an exact semantic-v8/profile-3
+    /// custody contact. Unsupported received finite provenance is omitted
+    /// before inventory ordering and cache repair.
+    #[doc(hidden)]
+    pub fn visit_custody_v1_retained_blob_sources(
+        &self,
+        policy: Option<&ControlPolicySnapshot>,
+        visitor: impl FnMut(&RetainedBlobSource),
+    ) -> Result<(), StoreError> {
+        self.visit_retained_blob_sources_with_eligibility(
+            policy,
+            BlobContactEligibility::CustodyV1,
+            visitor,
+        )
+    }
+
+    fn visit_retained_blob_sources_with_eligibility(
+        &self,
+        policy: Option<&ControlPolicySnapshot>,
+        eligibility: BlobContactEligibility,
         mut visitor: impl FnMut(&RetainedBlobSource),
     ) -> Result<(), StoreError> {
         self.require_live()?;
@@ -3905,7 +4961,7 @@ impl Store {
             if policy.is_some() && !blob_header_is_current_read(&read, &metadata.header)? {
                 continue;
             }
-            if !blob_lifetime_is_visible_read(&read, metadata.lifetime)? {
+            if !blob_lifetime_is_visible_for_contact_read(&read, metadata.lifetime, eligibility)? {
                 continue;
             }
             let sealed_len = read
@@ -3947,7 +5003,11 @@ impl Store {
             if policy.is_some() && !blob_header_is_current_read(&read, &pending.metadata.header)? {
                 continue;
             }
-            if !blob_lifetime_is_visible_read(&read, pending.metadata.lifetime)? {
+            if !blob_lifetime_is_visible_for_contact_read(
+                &read,
+                pending.metadata.lifetime,
+                eligibility,
+            )? {
                 continue;
             }
             let sealed_len = u64::try_from(pending.sealed.len())
@@ -3975,6 +5035,33 @@ impl Store {
     pub fn visit_pending_blob_sources(
         &self,
         policy: Option<&ControlPolicySnapshot>,
+        visitor: impl FnMut(&BlobSourceProjection),
+    ) -> Result<(), StoreError> {
+        self.visit_pending_blob_sources_with_eligibility(
+            policy,
+            BlobContactEligibility::AllVisible,
+            visitor,
+        )
+    }
+
+    /// Visits only durable pending sources for legacy contact cleanup.
+    #[doc(hidden)]
+    pub fn visit_durable_pending_blob_sources(
+        &self,
+        policy: Option<&ControlPolicySnapshot>,
+        visitor: impl FnMut(&BlobSourceProjection),
+    ) -> Result<(), StoreError> {
+        self.visit_pending_blob_sources_with_eligibility(
+            policy,
+            BlobContactEligibility::DurableOnly,
+            visitor,
+        )
+    }
+
+    fn visit_pending_blob_sources_with_eligibility(
+        &self,
+        policy: Option<&ControlPolicySnapshot>,
+        eligibility: BlobContactEligibility,
         mut visitor: impl FnMut(&BlobSourceProjection),
     ) -> Result<(), StoreError> {
         self.require_live()?;
@@ -3996,7 +5083,11 @@ impl Store {
             if policy.is_some() && !blob_header_is_current_read(&read, &pending.metadata.header)? {
                 continue;
             }
-            if !blob_lifetime_is_visible_read(&read, pending.metadata.lifetime)? {
+            if !blob_lifetime_is_visible_for_contact_read(
+                &read,
+                pending.metadata.lifetime,
+                eligibility,
+            )? {
                 continue;
             }
             let sealed_len = u64::try_from(pending.sealed.len())
@@ -4051,6 +5142,17 @@ impl Store {
         &self,
         policy: &ControlPolicySnapshot,
     ) -> Result<BlobTransferStatusSnapshot, StoreError> {
+        self.pending_blob_transfer_progress_with_eligibility(
+            policy,
+            BlobContactEligibility::AllVisible,
+        )
+    }
+
+    fn pending_blob_transfer_progress_with_eligibility(
+        &self,
+        policy: &ControlPolicySnapshot,
+        eligibility: BlobContactEligibility,
+    ) -> Result<BlobTransferStatusSnapshot, StoreError> {
         self.require_live()?;
         let authority = self.require_bound_mission()?;
         let read = self.database.begin_read()?;
@@ -4074,7 +5176,11 @@ impl Store {
             if !blob_header_is_current_read(&read, &pending.metadata.header)? {
                 continue;
             }
-            if !blob_lifetime_is_visible_read(&read, pending.metadata.lifetime)? {
+            if !blob_lifetime_is_visible_for_contact_read(
+                &read,
+                pending.metadata.lifetime,
+                eligibility,
+            )? {
                 continue;
             }
             let sealed_len = u64::try_from(pending.sealed.len())
@@ -4147,6 +5253,34 @@ impl Store {
         policy: &ControlPolicySnapshot,
         after: Option<BlobTransferId>,
     ) -> Result<Option<BlobSourceProjection>, StoreError> {
+        self.next_pending_blob_source_with_eligibility(
+            policy,
+            after,
+            BlobContactEligibility::CustodyV1,
+        )
+    }
+
+    /// Selects the next durable pending source while skipping finite rows
+    /// before the contact's one-source scheduling bound is consumed.
+    #[doc(hidden)]
+    pub fn next_durable_pending_blob_source_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        after: Option<BlobTransferId>,
+    ) -> Result<Option<BlobSourceProjection>, StoreError> {
+        self.next_pending_blob_source_with_eligibility(
+            policy,
+            after,
+            BlobContactEligibility::DurableOnly,
+        )
+    }
+
+    fn next_pending_blob_source_with_eligibility(
+        &self,
+        policy: &ControlPolicySnapshot,
+        after: Option<BlobTransferId>,
+        eligibility: BlobContactEligibility,
+    ) -> Result<Option<BlobSourceProjection>, StoreError> {
         self.require_live()?;
         let authority = self.require_bound_mission()?;
         let read = self.database.begin_read()?;
@@ -4160,7 +5294,7 @@ impl Store {
             for row in pending.range::<&[u8]>(bounds)? {
                 let (key, value) = row?;
                 if let Some(projection) =
-                    current_pending_projection_read(&read, key.value(), value.value())?
+                    current_pending_projection_read(&read, key.value(), value.value(), eligibility)?
                 {
                     return Ok(Some(projection));
                 }
@@ -4171,7 +5305,7 @@ impl Store {
                     break;
                 }
                 if let Some(projection) =
-                    current_pending_projection_read(&read, key.value(), value.value())?
+                    current_pending_projection_read(&read, key.value(), value.value(), eligibility)?
                 {
                     return Ok(Some(projection));
                 }
@@ -4181,7 +5315,7 @@ impl Store {
         for row in pending.iter()? {
             let (key, value) = row?;
             if let Some(projection) =
-                current_pending_projection_read(&read, key.value(), value.value())?
+                current_pending_projection_read(&read, key.value(), value.value(), eligibility)?
             {
                 return Ok(Some(projection));
             }
@@ -4350,6 +5484,50 @@ impl Store {
         offset: u64,
         bytes: &[u8],
     ) -> Result<BlobCarrierAppendOutcome, StoreError> {
+        self.append_blob_carrier_prefix_with_eligibility(
+            policy,
+            source,
+            object,
+            total_len,
+            offset,
+            bytes,
+            BlobContactEligibility::CustodyV1,
+        )
+    }
+
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_durable_blob_carrier_prefix_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        source: BlobTransferId,
+        object: BlobCarrierObjectId,
+        total_len: u64,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<BlobCarrierAppendOutcome, StoreError> {
+        self.append_blob_carrier_prefix_with_eligibility(
+            policy,
+            source,
+            object,
+            total_len,
+            offset,
+            bytes,
+            BlobContactEligibility::DurableOnly,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn append_blob_carrier_prefix_with_eligibility(
+        &self,
+        policy: &ControlPolicySnapshot,
+        source: BlobTransferId,
+        object: BlobCarrierObjectId,
+        total_len: u64,
+        offset: u64,
+        bytes: &[u8],
+        eligibility: BlobContactEligibility,
+    ) -> Result<BlobCarrierAppendOutcome, StoreError> {
         self.require_live()?;
         let authority = self.require_bound_mission()?;
         if total_len == 0
@@ -4370,6 +5548,7 @@ impl Store {
             .map(|value| decode_pending_blob_source(value.value()))
             .transpose()?
             .ok_or_else(|| blob_error(BlobStoreError::PendingSourceMissing))?;
+        require_blob_contact_eligibility(pending.metadata.lifetime, eligibility)?;
         let pending = normalize_pending_blob_policy_write(
             &write,
             source,
@@ -4674,6 +5853,40 @@ impl Store {
         object: BlobCarrierObjectId,
         plan: &VerifiedBlobTransferPlan,
     ) -> Result<BlobCarrierCommitOutcome, StoreError> {
+        self.commit_complete_blob_carrier_with_eligibility(
+            policy,
+            source,
+            object,
+            plan,
+            BlobContactEligibility::CustodyV1,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn commit_complete_durable_blob_carrier_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        source: BlobTransferId,
+        object: BlobCarrierObjectId,
+        plan: &VerifiedBlobTransferPlan,
+    ) -> Result<BlobCarrierCommitOutcome, StoreError> {
+        self.commit_complete_blob_carrier_with_eligibility(
+            policy,
+            source,
+            object,
+            plan,
+            BlobContactEligibility::DurableOnly,
+        )
+    }
+
+    fn commit_complete_blob_carrier_with_eligibility(
+        &self,
+        policy: &ControlPolicySnapshot,
+        source: BlobTransferId,
+        object: BlobCarrierObjectId,
+        plan: &VerifiedBlobTransferPlan,
+        eligibility: BlobContactEligibility,
+    ) -> Result<BlobCarrierCommitOutcome, StoreError> {
         self.require_live()?;
         let authority = self.require_bound_mission()?;
         let mut depot = BlobDepot::open_network_mutation(self, false)?;
@@ -4685,6 +5898,7 @@ impl Store {
                 .map(|value| decode_pending_blob_source(value.value()))
                 .transpose()?
                 .ok_or_else(|| blob_error(BlobStoreError::PendingSourceMissing))?;
+            require_blob_contact_eligibility(pending.metadata.lifetime, eligibility)?;
             require_blob_lifetime_visible_read(&read, pending.metadata.lifetime)?;
             if pending.metadata.transfer_id != source
                 || read
@@ -4784,6 +5998,22 @@ impl Store {
             )?;
         }
         if let Some(staged) = staged {
+            #[cfg(any(test, feature = "test-utils"))]
+            if let Some(sample) = self
+                .blob_carrier_commit_post_install_sample
+                .lock()
+                .map_err(|_| {
+                    blob_error(BlobStoreError::SchemaInvariant(
+                        "Blob carrier post-install sample lock is poisoned",
+                    ))
+                })?
+                .take()
+            {
+                let observation = self.database.begin_write()?;
+                enforce_live_write(&observation)?;
+                custody::observe_continuity_write(&observation, sample)?;
+                observation.commit()?;
+            }
             let write = self.database.begin_write()?;
             enforce_live_write(&write)?;
             let staging = blob_network_staging_usage_write(&write, authority)?;
@@ -4793,12 +6023,14 @@ impl Store {
                 .map(|value| decode_pending_blob_source(value.value()))
                 .transpose()?
                 .ok_or_else(|| blob_error(BlobStoreError::PendingSourceMissing))?;
+            require_blob_contact_eligibility(current_pending.metadata.lifetime, eligibility)?;
             let current_pending = normalize_pending_blob_policy_write(
                 &write,
                 source,
                 current_pending,
                 self.blob_lifecycle_limits,
             )?;
+            require_blob_lifetime_visible_write(&write, current_pending.metadata.lifetime)?;
             pressure::require_pending_source_write(&write, source, &current_pending)?;
             pressure::require_variant_write(&write, current_pending.metadata.variant_id)?;
             enforce_blob_policy_write(&write, authority, policy, &current_pending.metadata.header)?;
@@ -4848,6 +6080,36 @@ impl Store {
         source: BlobTransferId,
         plan: &VerifiedBlobTransferPlan,
     ) -> Result<Vec<BlobCarrierPrefixStatus>, StoreError> {
+        self.pending_blob_carrier_work_with_eligibility(
+            policy,
+            source,
+            plan,
+            BlobContactEligibility::CustodyV1,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn durable_pending_blob_carrier_work_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        source: BlobTransferId,
+        plan: &VerifiedBlobTransferPlan,
+    ) -> Result<Vec<BlobCarrierPrefixStatus>, StoreError> {
+        self.pending_blob_carrier_work_with_eligibility(
+            policy,
+            source,
+            plan,
+            BlobContactEligibility::DurableOnly,
+        )
+    }
+
+    fn pending_blob_carrier_work_with_eligibility(
+        &self,
+        policy: &ControlPolicySnapshot,
+        source: BlobTransferId,
+        plan: &VerifiedBlobTransferPlan,
+        eligibility: BlobContactEligibility,
+    ) -> Result<Vec<BlobCarrierPrefixStatus>, StoreError> {
         self.require_live()?;
         let authority = self.require_bound_mission()?;
         let read = self.database.begin_read()?;
@@ -4857,6 +6119,7 @@ impl Store {
             .map(|value| decode_pending_blob_source(value.value()))
             .transpose()?
             .ok_or_else(|| blob_error(BlobStoreError::PendingSourceMissing))?;
+        require_blob_contact_eligibility(pending.metadata.lifetime, eligibility)?;
         require_blob_lifetime_visible_read(&read, pending.metadata.lifetime)?;
         enforce_blob_policy_read(&read, authority, policy, &pending.metadata.header)?;
         require_pending_blob_plan(&pending, plan)?;
@@ -4919,6 +6182,58 @@ impl Store {
         max_bytes: usize,
         plan: &VerifiedBlobTransferPlan,
     ) -> Result<Option<(u64, Vec<u8>)>, StoreError> {
+        self.read_completed_blob_carrier_range_with_eligibility(
+            policy,
+            completion,
+            lineage,
+            source,
+            object,
+            offset,
+            max_bytes,
+            plan,
+            BlobContactEligibility::CustodyV1,
+        )
+    }
+
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn read_completed_durable_blob_carrier_range_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        completion: &BlobDepotCompletion,
+        lineage: &CurrentBlobLineage,
+        source: BlobTransferId,
+        object: BlobCarrierObjectId,
+        offset: u64,
+        max_bytes: usize,
+        plan: &VerifiedBlobTransferPlan,
+    ) -> Result<Option<(u64, Vec<u8>)>, StoreError> {
+        self.read_completed_blob_carrier_range_with_eligibility(
+            policy,
+            completion,
+            lineage,
+            source,
+            object,
+            offset,
+            max_bytes,
+            plan,
+            BlobContactEligibility::DurableOnly,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn read_completed_blob_carrier_range_with_eligibility(
+        &self,
+        policy: &ControlPolicySnapshot,
+        completion: &BlobDepotCompletion,
+        lineage: &CurrentBlobLineage,
+        source: BlobTransferId,
+        object: BlobCarrierObjectId,
+        offset: u64,
+        max_bytes: usize,
+        plan: &VerifiedBlobTransferPlan,
+        eligibility: BlobContactEligibility,
+    ) -> Result<Option<(u64, Vec<u8>)>, StoreError> {
         self.require_live()?;
         let authority = self.require_bound_mission()?;
         if max_bytes == 0 || max_bytes > MAX_BLOB_NETWORK_RANGE_BYTES {
@@ -4978,6 +6293,7 @@ impl Store {
             let Some(stored) = stored else {
                 return Ok(None);
             };
+            require_blob_contact_eligibility(stored.metadata.lifetime, eligibility)?;
             require_blob_lifetime_visible_read(&read, stored.metadata.lifetime)?;
             enforce_blob_policy_read(&read, authority, policy, &stored.metadata.header)?;
             if stored.metadata.variant_id != completion.variant_id()
@@ -5049,6 +6365,45 @@ impl Store {
         depot_completion: &BlobDepotCompletion,
         content_completion: &VerifiedBlobContentCompletion,
     ) -> Result<ApplyOutcome, StoreError> {
+        self.apply_verified_blob_with_eligibility(
+            policy,
+            plan,
+            lineage,
+            depot_completion,
+            content_completion,
+            BlobContactEligibility::CustodyV1,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn apply_verified_durable_blob_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        plan: &VerifiedBlobTransferPlan,
+        lineage: &CurrentBlobLineage,
+        depot_completion: &BlobDepotCompletion,
+        content_completion: &VerifiedBlobContentCompletion,
+    ) -> Result<ApplyOutcome, StoreError> {
+        self.apply_verified_blob_with_eligibility(
+            policy,
+            plan,
+            lineage,
+            depot_completion,
+            content_completion,
+            BlobContactEligibility::DurableOnly,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_verified_blob_with_eligibility(
+        &self,
+        policy: &ControlPolicySnapshot,
+        plan: &VerifiedBlobTransferPlan,
+        lineage: &CurrentBlobLineage,
+        depot_completion: &BlobDepotCompletion,
+        content_completion: &VerifiedBlobContentCompletion,
+        eligibility: BlobContactEligibility,
+    ) -> Result<ApplyOutcome, StoreError> {
         self.require_live()?;
         let authority = self.require_bound_mission()?;
         let source = BlobTransferId::new(plan.source_envelope().into_bytes());
@@ -5094,6 +6449,7 @@ impl Store {
                 return Err(blob_error(BlobStoreError::PendingSourceMissing));
             }
             if let Some(pending) = pending.as_ref() {
+                require_blob_contact_eligibility(pending.metadata.lifetime, eligibility)?;
                 let projected = lifecycle::project_lifetime_for_policy_read(
                     &preflight,
                     pending.metadata.lifetime,
@@ -5146,12 +6502,15 @@ impl Store {
             .map(|value| decode_pending_blob_source(value.value()))
             .transpose()?;
         let pending = match pending {
-            Some(pending) => Some(normalize_pending_blob_policy_write(
-                &write,
-                source,
-                pending,
-                self.blob_lifecycle_limits,
-            )?),
+            Some(pending) => {
+                require_blob_contact_eligibility(pending.metadata.lifetime, eligibility)?;
+                Some(normalize_pending_blob_policy_write(
+                    &write,
+                    source,
+                    pending,
+                    self.blob_lifecycle_limits,
+                )?)
+            }
             None => {
                 synchronize_blob_policy_generation_write(&write)?;
                 None
@@ -5193,6 +6552,7 @@ impl Store {
                         "completed Blob source lost its metadata",
                     ))
                 })?;
+            require_blob_contact_eligibility(metadata.lifetime, eligibility)?;
             require_blob_lifetime_visible_write(&write, metadata.lifetime)?;
             // Own the decoded metadata for the remainder of this branch.
             if metadata.transfer_id != accepted.transfer_id {
@@ -8389,7 +9749,32 @@ impl Store {
         budget: pressure::BlobPressureRecoveryBudget,
         custody_sample: Option<aster_mesh::CustodySample>,
     ) -> Result<pressure::BlobCapacityRecoveryResult, StoreError> {
+        self.run_blob_pressure_recovery_with_eligibility(
+            demand,
+            budget,
+            custody_sample,
+            BlobContactEligibility::AllVisible,
+        )
+    }
+
+    fn run_blob_pressure_recovery_with_eligibility(
+        &self,
+        demand: pressure::BlobCapacityRecoveryDemand,
+        budget: pressure::BlobPressureRecoveryBudget,
+        custody_sample: Option<aster_mesh::CustodySample>,
+        eligibility: BlobContactEligibility,
+    ) -> Result<pressure::BlobCapacityRecoveryResult, StoreError> {
         self.require_live()?;
+        // A durable-only contact must not checkpoint global finite age before
+        // it knows whether the selected pressure candidate is contact eligible.
+        // Durable eviction does not need a custody sample, so suppress it for
+        // the complete contact recovery transaction.
+        let custody_sample = match eligibility {
+            BlobContactEligibility::AllVisible | BlobContactEligibility::CustodyV1 => {
+                custody_sample
+            }
+            BlobContactEligibility::DurableOnly => None,
+        };
         let _depot_guard = self
             .blob_depot_lock
             .lock()
@@ -8427,7 +9812,14 @@ impl Store {
         }
 
         let read = self.database.begin_read()?;
-        let selection = pressure::select_pressure_candidate_read(&read, demand, budget)?;
+        let selection = match eligibility {
+            BlobContactEligibility::AllVisible | BlobContactEligibility::CustodyV1 => {
+                pressure::select_pressure_candidate_read(&read, demand, budget)?
+            }
+            BlobContactEligibility::DurableOnly => {
+                pressure::select_durable_pressure_candidate_read(&read, demand, budget)?
+            }
+        };
         drop(read);
         if !selection.proven() {
             return Ok(pressure::BlobCapacityRecoveryResult::empty(
@@ -8450,6 +9842,7 @@ impl Store {
                     budget,
                     selection,
                     custody_sample,
+                    eligibility,
                 );
             }
             pressure::PressureCandidate::Variant(variant) => {
@@ -8459,6 +9852,7 @@ impl Store {
                     budget,
                     selection,
                     custody_sample,
+                    eligibility,
                 );
             }
         };
@@ -8496,6 +9890,12 @@ impl Store {
             )));
         }
         let publication = decode_blob_metadata(&publication_record)?;
+        if !eligibility.admits(publication.lifetime) {
+            return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                charge.rows,
+                charge.bytes,
+            ));
+        }
         if publication.transfer_id != transfer
             || publication.header.priority >= demand.incoming_priority()
         {
@@ -8760,6 +10160,52 @@ impl Store {
         budget: BlobMaintenanceBudget,
         custody_sample: Option<aster_mesh::CustodySample>,
     ) -> Result<Option<BlobCapacityRecoveryResult>, StoreError> {
+        self.run_blob_pressure_recovery_after_cleanup_with_eligibility(
+            error,
+            incoming_priority,
+            content,
+            incoming_depot_units,
+            budget,
+            custody_sample,
+            BlobContactEligibility::AllVisible,
+        )
+    }
+
+    /// Contact-only pressure recovery. A finite candidate, or a variant with
+    /// any finite root, causes clean deferral from the same transaction that
+    /// would otherwise retire it.
+    #[doc(hidden)]
+    pub fn run_durable_blob_pressure_recovery_after_cleanup(
+        &self,
+        error: &StoreError,
+        incoming_priority: Priority,
+        content: Option<(&Topic, &Scope, BlobId)>,
+        incoming_depot_units: (u64, u64),
+        budget: BlobMaintenanceBudget,
+        custody_sample: Option<aster_mesh::CustodySample>,
+    ) -> Result<Option<BlobCapacityRecoveryResult>, StoreError> {
+        self.run_blob_pressure_recovery_after_cleanup_with_eligibility(
+            error,
+            incoming_priority,
+            content,
+            incoming_depot_units,
+            budget,
+            custody_sample,
+            BlobContactEligibility::DurableOnly,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_blob_pressure_recovery_after_cleanup_with_eligibility(
+        &self,
+        error: &StoreError,
+        incoming_priority: Priority,
+        content: Option<(&Topic, &Scope, BlobId)>,
+        incoming_depot_units: (u64, u64),
+        budget: BlobMaintenanceBudget,
+        custody_sample: Option<aster_mesh::CustodySample>,
+        eligibility: BlobContactEligibility,
+    ) -> Result<Option<BlobCapacityRecoveryResult>, StoreError> {
         let (incoming_depot_chunks, incoming_depot_variants) = incoming_depot_units;
         let mut context = pressure::BlobCapacityRecoveryContext::new(incoming_priority)
             .with_depot_units(incoming_depot_chunks, incoming_depot_variants);
@@ -8779,7 +10225,18 @@ impl Store {
             budget.files(),
         )
         .map_err(blob_error)?;
-        let recovery = self.run_blob_pressure_recovery(demand, pressure_budget, custody_sample)?;
+        let recovery = match eligibility {
+            BlobContactEligibility::AllVisible => {
+                self.run_blob_pressure_recovery(demand, pressure_budget, custody_sample)?
+            }
+            BlobContactEligibility::DurableOnly | BlobContactEligibility::CustodyV1 => self
+                .run_blob_pressure_recovery_with_eligibility(
+                    demand,
+                    pressure_budget,
+                    custody_sample,
+                    eligibility,
+                )?,
+        };
         if recovery.deficit_met()
             || recovery.evicted_transfer_ids().is_empty()
             || !matches!(
@@ -8824,11 +10281,15 @@ impl Store {
         };
         let physical_budget =
             BlobMaintenanceBudget::new(rows, budget.files(), bytes).map_err(blob_error)?;
-        let progress = self.run_blob_capacity_gc_for(
-            BlobCapacityGcTarget::Depot,
-            physical_budget,
-            custody_sample,
-        )?;
+        let progress = match eligibility {
+            BlobContactEligibility::AllVisible | BlobContactEligibility::CustodyV1 => self
+                .run_blob_capacity_gc_for(
+                    BlobCapacityGcTarget::Depot,
+                    physical_budget,
+                    custody_sample,
+                )?,
+            BlobContactEligibility::DurableOnly => BlobCapacityGcProgress::default(),
+        };
         let read = self.database.begin_read()?;
         let usage = depot::depot_admission_usage_read(&read)?;
         let current = match demand.partition() {
@@ -8854,6 +10315,7 @@ impl Store {
         budget: pressure::BlobPressureRecoveryBudget,
         selection: pressure::PressureSelection,
         custody_sample: Option<aster_mesh::CustodySample>,
+        eligibility: BlobContactEligibility,
     ) -> Result<pressure::BlobCapacityRecoveryResult, StoreError> {
         let authority = self.require_bound_mission()?;
         let write = self.database.begin_write()?;
@@ -8886,6 +10348,12 @@ impl Store {
             ));
         };
         let pending = &removal.authority.pending;
+        if !eligibility.admits(pending.metadata.lifetime) {
+            return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                charge.rows,
+                charge.bytes,
+            ));
+        }
         let final_root = removal.pressure.references.len() == 1;
         if final_root
             && removal.pressure.references[0]
@@ -9078,6 +10546,7 @@ impl Store {
         budget: pressure::BlobPressureRecoveryBudget,
         selection: pressure::PressureSelection,
         custody_sample: Option<aster_mesh::CustodySample>,
+        eligibility: BlobContactEligibility,
     ) -> Result<pressure::BlobCapacityRecoveryResult, StoreError> {
         let authority = self.require_bound_mission()?;
         let write = self.database.begin_write()?;
@@ -9192,6 +10661,12 @@ impl Store {
                             "Blob variant pressure publication contradicts its summary",
                         )));
                     }
+                    if !eligibility.admits(publication.lifetime) {
+                        return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                            charge.rows,
+                            charge.bytes,
+                        ));
+                    }
                     let proven_expired = matches!(
                         evaluate_blob_lifetime(
                             publication.lifetime,
@@ -9256,6 +10731,12 @@ impl Store {
                         return Err(blob_error(BlobStoreError::SchemaInvariant(
                             "Blob variant pressure pending source contradicts its summary",
                         )));
+                    }
+                    if !eligibility.admits(pending.metadata.lifetime) {
+                        return Ok(pressure::BlobCapacityRecoveryResult::empty(
+                            charge.rows,
+                            charge.bytes,
+                        ));
                     }
                     all_roots_proven_expired &= matches!(
                         evaluate_blob_lifetime(
@@ -9594,6 +11075,79 @@ impl Store {
         custody_sample: Option<aster_mesh::CustodySample>,
     ) -> Result<BlobCapacityGcProgress, StoreError> {
         self.run_blob_capacity_gc_inner(Some(target), budget, custody_sample)
+    }
+
+    /// Contact-only capacity cleanup deliberately performs no general
+    /// lifecycle or physical-maintenance turn. Pressure recovery below may
+    /// still retire an exactly revalidated durable candidate.
+    #[doc(hidden)]
+    pub fn run_durable_blob_capacity_gc_for(
+        &self,
+        _target: BlobCapacityGcTarget,
+        budget: BlobMaintenanceBudget,
+        _custody_sample: Option<aster_mesh::CustodySample>,
+    ) -> Result<BlobCapacityGcProgress, StoreError> {
+        self.require_live()?;
+        let mut progress = BlobCapacityGcProgress::default();
+        let mut position = None;
+        while progress.rows_examined < budget.rows
+            && progress.files_examined < budget.files
+            && progress.bytes_examined < budget.bytes
+        {
+            let step = self.run_one_capacity_physical_unit(
+                position.as_deref(),
+                budget.rows - progress.rows_examined,
+                budget.bytes - progress.bytes_examined,
+            )?;
+            let (rows, files, bytes) = match &step {
+                BlobCapacityPhysicalStep::Unit(unit) => {
+                    position = unit.next_position.clone();
+                    progress.manifests_finalized = progress
+                        .manifests_finalized
+                        .checked_add(u64::from(unit.finalized))
+                        .ok_or(StoreError::ItemCountAccountingOverflow)?;
+                    (unit.rows_examined, unit.files_examined, unit.bytes_examined)
+                }
+                BlobCapacityPhysicalStep::Continue {
+                    rows_examined,
+                    bytes_examined,
+                    next_position,
+                } => {
+                    position = next_position.clone();
+                    (*rows_examined, 0, *bytes_examined)
+                }
+                BlobCapacityPhysicalStep::Blocked {
+                    rows_examined,
+                    bytes_examined,
+                }
+                | BlobCapacityPhysicalStep::Exhausted {
+                    rows_examined,
+                    bytes_examined,
+                } => (*rows_examined, 0, *bytes_examined),
+            };
+            progress.rows_examined = progress
+                .rows_examined
+                .checked_add(rows)
+                .ok_or(StoreError::ItemCountAccountingOverflow)?;
+            progress.files_examined = progress
+                .files_examined
+                .checked_add(files)
+                .ok_or(StoreError::ItemCountAccountingOverflow)?;
+            progress.bytes_examined = progress
+                .bytes_examined
+                .checked_add(bytes)
+                .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+            match step {
+                BlobCapacityPhysicalStep::Unit(_) => std::thread::yield_now(),
+                BlobCapacityPhysicalStep::Continue { .. } if rows != 0 || bytes != 0 => {
+                    std::thread::yield_now();
+                }
+                BlobCapacityPhysicalStep::Continue { .. }
+                | BlobCapacityPhysicalStep::Blocked { .. }
+                | BlobCapacityPhysicalStep::Exhausted { .. } => break,
+            }
+        }
+        Ok(progress)
     }
 
     fn run_blob_capacity_gc_inner(
@@ -11684,6 +13238,37 @@ fn blob_source_projection(
         chunk_count: shape.chunk_count,
         metadata_fingerprint: digest.finalize().into(),
     })
+}
+
+fn verified_blob_source_projection(
+    blob: &ContentVerifiedBlobEnvelope,
+    sealed_len: u64,
+    lifetime: BlobLifetime,
+) -> Result<BlobSourceProjection, StoreError> {
+    let metadata = BlobMetadata {
+        transfer_id: BlobTransferId::new(blob.envelope_id()),
+        semantic_id: BlobSemanticId::new(blob.item_id()),
+        blob_id: blob.blob_id(),
+        variant_id: blob_variant_id(
+            blob.blob_id(),
+            blob.manifest().content_group(),
+            blob.manifest().content_epoch(),
+        ),
+        manifest_digest: *blob.manifest_digest(),
+        route_lineage: Some(*blob.route_lineage().binding()),
+        physical_lineage: Some(*blob.physical_lineage().binding()),
+        lifetime,
+        header: blob.header().clone(),
+    };
+    blob_source_projection(
+        &metadata,
+        sealed_len,
+        depot::BlobSourceShape {
+            total_len: blob.manifest().total_len(),
+            chunk_size: blob.manifest().chunk_size(),
+            chunk_count: blob.manifest().chunk_count(),
+        },
+    )
 }
 
 fn blob_replay_fence(
@@ -14947,6 +16532,7 @@ fn current_pending_projection_read(
     read: &redb::ReadTransaction,
     key: &[u8],
     value: &[u8],
+    eligibility: BlobContactEligibility,
 ) -> Result<Option<BlobSourceProjection>, StoreError> {
     let source = parse_blob_transfer_id("pending Blob source table", key)?;
     let pending = decode_pending_blob_source(value)?;
@@ -14958,7 +16544,7 @@ fn current_pending_projection_read(
     if !blob_header_is_current_read(read, &pending.metadata.header)? {
         return Ok(None);
     }
-    if !blob_lifetime_is_visible_read(read, pending.metadata.lifetime)? {
+    if !blob_lifetime_is_visible_for_contact_read(read, pending.metadata.lifetime, eligibility)? {
         return Ok(None);
     }
     let sealed_len = u64::try_from(pending.sealed.len())
@@ -16048,6 +17634,381 @@ fn parse_blob_transfer_id(
     Ok(BlobTransferId::new(bytes))
 }
 
+#[cfg(any(test, feature = "test-utils"))]
+fn blob_database_digest_read_for_test(read: &redb::ReadTransaction) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    macro_rules! bytes_table {
+        ($definition:expr) => {
+            for row in read
+                .open_table($definition)
+                .expect("Blob digest bytes table")
+                .iter()
+                .expect("Blob digest bytes rows")
+            {
+                let (key, value) = row.expect("Blob digest bytes row");
+                digest.update(
+                    u64::try_from(key.value().len())
+                        .expect("Blob digest key length")
+                        .to_be_bytes(),
+                );
+                digest.update(key.value());
+                digest.update(
+                    u64::try_from(value.value().len())
+                        .expect("Blob digest value length")
+                        .to_be_bytes(),
+                );
+                digest.update(value.value());
+            }
+        };
+    }
+    macro_rules! byte_u64_table {
+        ($definition:expr) => {
+            for row in read
+                .open_table($definition)
+                .expect("Blob digest byte/u64 table")
+                .iter()
+                .expect("Blob digest byte/u64 rows")
+            {
+                let (key, value) = row.expect("Blob digest byte/u64 row");
+                digest.update(
+                    u64::try_from(key.value().len())
+                        .expect("Blob digest key length")
+                        .to_be_bytes(),
+                );
+                digest.update(key.value());
+                digest.update(value.value().to_be_bytes());
+            }
+        };
+    }
+    bytes_table!(BLOB_PUBLICATIONS);
+    bytes_table!(BLOB_BYTES);
+    bytes_table!(BLOB_SEMANTIC_ITEMS);
+    bytes_table!(BLOB_CONTENT_INDEX);
+    bytes_table!(BLOB_OPERATIONS);
+    bytes_table!(BLOB_IMPORTS);
+    bytes_table!(BLOB_CHUNKS);
+    bytes_table!(BLOB_PENDING_SOURCES);
+    bytes_table!(BLOB_CARRIER_PREFIXES);
+    bytes_table!(BLOB_CARRIER_FETCH_CURSORS);
+    bytes_table!(ACCEPTED_DOTS);
+    byte_u64_table!(BLOB_ACCEPTANCE_MARKERS);
+    byte_u64_table!(PUBLISHER_HIGH_WATER);
+    byte_u64_table!(CAUSAL_FRONTIER);
+    for row in read
+        .open_table(BLOB_DEPOT_METADATA)
+        .expect("Blob depot digest metadata")
+        .iter()
+        .expect("Blob depot digest rows")
+    {
+        let (key, value) = row.expect("Blob depot digest row");
+        digest.update(key.value().as_bytes());
+        digest.update(value.value().to_be_bytes());
+    }
+    for row in read
+        .open_table(BLOB_NETWORK_METADATA)
+        .expect("Blob digest network metadata")
+        .iter()
+        .expect("Blob digest network rows")
+    {
+        let (key, value) = row.expect("Blob digest network row");
+        digest.update(key.value().as_bytes());
+        digest.update(value.value().to_be_bytes());
+    }
+    for field in blob_global_metadata_fields() {
+        digest.update(field.as_bytes());
+        digest.update(
+            read.open_table(METADATA)
+                .expect("Blob digest global metadata")
+                .get(field)
+                .expect("Blob digest global read")
+                .map_or(u64::MAX, |value| value.value())
+                .to_be_bytes(),
+        );
+    }
+    digest.finalize().into()
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+fn blob_current_admission_digest_read_for_test(
+    read: &redb::ReadTransaction,
+    include_maintenance_cursors: bool,
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(blob_database_digest_read_for_test(read));
+    let table_names = read
+        .list_tables()
+        .expect("Blob logical digest table names")
+        .map(|table| table.name().to_owned())
+        .collect::<BTreeSet<_>>();
+    macro_rules! bytes_table {
+        ($definition:expr) => {
+            for row in read
+                .open_table($definition)
+                .expect("Blob digest bytes table")
+                .iter()
+                .expect("Blob digest bytes rows")
+            {
+                let (key, value) = row.expect("Blob digest bytes row");
+                digest.update(
+                    u64::try_from(key.value().len())
+                        .expect("Blob digest key length")
+                        .to_be_bytes(),
+                );
+                digest.update(key.value());
+                digest.update(
+                    u64::try_from(value.value().len())
+                        .expect("Blob digest value length")
+                        .to_be_bytes(),
+                );
+                digest.update(value.value());
+            }
+        };
+    }
+    for row in read
+        .open_table(BLOB_ACCEPTANCE_ORDER)
+        .expect("Blob acceptance-order table")
+        .iter()
+        .expect("Blob acceptance-order rows")
+    {
+        let (key, value) = row.expect("Blob acceptance-order row");
+        digest.update(key.value().to_be_bytes());
+        digest.update(value.value());
+    }
+    for definition in [
+        lifecycle::BLOB_VARIANT_REFERENCES,
+        lifecycle::BLOB_LINEAGE_FENCES,
+        lifecycle::BLOB_REPLAY_FENCES,
+        lifecycle::BLOB_OPERATION_OWNERS,
+        lifecycle::BLOB_DELIVERY_OWNERS,
+        lifecycle::BLOB_RETENTION_DEADLINES,
+        lifecycle::BLOB_TTL_DEADLINES,
+        lifecycle::BLOB_RETIREMENT_RESOLVERS,
+        pressure::BLOB_PRESSURE_PUBLICATION_ROOTS,
+        pressure::BLOB_PRESSURE_PENDING_ROOTS,
+        pressure::BLOB_PRESSURE_VARIANT_SUMMARIES,
+        pressure::BLOB_PRESSURE_PUBLICATIONS,
+        pressure::BLOB_PRESSURE_CONTENT_PUBLICATIONS,
+        pressure::BLOB_PRESSURE_DURABLE_PUBLICATIONS,
+        pressure::BLOB_PRESSURE_DURABLE_CONTENT_PUBLICATIONS,
+    ] {
+        bytes_table!(definition);
+    }
+    let replay_causal_present = table_names.contains(lifecycle::BLOB_REPLAY_CAUSAL_FENCES.name());
+    digest.update(lifecycle::BLOB_REPLAY_CAUSAL_FENCES.name().as_bytes());
+    digest.update([u8::from(replay_causal_present)]);
+    if replay_causal_present {
+        bytes_table!(lifecycle::BLOB_REPLAY_CAUSAL_FENCES);
+    }
+    bytes_table!(pressure::BLOB_PRESSURE_PENDING_SOURCES);
+    bytes_table!(pressure::BLOB_PRESSURE_VARIANTS);
+    bytes_table!(pressure::BLOB_PRESSURE_DURABLE_PENDING_SOURCES);
+    bytes_table!(pressure::BLOB_PRESSURE_DURABLE_VARIANTS);
+    for definition in [
+        lifecycle::BLOB_TTL_EXPIRY_CURSORS,
+        pressure::BLOB_PRESSURE_REANCHOR_CURSORS,
+    ] {
+        for row in read
+            .open_table(definition)
+            .expect("Blob logical digest cursor table")
+            .iter()
+            .expect("Blob logical digest cursor rows")
+        {
+            let (key, value) = row.expect("Blob logical digest cursor row");
+            digest.update([key.value()]);
+            digest.update(value.value());
+        }
+    }
+    for definition in [
+        lifecycle::BLOB_LIFECYCLE_METADATA,
+        pressure::BLOB_PRESSURE_METADATA,
+    ] {
+        for row in read
+            .open_table(definition)
+            .expect("Blob logical digest metadata table")
+            .iter()
+            .expect("Blob logical digest metadata rows")
+        {
+            let (key, value) = row.expect("Blob logical digest metadata row");
+            digest.update(key.value().as_bytes());
+            digest.update(value.value().to_be_bytes());
+        }
+    }
+    if include_maintenance_cursors {
+        for row in read
+            .open_table(lifecycle::BLOB_MAINTENANCE_CURSORS)
+            .expect("Blob lifecycle cursor table")
+            .iter()
+            .expect("Blob lifecycle cursor rows")
+        {
+            let (key, value) = row.expect("Blob lifecycle cursor row");
+            digest.update([key.value()]);
+            digest.update(value.value());
+        }
+    }
+    digest.finalize().into()
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+fn blob_complete_logical_digest_for_test(
+    store: &Store,
+    exclude_deletion_turn: bool,
+    exclude_maintenance_cursors: bool,
+) -> [u8; 32] {
+    fn field(digest: &mut Sha256, label: &[u8], key: &[u8], value: &[u8]) {
+        for bytes in [label, key, value] {
+            digest.update(
+                u64::try_from(bytes.len())
+                    .expect("complete Blob digest field length")
+                    .to_be_bytes(),
+            );
+            digest.update(bytes);
+        }
+    }
+
+    let read = store
+        .database
+        .begin_read()
+        .expect("complete Blob logical digest read");
+    let mut digest = Sha256::new();
+    field(
+        &mut digest,
+        b"base-blob-state",
+        b"",
+        &blob_current_admission_digest_read_for_test(&read, false),
+    );
+    for key in [
+        BLOB_SUBSCRIPTION_COUNT,
+        BLOB_PENDING_DELIVERY_COUNT,
+        BLOB_ACKNOWLEDGEMENT_COUNT,
+        BLOB_DELIVERY_CURSOR_COUNT,
+        BLOB_SELECTOR_GENERATION,
+        BLOB_RETIREMENT_DELIVERY_COUNT,
+        BLOB_RETIREMENT_DELIVERY_ORDER_COUNT,
+        BLOB_RETIREMENT_ACKNOWLEDGEMENT_COUNT,
+        BLOB_RETIREMENT_DELIVERY_OWNER_COUNT,
+    ] {
+        let value = read
+            .open_table(METADATA)
+            .expect("complete Blob global metadata")
+            .get(key)
+            .expect("complete Blob global metadata read")
+            .map_or(u64::MAX, |value| value.value());
+        field(
+            &mut digest,
+            b"subscription-metadata",
+            key.as_bytes(),
+            &value.to_be_bytes(),
+        );
+    }
+    for (label, definition) in [
+        (b"subscriptions".as_slice(), BLOB_SUBSCRIPTIONS),
+        (
+            b"subscription-pending".as_slice(),
+            BLOB_SUBSCRIPTION_PENDING,
+        ),
+        (
+            b"delivery-acknowledgements".as_slice(),
+            BLOB_DELIVERY_ACKNOWLEDGEMENTS,
+        ),
+        (b"delivery-cursors".as_slice(), BLOB_DELIVERY_CURSORS),
+        (
+            b"retirement-deliveries".as_slice(),
+            BLOB_RETIREMENT_DELIVERIES,
+        ),
+        (
+            b"retirement-delivery-order".as_slice(),
+            BLOB_RETIREMENT_DELIVERY_ORDER,
+        ),
+        (
+            b"retirement-acknowledgements".as_slice(),
+            BLOB_RETIREMENT_ACKNOWLEDGEMENTS,
+        ),
+        (
+            b"retirement-delivery-owners".as_slice(),
+            BLOB_RETIREMENT_DELIVERY_OWNERS,
+        ),
+        (
+            b"deletion-manifests".as_slice(),
+            deletion::BLOB_DELETION_MANIFESTS,
+        ),
+        (
+            b"deletion-chunks".as_slice(),
+            deletion::BLOB_DELETION_CHUNKS,
+        ),
+    ] {
+        for row in read
+            .open_table(definition)
+            .expect("complete Blob bytes table")
+            .iter()
+            .expect("complete Blob bytes rows")
+        {
+            let (key, value) = row.expect("complete Blob bytes row");
+            field(&mut digest, label, key.value(), value.value());
+        }
+    }
+    for row in read
+        .open_table(deletion::BLOB_DELETION_METADATA)
+        .expect("complete Blob deletion metadata table")
+        .iter()
+        .expect("complete Blob deletion metadata rows")
+    {
+        let (key, value) = row.expect("complete Blob deletion metadata row");
+        if exclude_deletion_turn && key.value() == deletion::BLOB_DELETION_MAINTENANCE_TURN {
+            continue;
+        }
+        field(
+            &mut digest,
+            b"deletion-metadata",
+            key.value().as_bytes(),
+            &value.value().to_be_bytes(),
+        );
+    }
+    if !exclude_maintenance_cursors {
+        for row in read
+            .open_table(lifecycle::BLOB_MAINTENANCE_CURSORS)
+            .expect("complete Blob maintenance cursors")
+            .iter()
+            .expect("complete Blob maintenance cursor rows")
+        {
+            let (key, value) = row.expect("complete Blob maintenance cursor row");
+            field(
+                &mut digest,
+                b"maintenance-cursors",
+                &[key.value()],
+                value.value(),
+            );
+        }
+    }
+    for row in read
+        .open_table(deletion::BLOB_DELETION_CONTINUITY)
+        .expect("complete Blob deletion continuity")
+        .iter()
+        .expect("complete Blob deletion continuity rows")
+    {
+        let (key, value) = row.expect("complete Blob deletion continuity row");
+        field(
+            &mut digest,
+            b"deletion-continuity",
+            &[key.value()],
+            value.value(),
+        );
+    }
+    digest.finalize().into()
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl Store {
+    /// Test-only digest of exact Blob logical state.
+    ///
+    /// Periodic maintenance position and deletion-turn counters are excluded;
+    /// source, pending, carrier-prefix, carrier/transfer cursors, pressure,
+    /// lifecycle, subscription, retirement, and deletion authority are bound.
+    #[doc(hidden)]
+    pub fn test_blob_logical_digest(&self) -> [u8; 32] {
+        blob_complete_logical_digest_for_test(self, true, true)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
@@ -16125,15 +18086,19 @@ mod tests {
     }
 
     fn blob_services(seed: u8) -> BlobServices {
+        blob_services_with_nodes(seed, 1, 2)
+    }
+
+    fn blob_services_with_nodes(seed: u8, publisher_node: u64, reader_node: u64) -> BlobServices {
         let mut provisioner = ReferenceProvisioner::from_seed([seed; 32]).expect("provisioner");
         let access = ProvisioningAccess::member(blob_scope(), vec![1, 2, 3], vec![blob_topic()])
             .expect("Blob member access");
         let publisher = provisioner
-            .issue_control_authority(1, std::slice::from_ref(&access))
+            .issue_control_authority(publisher_node, std::slice::from_ref(&access))
             .and_then(ReferenceEnvelopeSealer::open)
             .expect("Blob publisher");
         let reader = provisioner
-            .issue_node(2, &[access])
+            .issue_node(reader_node, &[access])
             .and_then(ReferenceEnvelopeSealer::open)
             .expect("Blob reader");
         let authority = publisher.mission_authority_id();
@@ -16894,6 +18859,254 @@ mod tests {
     }
 
     #[test]
+    fn finite_send_authorization_checkpoints_age_and_rejects_lifetime_failures() {
+        // Mutation caught: constructing a finite claim from a stale snapshot,
+        // failing to durably charge local residence, or authorizing after a
+        // clock-domain discontinuity would emit a younger/indeterminate age.
+        let source_root = BlobTestRoot::new("finite-send-authorization-source");
+        let target_root = BlobTestRoot::new("finite-send-authorization-target");
+        let expired_root = BlobTestRoot::new("finite-send-authorization-expired");
+        let mut services = blob_services(0x62);
+        let source = Store::open_for_mission(&source_root.database, services.authority)
+            .expect("finite send source store");
+        let target = Store::open_for_mission(&target_root.database, services.authority)
+            .expect("finite send target store");
+        let plaintext = b"finite send authorization checkpoints exact age".to_vec();
+        let prepared = prepared_blob(&plaintext);
+        let proof = prepare_blob_proof_with_lifetime(
+            &source,
+            &mut services,
+            &prepared,
+            &plaintext,
+            1,
+            Priority::Immediate,
+            Some(5_000),
+        );
+        let plan = proof
+            .blob
+            .transfer_plan(&proof.manifest_bytes)
+            .expect("finite send plan");
+        let transfer = BlobTransferId::new(proof.blob.envelope_id());
+        let policy = target
+            .control_policy_snapshot()
+            .expect("finite send target policy");
+        let admitted = CustodySample {
+            clock_id: [0x63; 16],
+            tick_ms: 10_000,
+        };
+        target
+            .test_stage_verified_finite_blob_source_with_policy(
+                &policy,
+                &proof.blob,
+                &proof.sealed,
+                &plan,
+                700,
+                admitted,
+            )
+            .expect("stage finite send source");
+        let retained = target
+            .blob_source_projection(transfer)
+            .expect("finite send projection")
+            .expect("finite send retained source");
+
+        let first = target
+            .test_authorize_finite_blob_send_with_policy(
+                &policy,
+                &retained.source,
+                retained.retention,
+                &proof.blob,
+                &proof.sealed,
+                CustodySample {
+                    clock_id: admitted.clock_id,
+                    tick_ms: 10_125,
+                },
+                [0x64; 32],
+                7,
+                aster_mesh::BlobCustodyDirectionV1::ToSessionResponder,
+                40,
+            )
+            .expect("authorize first finite send")
+            .expect("live finite send authority");
+        let (first_claim, first_prepared) = first
+            .into_claim(&proof.blob, &proof.sealed)
+            .expect("construct first finite send claim");
+        assert_eq!(first_claim.prior_cumulative_age_ms(), 825);
+        assert_eq!(first_claim.forwarding_age_ms(), 865);
+        assert!(
+            target
+                .finalize_finite_blob_send_with_policy(
+                    &policy,
+                    first_prepared,
+                    &proof.blob,
+                    &proof.sealed,
+                    CustodySample {
+                        clock_id: admitted.clock_id,
+                        tick_ms: 10_150,
+                    },
+                )
+                .expect("finalize first finite send within charge")
+        );
+
+        drop(target);
+        let target = Store::open_for_mission(&target_root.database, services.authority)
+            .expect("reopen finite send target");
+        let policy = target
+            .control_policy_snapshot()
+            .expect("reopened finite send target policy");
+        let second = target
+            .test_authorize_finite_blob_send_with_policy(
+                &policy,
+                &target
+                    .blob_source_projection(transfer)
+                    .expect("checkpointed projection")
+                    .expect("checkpointed source")
+                    .source,
+                retained.retention,
+                &proof.blob,
+                &proof.sealed,
+                CustodySample {
+                    clock_id: admitted.clock_id,
+                    tick_ms: 10_200,
+                },
+                [0x65; 32],
+                8,
+                aster_mesh::BlobCustodyDirectionV1::ToSessionInitiator,
+                40,
+            )
+            .expect("authorize repeated finite send")
+            .expect("repeated finite send authority");
+        let (second_claim, second_prepared) = second
+            .into_claim(&proof.blob, &proof.sealed)
+            .expect("construct repeated finite send claim");
+        assert!(
+            second_claim.prior_cumulative_age_ms() >= first_claim.prior_cumulative_age_ms(),
+            "a later authorization must never authenticate a younger age"
+        );
+        assert!(
+            !target
+                .finalize_finite_blob_send_with_policy(
+                    &policy,
+                    second_prepared,
+                    &proof.blob,
+                    &proof.sealed,
+                    CustodySample {
+                        clock_id: admitted.clock_id,
+                        tick_ms: 10_250,
+                    },
+                )
+                .expect("abandon finite send after finalization overrun"),
+            "elapsed finalization beyond the authenticated charge must abandon the frame"
+        );
+        let retry = target
+            .test_authorize_finite_blob_send_with_policy(
+                &policy,
+                &target
+                    .blob_source_projection(transfer)
+                    .expect("overrun-checkpointed projection")
+                    .expect("overrun-checkpointed source")
+                    .source,
+                retained.retention,
+                &proof.blob,
+                &proof.sealed,
+                CustodySample {
+                    clock_id: admitted.clock_id,
+                    tick_ms: 10_250,
+                },
+                [0x65; 32],
+                9,
+                aster_mesh::BlobCustodyDirectionV1::ToSessionInitiator,
+                40,
+            )
+            .expect("reauthorize finite send after overrun")
+            .expect("fresh retry authority");
+        let (_retry_claim, retry_prepared) = retry
+            .into_claim(&proof.blob, &proof.sealed)
+            .expect("construct fresh retry claim");
+        assert!(
+            target
+                .finalize_finite_blob_send_with_policy(
+                    &policy,
+                    retry_prepared,
+                    &proof.blob,
+                    &proof.sealed,
+                    CustodySample {
+                        clock_id: admitted.clock_id,
+                        tick_ms: 10_250,
+                    },
+                )
+                .expect("finalize fresh retry within charge"),
+            "overrun requires a new authorization and claim before retry"
+        );
+
+        let expired = Store::open_for_mission(&expired_root.database, services.authority)
+            .expect("expired finite send target store");
+        let expired_policy = expired
+            .control_policy_snapshot()
+            .expect("expired finite send target policy");
+        expired
+            .test_stage_verified_finite_blob_source_with_policy(
+                &expired_policy,
+                &proof.blob,
+                &proof.sealed,
+                &plan,
+                700,
+                admitted,
+            )
+            .expect("stage eventually expired finite send source");
+        let expired_projection = expired
+            .blob_source_projection(transfer)
+            .expect("expired send projection")
+            .expect("expired send retained source");
+        assert!(
+            expired
+                .test_authorize_finite_blob_send_with_policy(
+                    &expired_policy,
+                    &expired_projection.source,
+                    expired_projection.retention,
+                    &proof.blob,
+                    &proof.sealed,
+                    CustodySample {
+                        clock_id: admitted.clock_id,
+                        tick_ms: 15_000,
+                    },
+                    [0x67; 32],
+                    10,
+                    aster_mesh::BlobCustodyDirectionV1::ToSessionResponder,
+                    40,
+                )
+                .expect("suppress expired finite send")
+                .is_none(),
+            "an expired source must not mint finite send authority"
+        );
+
+        let discontinuous_projection = target
+            .blob_source_projection(transfer)
+            .expect("pre-discontinuity projection")
+            .expect("pre-discontinuity source");
+        assert!(
+            target
+                .test_authorize_finite_blob_send_with_policy(
+                    &policy,
+                    &discontinuous_projection.source,
+                    discontinuous_projection.retention,
+                    &proof.blob,
+                    &proof.sealed,
+                    CustodySample {
+                        clock_id: [0x66; 16],
+                        tick_ms: 1,
+                    },
+                    [0x68; 32],
+                    11,
+                    aster_mesh::BlobCustodyDirectionV1::ToSessionResponder,
+                    40,
+                )
+                .expect("reject discontinuous finite send")
+                .is_none(),
+            "continuity loss must suppress finite emission"
+        );
+    }
+
+    #[test]
     fn verified_finite_projection_stages_promotes_merges_duplicate_and_reopens() {
         let source_root = BlobTestRoot::new("verified-finite-source");
         let target_root = BlobTestRoot::new("verified-finite-target");
@@ -17137,6 +19350,38 @@ mod tests {
             target.blob_stats().expect("merged pending duplicate stats"),
             before_pending_duplicate_stats,
             "a pending duplicate may update authority but not staging rows/bytes/counters"
+        );
+        let younger_duplicate = VerifiedFiniteBlobAdmission::for_test(
+            proof.blob.envelope_id(),
+            u64::try_from(proof.sealed.len()).expect("younger duplicate source length"),
+            proof.blob.item_id(),
+            proof.blob.blob_id(),
+            proof.blob.priority(),
+            5_000,
+            600,
+            pending_later_sample,
+        );
+        assert_eq!(
+            target
+                .stage_verified_blob_source_with_lifetime(
+                    &policy,
+                    &proof.blob,
+                    &proof.sealed,
+                    &plan,
+                    Some(younger_duplicate),
+                )
+                .expect("merge younger pending finite duplicate"),
+            BlobSourceStageOutcome::Duplicate
+        );
+        assert_eq!(
+            pending_lifetime(&target),
+            pending_merged,
+            "a younger authenticated duplicate must never rejuvenate retained age"
+        );
+        assert_eq!(
+            target.blob_stats().expect("younger duplicate stats"),
+            before_pending_duplicate_stats,
+            "a younger duplicate must not add staging rows or bytes"
         );
         {
             let read = target
@@ -18674,6 +20919,47 @@ mod tests {
         }
     }
 
+    fn blob_test_carriers(
+        source: &Store,
+        plan: &VerifiedBlobTransferPlan,
+    ) -> Vec<(BlobCarrierObjectId, Vec<u8>)> {
+        let mut source_depot = source.blob_depot().expect("source depot");
+        CoreBlobStore::begin_blob_with_lineage(
+            &mut source_depot,
+            plan.manifest(),
+            plan.physical_lineage(),
+        )
+        .expect("activate source plan");
+        (0..plan.manifest().chunk_count())
+            .map(|index| {
+                let carrier = plan
+                    .build_carrier(&mut source_depot, index)
+                    .expect("build exact carrier");
+                (
+                    BlobCarrierObjectId::new(carrier.object_id().wire_bytes())
+                        .expect("typed carrier id"),
+                    carrier.bytes().to_vec(),
+                )
+            })
+            .collect()
+    }
+
+    fn assert_durable_contact_rejects_without_mutation<T>(
+        store: &Store,
+        operation: impl FnOnce() -> Result<T, StoreError>,
+    ) {
+        let before = blob_complete_logical_digest(store);
+        assert!(matches!(
+            operation(),
+            Err(StoreError::Blob(BlobStoreError::ReadPlanChanged))
+        ));
+        assert_eq!(
+            blob_complete_logical_digest(store),
+            before,
+            "durable-contact rejection must leave the logical database unchanged"
+        );
+    }
+
     #[test]
     fn blob_store_one_slot_saturation_is_transient_and_non_destructive() {
         let source_root = BlobTestRoot::new("lease-saturation-source");
@@ -19259,6 +21545,170 @@ mod tests {
                 .pending_blob_source(transfer)
                 .expect("pending source after abort")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn finite_carrier_commit_rechecks_expiry_before_prefix_retirement() {
+        let source_root = BlobTestRoot::new("finite-carrier-commit-expiry-source");
+        let target_root = BlobTestRoot::new("finite-carrier-commit-expiry-target");
+        let mut services = blob_services(0xad);
+        let source = Store::open_for_mission(&source_root.database, services.authority)
+            .expect("finite commit-expiry source store");
+        let target = Store::open_for_mission(&target_root.database, services.authority)
+            .expect("finite commit-expiry target store");
+        let plaintext = vec![0xad; SELECTED_BLOB_CHUNK_SIZE as usize];
+        let prepared = prepared_blob(&plaintext);
+        let proof = prepare_blob_proof_with_lifetime(
+            &source,
+            &mut services,
+            &prepared,
+            &plaintext,
+            1,
+            Priority::Immediate,
+            Some(100),
+        );
+        let plan = proof
+            .blob
+            .transfer_plan(&proof.manifest_bytes)
+            .expect("finite commit-expiry transfer plan");
+        let policy = target
+            .control_policy_snapshot()
+            .expect("finite commit-expiry policy");
+        let transfer = BlobTransferId::new(proof.blob.envelope_id());
+        let checkpoint = CustodySample {
+            clock_id: [0xac; 16],
+            tick_ms: 100,
+        };
+        assert_eq!(
+            target
+                .test_stage_verified_finite_blob_source_with_policy(
+                    &policy,
+                    &proof.blob,
+                    &proof.sealed,
+                    &plan,
+                    50,
+                    checkpoint,
+                )
+                .expect("stage finite commit-expiry source"),
+            BlobSourceStageOutcome::Inserted
+        );
+        let carrier = {
+            let mut depot = source
+                .blob_depot()
+                .expect("finite commit-expiry source depot");
+            CoreBlobStore::begin_blob_with_lineage(
+                &mut depot,
+                plan.manifest(),
+                plan.physical_lineage(),
+            )
+            .expect("activate finite commit-expiry source plan");
+            plan.build_carrier(&mut depot, 0)
+                .expect("build finite commit-expiry carrier")
+        };
+        let object = BlobCarrierObjectId::new(carrier.object_id().wire_bytes())
+            .expect("finite commit-expiry carrier id");
+        let total_len = u64::try_from(carrier.bytes().len()).expect("carrier length");
+        let mut offset = 0u64;
+        for range in carrier.bytes().chunks(MAX_BLOB_NETWORK_RANGE_BYTES) {
+            target
+                .append_blob_carrier_prefix_with_policy(
+                    &policy, transfer, object, total_len, offset, range,
+                )
+                .expect("stage finite complete carrier prefix");
+            offset += u64::try_from(range.len()).expect("carrier range length");
+        }
+
+        let (reached_send, reached_receive) = std::sync::mpsc::sync_channel(0);
+        let (release_send, release_receive) = std::sync::mpsc::sync_channel(0);
+        target.set_blob_carrier_commit_post_snapshot_gate(reached_send, release_receive);
+        let (result, after_expiry) = std::thread::scope(|scope| {
+            let commit = scope.spawn(|| {
+                target.commit_complete_blob_carrier_with_policy(&policy, transfer, object, &plan)
+            });
+            reached_receive
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("finite commit reached its admitted snapshot");
+            let write = target
+                .database
+                .begin_write()
+                .expect("advance finite commit continuity");
+            custody::observe_continuity_write(
+                &write,
+                CustodySample {
+                    clock_id: checkpoint.clock_id,
+                    tick_ms: 150,
+                },
+            )
+            .expect("advance finite commit to exact expiry");
+            write.commit().expect("commit finite carrier expiry");
+            let after_expiry = {
+                let read = target
+                    .database
+                    .begin_read()
+                    .expect("finite commit-expiry admitted-state read");
+                let pending = read
+                    .open_table(BLOB_PENDING_SOURCES)
+                    .expect("finite commit-expiry pending table")
+                    .get(transfer.as_bytes().as_slice())
+                    .expect("finite commit-expiry pending lookup")
+                    .expect("finite commit-expiry pending row")
+                    .value()
+                    .to_vec();
+                let prefix = read
+                    .open_table(BLOB_CARRIER_PREFIXES)
+                    .expect("finite commit-expiry prefix table")
+                    .get(blob_carrier_prefix_key(transfer, object).as_slice())
+                    .expect("finite commit-expiry prefix lookup")
+                    .expect("finite commit-expiry prefix row")
+                    .value()
+                    .to_vec();
+                (pending, prefix)
+            };
+            release_send
+                .send(())
+                .expect("release finite commit after expiry");
+            (
+                commit.join().expect("join finite carrier commit"),
+                after_expiry,
+            )
+        });
+        assert!(matches!(
+            result,
+            Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+        ));
+        let read = target
+            .database
+            .begin_read()
+            .expect("finite commit-expiry prefix read");
+        let pending_after = read
+            .open_table(BLOB_PENDING_SOURCES)
+            .expect("finite commit-expiry pending table after")
+            .get(transfer.as_bytes().as_slice())
+            .expect("finite commit-expiry pending lookup after")
+            .expect("finite commit-expiry pending row after")
+            .value()
+            .to_vec();
+        let prefix_after = read
+            .open_table(BLOB_CARRIER_PREFIXES)
+            .expect("finite commit-expiry prefix table")
+            .get(blob_carrier_prefix_key(transfer, object).as_slice())
+            .expect("finite commit-expiry prefix lookup")
+            .expect("failed completion must leave the durable prefix for retirement policy")
+            .value()
+            .to_vec();
+        assert_eq!(
+            (pending_after, prefix_after),
+            after_expiry,
+            "post-install expiry must preserve the exact pending authority and prefix"
+        );
+        drop(read);
+        assert!(
+            target
+                .pending_blob_source(transfer)
+                .expect("expired finite commit pending lookup")
+                .is_none(),
+            "expired pending authority must be immediately non-forwardable"
         );
     }
 
@@ -20804,98 +23254,8 @@ mod tests {
     }
 
     fn blob_database_digest_read(read: &redb::ReadTransaction) -> [u8; 32] {
-        let mut digest = Sha256::new();
-        macro_rules! bytes_table {
-            ($definition:expr) => {
-                for row in read
-                    .open_table($definition)
-                    .expect("Blob digest bytes table")
-                    .iter()
-                    .expect("Blob digest bytes rows")
-                {
-                    let (key, value) = row.expect("Blob digest bytes row");
-                    digest.update(
-                        u64::try_from(key.value().len())
-                            .expect("Blob digest key length")
-                            .to_be_bytes(),
-                    );
-                    digest.update(key.value());
-                    digest.update(
-                        u64::try_from(value.value().len())
-                            .expect("Blob digest value length")
-                            .to_be_bytes(),
-                    );
-                    digest.update(value.value());
-                }
-            };
-        }
-        macro_rules! byte_u64_table {
-            ($definition:expr) => {
-                for row in read
-                    .open_table($definition)
-                    .expect("Blob digest byte/u64 table")
-                    .iter()
-                    .expect("Blob digest byte/u64 rows")
-                {
-                    let (key, value) = row.expect("Blob digest byte/u64 row");
-                    digest.update(
-                        u64::try_from(key.value().len())
-                            .expect("Blob digest key length")
-                            .to_be_bytes(),
-                    );
-                    digest.update(key.value());
-                    digest.update(value.value().to_be_bytes());
-                }
-            };
-        }
-        bytes_table!(BLOB_PUBLICATIONS);
-        bytes_table!(BLOB_BYTES);
-        bytes_table!(BLOB_SEMANTIC_ITEMS);
-        bytes_table!(BLOB_CONTENT_INDEX);
-        bytes_table!(BLOB_OPERATIONS);
-        bytes_table!(BLOB_IMPORTS);
-        bytes_table!(BLOB_CHUNKS);
-        bytes_table!(BLOB_PENDING_SOURCES);
-        bytes_table!(BLOB_CARRIER_PREFIXES);
-        bytes_table!(BLOB_CARRIER_FETCH_CURSORS);
-        bytes_table!(ACCEPTED_DOTS);
-        byte_u64_table!(BLOB_ACCEPTANCE_MARKERS);
-        byte_u64_table!(PUBLISHER_HIGH_WATER);
-        byte_u64_table!(CAUSAL_FRONTIER);
-        for row in read
-            .open_table(BLOB_DEPOT_METADATA)
-            .expect("Blob depot digest metadata")
-            .iter()
-            .expect("Blob depot digest rows")
-        {
-            let (key, value) = row.expect("Blob depot digest row");
-            digest.update(key.value().as_bytes());
-            digest.update(value.value().to_be_bytes());
-        }
-        for row in read
-            .open_table(BLOB_NETWORK_METADATA)
-            .expect("Blob digest network metadata")
-            .iter()
-            .expect("Blob digest network rows")
-        {
-            let (key, value) = row.expect("Blob digest network row");
-            digest.update(key.value().as_bytes());
-            digest.update(value.value().to_be_bytes());
-        }
-        for field in blob_global_metadata_fields() {
-            digest.update(field.as_bytes());
-            digest.update(
-                read.open_table(METADATA)
-                    .expect("Blob digest global metadata")
-                    .get(field)
-                    .expect("Blob digest global read")
-                    .map_or(u64::MAX, |value| value.value())
-                    .to_be_bytes(),
-            );
-        }
-        digest.finalize().into()
+        blob_database_digest_read_for_test(read)
     }
-
     fn blob_current_admission_digest(store: &Store) -> [u8; 32] {
         let read = store
             .database
@@ -20915,103 +23275,8 @@ mod tests {
     }
 
     fn blob_current_admission_digest_read(read: &redb::ReadTransaction) -> [u8; 32] {
-        let application_digest = blob_database_digest_read(read);
-        let mut digest = Sha256::new();
-        digest.update(application_digest);
-        for row in read
-            .open_table(BLOB_ACCEPTANCE_ORDER)
-            .expect("Blob acceptance-order table")
-            .iter()
-            .expect("Blob acceptance-order rows")
-        {
-            let (key, value) = row.expect("Blob acceptance-order row");
-            digest.update(key.value().to_be_bytes());
-            digest.update(value.value());
-        }
-        for definition in [
-            lifecycle::BLOB_VARIANT_REFERENCES,
-            lifecycle::BLOB_LINEAGE_FENCES,
-            lifecycle::BLOB_REPLAY_FENCES,
-            pressure::BLOB_PRESSURE_PUBLICATION_ROOTS,
-            pressure::BLOB_PRESSURE_PENDING_ROOTS,
-            pressure::BLOB_PRESSURE_VARIANT_SUMMARIES,
-            pressure::BLOB_PRESSURE_PUBLICATIONS,
-            pressure::BLOB_PRESSURE_CONTENT_PUBLICATIONS,
-        ] {
-            for row in read
-                .open_table(definition)
-                .expect("Blob lifecycle bytes table")
-                .iter()
-                .expect("Blob lifecycle bytes rows")
-            {
-                let (key, value) = row.expect("Blob lifecycle bytes row");
-                digest.update(
-                    u64::try_from(key.value().len())
-                        .expect("Blob lifecycle key length")
-                        .to_be_bytes(),
-                );
-                digest.update(key.value());
-                digest.update(
-                    u64::try_from(value.value().len())
-                        .expect("Blob lifecycle value length")
-                        .to_be_bytes(),
-                );
-                digest.update(value.value());
-            }
-        }
-        for row in read
-            .open_table(pressure::BLOB_PRESSURE_PENDING_SOURCES)
-            .expect("Blob pressure pending index")
-            .iter()
-            .expect("Blob pressure pending rows")
-        {
-            let (key, value) = row.expect("Blob pressure pending row");
-            digest.update(key.value());
-            digest.update(value.value());
-        }
-        for row in read
-            .open_table(pressure::BLOB_PRESSURE_VARIANTS)
-            .expect("Blob pressure variant index")
-            .iter()
-            .expect("Blob pressure variant rows")
-        {
-            let (key, value) = row.expect("Blob pressure variant row");
-            digest.update(key.value());
-            digest.update(value.value());
-        }
-        for row in read
-            .open_table(lifecycle::BLOB_LIFECYCLE_METADATA)
-            .expect("Blob lifecycle metadata table")
-            .iter()
-            .expect("Blob lifecycle metadata rows")
-        {
-            let (key, value) = row.expect("Blob lifecycle metadata row");
-            digest.update(key.value().as_bytes());
-            digest.update(value.value().to_be_bytes());
-        }
-        for row in read
-            .open_table(pressure::BLOB_PRESSURE_METADATA)
-            .expect("Blob pressure metadata table")
-            .iter()
-            .expect("Blob pressure metadata rows")
-        {
-            let (key, value) = row.expect("Blob pressure metadata row");
-            digest.update(key.value().as_bytes());
-            digest.update(value.value().to_be_bytes());
-        }
-        for row in read
-            .open_table(lifecycle::BLOB_MAINTENANCE_CURSORS)
-            .expect("Blob lifecycle cursor table")
-            .iter()
-            .expect("Blob lifecycle cursor rows")
-        {
-            let (key, value) = row.expect("Blob lifecycle cursor row");
-            digest.update([key.value()]);
-            digest.update(value.value());
-        }
-        digest.finalize().into()
+        blob_current_admission_digest_read_for_test(read, true)
     }
-
     fn blob_lifecycle_tables_present(path: &Path) -> BTreeSet<String> {
         let database = redb::Builder::new()
             .open_read_only(path)
@@ -25498,6 +27763,18 @@ mod tests {
             write
                 .delete_table(pressure::BLOB_PRESSURE_REANCHOR_CURSORS)
                 .expect("pressure reanchor cursors");
+            for table in [
+                pressure::BLOB_PRESSURE_DURABLE_PUBLICATIONS,
+                pressure::BLOB_PRESSURE_DURABLE_CONTENT_PUBLICATIONS,
+            ] {
+                write.delete_table(table).expect("durable pressure table");
+            }
+            write
+                .delete_table(pressure::BLOB_PRESSURE_DURABLE_PENDING_SOURCES)
+                .expect("durable pending pressure index");
+            write
+                .delete_table(pressure::BLOB_PRESSURE_DURABLE_VARIANTS)
+                .expect("durable variant pressure index");
             write
                 .delete_table(BLOB_ACCEPTANCE_ORDER)
                 .expect("acceptance order");
@@ -35332,192 +37609,652 @@ mod tests {
         digest.finalize().into()
     }
 
+    #[test]
+    fn blob_contact_eligibility_binds_exact_finite_profile_provenance() {
+        let finite = |provenance| BlobLifetime::Finite {
+            ttl_ms: 60_000,
+            age: custody::LowerBoundAgeCheckpoint {
+                cumulative_age_ms: 1,
+                checkpoint: Some(CustodySample {
+                    clock_id: [0x5a; 16],
+                    tick_ms: 10,
+                }),
+                continuity_generation: 1,
+                continuity_lost: false,
+            },
+            provenance,
+        };
+        let cases = [
+            ("durable", BlobLifetime::Durable, true, true),
+            (
+                "local-finite",
+                finite(BlobFiniteProvenance::Local),
+                false,
+                true,
+            ),
+            (
+                "v8-custody",
+                finite(BlobFiniteProvenance::NetworkV1 {
+                    semantic_version: 8,
+                    profile_id: aster_mesh::TransferProfileId::BlobCustodyV1 as u16,
+                }),
+                false,
+                true,
+            ),
+            (
+                "v8-legacy",
+                finite(BlobFiniteProvenance::NetworkV1 {
+                    semantic_version: 8,
+                    profile_id: aster_mesh::TransferProfileId::LegacyV6 as u16,
+                }),
+                false,
+                false,
+            ),
+            (
+                "v7-custody-profile-number",
+                finite(BlobFiniteProvenance::NetworkV1 {
+                    semantic_version: 7,
+                    profile_id: aster_mesh::TransferProfileId::BlobCustodyV1 as u16,
+                }),
+                false,
+                false,
+            ),
+            (
+                "future-version-custody-profile-number",
+                finite(BlobFiniteProvenance::NetworkV1 {
+                    semantic_version: 9,
+                    profile_id: aster_mesh::TransferProfileId::BlobCustodyV1 as u16,
+                }),
+                false,
+                false,
+            ),
+        ];
+
+        for (label, lifetime, durable, custody_v1) in cases {
+            assert_eq!(
+                BlobContactEligibility::DurableOnly.admits(lifetime),
+                durable,
+                "{label}: legacy contact eligibility"
+            );
+            assert_eq!(
+                BlobContactEligibility::CustodyV1.admits(lifetime),
+                custody_v1,
+                "{label}: custody contact eligibility"
+            );
+        }
+    }
+
+    #[test]
+    fn blob_durable_contact_omits_finite_before_inventory_and_pending_ordering() {
+        // Mutation caught: filtering finite roots after reconciliation or
+        // lexicographic pending selection would either disclose them or let a
+        // lower finite identity starve otherwise eligible durable work.
+        let source_root = BlobTestRoot::new("durable-contact-source");
+        let target_root = BlobTestRoot::new("durable-contact-target");
+        let mut services = blob_services(0x5a);
+        let mut pending_services = blob_services_with_nodes(0x5a, 3, 4);
+        assert_eq!(services.authority, pending_services.authority);
+        let source = Store::open_for_mission(&source_root.database, services.authority)
+            .expect("durable-contact source store");
+        let target = Store::open_for_mission(&target_root.database, services.authority)
+            .expect("durable-contact target store");
+        let checkpoint = CustodySample {
+            clock_id: [0x5b; 16],
+            tick_ms: 10_000,
+        };
+
+        let finite_live_plaintext = b"finite live omitted from durable contact".to_vec();
+        let finite_live_prepared = prepared_blob(&finite_live_plaintext);
+        let (finite_live, finite_live_operation, _) = publish_blob(
+            &target,
+            &mut services,
+            &finite_live_prepared,
+            &finite_live_plaintext,
+            1,
+            b"durable-contact-finite-live",
+        );
+        rewrite_live_blob_as_finite_for_retirement_test(
+            &target,
+            &finite_live,
+            Some(&finite_live_operation),
+            50_000,
+            100,
+            checkpoint,
+        );
+
+        let durable_reclaim_plaintext = b"durable contact pressure victim".to_vec();
+        let durable_reclaim_prepared = prepared_blob(&durable_reclaim_plaintext);
+        let (durable_reclaim, _, _) = publish_blob(
+            &target,
+            &mut services,
+            &durable_reclaim_prepared,
+            &durable_reclaim_plaintext,
+            1,
+            b"durable-contact-pressure-victim",
+        );
+        let (durable_shared, _, _) = publish_blob(
+            &target,
+            &mut services,
+            &finite_live_prepared,
+            &finite_live_plaintext,
+            1,
+            b"durable-contact-shared-finite-variant",
+        );
+        assert_eq!(durable_shared.variant_id, finite_live.variant_id);
+
+        let durable_live_plaintext = b"durable live remains contact eligible".to_vec();
+        let durable_live_prepared = prepared_blob(&durable_live_plaintext);
+        let (durable_live, _, _) = publish_blob(
+            &target,
+            &mut services,
+            &durable_live_prepared,
+            &durable_live_plaintext,
+            1,
+            b"durable-contact-durable-live",
+        );
+
+        let read = target
+            .database
+            .begin_read()
+            .expect("durable variant selection read");
+        let variant_selection = pressure::select_durable_pressure_candidate_read(
+            &read,
+            pressure::BlobCapacityRecoveryDemand::new(
+                pressure::BlobCapacityPartition::DepotVariants,
+                Priority::Flash,
+                1,
+            )
+            .expect("durable variant selection demand"),
+            pressure::BlobPressureRecoveryBudget::new(
+                MAX_BLOB_PRESSURE_FINAL_ROOT_ROWS,
+                MAX_BLOB_PRESSURE_FINAL_ROOT_BYTES,
+                8,
+                8,
+                1,
+            )
+            .expect("durable variant selection budget"),
+        )
+        .expect("durable variant selection");
+        assert_eq!(
+            variant_selection.candidate(),
+            Some(pressure::PressureCandidate::Variant(
+                durable_reclaim.variant_id
+            )),
+            "mixed finite/durable variants must be omitted before variant ordering"
+        );
+        drop(read);
+
+        let finite_pending_plaintext = b"finite pending omitted before ordering".to_vec();
+        let finite_pending_prepared = prepared_blob(&finite_pending_plaintext);
+        let finite_pending_proof = prepare_blob_proof_with_lifetime(
+            &source,
+            &mut pending_services,
+            &finite_pending_prepared,
+            &finite_pending_plaintext,
+            1,
+            Priority::Immediate,
+            Some(50_000),
+        );
+        // Advance the source publisher frontier after sealing the finite
+        // source so the independently staged durable source receives a later
+        // causal dot. The target never observes this filler publication.
+        let source_frontier_plaintext = b"durable-contact source frontier".to_vec();
+        let source_frontier_prepared = prepared_blob(&source_frontier_plaintext);
+        publish_blob(
+            &source,
+            &mut pending_services,
+            &source_frontier_prepared,
+            &source_frontier_plaintext,
+            1,
+            b"durable-contact-source-frontier",
+        );
+        let finite_pending_plan = finite_pending_proof
+            .blob
+            .transfer_plan(&finite_pending_proof.manifest_bytes)
+            .expect("finite pending plan");
+        let finite_pending = BlobTransferId::new(finite_pending_proof.blob.envelope_id());
+        let policy = target
+            .control_policy_snapshot()
+            .expect("durable-contact target policy");
+        assert_eq!(
+            target
+                .test_stage_verified_finite_blob_source_with_policy(
+                    &policy,
+                    &finite_pending_proof.blob,
+                    &finite_pending_proof.sealed,
+                    &finite_pending_plan,
+                    100,
+                    checkpoint,
+                )
+                .expect("stage finite pending source"),
+            BlobSourceStageOutcome::Inserted
+        );
+
+        let durable_pending_plaintext = b"durable pending must not be starved".to_vec();
+        let durable_pending_prepared = prepared_blob(&durable_pending_plaintext);
+        let durable_pending_proof = prepare_blob_proof(
+            &source,
+            &mut pending_services,
+            &durable_pending_prepared,
+            &durable_pending_plaintext,
+            1,
+        );
+        let durable_pending_plan = durable_pending_proof
+            .blob
+            .transfer_plan(&durable_pending_proof.manifest_bytes)
+            .expect("durable pending plan");
+        let durable_pending = BlobTransferId::new(durable_pending_proof.blob.envelope_id());
+        let before = blob_complete_logical_digest(&target);
+        assert!(matches!(
+            target.test_stage_verified_finite_blob_source_with_policy(
+                &policy,
+                &durable_pending_proof.blob,
+                &durable_pending_proof.sealed,
+                &durable_pending_plan,
+                100,
+                checkpoint,
+            ),
+            Err(StoreError::Blob(BlobStoreError::InvalidPublication(
+                "finite Blob fixture source is missing its signed TTL"
+            )))
+        ));
+        assert_eq!(blob_complete_logical_digest(&target), before);
+        assert_eq!(
+            target
+                .stage_verified_blob_source_with_lifetime(
+                    &policy,
+                    &durable_pending_proof.blob,
+                    &durable_pending_proof.sealed,
+                    &durable_pending_plan,
+                    None,
+                )
+                .expect("stage durable pending source"),
+            BlobSourceStageOutcome::Inserted
+        );
+
+        let finite_live_before_recovery = target
+            .get_blob(finite_live.transfer_id)
+            .expect("finite completed recovery lookup")
+            .expect("finite completed recovery source");
+        let finite_live_projection_before_recovery = target
+            .blob_source_projection(finite_live.transfer_id)
+            .expect("finite completed recovery projection")
+            .expect("finite completed recovery projection exists");
+        let finite_pending_before_recovery = target
+            .blob_source_projection(finite_pending)
+            .expect("finite pending recovery projection")
+            .expect("finite pending recovery projection exists");
+        let recovery = target
+            .run_durable_blob_pressure_recovery_after_cleanup(
+                &StoreError::ItemLimitExceeded {
+                    current: 1,
+                    limit: 1,
+                },
+                Priority::Flash,
+                None,
+                (0, 0),
+                BlobMaintenanceBudget::new(
+                    MAX_BLOB_PRESSURE_FINAL_ROOT_ROWS,
+                    8,
+                    MAX_BLOB_PRESSURE_FINAL_ROOT_BYTES,
+                )
+                .expect("durable contact recovery budget"),
+                Some(CustodySample {
+                    clock_id: checkpoint.clock_id,
+                    tick_ms: checkpoint.tick_ms + 1,
+                }),
+            )
+            .expect("durable contact pressure recovery")
+            .expect("typed capacity demand");
+        assert!(recovery.deficit_met());
+        assert_eq!(
+            recovery.evicted_transfer_ids(),
+            &[durable_reclaim.transfer_id],
+            "finite-first ordering must not hide the next eligible durable candidate"
+        );
+        assert_eq!(
+            target
+                .get_blob(finite_live.transfer_id)
+                .expect("finite completed after durable recovery")
+                .expect("finite completed remains after durable recovery"),
+            finite_live_before_recovery,
+        );
+        assert_eq!(
+            target
+                .blob_source_projection(finite_live.transfer_id)
+                .expect("finite completed projection after durable recovery")
+                .expect("finite completed projection remains after durable recovery"),
+            finite_live_projection_before_recovery,
+        );
+        assert_eq!(
+            target
+                .blob_source_projection(finite_pending)
+                .expect("finite pending projection after durable recovery")
+                .expect("finite pending remains after durable recovery"),
+            finite_pending_before_recovery,
+        );
+
+        let before = blob_complete_logical_digest(&target);
+        assert!(
+            target
+                .durable_blob_source_projection(finite_live.transfer_id)
+                .expect("finite durable-only exact projection")
+                .is_none()
+        );
+        assert_eq!(
+            target
+                .durable_blob_source_projection(durable_live.transfer_id)
+                .expect("durable exact projection")
+                .expect("durable completed exact projection")
+                .source
+                .transfer_id,
+            durable_live.transfer_id
+        );
+        let mut durable_retained = Vec::new();
+        target
+            .visit_durable_retained_blob_sources(Some(&policy), |item| {
+                durable_retained.push((item.source.transfer_id, item.retention));
+            })
+            .expect("durable retained visitor");
+        let mut expected_durable_retained = vec![
+            (
+                durable_shared.transfer_id,
+                BlobSourceRetention::Completed {
+                    acceptance_marker: durable_shared.acceptance_marker,
+                },
+            ),
+            (
+                durable_live.transfer_id,
+                BlobSourceRetention::Completed {
+                    acceptance_marker: durable_live.acceptance_marker,
+                },
+            ),
+            (durable_pending, BlobSourceRetention::Pending),
+        ];
+        expected_durable_retained.sort_unstable_by_key(|(source, _)| *source);
+        assert_eq!(durable_retained, expected_durable_retained);
+        let mut durable_pending_visited = Vec::new();
+        target
+            .visit_durable_pending_blob_sources(Some(&policy), |source| {
+                durable_pending_visited.push(source.transfer_id);
+            })
+            .expect("durable pending visitor");
+        assert_eq!(durable_pending_visited, vec![durable_pending]);
+        let mut completed_inventory = Vec::new();
+        target
+            .visit_retained_blob_sources_with_eligibility(
+                Some(&policy),
+                BlobContactEligibility::DurableOnly,
+                |item| {
+                    if matches!(item.retention, BlobSourceRetention::Completed { .. }) {
+                        completed_inventory.push(item.source.transfer_id);
+                    }
+                },
+            )
+            .expect("durable completed inventory");
+        let mut expected_completed_inventory =
+            vec![durable_shared.transfer_id, durable_live.transfer_id];
+        expected_completed_inventory.sort_unstable();
+        assert_eq!(completed_inventory, expected_completed_inventory);
+        let mut pending_inventory = Vec::new();
+        target
+            .visit_pending_blob_sources_with_eligibility(
+                Some(&policy),
+                BlobContactEligibility::DurableOnly,
+                |projection| pending_inventory.push(projection.transfer_id),
+            )
+            .expect("durable pending inventory");
+        assert_eq!(pending_inventory, vec![durable_pending]);
+        assert_eq!(
+            target
+                .pending_blob_transfer_progress_with_eligibility(
+                    &policy,
+                    BlobContactEligibility::DurableOnly,
+                )
+                .expect("durable pending progress")
+                .pending
+                .iter()
+                .map(|progress| progress.source.transfer_id)
+                .collect::<Vec<_>>(),
+            vec![durable_pending]
+        );
+        let after = (finite_pending > durable_pending).then_some(durable_pending);
+        assert_eq!(
+            target
+                .next_durable_pending_blob_source_with_policy(&policy, after)
+                .expect("next durable pending source")
+                .map(|projection| projection.transfer_id),
+            Some(durable_pending),
+            "finite ordering must not consume the one selected contact slot"
+        );
+        assert_eq!(
+            blob_complete_logical_digest(&target),
+            before,
+            "durable-contact filtering must not repair, checkpoint, or mutate finite authority"
+        );
+
+        let finite_carriers = blob_test_carriers(&source, &finite_pending_plan);
+        let (finite_object, finite_bytes) = &finite_carriers[0];
+        let finite_total = u64::try_from(finite_bytes.len()).expect("finite carrier length");
+        assert_durable_contact_rejects_without_mutation(&target, || {
+            target.durable_pending_blob_carrier_work_with_policy(
+                &policy,
+                finite_pending,
+                &finite_pending_plan,
+            )
+        });
+        assert_durable_contact_rejects_without_mutation(&target, || {
+            target.append_durable_blob_carrier_prefix_with_policy(
+                &policy,
+                finite_pending,
+                *finite_object,
+                finite_total,
+                0,
+                &finite_bytes[..finite_bytes.len().min(MAX_BLOB_NETWORK_RANGE_BYTES)],
+            )
+        });
+
+        for (object, bytes) in &finite_carriers {
+            let total = u64::try_from(bytes.len()).expect("finite carrier total");
+            for (index, range) in bytes.chunks(MAX_BLOB_NETWORK_RANGE_BYTES).enumerate() {
+                target
+                    .append_blob_carrier_prefix_with_policy(
+                        &policy,
+                        finite_pending,
+                        *object,
+                        total,
+                        u64::try_from(index * MAX_BLOB_NETWORK_RANGE_BYTES)
+                            .expect("finite carrier offset"),
+                        range,
+                    )
+                    .expect("stage finite carrier outside legacy contact");
+            }
+            assert_durable_contact_rejects_without_mutation(&target, || {
+                target.commit_complete_durable_blob_carrier_with_policy(
+                    &policy,
+                    finite_pending,
+                    *object,
+                    &finite_pending_plan,
+                )
+            });
+            target
+                .commit_complete_blob_carrier_with_policy(
+                    &policy,
+                    finite_pending,
+                    *object,
+                    &finite_pending_plan,
+                )
+                .expect("commit finite carrier outside legacy contact");
+        }
+        assert_durable_contact_rejects_without_mutation(&target, || {
+            target.completed_durable_pending_blob_with_policy(
+                &policy,
+                finite_pending,
+                &finite_pending_proof.blob,
+                &finite_pending_proof.manifest_bytes,
+                &finite_pending_plan,
+            )
+        });
+        let finite_completion = target
+            .completed_pending_blob_with_policy(
+                &policy,
+                finite_pending,
+                &finite_pending_proof.blob,
+                &finite_pending_proof.manifest_bytes,
+                &finite_pending_plan,
+            )
+            .expect("complete finite source outside legacy contact");
+        let finite_content_completion = {
+            let depot = target
+                .blob_depot_for_authenticated_read(&finite_completion)
+                .expect("finite authenticated depot");
+            let mut service = pending_services
+                .reader
+                .blob_service_with_store(&blob_scope(), &blob_topic(), 1, depot)
+                .expect("finite content verifier");
+            service
+                .verify_blob_content_completion(
+                    &finite_pending_proof.blob,
+                    &finite_pending_proof.manifest_bytes,
+                )
+                .expect("finite content completion")
+        };
+        let finite_lineage = pending_services
+            .reader
+            .verify_current_blob_lineage(&finite_pending_proof.blob)
+            .expect("finite current lineage");
+        assert_durable_contact_rejects_without_mutation(&target, || {
+            target.apply_verified_durable_blob_with_policy(
+                &policy,
+                &finite_pending_plan,
+                &finite_lineage,
+                &finite_completion,
+                &finite_content_completion,
+            )
+        });
+        target
+            .apply_verified_blob_with_policy(
+                &policy,
+                &finite_pending_plan,
+                &finite_lineage,
+                &finite_completion,
+                &finite_content_completion,
+            )
+            .expect("promote finite source outside legacy contact");
+        assert_durable_contact_rejects_without_mutation(&target, || {
+            target.read_completed_durable_blob_carrier_range_with_policy(
+                &policy,
+                &finite_completion,
+                &finite_lineage,
+                finite_pending,
+                *finite_object,
+                0,
+                finite_bytes.len().min(MAX_BLOB_NETWORK_RANGE_BYTES),
+                &finite_pending_plan,
+            )
+        });
+
+        // Mutation caught: applying the finite gate to the whole Blob lane
+        // would regress the historical durable carrier and promotion path.
+        let durable_carriers = blob_test_carriers(&source, &durable_pending_plan);
+        assert_eq!(
+            target
+                .durable_pending_blob_carrier_work_with_policy(
+                    &policy,
+                    durable_pending,
+                    &durable_pending_plan,
+                )
+                .expect("durable carrier work")
+                .len(),
+            durable_carriers.len()
+        );
+        for (object, bytes) in &durable_carriers {
+            let total = u64::try_from(bytes.len()).expect("durable carrier total");
+            for (index, range) in bytes.chunks(MAX_BLOB_NETWORK_RANGE_BYTES).enumerate() {
+                target
+                    .append_durable_blob_carrier_prefix_with_policy(
+                        &policy,
+                        durable_pending,
+                        *object,
+                        total,
+                        u64::try_from(index * MAX_BLOB_NETWORK_RANGE_BYTES)
+                            .expect("durable carrier offset"),
+                        range,
+                    )
+                    .expect("append durable carrier");
+            }
+            target
+                .commit_complete_durable_blob_carrier_with_policy(
+                    &policy,
+                    durable_pending,
+                    *object,
+                    &durable_pending_plan,
+                )
+                .expect("commit durable carrier");
+        }
+        let durable_completion = target
+            .completed_durable_pending_blob_with_policy(
+                &policy,
+                durable_pending,
+                &durable_pending_proof.blob,
+                &durable_pending_proof.manifest_bytes,
+                &durable_pending_plan,
+            )
+            .expect("complete durable source");
+        let durable_content_completion = {
+            let depot = target
+                .blob_depot_for_authenticated_read(&durable_completion)
+                .expect("durable authenticated depot");
+            let mut service = pending_services
+                .reader
+                .blob_service_with_store(&blob_scope(), &blob_topic(), 1, depot)
+                .expect("durable content verifier");
+            service
+                .verify_blob_content_completion(
+                    &durable_pending_proof.blob,
+                    &durable_pending_proof.manifest_bytes,
+                )
+                .expect("durable content completion")
+        };
+        let durable_lineage = pending_services
+            .reader
+            .verify_current_blob_lineage(&durable_pending_proof.blob)
+            .expect("durable current lineage");
+        target
+            .apply_verified_durable_blob_with_policy(
+                &policy,
+                &durable_pending_plan,
+                &durable_lineage,
+                &durable_completion,
+                &durable_content_completion,
+            )
+            .expect("promote durable source");
+        let (durable_object, durable_bytes) = &durable_carriers[0];
+        assert_eq!(
+            target
+                .read_completed_durable_blob_carrier_range_with_policy(
+                    &policy,
+                    &durable_completion,
+                    &durable_lineage,
+                    durable_pending,
+                    *durable_object,
+                    0,
+                    durable_bytes.len().min(MAX_BLOB_NETWORK_RANGE_BYTES),
+                    &durable_pending_plan,
+                )
+                .expect("read durable carrier range")
+                .expect("durable carrier range present")
+                .1,
+            durable_bytes[..durable_bytes.len().min(MAX_BLOB_NETWORK_RANGE_BYTES)]
+        );
+    }
+
     fn blob_complete_logical_digest(store: &Store) -> [u8; 32] {
-        blob_complete_logical_digest_with_options(store, false)
+        blob_complete_logical_digest_for_test(store, false, false)
     }
 
     fn blob_complete_logical_digest_without_deletion_turn(store: &Store) -> [u8; 32] {
-        blob_complete_logical_digest_with_options(store, true)
-    }
-
-    fn blob_complete_logical_digest_with_options(
-        store: &Store,
-        exclude_deletion_turn: bool,
-    ) -> [u8; 32] {
-        fn field(digest: &mut Sha256, label: &[u8], key: &[u8], value: &[u8]) {
-            for bytes in [label, key, value] {
-                digest.update(
-                    u64::try_from(bytes.len())
-                        .expect("complete Blob digest field length")
-                        .to_be_bytes(),
-                );
-                digest.update(bytes);
-            }
-        }
-
-        let read = store
-            .database
-            .begin_read()
-            .expect("complete Blob logical digest read");
-        let mut digest = Sha256::new();
-        field(
-            &mut digest,
-            b"base-blob-state",
-            b"",
-            &blob_database_digest_read(&read),
-        );
-        for key in [
-            BLOB_SUBSCRIPTION_COUNT,
-            BLOB_PENDING_DELIVERY_COUNT,
-            BLOB_ACKNOWLEDGEMENT_COUNT,
-            BLOB_DELIVERY_CURSOR_COUNT,
-            BLOB_SELECTOR_GENERATION,
-            BLOB_RETIREMENT_DELIVERY_COUNT,
-            BLOB_RETIREMENT_DELIVERY_ORDER_COUNT,
-            BLOB_RETIREMENT_ACKNOWLEDGEMENT_COUNT,
-            BLOB_RETIREMENT_DELIVERY_OWNER_COUNT,
-        ] {
-            let value = read
-                .open_table(METADATA)
-                .expect("complete Blob global metadata")
-                .get(key)
-                .expect("complete Blob global metadata read")
-                .map_or(u64::MAX, |value| value.value());
-            field(
-                &mut digest,
-                b"subscription-metadata",
-                key.as_bytes(),
-                &value.to_be_bytes(),
-            );
-        }
-        for (label, definition) in [(b"acceptance-order".as_slice(), BLOB_ACCEPTANCE_ORDER)] {
-            for row in read
-                .open_table(definition)
-                .expect("complete Blob u64/bytes table")
-                .iter()
-                .expect("complete Blob u64/bytes rows")
-            {
-                let (key, value) = row.expect("complete Blob u64/bytes row");
-                field(
-                    &mut digest,
-                    label,
-                    &key.value().to_be_bytes(),
-                    value.value(),
-                );
-            }
-        }
-        for (label, definition) in [
-            (b"subscriptions".as_slice(), BLOB_SUBSCRIPTIONS),
-            (
-                b"subscription-pending".as_slice(),
-                BLOB_SUBSCRIPTION_PENDING,
-            ),
-            (
-                b"delivery-acknowledgements".as_slice(),
-                BLOB_DELIVERY_ACKNOWLEDGEMENTS,
-            ),
-            (b"delivery-cursors".as_slice(), BLOB_DELIVERY_CURSORS),
-            (
-                b"retirement-deliveries".as_slice(),
-                BLOB_RETIREMENT_DELIVERIES,
-            ),
-            (
-                b"retirement-delivery-order".as_slice(),
-                BLOB_RETIREMENT_DELIVERY_ORDER,
-            ),
-            (
-                b"retirement-acknowledgements".as_slice(),
-                BLOB_RETIREMENT_ACKNOWLEDGEMENTS,
-            ),
-            (
-                b"retirement-delivery-owners".as_slice(),
-                BLOB_RETIREMENT_DELIVERY_OWNERS,
-            ),
-            (
-                b"variant-references".as_slice(),
-                lifecycle::BLOB_VARIANT_REFERENCES,
-            ),
-            (b"lineage-fences".as_slice(), lifecycle::BLOB_LINEAGE_FENCES),
-            (b"replay-fences".as_slice(), lifecycle::BLOB_REPLAY_FENCES),
-            (
-                b"deletion-manifests".as_slice(),
-                deletion::BLOB_DELETION_MANIFESTS,
-            ),
-            (
-                b"deletion-chunks".as_slice(),
-                deletion::BLOB_DELETION_CHUNKS,
-            ),
-        ] {
-            for row in read
-                .open_table(definition)
-                .expect("complete Blob bytes table")
-                .iter()
-                .expect("complete Blob bytes rows")
-            {
-                let (key, value) = row.expect("complete Blob bytes row");
-                field(&mut digest, label, key.value(), value.value());
-            }
-        }
-        for (label, definition) in [
-            (
-                b"lifecycle-metadata".as_slice(),
-                lifecycle::BLOB_LIFECYCLE_METADATA,
-            ),
-            (
-                b"deletion-metadata".as_slice(),
-                deletion::BLOB_DELETION_METADATA,
-            ),
-        ] {
-            for row in read
-                .open_table(definition)
-                .expect("complete Blob metadata table")
-                .iter()
-                .expect("complete Blob metadata rows")
-            {
-                let (key, value) = row.expect("complete Blob metadata row");
-                if exclude_deletion_turn
-                    && label == b"deletion-metadata"
-                    && key.value() == deletion::BLOB_DELETION_MAINTENANCE_TURN
-                {
-                    continue;
-                }
-                field(
-                    &mut digest,
-                    label,
-                    key.value().as_bytes(),
-                    &value.value().to_be_bytes(),
-                );
-            }
-        }
-        for row in read
-            .open_table(lifecycle::BLOB_MAINTENANCE_CURSORS)
-            .expect("complete Blob maintenance cursors")
-            .iter()
-            .expect("complete Blob maintenance cursor rows")
-        {
-            let (key, value) = row.expect("complete Blob maintenance cursor row");
-            field(
-                &mut digest,
-                b"maintenance-cursors",
-                &[key.value()],
-                value.value(),
-            );
-        }
-        for row in read
-            .open_table(deletion::BLOB_DELETION_CONTINUITY)
-            .expect("complete Blob deletion continuity")
-            .iter()
-            .expect("complete Blob deletion continuity rows")
-        {
-            let (key, value) = row.expect("complete Blob deletion continuity row");
-            field(
-                &mut digest,
-                b"deletion-continuity",
-                &[key.value()],
-                value.value(),
-            );
-        }
-        digest.finalize().into()
+        blob_complete_logical_digest_for_test(store, true, false)
     }
 
     fn blob_finalization_transaction_digest(store: &Store) -> [u8; 32] {
@@ -40101,6 +42838,15 @@ mod tests {
             .expect("read pressure database");
         let read = database.begin_read().expect("pressure digest read");
         let mut digest = Sha256::new();
+        let tables = read
+            .list_tables()
+            .expect("pressure digest table names")
+            .map(|table| table.name().to_owned())
+            .collect::<BTreeSet<_>>();
+        for table in pressure::pressure_table_names_for_test() {
+            digest.update(table.as_bytes());
+            digest.update([u8::from(tables.contains(table))]);
+        }
         for table in [
             pressure::BLOB_PRESSURE_PUBLICATION_ROOTS,
             pressure::BLOB_PRESSURE_PENDING_ROOTS,
@@ -40108,48 +42854,235 @@ mod tests {
             pressure::BLOB_PRESSURE_PUBLICATIONS,
             pressure::BLOB_PRESSURE_CONTENT_PUBLICATIONS,
         ] {
+            if tables.contains(table.name()) {
+                for row in read
+                    .open_table(table)
+                    .expect("pressure digest table")
+                    .iter()
+                    .expect("pressure digest rows")
+                {
+                    let (key, value) = row.expect("pressure digest row");
+                    digest.update(key.value());
+                    digest.update(value.value());
+                }
+            }
+        }
+        if tables.contains(pressure::BLOB_PRESSURE_PENDING_SOURCES.name()) {
             for row in read
-                .open_table(table)
-                .expect("pressure digest table")
+                .open_table(pressure::BLOB_PRESSURE_PENDING_SOURCES)
+                .expect("pending pressure digest table")
                 .iter()
-                .expect("pressure digest rows")
+                .expect("pending pressure digest rows")
             {
-                let (key, value) = row.expect("pressure digest row");
+                let (key, value) = row.expect("pending pressure digest row");
                 digest.update(key.value());
                 digest.update(value.value());
             }
         }
-        for row in read
-            .open_table(pressure::BLOB_PRESSURE_PENDING_SOURCES)
-            .expect("pending pressure digest table")
-            .iter()
-            .expect("pending pressure digest rows")
-        {
-            let (key, value) = row.expect("pending pressure digest row");
-            digest.update(key.value());
-            digest.update(value.value());
+        if tables.contains(pressure::BLOB_PRESSURE_VARIANTS.name()) {
+            for row in read
+                .open_table(pressure::BLOB_PRESSURE_VARIANTS)
+                .expect("variant pressure digest table")
+                .iter()
+                .expect("variant pressure digest rows")
+            {
+                let (key, value) = row.expect("variant pressure digest row");
+                digest.update(key.value());
+                digest.update(value.value());
+            }
         }
-        for row in read
-            .open_table(pressure::BLOB_PRESSURE_VARIANTS)
-            .expect("variant pressure digest table")
-            .iter()
-            .expect("variant pressure digest rows")
-        {
-            let (key, value) = row.expect("variant pressure digest row");
-            digest.update(key.value());
-            digest.update(value.value());
+        if tables.contains(pressure::BLOB_PRESSURE_METADATA.name()) {
+            for row in read
+                .open_table(pressure::BLOB_PRESSURE_METADATA)
+                .expect("pressure metadata")
+                .iter()
+                .expect("pressure metadata rows")
+            {
+                let (key, value) = row.expect("pressure metadata row");
+                digest.update(key.value().as_bytes());
+                digest.update(value.value().to_be_bytes());
+            }
         }
-        for row in read
-            .open_table(pressure::BLOB_PRESSURE_METADATA)
-            .expect("pressure metadata")
-            .iter()
-            .expect("pressure metadata rows")
-        {
-            let (key, value) = row.expect("pressure metadata row");
-            digest.update(key.value().as_bytes());
-            digest.update(value.value().to_be_bytes());
+        if tables.contains(pressure::BLOB_PRESSURE_REANCHOR_CURSORS.name()) {
+            for row in read
+                .open_table(pressure::BLOB_PRESSURE_REANCHOR_CURSORS)
+                .expect("pressure reanchor cursor table")
+                .iter()
+                .expect("pressure reanchor cursor rows")
+            {
+                let (key, value) = row.expect("pressure reanchor cursor row");
+                digest.update([key.value()]);
+                digest.update(value.value());
+            }
+        }
+        for table in [
+            pressure::BLOB_PRESSURE_DURABLE_PUBLICATIONS,
+            pressure::BLOB_PRESSURE_DURABLE_CONTENT_PUBLICATIONS,
+        ] {
+            if tables.contains(table.name()) {
+                for row in read
+                    .open_table(table)
+                    .expect("durable pressure digest table")
+                    .iter()
+                    .expect("durable pressure digest rows")
+                {
+                    let (key, value) = row.expect("durable pressure digest row");
+                    digest.update(key.value());
+                    digest.update(value.value());
+                }
+            }
+        }
+        if tables.contains(pressure::BLOB_PRESSURE_DURABLE_PENDING_SOURCES.name()) {
+            for row in read
+                .open_table(pressure::BLOB_PRESSURE_DURABLE_PENDING_SOURCES)
+                .expect("durable pending pressure digest table")
+                .iter()
+                .expect("durable pending pressure digest rows")
+            {
+                let (key, value) = row.expect("durable pending pressure digest row");
+                digest.update(key.value());
+                digest.update(value.value());
+            }
+        }
+        if tables.contains(pressure::BLOB_PRESSURE_DURABLE_VARIANTS.name()) {
+            for row in read
+                .open_table(pressure::BLOB_PRESSURE_DURABLE_VARIANTS)
+                .expect("durable variant pressure digest table")
+                .iter()
+                .expect("durable variant pressure digest rows")
+            {
+                let (key, value) = row.expect("durable variant pressure digest row");
+                digest.update(key.value());
+                digest.update(value.value());
+            }
         }
         digest.finalize().into()
+    }
+
+    fn retain_durable_pressure_tables_for_test(path: &Path, retained: u8) {
+        let database = Database::open(path).expect("raw durable pressure layout database");
+        let write = database
+            .begin_write()
+            .expect("durable pressure layout write");
+        if retained & 0b0001 == 0 {
+            write
+                .delete_table(pressure::BLOB_PRESSURE_DURABLE_PUBLICATIONS)
+                .expect("delete durable publication index");
+        }
+        if retained & 0b0010 == 0 {
+            write
+                .delete_table(pressure::BLOB_PRESSURE_DURABLE_CONTENT_PUBLICATIONS)
+                .expect("delete durable content-publication index");
+        }
+        if retained & 0b0100 == 0 {
+            write
+                .delete_table(pressure::BLOB_PRESSURE_DURABLE_PENDING_SOURCES)
+                .expect("delete durable pending-source index");
+        }
+        if retained & 0b1000 == 0 {
+            write
+                .delete_table(pressure::BLOB_PRESSURE_DURABLE_VARIANTS)
+                .expect("delete durable variant index");
+        }
+        write.commit().expect("commit durable pressure layout");
+    }
+
+    fn rewrite_pressure_v5_as_pre_task5_for_test(path: &Path) {
+        const FINITE_ROOT_MASK: u64 = 1 << 63;
+
+        let database = Database::open(path).expect("raw pre-Task-5 pressure-v5 database");
+        let write = database
+            .begin_write()
+            .expect("pre-Task-5 pressure-v5 write");
+
+        let summaries = {
+            let table = write
+                .open_table(pressure::BLOB_PRESSURE_VARIANT_SUMMARIES)
+                .expect("current pressure variant summaries");
+            table
+                .iter()
+                .expect("current pressure variant summary rows")
+                .map(|row| {
+                    let (key, value) = row.expect("current pressure variant summary row");
+                    let mut value = value.value().to_vec();
+                    let encoded_roots = u64::from_be_bytes(
+                        value[27..35]
+                            .try_into()
+                            .expect("pressure variant summary root count"),
+                    );
+                    value[27..35]
+                        .copy_from_slice(&(encoded_roots & !FINITE_ROOT_MASK).to_be_bytes());
+                    (key.value().to_vec(), value)
+                })
+                .collect::<Vec<_>>()
+        };
+        {
+            let mut table = write
+                .open_table(pressure::BLOB_PRESSURE_VARIANT_SUMMARIES)
+                .expect("pre-Task-5 pressure variant summaries");
+            for (key, value) in summaries {
+                table
+                    .insert(key.as_slice(), value.as_slice())
+                    .expect("rewrite raw pre-Task-5 variant summary");
+            }
+        }
+
+        let variants = {
+            let table = write
+                .open_table(pressure::BLOB_PRESSURE_VARIANTS)
+                .expect("current pressure variants");
+            table
+                .iter()
+                .expect("current pressure variant rows")
+                .map(|row| {
+                    let (key, value) = row.expect("current pressure variant row");
+                    let mut key = key.value();
+                    let encoded_roots = u64::from_be_bytes(
+                        key[68..76]
+                            .try_into()
+                            .expect("pressure variant index root count"),
+                    );
+                    key[68..76].copy_from_slice(&(encoded_roots & !FINITE_ROOT_MASK).to_be_bytes());
+                    (key, value.value().to_vec())
+                })
+                .collect::<Vec<_>>()
+        };
+        {
+            let mut table = write
+                .open_table(pressure::BLOB_PRESSURE_VARIANTS)
+                .expect("pre-Task-5 pressure variants");
+            let keys = table
+                .iter()
+                .expect("pre-Task-5 pressure variant keys")
+                .map(|row| row.expect("pre-Task-5 pressure variant key").0.value())
+                .collect::<Vec<_>>();
+            for key in keys {
+                table
+                    .remove(&key)
+                    .expect("remove current pressure variant index");
+            }
+            for (key, value) in variants {
+                table
+                    .insert(&key, value.as_slice())
+                    .expect("insert raw pre-Task-5 pressure variant index");
+            }
+        }
+
+        write
+            .delete_table(pressure::BLOB_PRESSURE_DURABLE_PUBLICATIONS)
+            .expect("delete pre-Task-5 durable publication index");
+        write
+            .delete_table(pressure::BLOB_PRESSURE_DURABLE_CONTENT_PUBLICATIONS)
+            .expect("delete pre-Task-5 durable content-publication index");
+        write
+            .delete_table(pressure::BLOB_PRESSURE_DURABLE_PENDING_SOURCES)
+            .expect("delete pre-Task-5 durable pending-source index");
+        write
+            .delete_table(pressure::BLOB_PRESSURE_DURABLE_VARIANTS)
+            .expect("delete pre-Task-5 durable variant index");
+        write
+            .commit()
+            .expect("commit genuine pre-Task-5 pressure-v5 layout");
     }
 
     fn strip_blob_pressure_schema_for_test(path: &Path) {
@@ -40173,6 +43106,23 @@ mod tests {
         write
             .delete_table(pressure::BLOB_PRESSURE_VARIANTS)
             .expect("delete variant pressure table");
+        for table in [
+            pressure::BLOB_PRESSURE_DURABLE_PUBLICATIONS,
+            pressure::BLOB_PRESSURE_DURABLE_CONTENT_PUBLICATIONS,
+        ] {
+            write
+                .delete_table(table)
+                .expect("delete durable pressure table");
+        }
+        write
+            .delete_table(pressure::BLOB_PRESSURE_DURABLE_PENDING_SOURCES)
+            .expect("delete durable pending pressure table");
+        write
+            .delete_table(pressure::BLOB_PRESSURE_DURABLE_VARIANTS)
+            .expect("delete durable variant pressure table");
+        write
+            .delete_table(pressure::BLOB_PRESSURE_REANCHOR_CURSORS)
+            .expect("delete pressure reanchor cursors");
         write.commit().expect("commit pressure predecessor");
     }
 
@@ -40222,7 +43172,7 @@ mod tests {
         let prepared = prepared_blob(&plaintext);
         let store = Store::open_for_mission(&root.database, services.authority)
             .expect("previous expiry-order store");
-        publish_blob(
+        let (publication, _, _) = publish_blob(
             &store,
             &mut services,
             &prepared,
@@ -40261,6 +43211,522 @@ mod tests {
                 .value(),
             5
         );
+        let summary = pressure::decode_variant_summary(
+            read.open_table(pressure::BLOB_PRESSURE_VARIANT_SUMMARIES)
+                .unwrap()
+                .get(publication.variant_id.as_bytes().as_slice())
+                .unwrap()
+                .unwrap()
+                .value(),
+        )
+        .unwrap();
+        assert!(!summary.has_finite_roots);
+        let indexed = read
+            .open_table(pressure::BLOB_PRESSURE_VARIANTS)
+            .unwrap()
+            .iter()
+            .unwrap()
+            .find_map(|row| {
+                let (key, _) = row.unwrap();
+                let (candidate, variant) =
+                    pressure::decode_variant_index_key(&key.value()).unwrap();
+                (variant == publication.variant_id).then_some(candidate)
+            })
+            .expect("migrated finite variant index");
+        assert_eq!(indexed, summary);
+    }
+
+    #[test]
+    fn finite_pressure_v2_and_v4_audit_then_migrate_to_current_indexes() {
+        for (label, pressure_version) in [("finite-pressure-v2", 2), ("finite-pressure-v4", 4)] {
+            let root = BlobTestRoot::new(label);
+            let mut services = blob_services(pressure_version as u8);
+            let plaintext = format!("{label} migration fixture").into_bytes();
+            let prepared = prepared_blob(&plaintext);
+            let store = Store::open_for_mission(&root.database, services.authority)
+                .expect("finite pressure predecessor store");
+            let (publication, operation, _) = publish_blob(
+                &store,
+                &mut services,
+                &prepared,
+                &plaintext,
+                1,
+                label.as_bytes(),
+            );
+            rewrite_live_blob_as_finite_for_retirement_test(
+                &store,
+                &publication,
+                Some(&operation),
+                50_000,
+                100,
+                CustodySample {
+                    clock_id: [pressure_version as u8; 16],
+                    tick_ms: 10_000,
+                },
+            );
+            drop(store);
+
+            if pressure_version == 2 {
+                downgrade_blob_policy_to_v4_for_test(&root.database);
+                let database = Database::open(&root.database).unwrap();
+                let write = database.begin_write().unwrap();
+                write
+                    .open_table(pressure::BLOB_PRESSURE_METADATA)
+                    .unwrap()
+                    .insert(pressure::PRESSURE_SCHEMA_VERSION_FIELD, 2)
+                    .unwrap();
+                write.commit().unwrap();
+            } else {
+                downgrade_blob_policy_to_v4_for_test(&root.database);
+            }
+
+            let database = Database::open(&root.database).unwrap();
+            let read = database.begin_read().unwrap();
+            let encoded = read
+                .open_table(pressure::BLOB_PRESSURE_VARIANT_SUMMARIES)
+                .unwrap()
+                .get(publication.variant_id.as_bytes().as_slice())
+                .unwrap()
+                .unwrap()
+                .value()
+                .to_vec();
+            assert_eq!(encoded[27] & 0x80, 0, "historical count must be raw");
+            assert!(
+                !pressure::decode_variant_summary(&encoded)
+                    .unwrap()
+                    .has_finite_roots,
+                "historical generations must not decode a v5 aggregate"
+            );
+            drop(read);
+            drop(database);
+
+            let predecessor = blob_database_digest(&root.database);
+            Store::inspect_existing(&root.database).expect("read-only finite predecessor audit");
+            assert_eq!(blob_database_digest(&root.database), predecessor);
+
+            drop(
+                Store::open_for_mission(&root.database, services.authority)
+                    .expect("writable finite pressure migration"),
+            );
+            Store::inspect_existing(&root.database).expect("inspect migrated finite pressure");
+            let database = Database::open(&root.database).unwrap();
+            let read = database.begin_read().unwrap();
+            let encoded = read
+                .open_table(pressure::BLOB_PRESSURE_VARIANT_SUMMARIES)
+                .unwrap()
+                .get(publication.variant_id.as_bytes().as_slice())
+                .unwrap()
+                .unwrap()
+                .value()
+                .to_vec();
+            assert_ne!(encoded[27] & 0x80, 0, "v5 aggregate must mark finite roots");
+            assert!(
+                pressure::decode_variant_summary(&encoded)
+                    .unwrap()
+                    .has_finite_roots
+            );
+            assert!(
+                read.open_table(pressure::BLOB_PRESSURE_DURABLE_PUBLICATIONS)
+                    .unwrap()
+                    .iter()
+                    .unwrap()
+                    .next()
+                    .is_none()
+            );
+            assert!(
+                read.open_table(pressure::BLOB_PRESSURE_DURABLE_VARIANTS)
+                    .unwrap()
+                    .iter()
+                    .unwrap()
+                    .next()
+                    .is_none()
+            );
+            drop(read);
+            drop(database);
+            let migrated = pressure_database_digest(&root.database);
+            drop(Store::open(&root.database).expect("idempotent finite pressure reopen"));
+            assert_eq!(pressure_database_digest(&root.database), migrated);
+        }
+    }
+
+    #[test]
+    fn exact_old_v5_pressure_layout_audits_then_populates_only_durable_indexes() {
+        let target_root = BlobTestRoot::new("pressure-old-v5-upgrade-target");
+        let source_root = BlobTestRoot::new("pressure-old-v5-upgrade-source");
+        let mut services = blob_services(0x65);
+        let mut pending_services = blob_services_with_nodes(0x65, 3, 4);
+        assert_eq!(services.authority, pending_services.authority);
+        let source = Store::open_for_mission(&source_root.database, services.authority)
+            .expect("old-v5 source store");
+        let target = Store::open_for_mission(&target_root.database, services.authority)
+            .expect("old-v5 target store");
+
+        let durable_plaintext = b"old-v5 durable publication".to_vec();
+        let durable_prepared = prepared_blob(&durable_plaintext);
+        let (durable_publication, _, _) = publish_blob(
+            &target,
+            &mut services,
+            &durable_prepared,
+            &durable_plaintext,
+            1,
+            b"old-v5-durable-publication",
+        );
+
+        let finite_only_plaintext = b"old-v5 finite-only publication".to_vec();
+        let finite_only_prepared = prepared_blob(&finite_only_plaintext);
+        let (finite_only_publication, finite_only_operation, _) = publish_blob(
+            &target,
+            &mut services,
+            &finite_only_prepared,
+            &finite_only_plaintext,
+            1,
+            b"old-v5-finite-only-publication",
+        );
+
+        let mixed_plaintext = b"old-v5 mixed finite and durable variant".to_vec();
+        let mixed_prepared = prepared_blob(&mixed_plaintext);
+        let (finite_publication, finite_operation, _) = publish_blob(
+            &target,
+            &mut services,
+            &mixed_prepared,
+            &mixed_plaintext,
+            1,
+            b"old-v5-finite-publication",
+        );
+        let (mixed_durable_publication, _, _) = publish_blob(
+            &target,
+            &mut services,
+            &mixed_prepared,
+            &mixed_plaintext,
+            1,
+            b"old-v5-mixed-durable-publication",
+        );
+        assert_eq!(
+            finite_publication.variant_id,
+            mixed_durable_publication.variant_id
+        );
+        let checkpoint = CustodySample {
+            clock_id: [0x65; 16],
+            tick_ms: 10_000,
+        };
+        rewrite_live_blob_as_finite_for_retirement_test(
+            &target,
+            &finite_only_publication,
+            Some(&finite_only_operation),
+            50_000,
+            100,
+            checkpoint,
+        );
+        rewrite_live_blob_as_finite_for_retirement_test(
+            &target,
+            &finite_publication,
+            Some(&finite_operation),
+            50_000,
+            100,
+            checkpoint,
+        );
+
+        let finite_pending_plaintext = b"old-v5 finite pending source".to_vec();
+        let finite_pending_prepared = prepared_blob(&finite_pending_plaintext);
+        let finite_pending_proof = prepare_blob_proof_with_lifetime(
+            &source,
+            &mut pending_services,
+            &finite_pending_prepared,
+            &finite_pending_plaintext,
+            1,
+            Priority::Immediate,
+            Some(50_000),
+        );
+        let finite_pending_plan = finite_pending_proof
+            .blob
+            .transfer_plan(&finite_pending_proof.manifest_bytes)
+            .expect("old-v5 finite pending plan");
+        let finite_pending = BlobTransferId::new(finite_pending_proof.blob.envelope_id());
+        let policy = target.control_policy_snapshot().expect("old-v5 policy");
+        assert_eq!(
+            target
+                .test_stage_verified_finite_blob_source_with_policy(
+                    &policy,
+                    &finite_pending_proof.blob,
+                    &finite_pending_proof.sealed,
+                    &finite_pending_plan,
+                    100,
+                    checkpoint,
+                )
+                .expect("stage old-v5 finite pending source"),
+            BlobSourceStageOutcome::Inserted
+        );
+
+        let durable_pending_plaintext = b"old-v5 durable pending source".to_vec();
+        let durable_pending_prepared = prepared_blob(&durable_pending_plaintext);
+        let durable_pending_proof = prepare_blob_proof(
+            &source,
+            &mut pending_services,
+            &durable_pending_prepared,
+            &durable_pending_plaintext,
+            1,
+        );
+        let durable_pending_plan = durable_pending_proof
+            .blob
+            .transfer_plan(&durable_pending_proof.manifest_bytes)
+            .expect("old-v5 durable pending plan");
+        let durable_pending = BlobTransferId::new(durable_pending_proof.blob.envelope_id());
+        assert_eq!(
+            target
+                .stage_verified_blob_source_with_lifetime(
+                    &policy,
+                    &durable_pending_proof.blob,
+                    &durable_pending_proof.sealed,
+                    &durable_pending_plan,
+                    None,
+                )
+                .expect("stage old-v5 durable pending source"),
+            BlobSourceStageOutcome::Inserted
+        );
+        drop(target);
+        drop(source);
+
+        let database = Database::open(&target_root.database).unwrap();
+        let read = database.begin_read().unwrap();
+        let durable_publication_transfers = BTreeSet::from([
+            durable_publication.transfer_id,
+            mixed_durable_publication.transfer_id,
+        ]);
+        let expected_publications = read
+            .open_table(pressure::BLOB_PRESSURE_PUBLICATIONS)
+            .unwrap()
+            .iter()
+            .unwrap()
+            .filter_map(|row| {
+                let (key, _) = row.unwrap();
+                let candidate = pressure::decode_publication_key(key.value()).unwrap();
+                durable_publication_transfers
+                    .contains(&candidate.transfer_id)
+                    .then(|| key.value().to_vec())
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(expected_publications.len(), 2);
+        let expected_content_publications = read
+            .open_table(pressure::BLOB_PRESSURE_CONTENT_PUBLICATIONS)
+            .unwrap()
+            .iter()
+            .unwrap()
+            .filter_map(|row| {
+                let (key, _) = row.unwrap();
+                let candidate = pressure::decode_content_publication_key(key.value()).unwrap();
+                durable_publication_transfers
+                    .contains(&candidate.publication.transfer_id)
+                    .then(|| key.value().to_vec())
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(expected_content_publications.len(), 2);
+        let expected_pending = read
+            .open_table(pressure::BLOB_PRESSURE_PENDING_SOURCES)
+            .unwrap()
+            .iter()
+            .unwrap()
+            .find_map(|row| {
+                let (key, _) = row.unwrap();
+                let candidate = pressure::decode_pending_index_key(&key.value()).unwrap();
+                (candidate.transfer_id == durable_pending).then_some(key.value())
+            })
+            .expect("durable pending canonical key");
+        let finite_pending_variant = pressure::decode_pending_root(
+            read.open_table(pressure::BLOB_PRESSURE_PENDING_ROOTS)
+                .unwrap()
+                .get(finite_pending.as_bytes().as_slice())
+                .unwrap()
+                .unwrap()
+                .value(),
+        )
+        .unwrap()
+        .variant_id;
+        let durable_pending_variant = pressure::decode_pending_root(
+            read.open_table(pressure::BLOB_PRESSURE_PENDING_ROOTS)
+                .unwrap()
+                .get(durable_pending.as_bytes().as_slice())
+                .unwrap()
+                .unwrap()
+                .value(),
+        )
+        .unwrap()
+        .variant_id;
+        let durable_variants =
+            BTreeSet::from([durable_publication.variant_id, durable_pending_variant]);
+        let expected_variants = read
+            .open_table(pressure::BLOB_PRESSURE_VARIANTS)
+            .unwrap()
+            .iter()
+            .unwrap()
+            .filter_map(|row| {
+                let (key, _) = row.unwrap();
+                let (_, variant) = pressure::decode_variant_index_key(&key.value()).unwrap();
+                durable_variants.contains(&variant).then_some(key.value())
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(expected_variants.len(), 2);
+        assert_ne!(finite_pending, durable_pending);
+        drop(read);
+        drop(database);
+
+        rewrite_pressure_v5_as_pre_task5_for_test(&target_root.database);
+        let database = Database::open(&target_root.database).unwrap();
+        let read = database.begin_read().unwrap();
+        for (variant, expected_publication_roots) in [
+            (finite_only_publication.variant_id, 1),
+            (finite_publication.variant_id, 2),
+            (finite_pending_variant, 0),
+        ] {
+            let summary_bytes = read
+                .open_table(pressure::BLOB_PRESSURE_VARIANT_SUMMARIES)
+                .unwrap()
+                .get(variant.as_bytes().as_slice())
+                .unwrap()
+                .unwrap()
+                .value()
+                .to_vec();
+            let raw_publication_roots =
+                u64::from_be_bytes(summary_bytes[27..35].try_into().unwrap());
+            assert_eq!(
+                raw_publication_roots, expected_publication_roots,
+                "pre-Task-5 v5 summary stores the raw publication-root count"
+            );
+            assert_eq!(
+                raw_publication_roots & (1 << 63),
+                0,
+                "pre-Task-5 v5 summary has no finite-root aggregate"
+            );
+            assert!(
+                !pressure::decode_variant_summary(&summary_bytes)
+                    .unwrap()
+                    .has_finite_roots
+            );
+            let variant_key = read
+                .open_table(pressure::BLOB_PRESSURE_VARIANTS)
+                .unwrap()
+                .iter()
+                .unwrap()
+                .find_map(|row| {
+                    let (key, _) = row.unwrap();
+                    let (_, indexed_variant) =
+                        pressure::decode_variant_index_key(&key.value()).unwrap();
+                    (indexed_variant == variant).then_some(key.value())
+                })
+                .expect("pre-Task-5 v5 variant index");
+            assert_eq!(
+                u64::from_be_bytes(variant_key[68..76].try_into().unwrap()),
+                expected_publication_roots,
+                "pre-Task-5 v5 index stores the raw publication-root count"
+            );
+        }
+        drop(read);
+        drop(database);
+        let old_v5 = pressure_database_digest(&target_root.database);
+        Store::inspect_existing(&target_root.database)
+            .expect("read-only exact old-v5 audit without durable tables");
+        assert_eq!(pressure_database_digest(&target_root.database), old_v5);
+
+        pressure::TEST_PRESSURE_MIGRATION_FAULT.set(true);
+        let interrupted = match Store::open_for_mission(&target_root.database, services.authority) {
+            Ok(_) => panic!("interrupted exact old-v5 upgrade must roll back"),
+            Err(error) => error,
+        };
+        assert_blob_schema_invariant(&interrupted);
+        pressure::TEST_PRESSURE_MIGRATION_FAULT.set(false);
+        assert_eq!(
+            pressure_database_digest(&target_root.database),
+            old_v5,
+            "old-v5 canonical bytes and table layout roll back atomically"
+        );
+        Store::inspect_existing(&target_root.database)
+            .expect("rolled-back exact old-v5 image remains byte-exact and auditable");
+
+        drop(
+            Store::open_for_mission(&target_root.database, services.authority)
+                .expect("writable exact old-v5 durable-index upgrade"),
+        );
+        Store::inspect_existing(&target_root.database).expect("post-upgrade current-v5 full audit");
+        let database = Database::open(&target_root.database).unwrap();
+        let read = database.begin_read().unwrap();
+        for variant in [
+            finite_only_publication.variant_id,
+            finite_publication.variant_id,
+            finite_pending_variant,
+        ] {
+            let summary_bytes = read
+                .open_table(pressure::BLOB_PRESSURE_VARIANT_SUMMARIES)
+                .unwrap()
+                .get(variant.as_bytes().as_slice())
+                .unwrap()
+                .unwrap()
+                .value()
+                .to_vec();
+            assert_ne!(
+                u64::from_be_bytes(summary_bytes[27..35].try_into().unwrap()) & (1 << 63),
+                0,
+                "current v5 summary restores the finite-root aggregate"
+            );
+            assert!(
+                pressure::decode_variant_summary(&summary_bytes)
+                    .unwrap()
+                    .has_finite_roots
+            );
+            let variant_key = read
+                .open_table(pressure::BLOB_PRESSURE_VARIANTS)
+                .unwrap()
+                .iter()
+                .unwrap()
+                .find_map(|row| {
+                    let (key, _) = row.unwrap();
+                    let (summary, indexed_variant) =
+                        pressure::decode_variant_index_key(&key.value()).unwrap();
+                    (indexed_variant == variant).then_some((key.value(), summary))
+                })
+                .expect("current v5 finite variant index");
+            assert_ne!(
+                u64::from_be_bytes(variant_key.0[68..76].try_into().unwrap()) & (1 << 63),
+                0,
+                "current v5 index restores the finite-root aggregate"
+            );
+            assert!(variant_key.1.has_finite_roots);
+        }
+        let actual_publications = read
+            .open_table(pressure::BLOB_PRESSURE_DURABLE_PUBLICATIONS)
+            .unwrap()
+            .iter()
+            .unwrap()
+            .map(|row| row.unwrap().0.value().to_vec())
+            .collect::<BTreeSet<_>>();
+        let actual_content_publications = read
+            .open_table(pressure::BLOB_PRESSURE_DURABLE_CONTENT_PUBLICATIONS)
+            .unwrap()
+            .iter()
+            .unwrap()
+            .map(|row| row.unwrap().0.value().to_vec())
+            .collect::<BTreeSet<_>>();
+        let actual_pending = read
+            .open_table(pressure::BLOB_PRESSURE_DURABLE_PENDING_SOURCES)
+            .unwrap()
+            .iter()
+            .unwrap()
+            .map(|row| row.unwrap().0.value())
+            .collect::<BTreeSet<_>>();
+        let actual_variants = read
+            .open_table(pressure::BLOB_PRESSURE_DURABLE_VARIANTS)
+            .unwrap()
+            .iter()
+            .unwrap()
+            .map(|row| row.unwrap().0.value())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(actual_publications, expected_publications);
+        assert_eq!(actual_content_publications, expected_content_publications);
+        assert_eq!(actual_pending, BTreeSet::from([expected_pending]));
+        assert_eq!(actual_variants, expected_variants);
+        drop(read);
+        drop(database);
+        let upgraded = pressure_database_digest(&target_root.database);
+        drop(Store::open(&target_root.database).expect("idempotent current-v5 reopen"));
+        assert_eq!(pressure_database_digest(&target_root.database), upgraded);
     }
 
     #[test]
@@ -40283,6 +43749,47 @@ mod tests {
             Err(error) => error,
         };
         assert_blob_schema_invariant(&writable);
+
+        let missing_old_v5 = BlobTestRoot::new("pressure-old-v5-missing-canonical");
+        drop(Store::open(&missing_old_v5.database).expect("create current pressure schema"));
+        rewrite_pressure_v5_as_pre_task5_for_test(&missing_old_v5.database);
+        let database = Database::open(&missing_old_v5.database).unwrap();
+        let write = database.begin_write().unwrap();
+        write
+            .delete_table(pressure::BLOB_PRESSURE_VARIANTS)
+            .expect("delete old-v5 canonical variant table");
+        write.commit().unwrap();
+        drop(database);
+        let before = pressure_database_digest(&missing_old_v5.database);
+        assert_blob_schema_invariant(
+            &Store::inspect_existing(&missing_old_v5.database)
+                .expect_err("old-v5 layout missing a canonical table must fail read-only"),
+        );
+        let writable = Store::open(&missing_old_v5.database)
+            .err()
+            .expect("old-v5 layout missing a canonical table must fail writable");
+        assert_blob_schema_invariant(&writable);
+        assert_eq!(pressure_database_digest(&missing_old_v5.database), before);
+
+        for retained in 1..0b1111 {
+            let partial = BlobTestRoot::new(&format!("partial-durable-pressure-{retained:04b}"));
+            drop(Store::open(&partial.database).expect("create complete current pressure schema"));
+            retain_durable_pressure_tables_for_test(&partial.database, retained);
+            let before = pressure_database_digest(&partial.database);
+            assert_blob_schema_invariant(
+                &Store::inspect_existing(&partial.database)
+                    .expect_err("partial durable-only table set must fail read-only"),
+            );
+            let writable = Store::open(&partial.database)
+                .err()
+                .expect("partial durable-only table set must fail writable");
+            assert_blob_schema_invariant(&writable);
+            assert_eq!(
+                pressure_database_digest(&partial.database),
+                before,
+                "partial durable-only table set must not be repaired"
+            );
+        }
 
         for (label, lifecycle_version, pressure_version) in
             [("current-old", 4, 3), ("old-current", 3, 4)]
@@ -40342,6 +43849,137 @@ mod tests {
             Err(error) => error,
         };
         assert_blob_schema_invariant(&writable);
+
+        let old_v5_corrupt = BlobTestRoot::new("pressure-old-v5-canonical-corruption");
+        drop(Store::open(&old_v5_corrupt.database).expect("current old-v5 source schema"));
+        let database = Database::open(&old_v5_corrupt.database).unwrap();
+        let write = database.begin_write().unwrap();
+        write
+            .open_table(pressure::BLOB_PRESSURE_PENDING_SOURCES)
+            .unwrap()
+            .insert(&[3u8; 68], &[] as &[u8])
+            .unwrap();
+        write.commit().unwrap();
+        drop(database);
+        rewrite_pressure_v5_as_pre_task5_for_test(&old_v5_corrupt.database);
+        let before = pressure_database_digest(&old_v5_corrupt.database);
+        assert_blob_schema_invariant(
+            &Store::inspect_existing(&old_v5_corrupt.database)
+                .expect_err("corrupt old-v5 canonical image must fail read-only"),
+        );
+        let writable = Store::open(&old_v5_corrupt.database)
+            .err()
+            .expect("corrupt old-v5 canonical image must fail before upgrade");
+        assert_blob_schema_invariant(&writable);
+        assert_eq!(pressure_database_digest(&old_v5_corrupt.database), before);
+
+        let durable_root = BlobTestRoot::new("pressure-orphan-durable-index");
+        drop(Store::open(&durable_root.database).expect("current durable pressure schema"));
+        let database = Database::open(&durable_root.database).unwrap();
+        let write = database.begin_write().unwrap();
+        write
+            .open_table(pressure::BLOB_PRESSURE_DURABLE_PENDING_SOURCES)
+            .unwrap()
+            .insert(&[2u8; 68], &[] as &[u8])
+            .unwrap();
+        write.commit().unwrap();
+        drop(database);
+        assert_blob_schema_invariant(
+            &Store::inspect_existing(&durable_root.database)
+                .expect_err("orphan durable-only pressure index must fail the audit"),
+        );
+        let writable = match Store::open(&durable_root.database) {
+            Ok(_) => panic!("writable audit must not repair an orphan durable-only index"),
+            Err(error) => error,
+        };
+        assert_blob_schema_invariant(&writable);
+
+        // The aggregate and index can agree with each other while lying about
+        // the authoritative roots.  The full audit must still reject that
+        // corruption rather than admitting the variant to durable selection.
+        let aggregate_root = BlobTestRoot::new("pressure-finite-root-aggregate-corruption");
+        let mut services = blob_services(0xd4);
+        let store = Store::open_for_mission(&aggregate_root.database, services.authority)
+            .expect("aggregate corruption store");
+        let plaintext = b"finite root aggregate audit".to_vec();
+        let prepared = prepared_blob(&plaintext);
+        let (publication, operation, _) = publish_blob(
+            &store,
+            &mut services,
+            &prepared,
+            &plaintext,
+            1,
+            b"finite-root-aggregate-audit",
+        );
+        rewrite_live_blob_as_finite_for_retirement_test(
+            &store,
+            &publication,
+            Some(&operation),
+            50_000,
+            100,
+            CustodySample {
+                clock_id: [0xd4; 16],
+                tick_ms: 10_000,
+            },
+        );
+        drop(store);
+
+        let database = Database::open(&aggregate_root.database).unwrap();
+        let write = database.begin_write().unwrap();
+        let encoded = write
+            .open_table(pressure::BLOB_PRESSURE_VARIANT_SUMMARIES)
+            .unwrap()
+            .get(publication.variant_id.as_bytes().as_slice())
+            .unwrap()
+            .unwrap()
+            .value()
+            .to_vec();
+        let summary = pressure::decode_variant_summary(&encoded).unwrap();
+        assert!(summary.has_finite_roots);
+        let old_key = write
+            .open_table(pressure::BLOB_PRESSURE_VARIANTS)
+            .unwrap()
+            .iter()
+            .unwrap()
+            .find_map(|row| {
+                let (key, _) = row.unwrap();
+                let key = key.value();
+                let (_, variant) = pressure::decode_variant_index_key(&key).unwrap();
+                (variant == publication.variant_id).then_some(key)
+            })
+            .expect("finite aggregate index key");
+        write
+            .open_table(pressure::BLOB_PRESSURE_VARIANTS)
+            .unwrap()
+            .remove(&old_key)
+            .unwrap()
+            .expect("finite aggregate index");
+        let contradictory = pressure::PressureVariantSummary {
+            has_finite_roots: false,
+            ..summary
+        };
+        let encoded = pressure::encode_variant_summary(contradictory);
+        write
+            .open_table(pressure::BLOB_PRESSURE_VARIANT_SUMMARIES)
+            .unwrap()
+            .insert(
+                publication.variant_id.as_bytes().as_slice(),
+                encoded.as_slice(),
+            )
+            .unwrap();
+        let mut key = old_key;
+        key[68] &= 0x7f;
+        write
+            .open_table(pressure::BLOB_PRESSURE_VARIANTS)
+            .unwrap()
+            .insert(&key, &[] as &[u8])
+            .unwrap();
+        write.commit().unwrap();
+        drop(database);
+        assert_blob_schema_invariant(
+            &Store::inspect_existing(&aggregate_root.database)
+                .expect_err("root-contradictory aggregate must fail the pressure audit"),
+        );
     }
 
     #[test]
@@ -42072,9 +45710,10 @@ mod tests {
     }
 
     #[test]
-    fn blob_pressure_manifest_remains_charged_until_physical_finalization() {
-        // Break caught: logical retirement and durable deletion authority must
-        // not release depot admission capacity before physical finalization.
+    fn blob_durable_capacity_gc_finalizes_existing_orphan_and_enables_transfer() {
+        // Break caught: contact-safe cleanup must reclaim already-authorized
+        // orphan physical data so a durable transfer can proceed, without
+        // borrowing lifecycle expiry or manifest-admission authority.
         let root = BlobTestRoot::new("pressure-depot-admission-recovery");
         let mut services = blob_services(0xb6);
         let first_plaintext = vec![0xb6; 512];
@@ -42138,7 +45777,7 @@ mod tests {
             "unexpected retained-charge error: {error}"
         );
         let progress = store
-            .run_blob_capacity_gc_for(
+            .run_durable_blob_capacity_gc_for(
                 BlobCapacityGcTarget::Depot,
                 BlobMaintenanceBudget::new(64, 16, 128 * 1024 * 1024)
                     .expect("physical finalization budget"),
@@ -42695,7 +46334,14 @@ mod tests {
         let before = blob_complete_logical_digest(&store);
         assert_blob_schema_invariant(
             &store
-                .run_blob_variant_pressure_recovery(low.variant_id, demand, budget, selection, None)
+                .run_blob_variant_pressure_recovery(
+                    low.variant_id,
+                    demand,
+                    budget,
+                    selection,
+                    None,
+                    BlobContactEligibility::AllVisible,
+                )
                 .expect_err("new protected root invalidates stale selection"),
         );
         assert_eq!(blob_complete_logical_digest(&store), before);

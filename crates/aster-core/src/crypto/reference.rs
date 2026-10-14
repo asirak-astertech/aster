@@ -4498,6 +4498,18 @@ impl ReferenceSessionInitiator {
         )
     }
 
+    /// Compatibility-only constructor for downstream authenticated transport
+    /// tests representing an older implementation. This symbol is absent
+    /// unless the non-default `test-utils` feature is selected.
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn start_with_semantic_versions_for_test(
+        bundle: ProvisioningBundle,
+        supported_versions: Vec<u16>,
+    ) -> Result<(Self, Vec<u8>), EnvelopeError> {
+        Self::start_with_semantic_versions(bundle, supported_versions)
+    }
+
     /// Test/compatibility entry point for representing an older implementation.
     /// Production callers do not choose session semantics.
     pub(crate) fn start_with_semantic_versions(
@@ -4885,6 +4897,46 @@ impl ReferenceAuthenticatedSession {
         self.semantic_version
     }
 
+    /// Non-secret identifier for this completed authenticated session.
+    pub const fn session_id(&self) -> [u8; 32] {
+        self.session_id
+    }
+
+    /// Mints one non-clone outbound Blob custody context from the completed
+    /// semantic/profile negotiation and this endpoint's authenticated role.
+    pub fn mint_blob_custody_send_context(
+        &self,
+        direction: BlobCustodyDirectionV1,
+        exchange_id: u64,
+        finalization_charge_ms: u64,
+    ) -> Result<crate::AuthenticatedBlobCustodySendContextV1, EnvelopeError> {
+        let expected_direction = match self.role {
+            SessionRole::Initiator => BlobCustodyDirectionV1::ToSessionResponder,
+            SessionRole::Responder => BlobCustodyDirectionV1::ToSessionInitiator,
+        };
+        let profiles = self
+            .transfer_profiles
+            .authenticated
+            .as_ref()
+            .ok_or_else(blob_custody_contact_unavailable)?;
+        if self.semantic_version != SEMANTIC_PROTOCOL_V8
+            || direction != expected_direction
+            || finalization_charge_ms == 0
+            || profiles.negotiated.profile(TransferLaneId::Blob)
+                != Some(TransferProfileId::BlobCustodyV1)
+        {
+            return Err(blob_custody_contact_unavailable());
+        }
+        Ok(
+            crate::AuthenticatedBlobCustodySendContextV1::from_authenticated_session(
+                self.session_id,
+                exchange_id,
+                direction,
+                finalization_charge_ms,
+            ),
+        )
+    }
+
     /// Opaque, authority-signed route-grant commitments from the peer credential.
     ///
     /// These bytes were authenticated by the completed handshake. They are safe
@@ -5030,6 +5082,113 @@ impl ReferenceAuthenticatedSession {
         .map_err(|_| transfer_profile_negotiation_failed())?;
         let digest = transfer_profile_digest(initiator, responder, &negotiated);
         Ok(Some(AuthenticatedTransferProfiles { negotiated, digest }))
+    }
+
+    /// Protects a complete v8 Blob source-bearing frame in the authenticated
+    /// profile-3 context. Durable frames end in the canonical absent field;
+    /// finite frames end in the exact canonical claim supplied here.
+    pub fn seal_blob_source_frame(
+        &mut self,
+        direction: BlobCustodyDirectionV1,
+        claim: Option<&BlobCustodyClaimV1>,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, EnvelopeError> {
+        let expected_direction = match self.role {
+            SessionRole::Initiator => BlobCustodyDirectionV1::ToSessionResponder,
+            SessionRole::Responder => BlobCustodyDirectionV1::ToSessionInitiator,
+        };
+        let profiles = self
+            .transfer_profiles
+            .authenticated
+            .as_ref()
+            .ok_or_else(blob_custody_contact_unavailable)?;
+        if self.semantic_version != SEMANTIC_PROTOCOL_V8
+            || direction != expected_direction
+            || profiles.negotiated.profile(TransferLaneId::Blob)
+                != Some(TransferProfileId::BlobCustodyV1)
+        {
+            return Err(blob_custody_contact_unavailable());
+        }
+        match claim {
+            None if plaintext.last() == Some(&0) => {}
+            Some(claim) => {
+                let encoded = claim.encode();
+                let tail_len = 1 + 2 + encoded.len();
+                let Some(tail) = plaintext.get(plaintext.len().saturating_sub(tail_len)..) else {
+                    return Err(blob_custody_contact_unavailable());
+                };
+                if claim.session_transcript() != self.session_id
+                    || claim.direction() != direction
+                    || tail[0] != 1
+                    || tail[1..3] != (encoded.len() as u16).to_be_bytes()
+                    || tail[3..] != encoded
+                {
+                    return Err(blob_custody_contact_unavailable());
+                }
+            }
+            None => return Err(blob_custody_contact_unavailable()),
+        }
+        let context = blob_custody_lane_record_context(profiles.digest, direction);
+        self.seal_frame_with_context(plaintext, &context)
+    }
+
+    /// Opens one complete v8 Blob source-bearing frame under profile 3.
+    /// Finite frames return the one-use contact authority for their exact
+    /// embedded claim; durable frames return no custody authority.
+    pub fn open_blob_source_frame(
+        &mut self,
+        direction: BlobCustodyDirectionV1,
+        frame: &[u8],
+    ) -> Result<crate::OpenedBlobSourceFrameV1, EnvelopeError> {
+        let expected_direction = match self.role {
+            SessionRole::Initiator => BlobCustodyDirectionV1::ToSessionInitiator,
+            SessionRole::Responder => BlobCustodyDirectionV1::ToSessionResponder,
+        };
+        let profiles = self
+            .transfer_profiles
+            .authenticated
+            .as_ref()
+            .ok_or_else(blob_custody_contact_unavailable)?;
+        if self.semantic_version != SEMANTIC_PROTOCOL_V8
+            || direction != expected_direction
+            || profiles.negotiated.profile(TransferLaneId::Blob)
+                != Some(TransferProfileId::BlobCustodyV1)
+        {
+            return Err(blob_custody_contact_unavailable());
+        }
+        let record = decode_transport_frame(frame)?;
+        let record_sequence = record.sequence;
+        let context = blob_custody_lane_record_context(profiles.digest, direction);
+        let aad = transport_frame_context_aad(&context)?;
+        let plaintext = self
+            .channel
+            .open_contextual(&self.provider, &record, &aad)
+            .map_err(handshake_error)?;
+        let tail_len = 1 + 2 + crate::BLOB_CUSTODY_CLAIM_V1_BYTES;
+        let tail = plaintext.get(plaintext.len().saturating_sub(tail_len)..);
+        if !tail.is_some_and(|tail| {
+            tail[0] == 1 && tail[1..3] == (crate::BLOB_CUSTODY_CLAIM_V1_BYTES as u16).to_be_bytes()
+        }) {
+            return if plaintext.last() == Some(&0) {
+                Ok((plaintext, None))
+            } else {
+                Err(blob_custody_contact_unavailable())
+            };
+        }
+        let tail = tail.expect("checked finite Blob source tail");
+        let claim = BlobCustodyClaimV1::decode(&tail[3..])
+            .map_err(|_| blob_custody_contact_unavailable())?;
+        if claim.session_transcript() != self.session_id || claim.direction() != direction {
+            return Err(blob_custody_contact_unavailable());
+        }
+        let authority = AuthenticatedBlobCustodyContactV1::from_opened_record(
+            self.session_id,
+            profiles.digest,
+            direction,
+            record_sequence,
+            claim.digest(),
+        );
+        Ok((plaintext, Some((claim, authority))))
     }
 
     /// Protects one frame in the fixed semantic-v8 Blob lane/profile-3 domain.
@@ -10593,6 +10752,73 @@ mod tests {
         assert_eq!(
             sender.negotiated_transfer_profile(crate::TransferLaneId::Blob),
             Some(crate::TransferProfileId::BlobCustodyV1)
+        );
+
+        // Mutation caught: protecting only an adjacent claim record, accepting
+        // a claim that differs from the complete authenticated source frame,
+        // or replaying that frame could mint reusable runtime authority.
+        let mut source_plaintext = b"canonical source-bearing prefix".to_vec();
+        source_plaintext.extend_from_slice(&[1, 0, 208]);
+        source_plaintext.extend_from_slice(&claim.encode());
+        let (mut source_sender, mut source_receiver) = pair();
+        authenticate_offers(&mut source_sender, &mut source_receiver, &current, &current);
+        let mut source_claim_bytes = claim.encode();
+        source_claim_bytes[14..46].copy_from_slice(&source_sender.session_id);
+        let source_claim = crate::BlobCustodyClaimV1::decode(&source_claim_bytes)
+            .expect("source-frame session claim");
+        source_plaintext.truncate(b"canonical source-bearing prefix".len());
+        source_plaintext.extend_from_slice(&[1, 0, 208]);
+        source_plaintext.extend_from_slice(&source_claim.encode());
+        let source_frame = source_sender
+            .seal_blob_source_frame(direction, Some(&source_claim), &source_plaintext)
+            .expect("protect complete Blob source frame");
+        let (opened_source, opened_finite) = source_receiver
+            .open_blob_source_frame(direction, &source_frame)
+            .expect("open complete Blob source frame");
+        let (opened_claim, source_authority) =
+            opened_finite.expect("finite source authority is present");
+        assert_eq!(opened_source, source_plaintext);
+        assert_eq!(opened_claim, source_claim);
+        assert_eq!(source_authority.claim_digest(), source_claim.digest());
+        assert!(
+            source_receiver
+                .open_blob_source_frame(direction, &source_frame)
+                .is_err(),
+            "the complete source record must remain replay-checked"
+        );
+        let mut mismatched_plaintext = source_plaintext.clone();
+        *mismatched_plaintext.last_mut().expect("claim tail") ^= 1;
+        assert!(
+            source_sender
+                .seal_blob_source_frame(direction, Some(&source_claim), &mismatched_plaintext,)
+                .is_err(),
+            "the protected source tail must equal the supplied canonical claim"
+        );
+
+        // Mutation caught: letting Store authorization accept caller-selected
+        // session, profile, exchange, direction, or finalization fields would
+        // mint a claim without exact authenticated outbound contact context.
+        let outbound = source_sender
+            .mint_blob_custody_send_context(direction, 73, 41)
+            .expect("mint exact outbound Blob custody context");
+        assert_eq!(outbound.semantic_version(), SEMANTIC_PROTOCOL_V8);
+        assert_eq!(
+            outbound.profile_id(),
+            TransferProfileId::BlobCustodyV1 as u16
+        );
+        assert_eq!(outbound.session_transcript(), source_sender.session_id());
+        assert_eq!(outbound.exchange_id(), 73);
+        assert_eq!(outbound.direction(), direction);
+        assert_eq!(outbound.finalization_charge_ms(), 41);
+        assert!(
+            source_sender
+                .mint_blob_custody_send_context(
+                    crate::BlobCustodyDirectionV1::ToSessionInitiator,
+                    73,
+                    41,
+                )
+                .is_err(),
+            "the authenticated sender role fixes the outbound direction"
         );
     }
 

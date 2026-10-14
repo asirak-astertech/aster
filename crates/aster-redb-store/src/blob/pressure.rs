@@ -17,8 +17,8 @@ const PRESSURE_CANDIDATE_COMPLETED: u8 = 1;
 const PRESSURE_EXPIRY_EXPIRED_FINITE: u8 = 0;
 const PRESSURE_EXPIRY_FINITE: u8 = 1;
 const PRESSURE_EXPIRY_DURABLE: u8 = 2;
-// Ordinary store opens remain on v4 until all Task-4 writers and retirement
-// paths maintain the v5 expiry authority transactionally.
+// Current writable stores use v5 expiry aggregates and durable-only indexes;
+// v2-v4 remain byte-exact read-only/migration inputs.
 const ACTIVE_PRESSURE_SCHEMA_VERSION: u64 = 5;
 const PRESSURE_V4_SCHEMA_VERSION: u64 = 4;
 const PRESSURE_SCHEMA_VERSION: u64 = 5;
@@ -243,6 +243,18 @@ pub(crate) enum PressureCandidate {
     Publication(BlobTransferId),
     PendingSource(BlobTransferId),
     Variant(BlobVariantId),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PressureSelectionEligibility {
+    AllVisible,
+    DurableOnly,
+}
+
+impl PressureSelectionEligibility {
+    const fn admits(self, expiry: PressureExpiry) -> bool {
+        matches!(self, Self::AllVisible) || matches!(expiry, PressureExpiry::Durable)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -555,6 +567,16 @@ pub(crate) const BLOB_PRESSURE_PENDING_SOURCES: TableDefinition<PressurePendingI
     TableDefinition::new("aster.blob-pressure-pending-sources.v1");
 pub(crate) const BLOB_PRESSURE_VARIANTS: TableDefinition<PressureVariantIndexKey, &[u8]> =
     TableDefinition::new("aster.blob-pressure-variants.v1");
+pub(crate) const BLOB_PRESSURE_DURABLE_PUBLICATIONS: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("aster.blob-pressure-durable-publications.v1");
+pub(crate) const BLOB_PRESSURE_DURABLE_CONTENT_PUBLICATIONS: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("aster.blob-pressure-durable-content-publications.v1");
+pub(crate) const BLOB_PRESSURE_DURABLE_PENDING_SOURCES: TableDefinition<
+    PressurePendingIndexKey,
+    &[u8],
+> = TableDefinition::new("aster.blob-pressure-durable-pending-sources.v1");
+pub(crate) const BLOB_PRESSURE_DURABLE_VARIANTS: TableDefinition<PressureVariantIndexKey, &[u8]> =
+    TableDefinition::new("aster.blob-pressure-durable-variants.v1");
 pub(crate) const BLOB_PRESSURE_REANCHOR_CURSORS: TableDefinition<u8, &[u8]> =
     TableDefinition::new("aster.blob-pressure-reanchor-cursors.v1");
 
@@ -1079,6 +1101,7 @@ pub(crate) fn charge_reanchor_turn_write(
 
 const PRESSURE_PENDING_INDEX_LEN: usize = 68;
 const PRESSURE_VARIANT_INDEX_LEN: usize = 84;
+const PRESSURE_VARIANT_HAS_FINITE_ROOT_MASK: u64 = 1 << 63;
 
 #[derive(Debug)]
 pub(crate) struct PressurePendingIndexKey;
@@ -1317,6 +1340,20 @@ fn expiry_indexes_active_read(read: &redb::ReadTransaction) -> Result<bool, Stor
             "Blob pressure schema version is unknown",
         )),
     }
+}
+
+fn finite_aggregate_active_write(write: &redb::WriteTransaction) -> Result<bool, StoreError> {
+    Ok(matches!(
+        pressure_schema_state(write)?,
+        PressureSchemaState::Current
+    ))
+}
+
+fn finite_aggregate_active_read(read: &redb::ReadTransaction) -> Result<bool, StoreError> {
+    Ok(matches!(
+        pressure_schema_state(read)?,
+        PressureSchemaState::Current
+    ))
 }
 
 fn publication_index_key_write(
@@ -1619,7 +1656,7 @@ pub(crate) fn encode_variant_index_key(
     summary: PressureVariantSummary,
     variant_id: BlobVariantId,
 ) -> [u8; PRESSURE_VARIANT_INDEX_LEN] {
-    encode_variant_index_key_for_generation(summary, variant_id, false)
+    encode_variant_index_key_for_generation(summary, variant_id, false, false)
 }
 
 fn variant_index_key_write(
@@ -1631,6 +1668,7 @@ fn variant_index_key_write(
         summary,
         variant_id,
         expiry_indexes_active_write(write)?,
+        finite_aggregate_active_write(write)?,
     ))
 }
 
@@ -1643,13 +1681,162 @@ fn variant_index_key_read(
         summary,
         variant_id,
         expiry_indexes_active_read(read)?,
+        finite_aggregate_active_read(read)?,
     ))
+}
+
+fn insert_durable_publication_indexes_write(
+    write: &redb::WriteTransaction,
+    root: &PressurePublicationRoot,
+    transfer: BlobTransferId,
+) -> Result<(), StoreError> {
+    if !expiry_indexes_active_write(write)? || root.expiry != PressureExpiry::Durable {
+        return Ok(());
+    }
+    let global = publication_index_key_write(
+        write,
+        PressurePublicationKey {
+            priority: root.priority,
+            expiry: root.expiry,
+            acceptance_order: root.acceptance_order,
+            transfer_id: transfer,
+        },
+    )?;
+    let content = content_publication_index_key_write(write, root, transfer)?;
+    if write
+        .open_table(BLOB_PRESSURE_DURABLE_PUBLICATIONS)?
+        .insert(global.as_slice(), &[] as &[u8])?
+        .is_some()
+        || write
+            .open_table(BLOB_PRESSURE_DURABLE_CONTENT_PUBLICATIONS)?
+            .insert(content.as_slice(), &[] as &[u8])?
+            .is_some()
+    {
+        return Err(pressure_corruption(
+            "durable publication pressure index is duplicated",
+        ));
+    }
+    Ok(())
+}
+
+fn remove_durable_publication_indexes_write(
+    write: &redb::WriteTransaction,
+    root: &PressurePublicationRoot,
+    transfer: BlobTransferId,
+) -> Result<(), StoreError> {
+    if !expiry_indexes_active_write(write)? || root.expiry != PressureExpiry::Durable {
+        return Ok(());
+    }
+    let global = publication_index_key_write(
+        write,
+        PressurePublicationKey {
+            priority: root.priority,
+            expiry: root.expiry,
+            acceptance_order: root.acceptance_order,
+            transfer_id: transfer,
+        },
+    )?;
+    if write
+        .open_table(BLOB_PRESSURE_DURABLE_PUBLICATIONS)?
+        .remove(global.as_slice())?
+        .is_none()
+        || write
+            .open_table(BLOB_PRESSURE_DURABLE_CONTENT_PUBLICATIONS)?
+            .remove(content_publication_index_key_write(write, root, transfer)?.as_slice())?
+            .is_none()
+    {
+        return Err(pressure_corruption(
+            "durable publication pressure root lacks its exact index",
+        ));
+    }
+    Ok(())
+}
+
+fn insert_durable_pending_index_write(
+    write: &redb::WriteTransaction,
+    root: PressurePendingRoot,
+    transfer: BlobTransferId,
+) -> Result<(), StoreError> {
+    if expiry_indexes_active_write(write)? && root.expiry == PressureExpiry::Durable {
+        let key = pending_index_key_write(write, root, transfer)?;
+        if write
+            .open_table(BLOB_PRESSURE_DURABLE_PENDING_SOURCES)?
+            .insert(&key, &[] as &[u8])?
+            .is_some()
+        {
+            return Err(pressure_corruption(
+                "durable pending pressure index is duplicated",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn remove_durable_pending_index_write(
+    write: &redb::WriteTransaction,
+    root: PressurePendingRoot,
+    transfer: BlobTransferId,
+) -> Result<(), StoreError> {
+    if expiry_indexes_active_write(write)? && root.expiry == PressureExpiry::Durable {
+        let key = pending_index_key_write(write, root, transfer)?;
+        if write
+            .open_table(BLOB_PRESSURE_DURABLE_PENDING_SOURCES)?
+            .remove(&key)?
+            .is_none()
+        {
+            return Err(pressure_corruption(
+                "durable pending pressure root lacks its exact index",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn insert_durable_variant_index_write(
+    write: &redb::WriteTransaction,
+    summary: PressureVariantSummary,
+    variant: BlobVariantId,
+) -> Result<(), StoreError> {
+    if expiry_indexes_active_write(write)? && !summary.has_finite_roots {
+        let key = variant_index_key_write(write, summary, variant)?;
+        if write
+            .open_table(BLOB_PRESSURE_DURABLE_VARIANTS)?
+            .insert(&key, &[] as &[u8])?
+            .is_some()
+        {
+            return Err(pressure_corruption(
+                "durable variant pressure index is duplicated",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn remove_durable_variant_index_write(
+    write: &redb::WriteTransaction,
+    summary: PressureVariantSummary,
+    variant: BlobVariantId,
+) -> Result<(), StoreError> {
+    if expiry_indexes_active_write(write)? && !summary.has_finite_roots {
+        let key = variant_index_key_write(write, summary, variant)?;
+        if write
+            .open_table(BLOB_PRESSURE_DURABLE_VARIANTS)?
+            .remove(&key)?
+            .is_none()
+        {
+            return Err(pressure_corruption(
+                "durable variant pressure summary lacks its exact index",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn encode_variant_index_key_for_generation(
     summary: PressureVariantSummary,
     variant_id: BlobVariantId,
     activate_expiry: bool,
+    activate_finite_aggregate: bool,
 ) -> [u8; PRESSURE_VARIANT_INDEX_LEN] {
     let mut output = [0u8; PRESSURE_VARIANT_INDEX_LEN];
     output[0] = PRESSURE_RECORD_VERSION;
@@ -1667,7 +1854,14 @@ fn encode_variant_index_key_for_generation(
     output[20..28].copy_from_slice(&summary.committed_progress.denominator.to_be_bytes());
     output[28..36].copy_from_slice(&summary.minimum_root_acceptance_order.to_be_bytes());
     output[36..68].copy_from_slice(variant_id.as_bytes());
-    output[68..76].copy_from_slice(&summary.publication_roots.to_be_bytes());
+    debug_assert!(summary.publication_roots < PRESSURE_VARIANT_HAS_FINITE_ROOT_MASK);
+    let encoded_publication_roots = summary.publication_roots
+        | if activate_finite_aggregate && summary.has_finite_roots {
+            PRESSURE_VARIANT_HAS_FINITE_ROOT_MASK
+        } else {
+            0
+        };
+    output[68..76].copy_from_slice(&encoded_publication_roots.to_be_bytes());
     output[76..84].copy_from_slice(&summary.pending_roots.to_be_bytes());
     output
 }
@@ -1772,6 +1966,7 @@ pub(crate) fn decode_variant_index_key(
             ));
         }
     };
+    let encoded_publication_roots = u64::from_be_bytes(bytes[68..76].try_into().unwrap());
     let summary = PressureVariantSummary {
         effective_priority: decode_priority(bytes[1])?,
         minimum_root_acceptance_order: u64::from_be_bytes(bytes[28..36].try_into().unwrap()),
@@ -1780,9 +1975,10 @@ pub(crate) fn decode_variant_index_key(
             u64::from_be_bytes(bytes[20..28].try_into().unwrap()),
         )?,
         finalized,
-        publication_roots: u64::from_be_bytes(bytes[68..76].try_into().unwrap()),
+        publication_roots: encoded_publication_roots & !PRESSURE_VARIANT_HAS_FINITE_ROOT_MASK,
         pending_roots: u64::from_be_bytes(bytes[76..84].try_into().unwrap()),
         final_reference_expiry: decode_fixed_expiry(&bytes[3..12])?,
+        has_finite_roots: encoded_publication_roots & PRESSURE_VARIANT_HAS_FINITE_ROOT_MASK != 0,
     };
     if summary.minimum_root_acceptance_order == 0
         || (summary.publication_roots == 0 && summary.pending_roots == 0)
@@ -1816,9 +2012,6 @@ fn select_publication_from_row(
     incoming_priority: Priority,
     charge: &mut PressureSelectionCharge,
 ) -> Result<Option<Option<PressureCandidate>>, StoreError> {
-    if !charge.charge(key.len(), value.len(), false)? {
-        return Ok(None);
-    }
     if !value.is_empty() {
         return Err(pressure_corruption(
             "Blob pressure publication index value is not empty",
@@ -1880,23 +2073,44 @@ fn select_global_publication_read(
     read: &redb::ReadTransaction,
     incoming_priority: Priority,
     charge: &mut PressureSelectionCharge,
+    eligibility: PressureSelectionEligibility,
 ) -> Result<(Option<PressureCandidate>, bool), StoreError> {
-    let table = read.open_table(BLOB_PRESSURE_PUBLICATIONS)?;
-    let Some(row) = table.iter()?.next().transpose()? else {
-        return Ok((None, true));
-    };
-    let (key, value) = row;
-    match select_publication_from_row(
-        read,
-        key.value(),
-        value.value(),
-        None,
-        incoming_priority,
-        charge,
-    )? {
-        Some(candidate) => Ok((candidate, true)),
-        None => Ok((None, false)),
+    let table = read.open_table(match eligibility {
+        PressureSelectionEligibility::AllVisible => BLOB_PRESSURE_PUBLICATIONS,
+        PressureSelectionEligibility::DurableOnly => BLOB_PRESSURE_DURABLE_PUBLICATIONS,
+    })?;
+    for row in table.iter()? {
+        let (key, value) = row?;
+        if !charge.charge(key.value().len(), value.value().len(), false)? {
+            return Ok((None, false));
+        }
+        if !value.value().is_empty() {
+            return Err(pressure_corruption(
+                "Blob pressure publication index value is not empty",
+            ));
+        }
+        let publication = decode_publication_key(key.value())?;
+        if !eligibility.admits(publication.expiry) {
+            if eligibility == PressureSelectionEligibility::DurableOnly {
+                return Err(pressure_corruption(
+                    "durable publication index contains a finite candidate",
+                ));
+            }
+            continue;
+        }
+        return match select_publication_from_row(
+            read,
+            key.value(),
+            value.value(),
+            None,
+            incoming_priority,
+            charge,
+        )? {
+            Some(candidate) => Ok((candidate, true)),
+            None => Ok((None, false)),
+        };
     }
+    Ok((None, true))
 }
 
 fn select_content_publication_read(
@@ -1904,121 +2118,159 @@ fn select_content_publication_read(
     identity: PressureContentIdentity,
     incoming_priority: Priority,
     charge: &mut PressureSelectionCharge,
+    eligibility: PressureSelectionEligibility,
 ) -> Result<(Option<PressureCandidate>, bool), StoreError> {
     let prefix = identity.index_prefix()?;
     let upper = pressure_prefix_upper_bound(&prefix)?;
-    let table = read.open_table(BLOB_PRESSURE_CONTENT_PUBLICATIONS)?;
-    let Some(row) = table
-        .range::<&[u8]>((
-            std::ops::Bound::Included(prefix.as_slice()),
-            std::ops::Bound::Excluded(upper.as_slice()),
-        ))?
-        .next()
-        .transpose()?
-    else {
-        return Ok((None, true));
-    };
-    let (key, value) = row;
-    match select_publication_from_row(
-        read,
-        key.value(),
-        value.value(),
-        Some(identity),
-        incoming_priority,
-        charge,
-    )? {
-        Some(candidate) => Ok((candidate, true)),
-        None => Ok((None, false)),
+    let table = read.open_table(match eligibility {
+        PressureSelectionEligibility::AllVisible => BLOB_PRESSURE_CONTENT_PUBLICATIONS,
+        PressureSelectionEligibility::DurableOnly => BLOB_PRESSURE_DURABLE_CONTENT_PUBLICATIONS,
+    })?;
+    for row in table.range::<&[u8]>((
+        std::ops::Bound::Included(prefix.as_slice()),
+        std::ops::Bound::Excluded(upper.as_slice()),
+    ))? {
+        let (key, value) = row?;
+        if !charge.charge(key.value().len(), value.value().len(), false)? {
+            return Ok((None, false));
+        }
+        if !value.value().is_empty() {
+            return Err(pressure_corruption(
+                "Blob pressure publication index value is not empty",
+            ));
+        }
+        let publication = decode_content_publication_key(key.value())?.publication;
+        if !eligibility.admits(publication.expiry) {
+            if eligibility == PressureSelectionEligibility::DurableOnly {
+                return Err(pressure_corruption(
+                    "durable content publication index contains a finite candidate",
+                ));
+            }
+            continue;
+        }
+        return match select_publication_from_row(
+            read,
+            key.value(),
+            value.value(),
+            Some(identity),
+            incoming_priority,
+            charge,
+        )? {
+            Some(candidate) => Ok((candidate, true)),
+            None => Ok((None, false)),
+        };
     }
+    Ok((None, true))
 }
 
 fn select_pending_source_read(
     read: &redb::ReadTransaction,
     incoming_priority: Priority,
     charge: &mut PressureSelectionCharge,
+    eligibility: PressureSelectionEligibility,
 ) -> Result<(Option<PressureCandidate>, bool), StoreError> {
-    let table = read.open_table(BLOB_PRESSURE_PENDING_SOURCES)?;
-    let Some(row) = table.iter()?.next().transpose()? else {
-        return Ok((None, true));
-    };
-    let (key, value) = row;
-    let key_bytes = key.value();
-    if !charge.charge(key_bytes.len(), value.value().len(), false)? {
-        return Ok((None, false));
-    }
-    if !value.value().is_empty() {
-        return Err(pressure_corruption(
-            "Blob pressure pending index value is not empty",
+    let table = read.open_table(match eligibility {
+        PressureSelectionEligibility::AllVisible => BLOB_PRESSURE_PENDING_SOURCES,
+        PressureSelectionEligibility::DurableOnly => BLOB_PRESSURE_DURABLE_PENDING_SOURCES,
+    })?;
+    for row in table.iter()? {
+        let (key, value) = row?;
+        let key_bytes = key.value();
+        if !charge.charge(key_bytes.len(), value.value().len(), false)? {
+            return Ok((None, false));
+        }
+        if !value.value().is_empty() {
+            return Err(pressure_corruption(
+                "Blob pressure pending index value is not empty",
+            ));
+        }
+        let entry = decode_pending_index_key(&key_bytes)?;
+        if !eligibility.admits(entry.expiry) {
+            if eligibility == PressureSelectionEligibility::DurableOnly {
+                return Err(pressure_corruption(
+                    "durable pending index contains a finite candidate",
+                ));
+            }
+            continue;
+        }
+        if entry.priority >= incoming_priority {
+            return Ok((None, true));
+        }
+        let roots = read.open_table(BLOB_PRESSURE_PENDING_ROOTS)?;
+        let encoded = roots
+            .get(entry.transfer_id.as_bytes().as_slice())?
+            .ok_or_else(|| pressure_corruption("pressure pending index lacks its root"))?;
+        if !charge.charge(32, encoded.value().len(), true)? {
+            return Ok((None, false));
+        }
+        let root = decode_pending_root(encoded.value())?;
+        if pending_index_key_read(read, root, entry.transfer_id)? != key_bytes {
+            return Err(pressure_corruption(
+                "Blob pressure pending index contradicts its root",
+            ));
+        }
+        return Ok((
+            Some(PressureCandidate::PendingSource(entry.transfer_id)),
+            true,
         ));
     }
-    let entry = decode_pending_index_key(&key_bytes)?;
-    if entry.priority >= incoming_priority {
-        return Ok((None, true));
-    }
-    let roots = read.open_table(BLOB_PRESSURE_PENDING_ROOTS)?;
-    let encoded = roots
-        .get(entry.transfer_id.as_bytes().as_slice())?
-        .ok_or_else(|| pressure_corruption("pressure pending index lacks its root"))?;
-    if !charge.charge(32, encoded.value().len(), true)? {
-        return Ok((None, false));
-    }
-    let root = decode_pending_root(encoded.value())?;
-    if pending_index_key_read(read, root, entry.transfer_id)? != key_bytes {
-        return Err(pressure_corruption(
-            "Blob pressure pending index contradicts its root",
-        ));
-    }
-    Ok((
-        Some(PressureCandidate::PendingSource(entry.transfer_id)),
-        true,
-    ))
+    Ok((None, true))
 }
 
 fn select_variant_read(
     read: &redb::ReadTransaction,
     incoming_priority: Priority,
     charge: &mut PressureSelectionCharge,
+    eligibility: PressureSelectionEligibility,
 ) -> Result<(Option<PressureCandidate>, bool), StoreError> {
-    let table = read.open_table(BLOB_PRESSURE_VARIANTS)?;
-    let Some(row) = table.iter()?.next().transpose()? else {
-        return Ok((None, true));
-    };
-    let (key, value) = row;
-    let key_bytes = key.value();
-    if !charge.charge(key_bytes.len(), value.value().len(), false)? {
-        return Ok((None, false));
+    let table = read.open_table(match eligibility {
+        PressureSelectionEligibility::AllVisible => BLOB_PRESSURE_VARIANTS,
+        PressureSelectionEligibility::DurableOnly => BLOB_PRESSURE_DURABLE_VARIANTS,
+    })?;
+    if let Some(row) = table.iter()?.next().transpose()? {
+        let (key, value) = row;
+        let key_bytes = key.value();
+        if !charge.charge(key_bytes.len(), value.value().len(), false)? {
+            return Ok((None, false));
+        }
+        if !value.value().is_empty() {
+            return Err(pressure_corruption(
+                "Blob pressure variant index value is not empty",
+            ));
+        }
+        let (indexed, variant) = decode_variant_index_key(&key_bytes)?;
+        if eligibility == PressureSelectionEligibility::DurableOnly && indexed.has_finite_roots {
+            return Err(pressure_corruption(
+                "durable variant index contains a finite-root candidate",
+            ));
+        }
+        if indexed.effective_priority >= incoming_priority {
+            return Ok((None, true));
+        }
+        if indexed
+            .publication_roots
+            .checked_add(indexed.pending_roots)
+            .ok_or(StoreError::ItemCountAccountingOverflow)?
+            > charge.budget.roots
+        {
+            return Ok((None, false));
+        }
+        let summaries = read.open_table(BLOB_PRESSURE_VARIANT_SUMMARIES)?;
+        let encoded = summaries
+            .get(variant.as_bytes().as_slice())?
+            .ok_or_else(|| pressure_corruption("pressure variant index lacks its summary"))?;
+        if !charge.charge(32, encoded.value().len(), false)? {
+            return Ok((None, false));
+        }
+        let actual = decode_variant_summary(encoded.value())?;
+        if actual != indexed || variant_index_key_read(read, actual, variant)? != key_bytes {
+            return Err(pressure_corruption(
+                "Blob pressure variant index contradicts its summary",
+            ));
+        }
+        return Ok((Some(PressureCandidate::Variant(variant)), true));
     }
-    if !value.value().is_empty() {
-        return Err(pressure_corruption(
-            "Blob pressure variant index value is not empty",
-        ));
-    }
-    let (summary, variant) = decode_variant_index_key(&key_bytes)?;
-    if summary.effective_priority >= incoming_priority {
-        return Ok((None, true));
-    }
-    if summary
-        .publication_roots
-        .checked_add(summary.pending_roots)
-        .ok_or(StoreError::ItemCountAccountingOverflow)?
-        > charge.budget.roots
-    {
-        return Ok((None, false));
-    }
-    let summaries = read.open_table(BLOB_PRESSURE_VARIANT_SUMMARIES)?;
-    let encoded = summaries
-        .get(variant.as_bytes().as_slice())?
-        .ok_or_else(|| pressure_corruption("pressure variant index lacks its summary"))?;
-    if !charge.charge(32, encoded.value().len(), false)? {
-        return Ok((None, false));
-    }
-    let actual = decode_variant_summary(encoded.value())?;
-    if actual != summary || variant_index_key_read(read, actual, variant)? != key_bytes {
-        return Err(pressure_corruption(
-            "Blob pressure variant index contradicts its summary",
-        ));
-    }
-    Ok((Some(PressureCandidate::Variant(variant)), true))
+    Ok((None, true))
 }
 
 /// Selects only from the rejected partition using the canonical ordered index.
@@ -2029,24 +2281,60 @@ pub(crate) fn select_pressure_candidate_read(
     demand: BlobCapacityRecoveryDemand,
     budget: BlobPressureRecoveryBudget,
 ) -> Result<PressureSelection, StoreError> {
+    select_pressure_candidate_read_with_eligibility(
+        read,
+        demand,
+        budget,
+        PressureSelectionEligibility::AllVisible,
+    )
+}
+
+pub(crate) fn select_durable_pressure_candidate_read(
+    read: &redb::ReadTransaction,
+    demand: BlobCapacityRecoveryDemand,
+    budget: BlobPressureRecoveryBudget,
+) -> Result<PressureSelection, StoreError> {
+    select_pressure_candidate_read_with_eligibility(
+        read,
+        demand,
+        budget,
+        PressureSelectionEligibility::DurableOnly,
+    )
+}
+
+fn select_pressure_candidate_read_with_eligibility(
+    read: &redb::ReadTransaction,
+    demand: BlobCapacityRecoveryDemand,
+    budget: BlobPressureRecoveryBudget,
+    eligibility: PressureSelectionEligibility,
+) -> Result<PressureSelection, StoreError> {
     let mut charge = PressureSelectionCharge::new(budget);
     if !pressure_ready_read(read)? {
         return Ok(charge.finish(None, true));
     }
     let (candidate, proven) = match demand.partition {
         BlobCapacityPartition::AggregateItems | BlobCapacityPartition::AggregateBytes => {
-            select_global_publication_read(read, demand.incoming_priority, &mut charge)?
+            select_global_publication_read(
+                read,
+                demand.incoming_priority,
+                &mut charge,
+                eligibility,
+            )?
         }
-        BlobCapacityPartition::ContentPublications(identity) => {
-            select_content_publication_read(read, identity, demand.incoming_priority, &mut charge)?
-        }
+        BlobCapacityPartition::ContentPublications(identity) => select_content_publication_read(
+            read,
+            identity,
+            demand.incoming_priority,
+            &mut charge,
+            eligibility,
+        )?,
         BlobCapacityPartition::NetworkStagingRows | BlobCapacityPartition::NetworkStagingBytes => {
-            select_pending_source_read(read, demand.incoming_priority, &mut charge)?
+            select_pending_source_read(read, demand.incoming_priority, &mut charge, eligibility)?
         }
         BlobCapacityPartition::DepotBytes
         | BlobCapacityPartition::DepotChunks
         | BlobCapacityPartition::DepotVariants => {
-            select_variant_read(read, demand.incoming_priority, &mut charge)?
+            select_variant_read(read, demand.incoming_priority, &mut charge, eligibility)?
         }
         BlobCapacityPartition::Operation | BlobCapacityPartition::PublicationLifecycle => {
             (None, true)
@@ -2300,9 +2588,17 @@ pub(crate) struct PressureVariantSummary {
     pub(crate) publication_roots: u64,
     pub(crate) pending_roots: u64,
     pub(crate) final_reference_expiry: PressureExpiry,
+    pub(crate) has_finite_roots: bool,
 }
 
 pub(crate) fn encode_variant_summary(summary: PressureVariantSummary) -> Vec<u8> {
+    encode_variant_summary_for_generation(summary, false)
+}
+
+fn encode_variant_summary_for_generation(
+    summary: PressureVariantSummary,
+    activate_finite_aggregate: bool,
+) -> Vec<u8> {
     let mut output = Vec::with_capacity(53);
     output.push(PRESSURE_RECORD_VERSION);
     output.push(summary.effective_priority as u8);
@@ -2310,10 +2606,27 @@ pub(crate) fn encode_variant_summary(summary: PressureVariantSummary) -> Vec<u8>
     output.extend_from_slice(&summary.committed_progress.numerator.to_be_bytes());
     output.extend_from_slice(&summary.committed_progress.denominator.to_be_bytes());
     output.push(u8::from(summary.finalized));
-    output.extend_from_slice(&summary.publication_roots.to_be_bytes());
+    debug_assert!(summary.publication_roots < PRESSURE_VARIANT_HAS_FINITE_ROOT_MASK);
+    let encoded_publication_roots = summary.publication_roots
+        | if activate_finite_aggregate && summary.has_finite_roots {
+            PRESSURE_VARIANT_HAS_FINITE_ROOT_MASK
+        } else {
+            0
+        };
+    output.extend_from_slice(&encoded_publication_roots.to_be_bytes());
     output.extend_from_slice(&summary.pending_roots.to_be_bytes());
     summary.final_reference_expiry.encode(&mut output);
     output
+}
+
+fn encode_variant_summary_write(
+    write: &redb::WriteTransaction,
+    summary: PressureVariantSummary,
+) -> Result<Vec<u8>, StoreError> {
+    Ok(encode_variant_summary_for_generation(
+        summary,
+        finite_aggregate_active_write(write)?,
+    ))
 }
 
 pub(crate) fn decode_variant_summary(bytes: &[u8]) -> Result<PressureVariantSummary, StoreError> {
@@ -2336,7 +2649,9 @@ pub(crate) fn decode_variant_summary(bytes: &[u8]) -> Result<PressureVariantSumm
             ));
         }
     };
-    let publication_roots = cursor.u64()?;
+    let encoded_publication_roots = cursor.u64()?;
+    let publication_roots = encoded_publication_roots & !PRESSURE_VARIANT_HAS_FINITE_ROOT_MASK;
+    let has_finite_roots = encoded_publication_roots & PRESSURE_VARIANT_HAS_FINITE_ROOT_MASK != 0;
     let pending_roots = cursor.u64()?;
     if publication_roots == 0 && pending_roots == 0 {
         return Err(pressure_corruption(
@@ -2353,6 +2668,7 @@ pub(crate) fn decode_variant_summary(bytes: &[u8]) -> Result<PressureVariantSumm
         publication_roots,
         pending_roots,
         final_reference_expiry,
+        has_finite_roots,
     })
 }
 
@@ -2437,7 +2753,29 @@ impl<'a> PressureCursor<'a> {
 enum PressureSchemaState {
     Predecessor,
     V4,
+    OldV5,
     Current,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PressureImageEncodingGeneration {
+    LegacyV4,
+    PreTask5V5,
+    CurrentV5,
+}
+
+impl PressureImageEncodingGeneration {
+    const fn expiry_indexes_active(self) -> bool {
+        !matches!(self, Self::LegacyV4)
+    }
+
+    const fn finite_aggregate_active(self) -> bool {
+        matches!(self, Self::CurrentV5)
+    }
+
+    const fn durable_indexes_active(self) -> bool {
+        matches!(self, Self::CurrentV5)
+    }
 }
 
 #[derive(Default)]
@@ -2449,6 +2787,10 @@ struct PressureImage {
     content_publications: BTreeMap<Vec<u8>, Vec<u8>>,
     pending_sources: BTreeMap<[u8; PRESSURE_PENDING_INDEX_LEN], Vec<u8>>,
     variants: BTreeMap<[u8; PRESSURE_VARIANT_INDEX_LEN], Vec<u8>>,
+    durable_publications: BTreeMap<Vec<u8>, Vec<u8>>,
+    durable_content_publications: BTreeMap<Vec<u8>, Vec<u8>>,
+    durable_pending_sources: BTreeMap<[u8; PRESSURE_PENDING_INDEX_LEN], Vec<u8>>,
+    durable_variants: BTreeMap<[u8; PRESSURE_VARIANT_INDEX_LEN], Vec<u8>>,
     finite_publication_generations: BTreeMap<Vec<u8>, u64>,
     finite_pending_generations: BTreeMap<Vec<u8>, u64>,
     next_pending_acceptance_order: u64,
@@ -2826,7 +3168,7 @@ fn pressure_v4_table_names() -> [&'static str; 8] {
     ]
 }
 
-fn pressure_table_names() -> [&'static str; 9] {
+fn pressure_old_v5_table_names() -> [&'static str; 9] {
     [
         BLOB_PRESSURE_METADATA.name(),
         BLOB_PRESSURE_PUBLICATION_ROOTS.name(),
@@ -2838,6 +3180,29 @@ fn pressure_table_names() -> [&'static str; 9] {
         BLOB_PRESSURE_VARIANTS.name(),
         BLOB_PRESSURE_REANCHOR_CURSORS.name(),
     ]
+}
+
+fn pressure_table_names() -> [&'static str; 13] {
+    [
+        BLOB_PRESSURE_METADATA.name(),
+        BLOB_PRESSURE_PUBLICATION_ROOTS.name(),
+        BLOB_PRESSURE_PENDING_ROOTS.name(),
+        BLOB_PRESSURE_VARIANT_SUMMARIES.name(),
+        BLOB_PRESSURE_PUBLICATIONS.name(),
+        BLOB_PRESSURE_CONTENT_PUBLICATIONS.name(),
+        BLOB_PRESSURE_PENDING_SOURCES.name(),
+        BLOB_PRESSURE_VARIANTS.name(),
+        BLOB_PRESSURE_REANCHOR_CURSORS.name(),
+        BLOB_PRESSURE_DURABLE_PUBLICATIONS.name(),
+        BLOB_PRESSURE_DURABLE_CONTENT_PUBLICATIONS.name(),
+        BLOB_PRESSURE_DURABLE_PENDING_SOURCES.name(),
+        BLOB_PRESSURE_DURABLE_VARIANTS.name(),
+    ]
+}
+
+#[cfg(test)]
+pub(crate) fn pressure_table_names_for_test() -> [&'static str; 13] {
+    pressure_table_names()
 }
 
 fn pressure_schema_state<T>(transaction: &T) -> Result<PressureSchemaState, StoreError>
@@ -2865,6 +3230,14 @@ where
                     .all(|name| normal.contains(*name)) =>
         {
             Ok(PressureSchemaState::V4)
+        }
+        count
+            if count == pressure_old_v5_table_names().len()
+                && pressure_old_v5_table_names()
+                    .iter()
+                    .all(|name| normal.contains(*name)) =>
+        {
+            Ok(PressureSchemaState::OldV5)
         }
         count if count == names.len() => Ok(PressureSchemaState::Current),
         _ => Err(pressure_corruption(
@@ -3063,7 +3436,7 @@ fn build_pressure_image(
     next_pending_acceptance_order: u64,
     publication_encoding: super::lifecycle::PublicationEncodingGeneration,
     pending_root_encoding: PressurePendingRootEncodingGeneration,
-    activate_expiry_indexes: bool,
+    index_encoding: PressureImageEncodingGeneration,
 ) -> Result<PressureImage, StoreError> {
     if next_pending_acceptance_order == 0 {
         return Err(pressure_corruption(
@@ -3074,6 +3447,9 @@ fn build_pressure_image(
         next_pending_acceptance_order,
         ..PressureImage::default()
     };
+    let activate_expiry_indexes = index_encoding.expiry_indexes_active();
+    let activate_finite_aggregate = index_encoding.finite_aggregate_active();
+    let activate_durable_indexes = index_encoding.durable_indexes_active();
     let mut variant_roots =
         BTreeMap::<BlobVariantId, Vec<(Priority, u64, bool, PressureExpiry)>>::new();
     for row in publications.iter()? {
@@ -3131,8 +3507,16 @@ fn build_pressure_image(
         image
             .publication_roots
             .insert(key.value().to_vec(), root_value);
-        image.publications.insert(global_key, Vec::new());
-        image.content_publications.insert(content_key, Vec::new());
+        image.publications.insert(global_key.clone(), Vec::new());
+        image
+            .content_publications
+            .insert(content_key.clone(), Vec::new());
+        if activate_durable_indexes && root.expiry == PressureExpiry::Durable {
+            image.durable_publications.insert(global_key, Vec::new());
+            image
+                .durable_content_publications
+                .insert(content_key, Vec::new());
+        }
         variant_roots.entry(root.variant_id).or_default().push((
             root.priority,
             acceptance_order,
@@ -3180,10 +3564,14 @@ fn build_pressure_image(
             key.value().to_vec(),
             encode_pending_root_for_generation(&root, pending_root_encoding)?,
         );
-        image.pending_sources.insert(
-            encode_pending_index_key_for_generation(root.clone(), source, activate_expiry_indexes),
-            Vec::new(),
-        );
+        let pending_key =
+            encode_pending_index_key_for_generation(root.clone(), source, activate_expiry_indexes);
+        image.pending_sources.insert(pending_key, Vec::new());
+        if activate_durable_indexes && root.expiry == PressureExpiry::Durable {
+            image
+                .durable_pending_sources
+                .insert(pending_key, Vec::new());
+        }
         variant_roots.entry(root.variant_id).or_default().push((
             root.priority,
             acceptance_order,
@@ -3274,14 +3662,24 @@ fn build_pressure_image(
                 .map(|(_, _, _, expiry)| *expiry)
                 .reduce(latest_expiry)
                 .ok_or_else(|| pressure_corruption("Blob pressure variant has no expiries"))?,
+            has_finite_roots: roots
+                .iter()
+                .any(|(_, _, _, expiry)| *expiry != PressureExpiry::Durable),
         };
-        image
-            .variant_summaries
-            .insert(variant.as_bytes().to_vec(), encode_variant_summary(summary));
-        image.variants.insert(
-            encode_variant_index_key_for_generation(summary, variant, activate_expiry_indexes),
-            Vec::new(),
+        image.variant_summaries.insert(
+            variant.as_bytes().to_vec(),
+            encode_variant_summary_for_generation(summary, activate_finite_aggregate),
         );
+        let variant_key = encode_variant_index_key_for_generation(
+            summary,
+            variant,
+            activate_expiry_indexes,
+            activate_finite_aggregate,
+        );
+        image.variants.insert(variant_key, Vec::new());
+        if activate_durable_indexes && !summary.has_finite_roots {
+            image.durable_variants.insert(variant_key, Vec::new());
+        }
     }
     Ok(image)
 }
@@ -3341,6 +3739,19 @@ fn audit_image_write(
     )
 }
 
+fn audit_durable_image_write(
+    write: &redb::WriteTransaction,
+    image: &PressureImage,
+) -> Result<(), StoreError> {
+    audit_durable_image(
+        &write.open_table(BLOB_PRESSURE_DURABLE_PUBLICATIONS)?,
+        &write.open_table(BLOB_PRESSURE_DURABLE_CONTENT_PUBLICATIONS)?,
+        &write.open_table(BLOB_PRESSURE_DURABLE_PENDING_SOURCES)?,
+        &write.open_table(BLOB_PRESSURE_DURABLE_VARIANTS)?,
+        image,
+    )
+}
+
 fn audit_image_read(read: &redb::ReadTransaction, image: &PressureImage) -> Result<(), StoreError> {
     audit_image(
         &read.open_table(BLOB_PRESSURE_PUBLICATION_ROOTS)?,
@@ -3352,6 +3763,38 @@ fn audit_image_read(read: &redb::ReadTransaction, image: &PressureImage) -> Resu
         &read.open_table(BLOB_PRESSURE_VARIANTS)?,
         image,
     )
+}
+
+fn audit_durable_image_read(
+    read: &redb::ReadTransaction,
+    image: &PressureImage,
+) -> Result<(), StoreError> {
+    audit_durable_image(
+        &read.open_table(BLOB_PRESSURE_DURABLE_PUBLICATIONS)?,
+        &read.open_table(BLOB_PRESSURE_DURABLE_CONTENT_PUBLICATIONS)?,
+        &read.open_table(BLOB_PRESSURE_DURABLE_PENDING_SOURCES)?,
+        &read.open_table(BLOB_PRESSURE_DURABLE_VARIANTS)?,
+        image,
+    )
+}
+
+fn audit_durable_image(
+    publications: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    content_publications: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    pending_sources: &impl ReadableTable<PressurePendingIndexKey, &'static [u8]>,
+    variants: &impl ReadableTable<PressureVariantIndexKey, &'static [u8]>,
+    image: &PressureImage,
+) -> Result<(), StoreError> {
+    if table_map(publications)? != image.durable_publications
+        || table_map(content_publications)? != image.durable_content_publications
+        || pending_index_map(pending_sources)? != image.durable_pending_sources
+        || variant_index_map(variants)? != image.durable_variants
+    {
+        return Err(pressure_corruption(
+            "Blob pressure durable indexes contradict authoritative state",
+        ));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3588,7 +4031,7 @@ fn apply_image(write: &redb::WriteTransaction, image: &PressureImage) -> Result<
             "injected Blob pressure migration interruption",
         ));
     }
-    apply_index_maps(write, image)?;
+    apply_current_index_maps(write, image)?;
     let mut cursors = write.open_table(BLOB_PRESSURE_REANCHOR_CURSORS)?;
     cursors.insert(1, image.reanchor_live_cursor.as_slice())?;
     cursors.insert(2, image.reanchor_pending_cursor.as_slice())?;
@@ -3650,8 +4093,78 @@ fn apply_index_maps(
     Ok(())
 }
 
+fn apply_current_index_maps(
+    write: &redb::WriteTransaction,
+    image: &PressureImage,
+) -> Result<(), StoreError> {
+    apply_index_maps(write, image)?;
+    apply_durable_index_maps(write, image)
+}
+
+fn replace_current_index_maps(
+    write: &redb::WriteTransaction,
+    image: &PressureImage,
+) -> Result<(), StoreError> {
+    write.delete_table(BLOB_PRESSURE_PUBLICATION_ROOTS)?;
+    write.delete_table(BLOB_PRESSURE_PENDING_ROOTS)?;
+    write.delete_table(BLOB_PRESSURE_VARIANT_SUMMARIES)?;
+    write.delete_table(BLOB_PRESSURE_PUBLICATIONS)?;
+    write.delete_table(BLOB_PRESSURE_CONTENT_PUBLICATIONS)?;
+    write.delete_table(BLOB_PRESSURE_PENDING_SOURCES)?;
+    write.delete_table(BLOB_PRESSURE_VARIANTS)?;
+    write.delete_table(BLOB_PRESSURE_DURABLE_PUBLICATIONS)?;
+    write.delete_table(BLOB_PRESSURE_DURABLE_CONTENT_PUBLICATIONS)?;
+    write.delete_table(BLOB_PRESSURE_DURABLE_PENDING_SOURCES)?;
+    write.delete_table(BLOB_PRESSURE_DURABLE_VARIANTS)?;
+    #[cfg(test)]
+    if TEST_PRESSURE_MIGRATION_FAULT.get() {
+        return Err(pressure_corruption(
+            "injected Blob pressure migration interruption",
+        ));
+    }
+    apply_current_index_maps(write, image)
+}
+
+fn apply_durable_index_maps(
+    write: &redb::WriteTransaction,
+    image: &PressureImage,
+) -> Result<(), StoreError> {
+    macro_rules! insert_map {
+        ($definition:expr, $rows:expr) => {{
+            let mut table = write.open_table($definition)?;
+            for (key, value) in $rows {
+                table.insert(key.as_slice(), value.as_slice())?;
+            }
+        }};
+    }
+    insert_map!(
+        BLOB_PRESSURE_DURABLE_PUBLICATIONS,
+        &image.durable_publications
+    );
+    insert_map!(
+        BLOB_PRESSURE_DURABLE_CONTENT_PUBLICATIONS,
+        &image.durable_content_publications
+    );
+    {
+        let mut table = write.open_table(BLOB_PRESSURE_DURABLE_PENDING_SOURCES)?;
+        for (key, value) in &image.durable_pending_sources {
+            table.insert(key, value.as_slice())?;
+        }
+    }
+    {
+        let mut table = write.open_table(BLOB_PRESSURE_DURABLE_VARIANTS)?;
+        for (key, value) in &image.durable_variants {
+            table.insert(key, value.as_slice())?;
+        }
+    }
+    Ok(())
+}
+
 fn replace_image(write: &redb::WriteTransaction, image: &PressureImage) -> Result<(), StoreError> {
-    let has_reanchor_cursors = pressure_schema_state(write)? == PressureSchemaState::Current;
+    let has_reanchor_cursors = matches!(
+        pressure_schema_state(write)?,
+        PressureSchemaState::OldV5 | PressureSchemaState::Current
+    );
     write.delete_table(BLOB_PRESSURE_PUBLICATION_ROOTS)?;
     write.delete_table(BLOB_PRESSURE_PENDING_ROOTS)?;
     write.delete_table(BLOB_PRESSURE_VARIANT_SUMMARIES)?;
@@ -3661,6 +4174,10 @@ fn replace_image(write: &redb::WriteTransaction, image: &PressureImage) -> Resul
     write.delete_table(BLOB_PRESSURE_VARIANTS)?;
     if has_reanchor_cursors {
         write.delete_table(BLOB_PRESSURE_REANCHOR_CURSORS)?;
+        write.delete_table(BLOB_PRESSURE_DURABLE_PUBLICATIONS)?;
+        write.delete_table(BLOB_PRESSURE_DURABLE_CONTENT_PUBLICATIONS)?;
+        write.delete_table(BLOB_PRESSURE_DURABLE_PENDING_SOURCES)?;
+        write.delete_table(BLOB_PRESSURE_DURABLE_VARIANTS)?;
     }
     apply_image(write, image)
 }
@@ -3669,7 +4186,10 @@ fn replace_with_v4_image(
     write: &redb::WriteTransaction,
     image: &PressureImage,
 ) -> Result<(), StoreError> {
-    let has_reanchor_cursors = pressure_schema_state(write)? == PressureSchemaState::Current;
+    let has_reanchor_cursors = matches!(
+        pressure_schema_state(write)?,
+        PressureSchemaState::OldV5 | PressureSchemaState::Current
+    );
     write.delete_table(BLOB_PRESSURE_PUBLICATION_ROOTS)?;
     write.delete_table(BLOB_PRESSURE_PENDING_ROOTS)?;
     write.delete_table(BLOB_PRESSURE_VARIANT_SUMMARIES)?;
@@ -3679,6 +4199,10 @@ fn replace_with_v4_image(
     write.delete_table(BLOB_PRESSURE_VARIANTS)?;
     if has_reanchor_cursors {
         write.delete_table(BLOB_PRESSURE_REANCHOR_CURSORS)?;
+        write.delete_table(BLOB_PRESSURE_DURABLE_PUBLICATIONS)?;
+        write.delete_table(BLOB_PRESSURE_DURABLE_CONTENT_PUBLICATIONS)?;
+        write.delete_table(BLOB_PRESSURE_DURABLE_PENDING_SOURCES)?;
+        write.delete_table(BLOB_PRESSURE_DURABLE_VARIANTS)?;
     }
     apply_v4_image(write, image)
 }
@@ -3702,7 +4226,7 @@ pub(crate) fn downgrade_pressure_v5_to_v4_for_test(
         next,
         super::lifecycle::publication_encoding_write(write)?,
         PressurePendingRootEncodingGeneration::PressureV4,
-        false,
+        PressureImageEncodingGeneration::LegacyV4,
     )?;
     write.delete_table(BLOB_PRESSURE_PUBLICATION_ROOTS)?;
     write.delete_table(BLOB_PRESSURE_PENDING_ROOTS)?;
@@ -3712,6 +4236,10 @@ pub(crate) fn downgrade_pressure_v5_to_v4_for_test(
     write.delete_table(BLOB_PRESSURE_PENDING_SOURCES)?;
     write.delete_table(BLOB_PRESSURE_VARIANTS)?;
     write.delete_table(BLOB_PRESSURE_REANCHOR_CURSORS)?;
+    write.delete_table(BLOB_PRESSURE_DURABLE_PUBLICATIONS)?;
+    write.delete_table(BLOB_PRESSURE_DURABLE_CONTENT_PUBLICATIONS)?;
+    write.delete_table(BLOB_PRESSURE_DURABLE_PENDING_SOURCES)?;
+    write.delete_table(BLOB_PRESSURE_DURABLE_VARIANTS)?;
     apply_index_maps(write, &image)?;
     let mut metadata = write.open_table(BLOB_PRESSURE_METADATA)?;
     metadata.insert(PRESSURE_SCHEMA_VERSION_FIELD, PRESSURE_V4_SCHEMA_VERSION)?;
@@ -3728,7 +4256,7 @@ fn audit_or_migrate_pressure_write_inner(
     let state = pressure_schema_state(write)?;
     if let Some(lifecycle_was_predecessor) = lifecycle_was_predecessor {
         match (lifecycle_was_predecessor, state) {
-            (false, PressureSchemaState::Current)
+            (false, PressureSchemaState::OldV5 | PressureSchemaState::Current)
             | (true, PressureSchemaState::Predecessor | PressureSchemaState::V4) => {}
             _ => {
                 return Err(pressure_corruption(
@@ -3740,7 +4268,12 @@ fn audit_or_migrate_pressure_write_inner(
     let publication_generation = super::lifecycle::publication_encoding_write(write)?;
     let pending_generation =
         super::pending_blob_encoding_for_publication_encoding(publication_generation);
-    let migrated_next = migrate_pending_acceptance_orders(write, pending_generation)?;
+    let migrated_next = match state {
+        PressureSchemaState::Predecessor | PressureSchemaState::V4 => Some(
+            migrate_pending_acceptance_orders(write, pending_generation)?,
+        ),
+        PressureSchemaState::OldV5 | PressureSchemaState::Current => None,
+    };
     match state {
         PressureSchemaState::Predecessor => {
             let mut image = build_pressure_image(
@@ -3750,10 +4283,12 @@ fn audit_or_migrate_pressure_write_inner(
                 &write.open_table(super::BLOB_CARRIER_PREFIXES)?,
                 &write.open_table(super::BLOB_IMPORTS)?,
                 &write.open_table(super::BLOB_CHUNKS)?,
-                migrated_next,
+                migrated_next.ok_or_else(|| {
+                    pressure_corruption("predecessor pressure migration order is missing")
+                })?,
                 super::lifecycle::publication_encoding_write(write)?,
                 PressurePendingRootEncodingGeneration::PressureV4,
-                true,
+                PressureImageEncodingGeneration::CurrentV5,
             )?;
             prepare_reanchor_image(write, &mut image)?;
             apply_image(write, &image)
@@ -3778,9 +4313,10 @@ fn audit_or_migrate_pressure_write_inner(
                 next,
                 super::lifecycle::publication_encoding_write(write)?,
                 PressurePendingRootEncodingGeneration::PressureV4,
-                true,
+                PressureImageEncodingGeneration::CurrentV5,
             )?;
             audit_image_write(write, &image)?;
+            audit_durable_image_write(write, &image)?;
             audit_reanchor_state(
                 &write.open_table(BLOB_PRESSURE_METADATA)?,
                 &write.open_table(BLOB_PRESSURE_REANCHOR_CURSORS)?,
@@ -3788,6 +4324,69 @@ fn audit_or_migrate_pressure_write_inner(
                 false,
                 &image.finite_publication_generations,
                 &image.finite_pending_generations,
+            )
+        }
+        PressureSchemaState::OldV5 => {
+            let metadata = write.open_table(BLOB_PRESSURE_METADATA)?;
+            let next = metadata
+                .get(NEXT_PENDING_ACCEPTANCE_ORDER)?
+                .map(|value| value.value())
+                .ok_or_else(|| {
+                    pressure_corruption("next pending Blob acceptance order is missing")
+                })?;
+            drop(metadata);
+            let old_image = build_pressure_image(
+                &write.open_table(super::BLOB_PUBLICATIONS)?,
+                &write.open_table(super::BLOB_ACCEPTANCE_MARKERS)?,
+                &write.open_table(super::BLOB_PENDING_SOURCES)?,
+                &write.open_table(super::BLOB_CARRIER_PREFIXES)?,
+                &write.open_table(super::BLOB_IMPORTS)?,
+                &write.open_table(super::BLOB_CHUNKS)?,
+                next,
+                super::lifecycle::publication_encoding_write(write)?,
+                PressurePendingRootEncodingGeneration::PressureV4,
+                PressureImageEncodingGeneration::PreTask5V5,
+            )?;
+            audit_image_write(write, &old_image)?;
+            audit_reanchor_state(
+                &write.open_table(BLOB_PRESSURE_METADATA)?,
+                &write.open_table(BLOB_PRESSURE_REANCHOR_CURSORS)?,
+                crate::custody::lower_bound_continuity_write(write)?,
+                true,
+                &old_image.finite_publication_generations,
+                &old_image.finite_pending_generations,
+            )?;
+            synchronize_reanchor_state_write(write)?;
+            let current_image = build_pressure_image(
+                &write.open_table(super::BLOB_PUBLICATIONS)?,
+                &write.open_table(super::BLOB_ACCEPTANCE_MARKERS)?,
+                &write.open_table(super::BLOB_PENDING_SOURCES)?,
+                &write.open_table(super::BLOB_CARRIER_PREFIXES)?,
+                &write.open_table(super::BLOB_IMPORTS)?,
+                &write.open_table(super::BLOB_CHUNKS)?,
+                next,
+                super::lifecycle::publication_encoding_write(write)?,
+                PressurePendingRootEncodingGeneration::PressureV4,
+                PressureImageEncodingGeneration::CurrentV5,
+            )?;
+            audit_reanchor_state(
+                &write.open_table(BLOB_PRESSURE_METADATA)?,
+                &write.open_table(BLOB_PRESSURE_REANCHOR_CURSORS)?,
+                crate::custody::lower_bound_continuity_write(write)?,
+                false,
+                &current_image.finite_publication_generations,
+                &current_image.finite_pending_generations,
+            )?;
+            replace_current_index_maps(write, &current_image)?;
+            audit_image_write(write, &current_image)?;
+            audit_durable_image_write(write, &current_image)?;
+            audit_reanchor_state(
+                &write.open_table(BLOB_PRESSURE_METADATA)?,
+                &write.open_table(BLOB_PRESSURE_REANCHOR_CURSORS)?,
+                crate::custody::lower_bound_continuity_write(write)?,
+                false,
+                &current_image.finite_publication_generations,
+                &current_image.finite_pending_generations,
             )
         }
         PressureSchemaState::V4 => {
@@ -3836,7 +4435,7 @@ fn audit_or_migrate_pressure_write_inner(
                 } else {
                     PressurePendingRootEncodingGeneration::PressureV3
                 },
-                false,
+                PressureImageEncodingGeneration::LegacyV4,
             )?;
             audit_image_write(write, &image)?;
             let mut current = build_pressure_image(
@@ -3849,7 +4448,7 @@ fn audit_or_migrate_pressure_write_inner(
                 next,
                 super::lifecycle::publication_encoding_write(write)?,
                 PressurePendingRootEncodingGeneration::PressureV4,
-                true,
+                PressureImageEncodingGeneration::CurrentV5,
             )?;
             prepare_reanchor_image(write, &mut current)?;
             replace_image(write, &current)
@@ -3886,7 +4485,7 @@ pub(crate) fn require_pressure_consistent_write(
     write: &redb::WriteTransaction,
 ) -> Result<(), StoreError> {
     match pressure_schema_state(write)? {
-        PressureSchemaState::V4 | PressureSchemaState::Current => {
+        PressureSchemaState::V4 | PressureSchemaState::OldV5 | PressureSchemaState::Current => {
             audit_or_migrate_pressure_write(write)
         }
         _ => Err(pressure_corruption(
@@ -3906,7 +4505,15 @@ pub(crate) fn inspect_pressure_read(
         ));
     }
     let metadata = read.open_table(BLOB_PRESSURE_METADATA)?;
-    if state == PressureSchemaState::Current {
+    if matches!(
+        state,
+        PressureSchemaState::OldV5 | PressureSchemaState::Current
+    ) {
+        if !lifecycle_is_current {
+            return Err(pressure_corruption(
+                "Blob lifecycle and pressure schema generations are mixed",
+            ));
+        }
         let next = metadata
             .get(NEXT_PENDING_ACCEPTANCE_ORDER)?
             .map(|value| value.value())
@@ -3922,9 +4529,16 @@ pub(crate) fn inspect_pressure_read(
             next,
             super::lifecycle::publication_encoding_read(read)?,
             PressurePendingRootEncodingGeneration::PressureV4,
-            true,
+            if state == PressureSchemaState::OldV5 {
+                PressureImageEncodingGeneration::PreTask5V5
+            } else {
+                PressureImageEncodingGeneration::CurrentV5
+            },
         )?;
         audit_image_read(read, &image)?;
+        if state == PressureSchemaState::Current {
+            audit_durable_image_read(read, &image)?;
+        }
         return audit_reanchor_state(
             &read.open_table(BLOB_PRESSURE_METADATA)?,
             &read.open_table(BLOB_PRESSURE_REANCHOR_CURSORS)?,
@@ -3981,7 +4595,7 @@ pub(crate) fn inspect_pressure_read(
         } else {
             PressurePendingRootEncodingGeneration::PressureV3
         },
-        false,
+        PressureImageEncodingGeneration::LegacyV4,
     )?;
     audit_image_read(read, &image)?;
     Ok(())
@@ -4098,6 +4712,7 @@ pub(super) fn insert_pending_source_write(
             "new pending Blob source duplicates its pressure index",
         ));
     }
+    insert_durable_pending_index_write(write, root.clone(), transfer)?;
 
     if variant_references_write(write, root.variant_id)?.is_empty() {
         add_root_to_variant_summary_without_references(
@@ -4153,7 +4768,7 @@ pub(super) fn require_pending_source_write(
             "pending Blob pressure root contradicts its source",
         ));
     }
-    let key = pending_index_key_write(write, root, transfer)?;
+    let key = pending_index_key_write(write, root.clone(), transfer)?;
     if write
         .open_table(BLOB_PRESSURE_PENDING_SOURCES)?
         .get(&key)?
@@ -4162,6 +4777,17 @@ pub(super) fn require_pending_source_write(
     {
         return Err(pressure_corruption(
             "pending Blob pressure root lacks its exact index",
+        ));
+    }
+    if expiry_indexes_active_write(write)?
+        && write
+            .open_table(BLOB_PRESSURE_DURABLE_PENDING_SOURCES)?
+            .get(&key)?
+            .is_some()
+            != (root.expiry == PressureExpiry::Durable)
+    {
+        return Err(pressure_corruption(
+            "pending Blob durable pressure index contradicts its root",
         ));
     }
     Ok(())
@@ -4178,6 +4804,7 @@ pub(super) fn rekey_pending_source_lifetime_write(
         .map(|value| value.value().to_vec())
         .ok_or_else(|| pressure_corruption("pending Blob source lacks its pressure root"))?;
     let old = decode_pending_root(&old_encoded)?;
+    remove_durable_pending_index_write(write, old.clone(), transfer)?;
     if write
         .open_table(BLOB_PRESSURE_PENDING_SOURCES)?
         .remove(&pending_index_key_write(write, old.clone(), transfer)?)?
@@ -4224,7 +4851,7 @@ pub(super) fn rekey_pending_source_lifetime_write(
     if write
         .open_table(BLOB_PRESSURE_PENDING_SOURCES)?
         .insert(
-            &pending_index_key_write(write, updated, transfer)?,
+            &pending_index_key_write(write, updated.clone(), transfer)?,
             &[] as &[u8],
         )?
         .is_some()
@@ -4233,6 +4860,7 @@ pub(super) fn rekey_pending_source_lifetime_write(
             "pending Blob pressure re-key duplicated its index",
         ));
     }
+    insert_durable_pending_index_write(write, updated, transfer)?;
     refresh_variant_summary(write, record.metadata.variant_id, false)
 }
 
@@ -4283,6 +4911,7 @@ pub(super) fn rekey_publication_lifetime_write(
         .map(|value| value.value().to_vec())
         .ok_or_else(|| pressure_corruption("publication lacks its pressure root"))?;
     let old = decode_publication_root(&encoded)?;
+    remove_durable_publication_indexes_write(write, &old, transfer)?;
     let old_global = publication_index_key_write(
         write,
         PressurePublicationKey {
@@ -4335,6 +4964,7 @@ pub(super) fn rekey_publication_lifetime_write(
             "publication pressure re-key duplicated its index",
         ));
     }
+    insert_durable_publication_indexes_write(write, &updated, transfer)?;
     refresh_variant_summary(write, updated.variant_id, false)
 }
 
@@ -4376,6 +5006,25 @@ fn require_publication_root_write(
         return Err(pressure_corruption(
             "publication pressure root lacks its exact indexes",
         ));
+    }
+    if expiry_indexes_active_write(write)? {
+        let content = content_publication_index_key_write(write, expected, transfer)?;
+        let durable = expected.expiry == PressureExpiry::Durable;
+        if write
+            .open_table(BLOB_PRESSURE_DURABLE_PUBLICATIONS)?
+            .get(global.as_slice())?
+            .is_some()
+            != durable
+            || write
+                .open_table(BLOB_PRESSURE_DURABLE_CONTENT_PUBLICATIONS)?
+                .get(content.as_slice())?
+                .is_some()
+                != durable
+        {
+            return Err(pressure_corruption(
+                "publication durable pressure indexes contradict its root",
+            ));
+        }
     }
     Ok(())
 }
@@ -4510,6 +5159,7 @@ fn require_variant_references_write(
     let mut publication_roots = 0u64;
     let mut pending_roots = 0u64;
     let mut final_reference_expiry = PressureExpiry::ExpiredFinite;
+    let mut has_finite_roots = false;
     for &(owner, transfer) in references {
         match owner {
             super::lifecycle::VariantReferenceOwner::Publication => {
@@ -4523,6 +5173,7 @@ fn require_variant_references_write(
                 effective_priority = effective_priority.max(root.priority);
                 minimum_order = minimum_order.min(root.acceptance_order);
                 final_reference_expiry = latest_expiry(final_reference_expiry, root.expiry);
+                has_finite_roots |= root.expiry != PressureExpiry::Durable;
                 publication_roots = publication_roots
                     .checked_add(1)
                     .ok_or(StoreError::ItemCountAccountingOverflow)?;
@@ -4542,10 +5193,9 @@ fn require_variant_references_write(
                 require_pending_source_write(write, transfer, &record)?;
                 effective_priority = effective_priority.max(record.metadata.header.priority);
                 minimum_order = minimum_order.min(record.pending_acceptance_order);
-                final_reference_expiry = latest_expiry(
-                    final_reference_expiry,
-                    lifetime_expiry(record.metadata.lifetime)?,
-                );
+                let expiry = lifetime_expiry(record.metadata.lifetime)?;
+                final_reference_expiry = latest_expiry(final_reference_expiry, expiry);
+                has_finite_roots |= expiry != PressureExpiry::Durable;
                 pending_roots = pending_roots
                     .checked_add(1)
                     .ok_or(StoreError::ItemCountAccountingOverflow)?;
@@ -4561,6 +5211,7 @@ fn require_variant_references_write(
         publication_roots,
         pending_roots,
         final_reference_expiry,
+        has_finite_roots,
     };
     let actual = write
         .open_table(BLOB_PRESSURE_VARIANT_SUMMARIES)?
@@ -4577,6 +5228,17 @@ fn require_variant_references_write(
     {
         return Err(pressure_corruption(
             "Blob pressure variant summary or index contradicts authoritative state",
+        ));
+    }
+    if expiry_indexes_active_write(write)?
+        && write
+            .open_table(BLOB_PRESSURE_DURABLE_VARIANTS)?
+            .get(&variant_index_key_write(write, actual, variant)?)?
+            .is_some()
+            != !actual.has_finite_roots
+    {
+        return Err(pressure_corruption(
+            "Blob durable pressure variant index contradicts its summary",
         ));
     }
     Ok(())
@@ -4706,6 +5368,41 @@ fn bounded_publication_root_write(
         return Err(pressure_corruption(
             "publication pressure root lacks its exact indexes",
         ));
+    }
+    if expiry_indexes_active_write(write)? {
+        let durable = root.expiry == PressureExpiry::Durable;
+        if durable
+            && (!charge.charge_row(
+                super::MaintenanceRowIdentity::new(
+                    BLOB_PRESSURE_DURABLE_PUBLICATIONS.name(),
+                    global.as_slice(),
+                ),
+                0,
+            )? || !charge.charge_row(
+                super::MaintenanceRowIdentity::new(
+                    BLOB_PRESSURE_DURABLE_CONTENT_PUBLICATIONS.name(),
+                    content.as_slice(),
+                ),
+                0,
+            )?)
+        {
+            return Ok(None);
+        }
+        if write
+            .open_table(BLOB_PRESSURE_DURABLE_PUBLICATIONS)?
+            .get(global.as_slice())?
+            .is_some()
+            != durable
+            || write
+                .open_table(BLOB_PRESSURE_DURABLE_CONTENT_PUBLICATIONS)?
+                .get(content.as_slice())?
+                .is_some()
+                != durable
+        {
+            return Err(pressure_corruption(
+                "publication durable pressure indexes contradict its root",
+            ));
+        }
     }
     Ok(Some(root))
 }
@@ -4854,6 +5551,30 @@ fn bounded_pending_root_write(
             "pending Blob pressure root lacks its exact index",
         ));
     }
+    if expiry_indexes_active_write(write)? {
+        let durable = root.expiry == PressureExpiry::Durable;
+        if durable
+            && !charge.charge_row(
+                super::MaintenanceRowIdentity::new(
+                    BLOB_PRESSURE_DURABLE_PENDING_SOURCES.name(),
+                    key.as_slice(),
+                ),
+                0,
+            )?
+        {
+            return Ok(None);
+        }
+        if write
+            .open_table(BLOB_PRESSURE_DURABLE_PENDING_SOURCES)?
+            .get(&key)?
+            .is_some()
+            != durable
+        {
+            return Err(pressure_corruption(
+                "pending Blob durable pressure index contradicts its root",
+            ));
+        }
+    }
     Ok(Some(root))
 }
 
@@ -4931,6 +5652,7 @@ pub(crate) fn require_variant_with_references_bounded_write(
     let mut publication_roots = 0u64;
     let mut pending_roots = 0u64;
     let mut final_reference_expiry = PressureExpiry::ExpiredFinite;
+    let mut has_finite_roots = false;
     for &(owner, transfer) in references {
         match owner {
             super::lifecycle::VariantReferenceOwner::Publication => {
@@ -4945,6 +5667,7 @@ pub(crate) fn require_variant_with_references_bounded_write(
                 effective_priority = effective_priority.max(root.priority);
                 minimum_order = minimum_order.min(root.acceptance_order);
                 final_reference_expiry = latest_expiry(final_reference_expiry, root.expiry);
+                has_finite_roots |= root.expiry != PressureExpiry::Durable;
                 publication_roots = publication_roots
                     .checked_add(1)
                     .ok_or(StoreError::ItemCountAccountingOverflow)?;
@@ -4978,6 +5701,7 @@ pub(crate) fn require_variant_with_references_bounded_write(
                 effective_priority = effective_priority.max(root.priority);
                 minimum_order = minimum_order.min(root.acceptance_order);
                 final_reference_expiry = latest_expiry(final_reference_expiry, root.expiry);
+                has_finite_roots |= root.expiry != PressureExpiry::Durable;
                 pending_roots = pending_roots
                     .checked_add(1)
                     .ok_or(StoreError::ItemCountAccountingOverflow)?;
@@ -5012,6 +5736,7 @@ pub(crate) fn require_variant_with_references_bounded_write(
         || actual.publication_roots != publication_roots
         || actual.pending_roots != pending_roots
         || actual.final_reference_expiry != final_reference_expiry
+        || actual.has_finite_roots != has_finite_roots
     {
         return Err(pressure_corruption(
             "Blob pressure variant summary contradicts its bounded roots",
@@ -5033,6 +5758,30 @@ pub(crate) fn require_variant_with_references_bounded_write(
         return Err(pressure_corruption(
             "Blob pressure variant summary lacks its exact index",
         ));
+    }
+    if expiry_indexes_active_write(write)? {
+        let durable = !actual.has_finite_roots;
+        if durable
+            && !charge.charge_row(
+                super::MaintenanceRowIdentity::new(
+                    BLOB_PRESSURE_DURABLE_VARIANTS.name(),
+                    key.as_slice(),
+                ),
+                0,
+            )?
+        {
+            return Ok(false);
+        }
+        if write
+            .open_table(BLOB_PRESSURE_DURABLE_VARIANTS)?
+            .get(&key)?
+            .is_some()
+            != durable
+        {
+            return Err(pressure_corruption(
+                "Blob durable pressure variant index contradicts its summary",
+            ));
+        }
     }
     Ok(true)
 }
@@ -5131,6 +5880,7 @@ fn variant_summary_for_references_write(
     let mut publication_roots = 0u64;
     let mut pending_roots = 0u64;
     let mut final_reference_expiry = PressureExpiry::ExpiredFinite;
+    let mut has_finite_roots = false;
     for &(owner, transfer) in references {
         let (priority, order, expiry) = match owner {
             super::lifecycle::VariantReferenceOwner::Publication => {
@@ -5175,6 +5925,7 @@ fn variant_summary_for_references_write(
         effective_priority = effective_priority.max(priority);
         minimum_order = minimum_order.min(order);
         final_reference_expiry = latest_expiry(final_reference_expiry, expiry);
+        has_finite_roots |= expiry != PressureExpiry::Durable;
     }
     let (committed_progress, finalized) = variant_progress_write(write, variant)?;
     Ok(PressureVariantSummary {
@@ -5185,6 +5936,7 @@ fn variant_summary_for_references_write(
         publication_roots,
         pending_roots,
         final_reference_expiry,
+        has_finite_roots,
     })
 }
 
@@ -5223,6 +5975,9 @@ fn add_root_to_variant_summary_without_references(
             "Blob pressure variant summary lacks its exact index",
         ));
     }
+    if let Some(old) = old {
+        remove_durable_variant_index_write(write, old, variant)?;
+    }
     let (committed_progress, finalized) = variant_progress_write(write, variant)?;
     let publication_roots = match old {
         Some(value) => value
@@ -5250,8 +6005,10 @@ fn add_root_to_variant_summary_without_references(
         final_reference_expiry: old.map_or(expiry, |value| {
             latest_expiry(value.final_reference_expiry, expiry)
         }),
+        has_finite_roots: old.is_some_and(|value| value.has_finite_roots)
+            || expiry != PressureExpiry::Durable,
     };
-    let encoded = encode_variant_summary(summary);
+    let encoded = encode_variant_summary_write(write, summary)?;
     write
         .open_table(BLOB_PRESSURE_VARIANT_SUMMARIES)?
         .insert(variant.as_bytes().as_slice(), encoded.as_slice())?;
@@ -5267,6 +6024,7 @@ fn add_root_to_variant_summary_without_references(
             "Blob pressure variant index duplicates another summary",
         ));
     }
+    insert_durable_variant_index_write(write, summary, variant)?;
     Ok(())
 }
 
@@ -5293,6 +6051,7 @@ fn refresh_variant_summary(
                 "Blob pressure variant summary lacks its exact index",
             ));
         }
+        remove_durable_variant_index_write(write, old, variant)?;
     } else if references.is_empty() {
         return Ok(());
     } else if !allow_first_summary || references.len() != 1 {
@@ -5317,6 +6076,7 @@ fn refresh_variant_summary(
     let mut publication_roots = 0u64;
     let mut pending_roots = 0u64;
     let mut final_reference_expiry = PressureExpiry::ExpiredFinite;
+    let mut has_finite_roots = false;
     for (owner, transfer) in references {
         match owner {
             super::lifecycle::VariantReferenceOwner::Publication => {
@@ -5336,6 +6096,7 @@ fn refresh_variant_summary(
                 effective_priority = effective_priority.max(root.priority);
                 minimum_order = minimum_order.min(root.acceptance_order);
                 final_reference_expiry = latest_expiry(final_reference_expiry, root.expiry);
+                has_finite_roots |= root.expiry != PressureExpiry::Durable;
                 publication_roots = publication_roots
                     .checked_add(1)
                     .ok_or(StoreError::ItemCountAccountingOverflow)?;
@@ -5357,6 +6118,7 @@ fn refresh_variant_summary(
                 effective_priority = effective_priority.max(root.priority);
                 minimum_order = minimum_order.min(root.acceptance_order);
                 final_reference_expiry = latest_expiry(final_reference_expiry, root.expiry);
+                has_finite_roots |= root.expiry != PressureExpiry::Durable;
                 pending_roots = pending_roots
                     .checked_add(1)
                     .ok_or(StoreError::ItemCountAccountingOverflow)?;
@@ -5372,8 +6134,9 @@ fn refresh_variant_summary(
         publication_roots,
         pending_roots,
         final_reference_expiry,
+        has_finite_roots,
     };
-    let encoded = encode_variant_summary(summary);
+    let encoded = encode_variant_summary_write(write, summary)?;
     write
         .open_table(BLOB_PRESSURE_VARIANT_SUMMARIES)?
         .insert(variant.as_bytes().as_slice(), encoded.as_slice())?;
@@ -5389,6 +6152,7 @@ fn refresh_variant_summary(
             "Blob pressure variant index duplicates another summary",
         ));
     }
+    insert_durable_variant_index_write(write, summary, variant)?;
     Ok(())
 }
 
@@ -5427,7 +6191,8 @@ pub(crate) fn reconcile_variant_write(
                         "pending pressure root contradicts authoritative state",
                     ));
                 }
-                let old_key = pending_index_key_write(write, old, transfer)?;
+                let old_key = pending_index_key_write(write, old.clone(), transfer)?;
+                remove_durable_pending_index_write(write, old, transfer)?;
                 if write
                     .open_table(BLOB_PRESSURE_PENDING_SOURCES)?
                     .remove(&old_key)?
@@ -5462,13 +6227,14 @@ pub(crate) fn reconcile_variant_write(
                 if write
                     .open_table(BLOB_PRESSURE_PENDING_SOURCES)?
                     .insert(
-                        &pending_index_key_write(write, expected, transfer)?,
+                        &pending_index_key_write(write, expected.clone(), transfer)?,
                         &[] as &[u8],
                     )?
                     .is_some()
                 {
                     return Err(pressure_corruption("pending pressure index is duplicated"));
                 }
+                insert_durable_pending_index_write(write, expected, transfer)?;
             }
         }
     }
@@ -5518,6 +6284,7 @@ fn insert_publication_root_write(
             "publication pressure index is duplicated",
         ));
     }
+    insert_durable_publication_indexes_write(write, &root, transfer)?;
     Ok(root.variant_id)
 }
 
@@ -5552,6 +6319,7 @@ fn remove_pending_root_write(
         .map(|value| value.value().to_vec())
         .ok_or_else(|| pressure_corruption("removed pending source lacks pressure root"))?;
     let root = decode_pending_root(&encoded)?;
+    remove_durable_pending_index_write(write, root.clone(), transfer)?;
     if root.variant_id != variant
         || write
             .open_table(BLOB_PRESSURE_PENDING_SOURCES)?
@@ -5624,6 +6392,7 @@ pub(crate) fn remove_publication_root_write(
         .map(|value| value.value().to_vec())
         .ok_or_else(|| pressure_corruption("removed publication lacks pressure root"))?;
     let root = decode_publication_root(&encoded)?;
+    remove_durable_publication_indexes_write(write, &root, transfer)?;
     let global = publication_index_key_write(
         write,
         PressurePublicationKey {
@@ -5680,6 +6449,7 @@ pub(crate) fn remove_drained_variant_write(
         .map(|value| decode_variant_summary(value.value()))
         .transpose()?
         .ok_or_else(|| pressure_corruption("final Blob root lacks its pressure summary"))?;
+    remove_durable_variant_index_write(write, summary, variant)?;
     if write
         .open_table(BLOB_PRESSURE_VARIANTS)?
         .remove(&variant_index_key_write(write, summary, variant)?)?
@@ -5699,7 +6469,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
     use aster_mesh::{BlobId, Priority, Scope, Topic};
-    use redb::ReadableDatabase;
+    use redb::{ReadableDatabase, ReadableTable};
 
     use super::{
         BLOB_PRESSURE_METADATA, BLOB_PRESSURE_PENDING_ROOTS, BLOB_PRESSURE_PUBLICATION_ROOTS,
@@ -5714,8 +6484,9 @@ mod tests {
         decode_variant_index_key, decode_variant_summary, encode_content_publication_key,
         encode_pending_index_key, encode_pending_root, encode_pending_root_for_generation,
         encode_publication_key, encode_publication_root, encode_reanchor_cursor,
-        encode_variant_index_key, encode_variant_summary, finish_reanchor_turn_write,
-        plan_reanchor_turn_write, pressure_ready_write, synchronize_reanchor_state_write,
+        encode_variant_index_key, encode_variant_summary, encode_variant_summary_for_generation,
+        finish_reanchor_turn_write, plan_reanchor_turn_write, pressure_ready_write,
+        synchronize_reanchor_state_write,
     };
     use crate::StoreError;
     use crate::blob::{BlobSemanticId, BlobTransferId, BlobVariantId};
@@ -5915,6 +6686,229 @@ mod tests {
     }
 
     #[test]
+    fn durable_selection_charges_finite_index_rows_without_opening_their_roots() {
+        // Mutation caught: durable-only selection used to open every skipped
+        // finite root without charging it, and variant selection rescanned both
+        // complete root tables once per skipped variant.  Finite index rows are
+        // bounded scan work, but must not consume the first eligible candidate.
+        let (path, database) = pressure_database("durable-selection-bounded-finite-prefix");
+        let write = database.begin_write().unwrap();
+        {
+            let mut metadata = write.open_table(BLOB_PRESSURE_METADATA).unwrap();
+            metadata
+                .insert(PRESSURE_SCHEMA_VERSION_FIELD, PRESSURE_SCHEMA_VERSION)
+                .unwrap();
+            metadata.insert(NEXT_PENDING_ACCEPTANCE_ORDER, 1).unwrap();
+            metadata.insert(REANCHOR_TARGET_GENERATION, 0).unwrap();
+            metadata.insert(REANCHOR_DIRTY, 0).unwrap();
+            metadata.insert(REANCHOR_NEXT_PHASE, 1).unwrap();
+        }
+        let topic = Topic::new("bounded-durable-selection").unwrap();
+        let scope = Scope::new("mission/bounded-durable-selection").unwrap();
+        let blob_id = BlobId::from_bytes([0xf0; 32]);
+        for ordinal in 0u8..9 {
+            let expiry = if ordinal == 8 {
+                PressureExpiry::Durable
+            } else {
+                PressureExpiry::Finite(100 + u64::from(ordinal))
+            };
+            let transfer = BlobTransferId::new([0x10 + ordinal; 32]);
+            let variant = BlobVariantId::from_bytes([0x30 + ordinal; 32]);
+            let publication = PressurePublicationRoot {
+                variant_id: variant,
+                semantic_id: BlobSemanticId::new([0x50 + ordinal; 32]),
+                priority: Priority::Routine,
+                acceptance_order: 1 + u64::from(ordinal),
+                expiry,
+                topic: topic.clone(),
+                scope: scope.clone(),
+                blob_id,
+            };
+            let encoded = super::encode_publication_root(&publication).unwrap();
+            write
+                .open_table(super::BLOB_PRESSURE_PUBLICATION_ROOTS)
+                .unwrap()
+                .insert(transfer.as_bytes().as_slice(), encoded.as_slice())
+                .unwrap();
+            let key = super::encode_publication_key_for_generation(
+                super::PressurePublicationKey {
+                    priority: publication.priority,
+                    expiry,
+                    acceptance_order: publication.acceptance_order,
+                    transfer_id: transfer,
+                },
+                true,
+            );
+            write
+                .open_table(super::BLOB_PRESSURE_PUBLICATIONS)
+                .unwrap()
+                .insert(key.as_slice(), &[] as &[u8])
+                .unwrap();
+            let content_key =
+                super::encode_content_publication_key_for_generation(&publication, transfer, true)
+                    .unwrap();
+            write
+                .open_table(super::BLOB_PRESSURE_CONTENT_PUBLICATIONS)
+                .unwrap()
+                .insert(content_key.as_slice(), &[] as &[u8])
+                .unwrap();
+            if expiry == PressureExpiry::Durable {
+                write
+                    .open_table(super::BLOB_PRESSURE_DURABLE_PUBLICATIONS)
+                    .unwrap()
+                    .insert(key.as_slice(), &[] as &[u8])
+                    .unwrap();
+                write
+                    .open_table(super::BLOB_PRESSURE_DURABLE_CONTENT_PUBLICATIONS)
+                    .unwrap()
+                    .insert(content_key.as_slice(), &[] as &[u8])
+                    .unwrap();
+            }
+
+            let pending_transfer = BlobTransferId::new([0x70 + ordinal; 32]);
+            let pending = PressurePendingRoot {
+                variant_id: BlobVariantId::from_bytes([0x90 + ordinal; 32]),
+                authenticated_source_binding: [0xb0 + ordinal; 32],
+                priority: Priority::Routine,
+                acceptance_order: 1 + u64::from(ordinal),
+                completion: PressureFraction::new(1, 2).unwrap(),
+                expiry,
+                topic: topic.clone(),
+                scope: scope.clone(),
+                blob_id,
+            };
+            let encoded = super::encode_pending_root(&pending).unwrap();
+            write
+                .open_table(super::BLOB_PRESSURE_PENDING_ROOTS)
+                .unwrap()
+                .insert(pending_transfer.as_bytes().as_slice(), encoded.as_slice())
+                .unwrap();
+            let key =
+                super::encode_pending_index_key_for_generation(pending, pending_transfer, true);
+            write
+                .open_table(super::BLOB_PRESSURE_PENDING_SOURCES)
+                .unwrap()
+                .insert(&key, &[] as &[u8])
+                .unwrap();
+            if expiry == PressureExpiry::Durable {
+                write
+                    .open_table(super::BLOB_PRESSURE_DURABLE_PENDING_SOURCES)
+                    .unwrap()
+                    .insert(&key, &[] as &[u8])
+                    .unwrap();
+            }
+
+            let summary = PressureVariantSummary {
+                effective_priority: Priority::Routine,
+                minimum_root_acceptance_order: 1 + u64::from(ordinal),
+                committed_progress: PressureFraction::new(1, 2).unwrap(),
+                finalized: false,
+                publication_roots: 1,
+                pending_roots: 0,
+                final_reference_expiry: expiry,
+                has_finite_roots: expiry != PressureExpiry::Durable,
+            };
+            let encoded = super::encode_variant_summary_for_generation(summary, true);
+            write
+                .open_table(super::BLOB_PRESSURE_VARIANT_SUMMARIES)
+                .unwrap()
+                .insert(variant.as_bytes().as_slice(), encoded.as_slice())
+                .unwrap();
+            let key = super::encode_variant_index_key_for_generation(summary, variant, true, true);
+            write
+                .open_table(super::BLOB_PRESSURE_VARIANTS)
+                .unwrap()
+                .insert(&key, &[] as &[u8])
+                .unwrap();
+            if expiry == PressureExpiry::Durable {
+                write
+                    .open_table(super::BLOB_PRESSURE_DURABLE_VARIANTS)
+                    .unwrap()
+                    .insert(&key, &[] as &[u8])
+                    .unwrap();
+            }
+        }
+        write.commit().unwrap();
+
+        let budget = super::BlobPressureRecoveryBudget::new(2, 64 * 1024, 1, 1, 1).unwrap();
+        let expected = [
+            (
+                super::BlobCapacityPartition::AggregateItems,
+                super::PressureCandidate::Publication(BlobTransferId::new([0x18; 32])),
+            ),
+            (
+                super::BlobCapacityPartition::ContentPublications(
+                    super::PressureContentIdentity::new(&topic, &scope, blob_id).unwrap(),
+                ),
+                super::PressureCandidate::Publication(BlobTransferId::new([0x18; 32])),
+            ),
+            (
+                super::BlobCapacityPartition::NetworkStagingRows,
+                super::PressureCandidate::PendingSource(BlobTransferId::new([0x78; 32])),
+            ),
+            (
+                super::BlobCapacityPartition::DepotVariants,
+                super::PressureCandidate::Variant(BlobVariantId::from_bytes([0x38; 32])),
+            ),
+        ];
+        let read = database.begin_read().unwrap();
+        for (partition, candidate) in expected {
+            let selection = super::select_durable_pressure_candidate_read(
+                &read,
+                super::BlobCapacityRecoveryDemand::new(partition, Priority::Immediate, 1).unwrap(),
+                budget,
+            )
+            .unwrap();
+            assert!(selection.proven());
+            assert_eq!(selection.candidate(), Some(candidate));
+            assert_eq!(selection.rows_examined(), 2);
+        }
+        drop(read);
+
+        let durable_variant = BlobVariantId::from_bytes([0x38; 32]);
+        let write = database.begin_write().unwrap();
+        let summaries = write
+            .open_table(super::BLOB_PRESSURE_VARIANT_SUMMARIES)
+            .unwrap();
+        let encoded = summaries
+            .get(durable_variant.as_bytes().as_slice())
+            .unwrap()
+            .unwrap()
+            .value()
+            .to_vec();
+        drop(summaries);
+        let contradictory = PressureVariantSummary {
+            has_finite_roots: true,
+            ..super::decode_variant_summary(&encoded).unwrap()
+        };
+        let encoded = super::encode_variant_summary_for_generation(contradictory, true);
+        write
+            .open_table(super::BLOB_PRESSURE_VARIANT_SUMMARIES)
+            .unwrap()
+            .insert(durable_variant.as_bytes().as_slice(), encoded.as_slice())
+            .unwrap();
+        write.commit().unwrap();
+        let read = database.begin_read().unwrap();
+        assert!(
+            super::select_durable_pressure_candidate_read(
+                &read,
+                super::BlobCapacityRecoveryDemand::new(
+                    super::BlobCapacityPartition::DepotVariants,
+                    Priority::Immediate,
+                    1,
+                )
+                .unwrap(),
+                budget,
+            )
+            .is_err(),
+            "a selected durable index must authenticate its aggregate against the summary",
+        );
+        drop(read);
+        drop(database);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn pressure_v5_reanchor_pass_uses_fenced_alternating_root_scans() {
         // Mutations caught: clearing dirty after an unfenced/partial pass,
         // repeatedly favoring publication roots, or scanning a target-normalized
@@ -6079,12 +7073,26 @@ mod tests {
             minimum_root_acceptance_order: u64::MAX,
             committed_progress: PressureFraction::new(u64::MAX - 1, u64::MAX).unwrap(),
             finalized: false,
-            publication_roots: u64::MAX,
+            publication_roots: super::PRESSURE_VARIANT_HAS_FINITE_ROOT_MASK - 1,
             pending_roots: 1,
             final_reference_expiry: PressureExpiry::Durable,
+            has_finite_roots: true,
         };
         let encoded_summary = encode_variant_summary(summary);
-        assert_eq!(decode_variant_summary(&encoded_summary).unwrap(), summary);
+        assert_eq!(
+            decode_variant_summary(&encoded_summary).unwrap(),
+            PressureVariantSummary {
+                has_finite_roots: false,
+                ..summary
+            }
+        );
+        assert_eq!(
+            &encoded_summary[27..35],
+            &(summary.publication_roots).to_be_bytes()
+        );
+        let encoded_current = encode_variant_summary_for_generation(summary, true);
+        assert_eq!(decode_variant_summary(&encoded_current).unwrap(), summary);
+        assert_eq!(encoded_current[27] & 0x80, 0x80);
         assert!(decode_variant_summary(&encoded_summary[..encoded_summary.len() - 1]).is_err());
         let mut unknown_summary = encoded_summary;
         unknown_summary[0] = PRESSURE_RECORD_VERSION.wrapping_add(1);
@@ -6243,9 +7251,10 @@ mod tests {
             minimum_root_acceptance_order: u64::MAX,
             committed_progress: PressureFraction::new(u64::MAX, u64::MAX).unwrap(),
             finalized: true,
-            publication_roots: u64::MAX,
+            publication_roots: super::PRESSURE_VARIANT_HAS_FINITE_ROOT_MASK - 1,
             pending_roots: u64::MAX,
             final_reference_expiry: PressureExpiry::Durable,
+            has_finite_roots: true,
         };
         let maximum_variant_key = encode_variant_index_key(maximum_summary, maximum_variant);
         assert_eq!(
@@ -6257,14 +7266,20 @@ mod tests {
                 vec![0xff; 8],
                 vec![0xff; 8],
                 vec![0xff; 32],
-                vec![0xff; 8],
+                vec![0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
                 vec![0xff; 8],
             ]
             .concat()
         );
         assert_eq!(
             decode_variant_index_key(&maximum_variant_key).unwrap(),
-            (maximum_summary, maximum_variant)
+            (
+                PressureVariantSummary {
+                    has_finite_roots: false,
+                    ..maximum_summary
+                },
+                maximum_variant,
+            )
         );
         assert!(
             decode_variant_index_key(&maximum_variant_key[..maximum_variant_key.len() - 1])
@@ -6296,6 +7311,7 @@ mod tests {
             publication_roots: 0,
             pending_roots: 1,
             final_reference_expiry: PressureExpiry::ExpiredFinite,
+            has_finite_roots: true,
         };
         let minimum_variant_key =
             encode_variant_index_key(minimum_summary, BlobVariantId::from_bytes([0; 32]));
@@ -6318,6 +7334,7 @@ mod tests {
             (
                 PressureVariantSummary {
                     final_reference_expiry: PressureExpiry::Durable,
+                    has_finite_roots: false,
                     ..minimum_summary
                 },
                 BlobVariantId::from_bytes([0; 32]),
@@ -6420,6 +7437,7 @@ mod tests {
             publication_roots: 0,
             pending_roots: 1,
             final_reference_expiry: PressureExpiry::Durable,
+            has_finite_roots: false,
         };
         let reduced_variant = encode_variant_index_key(summary, variant);
         let equivalent_variant = encode_variant_index_key(
@@ -6958,6 +7976,7 @@ mod tests {
             publication_roots: 0,
             pending_roots: 1,
             final_reference_expiry: PressureExpiry::Durable,
+            has_finite_roots: false,
         };
         let finite_summary = PressureVariantSummary {
             effective_priority: Priority::Routine,
@@ -6967,6 +7986,7 @@ mod tests {
             publication_roots: 0,
             pending_roots: 1,
             final_reference_expiry: PressureExpiry::ExpiredFinite,
+            has_finite_roots: true,
         };
         {
             let write = database.begin_write().unwrap();
@@ -7293,6 +8313,7 @@ mod tests {
                     publication_roots: u64::from(finalized),
                     pending_roots: u64::from(!finalized),
                     final_reference_expiry: PressureExpiry::Durable,
+                    has_finite_roots: false,
                 };
                 let encoded = super::encode_variant_summary(summary);
                 summaries

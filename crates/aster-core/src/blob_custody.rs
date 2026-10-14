@@ -77,6 +77,81 @@ pub struct AuthenticatedBlobCustodyContactV1 {
     contact_identity: [u8; 32],
 }
 
+/// Opaque one-use outbound context from an authenticated semantic-v8,
+/// profile-3 Blob session.
+///
+/// Construction is core-private and the type is deliberately non-`Clone`.
+/// Store authorization consumes it so raw session, exchange, direction, and
+/// finalization fields cannot independently mint a finite custody claim.
+#[derive(Debug, Eq, PartialEq)]
+pub struct AuthenticatedBlobCustodySendContextV1 {
+    semantic_version: u16,
+    profile_id: u16,
+    session_transcript: [u8; 32],
+    exchange_id: u64,
+    direction: BlobCustodyDirectionV1,
+    finalization_charge_ms: u64,
+}
+
+impl AuthenticatedBlobCustodySendContextV1 {
+    pub(crate) const fn from_authenticated_session(
+        session_transcript: [u8; 32],
+        exchange_id: u64,
+        direction: BlobCustodyDirectionV1,
+        finalization_charge_ms: u64,
+    ) -> Self {
+        Self {
+            semantic_version: SEMANTIC_VERSION,
+            profile_id: PROFILE_ID,
+            session_transcript,
+            exchange_id,
+            direction,
+            finalization_charge_ms,
+        }
+    }
+
+    /// Returns the authenticated semantic version.
+    pub const fn semantic_version(&self) -> u16 {
+        self.semantic_version
+    }
+
+    /// Returns the authenticated Blob transfer profile identifier.
+    pub const fn profile_id(&self) -> u16 {
+        self.profile_id
+    }
+
+    /// Returns the completed authenticated-session transcript identity.
+    pub const fn session_transcript(&self) -> [u8; 32] {
+        self.session_transcript
+    }
+
+    /// Returns the exact exchange bound to this source emission.
+    pub const fn exchange_id(&self) -> u64 {
+        self.exchange_id
+    }
+
+    /// Returns the authenticated outbound receiver direction.
+    pub const fn direction(&self) -> BlobCustodyDirectionV1 {
+        self.direction
+    }
+
+    /// Returns the conservative age contribution authenticated for finalization.
+    pub const fn finalization_charge_ms(&self) -> u64 {
+        self.finalization_charge_ms
+    }
+}
+
+/// Opened complete Blob source frame and its optional exact finite authority.
+///
+/// This name is public because the node mission boundary must carry the exact
+/// core-opened result without reconstructing or exposing either component.
+/// The authority remains non-`Clone` inside this return shape and can therefore
+/// still be consumed exactly once by the receiving Store transaction.
+pub type OpenedBlobSourceFrameV1 = (
+    Vec<u8>,
+    Option<(BlobCustodyClaimV1, AuthenticatedBlobCustodyContactV1)>,
+);
+
 impl AuthenticatedBlobCustodyContactV1 {
     pub(crate) fn from_opened_record(
         session_transcript: [u8; 32],

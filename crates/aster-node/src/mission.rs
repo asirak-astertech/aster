@@ -18,16 +18,17 @@ use aster_iroh::{
     Connection, EndpointId, SecretKey,
 };
 use aster_mesh::{
-    ApplicationProtection, AuthenticatedChannelBinding, ClassicalAuthenticatedSession,
+    ApplicationProtection, AuthenticatedBlobCustodySendContextV1, AuthenticatedChannelBinding,
+    BlobCustodyClaimV1, BlobCustodyDirectionV1, ClassicalAuthenticatedSession,
     ClassicalProvisioningBundle, ClassicalSessionInitiator, ClassicalSessionResponder,
     CustodyClaims, CustodyExpectation, MAX_PROTECTED_PROVISIONING_BYTES,
-    MAX_UNPROTECTED_PROVISIONING_BYTES, NodeId, ProvisioningBundle, ProvisioningLoadId,
-    ProvisioningProtectionError, ProvisioningSecretLoader, ProvisioningSecretRef,
-    ProvisioningSecretStoreError, ProvisioningUnprotector, ReferenceAuthenticatedSession,
-    ReferenceEnvelopeSealer, ReferenceSessionAwaitingFinished, ReferenceSessionInitiator,
-    ReferenceSessionResponder, ReferenceSessionResponderPending, SecurityProfileId,
-    UnprotectedProvisioning, VerifiedCustodyClaims, VerifiedSecurityProfile, engine::EnvelopeError,
-    load_provisioning_secret, unprotect_provisioning_artifact,
+    MAX_UNPROTECTED_PROVISIONING_BYTES, NodeId, OpenedBlobSourceFrameV1, ProvisioningBundle,
+    ProvisioningLoadId, ProvisioningProtectionError, ProvisioningSecretLoader,
+    ProvisioningSecretRef, ProvisioningSecretStoreError, ProvisioningUnprotector,
+    ReferenceAuthenticatedSession, ReferenceEnvelopeSealer, ReferenceSessionAwaitingFinished,
+    ReferenceSessionInitiator, ReferenceSessionResponder, ReferenceSessionResponderPending,
+    SecurityProfileId, UnprotectedProvisioning, VerifiedCustodyClaims, VerifiedSecurityProfile,
+    engine::EnvelopeError, load_provisioning_secret, unprotect_provisioning_artifact,
 };
 use std::{
     error::Error,
@@ -1617,6 +1618,24 @@ impl MissionSessionInitiator {
         Self::start_with_admission(bundle, HybridPeerAdmission::exact(peer, observed_carrier)?)
     }
 
+    #[cfg(test)]
+    fn start_with_semantic_versions_for_test(
+        bundle: ProvisioningBundle,
+        peer: MissionPeerBinding,
+        observed_carrier: EndpointId,
+        supported_versions: Vec<u16>,
+    ) -> Result<(Self, MissionHandshakeFlight), MissionSessionError> {
+        let admission = HybridPeerAdmission::exact(peer, observed_carrier)?;
+        let (inner, flight) = ReferenceSessionInitiator::start_with_semantic_versions_for_test(
+            bundle,
+            supported_versions,
+        )?;
+        Ok((
+            Self { inner, admission },
+            MissionHandshakeFlight::new(flight),
+        ))
+    }
+
     fn start_discovered(
         bundle: ProvisioningBundle,
         observed_carrier: EndpointId,
@@ -1675,6 +1694,39 @@ pub(crate) async fn initiate_over_iroh_metered(
     peer: MissionPeerBinding,
 ) -> Result<(MissionSession, MissionHandshakeReceipt), MissionSessionError> {
     initiate_over_iroh_metered_with_admission(connection, bundle, Some(peer)).await
+}
+
+/// Test-only authenticated handshake representing an older implementation.
+#[cfg(test)]
+pub(crate) async fn initiate_over_iroh_metered_for_semantic_version(
+    connection: &Connection,
+    bundle: ProvisioningBundle,
+    peer: MissionPeerBinding,
+    semantic_version: u16,
+) -> Result<(MissionSession, MissionHandshakeReceipt), MissionSessionError> {
+    let result = async {
+        let (initiator, first) = MissionSessionInitiator::start_with_semantic_versions_for_test(
+            bundle,
+            peer,
+            connection.remote_id(),
+            vec![semantic_version],
+        )?;
+        let second = connection.request(first.as_bytes()).await?;
+        let (pending, third) = initiator.receive_server(&second)?;
+        let fourth = connection.request(third.as_bytes()).await?;
+        let receipt = MissionHandshakeReceipt::from_flights([
+            first.len(),
+            second.len(),
+            third.len(),
+            fourth.len(),
+        ]);
+        Ok((pending.receive_finished(&fourth)?, receipt))
+    }
+    .await;
+    if result.is_err() {
+        connection.close();
+    }
+    result
 }
 
 /// Runs a discovered-peer initiator handshake and receipts it only on full success.
@@ -2301,6 +2353,23 @@ impl MissionSession {
         self.inner.semantic_version()
     }
 
+    /// Non-secret identifier for this completed authenticated mission session.
+    pub(crate) const fn session_id(&self) -> [u8; 32] {
+        self.inner.session_id()
+    }
+
+    /// Mints one exact non-clone outbound Blob custody context.
+    pub(crate) fn mint_blob_custody_send_context(
+        &self,
+        direction: BlobCustodyDirectionV1,
+        exchange_id: u64,
+        finalization_charge_ms: u64,
+    ) -> Result<AuthenticatedBlobCustodySendContextV1, MissionSessionError> {
+        self.inner
+            .mint_blob_custody_send_context(direction, exchange_id, finalization_charge_ms)
+            .map_err(Into::into)
+    }
+
     /// Authority-signed route-grant commitments authenticated in the peer's
     /// mission credential by the completed handshake.
     ///
@@ -2321,6 +2390,30 @@ impl MissionSession {
     /// Authenticates, decrypts, and replay-checks one application frame.
     pub fn open_application_frame(&mut self, frame: &[u8]) -> Result<Vec<u8>, MissionSessionError> {
         self.inner.open_frame(frame).map_err(Into::into)
+    }
+
+    /// Protects one complete v8 Blob source-bearing frame in profile 3.
+    pub(crate) fn seal_blob_source_frame(
+        &mut self,
+        direction: BlobCustodyDirectionV1,
+        claim: Option<&BlobCustodyClaimV1>,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, MissionSessionError> {
+        self.inner
+            .seal_blob_source_frame(direction, claim, plaintext)
+            .map_err(Into::into)
+    }
+
+    /// Opens one complete v8 Blob source-bearing frame and returns its exact
+    /// finite-contact authority when a claim is present.
+    pub(crate) fn open_blob_source_frame(
+        &mut self,
+        direction: BlobCustodyDirectionV1,
+        frame: &[u8],
+    ) -> Result<OpenedBlobSourceFrameV1, MissionSessionError> {
+        self.inner
+            .open_blob_source_frame(direction, frame)
+            .map_err(Into::into)
     }
 
     /// Protects and records this endpoint's one canonical transfer-profile offer.

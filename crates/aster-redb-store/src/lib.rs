@@ -5252,6 +5252,8 @@ pub struct Store {
     #[cfg(test)]
     blob_carrier_commit_post_snapshot_gate:
         std::sync::Mutex<Option<BlobCarrierCommitPostSnapshotGate>>,
+    #[cfg(any(test, feature = "test-utils"))]
+    blob_carrier_commit_post_install_sample: std::sync::Mutex<Option<aster_mesh::CustodySample>>,
 }
 
 /// Exact-writer cleanup handle for a live or terminal mission-bound store.
@@ -6159,6 +6161,8 @@ impl Store {
             blob_carrier_range_post_read_gate: std::sync::Mutex::new(None),
             #[cfg(test)]
             blob_carrier_commit_post_snapshot_gate: std::sync::Mutex::new(None),
+            #[cfg(any(test, feature = "test-utils"))]
+            blob_carrier_commit_post_install_sample: std::sync::Mutex::new(None),
         })
     }
 
@@ -6527,6 +6531,8 @@ impl Store {
                 blob_carrier_range_post_read_gate: _,
             #[cfg(test)]
                 blob_carrier_commit_post_snapshot_gate: _,
+            #[cfg(any(test, feature = "test-utils"))]
+                blob_carrier_commit_post_install_sample: _,
         } = self;
         Ok(ZeroizationStore {
             database,
