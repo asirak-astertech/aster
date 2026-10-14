@@ -432,15 +432,13 @@ jobs:
           cargo +1.97.1 deny fetch all
           CARGO_NET_OFFLINE=true sh ./tools/check-dependency-exception-scope.sh
           cargo +1.97.1 audit \
-            --ignore RUSTSEC-2026-0118 \
-            --ignore RUSTSEC-2026-0119 \
             --file Cargo.lock
 
       - name: Enforce dependency policy offline
         run: |
           python3 tools/check-netlink-packet-core-patch.py
-          CARGO="cargo +1.97.1" python3 tools/check-retained-libp2p-oracle-boundary.py
-          python3 tools/test-retained-libp2p-oracle-boundary.py
+          CARGO="cargo +1.97.1" python3 tools/check-libp2p-absence.py
+          python3 tools/test-libp2p-absence.py
           CARGO_NET_OFFLINE=true sh ./tools/check-dependency-exception-scope.sh
           CARGO_NET_OFFLINE=true sh ./tools/test-dependency-exception-scope.sh
           cargo +1.97.1 deny --locked --offline check
@@ -478,13 +476,6 @@ jobs:
         env:
           CARGO_NET_OFFLINE: "true"
         run: sh ./tools/run-fuzz-smoke.sh
-
-  runtime-volume-diagnostic:
-    name: Run manual runtime-volume diagnostic
-    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/ci-runtime-volume-diagnostic'
-    uses: ./.github/workflows/diagnostic-runtime-volume.yml
-    permissions:
-      contents: read
 
   required:
     name: required

@@ -58,8 +58,8 @@ run = [
   "python3 tools/check-selected-node-dependency-boundary.py",
   "python3 tools/check-netlink-packet-core-patch.py",
   "sh tools/test-netlink-packet-core-patch.sh",
-  "python3 tools/check-retained-libp2p-oracle-boundary.py",
-  "python3 tools/test-retained-libp2p-oracle-boundary.py",
+  "python3 tools/check-libp2p-absence.py",
+  "python3 tools/test-libp2p-absence.py",
   "sh ./tools/check-dependency-exception-scope.sh",
   "sh ./tools/test-dependency-exception-scope.sh",
 ]
@@ -242,11 +242,11 @@ run = [
   "sh ./tools/test-dependency-exception-scope.sh",
 ]
 
-[tasks.retained-oracle-boundary]
-description = "Verify the rejected libp2p provider remains an unpublished, opt-in lab oracle"
+[tasks.libp2p-absence]
+description = "Verify the removed libp2p provider and dependency family remain absent"
 run = [
-  "python3 tools/check-retained-libp2p-oracle-boundary.py",
-  "python3 tools/test-retained-libp2p-oracle-boundary.py",
+  "python3 tools/check-libp2p-absence.py",
+  "python3 tools/test-libp2p-absence.py",
 ]
 
 [tasks.protocol-version-contract]

@@ -19,6 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Replaced the experimental libp2p test provider with selected-node Iroh Event-volume and authenticated-reconnect regressions; retained the rest of the lab and archived the manual runtime-volume diagnostic.
+- Excluded checkout paths from the Gate-H dependency-name check so worktree names cannot be mistaken for network providers.
 - Upgrade dependencies: Iroh 1.3.0 (public DNS disabled)
 - Reduced CI turnaround with Rust compiler caching and partitioned nextest runs.
 - Prefiltered Event query candidates before authentication to avoid unnecessary verification work.
