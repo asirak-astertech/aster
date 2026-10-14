@@ -52,6 +52,7 @@ mandatory-access-control profile. The manual operator procedure is
 
 | Check | Runner | Purpose |
 | --- | --- | --- |
+| `Cargo lockfiles` | `ubuntu-24.04` | Checks every committed Cargo graph with `cargo fetch --locked` before Cargo builds start, and tests rejection of stale or missing lockfiles offline. |
 | `quality` | `ubuntu-24.04` | Runs the exact-source Python process contract, Rust and Go formatting, Apache-2.0-only project-license and package checks, exact 348-row implementation-requirements traceability, the selected-node dependency boundary, vendored netlink source-equivalence and 13-test compatibility gates, selected live-Event, live-mutable, live-State-subscription, live-Record-subscription, live-Blob, and live-Blob-subscription receipt checker tests, real-process smokes, C ABI build and C/C++ header checks, Rust/Python conformance, Python/Go binding tests, and lab-controller tests. |
 | `Rust Clippy` | `ubuntu-24.04` | Runs locked Clippy for every workspace target and feature, with warnings denied. |
 | `Rust tests (1/2)` and `Rust tests (2/2)` | `ubuntu-24.04` | Run two disjoint nextest partitions covering the complete locked, all-feature Rust workspace suite. Partition 1 also runs all workspace doctests with Cargo. Both start independently of Clippy and use the existing resource wrapper. |
@@ -61,6 +62,21 @@ mandatory-access-control profile. The manual operator procedure is
 | `age reference interoperability` | `ubuntu-24.04` | Installs exact `govulncheck` v1.6.0, runs `mise run age-reference-audit`, then runs `mise run age-reference-interop`: the Go oracle's reachable vulnerability and compiled-module license gates must pass before exact reference Go `filippo.io/age` v1.3.1 and the Rust provider exchange classic-X25519 artifacts in both directions, compare recovered plaintext, and agree on the recipient. |
 | `bounded fuzz smoke` | `ubuntu-24.04` | Runs all nine fixed 10,000-case hostile-input campaigns with the pinned nightly toolchain and `cargo-fuzz`: semantic wire decode, fragment decode, reference-envelope inspection, selected mechanics-frame decode, selected Negentropy, classical-profile decode, systemd credential decode, systemd admin-record decode, and systemd backup decode. |
 | `required` | `ubuntu-24.04` | Fails unless every validation lane completed successfully; this is the branch-protection check. |
+
+The `Cargo lockfiles` lane runs `sh tools/check-cargo-lockfiles.sh` against the
+root, fuzz, and standalone conformance-runner manifests with Rust 1.97.1. It
+reports each failing graph without regenerating lockfiles. Cargo build lanes
+wait for it; the `required` aggregation explicitly requires its success, so a
+failed gate and skipped dependent jobs cannot produce a successful aggregate.
+Each build runner still acquires its own dependencies before offline checks.
+
+Dependabot uses one Cargo configuration covering `/` and `/fuzz`, grouped by
+`dependency-name`, to coordinate each dependency's version update in one PR.
+This does not require the two lockfiles to contain identical graphs. GitHub's
+cross-directory grouping applies to version updates, not security updates;
+all PRs still face the lockfile gate. The actual next Dependabot run remains
+the integration check for this shared-manifest layout. See the public
+[Dependabot grouping reference](https://docs.github.com/en/code-security/reference/supply-chain-security/dependabot-options-reference#group-by-groups).
 
 The Rust dependency downloads happen before Cargo validation is switched to
 offline mode. The dependency-policy job is intentionally different: it obtains
