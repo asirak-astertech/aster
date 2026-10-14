@@ -52,12 +52,12 @@ mandatory-access-control profile. The manual operator procedure is
 
 | Check | Runner | Purpose |
 | --- | --- | --- |
-| `quality` | `ubuntu-24.04` | Runs the exact-source Python process contract, Rust and Go formatting, Apache-2.0-only project-license and package checks, exact 348-row implementation-requirements traceability, the selected-node dependency boundary, vendored netlink source-equivalence and 13-test compatibility gates, the libp2p-absence boundary, selected live-Event, live-mutable, live-State-subscription, live-Record-subscription, live-Blob, and live-Blob-subscription receipt checker tests, real-process smokes, C ABI build and C/C++ header checks, Rust/Python conformance, Python/Go binding tests, and lab-controller tests. |
+| `quality` | `ubuntu-24.04` | Runs the exact-source Python process contract, Rust and Go formatting, Apache-2.0-only project-license and package checks, exact 348-row implementation-requirements traceability, the selected-node dependency boundary, vendored netlink source-equivalence and 13-test compatibility gates, selected live-Event, live-mutable, live-State-subscription, live-Record-subscription, live-Blob, and live-Blob-subscription receipt checker tests, real-process smokes, C ABI build and C/C++ header checks, Rust/Python conformance, Python/Go binding tests, and lab-controller tests. |
 | `Rust Clippy` | `ubuntu-24.04` | Runs locked Clippy for every workspace target and feature, with warnings denied. |
 | `Rust tests (1/2)` and `Rust tests (2/2)` | `ubuntu-24.04` | Run two disjoint nextest partitions covering the complete locked, all-feature Rust workspace suite. Partition 1 also runs all workspace doctests with Cargo. Both start independently of Clippy and use the existing resource wrapper. |
 | `macOS tests` | `macos-14` | Runs all Rust workspace tests on the supported Apple runner with Rust 1.97.1. |
 | `Rust 1.91 MSRV` | `ubuntu-24.04` | Checks every workspace target and feature with the declared minimum supported Rust version. |
-| `dependency policy` | `ubuntu-24.04` | Enforces the libp2p-absence boundary, applies `deny.toml` to the root and fuzz dependency graphs, and audits both lockfiles against a freshly downloaded RustSec database. |
+| `dependency policy` | `ubuntu-24.04` | Applies `deny.toml` to the root and fuzz dependency graphs, and audits both lockfiles against a freshly downloaded RustSec database. |
 | `age reference interoperability` | `ubuntu-24.04` | Installs exact `govulncheck` v1.6.0, runs `mise run age-reference-audit`, then runs `mise run age-reference-interop`: the Go oracle's reachable vulnerability and compiled-module license gates must pass before exact reference Go `filippo.io/age` v1.3.1 and the Rust provider exchange classic-X25519 artifacts in both directions, compare recovered plaintext, and agree on the recipient. |
 | `bounded fuzz smoke` | `ubuntu-24.04` | Runs all nine fixed 10,000-case hostile-input campaigns with the pinned nightly toolchain and `cargo-fuzz`: semantic wire decode, fragment decode, reference-envelope inspection, selected mechanics-frame decode, selected Negentropy, classical-profile decode, systemd credential decode, systemd admin-record decode, and systemd backup decode. |
 | `required` | `ubuntu-24.04` | Fails unless every validation lane completed successfully; this is the branch-protection check. |
@@ -1661,10 +1661,7 @@ not by itself authorize a release or declare browser-WASM supported.
 
 [Decision 0045](../decisions/0045-remove-libp2p-test-oracle.md) supersedes
 Decision 0029's retention policy. The experimental provider and only its lab
-integration are removed; the rest of `aster-lab` remains. The replacement
-`tools/check-libp2p-absence.py` gate checks locked, offline, all-feature root and
-fuzz metadata and lockfiles for the removed provider and libp2p package family.
-Its six regression tests cover malformed metadata and reintroduction paths.
+integration are removed; the rest of `aster-lab` remains.
 
 The provider removal also removes the optional Hickory 0.25.2 lock entries.
 The root audit no longer ignores `RUSTSEC-2026-0118` or `RUSTSEC-2026-0119`.

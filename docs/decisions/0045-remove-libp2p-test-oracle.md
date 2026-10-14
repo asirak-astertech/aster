@@ -21,8 +21,7 @@ provider. This is not a retrospective provider comparison or selection result.
 1. Remove `aster-libp2p-provider`, the `aster-lab/libp2p-candidate` integration,
    and their dependency edges. Keep the rest of `aster-lab`, including its
    provider-neutral ownership and resource tests.
-2. Replace the retention gate with a root/fuzz metadata and lockfile absence
-   gate. Remove only the now-obsolete Hickory 0.25.2 audit suppressions; retain
+2. Remove the retention gate and the obsolete Hickory 0.25.2 audit suppressions; retain
    unrelated advisory/license exceptions and the netlink patch.
 3. Exercise two Events each direction using production `aster-node` contacts
    over persistent direct-loopback Iroh endpoints. A one-MiB plaintext Event
@@ -51,7 +50,7 @@ coverage remains unchanged; exact two-one-MiB plaintext volume is explicitly
 not claimed. Historical records remain available without claiming that their
 removed provider or diagnostic can be run from the current workspace.
 
-Run the focused selected-node tests, absence and dependency-scope regressions,
+Run the focused selected-node tests, dependency-scope regressions,
 requirements traceability, and the complete `mise run check` aggregate. Hosted
 CI, fresh-advisory audits, and target-platform qualification remain distinct
 from local verification.
