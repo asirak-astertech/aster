@@ -33,7 +33,7 @@ other data-class profiles, but this increment enables Blob only.
 
 This design is derived from and remains subordinate to:
 
-- `docs/data-mesh-requirements.md`, including immutable chunked resumable Blob
+- `data-mesh-requirements.md`, including immutable chunked resumable Blob
   transfer, transport abstraction, transport-blind public APIs, source
   authentication, bounded Tier-2 resources, independent interoperability, and
   mixed-version behavior;
@@ -205,6 +205,14 @@ absolute receive credit, completion, and settlement.
 Transport adapters do not interpret publications, Blob identities, custody,
 checkpoints, or promotion. Aster owns those semantics above the adapter.
 
+Each attempt is a full-duplex logical exchange even when the carrier exposes
+only unidirectional streams. The adapter must provide either one bidirectional
+stream or two concurrently open, independently bounded unidirectional streams:
+sender-to-receiver data and receiver-to-sender control. Opening a new ordered
+turn for each checkpoint is not conforming. Credit replenishment, checkpoints,
+backpressure heartbeats, finish, result, and result acknowledgement must remain
+live while data is in flight.
+
 ### Lifecycle and storage plane
 
 The authenticated source creates one durable pending-source root for the exact
@@ -271,7 +279,8 @@ The receiver returns:
 - its authoritative durable contiguous offset;
 - the checkpoint generation;
 - the absolute maximum offset the sender is currently allowed to transmit; and
-- the receiver-selected maximum extent length for this attempt.
+- the receiver-selected maximum extent length and checkpoint-batch byte limit
+  for this attempt.
 
 The durable offset must be within the declared encoded length, aligned to a
 verified storage boundary, and consistent with the exact pending source. A
@@ -306,10 +315,23 @@ Absolute limits, rather than reusable credit deltas, make duplicate or reordered
 checkpoint frames incapable of granting additional capacity. The durable offset
 never moves backward.
 
+While credit remains unchanged, the receiver may emit a freshly
+sequence-protected `StreamCheckpoint` with the same offset and limit as an
+authenticated control heartbeat. It grants no capacity. Heartbeat cadence and
+liveness deadlines remain bounded and configuration-owned.
+
 The receiver emits checkpoints after a bounded byte threshold or bounded timer,
 not after every extent. Storage and metadata are committed in batches. A crash
 may discard the uncheckpointed tail, which the sender retransmits, but it cannot
 expose or acknowledge unverified nondurable progress.
+
+A checkpoint batch contains one or more complete, verified carriers assembled
+from one or more extents. The initial defaults are a 4-MiB byte threshold and a
+250-ms timer, with an 8-MiB hard maximum; constrained receivers may advertise a
+smaller batch. One files-first durability operation and one redb transaction
+commit all chunk markers, counters, and the cumulative checkpoint for the
+batch. The maximum crash-retransmission tail is the lesser of the advertised
+receive window and advertised checkpoint-batch limit.
 
 ### `StreamFinish`, `StreamResult`, and `StreamResultAck`
 
@@ -344,8 +366,14 @@ limit is ordinary backpressure, not an error.
 Extent length and window size are negotiated downward from local limits. A
 constrained receiver may advertise small values. The initial resource profile
 uses extents no larger than 1 MiB, while the implementation retains a strict
-parser/allocation bound before reading peer-controlled payload bytes. The sum
-of all live stream buffers is governed by one configurable global budget, not a
+parser/allocation bound before reading peer-controlled payload bytes. A small
+fixed header permit is acquired before reading the bounded frame header; after
+validating its canonical length, a body permit for that exact length must be
+reserved from the global budget before reading or allocating the body. Header
+permits, body permits, queued records, session state, and checkpoint batches
+are all globally and per-session bounded. Every success, rejection, close,
+cancellation, and panic-unwind path releases its permits. The sum of all live
+stream buffers is governed by one configurable global budget, not a
 per-transfer allocation multiplied without bound by session count.
 
 The data path writes incrementally and must not buffer an advertised full Blob
@@ -387,13 +415,17 @@ remain profile-4 work and no profile-5 checkpoint is inferred from them.
 
 ## Automatic transport selection
 
-Transport selection is an internal local policy. A peer advertises supported
-transport identifiers and versions, but cannot assign local scores or force a
-choice.
+Transport selection is an internal local policy. Candidate support and peer
+locators must be known before opening a data attempt, from authenticated local
+configuration, provisioned peer records, or authenticated discovery. They are
+not advertised for the first time inside `StreamOpen`, because that is already
+carried by the selected transport. A peer cannot assign local scores or force a
+choice. After connection, normal Aster mission authentication and semantic/
+profile negotiation confirm the candidate before any Blob credit is issued.
 
 The first selector:
 
-1. intersects local and peer-supported stream transports;
+1. intersects locally enabled adapters with authenticated peer capabilities;
 2. removes transports prohibited by configuration or policy;
 3. prefers an already healthy authenticated connection;
 4. otherwise attempts candidates in configured priority order; and
@@ -416,20 +448,47 @@ Current Iroh direct/relay management may remain one adapter if Iroh owns that
 path choice internally. The Aster selector chooses among independently usable
 adapters, not internal implementation details it cannot safely control.
 
+Delivery is staged without weakening the final claim boundary:
+
+1. **Streaming/performance milestone:** ship profile 5 and the selector seam
+   with `IrohQuicV1`. This automatically selects the only eligible production
+   adapter and may reopen it after failure, but it does not demonstrate or
+   claim cross-transport selection or failover. Fake adapters test policy only.
+2. **Automatic-transport milestone:** register and qualify a second
+   independently usable production adapter that satisfies the same
+   authenticated reliable full-duplex stream contract. Only this milestone may
+   claim best-available selection and cross-transport failover.
+
+The existing `aster-ip::IpLink` and `aster-ble::BleLink` are packet links, not
+such streaming adapters. They may become candidates only after a separately
+reviewed reliability/ordering/flow-control adapter exists; this design does not
+silently relabel them as production stream transports.
+
 ## Transport failure and failover
 
 A transport attempt is failed when it closes, reports an unrecoverable adapter
 error, cannot open before its deadline, or makes no byte/checkpoint progress for
-the configured stall interval.
+the configured stall interval while the sender has positive credit. The data
+stall timer is suspended while the sender is credit-blocked. During
+backpressure, authenticated control heartbeats and adapter liveness remain
+bounded and observable; exceeding their separate liveness deadline may retry
+the attempt. Prolonged healthy zero-credit capacity is backpressure and may
+become `temporary/deferred capacity`, never a fabricated transport failure.
 
 On failure Aster:
 
 1. closes the failed attempt;
 2. keeps the pending source and logical transfer;
 3. selects the next eligible transport;
-4. creates a fresh attempt nonce and binding;
-5. obtains the receiver's authoritative durable checkpoint; and
-6. retransmits from that checkpoint.
+4. performs fresh peer/mission authentication and semantic/profile negotiation
+   on that transport, binding the authenticated peer identity to the expected
+   source peer;
+5. creates a fresh attempt nonce and session-transcript binding;
+6. for finite work, verifies a fresh `BlobCustodyClaimV2`, merges observed age
+   monotonically, and rejects any younger or mismatched claim;
+7. obtains the receiver's authoritative durable checkpoint only after those
+   checks; and
+8. retransmits from that checkpoint.
 
 Failover does not change semantic version, source, publication, custody age,
 Blob variant, or lifecycle state. A profile-5 pending source never resumes
@@ -482,8 +541,9 @@ Three units remain distinct:
    unit.
 2. **Streaming extent** — bounded network and storage scheduling unit that may
    contain multiple chunks.
-3. **Checkpoint batch** — one or more completed chunks whose cumulative progress
-   is committed together.
+3. **Checkpoint batch** — complete verified carriers collected from one or more
+   extents and committed together in one files-first durability operation and
+   one metadata transaction.
 
 The implementation must not create durable metadata per wire frame. Pending
 stream checkpoint state is constant-sized. Existing physical chunk rows remain
@@ -547,8 +607,9 @@ Protocol-visible outcomes distinguish:
 - protocol violation.
 
 Backpressure is expressed by unchanged credit. Transport closure, connection
-failure, and stalls are local retry/failover conditions and do not by themselves
-retire the logical transfer.
+failure, positive-credit data stalls, and control-liveness expiry are local
+retry/reopen or failover conditions and do not by themselves retire the logical
+transfer. Zero-credit data inactivity is not a stall.
 
 Integrity failures confined to authenticated pending content use PR 47's exact
 authorized cleanup path. Structural metadata, accounting, lineage, owner, or
@@ -588,17 +649,19 @@ by this increment. The existing file-based publish shape remains, but its
 policy that admits at least 2 GiB when Store quota permits. Applications cannot
 select a transport, extent size, checkpoint cadence, or resume offset.
 
-Bounded sanitized transfer status includes:
+Bounded sanitized application-visible transfer status includes only:
 
 - logical transfer state;
-- selected transport identifier;
-- current attempt count;
-- total, received, durable, and retransmitted bytes;
-- current receive limit and checkpoint offset;
+- total and durable bytes;
 - rolling payload throughput;
-- checkpoint latency and database commit count;
-- last failover recovery duration; and
-- terminal lifecycle, capacity, transport, or protocol category.
+- a sanitized terminal lifecycle, capacity, connectivity, integrity, or
+  protocol category.
+
+Transport identity, candidate ranking, attempt count, receive credit,
+checkpoint offsets, retransmission, checkpoint latency, commit count, and
+failover recovery are internal/operator telemetry. They may be exported through
+bounded privileged diagnostics and metrics, but never through the public Blob
+application API or application-selectable controls.
 
 Attempt history is aggregated under a fixed bound. Status makes no global
 convergence claim and contains no raw paths or peer-provided error text.
@@ -659,8 +722,10 @@ Required physical scenarios are:
 2. **Three-node resume:** one node publishes; the support node becomes an
    eligible complete content peer; the receiver makes partial progress from the
    first peer and completes the exact pending source from the alternate peer.
-3. **Transport failover:** interrupt the selected path during transfer and
-   prove automatic reselection plus resume from the durable checkpoint.
+3. **Recovery:** interrupt the selected Iroh path during transfer and prove
+   authenticated reopen plus resume from the durable checkpoint. After a
+   second production adapter is registered, add a separate cross-transport
+   scenario that proves automatic reselection and fresh authentication.
 4. **Process recovery:** terminate and restart the receiver during streaming,
    then complete without source re-admission or partial visibility.
 5. **Lifecycle races:** exercise finite TTL expiry, policy invalidation,
@@ -680,6 +745,9 @@ Unit, property, integration, conformance, and fuzz coverage must include:
 - small Blobs and every extent/checkpoint boundary;
 - the legacy 64-MiB boundary plus 1-GiB and 2-GiB objects;
 - receiver-selected smaller extents and zero/unchanged credit;
+- multiple credit/checkpoint cycles on one concurrently open data/control pair
+  without reopening it;
+- zero credit held beyond the data-stall deadline without false failover;
 - transport failure before and after durable checkpoints;
 - process failure during receive, checkpoint, verification, promotion, result,
   and acknowledgement;
@@ -691,6 +759,8 @@ Unit, property, integration, conformance, and fuzz coverage must include:
 - shared physical variants with different publication lifetimes;
 - new/new, new/legacy, and legacy/legacy negotiation;
 - bounded global memory and lease capacity under concurrent transfers;
+- reservation before every peer-controlled body allocation and exact permit
+  release on all error/cancellation paths;
 - full-capacity reservation and exact release after retirement/reclamation;
 - database commit count independent of wire-frame count;
 - decoder and state-machine fuzzing; and
