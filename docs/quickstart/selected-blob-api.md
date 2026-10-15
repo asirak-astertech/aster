@@ -4,9 +4,10 @@ This is the shortest path to Aster's **selected live Blob application surface**,
 its durable metadata-delivery queue, its exclusive stopped streaming facade,
 and the semantic-v7/v8 receipt-free streaming boundary for Blob transfer.
 `RunningNode::selected_blobs()` returns a cloneable `SelectedBlobHandle`: an
-application may durably publish an owned regular file while the node has no
-peers, read one freshly authenticated plaintext page at a time, and consume
-at-least-once notifications for exact source-authenticated Blob publications.
+application may publish a durable or finite-TTL owned regular file while the
+node has no peers, read one freshly authenticated plaintext page at a time,
+and consume tagged at-least-once content or retirement notifications for exact
+source-authenticated Blob publications.
 Each live page is at most 64 KiB and zeroizes its owned plaintext allocation on
 drop; each delivery is metadata only and carries no Blob plaintext.
 
@@ -36,14 +37,14 @@ are durable locally, not that any peer received them.
 ```rust
 use aster_mesh::Priority;
 use aster_node::application::{
-    BlobPublishRequest, BlobReadPageRequest, BlobReadRequest,
+    BlobPublishOptions, BlobPublishRequest, BlobReadPageRequest, BlobReadRequest,
     MAX_SELECTED_BLOB_PAGE_BYTES,
 };
 use std::{fs::File, io::Write};
 
 let blobs = running.selected_blobs();
 let published = blobs
-    .publish(
+    .publish_with_options(
         BlobPublishRequest {
             operation_key: b"my-app/blob/input-v1".to_vec(),
             topic: topic.clone(),
@@ -52,6 +53,7 @@ let published = blobs
             media_type: Some("application/octet-stream".into()),
             schema_id: Vec::new(),
         },
+        BlobPublishOptions::finite_ttl_ms(60_000)?,
         File::open(input_path)?,
     )
     .await?;
@@ -82,10 +84,15 @@ loop {
 The live publisher accepts a nonempty regular file of at most 64 MiB, with its
 cursor at exactly zero, and fixes the selected chunk size at 64 KiB. The file is
 moved into a bounded, joined worker rather than cloned into the actor command.
-The returned result is durable and operation-key idempotent. Retrying the exact
-operation with the same source and identity metadata recovers the original
-publisher counter and acceptance marker; reusing that operation key for
-different content or metadata fails closed as a conflict.
+The returned publication is operation-key idempotent and echoes its original
+signed TTL (`None` means durable), never a remaining lifetime or deletion
+timestamp. `BlobPublishOptions::finite_ttl_ms(0)` returns `InvalidRequest` before
+source I/O, and a host without a supported finite custody clock returns
+`UnsupportedValue` before source I/O or mutation. `publish` remains the durable
+wrapper. Retrying the exact operation with the same source, identity metadata,
+and lifetime recovers the original publisher counter and acceptance marker;
+changing content, metadata, or lifetime under that key fails closed as a
+conflict.
 
 Cancellation before enqueue cannot publish. Cancellation after enqueue has an
 indeterminate result because the worker may have committed; retry the exact
@@ -111,7 +118,7 @@ the delivered topic and scope.
 
 ```rust
 use aster_node::application::{
-    BlobPollRequest, BlobReadRequest, BlobSubscriptionRequest,
+    BlobDeliveryItem, BlobPollRequest, BlobReadRequest, BlobSubscriptionRequest,
     MAX_SELECTED_BLOB_DELIVERIES, MAX_SELECTED_BLOB_SUBSCRIPTION_SCAN,
 };
 
@@ -132,16 +139,29 @@ let page = blobs
     })
     .await?;
 
-for delivery in page.deliveries {
-    let read = BlobReadRequest {
-        id: delivery.id,
-        topic: delivery.topic.clone(),
-        scope: delivery.scope.clone(),
-    };
-    // Read `read` with `read_page` when the application needs plaintext.
-    blobs
-        .acknowledge(subscription.id, delivery.publication, delivery.token)
-        .await?;
+for item in page.deliveries {
+    match item {
+        BlobDeliveryItem::Content(delivery) => {
+            let read = BlobReadRequest {
+                id: delivery.id,
+                topic: delivery.topic.clone(),
+                scope: delivery.scope.clone(),
+            };
+            // Read `read` with `read_page` when the application needs plaintext.
+            blobs
+                .acknowledge(subscription.id, delivery.publication, delivery.token)
+                .await?;
+        }
+        BlobDeliveryItem::Retirement(retirement) => {
+            blobs
+                .acknowledge(
+                    subscription.id,
+                    retirement.publication,
+                    retirement.token,
+                )
+                .await?;
+        }
+    }
 }
 
 let local = blobs.delivery_status().await?;
@@ -169,23 +189,30 @@ one poll freshly authenticates; poll fails closed rather than silently advancing
 through a partial snapshot. `delivery_limit` bounds the committed attempts
 returned from that verified set.
 
-Before returning a delivery, the node rechecks current mission policy, exact
-source envelope and identity metadata, route/content authority, revocation and
-epoch, and the completed encrypted-depot content. The notification exposes only
-the publication ID, Blob ID, publisher/counter, topic/scope, priority, byte
+Before returning a content delivery, the node rechecks current mission policy,
+exact source envelope and identity metadata, route/content authority, revocation
+and epoch, and the completed encrypted-depot content. The notification exposes
+only the publication ID, Blob ID, publisher/counter, topic/scope, priority, byte
 length, media/schema identity metadata, acceptance marker, attempt, and opaque
-acknowledgement token. It never returns a manifest, source envelope, sealed
+acknowledgement token. A retirement notice instead identifies the retired
+publication, original TTL, typed reason, retirement generation, attempt, and a
+separately bound token. Neither form returns a manifest, source envelope, sealed
 bytes, key, nonce, chunk, carrier state, or depot path.
 
 Unacknowledged work is retried with a higher nonzero attempt and a new opaque
-token. Tokens bind the mission-local subscription incarnation, exact publication
-identity, delivery tenure, and issued attempt. Any earlier nonzero token at or
-below the durable attempt high-water remains valid while that exact publication
-tenure remains active, so a response lost to process termination can still be
-acknowledged after a later retry. Exact acknowledgement and reacknowledgement
-are idempotent; tokens above the issued high-water, cross-subscription or
-cross-publication tokens, prior-tenure tokens, stale incarnations, malformed
-tokens, and removed/recreated selectors fail closed.
+token. Version-1 tokens bind content tenure; version-2 tokens bind retirement
+generation, and acknowledgement dispatches strictly by that tag. Any earlier
+valid token at or below the durable attempt high-water remains valid while its
+exact content tenure or retirement evidence remains active, so a response lost
+to process termination can still be acknowledged after a later retry. Exact
+acknowledgement and reacknowledgement are idempotent; tokens above the issued
+high-water, cross-subscription or cross-publication tokens, prior-tenure tokens,
+stale incarnations, malformed tokens, and removed/recreated selectors fail
+closed. Reads and expired unacknowledged content tokens return
+`ExpiredOrRetired` while retirement evidence is retained. After its existing
+45-day conservative lower-bound
+retention expires, the retired publication and retirement token return
+`NotFound`.
 `unsubscribe` removes the selector and its delivery ledger without changing
 configured Blob network interests.
 
@@ -357,10 +384,13 @@ Normal and `AtLeast` run eligible v7/v8 profile-4 Blob work because `AtLeast`
 filters Event only.
 `ReceiveOnly` advertises, requests, stages, promotes, and counts zero Blob work.
 The live handle does not change those contact rules and reports no Blob peer or
-convergence status. Semantic-v8 authenticated custody supplies finite Blob
-TTL/expiry and bounded strictly-lower-priority pressure recovery internally.
+convergence status. On a host with a supported custody clock, the Rust
+`publish_with_options` surface activates local finite Blob publication and
+expiry. Finite transfer between peers remains restricted to semantic v8 with
+profile 4; v7 transfers durable Blob work only. Bounded strictly-lower-priority
+pressure recovery remains internal.
 Route-only Blob relay/custody, a metadata-independent whole-byte identity, and
-public Blob lifecycle API/CLI controls are not implemented.
+Blob TTL fields in the CLI, RPC, Protobuf, and FFI surfaces are not implemented.
 
 `publish` requires a seekable source because it makes two bounded passes. The
 first computes the whole-content and per-chunk digests with one bounded,

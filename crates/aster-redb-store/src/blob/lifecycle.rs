@@ -792,8 +792,7 @@ fn stored_ttl_deadline(
     } else {
         checkpoint
             .tick_ms
-            .checked_add(ttl_ms - age.cumulative_age_ms)
-            .ok_or_else(|| cursor_invariant("Blob TTL deadline arithmetic overflowed"))?
+            .saturating_add(ttl_ms - age.cumulative_age_ms)
     };
     Ok(Some(TtlDeadline {
         generation: age.continuity_generation,

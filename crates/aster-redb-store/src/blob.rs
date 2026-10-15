@@ -14,7 +14,7 @@ pub(crate) mod depot;
 pub(crate) mod lease;
 #[allow(dead_code)] // Lifecycle authority becomes active in Tasks 2-4.
 pub(crate) mod lifecycle;
-#[allow(dead_code)] // Canonical selection helpers become active in Task 3.
+#[allow(dead_code)]
 pub(crate) mod pressure;
 
 pub use lifecycle::{
@@ -417,6 +417,7 @@ pub enum BlobStoreError {
     InvalidPublication(&'static str),
     Verification(String),
     OperationConflict,
+    NotFound,
     ExpiredOrRetired,
     PublisherRevoked(NodeId),
     KeyEpochStale {
@@ -537,6 +538,7 @@ impl fmt::Display for BlobStoreError {
             Self::OperationConflict => {
                 formatter.write_str("Blob operation key is bound to another intent")
             }
+            Self::NotFound => formatter.write_str("Blob publication was not found"),
             Self::ExpiredOrRetired => formatter.write_str("Blob publication is expired or retired"),
             Self::PublisherRevoked(publisher) => {
                 write!(formatter, "Blob publisher {publisher:?} is revoked")
@@ -1068,7 +1070,7 @@ impl BlobPublicationIntent {
     }
 
     #[doc(hidden)]
-    pub(crate) fn new_with_ttl(
+    pub fn new_with_ttl(
         publisher: NodeId,
         topic: Topic,
         scope: Scope,
@@ -1162,6 +1164,7 @@ pub struct BlobReservation {
     topic: Topic,
     scope: Scope,
     ttl_ms: Option<u64>,
+    local_initial_sample: Option<aster_mesh::CustodySample>,
     previous_counter: u64,
     counter: u64,
     context: VersionVector,
@@ -1573,7 +1576,7 @@ impl BlobContactEligibility {
     }
 }
 
-/// Private projection of the exact Task-2 capability fields needed by the
+/// Private projection of the exact capability fields needed by the
 /// store transaction. Production construction consumes the opaque verified
 /// capability so decoded claim fields can never authorize network provenance.
 struct VerifiedFiniteBlobAdmission {
@@ -1649,7 +1652,7 @@ pub struct PreparedBlobCustodySend {
 }
 
 impl VerifiedBlobCustodySend {
-    /// Consumes the Store authorization to construct one exact Task-2 claim.
+    /// Consumes the Store authorization to construct one exact claim.
     pub fn into_claim(
         self,
         source: &ContentVerifiedBlobEnvelope,
@@ -1957,23 +1960,18 @@ pub(crate) fn evaluate_blob_lifetime(
         });
     }
     let remaining_ms = ttl_ms - projected.cumulative_age_ms;
+    // A positive TTL is exact even when its mathematical deadline lies beyond
+    // the representable custody-clock domain. Such a deadline is unreachable:
+    // at `u64::MAX` the accumulated representable age is still smaller than the
+    // requested TTL. Saturating the scheduling hint therefore preserves the
+    // lifetime contract without turning a valid publication into a schema
+    // failure.
     let deadline = projected
         .checkpoint
-        .map(|checkpoint| {
-            checkpoint
-                .tick_ms
-                .checked_add(remaining_ms)
-                .map(|tick_ms| aster_mesh::CustodySample {
-                    clock_id: checkpoint.clock_id,
-                    tick_ms,
-                })
-                .ok_or_else(|| {
-                    blob_error(BlobStoreError::SchemaInvariant(
-                        "Blob lifetime deadline arithmetic overflowed",
-                    ))
-                })
-        })
-        .transpose()?;
+        .map(|checkpoint| aster_mesh::CustodySample {
+            clock_id: checkpoint.clock_id,
+            tick_ms: checkpoint.tick_ms.saturating_add(remaining_ms),
+        });
     if projected.continuity_lost {
         return Ok(BlobLifetimeEvaluation::FiniteIndeterminate {
             age_ms: projected.cumulative_age_ms,
@@ -2746,10 +2744,10 @@ impl Store {
             .expect("Blob carrier-commit post-snapshot gate lock") = Some((reached, release));
     }
 
-    /// Test-only observation of the Store-owned Blob custody clock.
-    #[cfg(any(test, feature = "test-utils"))]
+    /// Advances the Store-owned Blob custody continuity without exposing its
+    /// internal checkpoint representation.
     #[doc(hidden)]
-    pub fn test_observe_blob_custody_sample(
+    pub fn observe_blob_custody_sample(
         &self,
         sample: aster_mesh::CustodySample,
     ) -> Result<(), StoreError> {
@@ -2760,6 +2758,15 @@ impl Store {
         custody::observe_continuity_write(&write, sample)?;
         write.commit()?;
         Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn test_observe_blob_custody_sample(
+        &self,
+        sample: aster_mesh::CustodySample,
+    ) -> Result<(), StoreError> {
+        self.observe_blob_custody_sample(sample)
     }
 
     /// Test-only deterministic fault seam consumed after physical carrier
@@ -3079,9 +3086,12 @@ impl Store {
         topic: &Topic,
         scope: &Scope,
     ) -> Result<BlobReservation, StoreError> {
-        self.reserve_blob_with_lifetime_policy(policy, publisher, topic, scope, None)
+        self.reserve_blob_with_lifetime_and_sample_policy(
+            policy, publisher, topic, scope, None, None,
+        )
     }
 
+    #[allow(dead_code)]
     pub(crate) fn reserve_blob_with_lifetime_policy(
         &self,
         policy: &ControlPolicySnapshot,
@@ -3089,6 +3099,20 @@ impl Store {
         topic: &Topic,
         scope: &Scope,
         ttl_ms: Option<u64>,
+    ) -> Result<BlobReservation, StoreError> {
+        self.reserve_blob_with_lifetime_and_sample_policy(
+            policy, publisher, topic, scope, ttl_ms, None,
+        )
+    }
+
+    fn reserve_blob_with_lifetime_and_sample_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        publisher: NodeId,
+        topic: &Topic,
+        scope: &Scope,
+        ttl_ms: Option<u64>,
+        local_initial_sample: Option<aster_mesh::CustodySample>,
     ) -> Result<BlobReservation, StoreError> {
         if ttl_ms == Some(0) {
             return Err(blob_error(BlobStoreError::InvalidPublication(
@@ -3158,10 +3182,38 @@ impl Store {
             topic: topic.clone(),
             scope: scope.clone(),
             ttl_ms,
+            local_initial_sample,
             previous_counter,
             counter,
             context,
         })
+    }
+
+    /// Reserves one local publication while binding its trusted initial custody
+    /// sample for a later same-transaction finite commit.
+    #[doc(hidden)]
+    pub fn reserve_local_blob_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        publisher: NodeId,
+        topic: &Topic,
+        scope: &Scope,
+        ttl_ms: Option<u64>,
+        initial_sample: Option<aster_mesh::CustodySample>,
+    ) -> Result<BlobReservation, StoreError> {
+        if ttl_ms.is_some() != initial_sample.is_some() {
+            return Err(blob_error(BlobStoreError::InvalidPublication(
+                "local finite Blob reservation requires one initial custody sample",
+            )));
+        }
+        self.reserve_blob_with_lifetime_and_sample_policy(
+            policy,
+            publisher,
+            topic,
+            scope,
+            ttl_ms,
+            initial_sample,
+        )
     }
 
     /// Policy-bound idempotency preflight before allocating a current-epoch variant.
@@ -3344,17 +3396,12 @@ impl Store {
         require_control_policy_read(&read, authority, policy)?;
         let stored = load_blob_from_read(&read, candidate.projection.transfer_id)?
             .ok_or_else(|| blob_error(BlobStoreError::CompletionMismatch))?;
-        let metadata = BlobMetadata {
-            transfer_id: stored.transfer_id,
-            semantic_id: stored.semantic_id,
-            blob_id: stored.blob_id,
-            variant_id: stored.variant_id,
-            manifest_digest: stored.manifest_digest,
-            route_lineage: stored.route_lineage,
-            physical_lineage: stored.physical_lineage,
-            lifetime: BlobLifetime::Durable,
-            header: stored.header.clone(),
-        };
+        let encoded = read
+            .open_table(BLOB_PUBLICATIONS)?
+            .get(candidate.projection.transfer_id.as_bytes().as_slice())?
+            .map(|value| value.value().to_vec())
+            .ok_or_else(|| blob_error(BlobStoreError::CompletionMismatch))?;
+        let metadata = decode_blob_metadata(&encoded)?;
         let shape = durable_blob_source_shape_read(&read, &metadata, true)?;
         let sealed_len = u64::try_from(stored.sealed.len())
             .map_err(|_| StoreError::PayloadByteAccountingOverflow)?;
@@ -6975,14 +7022,70 @@ impl Store {
             sealed,
             completion,
             BlobLifetime::Durable,
+            None,
         )
     }
 
-    #[allow(
-        dead_code,
-        clippy::too_many_arguments,
-        reason = "Task 6 activates this crate-private local path"
-    )]
+    /// Commits a locally prepared durable or finite publication. Finite age is
+    /// derived only from the reservation's private initial sample and the
+    /// trusted pre-commit sample inside the publication transaction.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_reserved_local_blob_once_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        request: &BlobOperationRequest<'_>,
+        reservation: &BlobReservation,
+        blob: &ContentVerifiedBlobEnvelope,
+        sealed: &[u8],
+        completion: &BlobDepotCompletion,
+        precommit_sample: Option<aster_mesh::CustodySample>,
+    ) -> Result<BlobOnceOutcome, StoreError> {
+        let lifetime = match reservation.ttl_ms {
+            None if precommit_sample.is_none() && reservation.local_initial_sample.is_none() => {
+                BlobLifetime::Durable
+            }
+            Some(ttl_ms) => {
+                reservation.local_initial_sample.ok_or_else(|| {
+                    blob_error(BlobStoreError::InvalidPublication(
+                        "local finite Blob reservation is missing its initial sample",
+                    ))
+                })?;
+                precommit_sample.ok_or_else(|| {
+                    blob_error(BlobStoreError::InvalidPublication(
+                        "local finite Blob commit is missing its pre-commit sample",
+                    ))
+                })?;
+                BlobLifetime::Finite {
+                    ttl_ms,
+                    age: custody::LowerBoundAgeCheckpoint {
+                        cumulative_age_ms: 0,
+                        checkpoint: None,
+                        continuity_generation: 0,
+                        continuity_lost: true,
+                    },
+                    provenance: BlobFiniteProvenance::Local,
+                }
+            }
+            _ => {
+                return Err(blob_error(BlobStoreError::InvalidPublication(
+                    "durable Blob commit received a custody sample",
+                )));
+            }
+        };
+        self.commit_reserved_blob_once_with_lifetime(
+            policy,
+            request,
+            reservation,
+            blob,
+            sealed,
+            completion,
+            lifetime,
+            reservation.local_initial_sample.zip(precommit_sample),
+        )
+    }
+
+    #[allow(dead_code, clippy::too_many_arguments)]
     pub(crate) fn commit_reserved_local_finite_blob_once_with_policy(
         &self,
         policy: &ControlPolicySnapshot,
@@ -7010,6 +7113,7 @@ impl Store {
                 age,
                 provenance: BlobFiniteProvenance::Local,
             },
+            None,
         )
     }
 
@@ -7023,6 +7127,7 @@ impl Store {
         sealed: &[u8],
         completion: &BlobDepotCompletion,
         lifetime: BlobLifetime,
+        local_samples: Option<(aster_mesh::CustodySample, aster_mesh::CustodySample)>,
     ) -> Result<BlobOnceOutcome, StoreError> {
         self.require_live()?;
         if policy != reservation.control_policy() {
@@ -7041,12 +7146,44 @@ impl Store {
         self.require_live()?;
         let read = self.database.begin_read()?;
         deletion::require_variant_available_read(&read, prepared.variant_id)?;
-        require_blob_lifetime_visible_read(&read, lifetime)?;
+        if local_samples.is_none() {
+            require_blob_lifetime_visible_read(&read, lifetime)?;
+        }
         drop(read);
         depot::verify_completion(self, completion)?;
 
         let write = self.database.begin_write()?;
         enforce_live_write(&write)?;
+        if let Some((initial, final_sample)) = local_samples {
+            let continuity = custody::observe_continuity_write(&write, final_sample)?;
+            let normalized = continuity.sample();
+            let continuous = initial.clock_id == final_sample.clock_id
+                && final_sample.tick_ms >= initial.tick_ms
+                && normalized.clock_id == initial.clock_id
+                && normalized.tick_ms >= initial.tick_ms
+                && continuity.sample().clock_id == final_sample.clock_id
+                && continuity.sample().tick_ms >= final_sample.tick_ms;
+            let ttl_ms = reservation.ttl_ms.expect("finite local reservation");
+            let cumulative_age_ms = normalized.tick_ms.checked_sub(initial.tick_ms);
+            if !continuous || cumulative_age_ms.is_none_or(|age| age >= ttl_ms) {
+                return Err(blob_error(BlobStoreError::ExpiredOrRetired));
+            }
+            let age = custody::LowerBoundAgeCheckpoint {
+                cumulative_age_ms: cumulative_age_ms.expect("checked finite publication age"),
+                checkpoint: Some(normalized),
+                continuity_generation: continuity.generation(),
+                continuity_lost: false,
+            };
+            prepared.lifetime = BlobLifetime::Finite {
+                ttl_ms,
+                age,
+                provenance: BlobFiniteProvenance::Local,
+            };
+            validate_blob_lifetime(prepared.lifetime)?;
+            let mut metadata = decode_blob_metadata(&prepared.encoded_metadata)?;
+            metadata.lifetime = prepared.lifetime;
+            prepared.encoded_metadata = encode_blob_metadata(metadata)?;
+        }
         synchronize_blob_policy_generation_write(&write)?;
         let projected_lifetime =
             lifecycle::project_lifetime_for_policy_write(&write, prepared.lifetime)?;
@@ -13689,6 +13826,9 @@ fn blob_read_plan_read(
     if rows.is_empty() && saw_retired {
         return Err(blob_error(BlobStoreError::ExpiredOrRetired));
     }
+    if rows.is_empty() {
+        return Err(blob_error(BlobStoreError::NotFound));
+    }
     rows.sort_by_key(|candidate| candidate.projection.semantic_id);
     let current_epoch = read
         .open_table(CONTROL_SCOPE_EPOCHS)?
@@ -14021,7 +14161,7 @@ fn load_blob_from_write(
     Ok(blob)
 }
 
-fn require_blob_publication_visible_write(
+pub(crate) fn require_blob_publication_visible_write(
     write: &redb::WriteTransaction,
     transfer_id: BlobTransferId,
 ) -> Result<(), StoreError> {
@@ -14099,8 +14239,13 @@ fn require_blob_causal_authority_write(
 pub(crate) struct BlobSubscriptionIdentity {
     pub transfer_id: BlobTransferId,
     pub semantic_id: BlobSemanticId,
+    pub blob_id: BlobId,
+    pub publisher: NodeId,
+    pub publisher_counter: u64,
     pub topic: Topic,
     pub scope: Scope,
+    pub priority: Priority,
+    pub ttl_ms: Option<u64>,
     pub acceptance_marker: u64,
 }
 
@@ -14116,8 +14261,13 @@ fn blob_subscription_identity_from_metadata(
     Ok(BlobSubscriptionIdentity {
         transfer_id: metadata.transfer_id,
         semantic_id: metadata.semantic_id,
+        blob_id: metadata.blob_id,
+        publisher: metadata.header.stamp.dot.publisher,
+        publisher_counter: metadata.header.stamp.dot.counter,
         topic: metadata.header.topic.clone(),
         scope: metadata.header.scope.clone(),
+        priority: metadata.header.priority,
+        ttl_ms: metadata.header.ttl_ms,
         acceptance_marker,
     })
 }
@@ -14301,6 +14451,29 @@ pub(crate) fn blob_subscription_lifetime_hidden_read(
         )));
     }
     blob_lifetime_is_visible_read(read, metadata.lifetime).map(|visible| !visible)
+}
+
+pub(crate) fn blob_subscription_lifetime_hidden_write(
+    write: &redb::WriteTransaction,
+    transfer_id: BlobTransferId,
+) -> Result<bool, StoreError> {
+    let Some(encoded) = write
+        .open_table(BLOB_PUBLICATIONS)?
+        .get(transfer_id.as_bytes().as_slice())?
+        .map(|value| value.value().to_vec())
+    else {
+        return Ok(false);
+    };
+    if lifecycle::publication_record_is_retired(&encoded).map_err(blob_error)? {
+        return Ok(false);
+    }
+    let metadata = decode_blob_metadata(&encoded)?;
+    if metadata.transfer_id != transfer_id {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "Blob subscription lifetime lookup differs from its publication key",
+        )));
+    }
+    blob_lifetime_is_visible_write(write, metadata.lifetime).map(|visible| !visible)
 }
 
 pub(crate) fn blob_subscription_projection_read(

@@ -201,10 +201,10 @@ evidence statuses below do not move.
 | Component | Selected responsibility | Deliberately excluded |
 |---|---|---|
 | `aster-profile` | Requirements-owned complete reconciliation key and canonical inventory ordering | Semantic identity, source security, policy, or a competing product object model |
-| `aster-redb-store` | One mission-bound transaction authority for ordered control/policy, content-verified Event/State/Record/Blob publication, the shared causal frontier, Event/State/Record delivery ledgers, the metadata-only exact-publication Blob delivery ledger, Event custody, class-specific operations/cursors, guarded Record resolution, route-only Event cache, Blob depot markers, exact pending Blob source plans, peer-neutral carrier prefixes, semantic-v8 finite custody, and bounded exact-manifest Blob reclamation. An additive open path binds one exact mission/profile/generation and rejects mismatch, rollback, or implicit advance. It grants ordinary Blob visibility only after exact depot, fresh full-content, fresh current-lineage, and lifecycle completion agree atomically. | Authenticating the caller-supplied profile generation, snapshot/backup-resistant rollback, deriving identity from unverified bytes, route-only Blob relay/custody, executing application merge code, State/Record TTL or GC, public Blob lifecycle controls, complete physical allocation/sanitization, automatic revoke-plus-rekey, or a second authority |
+| `aster-redb-store` | One mission-bound transaction authority for ordered control/policy, content-verified Event/State/Record/Blob publication, the shared causal frontier, Event/State/Record delivery ledgers, the tagged exact-publication/retirement Blob delivery ledger, Event custody, class-specific operations/cursors, guarded Record resolution, route-only Event cache, Blob depot markers, exact pending Blob source plans, peer-neutral carrier prefixes, semantic-v8 finite custody, and bounded exact-manifest Blob reclamation. An additive open path binds one exact mission/profile/generation and rejects mismatch, rollback, or implicit advance. It grants ordinary Blob visibility only after exact depot, fresh full-content, fresh current-lineage, and lifecycle completion agree atomically. | Authenticating the caller-supplied profile generation, snapshot/backup-resistant rollback, deriving identity from unverified bytes, route-only Blob relay/custody, executing application merge code, State/Record TTL or GC, protocol/CLI/RPC/Protobuf/FFI Blob lifetime controls, complete physical allocation/sanitization, automatic revoke-plus-rekey, or a second authority |
 | `aster-negentropy` | Sole bounded set-difference mechanism over class-specific exact Event, State, Record, and Blob source transfer identities, with timestamp zero | Object transfer, Blob carrier-prefix ownership, semantic identity, policy, or durable contact progress |
 | `aster-iroh` | Direct endpoint lifecycle, exact carrier authentication, rostered allowlist admission, unrostered carrier acceptance only into the higher-layer mission handshake, bounded exchange, opt-in exact carrier ALPN selection and TLS-exporter channel binding, an opt-in singleton controlled HTTPS relay with explicit WebPKI or replacement DER-root trust and observation-only path telemetry, and default-off short-lived nearby lookup or sanitized locator browsing on the default IPv4 multicast interface or an explicit sorted, deduplicated bounded interface set | Mission identity, item/source authorization, production/hosted discovery or public/default relay fallback, port mapping, hostile-bounded upstream discovery state, lifetime IP pinning, representative or physical NAT acceptance, or physical-path proof |
-| `aster-node` | Sole stock composition root for mission-before-inventory/control-before-data; exact rostered carrier/mission checks or bounded authority-authenticated automatic LAN admission; exact control/Event/State/Record transfer; semantic-v3-v8 Event custody; semantic-v4-v8 State/Record lanes; semantic-v7/v8 profile-4 direct content-capable Blob source-before-carrier transfer with v7 durable-only and v8 authenticated finite custody; semantic-v6-v8 static selected Event bridge negotiation, peer-route filtering, bounded rotation, durable receiver outcomes, and restart promotion; semantic-v7/v8 negotiated receipt-free Event pages; constrained emission with ReceiveOnly zero Blob; caller-provided protected live `NodeConfig`; actor-owned live Event/State/Record/Blob and privileged control handles; durable Event delivery, retained-bounded State positive-current-version, Record whole-key active-head, and metadata-only exact-publication Blob delivery with local State/Record/Blob delivery-ledger status and local durable Blob transfer progress; capacity-one joined Blob worker with bounded regular-file publication and zeroize-on-drop plaintext pages; exclusive stopped Event/State/Record/Blob/control facades; local zeroization; receipts and CLI. Its mission module additionally exposes an owned, cancellation-safe two-node profile-`0x0002` Iroh authorization/raw-exchange path. | Supported bridge administration or dynamic hierarchy lifecycle, stock runtime/CLI profile selection, production or hostile-LAN discovery qualification, production SecretStore or protected stock CLI/bindings, cross-process admin IPC, automatic revoke-plus-rekey, global convergence claims, State materialized-view or synthetic-withdrawal delivery, dynamic `NodeConfig` interest mutation through State/Record/Blob application subscriptions, State/Record/Blob peer/contact/convergence status, route-only Blob relay/custody, State/Record TTL/GC, public Blob lifecycle controls, broader State/Record partitions/relays, physical RF silence, automatic merge, generalized policy, coordinated provider destruction, platform-complete zeroization, or release authorization |
+| `aster-node` | Sole stock composition root for mission-before-inventory/control-before-data; exact rostered carrier/mission checks or bounded authority-authenticated automatic LAN admission; exact control/Event/State/Record transfer; semantic-v3-v8 Event custody; semantic-v4-v8 State/Record lanes; semantic-v7/v8 profile-4 direct content-capable Blob source-before-carrier transfer with v7 durable-only and v8 authenticated finite custody; semantic-v6-v8 static selected Event bridge negotiation, peer-route filtering, bounded rotation, durable receiver outcomes, and restart promotion; semantic-v7/v8 negotiated receipt-free Event pages; constrained emission with ReceiveOnly zero Blob; caller-provided protected live `NodeConfig`; actor-owned live Event/State/Record/Blob and privileged control handles; durable Event delivery, retained-bounded State positive-current-version, Record whole-key active-head, and tagged exact-publication/retirement Blob delivery with local State/Record/Blob delivery-ledger status and local durable Blob transfer progress; public Rust durable/finite Blob publication with exact original-TTL echoes and bounded lifecycle checks; capacity-one joined Blob worker with bounded regular-file publication and zeroize-on-drop plaintext pages; exclusive stopped Event/State/Record/Blob/control facades; local zeroization; receipts and CLI. Its mission module additionally exposes an owned, cancellation-safe two-node profile-`0x0002` Iroh authorization/raw-exchange path. | Supported bridge administration or dynamic hierarchy lifecycle, stock runtime/CLI profile selection, production or hostile-LAN discovery qualification, production SecretStore or protected stock CLI/bindings, cross-process admin IPC, automatic revoke-plus-rekey, global convergence claims, State materialized-view or synthetic-withdrawal delivery, dynamic `NodeConfig` interest mutation through State/Record/Blob application subscriptions, State/Record/Blob peer/contact/convergence status, route-only Blob relay/custody, State/Record TTL/GC, protocol/CLI/RPC/Protobuf/FFI Blob lifetime controls, broader State/Record partitions/relays, physical RF silence, automatic merge, generalized policy, coordinated provider destruction, platform-complete zeroization, or release authorization |
 | `aster-core` | Profile-`0x0001` mission/control/source security and recipient-filtered rekey planning; additive profile-`0x0002` provisioned singleton policy, P-256 semantic-v1 Event/control forms, four-flight exporter-bound session, and exact-magic facade; provider-neutral bounded provisioning protection plus operation-bound opaque SecretStore install/load/destroy contracts | A production SecretStore/protection backend, stock runtime profile selection, profile-`0x0002` State/Record/Blob/batch/bridge/rekey, hardware/platform custody policy, operational recovery or physical-erasure assurance; the core remains authoritative migration source and is not deleted while replacements lack equivalent tests |
 
 Each control transfer ID is the exact envelope digest authenticated against its
@@ -761,8 +761,9 @@ cross-class custody, and bridged-scale/resource acceptance remain open.
 
 The current selected node exposes `RunningNode::selected_blobs()` as a cloneable
 `SelectedBlobHandle` on the same bounded actor-owned application lane as Event,
-State, and Record. It exposes publication, bounded page reads, and durable
-metadata-only delivery for exact source-authenticated Blob publications. The
+State, and Record. It exposes durable or finite publication, bounded page reads,
+and durable tagged content/retirement metadata delivery for exact
+source-authenticated Blob publications. The
 signed-source v2 retained receipt below observes one bounded interrupted/reopen/
 different-peer resume use of publication and page reads and moves `DM-5.1-10`
 through `DM-5.1-13`, `DM-5.2-19` through `DM-5.2-22`, and `DM-7-16`; it predates
@@ -773,22 +774,31 @@ publication separation, and final reopen. Neither receipt relabels the earlier
 source freezes or the separate unretained cleanup/race automation.
 
 The live publisher accepts an already-open regular file only at cursor zero,
-and runs admitted file work on one joined capacity-one worker. Before
-preparation or durable mutation, the worker rejects an empty, non-regular, or
-over-64-MiB input. It rechecks metadata and length
+and runs admitted file work on one joined capacity-one worker. `publish`
+remains the durable wrapper; additive `publish_with_options` accepts a positive
+original TTL. Zero TTL is rejected before source I/O, and a host without the
+selected finite-custody clock rejects finite publication before source I/O or
+store mutation. Before preparation or durable mutation, the worker rejects an
+empty, non-regular, or over-64-MiB input. It rechecks metadata and length
 across bounded preparation/encryption passes, enforces the selected 1,024-chunk
 ceiling and depot quotas, source-seals only exact completed content, and commits
-through the existing operation-key-idempotent store authority. Pre-enqueue
+through the existing operation-key-idempotent store authority. Finite
+publication samples custody before staging and again before commit, counts
+staging time against the original TTL, and echoes that exact original lifetime
+rather than a remaining duration or deletion timestamp. Exact retry binds the
+same lifetime; changing it under the operation key is a conflict. Pre-enqueue
 cancellation cannot publish; post-enqueue cancellation is explicitly
 indeterminate and exact retry recovers the durable result. Failed or changed
 sources may retain bounded quota-charged nonpublic staging; no staging GC is
 claimed.
 
 `read_page` exact-loads the current application projection, checks its
-startup-authenticated route/content/depot capability, streams only the requested
-authenticated range, and performs a final policy/lifecycle check before
-disclosing a nonempty page of at most 64 KiB, spanning at most two canonical
-chunks. Plaintext is
+startup-authenticated route/content/depot capability and finite-custody state,
+streams only the requested authenticated range, and performs a final
+policy/lifecycle check before disclosing a nonempty page of at most 64 KiB,
+spanning at most two canonical chunks. Stopped `read_into` applies the same
+lifecycle boundary before each bounded page. Publication and read results echo
+the exact original TTL. Plaintext is
 held in a zeroize-on-drop value; caller copies become caller custody. Rekey,
 revocation, shutdown, and terminal zeroization close new disclosure, while
 durable exact retry remains subject to current authorization. Coherence failures
@@ -803,15 +813,22 @@ change configured Blob network interests or route/content authority.
 Poll fails closed unless its bound covers the complete matching retained set,
 then freshly verifies every exact source envelope, current policy, epoch,
 revocation, route/content lineage, and completed depot before atomically
-committing attempts. Delivery exposes authenticated identity metadata only;
-plaintext remains on the existing read surface. Opaque tokens bind the
-subscription incarnation, publication, tenure, and issued attempt. Exact
-ack/re-ack is idempotent, and an earlier nonzero attempt at or below the durable
-high-water remains valid while the same pending tenure is active. Wrong-tenure,
-wrong-incarnation, malformed, future/unissued, removed/recreated, or
-cross-bound tokens fail closed. `delivery_status` reports audited selector/pending/ack/cursor
-counts only; it is not peer, contact, transfer-progress, sync, or convergence
-status.
+committing attempts. A page carries exactly one tagged family: retirement
+notices win the page, while content remains pending for a later page, and the
+combined `has_more` covers both families. Content delivery exposes authenticated
+identity metadata including the exact original TTL; retirement delivery exposes
+the retired publication, original TTL, typed reason, and retirement generation.
+Neither opens plaintext. Version-1 tokens bind content tenure and version-2
+tokens bind retirement generation; acknowledgement dispatches strictly by the
+token tag. Exact ack/re-ack is idempotent, and an earlier nonzero attempt at or
+below the durable high-water remains valid while the same content tenure or
+retirement evidence is active. Wrong-tenure/generation, wrong-incarnation,
+malformed, future/unissued, removed/recreated, or cross-bound tokens fail
+closed. Reads and content tokens return `ExpiredOrRetired` while authenticated
+retirement evidence remains retained; after its 45-day conservative
+lower-bound retention expires, the same lookup returns `NotFound`.
+`delivery_status` reports audited selector/pending/ack/cursor counts only; it is
+not peer, contact, transfer-progress, sync, or convergence status.
 
 The live handle and stopped facade separately expose `transfer_status`, an
 audited local snapshot of retained publication/pending-source counts, staging
@@ -830,7 +847,11 @@ direct-Iroh transfer and receiver read, and peerless receiver restart read. The
 delivery tests separately cover exact publication identity, shared-BlobId
 publications, retry/token rotation, ack/re-ack, cross-binding rejection,
 selector removal/recreation, predecessor migration, bounds, policy withholding,
-and reopen. Transfer-status tests cover waiting, partial-prefix, committed-carrier,
+and reopen. Additional current-code tests cover finite publication before-I/O
+rejection, exact-TTL retry/conflict, staging-age and read-page expiry boundaries,
+restart, retirement-first tagged delivery, version-separated acknowledgement,
+and retirement-evidence expiry. Transfer-status tests cover waiting,
+partial-prefix, committed-carrier,
 reopen, aggregate separation, live-worker routing, and impossible-phase rejection.
 The historical semantic-v5 codec/storage and current v7/v8 stream/lifecycle
 cases remain separate same-process automation. The
@@ -848,7 +869,8 @@ the compiled
 retained acceptance harnesses, not minimal developer samples. Blob-specific
 sync/peer status, selected-node language binding, and local-agent method remain
 absent.
-Route-only relay/custody, TTL/expiry/GC,
+Route-only relay/custody, retained finite-TTL/expiry/retirement/GC acceptance,
+protocol/CLI/RPC/Protobuf/FFI lifetime controls,
 metadata-independent pure-byte identity,
 100-plus-MiB and process-RSS evidence, complete physical allocation accounting,
 physical systems/carriers, mixed implementations, long-duration/power-loss
@@ -1119,7 +1141,8 @@ historical Event/control receipt. At that network freeze, live Blob application
 access and subscription were absent; the current live mechanism above
 supersedes only the access absence. Retained Blob subscription and class-specific
 status acceptance,
-selected route-only Blob relay/custody, TTL/expiry/GC, pure whole-byte identity
+selected route-only Blob relay/custody, retained
+TTL/expiry/retirement/GC acceptance, pure whole-byte identity
 or metadata-independent deduplication, 100+ MiB/RSS and resource acceptance,
 physical carriers, mixed implementations, and release authorization remain
 open.
@@ -2894,7 +2917,8 @@ receipt above now advances `DM-5.1-12`, `DM-5.1-13`, and `DM-5.2-19` through
 `DM-5.2-22` to `observed-bounded` without rewriting this historical source/test
 identity. Retained Blob-delivery acceptance and Blob peer/convergence status,
 route-only Blob relay/custody,
-TTL/expiry/GC, pure-byte identity/deduplication, 100+ MiB and process-RSS
+retained TTL/expiry/retirement/GC acceptance, pure-byte
+identity/deduplication, 100+ MiB and process-RSS
 evidence, physical carriers, mixed implementations, and release authorization
 remain open.
 
@@ -4171,7 +4195,7 @@ closure nor supported-target, SBOM, packaging, or release acceptance.
 | Source and mission security | `implemented-uncredited` / `observed-bounded` / `open` / `external-gate` | Operationalize the additive exact profile-`0x0002` provisioned policy/Event/control/Iroh mission mechanisms through a named stock runtime, protected provisioning, CLI/bindings, snapshot-resistant rollback, and representative packet-capture plus compute/memory/bandwidth/idle/energy evidence; retain profile `0x0001` without reinterpretation; extend the caller-provided protected live Rust config and stopped Event/admin seams through an admitted production backend, issuance/recovery, and a coordinated live-drain/store-terminalization/provider-destroy lifecycle; add generalized multi-family control policy plus automatic/atomic revocation remediation; verify multi-scope, repeated, longer-partition, and physical revocation/rekey propagation; add non-Unix and physical/copy-on-write/snapshot/swap/backup zeroization assurance, each profile's admitted FIPS boundary, mixed-implementation interoperability, and independent cryptographic review |
 | Custody and constrained operation | `observed-bounded` / `implemented-uncredited` / `open` | Selected Event/RouteEvent has semantic-v3-format cumulative age inherited through v8, Linux finite Event TTL, expiry/GC, priority scheduling/retry, bounded quotas, thresholds, and receive-only inbound. Semantic-v8 Blob additionally has authenticated finite custody, conservative lower-bound age, expiry, and strictly-lower-priority bounded pressure recovery as current-code evidence only; v7 Blob remains durable-only. One retained Linux-container receipt observes only the Event boundary: exact threshold withholding, route-only custody, two expiry points, explicit pressure retirement, persisted quota replacement, priority-ordered delivery, and ReceiveOnly ingestion with zero local-object disclosure. Normal and AtLeast run v4-v8 mutable work and eligible v7/v8 profile-4 Blob work because AtLeast is Event-only; ReceiveOnly initiates/discloses neither. Selected finite State/Record TTL remains rejected/open. Still required are retained Blob lifecycle acceptance, retry-cadence acceptance, complete cross-class priority eviction/custody, route-only Blob custody, non-Linux Event age, physical RF silence and constrained-link evidence, bindings, scale, mixed implementations, and release authorization. |
 | Scope and application policy | `implemented-uncredited` / `open` | Retain the static semantic-v6 Event hierarchy execution boundary; then add supported multi-scope join/leave administration, bandwidth and complete storage quotas, dynamic routing/interest and peer policy, revocation/rekey lifecycle, and cross-class bridge custody. Separately broaden State/Record application-selector evidence, decide materialized-view/withdrawal requirements, add automatic registered-policy Record merge and atomic subscription update, and provide equivalent live status/gap semantics beyond Event. |
-| Blob behavior | `observed-bounded` / `implemented-uncredited` / `open` | One signed-source retained receipt covers bounded live Blob class support, immutability, peerless publication, direct seeding, exact partial progress across graceful reopen, different-eligible-peer continuation without source refetch, completion, and final reopen. Current code additionally has v7/v8 profile-4 range streaming, semantic-v8 finite custody/lifecycle, exact-partition pressure recovery, manifest-backed bounded reclamation, a durable metadata-only exact-publication delivery ledger with local counts, and a peer-neutral local durable transfer-progress snapshot; stream, lifecycle, cleanup, race, delivery-ledger, and transfer-status cases remain automation only. Retain delivery, transfer-status, stream, and lifecycle acceptance and add class-specific peer/convergence status, process/crash and long-offline recovery, arbitrary-peer and route-only relay/custody behavior, and public lifecycle controls; decide whether a metadata-independent pure-byte content ID is required; add complete physical accounting and hundreds-of-MiB/RSS acceptance. |
+| Blob behavior | `observed-bounded` / `implemented-uncredited` / `open` | One signed-source retained receipt covers bounded live Blob class support, immutability, peerless publication, direct seeding, exact partial progress across graceful reopen, different-eligible-peer continuation without source refetch, completion, and final reopen. Current code additionally has v7/v8 profile-4 range streaming, semantic-v8 finite custody/lifecycle, exact-partition pressure recovery, manifest-backed bounded reclamation, a durable tagged exact-publication/retirement Blob delivery ledger with local counts, public Rust durable/finite publication options with exact original-TTL echoes and bounded read-lifecycle checks, and a peer-neutral local durable transfer-progress snapshot; stream, lifecycle, cleanup, race, delivery-ledger, and transfer-status cases remain automation only. Retain delivery, transfer-status, stream, finite-TTL/expiry/retirement, pressure, and cleanup acceptance; add class-specific peer/convergence status, process/crash and long-offline recovery, arbitrary-peer and route-only relay/custody behavior, and protocol/CLI/RPC/Protobuf/FFI lifetime controls; decide whether a metadata-independent pure-byte content ID is required; add complete physical accounting and hundreds-of-MiB/RSS acceptance. |
 | Carrier portfolio | `implemented-uncredited` / `observed-bounded` / `open` / `external-gate` | Selected direct IP and one explicitly trusted singleton relay mechanism now exist, with one retained cone/direct and restrictive/controlled-relay software namespace-NAT observation. Still required are physical IP, representative NAT direct/fallback, discovery/punching policy, BTLE platform driver, smallest-MTU framing, link characteristics, State/Record/Blob-over-relay acceptance, mobility/outage recovery, mixed implementations, and future-carrier proof. |
 | DDIL resilience | `open` / `external-gate` | Loss/bandwidth floors, long custody/offline interval, crash/corruption recovery, broader partial-contact durable progress and alternate-peer/carrier continuation beyond the one bounded direct Blob case, mobility, and power/emission measurements |
 | Developer surface | `implemented-uncredited` / `open` | Preserve the documented live State positive-current-version, Record whole-key active-head, and Blob exact-publication delivery boundaries; add minimal compiled developer-facing State/Record/Blob delivery samples distinct from retained acceptance harnesses; add Blob peer/convergence status; add automatic merge only after a convergent design, atomic subscription update if required, C FFI and at least two selected-node bindings, broader multi-class examples including live privileged administration, carry caller-provided protected Rust startup and typed live/stopped control administration into the stock CLI/bindings with a production backend/recovery/destroy workflow, run an independent usability study, and decide the optional local agent |

@@ -1333,14 +1333,9 @@ fn lifetime_expiry(lifetime: super::BlobLifetime) -> Result<PressureExpiry, Stor
             }
             let remaining = ttl_ms - age.cumulative_age_ms;
             match age.checkpoint {
-                Some(checkpoint) => checkpoint
-                    .tick_ms
-                    .checked_add(remaining)
-                    .filter(|deadline| *deadline != 0)
-                    .map(PressureExpiry::Finite)
-                    .ok_or_else(|| {
-                        pressure_corruption("Blob pressure expiry arithmetic overflowed")
-                    }),
+                Some(checkpoint) => Ok(PressureExpiry::Finite(
+                    checkpoint.tick_ms.saturating_add(remaining),
+                )),
                 None => Ok(PressureExpiry::Finite(u64::MAX)),
             }
         }

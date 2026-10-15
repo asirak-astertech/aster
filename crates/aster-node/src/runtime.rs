@@ -1948,7 +1948,7 @@ impl NodeCustodyClock {
     }
 
     #[cfg(test)]
-    fn set_injected_tick(&self, tick_ms: u64) -> Result<(), NodeError> {
+    pub(crate) fn set_injected_tick(&self, tick_ms: u64) -> Result<(), NodeError> {
         let injected = self.injected.as_ref().ok_or_else(|| {
             NodeError::Protocol("custody test hook requires an injected clock".into())
         })?;
