@@ -13291,7 +13291,7 @@ fn accept_received_mutable(
             let outcome = match outcome {
                 Err(error) if blob_apply_capacity_error(&error) && blob.ttl_ms().is_none() => {
                     let original = error;
-                    let recovered = recover_blob_capacity_after_cleanup(
+                    let recovered = recover_contact_blob_capacity_after_cleanup(
                         store,
                         verifier,
                         &cache,
@@ -13300,6 +13300,7 @@ fn accept_received_mutable(
                         Some((blob.topic(), blob.scope(), blob.blob_id())),
                         plan.manifest().chunk_count(),
                         1,
+                        BlobContactMode::DurableOnly,
                         contact_custody_sample()?,
                         &lifecycle,
                     )?;
@@ -23478,8 +23479,15 @@ fn blob_capacity_recovery_budget() -> BlobMaintenanceBudget {
     .expect("selected capacity recovery bounds are nonzero")
 }
 
+#[derive(Clone, Copy)]
+enum BlobCapacityRecoveryVisibility {
+    LocalAllVisible,
+    DurableOnly,
+    CustodyV1,
+}
+
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn recover_blob_capacity_after_cleanup(
+pub(crate) fn recover_local_blob_capacity_after_cleanup(
     store: &Store,
     verifier: &ReferenceEnvelopeSealer,
     cache: &AuthenticatedEventRouteCache,
@@ -23491,23 +23499,121 @@ pub(crate) fn recover_blob_capacity_after_cleanup(
     custody_sample: Option<CustodySample>,
     lifecycle: &std::sync::MutexGuard<'_, ()>,
 ) -> Result<bool, NodeError> {
+    recover_blob_capacity_after_cleanup_with_visibility(
+        store,
+        verifier,
+        cache,
+        error,
+        incoming_priority,
+        content,
+        incoming_depot_chunks,
+        incoming_depot_variants,
+        BlobCapacityRecoveryVisibility::LocalAllVisible,
+        custody_sample,
+        lifecycle,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn recover_contact_blob_capacity_after_cleanup(
+    store: &Store,
+    verifier: &ReferenceEnvelopeSealer,
+    cache: &AuthenticatedEventRouteCache,
+    error: &StoreError,
+    incoming_priority: Priority,
+    content: Option<(&Topic, &Scope, BlobId)>,
+    incoming_depot_chunks: u64,
+    incoming_depot_variants: u64,
+    blob_contact_mode: BlobContactMode,
+    custody_sample: Option<CustodySample>,
+    lifecycle: &std::sync::MutexGuard<'_, ()>,
+) -> Result<bool, NodeError> {
+    let visibility = match blob_contact_mode {
+        BlobContactMode::DurableOnly => BlobCapacityRecoveryVisibility::DurableOnly,
+        BlobContactMode::CustodyV1 => BlobCapacityRecoveryVisibility::CustodyV1,
+    };
+    recover_blob_capacity_after_cleanup_with_visibility(
+        store,
+        verifier,
+        cache,
+        error,
+        incoming_priority,
+        content,
+        incoming_depot_chunks,
+        incoming_depot_variants,
+        visibility,
+        custody_sample,
+        lifecycle,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn recover_blob_capacity_after_cleanup_with_visibility(
+    store: &Store,
+    verifier: &ReferenceEnvelopeSealer,
+    cache: &AuthenticatedEventRouteCache,
+    error: &StoreError,
+    incoming_priority: Priority,
+    content: Option<(&Topic, &Scope, BlobId)>,
+    incoming_depot_chunks: u64,
+    incoming_depot_variants: u64,
+    visibility: BlobCapacityRecoveryVisibility,
+    custody_sample: Option<CustodySample>,
+    lifecycle: &std::sync::MutexGuard<'_, ()>,
+) -> Result<bool, NodeError> {
     let Some(target) = blob_capacity_gc_target(error) else {
         return Ok(false);
     };
     #[cfg(test)]
     cache.record_blob_capacity_recovery_attempt();
     let budget = blob_capacity_recovery_budget();
-    store.run_durable_blob_capacity_gc_for(target, budget, custody_sample)?;
+    match visibility {
+        // Depot cleanup must not admit the just-rejected partial import into
+        // deletion before its one retry. Exact AllVisible victim selection
+        // still happens in the pressure pass below.
+        BlobCapacityRecoveryVisibility::LocalAllVisible
+            if target == BlobCapacityGcTarget::Depot =>
+        {
+            store.run_durable_blob_capacity_gc_for(target, budget, custody_sample)?;
+        }
+        BlobCapacityRecoveryVisibility::LocalAllVisible => {
+            store.run_blob_capacity_gc_for(target, budget, custody_sample)?;
+        }
+        BlobCapacityRecoveryVisibility::DurableOnly | BlobCapacityRecoveryVisibility::CustodyV1 => {
+            store.run_durable_blob_capacity_gc_for(target, budget, custody_sample)?;
+        }
+    }
     #[cfg(test)]
     cache.record_blob_admission_trace(TestBlobAdmissionTrace::RoutineCleanupComplete);
-    let recovery = store.run_durable_blob_pressure_recovery_after_cleanup(
-        error,
-        incoming_priority,
-        content,
-        (incoming_depot_chunks, incoming_depot_variants),
-        budget,
-        custody_sample,
-    )?;
+    let recovery = match visibility {
+        BlobCapacityRecoveryVisibility::LocalAllVisible => store
+            .run_blob_pressure_recovery_after_cleanup(
+                error,
+                incoming_priority,
+                content,
+                (incoming_depot_chunks, incoming_depot_variants),
+                budget,
+                custody_sample,
+            )?,
+        BlobCapacityRecoveryVisibility::CustodyV1 => store
+            .run_custody_blob_pressure_recovery_after_cleanup(
+                error,
+                incoming_priority,
+                content,
+                (incoming_depot_chunks, incoming_depot_variants),
+                budget,
+                custody_sample,
+            )?,
+        BlobCapacityRecoveryVisibility::DurableOnly => store
+            .run_durable_blob_pressure_recovery_after_cleanup(
+                error,
+                incoming_priority,
+                content,
+                (incoming_depot_chunks, incoming_depot_variants),
+                budget,
+                custody_sample,
+            )?,
+    };
     #[cfg(test)]
     cache.record_blob_admission_trace(TestBlobAdmissionTrace::PressureComplete);
     let Some(recovery) = recovery else {
@@ -23516,6 +23622,11 @@ pub(crate) fn recover_blob_capacity_after_cleanup(
     cache.remove_evicted_blobs(verifier, recovery.evicted_transfer_ids(), lifecycle)?;
     #[cfg(test)]
     cache.record_blob_admission_trace(TestBlobAdmissionTrace::CacheReconciled);
+    let recovery = if recovery.deficit_met() || recovery.evicted_transfer_ids().is_empty() {
+        recovery
+    } else {
+        store.continue_blob_pressure_recovery_after_cache_reconciliation(recovery)?
+    };
     Ok(recovery.deficit_met())
 }
 
@@ -24010,7 +24121,7 @@ fn recover_and_finalize_pending_blob(
     let outcome = match outcome {
         Err(error) if blob_publication_capacity_error(&error) => {
             let original = error;
-            let recovered = recover_blob_capacity_after_cleanup(
+            let recovered = recover_contact_blob_capacity_after_cleanup(
                 store,
                 verifier,
                 &cache,
@@ -24019,6 +24130,7 @@ fn recover_and_finalize_pending_blob(
                 Some((blob.topic(), blob.scope(), blob.blob_id())),
                 0,
                 0,
+                blob_contact_mode,
                 contact_custody_sample()?,
                 &lifecycle,
             )?;
