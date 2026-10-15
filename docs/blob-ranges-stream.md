@@ -1,13 +1,13 @@
 # Receipt-free Blob range streaming
 
-Clean Room — Privileged
-
 ## Required profile and compatibility boundary
 
-Protocol draft.3 uses semantic-v7 profile ID `4`, `BlobRangesStreamV1`,
-exclusively for Blob lane `4`. The current Blob offer is `[4]`, not `[4, 1]`.
-Profile `3` remains reserved for the approved `BlobCustodyV1` design;
-this increment does not implement custody.
+Protocol draft.3 semantics v7 and v8 use profile ID `4`,
+`BlobRangesStreamV1`, exclusively for Blob lane `4`. The current Blob offer is
+`[4]`, not `[4, 1]`. Profile `3` remains reserved for the approved
+`BlobCustodyV1` design and is not offered or selected. Semantic v7 uses the
+profile-4 stream in durable-only mode; semantic v8 layers authenticated finite
+custody into that same profile-4 stream.
 Both authenticated offers must intersect on it; the digest commits both exact
 offers and all lane selections. A peer without profile 4 fails the protected
 profile exchange. A v5/v6 Blob carrier attempt fails explicitly before carrier
@@ -50,8 +50,10 @@ bytes. A data frame is at most 16,519 plaintext bytes (39-byte wrapper plus the
 existing 16,480-byte range response maximum). The terminal is 39 plaintext bytes.
 The terminal and all frame overheads are reserved before scheduling; the schedule
 is further limited by remaining contact bytes and frames. Later reverse-direction
-mutable lanes and EventBridge keep their existing reserves. A one-range stream
-fits within the unchanged legacy three-exchange/17,127-byte Blob lane reserve.
+mutable lanes and EventBridge keep their existing reserves. A minimum nonempty
+stream fits within the unchanged
+three-exchange/17,127-byte Blob lane reserve inherited from the historical
+carrier allocation.
 Source-item accounting counts one selected source turn per nonempty direction,
 not one source item per range. Range work is independently capped at 64 attempts
 per direction (128 across both directions), including unavailable responses. This
@@ -75,7 +77,7 @@ hash and index/count.
 
 The receiver selects work with `selected_pending_blob_contact_work`; each data
 record is authenticated and checked against its exact scheduled tuple before
-`append_blob_carrier_prefix_with_policy`. Both sides refresh contact policy for
+the version-derived, mode-aware append path. Both sides refresh contact policy for
 every protected record, and the receiver checks current source metadata before
 each append. The sender authenticates the immutable source/content and builds its transfer
 plan once per bounded schedule. Each range reloads and compares the exact source
@@ -94,10 +96,51 @@ fatal rather than being reclassified as recoverable transport interruptions.
 Each accepted ciphertext prefix is independently durable before the next record.
 A stream failure or missing terminal does not roll it back and does not mark it
 as remotely acknowledged. The next contact derives the missing suffix from Store.
-`recover_and_finalize_pending_blob` retains complete carrier verification and whole
-plaintext verification. Publication becomes visible only after full verification;
-partial ciphertext is not delivered as plaintext. A terminal means the sender
-finished its attempts, not that remote storage or publication succeeded.
+Only a valid schedule-bound terminal and EOF authorize the receiver to attempt
+carrier completion, publication promotion, or the turn's one cursor outcome.
+`recover_and_finalize_pending_blob` retains complete carrier verification and
+whole-plaintext verification. Publication becomes visible only after full
+verification; partial ciphertext is not delivered as plaintext. A terminal
+means the sender finished its attempts, not that remote storage or publication
+succeeded. If all bytes arrived before a lost terminal, a later authenticated
+empty schedule can finalize and promote the retained complete prefix without
+refetching it.
+
+## Version-derived lifecycle and storage policy
+
+Profile `4` is one raw range-stream grammar with policy selected by the
+authenticated semantic version. Semantic v7 admits and serves durable sources
+only. Semantic v8 admits durable sources and finite sources carrying an exact
+verified custody capability; a decoded claim alone is never admission
+authority. The finite source's positive TTL and authenticated cumulative age
+are bound to its exact source transfer and publication identity. Duplicate
+custody observations merge a nondecreasing age lower bound. Continuous local
+monotonic residence increases that bound; a restart or clock-domain gap adds no
+invented time, makes continuity loss sticky, and withholds the source until the
+lower bound itself proves expiry.
+
+Proven expiry and eligible bounded pressure recovery retire the exact
+publication or pending source logically before it can be inventoried, served,
+read, delivered, completed, or promoted. A policy or continuity failure instead
+withholds or rejects the affected work unless its exact maintenance path later
+authorizes retirement. Live-publication retirement creates retained retirement
+evidence and preserves the applicable physical-lineage and accepted-publication
+replay fences. Pending-source expiry removes the source, prefixes, and ordinary
+references while preserving its applicable physical-lineage fence; it does not
+invent a publication-retirement row. Those bounded non-evictable authorities
+prevent same-lineage substitution and, where applicable, publisher-dot replay
+after ordinary retirement evidence ages out. Selected retirement evidence is
+retained for 45 days of conservative lower-bound age, then expires through
+bounded maintenance.
+
+Storage-pressure recovery may atomically retire only eligible work below the
+incoming priority, with expired work ranked first. Selection is version-aware:
+durable contacts cannot expose finite candidates, and custody contacts require
+compatible finite provenance. Logical retirement and physical reclamation are
+separate. Reclamation first persists an exact variant deletion manifest, then
+removes only that manifest's rows/files under independent row, file, and byte
+budgets; a restart resumes the same authorized victim. Missing or delayed exact
+deletion authority fails closed and cannot take credit for unrelated cleanup.
 
 ## Validation scope
 
@@ -123,8 +166,10 @@ all six mutable directions with current peers, alongside an exact contact-reserv
 boundary unit test. The selected-frame
 fuzzer also exercises the schedule decoder and canonical roundtrip.
 
-The live fault suite additionally covers lost terminal after final append and
-full publication commit (reopen fetches zero bytes), corrupted AEAD and wrong
+The live fault suite additionally covers a lost terminal after the final append:
+reopen retains the complete prefix but no publication or cursor rotation, and a
+zero-byte authenticated reconnect performs the terminal-gated promotion. It also
+covers corrupted AEAD and wrong
 contextual AAD on the second range (the first durable prefix survives), and a
 real signed publisher revocation committed while both endpoints are paused after
 the first append (the next append is rejected). A controlled typed staging-capacity
@@ -139,5 +184,6 @@ boundary, not a physical disk-full experiment; publication quota and revocation
 are actual Store transitions. This is not exhaustive adversarial or power-loss
 evidence.
 
-No requirements traceability status or atomic-durability evidence is promoted by
-this change. Comparative benchmarks are a separate supervising-agent task.
+These tests are current-code reference evidence, not independent
+interoperability, device, physical-disk-full, power-loss, or performance
+acceptance. They do not promote requirements traceability status.

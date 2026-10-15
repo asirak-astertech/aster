@@ -475,7 +475,7 @@ Move protected Events through a relay that cannot read them
             <div class="q">Immutable content</div>
             <h3>Blob</h3>
             <div class="for">Imagery, maps, attachments, model files</div>
-            <p>Immutable chunks are bound to an authenticated manifest and stored through crash-resumable encrypted local staging. The live Rust API supports peerless durable publication, bounded authenticated reads, metadata-only delivery, and direct resumable transfer between content-capable peers. Route-only custody, TTL and garbage collection, representative physical or mixed-implementation acceptance, and release authorization remain open.</p>
+            <p>Immutable chunks are bound to an authenticated manifest and stored through crash-resumable encrypted local staging. The live Rust API supports peerless durable or finite-TTL publication, bounded authenticated reads, tagged content and retirement delivery, direct resumable transfer between content-capable peers, and bounded manifest-authorized reclamation. Route-only custody, Blob lifetime fields in CLI/RPC/Protobuf/FFI, representative physical or mixed-implementation acceptance, and release authorization remain open.</p>
           </article>
         </div>
       </div>

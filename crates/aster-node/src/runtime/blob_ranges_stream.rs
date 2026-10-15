@@ -6,7 +6,7 @@ use super::*;
 use crate::event_pages::TransferProfileId;
 use sha2::{Digest, Sha256};
 
-const MAX_RANGES: usize = 64;
+pub(super) const MAX_RANGES: usize = 64;
 const REQUEST_PREFIX: &[u8] = b"ABRS\x01";
 const DATA_PREFIX: &[u8] = b"ABRD\x01";
 const END_PREFIX: &[u8] = b"ABRE\x01";
@@ -21,8 +21,11 @@ pub(crate) fn fuzz_schedule(input: &[u8]) -> bool {
         EventDirection::ToSessionResponder,
         EventDirection::ToSessionInitiator,
     ] {
-        if let Ok(ranges) = decode_schedule(input, direction) {
-            assert_eq!(encode_schedule(&ranges, direction).unwrap(), input);
+        if let Ok(ranges) = decode_schedule(input, direction, SEMANTIC_PROTOCOL_V7) {
+            assert_eq!(
+                encode_schedule(&ranges, direction, SEMANTIC_PROTOCOL_V7).unwrap(),
+                input
+            );
             return true;
         }
     }
@@ -37,6 +40,8 @@ struct Context<'a> {
     store: &'a Store,
     guard: &'a EventLaneGuard,
     direction: EventDirection,
+    semantic_version: u16,
+    blob_contact_mode: BlobContactMode,
     digest: [u8; 32],
     reserve: ContactReserve,
 }
@@ -45,10 +50,16 @@ impl<'a> Context<'a> {
     fn new(
         store: &'a Store,
         guard: &'a EventLaneGuard,
+        blob_contact_mode: BlobContactMode,
         direction: EventDirection,
         receipt: &PeerReceipt,
     ) -> Result<Self, NodeError> {
-        if receipt.semantic_version != SEMANTIC_PROTOCOL_V7
+        let compatible = matches!(
+            (receipt.semantic_version, blob_contact_mode),
+            (SEMANTIC_PROTOCOL_V7, BlobContactMode::DurableOnly)
+                | (SEMANTIC_PROTOCOL_V8, BlobContactMode::CustodyV1)
+        );
+        if !compatible
             || !receipt
                 .negotiated_transfer_profiles
                 .is_some_and(|profiles| profiles[3] == TransferProfileId::BlobRangesStreamV1 as u16)
@@ -62,6 +73,8 @@ impl<'a> Context<'a> {
             store,
             guard,
             direction,
+            semantic_version: receipt.semantic_version,
+            blob_contact_mode,
             digest: receipt
                 .transfer_profile_digest
                 .ok_or_else(|| invalid("missing profile digest"))?,
@@ -91,7 +104,7 @@ impl<'a> Context<'a> {
         let digest = self.digest;
         #[cfg(test)]
         let digest = blob_ranges_stream_test::write_digest(self.store, plaintext, digest);
-        let protected = mission.seal_v7_application_frame(
+        let protected = mission.seal_profiled_application_frame(
             digest,
             LaneId::Blob,
             TransferProfileId::BlobRangesStreamV1,
@@ -126,7 +139,7 @@ impl<'a> Context<'a> {
         }
         self.check()?;
         check_protected_frame_with_reserve(receipt, protected.len(), self.reserve)?;
-        let plaintext = mission.open_v7_application_frame(
+        let plaintext = mission.open_profiled_application_frame(
             self.digest,
             LaneId::Blob,
             TransferProfileId::BlobRangesStreamV1,
@@ -141,6 +154,7 @@ impl<'a> Context<'a> {
 fn request_frame(
     candidate: &BlobRangeCandidate,
     direction: EventDirection,
+    semantic_version: u16,
 ) -> Result<Vec<u8>, NodeError> {
     Frame::BlobRangeFetch {
         direction,
@@ -151,12 +165,13 @@ fn request_frame(
         requested_len: candidate.requested_len,
         content_proof: candidate.proof,
     }
-    .encode_for_semantic_version(SEMANTIC_PROTOCOL_V7)
+    .encode_for_semantic_version(semantic_version)
 }
 
 fn encode_schedule(
     ranges: &[BlobRangeCandidate],
     direction: EventDirection,
+    semantic_version: u16,
 ) -> Result<Vec<u8>, NodeError> {
     if ranges.len() > MAX_RANGES {
         return Err(invalid("too many ranges"));
@@ -164,7 +179,7 @@ fn encode_schedule(
     let mut bytes = REQUEST_PREFIX.to_vec();
     bytes.extend_from_slice(&(ranges.len() as u16).to_be_bytes());
     for candidate in ranges {
-        bytes.extend_from_slice(&request_frame(candidate, direction)?);
+        bytes.extend_from_slice(&request_frame(candidate, direction, semantic_version)?);
     }
     Ok(bytes)
 }
@@ -172,6 +187,7 @@ fn encode_schedule(
 fn decode_schedule(
     bytes: &[u8],
     direction: EventDirection,
+    semantic_version: u16,
 ) -> Result<Vec<BlobRangeCandidate>, NodeError> {
     if bytes.len() < 7 || bytes.len() > MAX_REQUEST_BYTES || &bytes[..5] != REQUEST_PREFIX {
         return Err(invalid("invalid schedule header"));
@@ -190,7 +206,7 @@ fn decode_schedule(
             offset,
             requested_len,
             content_proof,
-        } = Frame::decode_for_semantic_version(encoded, SEMANTIC_PROTOCOL_V7)?
+        } = Frame::decode_for_semantic_version(encoded, semantic_version)?
         else {
             return Err(invalid("schedule entry is not a range"));
         };
@@ -224,6 +240,7 @@ fn decode_range_response(
     payload: &[u8],
     direction: EventDirection,
     candidate: &BlobRangeCandidate,
+    semantic_version: u16,
 ) -> Result<(BlobRangeDisposition, Vec<u8>), NodeError> {
     let Frame::BlobRange {
         direction: actual,
@@ -234,7 +251,7 @@ fn decode_range_response(
         requested_len,
         disposition,
         bytes,
-    } = Frame::decode_for_semantic_version(payload, SEMANTIC_PROTOCOL_V7)?
+    } = Frame::decode_for_semantic_version(payload, semantic_version)?
     else {
         return Err(invalid("expected range data"));
     };
@@ -297,11 +314,12 @@ pub(super) async fn receive(
     mission: &mut MissionSession,
     verifier: &mut ReferenceEnvelopeSealer,
     guard: &EventLaneGuard,
+    blob_contact_mode: BlobContactMode,
     direction: EventDirection,
     interest: &BlobInterest,
     receipt: &mut PeerReceipt,
 ) -> Result<(), NodeError> {
-    let context = Context::new(store, guard, direction, receipt)?;
+    let context = Context::new(store, guard, blob_contact_mode, direction, receipt)?;
     context.check()?;
     if direction == EventDirection::ToSessionResponder {
         connection.begin_additional_uni_pair()?;
@@ -315,56 +333,50 @@ pub(super) async fn receive(
         verifier,
         interest,
         cursor.map(|cursor| cursor.source()),
+        blob_contact_mode,
     )?;
     let mut ranges = Vec::new();
     if let Some(work) = work.as_mut() {
-        let completed = recover_and_finalize_pending_blob(
+        let retained = blob_source_projection_for_contact(
             store,
-            guard,
-            verifier,
-            work.source,
-            &work.blob,
-            &work.manifest_bytes,
-            &work.plan,
-            &mut work.carriers,
-            Some((peer, cursor)),
+            work.projection.transfer_id,
+            blob_contact_mode,
         )?;
-        if completed.is_none() {
-            work.carriers.sort_by_key(|status| status.object());
-            for status in &work.carriers {
-                let mut offset = status.prefix_len();
-                while offset < status.total_len() && ranges.len() < limit {
-                    let requested_len = (status.total_len() - offset)
-                        .min(MAX_BLOB_NETWORK_RANGE_BYTES as u64)
-                        as u32;
-                    ranges.push(BlobRangeCandidate {
-                        source: work.source,
-                        object: status.object(),
-                        total_len: status.total_len(),
-                        offset,
-                        requested_len,
-                        proof: work.proof,
-                    });
-                    offset += u64::from(requested_len);
-                }
-                if ranges.len() == limit {
-                    break;
-                }
+        if retained.as_ref().is_none_or(|retained| {
+            retained.retention != BlobSourceRetention::Pending || retained.source != work.projection
+        }) {
+            return Err(invalid(
+                "selected Blob source lost exact contact eligibility",
+            ));
+        }
+        // Complete prefixes are deliberately left staged until this stream's
+        // authenticated terminal arrives. A lost/bad terminal may retain byte
+        // progress, but it cannot commit, promote, or rotate object work.
+        work.carriers.sort_by_key(|status| status.object());
+        for status in &work.carriers {
+            let mut offset = status.prefix_len();
+            while offset < status.total_len() && ranges.len() < limit {
+                let requested_len =
+                    (status.total_len() - offset).min(MAX_BLOB_NETWORK_RANGE_BYTES as u64) as u32;
+                ranges.push(BlobRangeCandidate {
+                    source: work.source,
+                    object: status.object(),
+                    total_len: status.total_len(),
+                    offset,
+                    requested_len,
+                    proof: work.proof,
+                });
+                offset += u64::from(requested_len);
             }
-        } else if completed == Some(MutableApplyDisposition::DeferredCapacity) {
-            receipt.blob_deferred = receipt.blob_deferred.saturating_add(1);
-            advance_terminal_blob_source_cursor(
-                store,
-                &work.plan,
-                work.source,
-                Some((peer, cursor)),
-            )?;
+            if ranges.len() == limit {
+                break;
+            }
         }
     }
-    let schedule = encode_schedule(&ranges, direction)?;
+    let schedule = encode_schedule(&ranges, direction, context.semantic_version)?;
     let digest = schedule_hash(&schedule);
     let deadline = tokio::time::Instant::now() + CONTACT_DEADLINE;
-    let protected = mission.seal_v7_application_frame(
+    let protected = mission.seal_profiled_application_frame(
         context.digest,
         LaneId::Blob,
         TransferProfileId::BlobRangesStreamV1,
@@ -382,7 +394,7 @@ pub(super) async fn receive(
             },
         )
         .await?;
-    let accepted = mission.open_v7_application_frame(
+    let accepted = mission.open_profiled_application_frame(
         context.digest,
         LaneId::Blob,
         TransferProfileId::BlobRangesStreamV1,
@@ -399,14 +411,19 @@ pub(super) async fn receive(
     // Once a requested prefix cannot advance, consume/authenticate the bounded
     // remainder but do not append across the gap. No storage receipt is emitted.
     let mut discard_remaining = false;
+    let mut terminal_range_cursor_eligible = !ranges.is_empty();
+    let mut terminal_source_rotation = false;
     for (index, candidate) in ranges.iter().enumerate() {
         let bytes = context
             .read(&mut turn, mission, MAX_DATA_BYTES, receipt)
             .await?;
         let payload = check_envelope(&bytes, DATA_PREFIX, digest, index)?;
-        let (disposition, bytes) = decode_range_response(payload, direction, candidate)?;
+        let (disposition, bytes) =
+            decode_range_response(payload, direction, candidate, context.semantic_version)?;
         if disposition == BlobRangeDisposition::Unavailable {
             discard_remaining = true;
+            terminal_range_cursor_eligible = false;
+            terminal_source_rotation = false;
         }
         if discard_remaining {
             continue;
@@ -431,15 +448,29 @@ pub(super) async fn receive(
             ));
         }
         let append = || {
-            store.append_blob_carrier_prefix_with_policy(
+            append_blob_carrier_prefix_for_contact(
+                store,
                 guard.policy(),
                 candidate.source,
                 candidate.object,
                 candidate.total_len,
                 candidate.offset,
                 &bytes,
+                context.blob_contact_mode,
             )
         };
+        #[cfg(test)]
+        {
+            let cache = contact_mutable_route_cache(verifier)?;
+            cache.record_blob_carrier_append_attempt();
+            cache.record_blob_admission_trace(TestBlobAdmissionTrace::Append {
+                source: candidate.source,
+                object: candidate.object,
+                total_len: candidate.total_len,
+                offset: candidate.offset,
+                bytes_sha256: Sha256::digest(&bytes).into(),
+            });
+        }
         #[cfg(test)]
         let append_result = blob_ranges_stream_test::append_boundary(store, index, bytes.len())
             .and_then(|()| append());
@@ -449,13 +480,24 @@ pub(super) async fn receive(
             Ok(outcome) => outcome,
             Err(error) if blob_apply_capacity_error(&error) => {
                 receipt.blob_deferred = receipt.blob_deferred.saturating_add(1);
-                advance_terminal_blob_source_cursor(
-                    store,
-                    &work.plan,
-                    work.source,
-                    Some((peer, cursor)),
-                )?;
                 discard_remaining = true;
+                terminal_range_cursor_eligible = false;
+                terminal_source_rotation = true;
+                continue;
+            }
+            Err(error) if blob_lifetime_unavailable_error(&error) => {
+                let transition = settle_pending_blob_lifetime_unavailability_for_contact(
+                    store,
+                    verifier,
+                    work.source,
+                    context.blob_contact_mode,
+                )?;
+                if transition == PendingBlobLifetimeTransition::Missing {
+                    return Err(error.into());
+                }
+                discard_remaining = true;
+                terminal_range_cursor_eligible = false;
+                terminal_source_rotation = false;
                 continue;
             }
             Err(error) if blob_contact_policy_transition_error(&error) => {
@@ -503,22 +545,6 @@ pub(super) async fn receive(
             .find(|status| status.object() == candidate.object)
             .ok_or_else(|| invalid("carrier left selected work"))?;
         *retained = status;
-        if status.complete() {
-            let disposition = recover_and_finalize_pending_blob(
-                store,
-                guard,
-                verifier,
-                work.source,
-                &work.blob,
-                &work.manifest_bytes,
-                &work.plan,
-                &mut work.carriers,
-                Some((peer, cursor)),
-            )?;
-            if disposition == Some(MutableApplyDisposition::DeferredCapacity) {
-                receipt.blob_deferred = receipt.blob_deferred.saturating_add(1);
-            }
-        }
     }
     #[cfg(test)]
     if let Some(fault) = blob_ranges_stream_test::get(store)
@@ -528,7 +554,7 @@ pub(super) async fn receive(
         fault.receiver_paused.notify_one();
         fault.release_receiver.notified().await;
         connection.close();
-        return Err(invalid("injected lost terminal after publication"));
+        return Err(invalid("injected lost terminal after complete prefix"));
     }
     let terminal = context
         .read(&mut turn, mission, ENVELOPE_BYTES, receipt)
@@ -539,14 +565,71 @@ pub(super) async fn receive(
     if turn.read_frame().await?.is_some() {
         return Err(invalid("trailing frame after terminal"));
     }
-    if let Some(last) = ranges.last() {
+
+    // Commit complete prefixes and promote only after the schedule-bound
+    // terminal is authenticated. The recovery helper receives no scheduler
+    // authority: this function performs the turn's sole cursor decision below.
+    if !discard_remaining && let Some(work) = work.as_mut() {
+        match recover_and_finalize_pending_blob(
+            store,
+            guard,
+            verifier,
+            work.source,
+            &work.blob,
+            &work.manifest_bytes,
+            &work.plan,
+            &mut work.carriers,
+            context.blob_contact_mode,
+        ) {
+            Ok(Some(
+                PendingBlobRecoveryDisposition::DeferredLease
+                | PendingBlobRecoveryDisposition::Apply(MutableApplyDisposition::DeferredCapacity),
+            )) => {
+                receipt.blob_deferred = receipt.blob_deferred.saturating_add(1);
+                terminal_range_cursor_eligible = false;
+                terminal_source_rotation = true;
+            }
+            Ok(Some(PendingBlobRecoveryDisposition::Apply(_))) if ranges.is_empty() => {
+                // A reconnect can authenticate an empty schedule for prefixes
+                // that were already complete before this turn.
+                terminal_range_cursor_eligible = false;
+                terminal_source_rotation = true;
+            }
+            Ok(_) => {}
+            Err(error) if node_blob_lifetime_unavailable_error(&error) => {
+                let transition = settle_pending_blob_lifetime_unavailability_for_contact(
+                    store,
+                    verifier,
+                    work.source,
+                    context.blob_contact_mode,
+                )?;
+                if transition == PendingBlobLifetimeTransition::Missing {
+                    return Err(error);
+                }
+                terminal_range_cursor_eligible = false;
+                terminal_source_rotation = false;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    if terminal_source_rotation {
+        if let Some(work) = work.as_ref() {
+            advance_terminal_blob_source_cursor(
+                store,
+                &work.plan,
+                work.source,
+                Some((peer, cursor)),
+            )?;
+        }
+    } else if terminal_range_cursor_eligible && let Some(last) = ranges.last() {
         store.compare_and_advance_blob_carrier_fetch_cursor(
             peer,
             cursor,
             BlobCarrierFetchCursor::new(last.source, last.object),
         )?;
     }
-    let remaining = blob_carrier_remaining(store, guard)?;
+    let remaining = blob_carrier_remaining(store, guard, context.blob_contact_mode)?;
     receipt.blob_remaining += remaining;
     add_unscheduled_mutable(receipt, remaining)?;
     Ok(())
@@ -559,11 +642,12 @@ pub(super) async fn send(
     mission: &mut MissionSession,
     verifier: &mut ReferenceEnvelopeSealer,
     guard: &EventLaneGuard,
+    blob_contact_mode: BlobContactMode,
     direction: EventDirection,
     interest: &BlobInterest,
     receipt: &mut PeerReceipt,
 ) -> Result<(), NodeError> {
-    let context = Context::new(store, guard, direction, receipt)?;
+    let context = Context::new(store, guard, blob_contact_mode, direction, receipt)?;
     if direction == EventDirection::ToSessionResponder {
         connection.begin_additional_uni_pair()?;
     }
@@ -581,18 +665,18 @@ pub(super) async fn send(
                     {
                         return Err(invalid("oversized request"));
                     }
-                    let bytes = mission.open_v7_application_frame(
+                    let bytes = mission.open_profiled_application_frame(
                         context.digest,
                         LaneId::Blob,
                         TransferProfileId::BlobRangesStreamV1,
                         direction,
                         protected,
                     )?;
-                    let ranges = decode_schedule(&bytes, direction)?;
+                    let ranges = decode_schedule(&bytes, direction, context.semantic_version)?;
                     if ranges.len() > limit {
                         return Err(invalid("schedule exceeds directional budget"));
                     }
-                    let response = mission.seal_v7_application_frame(
+                    let response = mission.seal_profiled_application_frame(
                         context.digest,
                         LaneId::Blob,
                         TransferProfileId::BlobRangesStreamV1,
@@ -618,33 +702,44 @@ pub(super) async fn send(
     }
     result?;
     let schedule = schedule.ok_or_else(|| invalid("missing schedule"))?;
-    let ranges = decode_schedule(&schedule, direction)?;
+    let ranges = decode_schedule(&schedule, direction, context.semantic_version)?;
+    #[cfg(test)]
+    blob_ranges_stream_test::record_sender_schedule(store, ranges.len());
     let digest = schedule_hash(&schedule);
     let peer = mission.peer().mission_id();
     let commitments = mission.peer_route_grant_commitments().to_vec();
     let mut turn = connection
         .open_send_uni(deadline, event_turn_wire_budget(receipt, context.reserve)?)
         .await?;
+    let mut unavailable_remaining = false;
     let mut authenticated = None;
     for (index, candidate) in ranges.iter().enumerate() {
         context.check()?;
-        let bytes = serve_verified_blob_range_in_schedule(
-            store,
-            guard,
-            verifier,
-            peer,
-            &commitments,
-            interest,
-            candidate.source,
-            candidate.object,
-            candidate.total_len,
-            candidate.offset,
-            candidate.requested_len,
-            &candidate.proof,
-            &mut authenticated,
-        )?;
+        let bytes = if unavailable_remaining {
+            None
+        } else {
+            #[cfg(test)]
+            blob_ranges_stream_test::record_sender_service_attempt(store);
+            serve_verified_blob_range_in_schedule(
+                store,
+                guard,
+                verifier,
+                peer,
+                &commitments,
+                interest,
+                candidate.source,
+                candidate.object,
+                candidate.total_len,
+                candidate.offset,
+                candidate.requested_len,
+                &candidate.proof,
+                context.blob_contact_mode,
+                &mut authenticated,
+            )?
+        };
         #[cfg(test)]
         let bytes = blob_ranges_stream_test::range_bytes(store, index, bytes);
+        unavailable_remaining |= bytes.is_none();
         let disposition = if bytes.is_some() {
             BlobRangeDisposition::Data
         } else {
@@ -661,13 +756,17 @@ pub(super) async fn send(
             bytes: bytes.unwrap_or_default(),
         };
         let mut plaintext = envelope(DATA_PREFIX, digest, index);
-        plaintext.extend_from_slice(&frame.encode_for_semantic_version(SEMANTIC_PROTOCOL_V7)?);
+        plaintext.extend_from_slice(&frame.encode_for_semantic_version(context.semantic_version)?);
         context
             .write(&mut turn, mission, &plaintext, receipt)
             .await?;
         #[cfg(test)]
         if let Some(fault) = blob_ranges_stream_test::get(store)
-            && if fault.boundary == blob_ranges_stream_test::Boundary::LostTerminal {
+            && if matches!(
+                fault.boundary,
+                blob_ranges_stream_test::Boundary::LostTerminal
+                    | blob_ranges_stream_test::Boundary::AppendCapacityLostTerminal
+            ) {
                 index + 1 == ranges.len()
             } else {
                 index == 0
@@ -679,6 +778,7 @@ pub(super) async fn send(
                 fault.boundary,
                 blob_ranges_stream_test::Boundary::Original
                     | blob_ranges_stream_test::Boundary::LostTerminal
+                    | blob_ranges_stream_test::Boundary::AppendCapacityLostTerminal
             ) {
                 fault.fired.store(true, Ordering::Release);
                 connection.close();

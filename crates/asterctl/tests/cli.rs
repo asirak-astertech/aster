@@ -125,6 +125,8 @@ fn help_needs_neither_token_nor_agent() {
         "--token",
         "--token-file",
         "--help",
+        "blob-publish",
+        "blob-read",
     ] {
         assert!(text.contains(flag));
     }
@@ -341,7 +343,14 @@ fn timeout_before_command_sets_the_rpc_deadline_without_changing_output() {
 
 #[test]
 fn non_loopback_is_rejected_before_loading_credentials_or_payload() {
-    for command in ["status", "publish", "query", "subscribe"] {
+    for command in [
+        "status",
+        "publish",
+        "blob-publish",
+        "blob-read",
+        "query",
+        "subscribe",
+    ] {
         let output = cli(&[
             command,
             "--host",

@@ -759,7 +759,9 @@ const HELP: &str = "Aster selected-stack mesh CLI\n\n\
          exact source-sealed Aster objects. Events follow durable application Consume/Carry\n\
          selectors. Repeatable --state-interest, --record-interest, and --blob-interest values opt\n\
          the receiver into exact topic/scope source lanes; an empty class interest means\n\
-         receive-none. Blob source and resumable carrier phases require semantic v5.\n\
+         receive-none. Blob source and resumable carrier phases require selected semantic\n\
+         v7/v8 profile 4: v7 is durable-only and v8 adds authenticated finite custody.\n\
+         Semantic v5/v6 Blob intent fails without carrier fallback.\n\
          Record ingest retains concurrent revisions and never executes application merge code.\n\
          The demo defaults to the N-instance ping-pong scenario;\n\
          the explicit control scenario requires exactly four role-bound nodes. Concurrent demos\n\
@@ -1151,10 +1153,14 @@ mod tests {
     }
 
     #[test]
-    fn help_advertises_opt_in_semantic_v5_blob_reconciliation() {
+    fn help_advertises_selected_profile_four_blob_reconciliation() {
         let source = include_str!("main.rs");
         assert!(source.contains("[--blob-interest TOPIC@SCOPE ...]"));
-        assert!(source.contains("Blob source and resumable carrier phases require semantic v5."));
+        assert!(
+            source.contains("Blob source and resumable carrier phases require selected semantic")
+        );
+        assert!(source.contains("v7/v8 profile 4"));
+        assert!(source.contains("Semantic v5/v6 Blob intent fails without carrier fallback."));
     }
 
     #[test]

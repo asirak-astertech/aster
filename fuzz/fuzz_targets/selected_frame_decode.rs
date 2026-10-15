@@ -46,8 +46,7 @@ fn append_blob_tuple(candidate: &mut Vec<u8>, payload: &[u8], requested_len: u32
 fn structured_candidate(input: &[u8]) -> Vec<u8> {
     let (selector, payload) = input.split_first().unwrap_or((&0, &[]));
     let tag = TAGS[usize::from(*selector) % TAGS.len()];
-    if let Some(candidate) =
-        aster_node::fuzz_structured_v7_mechanics_frame(tag, *selector, payload)
+    if let Some(candidate) = aster_node::fuzz_structured_v7_mechanics_frame(tag, *selector, payload)
     {
         return candidate;
     }
@@ -264,15 +263,80 @@ fn structured_candidate(input: &[u8]) -> Vec<u8> {
     candidate
 }
 
+fn structured_v8_candidate(input: &[u8]) -> Vec<u8> {
+    const CLAIM: &str = "41535452424c30380001000800041111111111111111111111111111111111111111111111111111111111111111000000000000000001222222222222222222222222222222222222222222222222222222222222222200000000000000013333333333333333333333333333333333333333333333333333333333333333444444444444444444444444444444444444444444444444444444444444444400000000000000000100000000000000005555555555555555555555555555555500000000000000000000000000000000";
+    let selector = input.first().copied().unwrap_or(0);
+    let mut candidate = structured_candidate(input);
+    let Some((&tag, body)) = candidate.get(4).zip(candidate.get(5..)) else {
+        return candidate;
+    };
+    let is_blob = body.first() == Some(&3);
+    if is_blob && matches!(tag, 0x82 | 0x83) {
+        if selector & 1 == 0 {
+            candidate.push(0);
+        } else {
+            candidate.extend_from_slice(&[1, 0, 208]);
+            for offset in (0..CLAIM.len()).step_by(2) {
+                candidate.push(
+                    u8::from_str_radix(&CLAIM[offset..offset + 2], 16)
+                        .expect("fixed Blob claim seed is hexadecimal"),
+                );
+            }
+        }
+    } else if is_blob && matches!(tag, 0x84 | 0x85 | 0x86) {
+        if selector & 1 == 0 {
+            candidate.push(0);
+        } else {
+            candidate.push(1);
+            let digest = payload_digest(input.get(1..).unwrap_or_default());
+            candidate.extend_from_slice(&digest);
+        }
+    }
+    candidate
+}
+
+fn payload_digest(payload: &[u8]) -> [u8; 32] {
+    let mut digest = [0u8; 32];
+    let copied = payload.len().min(digest.len());
+    digest[..copied].copy_from_slice(&payload[..copied]);
+    digest
+}
+
+fn corpus_input(input: &[u8]) -> Vec<u8> {
+    let Some(hexadecimal) = input.strip_prefix(b"HEX:") else {
+        return input.to_vec();
+    };
+    let Ok(hexadecimal) = std::str::from_utf8(hexadecimal) else {
+        return input.to_vec();
+    };
+    let hexadecimal = hexadecimal.trim();
+    if hexadecimal.len() % 2 != 0 {
+        return input.to_vec();
+    }
+    let mut decoded = Vec::with_capacity(hexadecimal.len() / 2);
+    for offset in (0..hexadecimal.len()).step_by(2) {
+        let Ok(byte) = u8::from_str_radix(&hexadecimal[offset..offset + 2], 16) else {
+            return input.to_vec();
+        };
+        decoded.push(byte);
+    }
+    decoded
+}
+
 fuzz_target!(|input: &[u8]| {
     const MAX_FUZZ_FRAME_BYTES: usize = 2 * 1024 * 1024;
     const MAX_FUZZ_TURN_BYTES: usize = 64 * 1024 * 1024;
 
-    let _accepted = aster_node::fuzz_decode_mechanics_frame(input);
+    let decoded_input = corpus_input(input);
+    let _accepted = aster_node::fuzz_decode_mechanics_frame(&decoded_input);
+    let _accepted_v8 =
+        aster_node::fuzz_decode_mechanics_frame_for_semantic_version(&decoded_input, 8);
     let _accepted_turn =
         aster_iroh::fuzz_decode_uni_turn(input, MAX_FUZZ_FRAME_BYTES, MAX_FUZZ_TURN_BYTES);
     let frame = structured_candidate(input);
     assert!(aster_node::fuzz_decode_mechanics_frame(&frame));
+    let frame_v8 = structured_v8_candidate(input);
+    assert!(aster_node::fuzz_decode_mechanics_frame_for_semantic_version(&frame_v8, 8));
     let mut turn = b"ASTU\x01".to_vec();
     turn.extend_from_slice(
         &u32::try_from(frame.len())

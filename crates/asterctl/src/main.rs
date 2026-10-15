@@ -1,5 +1,7 @@
 mod args;
 mod auth;
+mod blob_publish;
+mod blob_read;
 mod client;
 mod operation_key;
 mod output;
@@ -45,6 +47,8 @@ fn run() -> Result<(), (u8, String)> {
         }
         args::Command::Help => return write_output(args::HELP),
         args::Command::PublishHelp => return write_output(publish::HELP),
+        args::Command::BlobPublishHelp => return write_output(blob_publish::HELP),
+        args::Command::BlobReadHelp => return write_output(blob_read::HELP),
         args::Command::QueryHelp => return write_output(query::HELP),
         args::Command::SubscribeHelp => return write_output(subscribe::HELP),
         args::Command::Status(options) => {
@@ -117,6 +121,41 @@ fn run() -> Result<(), (u8, String)> {
                 .map_err(|e| (1, e.describe("PublishEvent", &key)))?;
             output::publish(&response, &key.value, rpc.json)
                 .map_err(|_| (1, "cannot format PublishEvent response".to_owned()))?
+        }
+        args::Command::BlobPublish(options, publication) => {
+            let rpc = RpcContext::new(options)?;
+            let upload = publication
+                .prepare()
+                .map_err(|error| (1, error.to_owned()))?;
+            announce_key(&upload.key)?;
+            let response = rpc
+                .runtime
+                .block_on(client::publish_blob(
+                    rpc.address,
+                    &rpc.token,
+                    upload.metadata,
+                    upload.file,
+                    rpc.timeout,
+                ))
+                .map_err(|error| (1, error.describe("PublishBlob", &upload.key)))?;
+            output::publish_blob(&response, &upload.key.value, rpc.json)
+                .map_err(|_| (1, "cannot format PublishBlob response".to_owned()))?
+        }
+        args::Command::BlobRead(options, read) => {
+            let rpc = RpcContext::new(options)?;
+            let (request, output_path) = read.into_parts();
+            let metadata = rpc
+                .runtime
+                .block_on(client::read_blob(
+                    rpc.address,
+                    &rpc.token,
+                    request,
+                    output_path,
+                    rpc.timeout,
+                ))
+                .map_err(|error| (1, error))?;
+            output::read_blob(&metadata, rpc.json)
+                .map_err(|_| (1, "cannot format ReadBlob response".to_owned()))?
         }
         args::Command::Query(options, query) => {
             let rpc = RpcContext::new(options)?;
