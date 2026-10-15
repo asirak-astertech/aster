@@ -673,31 +673,41 @@ pub(super) async fn send(
     result?;
     let schedule = schedule.ok_or_else(|| invalid("missing schedule"))?;
     let ranges = decode_schedule(&schedule, direction, context.semantic_version)?;
+    #[cfg(test)]
+    blob_ranges_stream_test::record_sender_schedule(store, ranges.len());
     let digest = schedule_hash(&schedule);
     let peer = mission.peer().mission_id();
     let commitments = mission.peer_route_grant_commitments().to_vec();
     let mut turn = connection
         .open_send_uni(deadline, event_turn_wire_budget(receipt, context.reserve)?)
         .await?;
+    let mut unavailable_remaining = false;
     for (index, candidate) in ranges.iter().enumerate() {
         context.check()?;
-        let bytes = serve_verified_blob_range(
-            store,
-            guard,
-            verifier,
-            peer,
-            &commitments,
-            interest,
-            candidate.source,
-            candidate.object,
-            candidate.total_len,
-            candidate.offset,
-            candidate.requested_len,
-            &candidate.proof,
-            context.blob_contact_mode,
-        )?;
+        let bytes = if unavailable_remaining {
+            None
+        } else {
+            #[cfg(test)]
+            blob_ranges_stream_test::record_sender_service_attempt(store);
+            serve_verified_blob_range(
+                store,
+                guard,
+                verifier,
+                peer,
+                &commitments,
+                interest,
+                candidate.source,
+                candidate.object,
+                candidate.total_len,
+                candidate.offset,
+                candidate.requested_len,
+                &candidate.proof,
+                context.blob_contact_mode,
+            )?
+        };
         #[cfg(test)]
         let bytes = blob_ranges_stream_test::range_bytes(store, index, bytes);
+        unavailable_remaining |= bytes.is_none();
         let disposition = if bytes.is_some() {
             BlobRangeDisposition::Data
         } else {
