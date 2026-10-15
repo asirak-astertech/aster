@@ -84,6 +84,8 @@ loop {
 The live publisher accepts a nonempty regular file of at most 64 MiB, with its
 cursor at exactly zero, and fixes the selected chunk size at 64 KiB. The file is
 moved into a bounded, joined worker rather than cloned into the actor command.
+The 64-MiB ceiling is the current selected-backend policy, not a public RPC or
+wire-format guarantee.
 The returned publication is operation-key idempotent and echoes its original
 signed TTL (`None` means durable), never a remaining lifetime or deletion
 timestamp. `BlobPublishOptions::finite_ttl_ms(0)` returns `InvalidRequest` before
@@ -105,6 +107,82 @@ and externally cloned file descriptors remain caller custody. A blocking or
 hostile filesystem syscall can delay the joined worker and therefore delay
 shutdown or zeroization; no bounded shutdown-latency claim is made for such a
 file provider.
+
+## Use the local agent and `asterctl`
+
+The local `aster-agent` exposes native gRPC `PublishBlob` and `ReadBlob`
+streams backed by the same running node authority. Its plaintext listener is
+loopback-only. Supply exactly one bearer-token source to `asterctl`; a protected
+token file avoids placing the token in the command line:
+
+```sh
+TOKEN_FILE=/run/aster/client.token
+
+# Durable publication.
+asterctl --token-file "$TOKEN_FILE" blob-publish \
+  --file ./map.bin \
+  --topic imagery.maps \
+  --scope mission/team/alpha \
+  --operation-key map-001 \
+  --media-type application/octet-stream
+
+# Finite publication. The original 60000-ms TTL is echoed on every result.
+asterctl --token-file "$TOKEN_FILE" --json blob-publish \
+  --file ./overlay.bin \
+  --topic imagery.maps \
+  --scope mission/team/alpha \
+  --operation-key auto \
+  --ttl-ms 60000
+
+# Copy the returned Blob ID into BLOB_ID and read to a path that does not exist.
+asterctl --token-file "$TOKEN_FILE" blob-read \
+  --id "$BLOB_ID" \
+  --topic imagery.maps \
+  --scope mission/team/alpha \
+  --output ./downloaded-map.bin
+```
+
+`--operation-key auto` writes
+`asterctl: operation-key=<32-lowercase-hex-digits>` to stderr before sending.
+Save that exact value; JSON output also includes it as `operation_key`. A lost
+response or other unknown publication outcome must be recovered by repeating
+the identical file bytes, metadata, TTL, and other options with
+`--operation-key=<saved-key>`. The authoritative idempotent result can report
+`inserted: false`. A new key would describe a new application operation rather
+than recover the uncertain one.
+
+Text metadata uses exactly `TTL: durable` or `TTL: 60000 ms`. Finite JSON uses
+exactly `"ttlMs": "60000"`; durable JSON omits `ttlMs`. The value is the
+original authenticated lifetime, never a countdown or deletion time. Blob
+plaintext is written only to the requested output and is never printed.
+
+The RPC and CLI use checked `u64` lengths and bounded 64-KiB frames/pages; they
+do not promise a fixed total-size ceiling. The current selected backend rejects
+objects above 64 MiB. The shared agent deadline policy currently defaults to
+10 seconds and caps a stream at 30 seconds, even if `asterctl --timeout` asks
+for longer. These values describe this implementation, not durable RPC
+semantics, supported large-file behavior, or performance qualification.
+
+`blob-read` currently requires Linux and a destination filesystem supporting
+`O_TMPFILE` plus descriptor-relative publication of the open inode. It creates
+a mode-0600 anonymous inode in the pinned destination directory, synchronizes
+the complete verified stream, then links that exact inode atomically without
+replacing an existing or concurrently created path. Unsupported platforms and
+filesystems fail closed, and an incomplete stream leaves no named partial.
+
+The caller's source file and completed output file remain outside node
+zeroization custody. Node zeroization does not erase them, and callers must
+apply their own retention and sanitization policy. The agent separately stages
+an upload in one private allocated file under its pinned state root, unlinks it
+before accepting payload bytes, and currently requires Linux for that custody
+boundary. Keep the publish source contents and length unchanged until command
+exit; detectable size changes have an unknown publication outcome, while
+same-length in-place mutation is outside the command contract.
+
+The agent and CLI provide Blob publish and read, not Blob subscription, poll,
+acknowledgement, transfer status, peer/convergence status, or FFI lifetime
+controls. The Rust subscription API below remains a separate application
+surface.
 
 ## Subscribe to immutable publication metadata
 
@@ -390,7 +468,9 @@ expiry. Finite transfer between peers remains restricted to semantic v8 with
 profile 4; v7 transfers durable Blob work only. Bounded strictly-lower-priority
 pressure recovery remains internal.
 Route-only Blob relay/custody, a metadata-independent whole-byte identity, and
-Blob TTL fields in the CLI, RPC, Protobuf, and FFI surfaces are not implemented.
+Blob TTL fields in the FFI surface are not implemented. The local agent and
+`asterctl` expose Blob publish/read TTL, but not the Rust Blob subscription or
+transfer-status operations.
 
 `publish` requires a seekable source because it makes two bounded passes. The
 first computes the whole-content and per-chunk digests with one bounded,

@@ -7,7 +7,7 @@ the dedicated Compose provider with schema v2. There is no runtime provider
 selector. See the [schema v2 reference](../../docs/reference/aster-agent-config-v2.md)
 and [manual Compose operator procedure](../../docs/release/docker-compose.md).
 
-These examples target the loopback-only live Event/status API. Call the
+These examples target the loopback-only live Event/Blob/status API. Call the
 async functions from a Tokio runtime. The client examples require the `client`
 feature and an already running agent at `127.0.0.1:8181`; pass its provisioned
 client token (without the `Bearer ` prefix). See the
@@ -67,6 +67,72 @@ async fn grpc_status(
     Ok(owned)
 }
 ```
+
+### Publish and read Blobs with `asterctl`
+
+The running agent exposes bounded `PublishBlob` and `ReadBlob` streams. The
+ready-to-use client is `asterctl`, which uses native gRPC over HTTP/2 for these
+two commands. The plaintext listener remains loopback-only, and every command
+requires exactly one bearer-token source. Prefer a protected token file rather
+than a literal token in shell history:
+
+```sh
+TOKEN_FILE=/run/aster/client.token
+
+# Durable publication with an application-owned recovery key.
+asterctl --token-file "$TOKEN_FILE" blob-publish \
+  --file ./map.bin \
+  --topic imagery.maps \
+  --scope mission/team/alpha \
+  --operation-key map-001 \
+  --media-type application/octet-stream
+
+# Finite publication with a generated recovery key and exact JSON TTL output.
+asterctl --token-file "$TOKEN_FILE" --json blob-publish \
+  --file ./overlay.bin \
+  --topic imagery.maps \
+  --scope mission/team/alpha \
+  --operation-key auto \
+  --ttl-ms 60000
+
+# Read the returned ID to a new path; an existing path is never overwritten.
+asterctl --token-file "$TOKEN_FILE" blob-read \
+  --id "$BLOB_ID" \
+  --topic imagery.maps \
+  --scope mission/team/alpha \
+  --output ./downloaded-map.bin
+```
+
+Before sending an `auto` publication, `asterctl` writes
+`asterctl: operation-key=<32-lowercase-hex-digits>` to stderr. Save that exact
+key. JSON output also includes it as `operation_key`. If the result is unknown,
+retry the identical file bytes and publication options with
+`--operation-key=<saved-key>`; do not generate a new key. If the earlier attempt
+committed, the retry recovers it with `inserted: false`; if it did not, the
+retry may insert the publication and return `inserted: true`.
+
+Text output renders the original signed TTL as exactly `TTL: durable` or
+`TTL: 60000 ms`. Finite JSON renders exactly `"ttlMs": "60000"`; durable JSON
+omits `ttlMs`. These values are the original lifetime, not remaining time.
+
+The CLI and wire fields use checked `u64` lengths and do not define a 64-MiB
+protocol maximum. The current selected backend nevertheless admits at most
+64 MiB, and the shared agent deadline policy currently defaults to 10 seconds
+and caps each stream at 30 seconds. Those are current implementation limits,
+not RPC compatibility guarantees or large-file performance claims.
+
+`blob-read` currently requires Linux plus destination-filesystem support for
+`O_TMPFILE` and descriptor-relative linking. It creates an anonymous mode-0600
+inode in the pinned destination directory, synchronizes it, and atomically
+links that exact open inode to the requested new path. Unsupported platforms or
+filesystems fail closed. The caller's publish source and completed read output
+remain caller-owned files outside node zeroization custody; zeroizing the node
+does not erase either file. The agent's upload staging is separate, private,
+unlinked before payload acceptance, and currently Linux-only.
+
+This agent increment provides Blob publish and read only. Blob subscription,
+poll, acknowledgement, transfer-status commands, and Blob FFI lifetime fields
+remain outside this surface.
 
 ### Pipelined durable Event publication
 

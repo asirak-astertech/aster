@@ -32,8 +32,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   until physical finalization.
 - Rust selected-Blob finite publication options, exact original-TTL echoes,
   page-bounded lifecycle checks, and tagged content/retirement delivery with
-  separately bound acknowledgement tokens. CLI, RPC, Protobuf, and FFI Blob
-  lifetime fields remain unchanged.
+  separately bound acknowledgement tokens. C FFI Blob lifetime fields remain
+  unchanged.
+- Additive local `PublishBlob` and `ReadBlob` Protobuf/RPC streams and
+  `asterctl blob-publish`/`blob-read` commands for durable or finite-TTL file
+  publication and authenticated read to a new file. Transfers use bounded
+  native HTTP/2 frames/pages, exact operation-key recovery and original-TTL
+  output. The current 64-MiB backend admission and 30-second agent stream cap
+  are implementation limits, not wire guarantees; Blob subscription commands,
+  FFI lifetime controls, large-file qualification, and release acceptance are
+  not included.
 
 ### Changed
 
