@@ -14,6 +14,7 @@ use aster_agent::{
     proto::aster::application::v1alpha1 as api,
     sdk::{NumberedEventSdk, PipelinedEventPublisher, PublicationJournal, RecoveredState},
 };
+use aster_mesh::{ProvisioningAccess, ReferenceProvisioner, Scope, Topic};
 use aster_node::mission::UnprotectedReferenceMission;
 use aster_node::{MutableSourceInterests, NodeApplication, NodeConfig, start_node};
 use buffa::{Message as _, MessageName as _};
@@ -92,6 +93,365 @@ fn assert_authentication_error(error: &ConnectError, expected_type_url: &str) {
     assert_eq!(detail.operation, "unspecified");
     assert!(!detail.retryable);
     assert_eq!(detail.retry_delay_ms, None);
+}
+
+fn assert_public_reason(
+    error: &ConnectError,
+    code: ErrorCode,
+    reason: api::PublicErrorReason,
+    operation: &str,
+) {
+    assert_eq!(error.code, code);
+    assert_eq!(error.details.len(), 1);
+    let wire_detail = &error.details[0];
+    assert!(wire_detail.debug.is_none());
+    let detail = api::PublicErrorDetail::decode_from_slice(&decode_base64(
+        wire_detail.value.as_deref().expect("encoded public detail"),
+    ))
+    .expect("decodable public detail");
+    assert_eq!(detail.reason, reason);
+    assert_eq!(detail.operation, operation);
+    assert!(!detail.retryable);
+    assert_eq!(detail.retry_delay_ms, None);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let state = TestState::new();
+        let access = ProvisioningAccess::member(
+            Scope::new("mission/team/alpha").expect("Blob scope"),
+            vec![1],
+            vec![Topic::new("imagery.maps").expect("Blob topic")],
+        )
+        .expect("Blob access");
+        let mut provisioner =
+            ReferenceProvisioner::from_seed([0xb7; 32]).expect("reference provisioner");
+        let mission = UnprotectedReferenceMission::from_bytes(
+            provisioner
+                .issue_node(1, &[access])
+                .expect("issue Blob mission")
+                .to_bytes()
+                .expect("encode Blob mission"),
+        )
+        .expect("load disposable Blob test mission");
+        let node = start_node(NodeConfig {
+            state: state.0.clone(),
+            bind: "127.0.0.1:0".parse().expect("mesh bind"),
+            mission,
+            peers: Vec::new(),
+            mutable_interests: MutableSourceInterests::default(),
+            sync_interval: Duration::from_millis(50),
+            run_for: None,
+            application: NodeApplication::Relay,
+        })
+        .await
+        .expect("start real selected node");
+        let agent = BoundAgent::bind("127.0.0.1:0".parse().expect("agent bind"))
+            .await
+            .expect("bind agent");
+        let address = agent.local_addr().expect("agent address");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let server = tokio::spawn(agent.serve_with_blobs(
+            node.selected_events(),
+            node.selected_blobs(),
+            state.0.clone(),
+            ClientToken::from_bytes(TEST_TOKEN.to_vec()).expect("valid token"),
+            shutdown_rx,
+        ));
+        let grpc = Http2Connection::connect_plaintext(
+            format!("http://{address}")
+                .parse()
+                .expect("gRPC transport URI"),
+        )
+        .await
+        .expect("connect gRPC HTTP/2 transport")
+        .shared(8);
+        let client = api::AsterApplicationServiceClient::new(
+            grpc,
+            ClientConfig::new(
+                format!("http://{address}")
+                    .parse()
+                    .expect("gRPC client URI"),
+            )
+            .with_protocol(Protocol::Grpc)
+            .with_default_header(
+                "authorization",
+                format!("Bearer {}", String::from_utf8_lossy(TEST_TOKEN)),
+            ),
+        );
+
+        let grpc_web_client = api::AsterApplicationServiceClient::new(
+            HttpClient::plaintext(),
+            ClientConfig::new(
+                format!("http://{address}")
+                    .parse()
+                    .expect("gRPC-Web client URI"),
+            )
+            .with_protocol(Protocol::GrpcWeb)
+            .with_default_header(
+                "authorization",
+                format!("Bearer {}", String::from_utf8_lossy(TEST_TOKEN)),
+            ),
+        );
+        let grpc_web_frames = vec![
+            api::PublishBlobRequest {
+                frame: Some(api::publish_blob_request::Frame::Metadata(Box::new(
+                    api::PublishBlobMetadata {
+                        operation_key: b"grpc-web-rejected-blob".to_vec(),
+                        topic: "imagery.maps".to_owned(),
+                        scope: "mission/team/alpha".to_owned(),
+                        priority: api::Priority::Routine.into(),
+                        total_len: 1,
+                        ..Default::default()
+                    },
+                ))),
+                ..Default::default()
+            },
+            api::PublishBlobRequest {
+                frame: Some(api::publish_blob_request::Frame::Chunk(vec![0x44])),
+                ..Default::default()
+            },
+        ];
+        let grpc_web_error = grpc_web_client
+            .publish_blob(connectrpc::stream_iter(grpc_web_frames.clone()))
+            .await
+            .expect_err("gRPC-Web request streaming must be rejected");
+        assert_public_reason(
+            &grpc_web_error,
+            ErrorCode::Unimplemented,
+            api::PublicErrorReason::UnsupportedValue,
+            "publish_blob",
+        );
+        let after_grpc_web = client
+            .publish_blob(connectrpc::stream_iter(grpc_web_frames))
+            .await
+            .expect("gRPC-Web rejection must not mutate Blob state")
+            .into_owned();
+        assert!(after_grpc_web.inserted);
+
+        let payload = vec![0x5a; 65_536 + 3];
+        let metadata = api::PublishBlobMetadata {
+            operation_key: b"real-node-blob-durable".to_vec(),
+            topic: "imagery.maps".to_owned(),
+            scope: "mission/team/alpha".to_owned(),
+            priority: api::Priority::Immediate.into(),
+            media_type: Some("application/octet-stream".to_owned()),
+            schema_id: b"schema/blob-v1".to_vec(),
+            total_len: payload.len() as u64,
+            ttl_ms: None,
+            ..Default::default()
+        };
+        let frames = vec![
+            api::PublishBlobRequest {
+                frame: Some(api::publish_blob_request::Frame::Metadata(Box::new(
+                    metadata.clone(),
+                ))),
+                ..Default::default()
+            },
+            api::PublishBlobRequest {
+                frame: Some(api::publish_blob_request::Frame::Chunk(
+                    payload[..65_536].to_vec(),
+                )),
+                ..Default::default()
+            },
+            api::PublishBlobRequest {
+                frame: Some(api::publish_blob_request::Frame::Chunk(
+                    payload[65_536..].to_vec(),
+                )),
+                ..Default::default()
+            },
+        ];
+        let published = client
+            .publish_blob(connectrpc::stream_iter(frames.clone()))
+            .await
+            .expect("publish durable Blob")
+            .into_owned();
+        assert!(published.inserted);
+        assert_eq!(published.ttl_ms, None);
+        assert_eq!(published.total_len, payload.len() as u64);
+        let retried = client
+            .publish_blob(connectrpc::stream_iter(frames))
+            .await
+            .expect("retry durable Blob")
+            .into_owned();
+        assert!(!retried.inserted);
+        assert_eq!(retried.id, published.id);
+        assert_eq!(retried.ttl_ms, None);
+
+        let mut pages = client
+            .read_blob(api::ReadBlobRequest {
+                id: published.id.clone(),
+                topic: "imagery.maps".to_owned(),
+                scope: "mission/team/alpha".to_owned(),
+                ..Default::default()
+            })
+            .await
+            .expect("start multi-page Blob read");
+        let mut observed = Vec::new();
+        let mut offsets = Vec::new();
+        while let Some(page) = pages.message().await.expect("read Blob page") {
+            let page = page.to_owned_message();
+            assert_eq!(page.id, published.id);
+            assert_eq!(page.publisher, published.publisher);
+            assert_eq!(page.publisher_counter, published.publisher_counter);
+            assert_eq!(page.topic, "imagery.maps");
+            assert_eq!(page.scope, "mission/team/alpha");
+            assert_eq!(page.priority, api::Priority::Immediate);
+            assert_eq!(page.ttl_ms, None);
+            assert_eq!(page.total_len, payload.len() as u64);
+            assert_eq!(page.media_type.as_deref(), Some("application/octet-stream"));
+            assert_eq!(page.schema_id, b"schema/blob-v1");
+            assert_eq!(page.acceptance_marker, published.acceptance_marker);
+            offsets.push(page.offset);
+            observed.extend_from_slice(&page.chunk);
+            if page.complete {
+                break;
+            }
+        }
+        assert_eq!(offsets, [0, 65_536]);
+        assert_eq!(observed, payload);
+
+        let malformed_metadata = api::PublishBlobMetadata {
+            operation_key: b"real-node-blob-malformed".to_vec(),
+            topic: "imagery.maps".to_owned(),
+            scope: "mission/team/alpha".to_owned(),
+            priority: api::Priority::Routine.into(),
+            total_len: 2,
+            ..Default::default()
+        };
+        let malformed = client
+            .publish_blob(connectrpc::stream_iter(vec![
+                api::PublishBlobRequest {
+                    frame: Some(api::publish_blob_request::Frame::Metadata(Box::new(
+                        malformed_metadata.clone(),
+                    ))),
+                    ..Default::default()
+                },
+                api::PublishBlobRequest {
+                    frame: Some(api::publish_blob_request::Frame::Chunk(vec![1])),
+                    ..Default::default()
+                },
+            ]))
+            .await
+            .expect_err("length mismatch must fail before publication");
+        assert_public_reason(
+            &malformed,
+            ErrorCode::InvalidArgument,
+            api::PublicErrorReason::MalformedInput,
+            "publish_blob",
+        );
+        let recovered = client
+            .publish_blob(connectrpc::stream_iter(vec![
+                api::PublishBlobRequest {
+                    frame: Some(api::publish_blob_request::Frame::Metadata(Box::new(
+                        malformed_metadata,
+                    ))),
+                    ..Default::default()
+                },
+                api::PublishBlobRequest {
+                    frame: Some(api::publish_blob_request::Frame::Chunk(vec![1, 2])),
+                    ..Default::default()
+                },
+            ]))
+            .await
+            .expect("malformed attempt must not mutate operation state")
+            .into_owned();
+        assert!(recovered.inserted);
+        assert!(
+            fs::read_dir(&state.0)
+                .expect("inspect state root")
+                .all(|entry| !entry
+                    .expect("state entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".aster-agent-blob-upload-")),
+            "Blob staging names must be unlinked before payload custody"
+        );
+
+        let finite_payload = b"finite-blob".to_vec();
+        let finite = client
+            .publish_blob(connectrpc::stream_iter(vec![
+                api::PublishBlobRequest {
+                    frame: Some(api::publish_blob_request::Frame::Metadata(Box::new(
+                        api::PublishBlobMetadata {
+                            operation_key: b"real-node-blob-finite".to_vec(),
+                            topic: "imagery.maps".to_owned(),
+                            scope: "mission/team/alpha".to_owned(),
+                            priority: api::Priority::Priority.into(),
+                            media_type: Some("application/octet-stream".to_owned()),
+                            schema_id: b"schema/blob-v1".to_vec(),
+                            total_len: finite_payload.len() as u64,
+                            ttl_ms: Some(1_000),
+                            ..Default::default()
+                        },
+                    ))),
+                    ..Default::default()
+                },
+                api::PublishBlobRequest {
+                    frame: Some(api::publish_blob_request::Frame::Chunk(finite_payload)),
+                    ..Default::default()
+                },
+            ]))
+            .await
+            .expect("publish finite Blob")
+            .into_owned();
+        assert_eq!(finite.ttl_ms, Some(1_000));
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+
+        let mut expired = client
+            .read_blob(api::ReadBlobRequest {
+                id: finite.id,
+                topic: "imagery.maps".to_owned(),
+                scope: "mission/team/alpha".to_owned(),
+                ..Default::default()
+            })
+            .await
+            .expect("start expired read stream");
+        let expired = expired
+            .message()
+            .await
+            .expect_err("recently expired Blob must fail");
+        assert_public_reason(
+            &expired,
+            ErrorCode::NotFound,
+            api::PublicErrorReason::ExpiredOrRetired,
+            "read_blob",
+        );
+
+        let mut missing = client
+            .read_blob(api::ReadBlobRequest {
+                id: vec![0xee; 32],
+                topic: "imagery.maps".to_owned(),
+                scope: "mission/team/alpha".to_owned(),
+                ..Default::default()
+            })
+            .await
+            .expect("start never-observed read stream");
+        let missing = missing
+            .message()
+            .await
+            .expect_err("never-observed Blob must fail");
+        assert_public_reason(
+            &missing,
+            ErrorCode::NotFound,
+            api::PublicErrorReason::MissingDurableObject,
+            "read_blob",
+        );
+
+        shutdown_tx.send(true).expect("request shutdown");
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("agent shutdown timeout")
+            .expect("agent task")
+            .expect("agent serve");
+        node.shutdown().await.expect("node shutdown");
+    });
 }
 
 #[test]

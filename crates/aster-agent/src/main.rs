@@ -177,9 +177,10 @@ async fn run_legacy(mut arguments: Arguments) -> Result<(), BoxError> {
     #[cfg(not(feature = "nearby-discovery"))]
     let node = start_node(config).await?;
     let events = node.selected_events();
+    let blobs = node.selected_blobs();
 
     println!(
-        "AGENT status=ready listen=http://{listen} mesh_bind={mesh_bind} state={} protocol=connect+grpc+grpc-web api=aster.application.v1alpha1 event_live=true state_live=false record_live=false plaintext=loopback-only",
+        "AGENT status=ready listen=http://{listen} mesh_bind={mesh_bind} state={} protocol=connect+grpc+grpc-web api=aster.application.v1alpha1 event_live=true blob_live=true state_live=false record_live=false plaintext=loopback-only",
         format_path_field(&state),
     );
 
@@ -193,7 +194,9 @@ async fn run_legacy(mut arguments: Arguments) -> Result<(), BoxError> {
             }
         }
     });
-    let server_result = agent.serve(events, client_token, shutdown_rx).await;
+    let server_result = agent
+        .serve_with_blobs(events, blobs, state, client_token, shutdown_rx)
+        .await;
     signal.abort();
     let node_result = node.shutdown().await;
     server_result?;

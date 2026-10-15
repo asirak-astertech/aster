@@ -1,4 +1,4 @@
-//! Customer runtime supervision for the protected selected Event service.
+//! Customer runtime supervision for the protected selected Event and Blob service.
 
 use std::{error::Error, fmt, path::PathBuf, time::Duration};
 
@@ -14,7 +14,7 @@ use crate::{
     credentials::{
         CredentialReason, StartupCredentials, load_startup_credentials, open_node_config,
     },
-    event_service::application_service,
+    event_service::application_service_with_blobs,
     health::BoundHealth,
     lifecycle::{FailureReason, LifecycleState, ServiceStatus, credential_generation_hex},
     server::{BoundAgent, ServerStop},
@@ -124,6 +124,7 @@ where
     let limits = *config.limits();
     let node_config = open_node_config(&config, &credentials, loader)
         .map_err(|error| AgentRuntimeError::Bootstrap(error.kind()))?;
+    let state_root = node_config.state.clone();
 
     let health = BoundHealth::bind(health_address)
         .await
@@ -158,15 +159,25 @@ where
     };
 
     let events = node.selected_events();
+    let blobs = node.selected_blobs();
     let monitored_events = events.clone();
     let (stream_stop_send, stream_stop_receive) = tokio::sync::watch::channel(false);
     let (server_stop_send, server_stop_receive) = tokio::sync::watch::channel(ServerStop::Run);
-    let service = application_service(
+    let service = match application_service_with_blobs(
         events,
+        blobs,
+        state_root,
         configured_emission_policy,
         credential_generation,
         stream_stop_receive,
-    );
+    ) {
+        Ok(service) => service,
+        Err(_) => {
+            let _ = node.shutdown().await;
+            fail_startup(&status, &health_stop_send, &mut health_task).await;
+            return Err(AgentRuntimeError::Listener(FailureReason::Startup));
+        }
+    };
     let mut server_task = tokio::spawn(application.serve(
         service,
         credentials.token().clone(),

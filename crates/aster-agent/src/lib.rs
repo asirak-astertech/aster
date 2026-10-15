@@ -2,13 +2,15 @@
 //!
 //! The crate contains focused process facilities for bounded serving,
 //! credentials, health, lifecycle, and supervision. The selected customer MVP
-//! statically composes one crate-private Event application module over
-//! `SelectedEventHandle`; it does not provide runtime module selection, a
-//! plugin ABI, another durable authority, or a second service executable.
+//! statically composes crate-private Event and Blob application modules over
+//! the running node's selected handles; it does not provide runtime module
+//! selection, a plugin ABI, another durable authority, or a second service
+//! executable.
 
 #![doc = include_str!("../README.md")]
 #![forbid(unsafe_code)]
 
+mod blob_service;
 pub mod config;
 pub mod credentials;
 pub mod error;
@@ -27,7 +29,7 @@ mod wire_error;
 pub use credentials::ClientToken;
 pub use error::{PublicOperation, connect_application_error, public_error};
 
-use aster_node::application::SelectedEventHandle;
+use aster_node::application::{SelectedBlobHandle, SelectedEventHandle};
 
 /// Generated, repository-owned application protocol.
 ///
@@ -82,7 +84,7 @@ impl BoundAgent {
         self,
         events: SelectedEventHandle,
         token: ClientToken,
-        mut shutdown: tokio::sync::watch::Receiver<bool>,
+        shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let service = event_service::application_service(
             events,
@@ -90,6 +92,35 @@ impl BoundAgent {
             None,
             shutdown.clone(),
         );
+        self.serve_service(service, token, shutdown).await
+    }
+
+    /// Serves the Event and Blob routes from one running node authority.
+    pub async fn serve_with_blobs(
+        self,
+        events: SelectedEventHandle,
+        blobs: SelectedBlobHandle,
+        state_root: std::path::PathBuf,
+        token: ClientToken,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let service = event_service::application_service_with_blobs(
+            events,
+            blobs,
+            state_root,
+            aster_node::EventEmissionPolicy::Normal,
+            None,
+            shutdown.clone(),
+        )?;
+        self.serve_service(service, token, shutdown).await
+    }
+
+    async fn serve_service(
+        self,
+        service: connectrpc::ConnectRpcService<connectrpc::Router>,
+        token: ClientToken,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let status = lifecycle::ServiceStatus::starting();
         status.transition(lifecycle::LifecycleState::Ready)?;
         let reloadable = credentials::ReloadableClientToken::new(token);
