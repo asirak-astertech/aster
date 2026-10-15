@@ -7,19 +7,19 @@ updates:
       day: monday
     open-pull-requests-limit: 5
 
+  # Shared workspace pins affect both independently locked Cargo graphs.
   - package-ecosystem: cargo
-    directory: /
+    directories:
+      - /
+      - /fuzz
     schedule:
       interval: weekly
       day: monday
     open-pull-requests-limit: 10
-
-  - package-ecosystem: cargo
-    directory: /fuzz
-    schedule:
-      interval: weekly
-      day: monday
-    open-pull-requests-limit: 5
+    groups:
+      shared-dependencies:
+        patterns: ["*"]
+        group-by: dependency-name
 
   - package-ecosystem: gomod
     directory: /tools/age-reference

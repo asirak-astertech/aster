@@ -2273,6 +2273,100 @@ pub(crate) fn seed_peer_receipt_fanout_write(
     Ok(())
 }
 
+#[cfg(test)]
+pub(crate) fn seed_peer_retry_rows_write(
+    write: &redb::WriteTransaction,
+    rows: &[(NodeId, CustodyObjectKey)],
+    sample: CustodySample,
+    link_floor_ms: u64,
+    expected_policy: CustodyPolicyRevision,
+) -> Result<u64, StoreError> {
+    require_policy_revision_write(write, expected_policy)?;
+    let count = u64::try_from(rows.len()).map_err(|_| CustodyStoreError::CounterOverflow)?;
+    if count > MAX_CUSTODY_RETRY_RECORDS {
+        return Err(CustodyStoreError::RetryLimitExceeded {
+            current: count,
+            limit: MAX_CUSTODY_RETRY_RECORDS,
+        }
+        .into());
+    }
+
+    let mut retry_rows = Vec::with_capacity(rows.len());
+    let mut keys = BTreeSet::new();
+    let items = write.open_table(CUSTODY_ITEMS)?;
+    let receipts = write.open_table(CUSTODY_PEER_RECEIPTS)?;
+    let retries = write.open_table(CUSTODY_RETRIES)?;
+    for &(peer, object) in rows {
+        let key = peer_object_key(peer, object);
+        if !keys.insert(key) {
+            return Err(CustodyStoreError::Invariant("test retry rows contain duplicates").into());
+        }
+        if receipts.get(key.as_slice())?.is_some() {
+            return Err(CustodyStoreError::ItemChanged.into());
+        }
+        if peer_object_has_lease(write, peer, object)? {
+            return Err(CustodyStoreError::ItemChanged.into());
+        }
+        if retries.get(key.as_slice())?.is_some() {
+            return Err(CustodyStoreError::ItemChanged.into());
+        }
+        let item = items
+            .get(object.encoded().as_slice())?
+            .map(|value| decode_item(value.value()))
+            .transpose()?
+            .ok_or(CustodyStoreError::ItemNotFound)?;
+        if item.retiring {
+            return Err(CustodyStoreError::Retiring.into());
+        }
+        let due_tick_ms = sample
+            .tick_ms
+            .checked_add(retry_delay_ms(item.priority, 0, link_floor_ms))
+            .ok_or(CustodyStoreError::CounterOverflow)?;
+        retry_rows.push((
+            key,
+            encode_retry(RetryRecord {
+                attempts: 1,
+                item_revision: item.revision,
+                policy_revision: expected_policy.0,
+                clock_id: sample.clock_id,
+                due_tick_ms,
+                priority: item.priority,
+            }),
+        ));
+    }
+    drop(retries);
+    drop(receipts);
+    drop(items);
+
+    let metadata = write.open_table(CUSTODY_METADATA)?;
+    let retry_count = metadata_value(&metadata, CUSTODY_RETRY_COUNT_KEY)?;
+    drop(metadata);
+    let next_retry_count = retry_count
+        .checked_add(count)
+        .ok_or(CustodyStoreError::CounterOverflow)?;
+    if next_retry_count > MAX_CUSTODY_RETRY_RECORDS {
+        return Err(CustodyStoreError::RetryLimitExceeded {
+            current: retry_count,
+            limit: MAX_CUSTODY_RETRY_RECORDS,
+        }
+        .into());
+    }
+
+    let mut retries = write.open_table(CUSTODY_RETRIES)?;
+    for (key, retry) in &retry_rows {
+        if retries.insert(key.as_slice(), retry.as_slice())?.is_some() {
+            return Err(CustodyStoreError::Invariant("test retry rows collide").into());
+        }
+        insert_peer_retirement_reference_write(write, RETIREMENT_REFERENCE_RETRY, key.as_slice())?;
+    }
+    drop(retries);
+    write
+        .open_table(CUSTODY_METADATA)?
+        .insert(CUSTODY_RETRY_COUNT_KEY, next_retry_count)?;
+    advance_revision(write, false)?;
+    Ok(count)
+}
+
 fn decode_receipt(bytes: &[u8]) -> Result<ReceiptRecord, CustodyStoreError> {
     let mut cursor = CustodyCursor::new(bytes);
     let version = cursor.u8()?;

@@ -895,6 +895,15 @@ impl ReferenceProvisioner {
         build_scope_rekey_plan(scope, epoch, recipients, credentials)
     }
 
+    /// Returns locally issued public rekey-recipient identifiers in canonical registry order.
+    ///
+    /// These identifiers are not authentication evidence. Consumers must use the signed registry
+    /// and planning path to authenticate recipients. This accessor exposes no credential body,
+    /// signature, grant, secret, seed, or key.
+    pub fn rekey_registry_recipient_nodes(&self) -> impl ExactSizeIterator<Item = NodeId> + '_ {
+        self.issued_rekey_credentials.keys().copied()
+    }
+
     /// Exports the bounded public recipient registry as one authority-signed canonical artifact.
     /// No identity seed, private key, route key, or content key is included.
     pub fn export_rekey_registry(&self) -> Result<Vec<u8>, EnvelopeError> {
@@ -9319,6 +9328,12 @@ mod tests {
             .issue_node(1, &[member_access(vec![0])])
             .unwrap_or_else(|error| panic!("recipient issue failed: {error}"));
         let recipient_id = bundle_identity(&recipient);
+        assert_eq!(
+            provisioner
+                .rekey_registry_recipient_nodes()
+                .collect::<Vec<_>>(),
+            vec![recipient_id]
+        );
         let identity_seed = *recipient
             .identity_seed
             .as_ref()
@@ -9350,6 +9365,12 @@ mod tests {
             .import_rekey_registry_at_least(&registry, 1)
             .unwrap_or_else(|error| panic!("registry import failed: {error}"));
         assert_eq!(restarted.rekey_registry_generation(), 1);
+        assert_eq!(
+            restarted
+                .rekey_registry_recipient_nodes()
+                .collect::<Vec<_>>(),
+            vec![recipient_id]
+        );
         let plan = restarted
             .plan_scope_rekey(
                 scope("alpha"),
@@ -9384,6 +9405,14 @@ mod tests {
             .unwrap_or_else(|error| panic!("second recipient issue failed: {error}"));
         let second_id = bundle_identity(&second);
         assert_eq!(restarted.rekey_registry_generation(), 2);
+        let mut expected_recipients = vec![recipient_id, second_id];
+        expected_recipients.sort_unstable();
+        assert_eq!(
+            restarted
+                .rekey_registry_recipient_nodes()
+                .collect::<Vec<_>>(),
+            expected_recipients
+        );
         assert!(restarted.import_rekey_registry(&registry).is_err());
         assert!(
             restarted

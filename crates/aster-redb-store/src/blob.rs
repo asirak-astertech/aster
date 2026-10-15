@@ -29542,7 +29542,8 @@ mod tests {
 
     #[test]
     fn completion_capability_rejects_every_exact_import_identity_mutation() {
-        for (index, field) in [
+        let mut services = blob_services(0xa0);
+        for field in [
             "whole_plaintext_sha256",
             "media_type",
             "schema_id",
@@ -29553,10 +29554,8 @@ mod tests {
             "chunk_count",
         ]
         .into_iter()
-        .enumerate()
         {
             let root = BlobTestRoot::new(field);
-            let mut services = blob_services(0xa0 + u8::try_from(index).expect("mutation index"));
             let plaintext = vec![0xa5; 2_048];
             let prepared = prepared_blob(&plaintext);
             let store =
@@ -29864,9 +29863,28 @@ mod tests {
                 b"original-operation",
             );
             let write = store.database.begin_write().expect("seed operation ledger");
+            let mut tracked_byte_cap_bytes = None;
             {
                 let mut operations = write.open_table(BLOB_OPERATIONS).expect("operations");
                 if byte_cap {
+                    let mut operation_bytes = operations
+                        .iter()
+                        .expect("operation rows")
+                        .map(|row| {
+                            row.map(|(key, value)| {
+                                let key_bytes =
+                                    u64::try_from(key.value().len()).expect("operation key bytes");
+                                let value_bytes = u64::try_from(value.value().len())
+                                    .expect("operation value bytes");
+                                key_bytes
+                                    .checked_add(value_bytes)
+                                    .expect("operation row bytes")
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                        .expect("operation row lengths")
+                        .into_iter()
+                        .sum::<u64>();
                     let mut index = 0u32;
                     loop {
                         let mut key = vec![b'b'; 200];
@@ -29880,20 +29898,17 @@ mod tests {
                             }),
                         )
                         .expect("wrap byte-cap operation");
-                        let current_bytes = operations
-                            .iter()
-                            .expect("operation rows")
-                            .map(|row| {
-                                row.map(|(key, value)| key.value().len() + value.value().len())
-                            })
-                            .collect::<Result<Vec<_>, _>>()
-                            .expect("operation row lengths")
-                            .into_iter()
-                            .sum::<usize>();
-                        if u64::try_from(current_bytes + key.len() + encoded.len())
-                            .expect("operation bytes")
-                            > MAX_BLOB_OPERATION_BYTES - 64
-                        {
+                        let incoming_bytes = u64::try_from(key.len())
+                            .expect("incoming operation key bytes")
+                            .checked_add(
+                                u64::try_from(encoded.len())
+                                    .expect("incoming operation value bytes"),
+                            )
+                            .expect("incoming operation bytes");
+                        let next_bytes = operation_bytes
+                            .checked_add(incoming_bytes)
+                            .expect("operation bytes");
+                        if next_bytes > MAX_BLOB_OPERATION_BYTES - 64 {
                             break;
                         }
                         operations
@@ -29905,8 +29920,10 @@ mod tests {
                             key.as_slice(),
                         )
                         .expect("index byte-cap operation owner");
+                        operation_bytes = next_bytes;
                         index = index.checked_add(1).expect("operation index");
                     }
+                    tracked_byte_cap_bytes = Some(operation_bytes);
                 } else {
                     for index in 1..MAX_BLOB_OPERATIONS {
                         let key = format!("r{index:04}").into_bytes();
@@ -29949,6 +29966,12 @@ mod tests {
                     .sum::<u64>();
                 (count, bytes)
             };
+            if byte_cap {
+                assert_eq!(
+                    bytes,
+                    tracked_byte_cap_bytes.expect("tracked byte-cap operation bytes")
+                );
+            }
             {
                 let mut metadata = write.open_table(METADATA).expect("metadata");
                 metadata
@@ -30010,6 +30033,9 @@ mod tests {
 
     #[test]
     fn depot_owner_staging_recovers_every_durable_first_install_boundary() {
+        let services = blob_services(0xa0);
+        let authority = services.authority;
+        drop(services);
         for (index, point) in [
             depot::DepotFaultPoint::OwnerStagingCreated,
             depot::DepotFaultPoint::OwnerTempCreated,
@@ -30025,13 +30051,11 @@ mod tests {
         .enumerate()
         {
             let root = BlobTestRoot::new(&format!("owner-crash-{index}"));
-            let services = blob_services(0xa0 + u8::try_from(index).expect("fault index"));
-            let store =
-                Store::open_for_mission(&root.database, services.authority).expect("empty store");
+            let store = Store::open_for_mission(&root.database, authority).expect("empty store");
             depot::inject_test_fault(&root.path, point);
             assert!(store.blob_depot().is_err(), "fault {point:?} must fire");
             drop(store);
-            let reopened = Store::open_for_mission(&root.database, services.authority)
+            let reopened = Store::open_for_mission(&root.database, authority)
                 .expect("reopen interrupted owner election");
             drop(reopened.blob_depot().expect("same-DB owner-election retry"));
             assert_eq!(
