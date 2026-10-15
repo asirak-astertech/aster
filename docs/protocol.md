@@ -741,7 +741,7 @@ receiving selected Event work.
 
 This section retains the original versioned byte definitions and source/storage
 invariants. Protocol draft.3 no longer implements the legacy carrier dialogue;
-selected Blob carrier transfer requires profile 3 in §9.4 and
+selected Blob carrier transfer requires profile 4 in §9.4 and
 [Blob range streaming](blob-ranges-stream.md). The historical Result/Ack and
 Finish/Finished records are not an available runtime fallback.
 
@@ -944,7 +944,7 @@ without changing v1-v6 bytes. Immediately after the four-flight handshake, the
 initiator sends and the responder returns one protected canonical
 `TransferProfileOfferV1`. Known lane IDs are `1` Event, `2` State, `3` Record,
 `4` Blob, and `5` EventBridge. Known profile IDs are `1` `LegacyV6`, `2`
-`EventPagesV1`, and `3` `BlobRangesStreamV1`. Lanes and profiles are strictly
+`EventPagesV1`, `3` reserved for `BlobCustodyV1` (not implemented), and `4` `BlobRangesStreamV1`. Lanes and profiles are strictly
 descending and unique. Event, State, Record, and EventBridge MUST offer
 `LegacyV6`. Blob offers MUST contain `LegacyV6` or `BlobRangesStreamV1`;
 the selected runtime offers only `BlobRangesStreamV1`. Only Event may offer
@@ -957,7 +957,7 @@ and bind the complete canonical offers plus intersections into
 `transfer_profile_digest`. The current offer selects `EventPagesV1` for Event
 when both peers support it, `BlobRangesStreamV1` for Blob when both peers offer
 it, and `LegacyV6` for State, Record, and EventBridge. Blob has no legacy
-fallback: an authenticated peer without profile 3 fails profile intersection;
+fallback: an authenticated peer without profile 4 fails profile intersection;
 semantic-v5/v6 Blob carrier attempts are explicitly rejected before carrier IO.
 This is the draft.3 selected-runtime compatibility break, not a reinterpretation
 of old frame bytes. Historical codecs/vectors remain readable but do not enable
@@ -1966,7 +1966,7 @@ and visible quota/eviction policy. Evictions and conflicts surface to the app.
 | message | 1 Interest, 2 Summary, 3 Probe, 4 Node, 5 Offer, 6 Want, 7 Data, 8 Receipt |
 | transfer object kind | semantic 1: 1 source envelope, 2 Blob chunk; semantics 2 through 7 add 3 source-batch proof, 4 bridge authorization, 5 bridge-route wrapper; later mechanics allocate no new object kind |
 | semantic-v7 lane | 1 Event, 2 State, 3 Record, 4 Blob, 5 EventBridge; critical extension bit `0x8000` |
-| semantic-v7 transfer profile | 1 `LegacyV6`, 2 `EventPagesV1`, 3 `BlobRangesStreamV1`; critical extension bit `0x8000` |
+| semantic-v7 transfer profile | 1 `LegacyV6`, 2 `EventPagesV1`, 3 reserved `BlobCustodyV1` (not implemented), 4 `BlobRangesStreamV1`; critical extension bit `0x8000` |
 | semantic-v7 mechanics tag | `0xd1` TransferProfileOfferV1, `0xd2` EventTurnPlanV1, `0xd3` ChangeTurnHeaderV1, `0xd4` ChangePageV7, `0xd5` ChangeTurnFinishedV1 |
 | source envelope format | 2 singleton hybrid authentication; semantics 2 through 7 add 3 content-committing batch authentication |
 | batch authentication mode | 1 exact proof reference, Merkle path, and P-256 item signature |

@@ -108,7 +108,8 @@ impl LaneId {
 pub(crate) enum TransferProfileId {
     LegacyV6 = 1,
     EventPagesV1 = 2,
-    BlobRangesStreamV1 = 3,
+    // 3 is reserved for the approved BlobCustodyV1 design.
+    BlobRangesStreamV1 = 4,
 }
 
 impl TransferProfileId {
@@ -116,7 +117,7 @@ impl TransferProfileId {
         match value {
             1 => Some(Self::LegacyV6),
             2 => Some(Self::EventPagesV1),
-            3 => Some(Self::BlobRangesStreamV1),
+            4 => Some(Self::BlobRangesStreamV1),
             _ => None,
         }
     }
@@ -2225,7 +2226,7 @@ mod tests {
         let encoded = TransferProfileOfferV1::current().encode().unwrap();
         assert_eq!(
             format!(
-                "# aster-blob-ranges-stream-vectors/v1\tsemantic=7\toracle=self\nACCEPT\toffer-blob-stream-only-v1\t{}\n",
+                "# aster-blob-ranges-stream-vectors/v1\tsemantic=7\toracle=python-stdlib\nACCEPT\toffer-blob-stream-only-v1\t{}\n",
                 vector_hex(&encoded)
             ),
             include_str!("../../../conformance/vectors/blob-ranges-stream-v1.tsv")
@@ -2241,7 +2242,17 @@ mod tests {
         let current = TransferProfileOfferV1::current();
         let legacy = legacy_only_offer();
         let selected = negotiate_transfer_profiles(&current, &current).unwrap();
-        assert_eq!(selected.profile(LaneId::Blob).unwrap() as u16, 3);
+        assert_eq!(selected.profile(LaneId::Blob).unwrap() as u16, 4);
+        assert_eq!(TransferProfileId::decode(3), None);
+        let mut reserved = current.clone();
+        reserved
+            .lanes
+            .iter_mut()
+            .find(|(lane, _)| *lane == LaneId::Blob as u16)
+            .unwrap()
+            .1 = vec![3, 1];
+        assert!(negotiate_transfer_profiles(&current, &reserved).is_err());
+        assert!(negotiate_transfer_profiles(&reserved, &current).is_err());
         for (left, right) in [(&current, &legacy), (&legacy, &current)] {
             let error = negotiate_transfer_profiles(left, right).unwrap_err();
             assert!(
