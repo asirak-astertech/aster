@@ -24505,6 +24505,12 @@ mod tests {
                 std::process::id()
             )))
         }
+
+        fn copy_from(name: &str, source: &TestFile) -> Self {
+            let file = Self::new(name);
+            std::fs::copy(&source.0, &file.0).expect("copy test database");
+            file
+        }
     }
 
     impl Drop for TestFile {
@@ -25518,6 +25524,26 @@ mod tests {
         custody::seed_peer_receipt_fanout_write(&write, object, count)
             .expect("seed receipt fan-out");
         write.commit().expect("commit receipt fan-out");
+    }
+
+    fn seed_peer_retry_rows(
+        store: &Store,
+        rows: &[(NodeId, CustodyObjectKey)],
+        sample: aster_mesh::CustodySample,
+        link_floor_ms: u64,
+        expected_policy: CustodyPolicyRevision,
+    ) -> u64 {
+        let write = store.database.begin_write().expect("retry-row write");
+        let count = custody::seed_peer_retry_rows_write(
+            &write,
+            rows,
+            sample,
+            link_floor_ms,
+            expected_policy,
+        )
+        .expect("seed retry rows");
+        write.commit().expect("commit retry rows");
+        count
     }
 
     fn custody_continuity_tick(store: &Store) -> u64 {
@@ -33045,19 +33071,25 @@ mod tests {
         let mut authority =
             ReferenceEnvelopeSealer::open(authority_bundle).expect("authority sealer");
         let mut verifier = ReferenceEnvelopeSealer::open(verifier_bundle).expect("verifier sealer");
-        let mut recipients = vec![
-            ScopeRekeyRecipient::member(authority.identity(), vec![event_topic()])
-                .expect("authority recipient"),
-            ScopeRekeyRecipient::member(verifier.identity(), vec![event_topic()])
-                .expect("verifier recipient"),
-        ];
         for serial in 3..=MAX_CONTROL_INTENT_RECIPIENTS as u64 {
-            let relay = provisioner
+            let relay_bundle = provisioner
                 .issue_node(serial, std::slice::from_ref(&relay_access))
-                .and_then(ReferenceEnvelopeSealer::open)
                 .expect("relay recipient");
-            recipients.push(ScopeRekeyRecipient::route_only(relay.identity()));
+            drop(relay_bundle);
         }
+        let authority_recipient = authority.identity();
+        let verifier_recipient = verifier.identity();
+        let recipients = provisioner
+            .rekey_registry_recipient_nodes()
+            .map(|recipient| {
+                if recipient == authority_recipient || recipient == verifier_recipient {
+                    ScopeRekeyRecipient::member(recipient, vec![event_topic()])
+                        .expect("member recipient")
+                } else {
+                    ScopeRekeyRecipient::route_only(recipient)
+                }
+            })
+            .collect::<Vec<_>>();
         assert_eq!(recipients.len(), MAX_CONTROL_INTENT_RECIPIENTS);
         let registry = provisioner
             .export_rekey_registry()
@@ -41824,6 +41856,7 @@ mod tests {
         }
 
         for kind in 1_u8..=5 {
+            let (base, authority) = retirement_reference_fixture(kind, 0x20 + kind * 8);
             for (index, corruption) in [
                 Corruption::Missing,
                 Corruption::Orphaned,
@@ -41835,8 +41868,10 @@ mod tests {
             .into_iter()
             .enumerate()
             {
-                let (file, authority) =
-                    retirement_reference_fixture(kind, 0x20 + kind * 8 + index as u8);
+                let file = TestFile::copy_from(
+                    &format!("retirement reference kind {kind} corruption {index}"),
+                    &base,
+                );
                 let database = Database::open(&file.0).expect("raw database");
                 let write = database.begin_write().expect("raw write");
                 let reference_key = write
@@ -44991,9 +45026,9 @@ mod tests {
             tick_ms: 1_000_000,
         };
         let revision = store.custody_policy_revision().expect("revision");
-        let mut retry_ids = Vec::new();
-        for index in 0..MAX_CUSTODY_RETRY_RECORDS {
-            let counter = index + 1;
+        let mut retry_ids = Vec::with_capacity(2);
+        let mut filler_object = None;
+        for counter in 1..=2u64 {
             let logical_key = counter.to_be_bytes();
             let mut header = event_header(
                 services.publisher.identity(),
@@ -45006,23 +45041,64 @@ mod tests {
             );
             header.priority = Priority::Routine;
             let stored = accept_event(&store, &mut services, header, &logical_key);
-            let lease = store
+            let object = CustodyObjectKey::event(stored.transfer_id);
+            let peer_a_lease = store
                 .begin_custody_send(
                     peer_a,
-                    CustodyObjectKey::event(stored.transfer_id),
+                    object,
                     CustodyPeerSelectorRevision::new(4),
                     Some(sample),
                     1,
                     revision,
                 )
-                .expect("fill retry row");
+                .expect("construct peer A retry canary");
             store
-                .release_transfer_lease(lease.id)
-                .expect("retain retry row");
+                .release_transfer_lease(peer_a_lease.id)
+                .expect("retain peer A retry canary");
             retry_ids.push(stored.transfer_id);
+            filler_object.get_or_insert(object);
         }
+        let filler_object = filler_object.expect("peer A filler object");
+        let filler_sample = aster_mesh::CustodySample {
+            clock_id: sample.clock_id,
+            tick_ms: sample.tick_ms - 1,
+        };
+        let mut filler_rows = Vec::with_capacity(
+            usize::try_from(MAX_CUSTODY_RETRY_RECORDS - 2)
+                .expect("retry-cap filler row count fits usize"),
+        );
+        let mut filler_counter = 1u64;
+        while filler_rows.len()
+            < usize::try_from(MAX_CUSTODY_RETRY_RECORDS - 2)
+                .expect("retry-cap filler row count fits usize")
+        {
+            let mut filler_peer = [0u8; 32];
+            filler_peer[..8].copy_from_slice(&filler_counter.to_be_bytes());
+            filler_peer[31] = 0xa5;
+            filler_counter = filler_counter
+                .checked_add(1)
+                .expect("retry-cap filler peer counter");
+            if filler_peer != peer_a && filler_peer != peer_b {
+                filler_rows.push((filler_peer, filler_object));
+            }
+        }
+        assert_eq!(
+            seed_peer_retry_rows(&store, &filler_rows, filler_sample, 1, revision),
+            MAX_CUSTODY_RETRY_RECORDS - 2
+        );
+        assert_eq!(
+            store
+                .database
+                .begin_read()
+                .expect("retry-cap read")
+                .open_table(custody::CUSTODY_RETRIES)
+                .expect("retry-cap table")
+                .len()
+                .expect("retry-cap length"),
+            MAX_CUSTODY_RETRY_RECORDS
+        );
 
-        let next_counter = MAX_CUSTODY_RETRY_RECORDS + 1;
+        let next_counter = 3u64;
         let next_key = next_counter.to_be_bytes();
         let mut next_header = event_header(
             services.publisher.identity(),
@@ -45048,6 +45124,7 @@ mod tests {
         store
             .require_custody_send(&peer_b_lease, Some(sample), revision)
             .expect("peer B send authorization");
+
         store
             .settle_peer_custody_apply(
                 &peer_b_lease,
@@ -45099,6 +45176,7 @@ mod tests {
         store
             .release_transfer_lease(peer_a_replacement.id)
             .expect("retain peer A replacement retry");
+
         assert_eq!(
             store
                 .settle_authenticated_peer_inventory(
