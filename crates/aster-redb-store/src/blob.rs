@@ -869,6 +869,16 @@ pub struct PendingBlobSource {
     pub carriers: Vec<PendingBlobCarrier>,
 }
 
+/// Exact outcome of settling a finite pending source after a contact boundary
+/// observes that its lifetime is no longer transferable.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PendingBlobLifetimeTransition {
+    Missing,
+    Indeterminate,
+    ExpiredRetired,
+}
+
 /// Durable peer-neutral progress for one authenticated pending Blob source.
 ///
 /// This store-layer value retains the existing authenticated source projection
@@ -4164,6 +4174,67 @@ impl Store {
         source: BlobTransferId,
     ) -> Result<Option<PendingBlobSource>, StoreError> {
         self.pending_blob_source_with_eligibility(source, BlobContactEligibility::AllVisible, false)
+    }
+
+    /// Persists the exact finite pending-source lifetime transition that made
+    /// a custody-v1 stream boundary unavailable. Indeterminate work remains
+    /// staged and hidden with its sticky projected checkpoint; proven expiry
+    /// atomically retires the pending source and its prefixes.
+    #[doc(hidden)]
+    pub fn settle_custody_v1_pending_blob_lifetime_unavailability(
+        &self,
+        source: BlobTransferId,
+    ) -> Result<PendingBlobLifetimeTransition, StoreError> {
+        self.require_live()?;
+        let authority = self.require_bound_mission()?;
+        let write = self.database.begin_write()?;
+        enforce_live_write(&write)?;
+        let pending = write
+            .open_table(BLOB_PENDING_SOURCES)?
+            .get(source.as_bytes().as_slice())?
+            .map(|value| decode_pending_blob_source(value.value()))
+            .transpose()?;
+        let Some(pending) = pending else {
+            return Ok(PendingBlobLifetimeTransition::Missing);
+        };
+        require_blob_contact_eligibility(
+            pending.metadata.lifetime,
+            BlobContactEligibility::CustodyV1,
+        )?;
+        let pending = normalize_pending_blob_policy_write(
+            &write,
+            source,
+            pending,
+            self.blob_lifecycle_limits,
+        )?;
+        let continuity = custody::lower_bound_continuity_write(&write)?;
+        let sample = continuity.map(|authority| authority.sample);
+        let transition =
+            match evaluate_blob_lifetime(pending.metadata.lifetime, continuity, sample)? {
+                BlobLifetimeEvaluation::FiniteIndeterminate { .. } => {
+                    PendingBlobLifetimeTransition::Indeterminate
+                }
+                BlobLifetimeEvaluation::FiniteExpired { .. } => {
+                    apply_expired_pending_source_write(
+                        &write,
+                        authority,
+                        self.blob_depot_owner_binding,
+                        source,
+                        sample,
+                        self.blob_lifecycle_limits,
+                        false,
+                        None,
+                    )?;
+                    PendingBlobLifetimeTransition::ExpiredRetired
+                }
+                BlobLifetimeEvaluation::Durable | BlobLifetimeEvaluation::FiniteLive { .. } => {
+                    return Err(blob_error(BlobStoreError::SchemaInvariant(
+                        "pending Blob lifetime-unavailability settlement remained live",
+                    )));
+                }
+            };
+        write.commit()?;
+        Ok(transition)
     }
 
     /// Loads one exact pending source for a legacy durable contact.

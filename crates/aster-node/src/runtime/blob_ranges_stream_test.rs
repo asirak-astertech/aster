@@ -10,9 +10,11 @@ pub(super) enum Boundary {
     WrongAad,
     Revocation,
     AppendCapacity,
+    AppendCapacityLostTerminal,
     PrefixConflict,
     UnavailableGap,
     SenderLifecycle,
+    BadTerminalAad,
 }
 
 pub(super) struct Fault {
@@ -94,12 +96,15 @@ fn second_data(plaintext: &[u8]) -> bool {
 }
 
 pub(super) fn write_digest(store: &Store, plaintext: &[u8], mut digest: [u8; 32]) -> [u8; 32] {
-    if second_data(plaintext)
-        && let Some(fault) = get(store)
-        && fault.boundary == Boundary::WrongAad
-    {
-        digest[0] ^= 1;
-        fault.fired.store(true, Ordering::Release);
+    if let Some(fault) = get(store) {
+        let wrong_data_aad = second_data(plaintext) && fault.boundary == Boundary::WrongAad;
+        let wrong_terminal_aad = plaintext.starts_with(b"ABRE\x01")
+            && plaintext.get(37..39) != Some(&[0, 0])
+            && fault.boundary == Boundary::BadTerminalAad;
+        if wrong_data_aad || wrong_terminal_aad {
+            digest[0] ^= 1;
+            fault.fired.store(true, Ordering::Release);
+        }
     }
     digest
 }
@@ -137,7 +142,10 @@ pub(super) fn append_boundary(
 ) -> Result<(), StoreError> {
     if index == 1
         && let Some(fault) = get(store)
-        && fault.boundary == Boundary::AppendCapacity
+        && matches!(
+            fault.boundary,
+            Boundary::AppendCapacity | Boundary::AppendCapacityLostTerminal
+        )
     {
         fault.fired.store(true, Ordering::Release);
         return Err(StoreError::Blob(

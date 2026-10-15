@@ -77,13 +77,13 @@ use aster_redb_store::{
     MAX_CUSTODY_RETIREMENTS, MAX_EVENT_PAGE, MAX_MUTABLE_TRANSFER_CURSOR_PEERS,
     MAX_NETWORK_BLOB_BYTES, MAX_NETWORK_BLOB_CHUNKS, MAX_ROUTE_CACHE_ITEMS,
     MutableTransferCursorClass, MutableTransferCursorMode, NumberedEventOperationRequest,
-    NumberedEventPublishOutcome, PendingBlobSource, PreparedBlobCustodySend,
-    RecordSenderProjection, RecordTransferId, RejectedControl, ReservedEventOnceCommit,
-    RetainedBlobSource, RouteCacheOutcome, ScopeRekeyPublicationIntent, StateSenderProjection,
-    StateTransferId, Store, StoreBackingIdentity, StoreError, StoreInspection, StoreLimits,
-    StoreZeroizationState, StoredControl, StoredControlEffect, StoredEvent, StoredEventTransfer,
-    StoredRecord, StoredState, TransferLease, ZeroizationArtifact, ZeroizationIntent,
-    ZeroizationStore,
+    NumberedEventPublishOutcome, PendingBlobLifetimeTransition, PendingBlobSource,
+    PreparedBlobCustodySend, RecordSenderProjection, RecordTransferId, RejectedControl,
+    ReservedEventOnceCommit, RetainedBlobSource, RouteCacheOutcome, ScopeRekeyPublicationIntent,
+    StateSenderProjection, StateTransferId, Store, StoreBackingIdentity, StoreError,
+    StoreInspection, StoreLimits, StoreZeroizationState, StoredControl, StoredControlEffect,
+    StoredEvent, StoredEventTransfer, StoredRecord, StoredState, TransferLease,
+    ZeroizationArtifact, ZeroizationIntent, ZeroizationStore,
 };
 use sha2::{Digest as _, Sha256};
 #[cfg(unix)]
@@ -23658,6 +23658,51 @@ fn blob_contact_policy_transition_error(error: &StoreError) -> bool {
     )
 }
 
+fn blob_lifetime_unavailable_error(error: &StoreError) -> bool {
+    matches!(error, StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+}
+
+fn node_blob_lifetime_unavailable_error(error: &NodeError) -> bool {
+    matches!(error, NodeError::Store(error) if blob_lifetime_unavailable_error(error))
+}
+
+fn settle_pending_blob_lifetime_unavailability_for_contact(
+    store: &Store,
+    verifier: &ReferenceEnvelopeSealer,
+    source: BlobTransferId,
+    blob_contact_mode: BlobContactMode,
+) -> Result<(), NodeError> {
+    if blob_contact_mode != BlobContactMode::CustodyV1 {
+        return Err(NodeError::Protocol(
+            "durable-only Blob contact became lifetime-unavailable".into(),
+        ));
+    }
+    let cache = contact_mutable_route_cache(verifier)
+        .map_err(|error| fatal_blob_coherence("pending Blob lifetime cache binding", error))?;
+    let _lifecycle = cache
+        .lock_blob_lifecycle()
+        .map_err(|error| fatal_blob_coherence("pending Blob lifetime lock", error))?;
+    let claim = cache
+        .get_blob(verifier, source)
+        .map_err(|error| fatal_blob_coherence("pending Blob lifetime cache lookup", error))?;
+    let transition = store.settle_custody_v1_pending_blob_lifetime_unavailability(source)?;
+    if matches!(
+        transition,
+        PendingBlobLifetimeTransition::Missing | PendingBlobLifetimeTransition::ExpiredRetired
+    ) && let Some(claim) = claim
+    {
+        if claim.retention != BlobSourceRetention::Pending {
+            return Err(NodeError::FatalBlobCoherence(
+                "retired pending Blob lifetime found a completed cache claim".into(),
+            ));
+        }
+        cache
+            .remove_pending_blob(verifier, &claim)
+            .map_err(|error| fatal_blob_coherence("retired pending Blob cache removal", error))?;
+    }
+    Ok(())
+}
+
 fn node_blob_contact_policy_transition_error(error: &NodeError) -> bool {
     matches!(error, NodeError::Store(error) if blob_contact_policy_transition_error(error))
 }
@@ -23809,7 +23854,6 @@ fn recover_and_finalize_pending_blob(
     manifest_bytes: &[u8],
     plan: &VerifiedBlobTransferPlan,
     work: &mut Vec<BlobCarrierPrefixStatus>,
-    scheduler: Option<(NodeId, Option<BlobCarrierFetchCursor>)>,
     blob_contact_mode: BlobContactMode,
 ) -> Result<Option<PendingBlobRecoveryDisposition>, NodeError> {
     guard.check(store)?;
@@ -23860,13 +23904,6 @@ fn recover_and_finalize_pending_blob(
                 return Ok(Some(PendingBlobRecoveryDisposition::DeferredLease));
             }
             Err(error @ StoreError::Blob(BlobStoreError::Verification(_))) => {
-                if let Some((peer, cursor)) = scheduler {
-                    let _ = store.compare_and_advance_blob_carrier_fetch_cursor(
-                        peer,
-                        cursor,
-                        BlobCarrierFetchCursor::new(source, status.object()),
-                    )?;
-                }
                 store.abort_blob_carrier_prefix(source, status.object())?;
                 return Err(error.into());
             }
@@ -23874,7 +23911,6 @@ fn recover_and_finalize_pending_blob(
                 return Err(error.into());
             }
             Err(error) => {
-                advance_terminal_blob_source_cursor(store, plan, source, scheduler)?;
                 abort_pending_blob_with_cached_claim(store, verifier, source)?;
                 return Err(fatal_blob_coherence(
                     "pending Blob complete-carrier commit",
@@ -23924,7 +23960,6 @@ fn recover_and_finalize_pending_blob(
         Ok(memo) => memo,
         Err(error) if node_blob_contact_policy_transition_error(&error) => return Err(error),
         Err(error) => {
-            advance_terminal_blob_source_cursor(store, plan, source, scheduler)?;
             abort_pending_blob_with_cached_claim(store, verifier, source)?;
             return Err(fatal_blob_coherence(
                 "pending Blob completion memo reuse",
@@ -23934,7 +23969,6 @@ fn recover_and_finalize_pending_blob(
     };
     #[cfg(test)]
     if cache.fire_test_blob_contact_fault(TestBlobContactFault::PendingCompletion) {
-        advance_terminal_blob_source_cursor(store, plan, source, scheduler)?;
         abort_pending_blob_with_cached_claim(store, verifier, source)?;
         return Err(NodeError::FatalBlobCoherence(
             "injected pending Blob physical completion failure".into(),
@@ -23959,7 +23993,6 @@ fn recover_and_finalize_pending_blob(
                 return Err(error.into());
             }
             Err(error) => {
-                advance_terminal_blob_source_cursor(store, plan, source, scheduler)?;
                 abort_pending_blob_with_cached_claim(store, verifier, source)?;
                 return Err(fatal_blob_coherence(
                     "pending Blob physical completion",
@@ -23971,7 +24004,6 @@ fn recover_and_finalize_pending_blob(
             match store.blob_depot_for_pending_completion_verification(source, &depot_completion) {
                 Ok(depot) => depot,
                 Err(error) => {
-                    advance_terminal_blob_source_cursor(store, plan, source, scheduler)?;
                     abort_pending_blob_with_cached_claim(store, verifier, source)?;
                     return Err(fatal_blob_coherence(
                         "pending Blob authenticated depot open",
@@ -23988,7 +24020,6 @@ fn recover_and_finalize_pending_blob(
             ) {
                 Ok(service) => service,
                 Err(error) => {
-                    advance_terminal_blob_source_cursor(store, plan, source, scheduler)?;
                     abort_pending_blob_with_cached_claim(store, verifier, source)?;
                     return Err(fatal_blob_coherence(
                         "pending Blob content verifier construction",
@@ -24001,7 +24032,6 @@ fn recover_and_finalize_pending_blob(
                 Err(error) => {
                     let terminal_source_error = blob_terminal_content_error(&error);
                     drop(service);
-                    advance_terminal_blob_source_cursor(store, plan, source, scheduler)?;
                     abort_pending_blob_with_cached_claim(store, verifier, source)?;
                     let error = NodeError::Protocol(format!(
                         "pending Blob failed terminal content verification: {error}"
@@ -24064,7 +24094,6 @@ fn recover_and_finalize_pending_blob(
         if node_blob_contact_policy_transition_error(&error) {
             return Err(error);
         }
-        advance_terminal_blob_source_cursor(store, plan, source, scheduler)?;
         abort_pending_blob_with_cached_claim(store, verifier, source)?;
         return Err(fatal_blob_coherence(
             "pending Blob final completion cache",
@@ -24191,7 +24220,6 @@ fn recover_and_finalize_pending_blob(
         Err(error) if blob_contact_policy_transition_error(&error) => return Err(error.into()),
         Err(error @ StoreError::Blob(BlobStoreError::CompletionMismatch)) => {
             drop(lifecycle);
-            advance_terminal_blob_source_cursor(store, plan, source, scheduler)?;
             abort_pending_blob_with_cached_claim(store, verifier, source)?;
             return Err(fatal_blob_coherence(
                 "pending Blob publication completion",
@@ -24200,7 +24228,6 @@ fn recover_and_finalize_pending_blob(
         }
         Err(error) => {
             drop(lifecycle);
-            advance_terminal_blob_source_cursor(store, plan, source, scheduler)?;
             abort_pending_blob_with_cached_claim(store, verifier, source)?;
             return Err(fatal_blob_coherence(
                 "pending Blob durable publication",
@@ -48776,6 +48803,13 @@ mod tests {
             1,
             &plaintext,
         );
+        assert_eq!(
+            b_store
+                .blob_carrier_fetch_cursor(a.credentials.identity())
+                .unwrap(),
+            None,
+            "carrier cursor starts unset before any authenticated terminal"
+        );
         let mut committed_prefix = 0;
         if let Some(before_append) = interrupt {
             let fault = blob_ranges_stream_test::install(&a_store, &b_store, before_append);
@@ -48819,6 +48853,13 @@ mod tests {
                 }
             );
             assert!(b_store.get_blob(source).unwrap().is_none());
+            assert_eq!(
+                b_store
+                    .blob_carrier_fetch_cursor(a.credentials.identity())
+                    .unwrap(),
+                None,
+                "accepted prefix without a terminal is cursor-neutral"
+            );
             fault.release_sender.notify_one();
             fault.release_receiver.notify_one();
             assert!(
@@ -48878,6 +48919,11 @@ mod tests {
             "resume requests only missing ciphertext"
         );
         assert_eq!(b_store.blob_inventory().unwrap(), vec![source]);
+        let terminal_cursor = b_store
+            .blob_carrier_fetch_cursor(a.credentials.identity())
+            .unwrap()
+            .expect("valid terminal rotates the exact object cursor once");
+        assert_eq!(terminal_cursor.source(), source);
         let stored = b_store.get_blob(source).unwrap().unwrap();
         let mut sealer = open_test_sealer(&b.credentials);
         let route = sealer.verify_blob(&stored.sealed).unwrap();
@@ -50751,19 +50797,11 @@ mod tests {
                     "{label}: server lifetime loss became actor-fatal: {error}"
                 );
             }
-            if matches!(
-                boundary,
-                Boundary::PostInstallCompletion | Boundary::Promotion
-            ) {
-                assert!(
-                    client_result.is_err(),
-                    "{label}: failed completion/promotion must close only this contact"
-                );
-            } else {
-                assert!(
-                    client_result.is_ok() && server_result.is_ok(),
-                    "{label}: omission/unavailability should settle normally: client={client_result:?}, server={server_result:?}"
-                );
+            assert!(
+                client_result.is_ok() && server_result.is_ok(),
+                "{label}: omission/unavailability should settle normally: client={client_result:?}, server={server_result:?}"
+            );
+            if matches!(boundary, Boundary::PendingRecheck | Boundary::Service) {
                 assert_eq!(
                     client_result
                         .as_ref()
@@ -50778,18 +50816,35 @@ mod tests {
             let after_stats = receiver_store
                 .blob_stats()
                 .expect("lifetime retained stats after fault");
-            assert_eq!(
-                after_stats.pending_sources, before_stats.pending_sources,
-                "{label}"
+            let receiver_settles_lifetime = matches!(
+                boundary,
+                Boundary::PostInstallCompletion | Boundary::Promotion
             );
-            assert_eq!(
-                after_stats.carrier_prefixes, before_stats.carrier_prefixes,
-                "{label}"
-            );
-            assert!(
-                receiver_cache.has_blob_claim_for_test(transfer),
-                "{label}: retained pending authority must keep its cache claim"
-            );
+            let receiver_settles_expiry = label.ends_with("-expiry") && receiver_settles_lifetime;
+            if receiver_settles_expiry {
+                assert_eq!(after_stats.pending_sources, 0, "{label}: exact retirement");
+                assert_eq!(
+                    after_stats.carrier_prefixes, 0,
+                    "{label}: prefix retirement"
+                );
+                assert!(
+                    !receiver_cache.has_blob_claim_for_test(transfer),
+                    "{label}: retired pending authority removes its cache claim"
+                );
+            } else {
+                assert_eq!(
+                    after_stats.pending_sources, before_stats.pending_sources,
+                    "{label}"
+                );
+                assert_eq!(
+                    after_stats.carrier_prefixes, before_stats.carrier_prefixes,
+                    "{label}"
+                );
+                assert!(
+                    receiver_cache.has_blob_claim_for_test(transfer),
+                    "{label}: retained pending authority must keep its cache claim"
+                );
+            }
             let carrier_cursor_after = receiver_store
                 .blob_carrier_fetch_cursor(services.member.identity())
                 .expect("lifetime carrier cursor after fault");
@@ -50824,7 +50879,7 @@ mod tests {
                     0,
                     "{label}: multi-range unavailability emits no removed result/ACK frame"
                 );
-            } else {
+            } else if !receiver_settles_lifetime {
                 assert_eq!(
                     receiver_store.test_blob_logical_digest(),
                     fault_digest,
@@ -50843,6 +50898,26 @@ mod tests {
                         .load(Ordering::Acquire),
                     0,
                     "{label}: no result/ACK follows the failed boundary"
+                );
+            } else {
+                assert_ne!(
+                    receiver_store.test_blob_logical_digest(),
+                    fault_digest,
+                    "{label}: terminal lifetime settlement must persist after the injected transition"
+                );
+                assert!(
+                    receiver_store
+                        .pending_blob_source(transfer)
+                        .expect("settled lifetime pending lookup")
+                        .is_none(),
+                    "{label}: settled finite work remains non-forwardable"
+                );
+                assert_eq!(
+                    fault_state
+                        .result_frames_after_fault
+                        .load(Ordering::Acquire),
+                    0,
+                    "{label}: no result/ACK follows the settled boundary"
                 );
             }
 
@@ -52859,7 +52934,11 @@ mod tests {
         assert!(fault.fired.load(Ordering::Acquire));
         blob_ranges_stream_test::remove(&a_store);
         blob_ranges_stream_test::remove(&c_store);
-        assert_eq!(source_cache.blob_source_depot_authenticated_opens(), 1);
+        assert_eq!(
+            source_cache.blob_source_depot_authenticated_opens(),
+            0,
+            "source-envelope admission defers physical access to bounded range serving",
+        );
         assert_eq!(c_first.fetched, 1, "C fetches the source exactly once");
         assert_eq!(c_first.blob_ranges_fetched, 1);
         assert_eq!(
