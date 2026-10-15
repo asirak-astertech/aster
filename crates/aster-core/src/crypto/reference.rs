@@ -5085,7 +5085,7 @@ impl ReferenceAuthenticatedSession {
     }
 
     /// Protects a complete v8 Blob source-bearing frame in the authenticated
-    /// profile-3 context. Durable frames end in the canonical absent field;
+    /// profile-4 context. Durable frames end in the canonical absent field;
     /// finite frames end in the exact canonical claim supplied here.
     pub fn seal_blob_source_frame(
         &mut self,
@@ -5132,7 +5132,7 @@ impl ReferenceAuthenticatedSession {
         self.seal_frame_with_context(plaintext, &context)
     }
 
-    /// Opens one complete v8 Blob source-bearing frame under profile 3.
+    /// Opens one complete v8 Blob source-bearing frame under profile 4.
     /// Finite frames return the one-use contact authority for their exact
     /// embedded claim; durable frames return no custody authority.
     pub fn open_blob_source_frame(
@@ -5191,7 +5191,7 @@ impl ReferenceAuthenticatedSession {
         Ok((plaintext, Some((claim, authority))))
     }
 
-    /// Protects one frame in the fixed semantic-v8 Blob lane/profile-3 domain.
+    /// Protects one frame in the fixed semantic-v8 Blob lane/profile-4 domain.
     ///
     /// This allocates no finite Blob lifecycle behavior; it only ensures that a
     /// later receiver capability can be tied to the authenticated profile/lane
@@ -5224,7 +5224,7 @@ impl ReferenceAuthenticatedSession {
     }
 
     /// Authenticates, replay-checks, and canonically decodes one fixed
-    /// semantic-v8 Blob/profile-3 claim record with its opaque contact authority.
+    /// semantic-v8 Blob/profile-4 claim record with its opaque contact authority.
     ///
     /// The returned capability is bound to this completed session transcript,
     /// exact negotiated-profile digest, Blob profile/direction AAD, and accepted
@@ -10621,7 +10621,7 @@ mod tests {
     #[test]
     fn v8_blob_custody_requires_the_authenticated_negotiated_blob_profile() {
         // Mutations caught: accepting a caller-supplied transfer-profile
-        // digest, treating a Legacy-selected Blob lane as profile 3, or
+        // digest, treating a Legacy-selected Blob lane as profile 4, or
         // deriving negotiation state from an unauthenticated offer.
         let mut provisioner = ReferenceProvisioner::from_seed([0x84; 32])
             .unwrap_or_else(|error| panic!("provisioner failed: {error}"));
@@ -10688,7 +10688,7 @@ mod tests {
             legacy_receiver
                 .seal_transfer_profile_offer(&legacy)
                 .is_err(),
-            "a legacy-only Blob offer must fail before any profile-3 record can be minted"
+            "a legacy-only Blob offer must fail before any profile-4 record can be minted"
         );
 
         let (mut sender, mut receiver) = pair();
@@ -10812,7 +10812,7 @@ mod tests {
     }
 
     fn literal_blob_custody_claim() -> [u8; crate::BLOB_CUSTODY_CLAIM_V1_BYTES] {
-        const HEX: &str = "41535452424c30380001000800031111111111111111111111111111111111111111111111111111111111111111000000000000000001222222222222222222222222222222222222222222222222222222222222222200000000000000013333333333333333333333333333333333333333333333333333333333333333444444444444444444444444444444444444444444444444444444444444444400000000000000000100000000000000005555555555555555555555555555555500000000000000000000000000000000";
+        const HEX: &str = "41535452424c30380001000800041111111111111111111111111111111111111111111111111111111111111111000000000000000001222222222222222222222222222222222222222222222222222222222222222200000000000000013333333333333333333333333333333333333333333333333333333333333333444444444444444444444444444444444444444444444444444444444444444400000000000000000100000000000000005555555555555555555555555555555500000000000000000000000000000000";
         let mut output = [0u8; crate::BLOB_CUSTODY_CLAIM_V1_BYTES];
         for (index, byte) in output.iter_mut().enumerate() {
             *byte = u8::from_str_radix(&HEX[index * 2..index * 2 + 2], 16)

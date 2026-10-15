@@ -2,35 +2,35 @@ use super::blob_ranges_stream_test::Boundary as StreamBoundary;
 
 #[tokio::test]
 async fn blob_ranges_stream_live_lost_terminal_after_complete_prefix_reopens_without_refetch() {
-    stream_live_boundary(StreamBoundary::LostTerminal).await;
+    stream_live_boundary(false, StreamBoundary::LostTerminal).await;
 }
 #[tokio::test]
 async fn blob_ranges_stream_live_bad_aead_retains_prefix() {
-    stream_live_boundary(StreamBoundary::BadAead).await;
+    stream_live_boundary(false, StreamBoundary::BadAead).await;
 }
 #[tokio::test]
 async fn blob_ranges_stream_live_wrong_aad_retains_prefix() {
-    stream_live_boundary(StreamBoundary::WrongAad).await;
+    stream_live_boundary(false, StreamBoundary::WrongAad).await;
 }
 #[tokio::test]
 async fn blob_ranges_stream_live_revocation_rejects_next_append() {
-    stream_live_boundary(StreamBoundary::Revocation).await;
+    stream_live_boundary(false, StreamBoundary::Revocation).await;
 }
 #[tokio::test]
 async fn blob_ranges_stream_live_append_capacity_yields_preserving_prefix() {
-    stream_live_boundary(StreamBoundary::AppendCapacity).await;
+    stream_live_boundary(false, StreamBoundary::AppendCapacity).await;
 }
 #[tokio::test]
 async fn blob_ranges_stream_lost_terminal_after_append_capacity_is_cursor_neutral() {
-    stream_live_boundary(StreamBoundary::AppendCapacityLostTerminal).await;
+    stream_live_boundary(false, StreamBoundary::AppendCapacityLostTerminal).await;
 }
 #[tokio::test]
 async fn blob_ranges_stream_live_unavailable_gap_does_not_erase_prefix() {
-    stream_live_boundary(StreamBoundary::UnavailableGap).await;
+    stream_live_boundary(false, StreamBoundary::UnavailableGap).await;
 }
 #[tokio::test]
 async fn blob_ranges_stream_bad_terminal_is_cursor_neutral() {
-    stream_live_boundary(StreamBoundary::BadTerminalAad).await;
+    stream_live_boundary(false, StreamBoundary::BadTerminalAad).await;
 }
 
 #[tokio::test]
@@ -345,7 +345,12 @@ async fn blob_ranges_stream_sender_stops_service_after_mid_schedule_lifetime_los
     }
 }
 
-async fn stream_live_boundary(boundary: StreamBoundary) {
+#[tokio::test]
+async fn blob_ranges_stream_sender_revocation_rejects_cached_source() {
+    stream_live_boundary(true, StreamBoundary::Revocation).await;
+}
+
+async fn stream_live_boundary(sender_revocation: bool, boundary: StreamBoundary) {
     let services = control_test_services([0x71; 32]);
     let a = services.member.clone();
     let b = services.other.clone();
@@ -359,8 +364,8 @@ async fn stream_live_boundary(boundary: StreamBoundary) {
             false,
         )])
     };
-    let ar = root(&format!("stream-live-a-{boundary:?}"));
-    let br = root(&format!("stream-live-b-{boundary:?}"));
+    let ar = root(&format!("stream-live-a-{boundary:?}-{sender_revocation}"));
+    let br = root(&format!("stream-live-b-{boundary:?}-{sender_revocation}"));
     fs::create_dir_all(&ar).unwrap();
     fs::create_dir_all(&br).unwrap();
     let a_store = Arc::new(Store::open_for_mission(ar.join(STORE_FILE), authority).unwrap());
@@ -393,6 +398,8 @@ async fn stream_live_boundary(boundary: StreamBoundary) {
             .sum()
     };
     let fault = blob_ranges_stream_test::install_boundary(&a_store, &b_store, false, boundary);
+    let sender_cache = test_event_route_cache(&a_store, &a);
+    let receiver_cache = test_event_route_cache(&b_store, &b);
     if boundary == StreamBoundary::BadTerminalAad {
         // This case observes the fully received prefix after terminal
         // authentication fails; it does not need an interactive mid-range
@@ -406,7 +413,10 @@ async fn stream_live_boundary(boundary: StreamBoundary) {
         let a = a.clone();
         let b = b.clone();
         let interests = interests();
-        async move { blob_contact_test_pair(sa, a, interests.clone(), sb, b, interests).await }
+        let sender_cache = sender_cache.clone();
+        async move {
+            blob_contact_test_pair_with_caches(sa, a, interests.clone(), sender_cache, sb, b, interests, receiver_cache, None, None, None, None, 0).await
+        }
     });
     if boundary != StreamBoundary::BadTerminalAad {
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -436,15 +446,32 @@ async fn stream_live_boundary(boundary: StreamBoundary) {
                     .unwrap()
                     .envelope_id(),
             );
-            accept_received_control(
-                &b_store,
-                &mut open_test_sealer(&b),
+            let revoked_store = if sender_revocation { &a_store } else { &b_store };
+            let revoked_mission = if sender_revocation { &a } else { &b };
+            let accepted = accept_received_control(
+                revoked_store,
+                &mut open_test_sealer(revoked_mission),
                 services.authority.identity(),
                 id,
                 &revocation,
-            )
-            .unwrap();
-            assert!(b_store.is_control_principal_revoked(a.identity()).unwrap());
+            );
+            if sender_revocation {
+                assert!(
+                    matches!(accepted, Err(NodeError::Revoked(principal)) if principal == a.identity()),
+                    "sender self-revocation must commit and close its active identity: {accepted:?}"
+                );
+            } else {
+                accepted.expect("receiver accepts peer revocation");
+            }
+            assert!(
+                revoked_store
+                    .is_control_principal_revoked(a.identity())
+                    .unwrap()
+            );
+        }
+        if sender_revocation {
+            assert_eq!(sender_cache.blob_range_source_authentications(), 1);
+            assert_eq!(sender_cache.blob_range_depot_rechecks(), 1);
         }
         fault.release_sender.notify_one();
         fault.release_receiver.notify_one();
@@ -530,7 +557,11 @@ async fn stream_live_boundary(boundary: StreamBoundary) {
     if boundary == StreamBoundary::Revocation {
         assert_eq!(prefix(&b_store), MAX_BLOB_NETWORK_RANGE_BYTES as u64);
         assert!(b_store.get_blob(source).unwrap().is_none());
-        assert!(b_store.is_control_principal_revoked(a.identity()).unwrap());
+        assert_eq!(b_store.is_control_principal_revoked(a.identity()).unwrap(), !sender_revocation);
+        if sender_revocation {
+            assert_eq!(sender_cache.blob_range_source_authentications(), 1);
+            assert_eq!(sender_cache.blob_range_depot_rechecks(), 1, "no second range served after revocation");
+        }
     } else {
         if boundary == StreamBoundary::AppendCapacity {
             let second = publish_test_blob(

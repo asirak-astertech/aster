@@ -2392,7 +2392,7 @@ impl MissionSession {
         self.inner.open_frame(frame).map_err(Into::into)
     }
 
-    /// Protects one complete v8 Blob source-bearing frame in profile 3.
+    /// Protects one complete v8 Blob source-bearing frame in profile 4.
     pub(crate) fn seal_blob_source_frame(
         &mut self,
         direction: BlobCustodyDirectionV1,
