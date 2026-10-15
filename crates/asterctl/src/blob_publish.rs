@@ -1,11 +1,14 @@
 use crate::{api, operation_key, validation};
 use std::{
-    fs::File,
+    fs::{File, OpenOptions},
     io::Read,
     path::PathBuf,
     pin::Pin,
     task::{Context, Poll},
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt as _;
 
 pub const HELP: &str = "Usage: asterctl (--token TOKEN | --token-file PATH) [OPTIONS] blob-publish
                 --file PATH --topic TOPIC --scope SCOPE
@@ -29,7 +32,9 @@ Generated keys are printed to stderr before sending and included in JSON output.
 The source file's contents and length must remain unchanged until the command exits.
 ";
 
-pub(crate) const CHUNK_BYTES: usize = 64 * 1024;
+/// Stable native gRPC Blob payload frame size owned by the CLI protocol layer.
+pub(crate) const RPC_FRAME_BYTES: usize = 64 * 1024;
+pub(crate) const CHUNK_BYTES: usize = RPC_FRAME_BYTES;
 const MAX_MEDIA_TYPE_BYTES: usize = 255;
 const MAX_SCHEMA_ID_BYTES: usize = 1024;
 
@@ -120,8 +125,7 @@ impl Publication {
 
     pub fn prepare(self) -> Result<PreparedUpload, &'static str> {
         self.validate()?;
-        let file = File::open(self.file.expect("validated source path"))
-            .map_err(|_| "cannot open source file")?;
+        let file = open_source(&self.file.expect("validated source path"))?;
         let file_metadata = file.metadata().map_err(|_| "cannot inspect source file")?;
         if !file_metadata.is_file() {
             return Err("source must be a regular file");
@@ -150,6 +154,26 @@ impl Publication {
             key,
         })
     }
+}
+
+fn open_source(path: &std::path::Path) -> Result<File, &'static str> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        // Opening a FIFO for read normally waits for a writer. Preflight must
+        // reject it from its descriptor metadata instead of blocking the CLI.
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path).map_err(|_| "cannot open source file")?;
+    let file_metadata = file.metadata().map_err(|_| "cannot inspect source file")?;
+    if !file_metadata.is_file() {
+        return Err("source must be a regular file");
+    }
+    if file_metadata.len() == 0 {
+        return Err("source file must not be empty");
+    }
+    Ok(file)
 }
 
 fn parse_priority(value: &str) -> Result<buffa::EnumValue<api::Priority>, &'static str> {

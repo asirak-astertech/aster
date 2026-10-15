@@ -124,8 +124,6 @@ where
     let limits = *config.limits();
     let node_config = open_node_config(&config, &credentials, loader)
         .map_err(|error| AgentRuntimeError::Bootstrap(error.kind()))?;
-    let state_root = node_config.state.clone();
-
     let health = BoundHealth::bind(health_address)
         .await
         .map_err(|_| AgentRuntimeError::Listener(FailureReason::Startup))?;
@@ -149,6 +147,7 @@ where
             return Err(AgentRuntimeError::Bootstrap(kind));
         }
     };
+    let state_root = node.state_root().to_path_buf();
     let application = match BoundAgent::bind(application_address).await {
         Ok(application) => application,
         Err(_) => {

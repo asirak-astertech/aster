@@ -5,7 +5,11 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::{
     fs,
     path::PathBuf,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    task::Poll,
     time::Duration,
 };
 
@@ -15,6 +19,7 @@ use aster_agent::{
     sdk::{NumberedEventSdk, PipelinedEventPublisher, PublicationJournal, RecoveredState},
 };
 use aster_mesh::{ProvisioningAccess, ReferenceProvisioner, Scope, Topic};
+use aster_node::application::MAX_SELECTED_LIVE_BLOB_BYTES;
 use aster_node::mission::UnprotectedReferenceMission;
 use aster_node::{MutableSourceInterests, NodeApplication, NodeConfig, start_node};
 use buffa::{Message as _, MessageName as _};
@@ -101,6 +106,16 @@ fn assert_public_reason(
     reason: api::PublicErrorReason,
     operation: &str,
 ) {
+    assert_public_reason_with_retryability(error, code, reason, operation, false);
+}
+
+fn assert_public_reason_with_retryability(
+    error: &ConnectError,
+    code: ErrorCode,
+    reason: api::PublicErrorReason,
+    operation: &str,
+    retryable: bool,
+) {
     assert_eq!(error.code, code);
     assert_eq!(error.details.len(), 1);
     let wire_detail = &error.details[0];
@@ -111,8 +126,27 @@ fn assert_public_reason(
     .expect("decodable public detail");
     assert_eq!(detail.reason, reason);
     assert_eq!(detail.operation, operation);
-    assert!(!detail.retryable);
+    assert_eq!(detail.retryable, retryable);
     assert_eq!(detail.retry_delay_ms, None);
+}
+
+fn blob_mission() -> UnprotectedReferenceMission {
+    let access = ProvisioningAccess::member(
+        Scope::new("mission/team/alpha").expect("Blob scope"),
+        vec![1],
+        vec![Topic::new("imagery.maps").expect("Blob topic")],
+    )
+    .expect("Blob access");
+    let mut provisioner =
+        ReferenceProvisioner::from_seed([0xb7; 32]).expect("reference provisioner");
+    UnprotectedReferenceMission::from_bytes(
+        provisioner
+            .issue_node(1, &[access])
+            .expect("issue Blob mission")
+            .to_bytes()
+            .expect("encode Blob mission"),
+    )
+    .expect("load disposable Blob test mission")
 }
 
 #[cfg(target_os = "linux")]
@@ -124,26 +158,10 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
         .expect("runtime");
     runtime.block_on(async {
         let state = TestState::new();
-        let access = ProvisioningAccess::member(
-            Scope::new("mission/team/alpha").expect("Blob scope"),
-            vec![1],
-            vec![Topic::new("imagery.maps").expect("Blob topic")],
-        )
-        .expect("Blob access");
-        let mut provisioner =
-            ReferenceProvisioner::from_seed([0xb7; 32]).expect("reference provisioner");
-        let mission = UnprotectedReferenceMission::from_bytes(
-            provisioner
-                .issue_node(1, &[access])
-                .expect("issue Blob mission")
-                .to_bytes()
-                .expect("encode Blob mission"),
-        )
-        .expect("load disposable Blob test mission");
         let node = start_node(NodeConfig {
             state: state.0.clone(),
             bind: "127.0.0.1:0".parse().expect("mesh bind"),
-            mission,
+            mission: blob_mission(),
             peers: Vec::new(),
             mutable_interests: MutableSourceInterests::default(),
             sync_interval: Duration::from_millis(50),
@@ -157,13 +175,17 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
             .expect("bind agent");
         let address = agent.local_addr().expect("agent address");
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let server = tokio::spawn(agent.serve_with_blobs(
-            node.selected_events(),
-            node.selected_blobs(),
-            state.0.clone(),
-            ClientToken::from_bytes(TEST_TOKEN.to_vec()).expect("valid token"),
-            shutdown_rx,
-        ));
+        let server = tokio::spawn(
+            agent
+                .serve_with_blobs(
+                    node.selected_events(),
+                    node.selected_blobs(),
+                    node.state_root().to_path_buf(),
+                    ClientToken::from_bytes(TEST_TOKEN.to_vec()).expect("valid token"),
+                    shutdown_rx,
+                )
+                .expect("construct combined Event/Blob service"),
+        );
         let grpc = Http2Connection::connect_plaintext(
             format!("http://{address}")
                 .parse()
@@ -173,7 +195,7 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
         .expect("connect gRPC HTTP/2 transport")
         .shared(8);
         let client = api::AsterApplicationServiceClient::new(
-            grpc,
+            grpc.clone(),
             ClientConfig::new(
                 format!("http://{address}")
                     .parse()
@@ -185,6 +207,124 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
                 format!("Bearer {}", String::from_utf8_lossy(TEST_TOKEN)),
             ),
         );
+
+        let pending_upload = |key: &'static [u8], polled: Arc<tokio::sync::Notify>| {
+            let mut metadata = Some(api::PublishBlobRequest {
+                frame: Some(api::publish_blob_request::Frame::Metadata(Box::new(
+                    api::PublishBlobMetadata {
+                        operation_key: key.to_vec(),
+                        topic: "imagery.maps".to_owned(),
+                        scope: "mission/team/alpha".to_owned(),
+                        priority: api::Priority::Routine.into(),
+                        total_len: 1,
+                        ..Default::default()
+                    },
+                ))),
+                ..Default::default()
+            });
+            futures::stream::poll_fn(move |_| {
+                if let Some(metadata) = metadata.take() {
+                    Poll::Ready(Some(metadata))
+                } else {
+                    polled.notify_one();
+                    Poll::Pending
+                }
+            })
+        };
+        let one_byte_upload = |key: &[u8], declared_len: u64| {
+            vec![
+                api::PublishBlobRequest {
+                    frame: Some(api::publish_blob_request::Frame::Metadata(Box::new(
+                        api::PublishBlobMetadata {
+                            operation_key: key.to_vec(),
+                            topic: "imagery.maps".to_owned(),
+                            scope: "mission/team/alpha".to_owned(),
+                            priority: api::Priority::Routine.into(),
+                            total_len: declared_len,
+                            ..Default::default()
+                        },
+                    ))),
+                    ..Default::default()
+                },
+                api::PublishBlobRequest {
+                    frame: Some(api::publish_blob_request::Frame::Chunk(vec![0x31])),
+                    ..Default::default()
+                },
+            ]
+        };
+        let cancelled_polled = Arc::new(tokio::sync::Notify::new());
+        let cancelled_client = client.clone();
+        let cancelled_stream =
+            pending_upload(b"real-node-blob-cancelled", Arc::clone(&cancelled_polled));
+        let cancelled =
+            tokio::spawn(async move { cancelled_client.publish_blob(cancelled_stream).await });
+        cancelled_polled.notified().await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let probe = client
+                    .publish_blob(connectrpc::stream_iter(one_byte_upload(
+                        b"real-node-capacity-probe",
+                        2,
+                    )))
+                    .await
+                    .expect_err("capacity probe is intentionally short");
+                if probe.code == ErrorCode::ResourceExhausted {
+                    break;
+                }
+                assert_eq!(probe.code, ErrorCode::InvalidArgument);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pending upload acquired server staging and the singleton permit");
+        cancelled.abort();
+        assert!(cancelled.await.unwrap_err().is_cancelled());
+        let recovered_cancelled = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match client
+                    .publish_blob(connectrpc::stream_iter(one_byte_upload(
+                        b"real-node-blob-cancelled",
+                        1,
+                    )))
+                    .await
+                {
+                    Ok(response) => break response.into_owned(),
+                    Err(error) if error.code == ErrorCode::ResourceExhausted => {
+                        tokio::task::yield_now().await;
+                    }
+                    Err(error) => panic!("cancel recovery failed: {error:?}"),
+                }
+            }
+        })
+        .await
+        .expect("cancellation releases staging and capacity after cleanup");
+        assert!(recovered_cancelled.inserted);
+
+        let deadline_client = api::AsterApplicationServiceClient::new(
+            grpc,
+            ClientConfig::new(
+                format!("http://{address}")
+                    .parse()
+                    .expect("deadline client URI"),
+            )
+            .with_protocol(Protocol::Grpc)
+            .with_default_timeout(Duration::from_millis(10))
+            .with_default_header(
+                "authorization",
+                format!("Bearer {}", String::from_utf8_lossy(TEST_TOKEN)),
+            ),
+        );
+        let deadline_polled = Arc::new(tokio::sync::Notify::new());
+        let deadline_stream =
+            pending_upload(b"real-node-blob-deadline", Arc::clone(&deadline_polled));
+        let deadline_task =
+            tokio::spawn(async move { deadline_client.publish_blob(deadline_stream).await });
+        deadline_polled.notified().await;
+        let deadline = deadline_task
+            .await
+            .expect("deadline request task")
+            .expect_err("an incomplete upload must obey the client deadline");
+        assert_eq!(deadline.code, ErrorCode::DeadlineExceeded);
 
         let grpc_web_client = api::AsterApplicationServiceClient::new(
             HttpClient::plaintext(),
@@ -317,52 +457,105 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
         assert_eq!(offsets, [0, 65_536]);
         assert_eq!(observed, payload);
 
-        let malformed_metadata = api::PublishBlobMetadata {
-            operation_key: b"real-node-blob-malformed".to_vec(),
-            topic: "imagery.maps".to_owned(),
-            scope: "mission/team/alpha".to_owned(),
-            priority: api::Priority::Routine.into(),
-            total_len: 2,
+        let metadata_frame = |key: &[u8], total_len| api::PublishBlobRequest {
+            frame: Some(api::publish_blob_request::Frame::Metadata(Box::new(
+                api::PublishBlobMetadata {
+                    operation_key: key.to_vec(),
+                    topic: "imagery.maps".to_owned(),
+                    scope: "mission/team/alpha".to_owned(),
+                    priority: api::Priority::Routine.into(),
+                    total_len,
+                    ..Default::default()
+                },
+            ))),
             ..Default::default()
         };
-        let malformed = client
-            .publish_blob(connectrpc::stream_iter(vec![
-                api::PublishBlobRequest {
-                    frame: Some(api::publish_blob_request::Frame::Metadata(Box::new(
-                        malformed_metadata.clone(),
-                    ))),
-                    ..Default::default()
-                },
-                api::PublishBlobRequest {
-                    frame: Some(api::publish_blob_request::Frame::Chunk(vec![1])),
-                    ..Default::default()
-                },
-            ]))
-            .await
-            .expect_err("length mismatch must fail before publication");
-        assert_public_reason(
-            &malformed,
-            ErrorCode::InvalidArgument,
-            api::PublicErrorReason::MalformedInput,
-            "publish_blob",
-        );
-        let recovered = client
-            .publish_blob(connectrpc::stream_iter(vec![
-                api::PublishBlobRequest {
-                    frame: Some(api::publish_blob_request::Frame::Metadata(Box::new(
-                        malformed_metadata,
-                    ))),
-                    ..Default::default()
-                },
-                api::PublishBlobRequest {
-                    frame: Some(api::publish_blob_request::Frame::Chunk(vec![1, 2])),
-                    ..Default::default()
-                },
-            ]))
-            .await
-            .expect("malformed attempt must not mutate operation state")
-            .into_owned();
-        assert!(recovered.inserted);
+        let chunk_frame = |bytes| api::PublishBlobRequest {
+            frame: Some(api::publish_blob_request::Frame::Chunk(bytes)),
+            ..Default::default()
+        };
+        let malformed_cases = vec![
+            (
+                "missing-frame",
+                vec![api::PublishBlobRequest::default()],
+                ErrorCode::InvalidArgument,
+                api::PublicErrorReason::MalformedInput,
+                None,
+            ),
+            (
+                "over-policy",
+                vec![metadata_frame(
+                    b"real-node-blob-over-policy",
+                    MAX_SELECTED_LIVE_BLOB_BYTES + 1,
+                )],
+                ErrorCode::ResourceExhausted,
+                api::PublicErrorReason::ResourceExhaustion,
+                Some(b"real-node-blob-over-policy".as_slice()),
+            ),
+            (
+                "short",
+                vec![
+                    metadata_frame(b"real-node-blob-short", 2),
+                    chunk_frame(vec![1]),
+                ],
+                ErrorCode::InvalidArgument,
+                api::PublicErrorReason::MalformedInput,
+                Some(b"real-node-blob-short".as_slice()),
+            ),
+            (
+                "long",
+                vec![
+                    metadata_frame(b"real-node-blob-long", 1),
+                    chunk_frame(vec![1, 2]),
+                ],
+                ErrorCode::InvalidArgument,
+                api::PublicErrorReason::MalformedInput,
+                Some(b"real-node-blob-long".as_slice()),
+            ),
+            (
+                "reordered",
+                vec![chunk_frame(vec![1])],
+                ErrorCode::InvalidArgument,
+                api::PublicErrorReason::MalformedInput,
+                None,
+            ),
+        ];
+        for (label, frames, code, reason, rejected_key) in malformed_cases {
+            let error = client
+                .publish_blob(connectrpc::stream_iter(frames))
+                .await
+                .expect_err(label);
+            assert_public_reason_with_retryability(
+                &error,
+                code,
+                reason,
+                "publish_blob",
+                reason == api::PublicErrorReason::ResourceExhaustion,
+            );
+
+            let recovery_key = rejected_key
+                .map(<[u8]>::to_vec)
+                .unwrap_or_else(|| format!("real-node-recovery-{label}").into_bytes());
+            let recovered = client
+                .publish_blob(connectrpc::stream_iter(vec![
+                    metadata_frame(&recovery_key, 1),
+                    chunk_frame(vec![0x41]),
+                ]))
+                .await
+                .expect("every rejected stream must release staging and its upload permit")
+                .into_owned();
+            assert!(recovered.inserted);
+            let retry = client
+                .publish_blob(connectrpc::stream_iter(vec![
+                    metadata_frame(&recovery_key, 1),
+                    chunk_frame(vec![0x41]),
+                ]))
+                .await
+                .expect("exact-key recovery must remain idempotent")
+                .into_owned();
+            assert!(!retry.inserted);
+            assert_eq!(retry.id, recovered.id);
+        }
         assert!(
             fs::read_dir(&state.0)
                 .expect("inspect state root")

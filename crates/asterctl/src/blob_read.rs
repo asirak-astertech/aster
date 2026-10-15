@@ -21,7 +21,9 @@ See asterctl --help for global options.
 Blob bytes are written only to --output; stdout contains metadata only.
 ";
 
-const MAX_PAGE_BYTES: usize = 64 * 1024;
+/// Stable native gRPC Blob response-page size owned by the CLI protocol layer.
+pub(crate) const RPC_PAGE_BYTES: usize = 64 * 1024;
+const MAX_PAGE_BYTES: usize = RPC_PAGE_BYTES;
 const MAX_MEDIA_TYPE_BYTES: usize = 255;
 const MAX_SCHEMA_ID_BYTES: usize = 1024;
 
@@ -446,27 +448,26 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn blob_read_publishes_the_exact_open_inode_not_a_named_replacement() {
         let directory =
             std::env::temp_dir().join(format!("asterctl-blob-open-inode-{}", std::process::id()));
         let path = directory.join("destination");
-        let displaced = directory.join("displaced");
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir(&directory).unwrap();
 
         let mut output = OutputFile::create(path.clone()).unwrap();
         output.write_page(b"downloaded bytes").unwrap();
-        if let Some(temporary) = fs::read_dir(&directory)
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .find(|candidate| candidate != &path)
-        {
-            fs::rename(&temporary, &displaced).unwrap();
-            fs::write(&temporary, b"unrelated replacement").unwrap();
-        }
+        use std::os::unix::fs::MetadataExt as _;
+        let open_inode = (
+            output.file.metadata().unwrap().dev(),
+            output.file.metadata().unwrap().ino(),
+        );
 
         assert_eq!(output.finish(), Ok(()));
         assert_eq!(fs::read(&path).unwrap(), b"downloaded bytes");
+        let linked = fs::metadata(&path).unwrap();
+        assert_eq!(open_inode, (linked.dev(), linked.ino()));
 
         fs::remove_dir_all(directory).unwrap();
     }
