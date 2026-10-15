@@ -265,6 +265,56 @@ pub(crate) struct PressureSelection {
     proven: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BlobPressurePhysicalCandidate {
+    variant: BlobVariantId,
+    partition: BlobCapacityPartition,
+    deficit: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BlobPressurePhysicalRecoveryReceipt {
+    variant: BlobVariantId,
+    partition: BlobCapacityPartition,
+    baseline: u64,
+    deficit: u64,
+    budget_rows: u64,
+    budget_files: u64,
+    budget_bytes: u64,
+    consumed_rows: u64,
+    consumed_bytes: u64,
+}
+
+impl BlobPressurePhysicalRecoveryReceipt {
+    pub(crate) const fn variant(self) -> BlobVariantId {
+        self.variant
+    }
+
+    pub(crate) const fn partition(self) -> BlobCapacityPartition {
+        self.partition
+    }
+
+    pub(crate) const fn baseline(self) -> u64 {
+        self.baseline
+    }
+
+    pub(crate) const fn deficit(self) -> u64 {
+        self.deficit
+    }
+
+    pub(crate) const fn remaining_rows(self) -> u64 {
+        self.budget_rows - self.consumed_rows
+    }
+
+    pub(crate) const fn remaining_files(self) -> u64 {
+        self.budget_files
+    }
+
+    pub(crate) const fn remaining_bytes(self) -> u64 {
+        self.budget_bytes - self.consumed_bytes
+    }
+}
+
 /// Bounded store-owned outcome of one pressure attempt.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[doc(hidden)]
@@ -274,6 +324,8 @@ pub struct BlobCapacityRecoveryResult {
     deficit_met: bool,
     rows_examined: u64,
     bytes_examined: u64,
+    physical_candidate: Option<BlobPressurePhysicalCandidate>,
+    physical_receipt: Option<BlobPressurePhysicalRecoveryReceipt>,
 }
 
 impl BlobCapacityRecoveryResult {
@@ -284,6 +336,8 @@ impl BlobCapacityRecoveryResult {
             deficit_met: false,
             rows_examined,
             bytes_examined,
+            physical_candidate: None,
+            physical_receipt: None,
         }
     }
 
@@ -300,7 +354,34 @@ impl BlobCapacityRecoveryResult {
             deficit_met: recovered_units >= deficit,
             rows_examined,
             bytes_examined,
+            physical_candidate: None,
+            physical_receipt: None,
         }
+    }
+
+    pub(crate) fn recovered_with_physical_candidate(
+        evicted_transfer_ids: Vec<BlobTransferId>,
+        recovered_units: u64,
+        demand: BlobCapacityRecoveryDemand,
+        rows_examined: u64,
+        bytes_examined: u64,
+        variant: BlobVariantId,
+    ) -> Self {
+        let mut result = Self::recovered(
+            evicted_transfer_ids,
+            recovered_units,
+            demand.deficit(),
+            rows_examined,
+            bytes_examined,
+        );
+        if !result.deficit_met {
+            result.physical_candidate = Some(BlobPressurePhysicalCandidate {
+                variant,
+                partition: demand.partition(),
+                deficit: demand.deficit(),
+            });
+        }
+        result
     }
 
     pub fn evicted_transfer_ids(&self) -> &[BlobTransferId] {
@@ -323,16 +404,48 @@ impl BlobCapacityRecoveryResult {
         self.bytes_examined
     }
 
+    pub(crate) fn bind_physical_recovery(
+        mut self,
+        baseline: u64,
+        budget: super::BlobMaintenanceBudget,
+    ) -> Self {
+        let Some(candidate) = self.physical_candidate.take() else {
+            return self;
+        };
+        if self.rows_examined >= budget.rows() || self.bytes_examined >= budget.bytes() {
+            return self;
+        }
+        self.physical_receipt = Some(BlobPressurePhysicalRecoveryReceipt {
+            variant: candidate.variant,
+            partition: candidate.partition,
+            baseline,
+            deficit: candidate.deficit,
+            budget_rows: budget.rows(),
+            budget_files: budget.files(),
+            budget_bytes: budget.bytes(),
+            consumed_rows: self.rows_examined,
+            consumed_bytes: self.bytes_examined,
+        });
+        self
+    }
+
+    pub(crate) fn take_physical_recovery_receipt(
+        &mut self,
+    ) -> Option<BlobPressurePhysicalRecoveryReceipt> {
+        self.physical_receipt.take()
+    }
+
     pub(crate) fn with_physical_recovery(
         self,
         recovered_units: u64,
         deficit: u64,
         progress: super::BlobCapacityGcProgress,
     ) -> Result<Self, StoreError> {
+        let deficit_met = recovered_units >= deficit;
         Ok(Self {
             evicted_transfer_ids: self.evicted_transfer_ids,
             recovered_units,
-            deficit_met: recovered_units >= deficit,
+            deficit_met,
             rows_examined: self
                 .rows_examined
                 .checked_add(progress.rows_examined)
@@ -341,6 +454,12 @@ impl BlobCapacityRecoveryResult {
                 .bytes_examined
                 .checked_add(progress.bytes_examined)
                 .ok_or(StoreError::PayloadByteAccountingOverflow)?,
+            physical_candidate: if deficit_met {
+                None
+            } else {
+                self.physical_candidate
+            },
+            physical_receipt: None,
         })
     }
 }

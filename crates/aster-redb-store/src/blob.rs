@@ -1435,7 +1435,14 @@ struct BlobCapacityPhysicalUnitProgress {
     files_examined: u64,
     bytes_examined: u64,
     finalized: bool,
+    failed: bool,
     next_position: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Copy)]
+enum BlobCapacityPhysicalSelection {
+    Global,
+    Exact(BlobVariantId),
 }
 
 enum BlobCapacityPhysicalStep {
@@ -9618,13 +9625,26 @@ impl Store {
 
     fn run_one_capacity_physical_unit(
         &self,
+        selection_scope: BlobCapacityPhysicalSelection,
         position: Option<&[u8]>,
         rows_budget: u64,
         bytes_budget: u64,
     ) -> Result<BlobCapacityPhysicalStep, StoreError> {
         let read = self.database.begin_read()?;
-        let selection =
-            deletion::select_physical_work_read(&read, position, rows_budget, bytes_budget)?;
+        let selection = match selection_scope {
+            BlobCapacityPhysicalSelection::Global => {
+                deletion::select_physical_work_read(&read, position, rows_budget, bytes_budget)?
+            }
+            BlobCapacityPhysicalSelection::Exact(variant) => {
+                deletion::select_exact_physical_work_read(
+                    &read,
+                    variant,
+                    position,
+                    rows_budget,
+                    bytes_budget,
+                )?
+            }
+        };
         drop(read);
         let work = match selection {
             deletion::BlobDeletionSelection::Work(work) => *work,
@@ -9633,11 +9653,13 @@ impl Store {
                 rows_examined,
                 bytes_examined,
             } => {
-                self.require_live()?;
-                let write = self.database.begin_write()?;
-                enforce_live_write(&write)?;
-                deletion::advance_blob_deletion_maintenance_turn(&write)?;
-                write.commit()?;
+                if matches!(selection_scope, BlobCapacityPhysicalSelection::Global) {
+                    self.require_live()?;
+                    let write = self.database.begin_write()?;
+                    enforce_live_write(&write)?;
+                    deletion::advance_blob_deletion_maintenance_turn(&write)?;
+                    write.commit()?;
+                }
                 return Ok(BlobCapacityPhysicalStep::Continue {
                     rows_examined,
                     bytes_examined,
@@ -9648,11 +9670,13 @@ impl Store {
                 rows_examined,
                 bytes_examined,
             } => {
-                self.require_live()?;
-                let write = self.database.begin_write()?;
-                enforce_live_write(&write)?;
-                deletion::advance_blob_deletion_maintenance_turn(&write)?;
-                write.commit()?;
+                if matches!(selection_scope, BlobCapacityPhysicalSelection::Global) {
+                    self.require_live()?;
+                    let write = self.database.begin_write()?;
+                    enforce_live_write(&write)?;
+                    deletion::advance_blob_deletion_maintenance_turn(&write)?;
+                    write.commit()?;
+                }
                 return Ok(BlobCapacityPhysicalStep::Exhausted {
                     rows_examined,
                     bytes_examined,
@@ -9723,6 +9747,7 @@ impl Store {
                             .checked_add(bytes_examined)
                             .ok_or(StoreError::PayloadByteAccountingOverflow)?,
                         finalized: false,
+                        failed: true,
                         next_position: Some(work.position.clone()),
                     },
                 ));
@@ -9764,6 +9789,7 @@ impl Store {
                     .checked_add(physical_bytes)
                     .ok_or(StoreError::PayloadByteAccountingOverflow)?,
                 finalized,
+                failed: false,
                 next_position,
             },
         ))
@@ -10223,6 +10249,70 @@ impl Store {
         )
     }
 
+    /// Custody-v1 contact pressure recovery. Durable and locally originated
+    /// finite rows are eligible, while received finite rows must retain the
+    /// exact semantic-v8 BlobRangesStreamV1 provenance.
+    #[doc(hidden)]
+    pub fn run_custody_blob_pressure_recovery_after_cleanup(
+        &self,
+        error: &StoreError,
+        incoming_priority: Priority,
+        content: Option<(&Topic, &Scope, BlobId)>,
+        incoming_depot_units: (u64, u64),
+        budget: BlobMaintenanceBudget,
+        custody_sample: Option<aster_mesh::CustodySample>,
+    ) -> Result<Option<BlobCapacityRecoveryResult>, StoreError> {
+        self.run_blob_pressure_recovery_after_cleanup_with_eligibility(
+            error,
+            incoming_priority,
+            content,
+            incoming_depot_units,
+            budget,
+            custody_sample,
+            BlobContactEligibility::CustodyV1,
+        )
+    }
+
+    /// Finishes one already-selected depot pressure recovery after the caller
+    /// has removed the exact evicted cache claims and released their leases.
+    /// This bounded continuation processes only admitted physical deletion
+    /// work and never selects or retires another pressure victim.
+    #[doc(hidden)]
+    pub fn continue_blob_pressure_recovery_after_cache_reconciliation(
+        &self,
+        mut recovery: BlobCapacityRecoveryResult,
+    ) -> Result<BlobCapacityRecoveryResult, StoreError> {
+        if recovery.deficit_met() || recovery.evicted_transfer_ids().is_empty() {
+            return Ok(recovery);
+        }
+        let Some(receipt) = recovery.take_physical_recovery_receipt() else {
+            return Ok(recovery);
+        };
+        let progress = self.continue_exact_blob_pressure_physical_recovery(receipt)?;
+        let read = self.database.begin_read()?;
+        let target_complete =
+            !deletion::variant_has_deletion_manifest_read(&read, receipt.variant())?;
+        let current = Self::blob_pressure_depot_partition_usage(
+            depot::depot_admission_usage_read(&read)?,
+            receipt.partition(),
+        );
+        let released = receipt.baseline().checked_sub(current).ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "Blob pressure physical continuation increased depot usage",
+            ))
+        })?;
+        // A missing authority is not itself proof that this continuation
+        // released the measured capacity: an unrelated manifest can finalize
+        // after the receipt baseline was captured. Credit the aggregate delta
+        // only when this exact bounded continuation observed finalization.
+        let verified_released = if progress.manifests_finalized == 1 && target_complete {
+            released
+        } else {
+            recovery.recovered_units()
+        };
+        recovery.with_physical_recovery(verified_released, receipt.deficit(), progress)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn run_blob_pressure_recovery_after_cleanup_with_eligibility(
         &self,
@@ -10276,15 +10366,6 @@ impl Store {
         {
             return Ok(Some(recovery));
         }
-        let Some(rows) = budget.rows().checked_sub(recovery.rows_examined()) else {
-            return Ok(Some(recovery));
-        };
-        let Some(bytes) = budget.bytes().checked_sub(recovery.bytes_examined()) else {
-            return Ok(Some(recovery));
-        };
-        if rows == 0 || bytes == 0 {
-            return Ok(Some(recovery));
-        }
         let baseline = match error {
             StoreError::Blob(BlobStoreError::DepotByteLimitExceeded { current, .. })
                 if demand.partition() == pressure::BlobCapacityPartition::DepotBytes =>
@@ -10307,33 +10388,109 @@ impl Store {
                 )));
             }
         };
-        let physical_budget =
-            BlobMaintenanceBudget::new(rows, budget.files(), bytes).map_err(blob_error)?;
-        let progress = match eligibility {
-            BlobContactEligibility::AllVisible | BlobContactEligibility::CustodyV1 => self
-                .run_blob_capacity_gc_for(
-                    BlobCapacityGcTarget::Depot,
-                    physical_budget,
-                    custody_sample,
-                )?,
-            BlobContactEligibility::DurableOnly => BlobCapacityGcProgress::default(),
-        };
         let read = self.database.begin_read()?;
-        let usage = depot::depot_admission_usage_read(&read)?;
-        let current = match demand.partition() {
-            pressure::BlobCapacityPartition::DepotBytes => usage.reserved_bytes,
-            pressure::BlobCapacityPartition::DepotChunks => usage.chunks,
-            pressure::BlobCapacityPartition::DepotVariants => usage.variants,
-            _ => unreachable!("depot partitions were checked above"),
-        };
+        let current = Self::blob_pressure_depot_partition_usage(
+            depot::depot_admission_usage_read(&read)?,
+            demand.partition(),
+        );
         let released = baseline.checked_sub(current).ok_or_else(|| {
             blob_error(BlobStoreError::SchemaInvariant(
                 "Blob pressure physical recovery increased depot usage",
             ))
         })?;
-        recovery
-            .with_physical_recovery(released, demand.deficit(), progress)
-            .map(Some)
+        let recovery = recovery.with_physical_recovery(
+            released,
+            demand.deficit(),
+            BlobCapacityGcProgress::default(),
+        )?;
+        if recovery.deficit_met() {
+            Ok(Some(recovery))
+        } else {
+            Ok(Some(recovery.bind_physical_recovery(baseline, budget)))
+        }
+    }
+
+    fn blob_pressure_depot_partition_usage(
+        usage: depot::DepotAdmissionUsage,
+        partition: pressure::BlobCapacityPartition,
+    ) -> u64 {
+        match partition {
+            pressure::BlobCapacityPartition::DepotBytes => usage.reserved_bytes,
+            pressure::BlobCapacityPartition::DepotChunks => usage.chunks,
+            pressure::BlobCapacityPartition::DepotVariants => usage.variants,
+            _ => unreachable!("depot partitions were checked before usage projection"),
+        }
+    }
+
+    fn continue_exact_blob_pressure_physical_recovery(
+        &self,
+        receipt: pressure::BlobPressurePhysicalRecoveryReceipt,
+    ) -> Result<BlobCapacityGcProgress, StoreError> {
+        let mut progress = BlobCapacityGcProgress::default();
+        let manifest_position =
+            lifecycle::deletion_manifest_cursor_position(receipt.variant()).to_vec();
+        let mut position = Some(manifest_position.clone());
+        while progress.rows_examined < receipt.remaining_rows()
+            && progress.files_examined < receipt.remaining_files()
+            && progress.bytes_examined < receipt.remaining_bytes()
+        {
+            let step = self.run_one_capacity_physical_unit(
+                BlobCapacityPhysicalSelection::Exact(receipt.variant()),
+                position.as_deref(),
+                receipt.remaining_rows() - progress.rows_examined,
+                receipt.remaining_bytes() - progress.bytes_examined,
+            )?;
+            match step {
+                BlobCapacityPhysicalStep::Unit(unit) => {
+                    progress.rows_examined = progress
+                        .rows_examined
+                        .checked_add(unit.rows_examined)
+                        .ok_or(StoreError::ItemCountAccountingOverflow)?;
+                    progress.files_examined = progress
+                        .files_examined
+                        .checked_add(unit.files_examined)
+                        .ok_or(StoreError::ItemCountAccountingOverflow)?;
+                    progress.bytes_examined = progress
+                        .bytes_examined
+                        .checked_add(unit.bytes_examined)
+                        .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+                    progress.manifests_finalized = progress
+                        .manifests_finalized
+                        .checked_add(u64::from(unit.finalized))
+                        .ok_or(StoreError::ItemCountAccountingOverflow)?;
+                    position = unit
+                        .next_position
+                        .or_else(|| Some(manifest_position.clone()));
+                    if unit.finalized || unit.failed {
+                        break;
+                    }
+                }
+                BlobCapacityPhysicalStep::Continue {
+                    rows_examined,
+                    bytes_examined,
+                    ..
+                }
+                | BlobCapacityPhysicalStep::Blocked {
+                    rows_examined,
+                    bytes_examined,
+                }
+                | BlobCapacityPhysicalStep::Exhausted {
+                    rows_examined,
+                    bytes_examined,
+                } => {
+                    progress.rows_examined = progress
+                        .rows_examined
+                        .checked_add(rows_examined)
+                        .ok_or(StoreError::ItemCountAccountingOverflow)?;
+                    progress.bytes_examined = progress
+                        .bytes_examined
+                        .checked_add(bytes_examined)
+                        .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+                    break;
+                }
+            }
+        }
+        Ok(progress)
     }
 
     fn run_blob_pending_pressure_recovery(
@@ -10941,6 +11098,7 @@ impl Store {
             staging_rows,
             staging_bytes,
         } = plan;
+        let admitted_physical_manifest = deletion.is_some();
         if pressure.references.len() != publications.len() + pending.len() {
             return Err(blob_error(BlobStoreError::SchemaInvariant(
                 "whole-variant retirement plan lost a pressure root",
@@ -11073,13 +11231,26 @@ impl Store {
                 .durable_committed()
                 .map_err(lease::store_error)?;
         }
-        Ok(pressure::BlobCapacityRecoveryResult::recovered(
-            evicted,
-            recovered_units,
-            demand.deficit(),
-            charge.rows,
-            charge.bytes,
-        ))
+        if admitted_physical_manifest {
+            Ok(
+                pressure::BlobCapacityRecoveryResult::recovered_with_physical_candidate(
+                    evicted,
+                    recovered_units,
+                    demand,
+                    charge.rows,
+                    charge.bytes,
+                    variant,
+                ),
+            )
+        } else {
+            Ok(pressure::BlobCapacityRecoveryResult::recovered(
+                evicted,
+                recovered_units,
+                demand.deficit(),
+                charge.rows,
+                charge.bytes,
+            ))
+        }
     }
 
     /// Reclaims only already-unreferenced exact variants under independent
@@ -11105,9 +11276,10 @@ impl Store {
         self.run_blob_capacity_gc_inner(Some(target), budget, custody_sample)
     }
 
-    /// Contact-only capacity cleanup deliberately performs no general
-    /// lifecycle or physical-maintenance turn. Pressure recovery below may
-    /// still retire an exactly revalidated durable candidate.
+    /// Contact-only capacity cleanup performs no lifecycle admission or
+    /// expiry. It only reclaims already-authorized physical deletion
+    /// manifests under the supplied bounds; pressure recovery below may still
+    /// retire an exactly revalidated durable candidate.
     #[doc(hidden)]
     pub fn run_durable_blob_capacity_gc_for(
         &self,
@@ -11123,6 +11295,7 @@ impl Store {
             && progress.bytes_examined < budget.bytes
         {
             let step = self.run_one_capacity_physical_unit(
+                BlobCapacityPhysicalSelection::Global,
                 position.as_deref(),
                 budget.rows - progress.rows_examined,
                 budget.bytes - progress.bytes_examined,
@@ -11227,6 +11400,7 @@ impl Store {
             let rows_left = budget.rows - progress.rows_examined;
             let bytes_left = budget.bytes - progress.bytes_examined;
             match self.run_one_capacity_physical_unit(
+                BlobCapacityPhysicalSelection::Global,
                 physical_position.as_deref(),
                 rows_left,
                 bytes_left,
@@ -18324,6 +18498,27 @@ mod tests {
         cumulative_age_ms: u64,
         checkpoint: CustodySample,
     ) -> BlobPublicationIntent {
+        rewrite_live_blob_as_finite_with_provenance_for_test(
+            store,
+            stored,
+            operation,
+            ttl_ms,
+            cumulative_age_ms,
+            checkpoint,
+            BlobFiniteProvenance::Local,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn rewrite_live_blob_as_finite_with_provenance_for_test(
+        store: &Store,
+        stored: &StoredBlob,
+        operation: Option<&BlobOperationKey>,
+        ttl_ms: u64,
+        cumulative_age_ms: u64,
+        checkpoint: CustodySample,
+        provenance: BlobFiniteProvenance,
+    ) -> BlobPublicationIntent {
         // This fixture introduces custody continuity after the durable
         // publication already exists. Drain the production reanchor pass so
         // the direct finite rewrite starts from a clean v5 pressure image.
@@ -18393,7 +18588,7 @@ mod tests {
                 continuity_generation: continuity.generation(),
                 continuity_lost: false,
             },
-            provenance: BlobFiniteProvenance::Local,
+            provenance,
         };
         lifecycle::replace_policy_ttl_deadline_write(
             &write,
@@ -37713,6 +37908,121 @@ mod tests {
     }
 
     #[test]
+    fn blob_custody_pressure_skips_incompatible_finite_provenance() {
+        // Break caught: a v8 custody contact must not use local AllVisible
+        // pressure and evict a finite row from an unsupported profile. Keep
+        // the incompatible and eligible cases isolated: a bounded pressure
+        // pass is allowed to stop after exact revalidation rejects its oldest
+        // index candidate rather than scanning past it.
+        let root = BlobTestRoot::new("custody-pressure-provenance");
+        let mut services = blob_services(0x5c);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("custody pressure provenance store");
+        let checkpoint = CustodySample {
+            clock_id: [0x5d; 16],
+            tick_ms: 10_000,
+        };
+        let future_plaintext = b"future provenance pressure row".to_vec();
+        let future_prepared = prepared_blob(&future_plaintext);
+        let (future, future_operation, _) = publish_blob(
+            &store,
+            &mut services,
+            &future_prepared,
+            &future_plaintext,
+            1,
+            b"custody-pressure-future",
+        );
+        rewrite_live_blob_as_finite_with_provenance_for_test(
+            &store,
+            &future,
+            Some(&future_operation),
+            60_000,
+            10,
+            checkpoint,
+            BlobFiniteProvenance::NetworkV1 {
+                semantic_version: 9,
+                profile_id: aster_mesh::TransferProfileId::BlobRangesStreamV1 as u16,
+            },
+        );
+
+        let recovery = store
+            .run_custody_blob_pressure_recovery_after_cleanup(
+                &StoreError::ItemLimitExceeded {
+                    current: 1,
+                    limit: 0,
+                },
+                Priority::Flash,
+                None,
+                (0, 0),
+                BlobMaintenanceBudget::new(
+                    MAX_BLOB_PRESSURE_FINAL_ROOT_ROWS,
+                    2,
+                    MAX_BLOB_PRESSURE_FINAL_ROOT_BYTES,
+                )
+                .expect("custody pressure provenance budget"),
+                Some(CustodySample {
+                    clock_id: checkpoint.clock_id,
+                    tick_ms: checkpoint.tick_ms + 1,
+                }),
+            )
+            .expect("custody pressure provenance recovery")
+            .expect("typed custody pressure demand");
+        assert!(recovery.evicted_transfer_ids().is_empty());
+        assert!(store.get_blob(future.transfer_id).unwrap().is_some());
+
+        let eligible_root = BlobTestRoot::new("custody-pressure-v8-provenance");
+        let mut eligible_services = blob_services(0x5e);
+        let eligible_store =
+            Store::open_for_mission(&eligible_root.database, eligible_services.authority)
+                .expect("v8 custody pressure provenance store");
+        let v8_plaintext = b"v8 custody pressure row".to_vec();
+        let v8_prepared = prepared_blob(&v8_plaintext);
+        let (v8, v8_operation, _) = publish_blob(
+            &eligible_store,
+            &mut eligible_services,
+            &v8_prepared,
+            &v8_plaintext,
+            1,
+            b"custody-pressure-v8",
+        );
+        rewrite_live_blob_as_finite_with_provenance_for_test(
+            &eligible_store,
+            &v8,
+            Some(&v8_operation),
+            60_000,
+            10,
+            checkpoint,
+            BlobFiniteProvenance::NetworkV1 {
+                semantic_version: 8,
+                profile_id: aster_mesh::TransferProfileId::BlobRangesStreamV1 as u16,
+            },
+        );
+        let eligible_recovery = eligible_store
+            .run_custody_blob_pressure_recovery_after_cleanup(
+                &StoreError::ItemLimitExceeded {
+                    current: 1,
+                    limit: 0,
+                },
+                Priority::Flash,
+                None,
+                (0, 0),
+                BlobMaintenanceBudget::new(
+                    MAX_BLOB_PRESSURE_FINAL_ROOT_ROWS,
+                    2,
+                    MAX_BLOB_PRESSURE_FINAL_ROOT_BYTES,
+                )
+                .expect("v8 custody pressure provenance budget"),
+                Some(CustodySample {
+                    clock_id: checkpoint.clock_id,
+                    tick_ms: checkpoint.tick_ms + 1,
+                }),
+            )
+            .expect("v8 custody pressure provenance recovery")
+            .expect("typed v8 custody pressure demand");
+        assert_eq!(eligible_recovery.evicted_transfer_ids(), &[v8.transfer_id]);
+    }
+
+    #[test]
     fn blob_durable_contact_omits_finite_before_inventory_and_pending_ordering() {
         // Mutation caught: filtering finite roots after reconciliation or
         // lexicographic pending selection would either disclose them or let a
@@ -45830,6 +46140,409 @@ mod tests {
             !deletion::variant_has_deletion_manifest_read(&read, first.variant_id)
                 .expect("finalized deletion authority")
         );
+    }
+
+    #[test]
+    fn blob_pressure_cache_reconciliation_continues_only_the_selected_manifest() {
+        // Break caught: the post-cache continuation must not scan the global
+        // deletion queue and prove the selected pressure deficit by finalizing
+        // an unrelated manifest that sorts first.
+        let root = BlobTestRoot::new("pressure-exact-post-cache-continuation");
+        let mut services = blob_services(0xb7);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("exact post-cache continuation store");
+        let first_plaintext = b"exact continuation candidate one".to_vec();
+        let second_plaintext = b"exact continuation candidate two".to_vec();
+        let first_prepared = prepared_blob(&first_plaintext);
+        let second_prepared = prepared_blob(&second_plaintext);
+        let first_proof = prepare_blob_proof_with_priority(
+            &store,
+            &mut services,
+            &first_prepared,
+            &first_plaintext,
+            1,
+            Priority::Routine,
+        );
+        let unrelated =
+            commit_blob_proof(&store, &services, &first_proof, b"pressure-exact-unrelated")
+                .0
+                .blob()
+                .clone();
+        let second_proof = prepare_blob_proof_with_priority(
+            &store,
+            &mut services,
+            &second_prepared,
+            &second_plaintext,
+            1,
+            Priority::Routine,
+        );
+        let selected =
+            commit_blob_proof(&store, &services, &second_proof, b"pressure-exact-selected")
+                .0
+                .blob()
+                .clone();
+        let selected_shared_proof = prepare_blob_proof_with_priority(
+            &store,
+            &mut services,
+            &second_prepared,
+            &second_plaintext,
+            1,
+            Priority::Routine,
+        );
+        let selected_shared = commit_blob_proof(
+            &store,
+            &services,
+            &selected_shared_proof,
+            b"pressure-exact-selected-shared",
+        )
+        .0
+        .blob()
+        .clone();
+        assert_eq!(selected_shared.variant_id, selected.variant_id);
+        assert!(unrelated.variant_id < selected.variant_id);
+        let pressure_budget = pressure::BlobPressureRecoveryBudget::new(
+            MAX_BLOB_PRESSURE_FINAL_ROOT_ROWS,
+            MAX_BLOB_PRESSURE_FINAL_ROOT_BYTES,
+            1,
+            1,
+            1,
+        )
+        .expect("single-root pressure budget");
+        let demand = pressure::BlobCapacityRecoveryDemand::new(
+            pressure::BlobCapacityPartition::DepotVariants,
+            Priority::Immediate,
+            1,
+        )
+        .expect("one-variant pressure demand");
+        let unrelated_recovery = store
+            .run_blob_pressure_recovery(demand, pressure_budget, None)
+            .expect("admit unrelated deletion manifest");
+        assert_eq!(
+            unrelated_recovery.evicted_transfer_ids(),
+            &[unrelated.transfer_id]
+        );
+        let admission_error = StoreError::Blob(BlobStoreError::DepotVariantLimitExceeded {
+            current: 2,
+            limit: 2,
+        });
+        let selected_recovery = store
+            .run_blob_pressure_recovery_after_cleanup(
+                &admission_error,
+                Priority::Immediate,
+                None,
+                (0, 1),
+                BlobMaintenanceBudget::new(
+                    MAX_BLOB_PRESSURE_FINAL_ROOT_ROWS + 64,
+                    2,
+                    MAX_BLOB_PRESSURE_FINAL_ROOT_BYTES + 128 * 1024 * 1024,
+                )
+                .expect("pressure plus one-manifest physical budget"),
+                None,
+            )
+            .expect("select exact pressure recovery")
+            .expect("typed depot capacity demand");
+        let mut evicted = selected_recovery.evicted_transfer_ids().to_vec();
+        evicted.sort_unstable();
+        let mut expected = vec![selected.transfer_id, selected_shared.transfer_id];
+        expected.sort_unstable();
+        assert_eq!(evicted, expected);
+        deletion_manifest_for_test(&store, unrelated.variant_id);
+        deletion_manifest_for_test(&store, selected.variant_id);
+
+        drop(store);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("reopen exact post-cache continuation store");
+
+        let continued = store
+            .continue_blob_pressure_recovery_after_cache_reconciliation(selected_recovery)
+            .expect("continue the exact selected pressure recovery");
+        assert!(continued.deficit_met());
+        let read = store
+            .database
+            .begin_read()
+            .expect("continuation manifest read");
+        assert!(
+            deletion::variant_has_deletion_manifest_read(&read, unrelated.variant_id)
+                .expect("unrelated manifest remains")
+        );
+        assert!(
+            !deletion::variant_has_deletion_manifest_read(&read, selected.variant_id)
+                .expect("selected manifest finalized")
+        );
+    }
+
+    #[test]
+    fn blob_exact_physical_selection_stops_on_delayed_or_missing_authority() {
+        // Break caught: an exact continuation must report no selected work
+        // instead of falling through to an unrelated globally-ready manifest.
+        let root = BlobTestRoot::new("pressure-exact-authority-boundary");
+        let services = blob_services(0xba);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("exact authority-boundary store");
+        let first = install_unreferenced_variant(
+            &store,
+            &services,
+            b"exact authority first variant",
+            1,
+            true,
+        );
+        let second = install_unreferenced_variant(
+            &store,
+            &services,
+            b"exact authority second variant",
+            2,
+            true,
+        );
+        store
+            .test_admit_blob_deletion_manifest(first)
+            .expect("admit first exact authority manifest");
+        store
+            .test_admit_blob_deletion_manifest(second)
+            .expect("admit second exact authority manifest");
+        let (unrelated, delayed) = if first < second {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        let delayed_manifest = deletion_manifest_for_test(&store, delayed);
+        let next_retry_turn = {
+            let read = store.database.begin_read().expect("read deletion turn");
+            read.open_table(deletion::BLOB_DELETION_METADATA)
+                .expect("deletion metadata")
+                .get(deletion::BLOB_DELETION_MAINTENANCE_TURN)
+                .expect("deletion turn lookup")
+                .expect("deletion turn")
+                .value()
+                + 8
+        };
+        let write = store
+            .database
+            .begin_write()
+            .expect("delay exact authority manifest");
+        deletion::set_blob_deletion_phase_for_test(
+            &write,
+            delayed,
+            delayed_manifest.phase,
+            deletion::BlobDeletionRetry {
+                category: Some(deletion::BlobDeletionFailureCategory::ChunkUnlink),
+                attempts: 1,
+                next_retry_turn,
+            },
+        )
+        .expect("persist delayed exact authority");
+        write.commit().expect("commit delayed exact authority");
+
+        let read = store.database.begin_read().expect("exact selection read");
+        assert!(matches!(
+            deletion::select_exact_physical_work_read(&read, delayed, None, u64::MAX, u64::MAX,)
+                .expect("delayed exact selection"),
+            deletion::BlobDeletionSelection::Complete { .. }
+        ));
+        assert!(matches!(
+            deletion::select_physical_work_read(&read, None, u64::MAX, u64::MAX)
+                .expect("global unrelated selection"),
+            deletion::BlobDeletionSelection::Work(work) if work.manifest.variant_id == unrelated
+        ));
+        let missing = BlobVariantId::from_bytes([0xff; 32]);
+        assert_ne!(missing, first);
+        assert_ne!(missing, second);
+        assert!(matches!(
+            deletion::select_exact_physical_work_read(&read, missing, None, u64::MAX, u64::MAX,)
+                .expect("missing exact selection"),
+            deletion::BlobDeletionSelection::Complete { .. }
+        ));
+    }
+
+    #[test]
+    fn blob_exact_continuation_does_not_credit_unrelated_release_when_authority_is_missing() {
+        // Break caught: disappearance of the selected manifest is not proof
+        // that this continuation released capacity. An unrelated manifest may
+        // have finalized after the receipt baseline was captured.
+        let root = BlobTestRoot::new("pressure-exact-missing-authority-credit");
+        let services = blob_services(0xbc);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("exact missing-authority credit store");
+        let first = install_unreferenced_variant(
+            &store,
+            &services,
+            b"exact missing authority first variant",
+            1,
+            true,
+        );
+        let second = install_unreferenced_variant(
+            &store,
+            &services,
+            b"exact missing authority second variant",
+            2,
+            true,
+        );
+        store
+            .test_admit_blob_deletion_manifest(first)
+            .expect("admit first missing-authority manifest");
+        store
+            .test_admit_blob_deletion_manifest(second)
+            .expect("admit second missing-authority manifest");
+        let (unrelated, selected) = if first < second {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        let receipt_budget = BlobMaintenanceBudget::new(128, 2, 128 * 1024 * 1024)
+            .expect("missing-authority receipt budget");
+        let demand = pressure::BlobCapacityRecoveryDemand::new(
+            pressure::BlobCapacityPartition::DepotVariants,
+            Priority::Immediate,
+            1,
+        )
+        .expect("missing-authority demand");
+        let recovery = pressure::BlobCapacityRecoveryResult::recovered_with_physical_candidate(
+            vec![BlobTransferId::new([0xbc; 32])],
+            0,
+            demand,
+            0,
+            0,
+            selected,
+        )
+        .bind_physical_recovery(2, receipt_budget);
+
+        let progress = store
+            .run_durable_blob_capacity_gc_for(BlobCapacityGcTarget::Depot, receipt_budget, None)
+            .expect("finalize only the unrelated manifest");
+        assert_eq!(progress.manifests_finalized, 1);
+        let read = store.database.begin_read().expect("manifest state read");
+        assert!(
+            !deletion::variant_has_deletion_manifest_read(&read, unrelated)
+                .expect("unrelated authority finalized")
+        );
+        assert!(
+            deletion::variant_has_deletion_manifest_read(&read, selected)
+                .expect("selected authority remains")
+        );
+        drop(read);
+
+        let write = store
+            .database
+            .begin_write()
+            .expect("remove selected authority");
+        {
+            let mut manifests = write
+                .open_table(deletion::BLOB_DELETION_MANIFESTS)
+                .expect("selected authority table");
+            assert!(
+                manifests
+                    .remove(selected.as_bytes().as_slice())
+                    .expect("remove selected authority")
+                    .is_some()
+            );
+        }
+        write.commit().expect("commit missing selected authority");
+
+        let continued = store
+            .continue_blob_pressure_recovery_after_cache_reconciliation(recovery)
+            .expect("continue with missing selected authority");
+        assert!(!continued.deficit_met());
+        assert_eq!(continued.recovered_units(), 0);
+    }
+
+    #[test]
+    fn blob_exact_pressure_continuation_honors_partial_file_budget() {
+        // Break caught: exhausting the selected receipt's file budget must
+        // retain both manifests and must not spend the remainder globally.
+        let root = BlobTestRoot::new("pressure-exact-partial-budget");
+        let mut services = blob_services(0xbb);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("exact partial-budget store");
+        let first_plaintext = b"exact continuation candidate one".to_vec();
+        let second_plaintext = b"exact continuation candidate two".to_vec();
+        let first_prepared = prepared_blob(&first_plaintext);
+        let second_prepared = prepared_blob(&second_plaintext);
+        let first_proof = prepare_blob_proof_with_priority(
+            &store,
+            &mut services,
+            &first_prepared,
+            &first_plaintext,
+            1,
+            Priority::Routine,
+        );
+        let unrelated = commit_blob_proof(
+            &store,
+            &services,
+            &first_proof,
+            b"pressure-partial-unrelated",
+        )
+        .0
+        .blob()
+        .clone();
+        let second_proof = prepare_blob_proof_with_priority(
+            &store,
+            &mut services,
+            &second_prepared,
+            &second_plaintext,
+            1,
+            Priority::Routine,
+        );
+        let selected = commit_blob_proof(
+            &store,
+            &services,
+            &second_proof,
+            b"pressure-partial-selected",
+        )
+        .0
+        .blob()
+        .clone();
+        assert!(unrelated.variant_id < selected.variant_id);
+        let demand = pressure::BlobCapacityRecoveryDemand::new(
+            pressure::BlobCapacityPartition::DepotVariants,
+            Priority::Immediate,
+            1,
+        )
+        .expect("one-variant partial demand");
+        let unrelated_recovery = store
+            .run_blob_pressure_recovery(
+                demand,
+                pressure::BlobPressureRecoveryBudget::new(
+                    MAX_BLOB_PRESSURE_FINAL_ROOT_ROWS,
+                    MAX_BLOB_PRESSURE_FINAL_ROOT_BYTES,
+                    1,
+                    1,
+                    1,
+                )
+                .expect("partial unrelated pressure budget"),
+                None,
+            )
+            .expect("admit partial unrelated manifest");
+        assert_eq!(
+            unrelated_recovery.evicted_transfer_ids(),
+            &[unrelated.transfer_id]
+        );
+        let recovery = store
+            .run_blob_pressure_recovery_after_cleanup(
+                &StoreError::Blob(BlobStoreError::DepotVariantLimitExceeded {
+                    current: 2,
+                    limit: 2,
+                }),
+                Priority::Immediate,
+                None,
+                (0, 1),
+                BlobMaintenanceBudget::new(
+                    MAX_BLOB_PRESSURE_FINAL_ROOT_ROWS + 64,
+                    1,
+                    MAX_BLOB_PRESSURE_FINAL_ROOT_BYTES + 128 * 1024 * 1024,
+                )
+                .expect("one-file exact continuation budget"),
+                None,
+            )
+            .expect("select partial exact recovery")
+            .expect("typed partial exact recovery");
+        assert_eq!(recovery.evicted_transfer_ids(), &[selected.transfer_id]);
+        let continued = store
+            .continue_blob_pressure_recovery_after_cache_reconciliation(recovery)
+            .expect("run bounded exact continuation");
+        assert!(!continued.deficit_met());
+        let unrelated_manifest = deletion_manifest_for_test(&store, unrelated.variant_id);
+        let selected_manifest = deletion_manifest_for_test(&store, selected.variant_id);
+        assert_eq!(unrelated_manifest.totals.deleted, 0);
+        assert_eq!(selected_manifest.totals.deleted, 1);
     }
 
     #[test]

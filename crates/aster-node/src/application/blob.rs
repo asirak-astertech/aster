@@ -57,7 +57,7 @@ use crate::{
         AuthenticatedEventRouteCache, NodeCustodyClock, STORE_FILE, StartupEventVerification,
         blob_capacity_gc_target, cache_authenticated_blob_route_claim, ensure_principal_active,
         ensure_state_accepts_normal_operation, equivalent_blob_capacity_error,
-        open_startup_event_verifier_and_cache, recover_blob_capacity_after_cleanup,
+        open_startup_event_verifier_and_cache, recover_local_blob_capacity_after_cleanup,
         refresh_application_policy,
     },
 };
@@ -1752,7 +1752,7 @@ impl SelectedBlobNode {
             .custody_clock
             .sample()
             .map_err(|error| application_error("blob publish", error))?;
-        recover_blob_capacity_after_cleanup(
+        recover_local_blob_capacity_after_cleanup(
             &self.store,
             &self.verifier,
             source_route_cache,

@@ -2586,6 +2586,29 @@ pub(crate) fn select_physical_work_read(
     rows_budget: u64,
     bytes_budget: u64,
 ) -> Result<BlobDeletionSelection, StoreError> {
+    select_physical_work_read_inner(read, None, position, rows_budget, bytes_budget)
+}
+
+/// Selects physical work only for one previously admitted exact manifest.
+/// Missing or retry-delayed authority stops this pass; it never falls through
+/// to another manifest in the global deletion order.
+pub(crate) fn select_exact_physical_work_read(
+    read: &redb::ReadTransaction,
+    variant: BlobVariantId,
+    position: Option<&[u8]>,
+    rows_budget: u64,
+    bytes_budget: u64,
+) -> Result<BlobDeletionSelection, StoreError> {
+    select_physical_work_read_inner(read, Some(variant), position, rows_budget, bytes_budget)
+}
+
+fn select_physical_work_read_inner(
+    read: &redb::ReadTransaction,
+    exact_variant: Option<BlobVariantId>,
+    position: Option<&[u8]>,
+    rows_budget: u64,
+    bytes_budget: u64,
+) -> Result<BlobDeletionSelection, StoreError> {
     reset_discovery_observation();
     let start = deletion_position_start(position)?;
     let start_variant = match start {
@@ -2595,6 +2618,13 @@ pub(crate) fn select_physical_work_read(
         | BlobDeletionPosition::ChunkResume(variant, _)
         | BlobDeletionPosition::ManifestResume(variant) => Some(variant),
     };
+    if let (Some(exact), Some(position_variant)) = (exact_variant, start_variant)
+        && exact != position_variant
+    {
+        return Err(invariant(
+            "Exact Blob deletion cursor belongs to another variant",
+        ));
+    }
     let turn = read
         .open_table(BLOB_DELETION_METADATA)?
         .get(BLOB_DELETION_MAINTENANCE_TURN)?
@@ -2602,7 +2632,8 @@ pub(crate) fn select_physical_work_read(
         .value();
     let manifests = read.open_table(BLOB_DELETION_MANIFESTS)?;
     let mut selected = None;
-    let lower = start_variant
+    let range_start = start_variant.or(exact_variant);
+    let lower = range_start
         .as_ref()
         .map_or(std::ops::Bound::Unbounded, |variant| match start {
             BlobDeletionPosition::ManifestResume(_) => {
@@ -2610,11 +2641,16 @@ pub(crate) fn select_physical_work_read(
             }
             _ => std::ops::Bound::Included(variant.as_bytes().as_slice()),
         });
+    let upper = exact_variant
+        .as_ref()
+        .map_or(std::ops::Bound::Unbounded, |variant| {
+            std::ops::Bound::Included(variant.as_bytes().as_slice())
+        });
     let mut rows_examined = 0u64;
     let mut bytes_examined = 0u64;
     let mut last_scanned = None;
     let mut exhausted_budget = false;
-    let mut manifest_rows = manifests.range::<&[u8]>((lower, std::ops::Bound::Unbounded))?;
+    let mut manifest_rows = manifests.range::<&[u8]>((lower, upper))?;
     loop {
         if rows_examined >= rows_budget
             || bytes_examined
@@ -2630,6 +2666,11 @@ pub(crate) fn select_physical_work_read(
         };
         let (key, value) = row?;
         let variant = parse_variant_key(key.value())?;
+        if exact_variant.is_some_and(|exact| exact != variant) {
+            return Err(invariant(
+                "Exact Blob deletion selection escaped its variant",
+            ));
+        }
         let header = decode_manifest_header(value.value())?;
         if header.variant_id != variant {
             return Err(invariant(
