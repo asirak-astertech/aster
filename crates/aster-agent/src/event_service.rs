@@ -1,4 +1,9 @@
-use std::{collections::VecDeque, sync::Arc, time::Duration};
+use std::{
+    collections::VecDeque,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use aster_node::EventEmissionPolicy;
 use aster_node::application::{
@@ -11,7 +16,7 @@ use aster_node::application::{
     EventSubscriptionId, EventSubscriptionRequest, EventSyncStatus as NodeEventSyncStatus,
     EventUnsubscribe, NumberedEventPublishRequest, NumberedEventResult,
     PeerAuthorization as NodePeerAuthorization, Priority as NodePriority, Scope,
-    SelectedEventHandle, SelectedEventStatus, Topic,
+    SelectedBlobHandle, SelectedEventHandle, SelectedEventStatus, Topic,
 };
 use aster_redb_store::{CustodyRetirementReason, MAX_EVENT_PENDING_DELIVERIES};
 use connectrpc::{
@@ -21,6 +26,7 @@ use futures::StreamExt as _;
 
 use crate::{
     MAX_AGENT_RESPONSE_PROTO_BYTES, MAX_STREAM_BACKOFF_MS, MIN_STREAM_BACKOFF_MS, api,
+    blob_service::BlobConnectService,
     credentials::CredentialGeneration,
     error::{
         PublicOperation, connect_application_error, public_application_error_detail, public_error,
@@ -40,6 +46,7 @@ const PUBLISH_EVENTS_WINDOW: usize = 8;
 #[derive(Clone)]
 pub(crate) struct AsterConnectService {
     events: SelectedEventHandle,
+    blobs: Option<BlobConnectService>,
     configured_emission_policy: EventEmissionPolicy,
     credential_generation: Option<CredentialGeneration>,
     shutdown: tokio::sync::watch::Receiver<bool>,
@@ -55,16 +62,47 @@ impl AsterConnectService {
     ) -> Self {
         Self {
             events,
+            blobs: None,
             configured_emission_policy,
             credential_generation,
             shutdown,
         }
     }
 
+    /// Adds the running node's live Blob authority and validated state root.
+    pub(crate) fn with_blobs(
+        mut self,
+        blobs: SelectedBlobHandle,
+        state_root: &Path,
+    ) -> std::io::Result<Self> {
+        self.blobs = Some(BlobConnectService::new(blobs, state_root)?);
+        Ok(self)
+    }
+
     /// Builds the protocol router without exposing node internals.
     pub(crate) fn router(self) -> connectrpc::Router {
         Arc::new(self).register(connectrpc::Router::new())
     }
+}
+
+pub(crate) fn application_service_with_blobs(
+    events: SelectedEventHandle,
+    blobs: SelectedBlobHandle,
+    state_root: PathBuf,
+    configured_emission_policy: EventEmissionPolicy,
+    credential_generation: Option<CredentialGeneration>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> std::io::Result<connectrpc::ConnectRpcService<connectrpc::Router>> {
+    Ok(configured_service(
+        AsterConnectService::new(
+            events,
+            configured_emission_policy,
+            credential_generation,
+            shutdown,
+        )
+        .with_blobs(blobs, &state_root)?
+        .router(),
+    ))
 }
 
 pub(crate) fn application_service(
@@ -217,6 +255,16 @@ pub(crate) fn rejection_router() -> connectrpc::Router {
             "QueryEventGaps",
             rejection_handler::<api::QueryEventGapsRequest, api::QueryEventGapsResponse>(),
         )
+        .route_bidi_stream(
+            APPLICATION_SERVICE_NAME,
+            "PublishBlob",
+            rejection_handler::<api::PublishBlobRequest, api::PublishBlobResponse>(),
+        )
+        .route_bidi_stream(
+            APPLICATION_SERVICE_NAME,
+            "ReadBlob",
+            rejection_handler::<api::ReadBlobRequest, api::ReadBlobResponse>(),
+        )
 }
 
 #[allow(refining_impl_trait)]
@@ -241,6 +289,40 @@ impl api::AsterApplicationService for AsterConnectService {
             ),
             PublicOperation::GetStatus,
         )
+    }
+
+    async fn publish_blob(
+        &self,
+        ctx: RequestContext,
+        requests: connectrpc::InboundStream<api::PublishBlobRequest>,
+    ) -> ServiceResult<api::PublishBlobResponse> {
+        let blobs = self.blobs.as_ref().ok_or_else(|| {
+            public_error(
+                ErrorCode::FailedPrecondition,
+                api::PublicErrorReason::FailedPrecondition,
+                PublicOperation::PublishBlob,
+                false,
+                None,
+            )
+        })?;
+        blobs.publish(ctx, requests).await
+    }
+
+    async fn read_blob(
+        &self,
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, api::ReadBlobRequest>,
+    ) -> ServiceResult<ServiceStream<api::ReadBlobResponse>> {
+        let blobs = self.blobs.as_ref().ok_or_else(|| {
+            public_error(
+                ErrorCode::FailedPrecondition,
+                api::PublicErrorReason::FailedPrecondition,
+                PublicOperation::ReadBlob,
+                false,
+                None,
+            )
+        })?;
+        blobs.read(request.to_owned_message()).await
     }
 
     async fn publish_event(
