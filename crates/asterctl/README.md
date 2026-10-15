@@ -10,7 +10,7 @@ agents require a local authenticated tunnel endpoint; `--host` cannot send
 bearer tokens or Event payloads directly over a remote plaintext connection.
 
 Currently it provides `status`, `publish`, `query`, `subscribe`,
-`subscriptions`, and `unsubscribe`.
+`subscriptions`, `unsubscribe`, `blob-publish`, and `blob-read`.
 
 See man page for usage details
 
@@ -77,15 +77,64 @@ Plain-text command-line arguments may appear in process listings and shell
 history. The CLI never includes tokens or remote error messages in diagnostics.
 
 The client uses ConnectRPC with Protobuf messages over HTTP and sends one
-Bearer authorization header. The current agent accepts loopback listeners;
-`--host` does not change that server restriction. There is no TLS. Each RPC
-has a configurable timeout (10 seconds by default), a 4-MiB response limit and a
-4-MiB decoded-element budget.
+Bearer authorization header. Blob transfers use native gRPC over HTTP/2 so
+request and response pages remain bounded; the Event commands retain their
+existing Connect protocol behavior. The current agent accepts loopback
+listeners; `--host` does not change that server restriction. There is no TLS.
+Each RPC has a configurable timeout (10 seconds by default), a 4-MiB response
+limit and a 4-MiB decoded-element budget.
 Use `--timeout 30` or `--timeout=30` before or after the command to change the
 client deadline. The agent may enforce a shorter deadline: the current
 `aster-agent` caps each RPC at 30 seconds, even when the client requests more.
 Query applies a fresh deadline to each page request, not to the whole query.
 The RPC timeout does not limit time spent entering a payload on stdin.
+
+## Publish and read Blobs
+
+```sh
+asterctl --token-file ./client.token blob-publish \
+    --file ./map.bin --topic imagery.maps --scope mission/team/alpha \
+    --operation-key map-001 --media-type application/octet-stream
+
+asterctl --token-file ./client.token blob-read \
+    --id "$BLOB_ID" --topic imagery.maps --scope mission/team/alpha \
+    --output ./downloaded-map.bin
+```
+
+`blob-publish` requires a nonempty regular source file. The path remains local
+and is never sent to the agent. The client sends metadata first, then streams
+canonical chunks of at most 64 KiB without buffering the whole Blob or treating
+the current backend size policy as a public maximum. The current agent may
+reject a source above its configured backend limit. Keep the opened source
+file's contents and length unchanged until the command exits. Detectable size
+changes fail the command with an unknown publication outcome; in-place
+same-length mutation is outside the command contract and can produce mixed
+source bytes. `--schema-id` is Base64;
+`--ttl-ms` accepts positive unsigned 64-bit milliseconds, including
+`18446744073709551615`. Omitting it selects durable publication.
+
+`blob-read` requires an exact Blob ID, topic, scope, and destination. On Linux,
+it writes to an anonymous temporary inode in the pinned destination directory,
+then publishes that exact open inode with an atomic no-replace descriptor link
+after synchronization. No named partial path exists. Closing the descriptor
+discards an incomplete read, and an existing or concurrently created
+destination is never overwritten. The command fails before contacting the
+agent on non-Linux platforms and when the destination filesystem cannot create
+the required anonymous temporary. If descriptor-link publication is
+unsupported, finalization fails without publishing an output path. Every
+streamed page must have contiguous offsets, stable authenticated metadata and
+TTL, and an exact complete length. Blob bytes go only to the destination;
+stdout contains metadata and never Blob plaintext.
+
+Both text formats use exactly `TTL: durable` or `TTL: MILLISECONDS ms`. Finite
+JSON includes `"ttlMs": "MILLISECONDS"`; durable JSON omits `ttlMs`.
+`blob-publish --json` also includes `operation_key`. An identical retry with the
+same key and file is successful with `inserted: false`. If a publish result is
+unusable or its TTL does not exactly match the request, the outcome is unknown;
+retry the identical request using the same operation key.
+
+See [asterctl-blob-publish(1)](asterctl-blob-publish.1) and
+[asterctl-blob-read(1)](asterctl-blob-read.1).
 
 ## Publish
 
@@ -199,7 +248,7 @@ See [asterctl-unsubscribe(1)](asterctl-unsubscribe.1).
 
 ## Operation keys and manual recovery
 
-Both `publish` and `subscribe` require `--operation-key KEY|auto`.
+`publish`, `blob-publish`, and `subscribe` require `--operation-key KEY|auto`.
 `--operation-key auto` and `--operation-key=auto` are equivalent. An omitted
 key is an argument error (exit code `2`), detected before reading a publication
 payload from stdin or sending an RPC:

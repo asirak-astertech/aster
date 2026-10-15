@@ -1,0 +1,92 @@
+." Copyright 2026 Defense Unicorns, Inc.
+." SPDX-License-Identifier: Apache-2.0
+." Clean Room — Privileged
+.TH ASTERCTL-BLOB-PUBLISH 1 "2026-10-15" "Aster" "User Commands"
+.SH NAME
+asterctl-blob-publish \- publish a local file as an immutable Aster Blob
+.SH SYNOPSIS
+.SY asterctl
+.RI [ GLOBAL-OPTIONS ]
+.B blob-publish
+.BI \-\-file " PATH"
+.BI \-\-topic " TOPIC"
+.BI \-\-scope " SCOPE"
+.BI \-\-operation\-key " KEY|auto"
+.RI [ BLOB-OPTIONS ]
+.YS
+.SH DESCRIPTION
+.B asterctl blob-publish
+publishes one nonempty regular file through a running Aster agent.
+The local path is never sent to the agent. Metadata is sent first, followed by
+canonical bounded file chunks over one native HTTP/2 stream. The complete Blob
+is not buffered in memory. Chunks are at most 64 KiB. The CLI and wire contract
+do not impose a total-size maximum; the agent may reject a source above its
+configured backend limit.
+.PP
+The opened source file's contents and length must remain unchanged until the
+command exits. A detectable size change fails with an unknown publication
+outcome. In-place same-length mutation is outside the command contract and can
+produce a stream containing bytes from more than one source state.
+.PP
+Exactly one of
+.B \-\-token
+or
+.B \-\-token\-file
+is required; see
+.BR asterctl (1).
+.SH OPTIONS
+.TP
+.BI \-\-file " PATH"
+Required source path. It must identify a nonempty regular file and remain
+stable for the command duration as described above.
+.TP
+.BI \-\-topic " TOPIC"
+Required Blob topic of 1\(en128 approved ASCII characters.
+.TP
+.BI \-\-scope " SCOPE"
+Required exact propagation and authorization scope.
+.TP
+.BI \-\-priority " PRIORITY"
+One of routine, priority, immediate, or flash. Default: routine.
+.TP
+.BI \-\-media\-type " TYPE"
+Optional UTF-8 media type of 1\(en255 bytes.
+.TP
+.BI \-\-schema\-id " BASE64"
+Optional schema identity encoded as Base64, at most 1024 decoded bytes.
+.TP
+.BI \-\-ttl\-ms " MILLISECONDS"
+Optional positive unsigned 64-bit lifetime. Omission means durable.
+.TP
+.BI \-\-operation\-key " KEY|auto"
+Required UTF-8 key of 1\(en256 bytes, or auto to generate a new key.
+An idempotent retry must use the same key, file bytes, and publication options.
+.SH OUTPUT
+Prints Blob ID, publisher, publisher counter, priority, total length, optional
+media type, schema ID, acceptance marker, inserted state, and original TTL.
+Text renders TTL as exactly
+.B TTL: durable
+or
+.BR "TTL: MILLISECONDS ms" .
+Finite JSON uses an exact decimal string in
+.BR ttlMs ;
+durable JSON omits that field. JSON also includes
+.BR operation_key .
+Blob plaintext is never printed.
+.PP
+If the response or TTL echo is unusable, the outcome is unknown and the error
+prints exact guidance to retry the identical request with the same operation
+key.
+.SH EXIT STATUS
+.TP
+.B 0
+Publication succeeded, including an identical idempotent retry.
+.TP
+.B 1
+Publication failed or its outcome is unknown.
+.TP
+.B 2
+Invalid or missing arguments.
+.SH SEE ALSO
+.BR asterctl (1),
+.BR asterctl-blob-read (1)

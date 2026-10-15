@@ -1,4 +1,4 @@
-use crate::api;
+use crate::{api, blob_read};
 use serde::{Serialize, ser::SerializeMap};
 use serde_json::Value;
 use std::io::{self, Write};
@@ -70,6 +70,64 @@ pub fn publish(
         "operation_key": operation_key,
     };
     if let Some(ttl_ms) = response.ttl_ms {
+        fields.extend(fields! { "ttlMs": ttl_ms.to_string() });
+    }
+    Ok(serde_json::to_string_pretty(&Output::Object(fields))? + "\n")
+}
+
+pub fn publish_blob(
+    response: &api::PublishBlobResponse,
+    operation_key: &str,
+    json: bool,
+) -> Result<String, serde_json::Error> {
+    if !json {
+        return Ok(text::publish_blob(response));
+    }
+    let mut fields = fields! {
+        "id": Bytes(&response.id),
+        "publisher": Bytes(&response.publisher),
+        "publisherCounter": response.publisher_counter.to_string(),
+        "priority": response.priority,
+        "totalLen": response.total_len.to_string(),
+        "schemaId": Bytes(&response.schema_id),
+        "acceptanceMarker": response.acceptance_marker.to_string(),
+        "inserted": response.inserted,
+        "operation_key": operation_key,
+    };
+    if let Some(media_type) = &response.media_type {
+        fields.push((
+            "mediaType",
+            Output::Scalar(Value::String(media_type.clone())),
+        ));
+    }
+    if let Some(ttl_ms) = response.ttl_ms {
+        fields.extend(fields! { "ttlMs": ttl_ms.to_string() });
+    }
+    Ok(serde_json::to_string_pretty(&Output::Object(fields))? + "\n")
+}
+
+pub fn read_blob(metadata: &blob_read::Metadata, json: bool) -> Result<String, serde_json::Error> {
+    if !json {
+        return Ok(text::read_blob(metadata));
+    }
+    let mut fields = fields! {
+        "id": Bytes(&metadata.id),
+        "publisher": Bytes(&metadata.publisher),
+        "publisherCounter": metadata.publisher_counter.to_string(),
+        "topic": &metadata.topic,
+        "scope": &metadata.scope,
+        "priority": metadata.priority,
+        "totalLen": metadata.total_len.to_string(),
+        "schemaId": Bytes(&metadata.schema_id),
+        "acceptanceMarker": metadata.acceptance_marker.to_string(),
+    };
+    if let Some(media_type) = &metadata.media_type {
+        fields.push((
+            "mediaType",
+            Output::Scalar(Value::String(media_type.clone())),
+        ));
+    }
+    if let Some(ttl_ms) = metadata.ttl_ms {
         fields.extend(fields! { "ttlMs": ttl_ms.to_string() });
     }
     Ok(serde_json::to_string_pretty(&Output::Object(fields))? + "\n")
@@ -338,6 +396,57 @@ mod tests {
                 ttl_ms.map(|ms| json!(ms.to_string()))
             );
         }
+    }
+
+    #[test]
+    fn blob_metadata_output_uses_exact_ttl_and_never_contains_plaintext() {
+        let response = api::PublishBlobResponse {
+            id: vec![1; 32],
+            publisher: vec![2; 32],
+            publisher_counter: u64::MAX,
+            priority: api::Priority::Immediate.into(),
+            ttl_ms: Some(u64::MAX),
+            total_len: 65_537,
+            media_type: Some("application/octet-stream".into()),
+            schema_id: b"schema".to_vec(),
+            acceptance_marker: 9,
+            inserted: true,
+            ..Default::default()
+        };
+        let json: Value =
+            serde_json::from_str(&publish_blob(&response, "blob-key", true).unwrap()).unwrap();
+        assert_eq!(json["ttlMs"], u64::MAX.to_string());
+        assert_eq!(json["totalLen"], "65537");
+        assert_eq!(json["operation_key"], "blob-key");
+        assert_eq!(json["inserted"], true);
+        assert_eq!(json.get("chunk"), None);
+        let text = publish_blob(&response, "blob-key", false).unwrap();
+        assert!(
+            text.lines()
+                .any(|line| line == format!("  TTL: {} ms", u64::MAX))
+        );
+        assert_eq!(text_value(&text, "TTL"), format!("{} ms", u64::MAX));
+        assert_eq!(text_value(&text, "Inserted"), "Yes");
+
+        let metadata = blob_read::Metadata {
+            id: response.id,
+            publisher: response.publisher,
+            publisher_counter: response.publisher_counter,
+            topic: "imagery.maps".into(),
+            scope: "mission/team/alpha".into(),
+            priority: response.priority,
+            ttl_ms: None,
+            total_len: response.total_len,
+            media_type: response.media_type,
+            schema_id: response.schema_id,
+            acceptance_marker: response.acceptance_marker,
+        };
+        let json: Value = serde_json::from_str(&read_blob(&metadata, true).unwrap()).unwrap();
+        assert_eq!(json.get("ttlMs"), None);
+        assert_eq!(json.get("chunk"), None);
+        let text = read_blob(&metadata, false).unwrap();
+        assert!(text.lines().any(|line| line == "  TTL: durable"));
+        assert_eq!(text_value(&text, "TTL"), "durable");
     }
 
     #[test]
