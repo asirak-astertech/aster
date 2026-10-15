@@ -108,6 +108,8 @@ impl LaneId {
 pub(crate) enum TransferProfileId {
     LegacyV6 = 1,
     EventPagesV1 = 2,
+    // 3 is reserved for the approved BlobCustodyV1 design.
+    BlobRangesStreamV1 = 4,
 }
 
 impl TransferProfileId {
@@ -115,6 +117,7 @@ impl TransferProfileId {
         match value {
             1 => Some(Self::LegacyV6),
             2 => Some(Self::EventPagesV1),
+            4 => Some(Self::BlobRangesStreamV1),
             _ => None,
         }
     }
@@ -135,7 +138,7 @@ impl TransferProfileOfferV1 {
                 ),
                 (
                     LaneId::Blob as u16,
-                    vec![TransferProfileId::LegacyV6 as u16],
+                    vec![TransferProfileId::BlobRangesStreamV1 as u16],
                 ),
                 (
                     LaneId::Record as u16,
@@ -158,12 +161,14 @@ impl TransferProfileOfferV1 {
 
     #[cfg(test)]
     pub(crate) fn legacy_only() -> Self {
-        Self {
-            lanes: LaneId::DESCENDING
-                .into_iter()
-                .map(|lane| (lane as u16, vec![TransferProfileId::LegacyV6 as u16]))
-                .collect(),
-        }
+        let mut offer = Self::current();
+        offer
+            .lanes
+            .iter_mut()
+            .find(|(lane, _)| *lane == LaneId::Event as u16)
+            .unwrap()
+            .1 = vec![TransferProfileId::LegacyV6 as u16];
+        offer
     }
 
     #[cfg(test)]
@@ -239,7 +244,17 @@ impl TransferProfileOfferV1 {
                 continue;
             };
             known_lanes.insert(lane);
-            if !profiles.contains(&(TransferProfileId::LegacyV6 as u16)) {
+            if lane != LaneId::Blob
+                && profiles.contains(&(TransferProfileId::BlobRangesStreamV1 as u16))
+            {
+                return Err(EventPagesError::invalid(
+                    "BlobRangesStreamV1 is valid only for the Blob lane",
+                ));
+            }
+            if !profiles.contains(&(TransferProfileId::LegacyV6 as u16))
+                && !(lane == LaneId::Blob
+                    && profiles.contains(&(TransferProfileId::BlobRangesStreamV1 as u16)))
+            {
                 return Err(EventPagesError::invalid(
                     "every fixed lane must offer LegacyV6",
                 ));
@@ -1862,7 +1877,7 @@ mod tests {
             offer.known_lanes(),
             vec![
                 (LaneId::EventBridge, vec![TransferProfileId::LegacyV6]),
-                (LaneId::Blob, vec![TransferProfileId::LegacyV6]),
+                (LaneId::Blob, vec![TransferProfileId::BlobRangesStreamV1]),
                 (LaneId::Record, vec![TransferProfileId::LegacyV6]),
                 (LaneId::State, vec![TransferProfileId::LegacyV6]),
                 (
@@ -2206,6 +2221,48 @@ mod tests {
         assert!(oversized.encode().is_err());
     }
 
+    #[test]
+    fn blob_stream_only_offer_matches_versioned_vector() {
+        let encoded = TransferProfileOfferV1::current().encode().unwrap();
+        assert_eq!(
+            format!(
+                "# aster-blob-ranges-stream-vectors/v1\tsemantic=7\toracle=python-stdlib\nACCEPT\toffer-blob-stream-only-v1\t{}\n",
+                vector_hex(&encoded)
+            ),
+            include_str!("../../../conformance/vectors/blob-ranges-stream-v1.tsv")
+        );
+        assert_eq!(
+            TransferProfileOfferV1::decode(&encoded).unwrap(),
+            TransferProfileOfferV1::current()
+        );
+    }
+
+    #[test]
+    fn blob_ranges_stream_rejects_unsupported_peer_without_fallback() {
+        let current = TransferProfileOfferV1::current();
+        let legacy = legacy_only_offer();
+        let selected = negotiate_transfer_profiles(&current, &current).unwrap();
+        assert_eq!(selected.profile(LaneId::Blob).unwrap() as u16, 4);
+        assert_eq!(TransferProfileId::decode(3), None);
+        let mut reserved = current.clone();
+        reserved
+            .lanes
+            .iter_mut()
+            .find(|(lane, _)| *lane == LaneId::Blob as u16)
+            .unwrap()
+            .1 = vec![3, 1];
+        assert!(negotiate_transfer_profiles(&current, &reserved).is_err());
+        assert!(negotiate_transfer_profiles(&reserved, &current).is_err());
+        for (left, right) in [(&current, &legacy), (&legacy, &current)] {
+            let error = negotiate_transfer_profiles(left, right).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("no common transfer profile for lane 4")
+            );
+        }
+    }
+
     fn legacy_only_offer() -> TransferProfileOfferV1 {
         TransferProfileOfferV1::from_lanes(vec![
             (LaneId::EventBridge, vec![TransferProfileId::LegacyV6]),
@@ -2227,7 +2284,14 @@ mod tests {
     }
 
     fn canonical_event_page_vectors() -> Vec<(&'static str, Vec<u8>)> {
-        let current = TransferProfileOfferV1::current();
+        // Historical vectors bind the original explicit offers, not new defaults.
+        let mut current = TransferProfileOfferV1::current();
+        current
+            .lanes
+            .iter_mut()
+            .find(|(lane, _)| *lane == LaneId::Blob as u16)
+            .unwrap()
+            .1 = vec![TransferProfileId::LegacyV6 as u16];
         let legacy = legacy_only_offer();
         let current_profiles = negotiate_transfer_profiles(&current, &current).unwrap();
         let fallback_profiles = negotiate_transfer_profiles(&current, &legacy).unwrap();
@@ -2625,7 +2689,7 @@ mod tests {
             }
         );
 
-        let legacy = legacy_only_offer();
+        let legacy = TransferProfileOfferV1::legacy_only();
         let fallback_profiles = negotiate_transfer_profiles(&current, &legacy).unwrap();
         let fallback_digest = transfer_profile_digest(&current, &legacy, &fallback_profiles);
         let fallback = build_local_event_send_plan(
@@ -2652,7 +2716,7 @@ mod tests {
     #[test]
     fn asymmetric_page_support_falls_back_to_complete_legacy_direction() {
         let current = TransferProfileOfferV1::current();
-        let legacy = legacy_only_offer();
+        let legacy = TransferProfileOfferV1::legacy_only();
         let profiles = negotiate_transfer_profiles(&current, &legacy).unwrap();
         let digest = transfer_profile_digest(&current, &legacy, &profiles);
         let difference = vec![id(1), id(2)];
@@ -3051,7 +3115,7 @@ mod tests {
             "EventPagesV1 must not accept an exact LegacyActive substitution"
         );
 
-        let legacy = legacy_only_offer();
+        let legacy = TransferProfileOfferV1::legacy_only();
         let legacy_profiles = negotiate_transfer_profiles(&current, &legacy).unwrap();
         let legacy_digest = transfer_profile_digest(&current, &legacy, &legacy_profiles);
         let legacy_plan = EventTurnPlanV1::LegacyActive {

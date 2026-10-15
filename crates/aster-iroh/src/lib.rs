@@ -2118,6 +2118,7 @@ pub struct Connection {
     path_witness: Arc<Mutex<PathWitness>>,
     security_profile: CarrierSecurityProfile,
     uni_turn_state: Arc<Mutex<UniTurnState>>,
+    additional_uni_pair: Arc<Mutex<Option<UniTurnRole>>>,
 }
 
 impl Connection {
@@ -2176,12 +2177,38 @@ impl Connection {
             path_witness,
             security_profile,
             uni_turn_state: Arc::new(Mutex::new(UniTurnState::initial(uni_turn_role))),
+            additional_uni_pair: Arc::new(Mutex::new(Some(uni_turn_role))),
         }
     }
 
     /// Returns this connection's local carrier endpoint identity.
+    ///
+    /// This does not expose mission identity.
     pub fn local_id(&self) -> EndpointId {
         self.local_id
+    }
+
+    /// Starts the one optional additional role-ordered uni-turn pair.
+    ///
+    /// The caller must bilaterally negotiate this extension. Both original
+    /// turns must have completed (or been explicitly skipped). Clones share
+    /// admission; a third pair and reset of an active turn are rejected.
+    pub fn begin_additional_uni_pair(&self) -> Result<(), CarrierError> {
+        let mut state = lock_uni_turn_state(&self.uni_turn_state)?;
+        if *state != UniTurnState::Complete {
+            return Err(CarrierError::Transport(
+                "previous uni-turn pair is incomplete".into(),
+            ));
+        }
+        let mut admission = self
+            .additional_uni_pair
+            .lock()
+            .map_err(|_| CarrierError::Transport("uni-turn pair admission lock poisoned".into()))?;
+        let role = admission.take().ok_or_else(|| {
+            CarrierError::Transport("additional uni-turn pair already admitted".into())
+        })?;
+        *state = UniTurnState::initial(role);
+        Ok(())
     }
 
     /// Returns the authenticated remote endpoint identity.
@@ -4847,6 +4874,23 @@ mod tests {
         assert!(server_task.await.expect("server task").is_err());
 
         connection.close();
+        client.close().await;
+        server.close().await;
+    }
+
+    #[tokio::test]
+    async fn additional_uni_pair_requires_completed_first_pair_and_is_single_use() {
+        let (server, client, receiver, sender) = direct_connection_pair().await;
+        assert!(sender.begin_additional_uni_pair().is_err());
+        for connection in [&sender, &receiver] {
+            connection.skip_uni_turn().unwrap();
+            connection.skip_uni_turn().unwrap();
+            connection.begin_additional_uni_pair().unwrap();
+            assert!(connection.clone().begin_additional_uni_pair().is_err());
+            connection.skip_uni_turn().unwrap();
+            connection.skip_uni_turn().unwrap();
+            assert!(connection.begin_additional_uni_pair().is_err());
+        }
         client.close().await;
         server.close().await;
     }

@@ -2483,6 +2483,34 @@ impl Store {
         }
     }
 
+    /// Corrupts a test-owned prefix's source binding without changing its size.
+    /// Exercises real append and abort coherence failures, not injected results.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn test_corrupt_blob_carrier_prefix_source(
+        &self,
+        source: BlobTransferId,
+        object: BlobCarrierObjectId,
+    ) -> Result<(), StoreError> {
+        let write = self.database.begin_write()?;
+        let key = blob_carrier_prefix_key(source, object);
+        let mut table = write.open_table(BLOB_CARRIER_PREFIXES)?;
+        let encoded = table
+            .get(key.as_slice())?
+            .expect("test prefix exists")
+            .value()
+            .to_vec();
+        let mut record = decode_blob_carrier_prefix(&encoded)?;
+        let mut other = *source.as_bytes();
+        other[0] ^= 1;
+        record.source = BlobTransferId::new(other);
+        let encoded = encode_blob_carrier_prefix(&record)?;
+        table.insert(key.as_slice(), encoded.as_slice())?;
+        drop(table);
+        write.commit()?;
+        Ok(())
+    }
+
     /// Atomically clears only one exact carrier object's durable progress.
     ///
     /// A source mismatch cannot delete another source's object. Missing state

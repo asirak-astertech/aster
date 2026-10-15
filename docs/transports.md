@@ -476,8 +476,8 @@ descending order:
   receipt-free ordered pages for exact durable, finite-TTL, tombstone,
   route-only, mixed, and bounded blind ReceiveOnly traffic when both peers
   advertise `EventPagesV1`; only older/non-page peers use the complete
-  semantic-v6 Event mechanics. State, Record, Blob, and EventBridge always use
-  mandatory `LegacyV6` in this increment. Page send is an attempt, not proof of
+  semantic-v6 Event mechanics. State, Record, and EventBridge use
+  `LegacyV6`. Blob requires `BlobRangesStreamV1`; both peers must support it. Page send is an attempt, not proof of
   remote delivery.
 - **Semantic version 6** remains a compatibility option. It inherits ordinary Event,
   compact-batch, custody, State/Record, and Blob behavior from version 5 and
