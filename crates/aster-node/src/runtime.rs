@@ -7672,13 +7672,10 @@ enum TestBlobContactFault {
     AppendCoherence = 9,
     CommitLeaseCapacity = 10,
     RangeLeaseCapacity = 11,
-    AppendCapacity = 12,
     HoldPromotion = 13,
     StageRetryCoherence = 14,
-    AppendRetryCoherence = 15,
     PromotionRetryCoherence = 16,
     StageCapacityThenRetryCoherence = 17,
-    AppendCapacityThenRetryCoherence = 18,
     PromotionCapacityThenRetryCoherence = 19,
     PendingLifetimeExpiry = 20,
     PendingLifetimeDiscontinuity = 21,
@@ -7763,9 +7760,6 @@ impl TestBlobContactFaultState {
         let retry = match fault {
             TestBlobContactFault::StageCapacityThenRetryCoherence => {
                 Some(TestBlobContactFault::StageRetryCoherence)
-            }
-            TestBlobContactFault::AppendCapacityThenRetryCoherence => {
-                Some(TestBlobContactFault::AppendRetryCoherence)
             }
             TestBlobContactFault::PromotionCapacityThenRetryCoherence => {
                 Some(TestBlobContactFault::PromotionRetryCoherence)
@@ -24742,7 +24736,7 @@ fn serve_verified_blob_range_in_schedule(
                     object,
                     offset,
                     usize::try_from(requested_len).expect("u32 fits usize"),
-                    &plan,
+                    plan,
                 ),
             BlobContactMode::CustodyV1 => store.read_completed_blob_carrier_range_with_policy(
                 guard.policy(),
@@ -24752,7 +24746,7 @@ fn serve_verified_blob_range_in_schedule(
                 object,
                 offset,
                 usize::try_from(requested_len).expect("u32 fits usize"),
-                &plan,
+                plan,
             ),
         }
     };
@@ -24767,7 +24761,7 @@ fn serve_verified_blob_range_in_schedule(
                 object,
                 offset,
                 usize::try_from(requested_len).expect("u32 fits usize"),
-                &plan,
+                plan,
             ),
         BlobContactMode::CustodyV1 => store.read_completed_blob_carrier_range_with_policy(
             guard.policy(),
@@ -24777,7 +24771,7 @@ fn serve_verified_blob_range_in_schedule(
             object,
             offset,
             usize::try_from(requested_len).expect("u32 fits usize"),
-            &plan,
+            plan,
         ),
     };
     #[cfg(test)]
@@ -40085,7 +40079,8 @@ mod tests {
                         assert_eq!(error.operation(), "blob read page");
                         assert!(matches!(
                             error.kind(),
-                            ApplicationErrorKind::RequestRejected
+                            ApplicationErrorKind::NotFound
+                                | ApplicationErrorKind::RequestRejected
                                 | ApplicationErrorKind::UnauthorizedOrRevoked
                                 | ApplicationErrorKind::PolicyUnsettled
                                 | ApplicationErrorKind::ResourceLimit
@@ -43180,7 +43175,8 @@ mod tests {
                     Err(error)
                         if matches!(
                             error.kind(),
-                            ApplicationErrorKind::RequestRejected
+                            ApplicationErrorKind::NotFound
+                                | ApplicationErrorKind::RequestRejected
                                 | ApplicationErrorKind::UnauthorizedOrRevoked
                                 | ApplicationErrorKind::PolicyUnsettled
                         ) =>
@@ -47128,141 +47124,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_blob_append_capacity_runs_recovery_and_retries_once() {
-        let mut missions = issue_missions(2);
-        let receiver = missions.pop().expect("append receiver mission");
-        let source_mission = missions.pop().expect("append source mission");
-        let authority = source_mission.credentials.mission_authority_id();
-        let topic = Topic::new("opaque").expect("append pressure topic");
-        let scope = Scope::new("test/runtime-contact").expect("append pressure scope");
-        let interests = || {
-            MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
-                topic.clone(),
-                scope.clone(),
-                false,
-            )])
-        };
-        let low_state = root("blob-append-pressure-low-source");
-        let source_state = root("blob-append-pressure-source");
-        let receiver_state = root("blob-append-pressure-receiver");
-        for state in [&low_state, &source_state, &receiver_state] {
-            fs::create_dir_all(state).expect("append pressure state");
-        }
-        let low_store = Store::open_for_mission(low_state.join(STORE_FILE), authority)
-            .expect("append low source store");
-        let mut low_verifier = open_test_sealer(&source_mission.credentials);
-        let evicted = publish_test_blob_with_priority(
-            &low_store,
-            &mut low_verifier,
-            &topic,
-            &scope,
-            1,
-            Priority::Routine,
-            &[0x78; 4 * 1024],
-        );
-        let evicted_sealed = low_store
-            .get_blob(evicted)
-            .expect("append low source lookup")
-            .expect("append low source")
-            .sealed;
-        let source_store = Arc::new(
-            Store::open_for_mission(source_state.join(STORE_FILE), authority)
-                .expect("append pressure source store"),
-        );
-        let mut source_verifier = open_test_sealer(&source_mission.credentials);
-        let incoming = publish_test_blob_with_priority(
-            &source_store,
-            &mut source_verifier,
-            &topic,
-            &scope,
-            1,
-            Priority::Flash,
-            &[0x79; 4 * 1024],
-        );
-        let receiver_store = Arc::new(
-            Store::open_for_mission(receiver_state.join(STORE_FILE), authority)
-                .expect("append pressure receiver store"),
-        );
-        let mut receiver_verifier = open_test_sealer(&receiver.credentials);
-        let unrelated = publish_test_blob_with_priority(
-            &receiver_store,
-            &mut receiver_verifier,
-            &topic,
-            &scope,
-            1,
-            Priority::Flash,
-            &[0x7a; 4 * 1024],
-        );
-        let append_fault = install_test_blob_contact_fault(
-            receiver.credentials.identity(),
-            TestBlobContactFault::AppendCapacity,
-        );
-        let source_cache = test_event_route_cache(&source_store, &source_mission.credentials);
-        let receiver_cache = test_event_route_cache(&receiver_store, &receiver.credentials);
-        stage_test_pending_blob(
-            &receiver_store,
-            &receiver_cache,
-            &receiver.credentials,
-            evicted,
-            &evicted_sealed,
-        );
-        prime_remote_blob_policy_for_pressure(&receiver_store);
-
-        for _ in 0..16 {
-            let _ = blob_contact_test_pair_with_caches(
-                source_store.clone(),
-                source_mission.credentials.clone(),
-                interests(),
-                Arc::clone(&source_cache),
-                receiver_store.clone(),
-                receiver.credentials.clone(),
-                interests(),
-                Arc::clone(&receiver_cache),
-                None,
-                None,
-                None,
-                None,
-                0,
-            )
-            .await;
-            if receiver_store
-                .get_blob(incoming)
-                .expect("append-pressure incoming lookup")
-                .is_some()
-            {
-                break;
-            }
-        }
-
-        assert!(append_fault.fired.load(Ordering::Acquire));
-        assert_eq!(receiver_cache.blob_stage_admission_attempts(), 1);
-        assert_eq!(receiver_cache.blob_carrier_append_attempts(), 2);
-        assert_eq!(receiver_cache.blob_carrier_commit_attempts(), 1);
-        assert_eq!(receiver_cache.blob_promotion_attempts(), 1);
-        assert_eq!(receiver_cache.blob_capacity_recovery_attempts(), 1);
-        assert_single_blob_recovery_retries_identical(
-            &receiver_cache,
-            |step| matches!(step, TestBlobAdmissionTrace::Append { source, .. } if *source == incoming),
-        );
-        assert!(!receiver_cache.has_blob_claim_for_test(evicted));
-        assert!(
-            receiver_store
-                .pending_blob_source(evicted)
-                .expect("append-evicted pending source lookup")
-                .is_none()
-        );
-        assert!(receiver_cache.has_blob_claim_for_test(unrelated));
-        assert!(receiver_cache.has_blob_claim_for_test(incoming));
-
-        drop(low_store);
-        drop(source_store);
-        drop(receiver_store);
-        for state in [low_state, source_state, receiver_state] {
-            fs::remove_dir_all(state).expect("append pressure cleanup");
-        }
-    }
-
-    #[tokio::test]
     async fn remote_blob_staging_retry_propagates_injected_invariant() {
         let mut missions = issue_missions(2);
         let receiver = missions.pop().expect("staging retry receiver mission");
@@ -47351,126 +47212,6 @@ mod tests {
         drop(receiver_store);
         for state in [source_state, receiver_state] {
             fs::remove_dir_all(state).expect("staging retry cleanup");
-        }
-    }
-
-    #[tokio::test]
-    async fn remote_blob_append_retry_propagates_injected_invariant() {
-        let mut missions = issue_missions(2);
-        let receiver = missions.pop().expect("append retry receiver mission");
-        let source_mission = missions.pop().expect("append retry source mission");
-        let authority = source_mission.credentials.mission_authority_id();
-        let topic = Topic::new("opaque").expect("append retry topic");
-        let scope = Scope::new("test/runtime-contact").expect("append retry scope");
-        let interests = || {
-            MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
-                topic.clone(),
-                scope.clone(),
-                false,
-            )])
-        };
-        let low_state = root("blob-append-retry-invariant-low");
-        let source_state = root("blob-append-retry-invariant-source");
-        let receiver_state = root("blob-append-retry-invariant-receiver");
-        for state in [&low_state, &source_state, &receiver_state] {
-            fs::create_dir_all(state).expect("append retry state");
-        }
-        let low_store = Store::open_for_mission(low_state.join(STORE_FILE), authority)
-            .expect("append retry low store");
-        let mut low_verifier = open_test_sealer(&source_mission.credentials);
-        let evicted = publish_test_blob_with_priority(
-            &low_store,
-            &mut low_verifier,
-            &topic,
-            &scope,
-            1,
-            Priority::Routine,
-            &[0x83; 4 * 1024],
-        );
-        let evicted_sealed = low_store
-            .get_blob(evicted)
-            .expect("append retry low lookup")
-            .expect("append retry low source")
-            .sealed;
-        let source_store = Arc::new(
-            Store::open_for_mission(source_state.join(STORE_FILE), authority)
-                .expect("append retry source store"),
-        );
-        let mut source_verifier = open_test_sealer(&source_mission.credentials);
-        let incoming = publish_test_blob_with_priority(
-            &source_store,
-            &mut source_verifier,
-            &topic,
-            &scope,
-            1,
-            Priority::Flash,
-            &[0x84; 4 * 1024],
-        );
-        let receiver_store = Arc::new(
-            Store::open_for_mission(receiver_state.join(STORE_FILE), authority)
-                .expect("append retry receiver store"),
-        );
-        let retry_fault = install_test_blob_contact_fault(
-            receiver.credentials.identity(),
-            TestBlobContactFault::AppendCapacityThenRetryCoherence,
-        );
-        let source_cache = test_event_route_cache(&source_store, &source_mission.credentials);
-        let receiver_cache = test_event_route_cache(&receiver_store, &receiver.credentials);
-        stage_test_pending_blob(
-            &receiver_store,
-            &receiver_cache,
-            &receiver.credentials,
-            evicted,
-            &evicted_sealed,
-        );
-        prime_remote_blob_policy_for_pressure(&receiver_store);
-
-        let mut receiver_error = None;
-        for _ in 0..16 {
-            let (receiver_result, _) = blob_contact_test_pair_with_caches_results(
-                Arc::clone(&source_store),
-                source_mission.credentials.clone(),
-                interests(),
-                Arc::clone(&source_cache),
-                Arc::clone(&receiver_store),
-                receiver.credentials.clone(),
-                interests(),
-                Arc::clone(&receiver_cache),
-                None,
-                None,
-                None,
-                None,
-                0,
-            )
-            .await;
-            if let Err(error) = receiver_result {
-                receiver_error = Some(error);
-                break;
-            }
-        }
-
-        assert!(
-            matches!(
-                &receiver_error,
-                Some(NodeError::FatalBlobCoherence(message))
-                    if message.contains("carrier append retry coherence failure")
-            ),
-            "unexpected append retry result: {receiver_error:?}"
-        );
-        assert!(retry_fault.exhausted());
-        assert_eq!(receiver_cache.blob_stage_admission_attempts(), 1);
-        assert_eq!(receiver_cache.blob_carrier_append_attempts(), 2);
-        assert_eq!(receiver_cache.blob_capacity_recovery_attempts(), 1);
-        assert!(!receiver_cache.has_blob_claim_for_test(evicted));
-        assert!(receiver_cache.has_blob_claim_for_test(incoming));
-
-        drop(low_store);
-        drop(source_cache);
-        drop(receiver_cache);
-        drop(source_store);
-        drop(receiver_store);
-        for state in [low_state, source_state, receiver_state] {
-            fs::remove_dir_all(state).expect("append retry cleanup");
         }
     }
 
@@ -48337,7 +48078,7 @@ mod tests {
         .expect("inject pre-promotion cache claim");
         conflicting_promotion.retention = BlobSourceRetention::Pending;
         conflicting_promotion.depot_completion = None;
-        conflicting_promotion.metadata_fingerprint[0] ^= 0x40;
+        conflicting_promotion.manifest_digest[0] ^= 0x40;
         promotion_cache
             .insert_blob(&source_verifier, conflicting_promotion)
             .expect("cache conflicting pre-promotion claim");
@@ -49305,24 +49046,26 @@ mod tests {
                                     with_test_contact_hooks(
                                         server_reconciliation_exchanges_before_defer,
                                         Vec::new(),
-                                        serve_connection_with_forwarding(InboundContact {
-                                            store: server_store,
-                                            connection,
-                                            mission: server_mission,
-                                            expected_peer: Some(peer),
-                                            #[cfg(feature = "nearby-discovery")]
-                                            automatic_admission: None,
-                                            policy_lock: Arc::new(RwLock::new(())),
-                                            emission_policy: server_policy,
-                                            custody_clock: NodeCustodyClock::injected(
-                                                [0xb1; 16],
-                                                server_clock_tick_ms,
-                                                0,
-                                            ),
-                                            event_route_cache: server_cache,
-                                            event_bridge: server_bridge,
-                                            mutable_interests: server_interests,
-                                        }),
+                                        Box::pin(serve_connection_with_forwarding(
+                                            InboundContact {
+                                                store: server_store,
+                                                connection,
+                                                mission: server_mission,
+                                                expected_peer: Some(peer),
+                                                #[cfg(feature = "nearby-discovery")]
+                                                automatic_admission: None,
+                                                policy_lock: Arc::new(RwLock::new(())),
+                                                emission_policy: server_policy,
+                                                custody_clock: NodeCustodyClock::injected(
+                                                    [0xb1; 16],
+                                                    server_clock_tick_ms,
+                                                    0,
+                                                ),
+                                                event_route_cache: server_cache,
+                                                event_bridge: server_bridge,
+                                                mutable_interests: server_interests,
+                                            },
+                                        )),
                                     ),
                                 ),
                             ),
@@ -49344,7 +49087,7 @@ mod tests {
                             with_test_contact_hooks(
                                 client_reconciliation_exchanges_before_defer,
                                 Vec::new(),
-                                sync_once_with_forwarding(
+                                Box::pin(sync_once_with_forwarding(
                                     &client,
                                     OutboundContact {
                                         store: client_store,
@@ -49372,7 +49115,7 @@ mod tests {
                                         mutable_interests: client_interests,
                                         controlled_relay: None,
                                     },
-                                ),
+                                )),
                             ),
                         ),
                     ),
@@ -54447,7 +54190,7 @@ mod tests {
                         with_test_contact_hooks(
                             server_defer,
                             server_races,
-                            serve_connection_with_forwarding(InboundContact {
+                            Box::pin(serve_connection_with_forwarding(InboundContact {
                                 store,
                                 connection,
                                 mission: credentials,
@@ -54460,7 +54203,7 @@ mod tests {
                                 event_route_cache: server_event_route_cache,
                                 event_bridge: None,
                                 mutable_interests: MutableSourceInterests::default(),
-                            }),
+                            })),
                         ),
                     )
                     .await;
@@ -54474,7 +54217,7 @@ mod tests {
                 with_test_contact_hooks(
                     client_defer,
                     client_races,
-                    sync_once_with_forwarding(
+                    Box::pin(sync_once_with_forwarding(
                         client,
                         OutboundContact {
                             store: client_store,
@@ -54498,7 +54241,7 @@ mod tests {
                             mutable_interests: MutableSourceInterests::default(),
                             controlled_relay: None,
                         },
-                    ),
+                    )),
                 ),
             )
             .await;
@@ -59916,7 +59659,7 @@ mod tests {
             matching_interest.clone(),
         )
         .await;
-        if mission.semantic_version() == SEMANTIC_PROTOCOL_V7 {
+        if mission.semantic_version() >= SEMANTIC_PROTOCOL_V7 {
             defer_empty_mutable_classes(&client_mission, &connection, &mut mission, &mut receipt)
                 .await;
             assert_eq!(
@@ -59933,13 +59676,13 @@ mod tests {
             connection
                 .finish_as_initiator()
                 .await
-                .expect("finish low-level v7 initiator");
+                .expect("finish low-level profiled initiator");
             server_task
                 .take()
                 .expect("unconsumed server task")
                 .await
                 .expect("server task")
-                .expect("v7 contact must finish without disclosing the hidden ID");
+                .expect("profiled contact must finish without disclosing the hidden ID");
         } else if mission.semantic_version() >= MIN_CUSTODY_SEMANTIC_VERSION {
             finish_v3_event_lane(
                 &connection,
