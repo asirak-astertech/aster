@@ -1,6 +1,6 @@
 # Aster Mesh Protocol Specification
 
-- Specification version: 0.1.0-draft.2
+- Specification version: 0.1.0-draft.3
 - Wire major/minor: 1.0
 - Status: reference draft; not production-authorized
 - Date: 2026-08-25
@@ -747,7 +747,13 @@ contact and sends or discloses no mutable interest, inventory, ID, or object.
 This is stricter than the bounded mandatory reply traffic allowed while
 receiving selected Event work.
 
-### 9.2 Selected semantic-v5 direct Blob transfer
+### 9.2 Historical semantic-v5 direct Blob transfer
+
+This section retains the original versioned byte definitions and source/storage
+invariants. Protocol draft.3 no longer implements the legacy carrier dialogue;
+selected Blob carrier transfer requires profile 3 in §9.4 and
+[Blob range streaming](blob-ranges-stream.md). The historical Result/Ack and
+Finish/Finished records are not an available runtime fallback.
 
 Semantic version `5` inherits the exact Event behavior of versions `1` through
 `4` and the semantic-v4 State/Record mechanics above. It additionally allocates
@@ -997,23 +1003,30 @@ Blob mechanics. Immediately after the four-flight handshake, the
 initiator sends and the responder returns one protected canonical
 `TransferProfileOfferV1`. Known lane IDs are `1` Event, `2` State, `3` Record,
 `4` Blob, and `5` EventBridge. Known profile IDs are `1` `LegacyV6`, `2`
-`EventPagesV1`, and `3` `BlobCustodyV1`. Lanes and profiles are strictly
-descending and unique. Every known lane MUST offer `LegacyV6`; only Event may
-offer `EventPagesV1`, and only Blob may offer `BlobCustodyV1`. Unknown
+`EventPagesV1`, and `3` `BlobRangesStreamV1`. Lanes and profiles are strictly
+descending and unique. Event, State, Record, and EventBridge MUST offer
+`LegacyV6`. Blob offers MUST contain `LegacyV6` or `BlobRangesStreamV1`;
+the selected runtime offers only `BlobRangesStreamV1`. Only Event may offer
+`EventPagesV1`, and only Blob may offer `BlobRangesStreamV1`. Unknown
 IDs with bit `0x8000` set are critical and fail the contact; other unknown IDs
 remain canonical digest input but are not selected.
 
 Both peers compute the same highest common profile independently for each lane
 and bind the complete canonical offers plus intersections into
 `transfer_profile_digest`. The current offer selects `EventPagesV1` for Event
-when both peers support it and `LegacyV6` for State, Record, Blob, and
-EventBridge. A v7 offer is byte-identical to its prior canonical encoding and
-offers Blob only `[LegacyV6]`. A v8 offer changes only the Blob profile list to
-`[BlobCustodyV1, LegacyV6]`. Thus semantic v8 never removes another data class;
-it allocates Blob custody negotiation only. A missing mandatory legacy profile,
-an empty intersection, digest mismatch, or profile substitution fails closed.
+when both peers support it, `BlobRangesStreamV1` for Blob when both peers offer
+it, and `LegacyV6` for State, Record, and EventBridge. Blob has no legacy
+fallback: an authenticated peer without profile 3 fails profile intersection;
+semantic-v5/v6 Blob carrier attempts are explicitly rejected before carrier IO.
+This is the selected-runtime compatibility break, not a reinterpretation of old
+frame bytes. Historical codecs/vectors remain readable but do not enable legacy
+Blob transfer. No other data class changes its profile or grammar. Semantic v7
+uses profile 3 with durable-only policy; semantic v8 uses the same stream with
+authenticated finite-TTL custody. See [receipt-free Blob ranges](blob-ranges-stream.md)
+for the versioned profile contract. A missing required profile, empty
+intersection, digest mismatch, or profile substitution fails closed.
 
-`BlobCustodyV1` is selected only in a semantic-v8 session. It allocates the
+Semantic-v8 custody allocates the
 following Blob-only extension to the existing mutable tags without allocating
 any new tag. After the existing length-prefixed source bytes in a Blob
 `MutableOffer` or `MutableObject`, v8 appends:
@@ -1046,12 +1059,10 @@ overhead is 211 bytes and each result/ack field is 33 bytes. The exact selected
 v8 mutable contact byte reserve is 32,407,284 bytes, 554 bytes above the v7
 reserve; frame and item counts are unchanged.
 
-This grammar and the shared verified capability do not activate finite Blob
-inventory, offer/fetch scheduling, pending insertion, carrier work, cursor
-advancement, or promotion. A Blob lane selected as `LegacyV6`, including every
-v7 session and any v8 fallback, suppresses finite-Blob source transfer; the
-current `BlobCustodyV1` runtime also fails closed before finite storage until the
-later lifecycle increment is enabled.
+Finite Blob inventory, offer/fetch scheduling, pending insertion, carrier work,
+cursor advancement, and promotion require semantic-v8 authenticated custody.
+Semantic-v7 profile 3 suppresses finite Blob transfer while retaining the same
+durable-only range-stream mechanics.
 
 Each Event direction then exchanges one `EventTurnPlanV1`: `PageActive`,
 `PageBlindActive`, `LegacyActive`, `Empty`, or `Suppressed`. `PageActive` binds
@@ -1906,7 +1917,7 @@ The semantic-version inheritance registry is normative:
 | `5` | v4 | direct Blob transfer |
 | `6` | v5 ordinary lanes byte-for-byte | Event bridge transfer |
 | `7` | v6 byte-for-byte | per-lane transfer profiles and receipt-free Event pages |
-| `8` | v7 byte-for-byte except the v8 Blob offer and lane AAD domain | `BlobCustodyV1` negotiation allocation; finite Blob transfer remains suppressed under `LegacyV6` |
+| `8` | v7 byte-for-byte except the lane AAD domain and Blob custody fields | authenticated finite Blob custody over `BlobRangesStreamV1` |
 
 An inherited version retains every earlier stable encoding and selected-lane
 rule unless the registry names an additional mechanic. In particular, semantic
@@ -2080,7 +2091,7 @@ and visible quota/eviction policy. Evictions and conflicts surface to the app.
 | message | 1 Interest, 2 Summary, 3 Probe, 4 Node, 5 Offer, 6 Want, 7 Data, 8 Receipt |
 | transfer object kind | semantic 1: 1 source envelope, 2 Blob chunk; semantics 2 through 8 add 3 source-batch proof, 4 bridge authorization, 5 bridge-route wrapper; later mechanics allocate no new object kind |
 | semantic-v7/v8 lane | 1 Event, 2 State, 3 Record, 4 Blob, 5 EventBridge; critical extension bit `0x8000` |
-| semantic-v7/v8 transfer profile | 1 `LegacyV6`, 2 `EventPagesV1`, 3 `BlobCustodyV1` (Blob only, v8 only); critical extension bit `0x8000` |
+| semantic-v7/v8 transfer profile | 1 `LegacyV6`, 2 `EventPagesV1`, 3 `BlobRangesStreamV1` (Blob only; v7 durable-only, v8 authenticated custody); critical extension bit `0x8000` |
 | semantic-v7/v8 mechanics tag | `0xd1` TransferProfileOfferV1, `0xd2` EventTurnPlanV1, `0xd3` ChangeTurnHeaderV1, `0xd4` ChangePageV7, `0xd5` ChangeTurnFinishedV1 |
 | source envelope format | 2 singleton hybrid authentication; semantics 2 through 8 add 3 content-committing batch authentication |
 | batch authentication mode | 1 exact proof reference, Merkle path, and P-256 item signature |

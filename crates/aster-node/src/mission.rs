@@ -3550,7 +3550,7 @@ mod tests {
             .expect("negotiate v8 profiles");
         let digest = crate::event_pages::transfer_profile_digest(&offer, &offer, &negotiated);
         let lane = crate::event_pages::LaneId::Blob;
-        let profile = crate::event_pages::TransferProfileId::BlobCustodyV1;
+        let profile = crate::event_pages::TransferProfileId::BlobRangesStreamV1;
         let direction = EventDirection::ToSessionResponder;
 
         let v8 = sender

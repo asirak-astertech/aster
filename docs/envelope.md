@@ -1,6 +1,6 @@
 # Aster Fixed Binary Security Objects
 
-- Specification version: 0.1.0-draft.1
+- Specification version: 0.1.0-draft.2
 - Stable wire/cryptographic profile: `1`, suite `0x0001`
 - Negotiated semantic versions: default/highest `8`, compatibility `7`, `6`, `5`, `4`, `3`, `2`, and `1`
 - Status: normative for the implemented reference profile
@@ -1398,7 +1398,8 @@ associated data is:
 "ASTER-RECORD-AAD-v1" || sequence u64 || b32(application_aad)
 ```
 
-The semantic-v7/v8 Event plan/header/page/terminal records use this exact
+The subsequent semantic-v7/v8 Event plan/header/page/terminal records and
+`BlobRangesStreamV1` schedule/acceptance/data/terminal records use this exact
 application AAD:
 
 ```text
@@ -1420,9 +1421,13 @@ and the profile digest are defined in [protocol.md](protocol.md) section 9.4.
 Semantic v8 uses the byte-identical field layout with the exact context domain
 `"ASTER/v8-lane-record/v1" || 0x00` and `semantic_version u16 = 8`.
 Opening under another semantic version/domain or a different digest, lane,
-profile, or direction MUST fail authentication. The profile offer and every negotiated `LegacyV6`
-Event/State/Record/Blob/EventBridge frame keep the ordinary exact ASCII
+profile, or direction MUST fail authentication. The profile offer and every
+negotiated `LegacyV6` Event/State/Record/EventBridge frame keep the ordinary exact ASCII
 application AAD `"aster/transport-frame/v1"`; v1-v6 bytes remain unchanged.
+Blob source metadata also retains ordinary AAD, while carrier streaming binds
+lane `4`, profile `3`, and its exact direction. The selected runtime no longer
+executes legacy Blob carrier Result/Ack or Finish/Finished exchanges; their
+historical byte definitions below are not a fallback path.
 
 AES-256-GCM uses the directional traffic key from §8 and the transmitted nonce.
 The nonce is not derived from the record sequence. Both AAD domains share the

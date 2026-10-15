@@ -274,6 +274,9 @@ pub fn fuzz_structured_v7_mechanics_frame(
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub fn fuzz_decode_mechanics_frame(input: &[u8]) -> bool {
+    if input.starts_with(b"ABRS") {
+        return runtime::blob_ranges_stream::fuzz_schedule(input);
+    }
     let Ok(frame) = frame::Frame::decode(input) else {
         return false;
     };

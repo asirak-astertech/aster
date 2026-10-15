@@ -34,6 +34,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Faster Blob transfers. Breaking change: both nodes must be updated.
+- Replaced libp2p-based tests with Event delivery and reconnection tests using Iroh. Removed the unused libp2p provider and its dependencies.
+- Fixed a test failure caused by `iroh` in the checkout directory name.
 - Upgrade dependencies: Iroh 1.3.0 (public DNS disabled)
 - Reduced CI turnaround with Rust compiler caching and partitioned nextest runs.
 - Prefiltered Event query candidates before authentication to avoid unnecessary verification work.
