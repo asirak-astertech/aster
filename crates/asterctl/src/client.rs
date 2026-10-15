@@ -537,6 +537,7 @@ pub async fn subscribe(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
     use std::{
         future::poll_fn,
         sync::{Arc, Mutex},
@@ -596,6 +597,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn receipt(metadata: &api::PublishBlobMetadata) -> api::PublishBlobResponse {
         api::PublishBlobResponse {
             id: vec![1; 32],
@@ -612,6 +614,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn read_page(offset: u64, chunk: Vec<u8>, complete: bool) -> api::ReadBlobResponse {
         api::ReadBlobResponse {
             id: vec![1; 32],
@@ -633,9 +636,13 @@ mod tests {
     }
 
     fn test_path(suffix: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         std::env::temp_dir().join(format!(
-            "asterctl-native-http2-{}-{suffix}",
-            std::process::id()
+            "asterctl-native-http2-{}-{}-{suffix}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
         ))
     }
 
@@ -823,6 +830,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn blob_native_http2_fixture_covers_multi_page_publish_and_read_clients() {
         let payload = vec![0x5a; blob_publish::CHUNK_BYTES + 1];
@@ -967,6 +975,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_publish_error_fixtures_keep_their_sources_isolated() {
+        let (rejected, unavailable) = tokio::join!(
+            publish_error(connectrpc::ConnectError::new(
+                connectrpc::ErrorCode::InvalidArgument,
+                "fixture rejection",
+            )),
+            publish_error(connectrpc::ConnectError::unavailable("fixture unavailable")),
+        );
+        assert_eq!(rejected.reason, "invalid_argument");
+        assert!(!rejected.unknown);
+        assert_eq!(unavailable.reason, "unavailable");
+        assert!(unavailable.unknown);
+    }
+
+    #[tokio::test]
     async fn blob_native_http2_fixture_preserves_rpc_error_and_unknown_outcome_classification() {
         let key = crate::operation_key::Selection::Explicit("blob-key".into())
             .resolve()
@@ -1063,6 +1086,7 @@ mod tests {
         std::fs::remove_file(source).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn blob_native_http2_read_error_discards_anonymous_partial_output() {
         let router = connectrpc::Router::new().route_server_stream(
@@ -1101,6 +1125,7 @@ mod tests {
         fixture.stop().await;
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn blob_native_http2_read_failure_leaves_no_named_partial_or_unrelated_damage() {
         let directory = test_path("cleanup-directory");

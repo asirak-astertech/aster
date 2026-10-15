@@ -169,6 +169,7 @@ fn blob_publish_rejects_a_writerless_fifo_without_blocking_preflight() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn blob_read_rejects_an_existing_output_without_clobbering_it() {
     let output_path = source(b"keep me");
@@ -193,6 +194,40 @@ fn blob_read_rejects_an_existing_output_without_clobbering_it() {
         String::from_utf8(output.stderr)
             .unwrap()
             .contains("output path already exists")
+    );
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn blob_read_rejects_unsupported_platforms_before_contact_or_output_creation() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let destination = TestPath::new("unsupported-read");
+    let output = cli([
+        OsString::from("blob-read"),
+        "--token".into(),
+        TOKEN.into(),
+        "--id".into(),
+        BLOB_ID.into(),
+        "--topic".into(),
+        "imagery.maps".into(),
+        "--scope".into(),
+        "mission/team/alpha".into(),
+        "--output".into(),
+        destination.path().as_os_str().to_owned(),
+        "--port".into(),
+        listener.local_addr().unwrap().port().to_string().into(),
+    ]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("blob-read output is unsupported on this platform")
+    );
+    assert!(!destination.path().exists());
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
     );
 }
 
@@ -224,7 +259,7 @@ fn blob_commands_require_every_semantic_and_path_argument() {
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn blob_commands_preserve_non_utf8_native_paths() {
     use std::os::unix::ffi::OsStringExt as _;
