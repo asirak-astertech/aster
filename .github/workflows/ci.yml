@@ -29,6 +29,7 @@ env:
 
 jobs:
   quality:
+    needs: cargo-lockfiles
     name: quality
     runs-on: ubuntu-24.04
     # Keep headroom for exact-Python setup, support checks, and runner variance.
@@ -153,6 +154,26 @@ jobs:
           CARGO_NET_OFFLINE: "true"
         run: mise run agent-process-smoke
 
+  cargo-lockfiles:
+    name: Cargo lockfiles
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - *checkout-source
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.97.1 --profile minimal
+
+      - name: Test stale-lockfile rejection offline
+        env:
+          RUSTUP_TOOLCHAIN: "1.97.1"
+        run: python3 tools/test-check-cargo-lockfiles.py
+
+      - name: Validate every committed Cargo dependency graph
+        env:
+          RUSTUP_TOOLCHAIN: "1.97.1"
+        run: sh tools/check-cargo-lockfiles.sh
+
   path-lab-smoke:
     name: path-lab netem smoke
     runs-on: ubuntu-24.04
@@ -190,6 +211,7 @@ jobs:
             --containerlab "$RUNNER_TEMP/containerlab"
 
   path-delivery-smoke:
+    needs: cargo-lockfiles
     name: path-lab real Event delivery
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -223,6 +245,7 @@ jobs:
             --docker "$(command -v docker)"
 
   macos-tests:
+    needs: cargo-lockfiles
     name: macOS tests
     runs-on: macos-14
     timeout-minutes: 30
@@ -268,6 +291,7 @@ jobs:
         run: sh tools/test-aster-mesh-playground-real.sh
 
   rust-clippy:
+    needs: cargo-lockfiles
     name: Rust Clippy
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -291,6 +315,7 @@ jobs:
         run: mise run check-clippy
 
   rust-tests:
+    needs: cargo-lockfiles
     name: Rust tests (${{ matrix.partition }}/2)
     runs-on: ubuntu-24.04
     timeout-minutes: 35
@@ -337,6 +362,7 @@ jobs:
         run: sh tools/with-test-resources.sh cargo test --locked --workspace --all-features --doc
 
   msrv:
+    needs: cargo-lockfiles
     name: Rust 1.91 MSRV
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -355,6 +381,7 @@ jobs:
         run: cargo +1.91.0 check --locked --workspace --all-targets --all-features
 
   age-reference-interop:
+    needs: cargo-lockfiles
     name: age reference interoperability
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -393,6 +420,7 @@ jobs:
         run: mise run age-reference-interop
 
   dependency-policy:
+    needs: cargo-lockfiles
     name: dependency policy
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -432,15 +460,11 @@ jobs:
           cargo +1.97.1 deny fetch all
           CARGO_NET_OFFLINE=true sh ./tools/check-dependency-exception-scope.sh
           cargo +1.97.1 audit \
-            --ignore RUSTSEC-2026-0118 \
-            --ignore RUSTSEC-2026-0119 \
             --file Cargo.lock
 
       - name: Enforce dependency policy offline
         run: |
           python3 tools/check-netlink-packet-core-patch.py
-          CARGO="cargo +1.97.1" python3 tools/check-retained-libp2p-oracle-boundary.py
-          python3 tools/test-retained-libp2p-oracle-boundary.py
           CARGO_NET_OFFLINE=true sh ./tools/check-dependency-exception-scope.sh
           CARGO_NET_OFFLINE=true sh ./tools/test-dependency-exception-scope.sh
           cargo +1.97.1 deny --locked --offline check
@@ -450,6 +474,7 @@ jobs:
         run: cargo +1.97.1 audit --no-fetch --file fuzz/Cargo.lock
 
   fuzz-smoke:
+    needs: cargo-lockfiles
     name: bounded fuzz smoke
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -479,17 +504,11 @@ jobs:
           CARGO_NET_OFFLINE: "true"
         run: sh ./tools/run-fuzz-smoke.sh
 
-  runtime-volume-diagnostic:
-    name: Run manual runtime-volume diagnostic
-    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/ci-runtime-volume-diagnostic'
-    uses: ./.github/workflows/diagnostic-runtime-volume.yml
-    permissions:
-      contents: read
-
   required:
     name: required
     if: ${{ always() }}
     needs:
+      - cargo-lockfiles
       - quality
       - rust-clippy
       - rust-tests
@@ -507,6 +526,7 @@ jobs:
         # This aggregation job does not check out the repository.
         shell: bash
         env:
+          LOCKFILES_RESULT: ${{ needs.cargo-lockfiles.result }}
           QUALITY_RESULT: ${{ needs.quality.result }}
           RUST_CLIPPY_RESULT: ${{ needs.rust-clippy.result }}
           RUST_TESTS_RESULT: ${{ needs.rust-tests.result }}
@@ -520,6 +540,7 @@ jobs:
         run: |
           umask 077
           for result in \
+            "$LOCKFILES_RESULT" \
             "$QUALITY_RESULT" \
             "$RUST_CLIPPY_RESULT" \
             "$RUST_TESTS_RESULT" \

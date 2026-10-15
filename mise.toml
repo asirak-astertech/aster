@@ -23,6 +23,7 @@ run = [
 [tasks.check-foundation]
 description = "Run formatting, policy, traceability, and receipt checks"
 run = [
+  "sh tools/check-cargo-lockfiles.sh",
   "cargo fmt --all -- --check",
   "sh tools/check-agent-proto.sh",
   "python3 tools/check-project-license.py",
@@ -30,6 +31,7 @@ run = [
   "python3 tools/check-protocol-version-contract.py",
   "python3 tools/test-protocol-version-contract.py",
   "python3 tools/test-run-fuzz-smoke.py",
+  "python3 tools/test-check-cargo-lockfiles.py",
   "python3 tools/test_aster_tour_ui.py",
   "python3 tools/test_aster_mesh_playground.py",
   "python3 tools/test_aster_lan_mvp.py",
@@ -58,8 +60,6 @@ run = [
   "python3 tools/check-selected-node-dependency-boundary.py",
   "python3 tools/check-netlink-packet-core-patch.py",
   "sh tools/test-netlink-packet-core-patch.sh",
-  "python3 tools/check-retained-libp2p-oracle-boundary.py",
-  "python3 tools/test-retained-libp2p-oracle-boundary.py",
   "sh ./tools/check-dependency-exception-scope.sh",
   "sh ./tools/test-dependency-exception-scope.sh",
 ]
@@ -240,13 +240,6 @@ description = "Verify active pilot and lock-only advisory dispositions cannot es
 run = [
   "sh ./tools/check-dependency-exception-scope.sh",
   "sh ./tools/test-dependency-exception-scope.sh",
-]
-
-[tasks.retained-oracle-boundary]
-description = "Verify the rejected libp2p provider remains an unpublished, opt-in lab oracle"
-run = [
-  "python3 tools/check-retained-libp2p-oracle-boundary.py",
-  "python3 tools/test-retained-libp2p-oracle-boundary.py",
 ]
 
 [tasks.protocol-version-contract]

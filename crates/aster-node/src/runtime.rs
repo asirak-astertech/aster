@@ -44313,7 +44313,253 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn current_stack_near_two_mib_events_each_direction() {
+        // The fixture's hybrid source-authentication envelope is just over 10 KiB.
+        // Reserve 11 KiB (the smallest whole-KiB margin that fits), and check the
+        // actual sealed size before contact rather than changing the wire limit.
+        current_stack_event_regression("near-two-mib", MAX_OBJECT_BYTES - 11 * 1024, 2, false)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn current_stack_exact_64_kib_event_after_fresh_auth_reconnect() {
+        current_stack_event_regression("64-kib-reconnect", 64 * 1024, 1, true).await;
+    }
+
+    async fn current_stack_event_regression(
+        label: &str,
+        payload_size: usize,
+        count: usize,
+        reconnect: bool,
+    ) {
+        let services = control_test_services([0xd7; 32]);
+        let states = [
+            root(&format!("{label}-server")),
+            root(&format!("{label}-client")),
+        ];
+        let missions = [services.member, services.other];
+        let mut stores = Vec::new();
+        let mut endpoints = Vec::new();
+        for (index, state) in states.iter().enumerate() {
+            fs::create_dir_all(state).expect("isolated store parent");
+            let store = Arc::new(
+                Store::open_for_mission(
+                    state.join(STORE_FILE),
+                    missions[index].mission_authority_id(),
+                )
+                .expect("mission store"),
+            );
+            seed_test_event_subscription(
+                &store,
+                EventSubscriptionMode::Consume,
+                &services.topic,
+                &services.scope,
+                b"current-stack-consume",
+            );
+            stores.push(store);
+            endpoints.push(
+                Endpoint::bind(
+                    aster_iroh::SecretKey::generate(),
+                    EndpointConfig::direct("127.0.0.1:0".parse().expect("loopback")),
+                )
+                .await
+                .expect("persistent endpoint"),
+            );
+        }
+        let node = |index: usize| TestForwardingNode {
+            store: stores[index].clone(),
+            mission: missions[index].clone(),
+            policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+            clock: NodeCustodyClock::injected([0xd7 + index as u8; 16], 0, 0),
+            reconciliation_exchanges_before_defer: None,
+            preopen_custody_races: vec![],
+        };
+        let ids = [endpoints[0].id(), endpoints[1].id()];
+        let addresses = [loopback(&endpoints[0]), loopback(&endpoints[1])];
+        if reconnect {
+            let (client, server, _, _) = contact_test_pair_on_endpoints(
+                &endpoints[0],
+                &endpoints[1],
+                missions[1].identity(),
+                node(0),
+                node(1),
+            )
+            .await;
+            assert_eq!(client.expect("first client authentication").fetched, 0);
+            assert_eq!(server.expect("first server authentication").fetched, 0);
+        }
+        let mut publications = Vec::new();
+        for index in 0..2 {
+            let mut sealer = open_test_sealer(&missions[index]);
+            for ordinal in 0..count {
+                let payload = vec![0x40 + (index * count + ordinal) as u8; payload_size];
+                let id = publish_test_epoch_one_event_with_payload(
+                    &stores[index],
+                    &mut sealer,
+                    &services.topic,
+                    &services.scope,
+                    format!("{label}-{index}-{ordinal}").as_bytes(),
+                    &payload,
+                    Priority::Routine,
+                );
+                let sealed_size = stores[index]
+                    .get_event(id)
+                    .expect("published lookup")
+                    .expect("published Event")
+                    .sealed
+                    .len();
+                assert!(
+                    sealed_size <= MAX_OBJECT_BYTES,
+                    "sealed Event {sealed_size} exceeds {MAX_OBJECT_BYTES}"
+                );
+                let overhead = sealed_size
+                    .checked_sub(payload_size)
+                    .expect("envelope overhead");
+                assert!(overhead > 10 * 1024 && overhead <= 11 * 1024);
+                eprintln!("current-stack payload={payload_size} sealed={sealed_size}");
+                publications.push((index, id, payload));
+            }
+        }
+        if reconnect {
+            // The carrier is unchanged, but a fresh mission check must reject the
+            // wrong expected identity before newly published Events can be delivered.
+            let (client, server, client_inserted, server_inserted) =
+                contact_test_pair_on_endpoints(
+                    &endpoints[0],
+                    &endpoints[1],
+                    services.excluded.identity(),
+                    node(0),
+                    node(1),
+                )
+                .await;
+            assert!(client.is_err());
+            assert!(matches!(
+                server,
+                Err(NodeError::Mission(
+                    MissionSessionError::MissionIdentityMismatch { .. }
+                ))
+            ));
+            assert!(!client_inserted.load(Ordering::SeqCst));
+            assert!(!server_inserted.load(Ordering::SeqCst));
+            for (source, id, _) in &publications {
+                assert!(
+                    stores[1 - source]
+                        .get_event(*id)
+                        .expect("denied lookup")
+                        .is_none()
+                );
+            }
+        }
+        let (client, server, client_inserted, server_inserted) = contact_test_pair_on_endpoints(
+            &endpoints[0],
+            &endpoints[1],
+            missions[1].identity(),
+            node(0),
+            node(1),
+        )
+        .await;
+        let client = client.expect("authenticated client transfer");
+        let server = server.expect("authenticated server transfer");
+        assert_eq!(client.fetched, count);
+        assert_eq!(server.fetched, count);
+        assert_eq!(client.offered, count);
+        assert_eq!(server.offered, count);
+        assert!(client_inserted.load(Ordering::SeqCst));
+        assert!(server_inserted.load(Ordering::SeqCst));
+        for (source, id, expected) in &publications {
+            let receiver = 1 - source;
+            let stored = stores[receiver]
+                .get_event(*id)
+                .expect("received lookup")
+                .expect("received Event");
+            let original = stores[*source]
+                .get_event(*id)
+                .expect("source lookup")
+                .expect("source Event");
+            assert_eq!(stored.sealed, original.sealed);
+            let mut verifier = open_test_sealer(&missions[receiver]);
+            let route = verifier
+                .verify_event(&stored.sealed)
+                .expect("source authentication");
+            let EventContentVerification::ContentVerified { payload, .. } = verifier
+                .verify_event_content(route, &stored.sealed)
+                .expect("content authentication")
+            else {
+                panic!("receiver must have a content grant")
+            };
+            assert_eq!(&payload, expected);
+            assert_eq!(payload.len(), payload_size);
+        }
+        assert_eq!([endpoints[0].id(), endpoints[1].id()], ids);
+        assert_eq!(
+            [loopback(&endpoints[0]), loopback(&endpoints[1])],
+            addresses
+        );
+        let (client, server, _, _) = contact_test_pair_on_endpoints(
+            &endpoints[0],
+            &endpoints[1],
+            missions[1].identity(),
+            node(0),
+            node(1),
+        )
+        .await;
+        assert_eq!(client.expect("converged client").fetched, 0);
+        assert_eq!(server.expect("converged server").fetched, 0);
+        for store in &stores {
+            assert_eq!(
+                store.event_count().expect("exact final count"),
+                (2 * count) as u64
+            );
+        }
+        for endpoint in endpoints {
+            endpoint.close().await;
+        }
+        drop(stores);
+        for state in states {
+            fs::remove_dir_all(state).expect("store cleanup");
+        }
+    }
+
     async fn contact_test_pair_with_forwarding_results_tracked(
+        server_node: TestForwardingNode,
+        client_node: TestForwardingNode,
+    ) -> (
+        Result<CompletedPeerContact, NodeError>,
+        Result<CompletedPeerContact, NodeError>,
+        Arc<AtomicBool>,
+        Arc<AtomicBool>,
+    ) {
+        let server = Endpoint::bind(
+            aster_iroh::SecretKey::generate(),
+            EndpointConfig::direct("127.0.0.1:0".parse().expect("server address")),
+        )
+        .await
+        .expect("server endpoint");
+        let client = Endpoint::bind(
+            aster_iroh::SecretKey::generate(),
+            EndpointConfig::direct("127.0.0.1:0".parse().expect("client address")),
+        )
+        .await
+        .expect("client endpoint");
+        let expected_client = client_node.mission.identity();
+        let result = contact_test_pair_on_endpoints(
+            &server,
+            &client,
+            expected_client,
+            server_node,
+            client_node,
+        )
+        .await;
+        client.close().await;
+        server.close().await;
+        result
+    }
+
+    async fn contact_test_pair_on_endpoints(
+        server: &Endpoint,
+        client: &Endpoint,
+        expected_client: NodeId,
         server_node: TestForwardingNode,
         client_node: TestForwardingNode,
     ) -> (
@@ -44342,28 +44588,17 @@ mod tests {
         let client_event_route_cache = test_event_route_cache(&client_store, &client_mission);
         let server_event_inserted = Arc::new(AtomicBool::new(false));
         let client_event_inserted = Arc::new(AtomicBool::new(false));
-        let server = Endpoint::bind(
-            aster_iroh::SecretKey::generate(),
-            EndpointConfig::direct("127.0.0.1:0".parse().expect("server address")),
-        )
-        .await
-        .expect("server endpoint");
-        let client = Endpoint::bind(
-            aster_iroh::SecretKey::generate(),
-            EndpointConfig::direct("127.0.0.1:0".parse().expect("client address")),
-        )
-        .await
-        .expect("client endpoint");
         let server_task = tokio::spawn({
             let server = server.clone();
             let store = server_store;
             let credentials = server_mission.clone();
             let allowed = BTreeSet::from([client.id()]);
-            let peer = MissionPeerBinding::new(client.id(), client_mission.identity());
+            let peer = MissionPeerBinding::new(client.id(), expected_client);
             let event_inserted = server_event_inserted.clone();
             async move {
                 let connection = server.accept(&allowed).await.expect("accept carrier");
-                CONTACT_EVENT_INSERTED
+                let closing_connection = connection.clone();
+                let result = CONTACT_EVENT_INSERTED
                     .scope(
                         event_inserted,
                         with_test_contact_hooks(
@@ -44385,7 +44620,8 @@ mod tests {
                             }),
                         ),
                     )
-                    .await
+                    .await;
+                (result, closing_connection)
             }
         });
         let snapshot = client_policy.snapshot().expect("client policy snapshot");
@@ -44396,14 +44632,14 @@ mod tests {
                     client_defer,
                     client_races,
                     sync_once_with_forwarding(
-                        &client,
+                        client,
                         OutboundContact {
                             store: client_store,
                             mission: client_mission,
                             peer: MissionExpectedPeer {
                                 carrier: ExpectedPeer {
                                     id: server.id(),
-                                    address: loopback(&server),
+                                    address: loopback(server),
                                 },
                                 mission: server_mission.identity(),
                             }
@@ -44423,9 +44659,9 @@ mod tests {
                 ),
             )
             .await;
-        let server_receipt = server_task.await.expect("server task");
-        client.close().await;
-        server.close().await;
+        let (server_receipt, connection) = server_task.await.expect("server task");
+        // Both production contacts have finished before disconnecting; endpoints survive.
+        connection.close();
         (
             client_receipt,
             server_receipt,

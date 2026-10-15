@@ -22,9 +22,7 @@ lock_hickory_packages=$(
     }
   ' "$repository_root/Cargo.lock"
 )
-expected_lock_hickory_packages='hickory-proto 0.25.2
-hickory-proto 0.26.1
-hickory-resolver 0.25.2'
+expected_lock_hickory_packages='hickory-proto 0.26.1'
 
 if [ "$lock_hickory_packages" != "$expected_lock_hickory_packages" ]; then
   printf '%s\n' 'dependency-exception scope failed: unexpected lock-only Hickory package set' >&2
@@ -125,4 +123,4 @@ if printf '%s\n' "$fuzz_packages" | awk '
   exit 1
 fi
 
-printf '%s\n' 'dependency-exception scope passed: RUSTSEC-2026-0173 is isolated to aster-provisioning-age; unmaintained paste is absent from the lock and active graphs; Hickory 0.25.2 remains lock-only/inactive while safe 0.26.1 is permitted; ignored packages are absent from fuzz'
+printf '%s\n' 'dependency-exception scope passed: RUSTSEC-2026-0173 is isolated to aster-provisioning-age; unmaintained paste is absent from the lock and active graphs; Hickory 0.25.2 is absent while safe 0.26.1 is permitted; ignored packages are absent from fuzz'
