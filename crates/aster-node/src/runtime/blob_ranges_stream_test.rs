@@ -12,6 +12,7 @@ pub(super) enum Boundary {
     AppendCapacity,
     PrefixConflict,
     UnavailableGap,
+    SenderLifecycle,
 }
 
 pub(super) struct Fault {
@@ -22,6 +23,8 @@ pub(super) struct Fault {
     pub receiver_paused: tokio::sync::Notify,
     pub release_sender: tokio::sync::Notify,
     pub release_receiver: tokio::sync::Notify,
+    pub sender_schedule_ranges: AtomicU64,
+    pub sender_service_attempts: AtomicU64,
 }
 
 fn registry() -> &'static StdMutex<BTreeMap<usize, Arc<Fault>>> {
@@ -47,11 +50,28 @@ pub(super) fn install_boundary(
         receiver_paused: tokio::sync::Notify::new(),
         release_sender: tokio::sync::Notify::new(),
         release_receiver: tokio::sync::Notify::new(),
+        sender_schedule_ranges: AtomicU64::new(0),
+        sender_service_attempts: AtomicU64::new(0),
     });
     let mut registry = registry().lock().unwrap();
     registry.insert(sender as *const Store as usize, fault.clone());
     registry.insert(receiver as *const Store as usize, fault.clone());
     fault
+}
+
+pub(super) fn record_sender_schedule(store: &Store, ranges: usize) {
+    if let Some(fault) = get(store) {
+        fault.sender_schedule_ranges.store(
+            u64::try_from(ranges).expect("bounded Blob range count fits u64"),
+            Ordering::Release,
+        );
+    }
+}
+
+pub(super) fn record_sender_service_attempt(store: &Store) {
+    if let Some(fault) = get(store) {
+        fault.sender_service_attempts.fetch_add(1, Ordering::AcqRel);
+    }
 }
 
 pub(super) fn remove(store: &Store) {
