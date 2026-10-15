@@ -9,7 +9,7 @@ the complete protocol and semantic reference implementation.
 | Event | Direct Iroh or one operator-pinned controlled Iroh relay | Live Rust handle, stopped Rust handle, and local ConnectRPC agent |
 | State | Class-specific direct-Iroh reconciliation | Cloneable live Rust handle and exclusive stopped Rust facade |
 | Record | Class-specific direct-Iroh reconciliation | Cloneable live Rust handle and exclusive stopped Rust facade |
-| Blob | Semantic-v5 direct source/carrier transfer | Cloneable live Rust handle, exclusive stopped Rust handle, and encrypted local depot |
+| Blob | Semantic-v7/v8 profile-4 direct range stream; v7 durable-only, v8 authenticated finite custody | Cloneable live Rust handle, exclusive stopped Rust handle, and encrypted local depot |
 
 Read the diagrams from broadest to narrowest: application surfaces, runtime
 ownership, then the publication and contact flows for each mechanism. Exact
@@ -40,7 +40,7 @@ flowchart LR
     Record --> Exclusive
     Blob --> Depot["Encrypted local depot"]
     Actor --> Depot
-    Actor --> Network["Event · State · Record · v5 Blob reconciliation"]
+    Actor --> Network["Event · State · Record · v7/v8 Blob reconciliation"]
 ```
 
 The running actor and stopped handles never own the store at the same time.
@@ -49,8 +49,9 @@ the running actor, or use their stopped facades after the actor exits. Objects
 published through either mode reconcile under the same authority. Blob
 applications likewise publish through the live handle or stopped facade; the
 live handle returns only bounded pages, while the stopped facade supports
-caller-owned streaming. Semantic v5 separately transfers already-durable Blob
-sources and bounded carrier prefixes directly between content-capable peers.
+caller-owned streaming. Semantic v7/v8 profile 4 separately transfers Blob
+sources and bounded carrier prefixes directly between content-capable peers;
+v7 is durable-only and v8 additionally admits authenticated finite custody.
 
 ### Runtime trust path
 
@@ -279,8 +280,9 @@ owned, already-open regular file positioned at byte zero, rejects empty input,
 and is capped at 64 MiB/1,024 canonical 64-KiB chunks. A live read returns one
 freshly authenticated, zeroize-on-drop plaintext page of `1..=64 KiB`; the
 stopped facade retains its synchronous caller-owned streaming interface. The
-runtime separately adds semantic-v5 Blob source and carrier-range frames; v1-v4
-emit none. `BlobId` commits the exact plaintext bytes, canonical chunk profile,
+runtime separately uses semantic-v7/v8 profile-4 Blob source and range-stream
+frames; v5/v6 carrier attempts fail before IO. `BlobId` commits the exact
+plaintext bytes, canonical chunk profile,
 and media/schema identity metadata. It is not a metadata-independent whole-byte
 content identifier.
 
@@ -389,8 +391,10 @@ open strictly checks exact bidirectional correspondence among base rows,
 lifecycle rows, typed references, permanent fences, accounting, and cursor
 shape; it does not repair a partial or contradictory current schema.
 
-Under semantic v5, a content-capable receiver reconciles exact Blob source IDs
-before requesting only missing, peer-neutral 16-KiB carrier prefixes. Every
+Under semantic v7/v8 profile 4, a content-capable receiver reconciles exact Blob
+source IDs before requesting only missing, peer-neutral 16-KiB carrier prefixes.
+V7 selects durable work only; v8 also selects finite work with exact
+authenticated custody provenance. Every
 source and range send requires the authenticated peer's current exact content
 proof plus route and nonrevocation authority. Pending bytes remain outside
 ordinary publication until the exact depot, full-content, and current-lineage
@@ -435,12 +439,13 @@ then schedules background pages behind operational priority and yields between
 bounded filesystem units. An exact depot byte, chunk, or variant capacity
 failure may run one separately bounded, cursor-neutral pass over exact
 already-unreferenced work and retry the admission once. Other resource limits
-do not trigger that pass. Policy-invalidated live publications are retired as
-one bounded atomic unit with their operation and delivery aliases; permanent
-fences remain, and retained retirement records expire after 45 days of
-accumulated conservative lower-bound age. Finite Blob TTL, pressure eviction,
-route-only custody, and public protocol/API/CLI lifecycle controls are not
-implemented.
+do not trigger that pass. Proven expiry and eligible pressure recovery retire
+exact work as one bounded atomic unit; policy or continuity failures otherwise
+withhold or reject it. Permanent fences remain, and retained retirement records
+expire after 45 days of accumulated conservative lower-bound age. Finite Blob
+TTL and bounded strictly-lower-priority pressure recovery are selected under
+semantic-v8 custody. Route-only custody and public protocol/API/CLI lifecycle
+controls remain unimplemented.
 
 ## Live application command and status flow
 

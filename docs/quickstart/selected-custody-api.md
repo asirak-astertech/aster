@@ -3,13 +3,15 @@
 The selected runtime applies source-authenticated priority and finite TTL to
 Event and route-only Event custody. It also exposes aggregate logical-store
 limits, exact-scope custody quotas, a minimum emitted priority, and receive-only
-operation. State, Record, and Blob remain outside Event custody, priority, and
-TTL pressure. Their independent semantic-v4/v5 lanes still run during `Normal`
-and `AtLeast` contacts; `AtLeast` is an Event threshold only. `ReceiveOnly`
+operation. State and Record remain outside Event custody, priority, and TTL
+pressure. Blob has an independent semantic-v8 authenticated finite-custody and
+storage-pressure policy; semantic v7 Blob work is durable-only. The independent
+State/Record v4-v8 and Blob v7/v8 lanes still run during `Normal` and
+`AtLeast` contacts; `AtLeast` is an Event threshold only. `ReceiveOnly`
 initiates or discloses none of those lanes. See the selected State, Record, and
 Blob API guides for their application surfaces and limits.
 
-Semantic v7 does not weaken this custody contract. When both peers negotiate
+Semantic v7/v8 does not weaken this custody contract. When both peers negotiate
 `EventPagesV1`, durable Events, tombstones, and finite-TTL non-tombstones use
 receipt-free Event pages. Every finite entry carries session-authenticated
 cumulative custody age and is checked for continuity, policy, and expiry before
@@ -226,17 +228,17 @@ order:
 
 Protected live delivery, causal, tombstone, and equivocation rows are not
 ordinary victims; absolute expiry may still retire them. This route-first
-policy and the absence of State/Record/Blob custody
+policy and the absence of State/Record and route-only Blob custody
 mean the implementation does **not** claim the broader requirement that every
 store class always evicts the globally lowest priority first.
 
 ## Understand emission modes
 
-| Policy | Contact initiation | Event/control object emission | Semantic-v4/v5 State/Record and v5 Blob | Authenticated inbound work |
+| Policy | Contact initiation | Event/control object emission | State/Record v4-v8 and Blob v7/v8 profile 4 | Authenticated inbound work |
 |---|---|---|---|---|
-| `Normal` | yes | every eligible priority | full interested mutable lanes plus v5 Blob work | accepted within policy and quota |
-| `AtLeast(p)` | yes | only Events at or above `p`; required contact/control work continues | full interested mutable lanes plus v5 Blob work; `p` is Event-only | accepted within policy and quota |
-| `ReceiveOnly` | no | no discovery or local inventory disclosure, control object, or Event object | zero State/Record/Blob interest, inventory, source, object, range, staging, promotion, or accounting | protected empty inventory replies and semantic-v3/v4/v5 blind-Event-offer acknowledgements/results may be emitted; bounded Event offers may be accepted within policy and quota |
+| `Normal` | yes | every eligible priority | full interested mutable lanes plus eligible v7/v8 Blob work | accepted within policy and quota |
+| `AtLeast(p)` | yes | only Events at or above `p`; required contact/control work continues | full interested mutable lanes plus eligible v7/v8 Blob work; `p` is Event-only | accepted within policy and quota |
+| `ReceiveOnly` | no | no discovery or local inventory disclosure, control object, or Event object | zero State/Record/Blob interest, inventory, source, object, range, staging, promotion, or accounting | protected empty inventory replies and semantic-v3-v8 blind-Event-offer acknowledgements/results may be emitted; bounded Event offers may be accepted within policy and quota |
 
 The selected direct-Iroh endpoint disables hosted discovery in every mode;
 `AtLeast` does not dynamically control discovery and still initiates configured
@@ -254,18 +256,19 @@ change, not Carry/Consume mode or unrelated inventory.
 
 ## Compatibility and claim boundary
 
-Finite Event custody requires semantic version 3, 4, or 5. Explicit version-1 and
+Finite Event custody requires semantic version 3 through 8. Explicit version-1 and
 version-2 sessions remain compatible with durable Event transfer only. The
 protected lane-defer exchange, receiver-relative apply disposition, and
 generation-scoped suppression-receipt accounting are v3-format mechanisms
-inherited by v4 and v5; no
+inherited by v4 through v8; no
 equivalent deterministic whole-contact partial claim is made for v1/v2.
 
 The selected implementation covers Event and RouteEvent custody only. It does
 not add State/Record custody; their cloneable live handles and separate
-semantic-v4/v5 mutable reconciliation run outside this custody policy in `Normal`
-and `AtLeast`, as do the live Blob application surface and semantic-v5 direct
-Blob work. This guide adds no finite State/Record TTL or Blob custody/TTL/GC.
+semantic v4-v8 mutable reconciliation run outside this custody policy in `Normal`
+and `AtLeast`, as do the live Blob application surface and semantic-v7/v8
+profile-4 Blob work. This guide adds no finite State/Record TTL and does not
+define Blob's separate semantic-v8 custody, TTL, or bounded GC policy.
 See the selected [State](selected-state-api.md),
 [Record](selected-record-api.md), and [Blob](selected-blob-api.md) API guides for
 those independent application boundaries.

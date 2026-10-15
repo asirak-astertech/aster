@@ -1023,9 +1023,12 @@ authenticated session and exact content-verified source, compares the complete
 claim, and only then returns a nonconstructible verified Blob custody
 capability. Store admission MUST accept that capability, never the decoded
 claim. The exact vectors are in
-`conformance/vectors/blob-custody-v8.tsv`. This object definition does not
-activate finite Blob scheduling, storage, carrier transfer, cursor advancement,
-or promotion.
+`conformance/vectors/blob-custody-v8.tsv`. Under semantic v8 with authenticated
+Blob profile `4`, that capability admits the exact finite source to the selected
+pending-store and range-stream lifecycle; inventory, range service, cursor
+advancement, completion, and promotion each still recheck the current source
+and lifecycle policy. Semantic v7 uses the same raw stream profile for durable
+sources only and cannot reinterpret a decoded v8 claim as authority.
 
 ## 8. Handshake flights and transcript
 
@@ -1456,17 +1459,19 @@ direction, ordinary or contextual, therefore uses sequence zero.
 
 The selected-node mechanics plaintext is protected as the ordinary §9
 application record with the exact ordinary transport-frame AAD above. Semantics v4, v5,
-v6, and v7 add no
+v6, v7, and v8 add no
 new outer record, source envelope, or suite. Every selected mechanics plaintext
 starts with `"ASM\x01" || tag u8`. The mutable tags are invalid unless the
-completed session negotiated semantic version `4`, `5`, `6`, or `7`; class `3` is
-valid only at v5, v6, or v7, and v1-v3 Event-compatible sessions reject every
-mutable class.
+completed session negotiated semantic version `4`, `5`, `6`, `7`, or `8`; class
+`3` is valid only at v5 through v8, and v1-v3 Event-compatible sessions reject
+every mutable class. Semantic-v8 Blob source and result records append the exact
+custody claim/digest fields defined in [protocol.md](protocol.md) §9.4; the base
+fields below remain byte-identical.
 
 The common mutable fields are:
 
 ```text
-class       u8: 1 State, 2 Record, 3 Blob source under semantic v5, v6, or v7
+class       u8: 1 State, 2 Record, 3 Blob source under semantic v5 through v8
 direction   u8: 1 ToSessionInitiator, 2 ToSessionResponder
 transfer_id 32 bytes; its typed class MUST equal class
 disposition u8: 0 Duplicate, 1 Inserted, 2 DeferredCapacity
@@ -1496,13 +1501,16 @@ the contact. The exact sequencing, capacity meaning, fairness cursor, mode
 behavior, and finite-TTL rejection are normative in
 [protocol.md](protocol.md) §9.1.
 
-### 9.2 Semantic-v5 selected Blob mechanics plaintext
+### 9.2 Historical semantic-v5 Blob mechanics plaintext
 
-Semantic v5 reuses the protected §9 record and the mutable source grammar
+Semantic v5 allocated the protected §9 record and the mutable source grammar
 above with `class = 3` for Blob source envelopes. It reserves separate exact
 Blob interest and carrier-range tags; v1-v4 sessions reject all of them. Source
 and carrier formats remain `ASTRENV2`/`ASTRENV3` and `ASTRBT01` version 1.
-Semantic v6 inherits these Blob mechanics byte-for-byte.
+Semantic v6 inherited these Blob mechanics byte-for-byte. The definitions below
+remain parser and compatibility codec allocations, not a current carrier
+fallback. Current Blob carrier transfer requires semantic v7/v8 profile 4 and
+uses the receipt-free grammar in [protocol.md](protocol.md) §9.4.
 
 BlobInterest (`0x6b`) and BlobInterestReply (`0x6c`) encode:
 
@@ -1547,22 +1555,23 @@ BlobCarrierFinish (`0xb1`) and BlobCarrierFinished (`0xb2`) encode `direction ||
 remaining u64`; each is exactly 14 plaintext bytes and `remaining` is at most
 the selected reconciliation cardinality bound. Finished echoes the requester's
 remaining count for sequencing only; it is not independent proof of requester
-disk state. The exact per-range Result/Ack tuples bind accepted durable-prefix
-progress. The exact authorization,
-sequencing, source-before-carrier, peer-neutral durable-prefix, completion, and
-policy rules are normative in [protocol.md](protocol.md) §9.2.
+disk state. The historical per-range Result/Ack tuples bound accepted
+durable-prefix progress. Their authorization, sequencing, source-before-carrier,
+peer-neutral durable-prefix, completion, and policy rules remain documented in
+[protocol.md](protocol.md) §9.2 for compatibility analysis.
 
-The runtime reserves exactly 17,127 protected bytes for one full carrier-range
-settlement: one 123-byte Fetch, one maximum 16,480-byte Range, two 92-byte
+The historical six-frame carrier-range settlement occupied exactly 17,127
+protected bytes: one 123-byte Fetch, one maximum 16,480-byte Range, two 92-byte
 Result/Ack plaintexts, two 14-byte Finish/Finished plaintexts, and 52 bytes of
-record protection for each of the six frames. This is three exchanges and does
-not change any codec limit.
+record protection for each of the six frames. The current minimum nonempty
+profile-4 stream inherits this unchanged three-exchange sizing allocation; the
+legacy settlement is not emitted.
 
 ### 9.3 Semantic-v6 selected Event-bridge mechanics plaintext
 
 Semantic v6 inherits every v5 ordinary mechanics plaintext byte-for-byte and
 adds six Event-bridge tags under the same `"ASM\x01" || tag` prefix. They are
-invalid unless the completed session negotiated semantic version `6` or `7`; v1-v5
+invalid unless the completed session negotiated semantic version `6`, `7`, or `8`; v1-v5
 sessions reject them. The lane proceeds beyond its hello only when both
 authenticated endpoints send the canonical `enabled = 1` value.
 

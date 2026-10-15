@@ -1,65 +1,65 @@
 use super::*;
 
 #[test]
-fn python_constructed_stream_record_vectors() {
+fn python_constructed_stream_record_vectors_cover_v7_and_v8() {
     let direction = EventDirection::ToSessionResponder;
     let single = BlobRangeCandidate {
         total_len: 1,
         requested_len: 1,
         ..candidate(0)
     };
-    let digest =
-        schedule_hash(&encode_schedule(&[single], direction, SEMANTIC_PROTOCOL_V7).unwrap());
-    let mut count = 0;
-    for line in include_str!("../../../../conformance/vectors/blob-stream-records-v1.tsv")
-        .lines()
-        .filter(|line| !line.starts_with('#'))
-    {
-        let fields: Vec<_> = line.split('\t').collect();
-        let bytes: Vec<u8> = fields[3]
-            .as_bytes()
-            .chunks_exact(2)
-            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
-            .collect();
-        let accepted = match fields[1] {
-            "schedule" => decode_schedule(&bytes, direction, SEMANTIC_PROTOCOL_V7).map(|ranges| {
-                assert_eq!(
-                    encode_schedule(&ranges, direction, SEMANTIC_PROTOCOL_V7).unwrap(),
-                    bytes
-                );
-            }),
-            "terminal" => check_envelope(&bytes, END_PREFIX, digest, 1).and_then(|tail| {
-                if tail.is_empty() {
+    for semantic_version in [SEMANTIC_PROTOCOL_V7, SEMANTIC_PROTOCOL_V8] {
+        let digest =
+            schedule_hash(&encode_schedule(&[single], direction, semantic_version).unwrap());
+        let mut count = 0;
+        for line in include_str!("../../../../conformance/vectors/blob-stream-records-v1.tsv")
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+        {
+            let fields: Vec<_> = line.split('\t').collect();
+            let bytes: Vec<u8> = fields[3]
+                .as_bytes()
+                .chunks_exact(2)
+                .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+                .collect();
+            let accepted = match fields[1] {
+                "schedule" => decode_schedule(&bytes, direction, semantic_version).map(|ranges| {
+                    assert_eq!(
+                        encode_schedule(&ranges, direction, semantic_version).unwrap(),
+                        bytes
+                    );
+                }),
+                "terminal" => check_envelope(&bytes, END_PREFIX, digest, 1).and_then(|tail| {
+                    if tail.is_empty() {
+                        Ok(())
+                    } else {
+                        Err(invalid("trailing terminal"))
+                    }
+                }),
+                "data" => (|| {
+                    let payload = check_envelope(&bytes, DATA_PREFIX, digest, 0)?;
+                    let frame = Frame::decode_for_semantic_version(payload, semantic_version)?;
+                    decode_range_response(payload, direction, &single, semantic_version)?;
+                    assert_eq!(
+                        frame.encode_for_semantic_version(semantic_version).unwrap(),
+                        payload
+                    );
                     Ok(())
-                } else {
-                    Err(invalid("trailing terminal"))
-                }
-            }),
-            "data" => (|| {
-                let payload = check_envelope(&bytes, DATA_PREFIX, digest, 0)?;
-                let frame = Frame::decode_for_semantic_version(payload, SEMANTIC_PROTOCOL_V7)?;
-                decode_range_response(payload, direction, &single, SEMANTIC_PROTOCOL_V7)?;
-                assert_eq!(
-                    frame
-                        .encode_for_semantic_version(SEMANTIC_PROTOCOL_V7)
-                        .unwrap(),
-                    payload
-                );
-                Ok(())
-            })(),
-            _ => panic!("unknown vector kind"),
+                })(),
+                _ => panic!("unknown vector kind"),
+            }
+            .is_ok();
+            assert_eq!(
+                accepted,
+                fields[0] == "ACCEPT",
+                "semantic-v{semantic_version} {} {}",
+                fields[1],
+                fields[2]
+            );
+            count += 1;
         }
-        .is_ok();
-        assert_eq!(
-            accepted,
-            fields[0] == "ACCEPT",
-            "{} {}",
-            fields[1],
-            fields[2]
-        );
-        count += 1;
+        assert_eq!(count, 37);
     }
-    assert_eq!(count, 37);
 }
 
 fn candidate(offset: u64) -> BlobRangeCandidate {
@@ -171,7 +171,7 @@ fn terminal_binds_schedule_count_and_frame_kind() {
 }
 
 #[test]
-fn streaming_fits_original_one_range_boundary_and_preserves_reverse_and_bridge() {
+fn minimum_nonempty_stream_fits_inherited_boundary_and_preserves_reverse_and_bridge() {
     for direction in [
         EventDirection::ToSessionResponder,
         EventDirection::ToSessionInitiator,
