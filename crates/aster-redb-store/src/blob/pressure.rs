@@ -4154,10 +4154,7 @@ fn apply_image(write: &redb::WriteTransaction, image: &PressureImage) -> Result<
 
 fn apply_v4_image(write: &redb::WriteTransaction, image: &PressureImage) -> Result<(), StoreError> {
     let mut metadata = write.open_table(BLOB_PRESSURE_METADATA)?;
-    metadata.insert(
-        PRESSURE_SCHEMA_VERSION_FIELD,
-        ACTIVE_PRESSURE_SCHEMA_VERSION,
-    )?;
+    metadata.insert(PRESSURE_SCHEMA_VERSION_FIELD, PRESSURE_V4_SCHEMA_VERSION)?;
     metadata.insert(
         NEXT_PENDING_ACCEPTANCE_ORDER,
         image.next_pending_acceptance_order,
@@ -4587,7 +4584,48 @@ pub(crate) fn audit_or_migrate_pressure_after_lifecycle_write(
         // Its caller pairs the generations before any reopen assertion. Keep
         // this escape hatch test-only so production opens always enforce the
         // exact lifecycle/pressure generation matrix below.
-        return audit_or_migrate_pressure_write_inner(write, None);
+        let state = pressure_schema_state(write)?;
+        if !matches!(
+            state,
+            PressureSchemaState::Predecessor | PressureSchemaState::V4
+        ) {
+            return Err(pressure_corruption(
+                "Blob lifecycle and pressure schema generations are mixed",
+            ));
+        }
+        let publication_generation = super::lifecycle::publication_encoding_migration_write(write)?;
+        let pending_generation =
+            super::pending_blob_encoding_for_publication_encoding(publication_generation);
+        let next = match state {
+            PressureSchemaState::Predecessor => {
+                migrate_pending_acceptance_orders(write, pending_generation)?
+            }
+            PressureSchemaState::V4 => write
+                .open_table(BLOB_PRESSURE_METADATA)?
+                .get(NEXT_PENDING_ACCEPTANCE_ORDER)?
+                .map(|value| value.value())
+                .ok_or_else(|| {
+                    pressure_corruption("next pending Blob acceptance order is missing")
+                })?,
+            PressureSchemaState::OldV5 | PressureSchemaState::Current => unreachable!(),
+        };
+        let image = build_pressure_image(
+            &write.open_table(super::BLOB_PUBLICATIONS)?,
+            &write.open_table(super::BLOB_ACCEPTANCE_MARKERS)?,
+            &write.open_table(super::BLOB_PENDING_SOURCES)?,
+            &write.open_table(super::BLOB_CARRIER_PREFIXES)?,
+            &write.open_table(super::BLOB_IMPORTS)?,
+            &write.open_table(super::BLOB_CHUNKS)?,
+            next,
+            publication_generation,
+            PressurePendingRootEncodingGeneration::PressureV4,
+            PressureImageEncodingGeneration::LegacyV4,
+        )?;
+        return match state {
+            PressureSchemaState::Predecessor => apply_v4_image(write, &image),
+            PressureSchemaState::V4 => audit_image_write(write, &image),
+            PressureSchemaState::OldV5 | PressureSchemaState::Current => unreachable!(),
+        };
     }
     audit_or_migrate_pressure_write_inner(write, Some(lifecycle_was_predecessor))
 }
@@ -6622,6 +6660,27 @@ mod tests {
             .expect("pressure fixture metadata")
             .insert(PRESSURE_SCHEMA_VERSION_FIELD, PRESSURE_V4_SCHEMA_VERSION)
             .expect("pressure fixture schema");
+        write
+            .open_table(BLOB_PRESSURE_PUBLICATION_ROOTS)
+            .expect("pressure fixture publication roots");
+        write
+            .open_table(BLOB_PRESSURE_PENDING_ROOTS)
+            .expect("pressure fixture pending roots");
+        write
+            .open_table(super::BLOB_PRESSURE_VARIANT_SUMMARIES)
+            .expect("pressure fixture variant summaries");
+        write
+            .open_table(super::BLOB_PRESSURE_PUBLICATIONS)
+            .expect("pressure fixture publications");
+        write
+            .open_table(super::BLOB_PRESSURE_CONTENT_PUBLICATIONS)
+            .expect("pressure fixture content publications");
+        write
+            .open_table(super::BLOB_PRESSURE_PENDING_SOURCES)
+            .expect("pressure fixture pending sources");
+        write
+            .open_table(super::BLOB_PRESSURE_VARIANTS)
+            .expect("pressure fixture variants");
         write.commit().expect("commit pressure fixture schema");
         (path, database)
     }
@@ -6817,6 +6876,9 @@ mod tests {
             metadata.insert(REANCHOR_DIRTY, 0).unwrap();
             metadata.insert(REANCHOR_NEXT_PHASE, 1).unwrap();
         }
+        write
+            .open_table(BLOB_PRESSURE_REANCHOR_CURSORS)
+            .expect("current pressure fixture reanchor cursors");
         let topic = Topic::new("bounded-durable-selection").unwrap();
         let scope = Scope::new("mission/bounded-durable-selection").unwrap();
         let blob_id = BlobId::from_bytes([0xf0; 32]);

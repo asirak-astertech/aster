@@ -1924,6 +1924,10 @@ impl SelectedBlobNode {
         clippy::result_large_err,
         reason = "one retry retains the original store error and immutable recovery context by value"
     )]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "publish admission, source, retry, and held-lifecycle inputs stay explicit"
+    )]
     fn publish_inner<R: Read + Seek>(
         &mut self,
         request: BlobPublishRequest,
@@ -6134,7 +6138,10 @@ mod tests {
             assert_eq!(node.publish_attempts, 1);
             let stats = node.store.blob_stats().expect("post-retry Blob stats");
             assert_eq!(stats.publications, 0);
-            assert_eq!(stats.variants, 0);
+            assert_eq!(
+                stats.variants, 1,
+                "physical-only cleanup cannot invent deletion authority for an unreferenced variant"
+            );
         }
     }
 
@@ -7019,7 +7026,7 @@ mod tests {
             .blocking_recv()
             .expect("absent Blob response")
             .expect_err("absent Blob cannot return plaintext");
-        assert_eq!(absent.kind(), ApplicationErrorKind::UnauthorizedOrRevoked);
+        assert_eq!(absent.kind(), ApplicationErrorKind::NotFound);
     }
 
     #[test]

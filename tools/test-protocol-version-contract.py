@@ -46,9 +46,9 @@ The current handshake negotiates semantic versions `8`, `7`, `6`, `5`, `4`, `3`,
 | `2` | v1 | compact batch and bridge objects |
 | `3` | v2 | session custody record |
 | `4` | v3 | State and Record reconciliation |
-| `5` | v4 | direct Blob transfer |
+| `5` | v4 | historical direct Blob frame allocation |
 | `6` | v5 ordinary lanes byte-for-byte | Event bridge transfer |
-| `7` | v6 byte-for-byte | per-lane transfer profiles and receipt-free Event pages |
+| `7` | v6 byte-for-byte | per-lane profiles, receipt-free Event pages, and durable Blob range streams |
 | `8` | v7 byte-for-byte except the lane AAD domain and Blob custody fields | authenticated finite Blob custody over `BlobRangesStreamV1` |
 """
 

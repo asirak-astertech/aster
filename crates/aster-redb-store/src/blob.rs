@@ -146,10 +146,11 @@ pub const MAX_BLOB_NETWORK_SOURCE_BYTES: usize = 1024 * 1024;
 /// Exact maximum row count for one atomic policy-invalidation retirement.
 ///
 /// This private runtime integration bound covers one 12-row publication
-/// discovery, ten fixed retirement rows, two operation-accounting rows, every
-/// globally bounded operation plus owner/resolver/deadline, and every bounded
-/// live delivery conversion: old inverse owner, pending row, cursor, v3
-/// primary, order row, and v3 inverse owner.
+/// discovery, both maintenance cursors, source authority, ten fixed retirement
+/// rows, two operation-accounting rows, nine pressure rows, every globally
+/// bounded operation plus owner/resolver/deadline, and every bounded live
+/// delivery conversion: old inverse owner, pending row, cursor, v3 primary,
+/// order row, and v3 inverse owner.
 const MAX_BLOB_POLICY_RETIREMENT_DELIVERY_ROWS: u64 = crate::MAX_BLOB_SUBSCRIPTIONS
     .checked_mul(6)
     .expect("bounded Blob retirement delivery rows fit u64");
@@ -157,10 +158,16 @@ const MAX_BLOB_POLICY_RETIREMENT_OPERATION_ROWS: u64 = MAX_BLOB_OPERATIONS
     .checked_mul(4)
     .expect("bounded Blob retirement operation rows fit u64");
 const MAX_BLOB_POLICY_RETIREMENT_FIXED_ROWS: u64 = 12u64
+    .checked_add(2)
+    .expect("bounded Blob retirement maintenance cursor rows fit u64")
+    .checked_add(1)
+    .expect("bounded Blob retirement source row fits u64")
     .checked_add(10)
     .expect("bounded Blob retirement fixed rows fit u64")
     .checked_add(2)
-    .expect("bounded Blob retirement accounting rows fit u64");
+    .expect("bounded Blob retirement accounting rows fit u64")
+    .checked_add(9)
+    .expect("bounded Blob retirement pressure rows fit u64");
 #[doc(hidden)]
 pub const MAX_BLOB_POLICY_RETIREMENT_ROWS: u64 = MAX_BLOB_POLICY_RETIREMENT_FIXED_ROWS
     .checked_add(MAX_BLOB_POLICY_RETIREMENT_OPERATION_ROWS)
@@ -239,6 +246,32 @@ const MAX_BLOB_POLICY_RETIREMENT_ACCOUNTING_BYTES: u64 = ("next_retirement_gener
     + ("semantic_blob_item_count".len() + 8) as u64
     + ("semantic_blob_total_bytes".len() + 8) as u64
     + ("semantic_blob_operation_total_bytes".len() + 8) as u64;
+// One maximum chunk-state row plus the current durable publication root,
+// global/content indexes, variant summary/index, and their three durable
+// index aliases. Values are empty for every ordered pressure index.
+const MAX_BLOB_POLICY_RETIREMENT_PRESSURE_BYTES: u64 = (40 + 186)
+    + (32
+        + 1
+        + 2 * 32
+        + 1
+        + 8
+        + 9
+        + 2
+        + aster_profile::MAX_TOPIC_BYTES as u64
+        + 2
+        + aster_profile::MAX_SCOPE_BYTES as u64
+        + 32)
+    + 2 * 52
+    + 2 * (1
+        + 32
+        + 2
+        + aster_profile::MAX_TOPIC_BYTES as u64
+        + 2
+        + aster_profile::MAX_SCOPE_BYTES as u64
+        + 32
+        + 51)
+    + (32 + 52)
+    + 2 * 84;
 /// Proven encoded-byte upper bound paired with
 /// [`MAX_BLOB_POLICY_RETIREMENT_ROWS`].
 ///
@@ -259,6 +292,7 @@ pub const MAX_BLOB_POLICY_RETIREMENT_BYTES: u64 = (MAX_BLOB_POLICY_RETIREMENT_DI
         + 8 + 32 // acceptance-order row
         + 33 + 57 // publication resolver and deadline
         + MAX_BLOB_POLICY_RETIREMENT_ACCOUNTING_BYTES
+        + MAX_BLOB_POLICY_RETIREMENT_PRESSURE_BYTES
         + MAX_BLOB_OPERATION_BYTES
         + MAX_BLOB_OPERATIONS
             * ((64 + MAX_BLOB_OPERATION_KEY_BYTES as u64)
@@ -34288,6 +34322,75 @@ mod tests {
     }
 
     #[test]
+    fn blob_policy_retirement_byte_ceiling_explicitly_covers_durable_pressure_rows() {
+        let transfer = BlobTransferId::new([0x41; 32]);
+        let variant = BlobVariantId::from_bytes([0x42; 32]);
+        let root = pressure::PressurePublicationRoot {
+            variant_id: variant,
+            semantic_id: BlobSemanticId::new([0x43; 32]),
+            priority: Priority::Immediate,
+            acceptance_order: u64::MAX,
+            expiry: pressure::PressureExpiry::Durable,
+            topic: Topic::new("t".repeat(aster_profile::MAX_TOPIC_BYTES))
+                .expect("maximum pressure topic"),
+            scope: Scope::new("s".repeat(aster_profile::MAX_SCOPE_BYTES))
+                .expect("maximum pressure scope"),
+            blob_id: BlobId::from_bytes([0x44; 32]),
+        };
+        let publication_key = pressure::encode_publication_key(pressure::PressurePublicationKey {
+            priority: root.priority,
+            expiry: root.expiry,
+            acceptance_order: root.acceptance_order,
+            transfer_id: transfer,
+        });
+        let content_key = pressure::encode_content_publication_key(&root, transfer)
+            .expect("maximum pressure content key");
+        let summary = pressure::PressureVariantSummary {
+            effective_priority: root.priority,
+            minimum_root_acceptance_order: root.acceptance_order,
+            committed_progress: pressure::PressureFraction::ONE,
+            finalized: true,
+            publication_roots: 1,
+            pending_roots: 0,
+            final_reference_expiry: pressure::PressureExpiry::Durable,
+            has_finite_roots: false,
+        };
+        let variant_key = pressure::encode_variant_index_key(summary, variant);
+        let pressure_bytes = (40 + 186) // one maximum encoded chunk-state row
+            + 32
+            + pressure::encode_publication_root(&root)
+                .expect("maximum pressure publication root")
+                .len()
+            + 2 * publication_key.len() // complete plus durable global indexes
+            + 2 * content_key.len() // complete plus durable content indexes
+            + 32
+            + pressure::encode_variant_summary(summary).len()
+            + 2 * variant_key.len(); // complete plus durable variant indexes
+        let base_without_pressure = MAX_BLOB_POLICY_RETIREMENT_DISCOVERY_BYTES
+            + 8
+            + 32
+            + 33
+            + 57
+            + MAX_BLOB_POLICY_RETIREMENT_ACCOUNTING_BYTES
+            + MAX_BLOB_OPERATION_BYTES
+            + MAX_BLOB_OPERATIONS
+                * ((64 + MAX_BLOB_OPERATION_KEY_BYTES as u64)
+                    + (33 + MAX_BLOB_OPERATION_KEY_BYTES as u64)
+                    + 57)
+            + MAX_BLOB_POLICY_RETIREMENT_DELIVERIES_BYTES;
+        assert_eq!(pressure_bytes, 1_741);
+        assert_eq!(
+            MAX_BLOB_POLICY_RETIREMENT_PRESSURE_BYTES,
+            u64::try_from(pressure_bytes).expect("pressure bytes fit u64")
+        );
+        assert_eq!(
+            MAX_BLOB_POLICY_RETIREMENT_BYTES,
+            base_without_pressure + u64::try_from(pressure_bytes).expect("pressure bytes fit u64"),
+            "the byte ceiling must name pressure authority rather than rely on unrelated slack"
+        );
+    }
+
+    #[test]
     fn blob_policy_retirement_maximum_delivery_fanout_is_atomic_and_bounded() {
         // Break caught: mutating delivery rows before the bounded publication
         // candidate is admitted allows a short turn to retire only part of the
@@ -34501,8 +34604,13 @@ mod tests {
         };
         assert_eq!(
             exact_retirement_rows,
-            12 + 8 + 1 + 10 + 2 + 4 + 6 * crate::blob_subscription::MAX_BLOB_SUBSCRIPTIONS,
+            12 + 8 + 1 + 10 + 2 + 7 + 6 * crate::blob_subscription::MAX_BLOB_SUBSCRIPTIONS,
             "one-operation maximum-fanout retirement charges source, lifecycle, pressure, and delivery authority"
+        );
+        assert_eq!(
+            MAX_BLOB_POLICY_RETIREMENT_ROWS,
+            exact_retirement_rows + 4 * (MAX_BLOB_OPERATIONS - 1),
+            "the runtime row ceiling combines maximum delivery and operation fan-out"
         );
         let before_short = blob_complete_logical_digest(&store);
         let short = store
@@ -34606,6 +34714,26 @@ mod tests {
                 ),
                 Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
             ));
+            let retirement_plan = store
+                .prepare_blob_retirement_poll_with_policy(&policy, subscription, 1)
+                .expect("maximum-fanout retirement poll plan");
+            let retirement = store
+                .commit_blob_retirement_poll_with_policy(&policy, &retirement_plan)
+                .expect("maximum-fanout retirement delivery")
+                .deliveries
+                .remove(0);
+            assert_eq!(retirement.semantic_id, stored.semantic_id);
+            assert_eq!(
+                store
+                    .acknowledge_blob_retirement_with_policy(
+                        &policy,
+                        subscription,
+                        stored.semantic_id,
+                        retirement.token,
+                    )
+                    .expect("acknowledge maximum-fanout retirement"),
+                BlobDeliveryAck::Acknowledged
+            );
             let plan = store
                 .prepare_blob_subscription_poll_with_policy(&policy, subscription, 1, 2)
                 .expect("unrelated fanout poll plan");
@@ -34635,7 +34763,7 @@ mod tests {
             &store,
             lifecycle::BlobMaintenanceClass::ExpiredRetirementRecords,
         );
-        let maximum_expiry_rows = 6 + 4 * crate::blob_subscription::MAX_BLOB_SUBSCRIPTIONS;
+        let maximum_expiry_rows = 6 + 3 * crate::blob_subscription::MAX_BLOB_SUBSCRIPTIONS;
         let expired = store
             .run_blob_maintenance_turn_with_sample(
                 lifecycle::BlobMaintenanceBudget::new(maximum_expiry_rows, 1, 2 * 1024 * 1024)
@@ -34648,7 +34776,7 @@ mod tests {
             .expect("expire maximum bounded delivery fanout atomically");
         assert_eq!(
             expired.rows_examined, maximum_expiry_rows,
-            "maximum expiry charges six core rows plus each bounded subscription examination and its three dependent rows"
+            "maximum expiry charges six core rows plus each bounded subscription examination and its retirement receipt/owner rows"
         );
         assert_eq!(
             store
@@ -35024,6 +35152,9 @@ mod tests {
                     "aster.blob-chunks.v1",
                     "aster.blob-lifecycle-metadata.v1",
                     "aster.blob-pressure-content-publications.v1",
+                    "aster.blob-pressure-durable-content-publications.v1",
+                    "aster.blob-pressure-durable-publications.v1",
+                    "aster.blob-pressure-durable-variants.v1",
                     "aster.blob-pressure-publication-roots.v1",
                     "aster.blob-pressure-publications.v1",
                     "aster.blob-pressure-variant-summaries.v1",
@@ -35032,7 +35163,7 @@ mod tests {
                 ]),
                 "the explicit pre-acceptance plan stages each contribute one unique row"
             );
-            assert_eq!(added.len(), 8);
+            assert_eq!(added.len(), 11);
             assert!(added.contains(&acceptance_order_identity));
             charge.rows
         };
@@ -35213,8 +35344,20 @@ mod tests {
         };
         assert_eq!(
             exact_rows,
-            12 + 2 + 1 + 10 + 2 + 6 + 4 * MAX_BLOB_OPERATIONS,
-            "maximum aliases charge both maintenance cursors, source bytes, six distinct pressure rows, and each operation, owner, resolver, and deadline"
+            12 + 2 + 1 + 10 + 2 + 9 + 4 * MAX_BLOB_OPERATIONS,
+            "maximum aliases charge both maintenance cursors, source bytes, nine distinct pressure rows, and each operation, owner, resolver, and deadline"
+        );
+        assert_eq!(
+            MAX_BLOB_POLICY_RETIREMENT_ROWS,
+            exact_rows + MAX_BLOB_POLICY_RETIREMENT_DELIVERY_ROWS,
+            "the runtime row ceiling combines maximum operation and delivery fan-out"
+        );
+        assert!(
+            MAX_BLOB_POLICY_RETIREMENT_BYTES
+                >= exact_bytes + MAX_BLOB_POLICY_RETIREMENT_DELIVERIES_BYTES,
+            "the runtime byte ceiling combines maximum operation and delivery fan-out: ceiling={}, required={}",
+            MAX_BLOB_POLICY_RETIREMENT_BYTES,
+            exact_bytes + MAX_BLOB_POLICY_RETIREMENT_DELIVERIES_BYTES,
         );
         let before = blob_complete_logical_digest(&store);
         let before_usage = store
