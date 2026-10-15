@@ -1374,7 +1374,7 @@ authentication. The profile offer and every negotiated `LegacyV6`
 Event/State/Record/EventBridge frame keep the ordinary exact ASCII
 application AAD `"aster/transport-frame/v1"`; v1-v6 bytes remain unchanged.
 Blob source metadata also retains ordinary AAD, while carrier streaming binds
-lane `4`, profile `3`, and its exact direction. The selected runtime no longer
+lane `4`, profile `4`, and its exact direction. The selected runtime no longer
 executes legacy Blob carrier Result/Ack or Finish/Finished exchanges; their
 historical byte definitions below are not a fallback path.
 

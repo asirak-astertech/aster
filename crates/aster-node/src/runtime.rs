@@ -21508,6 +21508,7 @@ const fn future_blob_carrier_lane_reserve(direction: EventDirection) -> (usize, 
     }
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn serve_verified_blob_range(
     store: &Store,
@@ -21522,6 +21523,45 @@ fn serve_verified_blob_range(
     offset: u64,
     requested_len: u32,
     proof: &[u8; crate::frame::BLOB_CONTENT_PROOF_BYTES],
+) -> Result<Option<Vec<u8>>, NodeError> {
+    serve_verified_blob_range_in_schedule(
+        store,
+        guard,
+        verifier,
+        peer,
+        commitments,
+        peer_interest,
+        source,
+        object,
+        total_len,
+        offset,
+        requested_len,
+        proof,
+        &mut None,
+    )
+}
+
+struct AuthenticatedBlobRangeSource {
+    sealed: Vec<u8>,
+    blob: ContentVerifiedBlobEnvelope,
+    plan: VerifiedBlobTransferPlan,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn serve_verified_blob_range_in_schedule(
+    store: &Store,
+    guard: &EventLaneGuard,
+    verifier: &mut ReferenceEnvelopeSealer,
+    peer: NodeId,
+    commitments: &[[u8; 32]],
+    peer_interest: &BlobInterest,
+    source: BlobTransferId,
+    object: BlobCarrierObjectId,
+    total_len: u64,
+    offset: u64,
+    requested_len: u32,
+    proof: &[u8; crate::frame::BLOB_CONTENT_PROOF_BYTES],
+    authenticated: &mut Option<AuthenticatedBlobRangeSource>,
 ) -> Result<Option<Vec<u8>>, NodeError> {
     guard.check(store)?;
     if !canonical_blob_network_range(total_len, offset, requested_len) {
@@ -21623,42 +21663,62 @@ fn serve_verified_blob_range(
             "served bounded Blob source escaped the selected network source cap".into(),
         ));
     }
-    #[cfg(test)]
-    cache.record_blob_range_source_authentication();
-    let route = verifier
-        .verify_blob(&stored.sealed)
-        .map_err(NodeError::from)
-        .map_err(|error| fatal_blob_coherence("served Blob source authentication", error))?;
-    if BlobTransferId::new(route.envelope_id()) != source {
-        return Err(NodeError::FatalBlobCoherence(
-            "served Blob source identity changed".into(),
-        ));
-    }
-    let BlobContentVerification::ContentVerified {
-        blob,
-        manifest_bytes,
-    } = verifier
-        .verify_blob_content(route, &stored.sealed)
-        .map_err(NodeError::from)
-        .map_err(|error| fatal_blob_coherence("served Blob content authentication", error))?
-    else {
-        return Err(NodeError::FatalBlobCoherence(
-            "served Blob lost its content grant".into(),
-        ));
-    };
-    let plan = blob
-        .transfer_plan(&manifest_bytes)
-        .map_err(|error| {
-            NodeError::Protocol(format!("served Blob transfer plan is invalid: {error}"))
-        })
-        .map_err(|error| fatal_blob_coherence("served Blob transfer plan", error))?;
-    if plan.manifest().total_len() > MAX_NETWORK_BLOB_BYTES
-        || plan.manifest().chunk_count() > MAX_NETWORK_BLOB_CHUNKS
+    // Only immutable cryptographic results live for this bounded schedule.
+    // Reload and compare exact durable bytes on every range; all current
+    // authority, lineage, completion and depot checks below remain per-range.
+    if let Some(prior) = authenticated.as_ref()
+        && prior.sealed != stored.sealed
     {
         return Err(NodeError::FatalBlobCoherence(
-            "served bounded Blob plan escaped the selected network manifest caps".into(),
+            "served Blob source changed within its schedule".into(),
         ));
     }
+    if authenticated.is_none() {
+        #[cfg(test)]
+        cache.record_blob_range_source_authentication();
+        let route = verifier
+            .verify_blob(&stored.sealed)
+            .map_err(NodeError::from)
+            .map_err(|error| fatal_blob_coherence("served Blob source authentication", error))?;
+        if BlobTransferId::new(route.envelope_id()) != source {
+            return Err(NodeError::FatalBlobCoherence(
+                "served Blob source identity changed".into(),
+            ));
+        }
+        let BlobContentVerification::ContentVerified {
+            blob,
+            manifest_bytes,
+        } = verifier
+            .verify_blob_content(route, &stored.sealed)
+            .map_err(NodeError::from)
+            .map_err(|error| fatal_blob_coherence("served Blob content authentication", error))?
+        else {
+            return Err(NodeError::FatalBlobCoherence(
+                "served Blob lost its content grant".into(),
+            ));
+        };
+        let plan = blob
+            .transfer_plan(&manifest_bytes)
+            .map_err(|error| {
+                NodeError::Protocol(format!("served Blob transfer plan is invalid: {error}"))
+            })
+            .map_err(|error| fatal_blob_coherence("served Blob transfer plan", error))?;
+        if plan.manifest().total_len() > MAX_NETWORK_BLOB_BYTES
+            || plan.manifest().chunk_count() > MAX_NETWORK_BLOB_CHUNKS
+        {
+            return Err(NodeError::FatalBlobCoherence(
+                "served bounded Blob plan escaped the selected network manifest caps".into(),
+            ));
+        }
+        *authenticated = Some(AuthenticatedBlobRangeSource {
+            sealed: stored.sealed.clone(),
+            blob,
+            plan,
+        });
+    }
+    let AuthenticatedBlobRangeSource { blob, plan, .. } =
+        authenticated.as_ref().expect("authenticated above");
+
     let (still_current, completion) = cache
         .verify_completed_blob_source_claim(
             verifier,
@@ -21676,7 +21736,7 @@ fn serve_verified_blob_range(
         return Ok(None);
     }
     ensure_mutable_active(store, blob.publisher(), blob.scope(), blob.key_epoch())?;
-    let lineage = verifier.verify_current_blob_lineage(&blob)?;
+    let lineage = verifier.verify_current_blob_lineage(blob)?;
     let final_selector = peer_interest
         .selector(blob.topic(), blob.scope())
         .filter(|selector| selector.epoch() == blob.key_epoch())
@@ -21715,7 +21775,7 @@ fn serve_verified_blob_range(
         object,
         offset,
         usize::try_from(requested_len).expect("u32 fits usize"),
-        &plan,
+        plan,
     );
     #[cfg(test)]
     if result.is_ok() && cache.fire_test_blob_contact_fault(TestBlobContactFault::RangePostcheck) {
@@ -42345,7 +42405,7 @@ mod tests {
                 .sum();
             assert_eq!(prefix, committed_prefix);
         }
-        let (received, _, _, _) = blob_contact_test_pair(
+        let (received, _, sender_cache, _) = blob_contact_test_pair(
             a_store.clone(),
             a.credentials.clone(),
             interests(),
@@ -42355,6 +42415,11 @@ mod tests {
         )
         .await;
         assert!(received.blob_ranges_fetched > 1, "{received:?}");
+        assert_eq!(sender_cache.blob_range_source_authentications(), 1);
+        assert_eq!(
+            sender_cache.blob_range_depot_rechecks(),
+            received.blob_ranges_fetched as u64
+        );
         if interrupt.is_some() {
             assert_eq!(received.fetched, 0, "resume reuses authenticated source");
         }
@@ -42536,15 +42601,21 @@ mod tests {
                     ),
                 ),
             )
-            .await
-            .expect("Blob client contact");
-        let server_receipt = server_task
-            .await
-            .expect("Blob server task")
-            .expect("Blob server contact");
+            .await;
+        if client_receipt.is_err() {
+            client.close().await;
+        }
+        let server_receipt = server_task.await.expect("Blob server task");
         client.close().await;
         server.close().await;
-        (client_receipt.receipt, server_receipt.receipt)
+        match (client_receipt, server_receipt) {
+            (Ok(client), Ok(server)) => (client.receipt, server.receipt),
+            (client, server) => panic!(
+                "Blob contact errors: client={:?}, server={:?}",
+                client.err(),
+                server.err()
+            ),
+        }
     }
 
     #[tokio::test]

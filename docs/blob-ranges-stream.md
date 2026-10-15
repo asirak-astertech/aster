@@ -4,10 +4,12 @@ Clean Room — Privileged
 
 ## Required profile and compatibility boundary
 
-Protocol draft.3 uses semantic-v7 profile ID `3`, `BlobRangesStreamV1`,
-exclusively for Blob lane `4`. The current Blob offer is `[3]`, not `[3, 1]`.
+Protocol draft.3 uses semantic-v7 profile ID `4`, `BlobRangesStreamV1`,
+exclusively for Blob lane `4`. The current Blob offer is `[4]`, not `[4, 1]`.
+Profile `3` remains reserved for the approved `BlobCustodyV1` design;
+this increment does not implement custody.
 Both authenticated offers must intersect on it; the digest commits both exact
-offers and all lane selections. A peer without profile 3 fails the protected
+offers and all lane selections. A peer without profile 4 fails the protected
 profile exchange. A v5/v6 Blob carrier attempt fails explicitly before carrier
 IO. Old implementations that require LegacyV6 in every offer also reject the
 new offer rather than misdecoding a stream. There is no retry using old Blob
@@ -75,8 +77,10 @@ The receiver selects work with `selected_pending_blob_contact_work`; each data
 record is authenticated and checked against its exact scheduled tuple before
 `append_blob_carrier_prefix_with_policy`. Both sides refresh contact policy for
 every protected record, and the receiver checks current source metadata before
-each append. The sender uses `serve_verified_blob_range` for each range, retaining
-entitlement, revocation/expiry, object identity, and current-lineage checks. An
+each append. The sender authenticates the immutable source/content and builds its transfer
+plan once per bounded schedule. Each range reloads and compares the exact source
+bytes and rechecks durable projection/completion, entitlement, revocation/expiry,
+object identity, current lineage, and depot policy before serving bytes. An
 unavailable response does not append bytes. After an unavailable range or typed
 append-capacity deferral, the receiver authenticates and validates the remaining
 bounded records and terminal but discards their payloads, so later data cannot
@@ -96,6 +100,17 @@ partial ciphertext is not delivered as plaintext. A terminal means the sender
 finished its attempts, not that remote storage or publication succeeded.
 
 ## Validation scope
+
+`conformance/blob_stream_oracle.py` constructs the profile offer and 37
+schedule, range-data, and terminal vectors independently with Python's standard
+library. Rust checks acceptance/rejection, exact re-encoding, schedule hashes,
+order, counts, lengths, tuple bindings, and malformed records. The gate checks
+that the retained corpus matches the Python construction. This supplies
+code-path and language diversity, not independent-team interoperability evidence.
+Counted live transfer regressions require one source/content authentication per
+schedule and a fresh depot check per range. Signed revocation committed at the
+sender after the first range rejects the next send with no second depot read;
+the receiver-side revocation regression remains separate.
 
 Tests cover required bilateral selection and explicit incompatibility, historical vectors, bounded
 schedule/terminal rejection, one-contact multi-range transfer, and real in-flight
