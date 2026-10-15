@@ -19,7 +19,9 @@
 //! zeroize-on-drop plaintext pages. The corresponding stopped facades retain
 //! exclusive maintenance/application access and streaming Blob I/O. State and
 //! Record additionally use class-specific, explicitly interested reconciliation
-//! lanes; semantic v5 adds an explicitly interested, resumable Blob lane.
+//! lanes. Blob transfer is selected only for semantic v7/v8 profile 4: v7 is
+//! durable-only and v8 adds authenticated finite custody. Semantic v5/v6 Blob
+//! intent fails instead of falling back to a historical carrier path.
 //! Shutdown and zeroization close live application
 //! admission before releasing the actor's store authority, so retained handles
 //! fail closed with [`application::ApplicationErrorKind::StateUnavailable`].

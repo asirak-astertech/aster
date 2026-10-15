@@ -486,12 +486,15 @@ pub(super) async fn receive(
                 continue;
             }
             Err(error) if blob_lifetime_unavailable_error(&error) => {
-                settle_pending_blob_lifetime_unavailability_for_contact(
+                let transition = settle_pending_blob_lifetime_unavailability_for_contact(
                     store,
                     verifier,
                     work.source,
                     context.blob_contact_mode,
                 )?;
+                if transition == PendingBlobLifetimeTransition::Missing {
+                    return Err(error.into());
+                }
                 discard_remaining = true;
                 terminal_range_cursor_eligible = false;
                 terminal_source_rotation = false;
@@ -594,12 +597,15 @@ pub(super) async fn receive(
             }
             Ok(_) => {}
             Err(error) if node_blob_lifetime_unavailable_error(&error) => {
-                settle_pending_blob_lifetime_unavailability_for_contact(
+                let transition = settle_pending_blob_lifetime_unavailability_for_contact(
                     store,
                     verifier,
                     work.source,
                     context.blob_contact_mode,
                 )?;
+                if transition == PendingBlobLifetimeTransition::Missing {
+                    return Err(error);
+                }
                 terminal_range_cursor_eligible = false;
                 terminal_source_rotation = false;
             }

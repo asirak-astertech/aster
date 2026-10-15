@@ -1,6 +1,6 @@
 #![allow(
     dead_code,
-    reason = "semantic-v7 profile negotiation consumes these Task 1 contracts in Task 3"
+    reason = "semantic-v7 profile negotiation consumes these contracts in the runtime"
 )]
 
 use aster_mesh::{MAX_CUSTODY_WRAPPER_BYTES, Priority};
@@ -1932,15 +1932,18 @@ mod tests {
         let encoded = TransferProfileOfferV1::current().encode().unwrap();
         assert_eq!(
             format!(
-                "# aster-blob-ranges-stream-vectors/v1\tsemantic=7\toracle=python-stdlib\nACCEPT\toffer-blob-stream-only-v1\t{}\n",
+                "# aster-blob-ranges-stream-vectors/v1\tsemantic=7,8\toracle=python-stdlib\nACCEPT\toffer-blob-stream-only-v1\t{}\n",
                 vector_hex(&encoded)
             ),
             include_str!("../../../conformance/vectors/blob-ranges-stream-v1.tsv")
         );
-        assert_eq!(
-            TransferProfileOfferV1::decode(&encoded).unwrap(),
-            TransferProfileOfferV1::current()
-        );
+        for semantic_version in [SEMANTIC_PROTOCOL_V7, SEMANTIC_PROTOCOL_V8] {
+            assert_eq!(
+                TransferProfileOfferV1::decode(&encoded).unwrap(),
+                TransferProfileOfferV1::for_semantic_version(semantic_version)
+                    .expect("versioned Blob stream offer")
+            );
+        }
     }
 
     #[test]

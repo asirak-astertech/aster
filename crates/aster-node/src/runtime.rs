@@ -455,8 +455,8 @@ const BLOB_RANGE_FETCH_PLAINTEXT_BYTES: usize =
     4 + 1 + 1 + 32 + 33 + 8 + 8 + 4 + crate::frame::BLOB_CONTENT_PROOF_BYTES;
 const BLOB_RANGE_PLAINTEXT_MAX_BYTES: usize =
     4 + 1 + 1 + 32 + 33 + 8 + 8 + 4 + 1 + 4 + crate::frame::MAX_BLOB_RANGE_BYTES;
-// Keep the established lane allocation: six protected frames and 17,127 bytes.
-// A one-range stream (schedule, acceptance, data, terminal) fits this allowance.
+// Keep the inherited lane allocation: three exchanges and 17,127 bytes.
+// A minimum nonempty stream (schedule, acceptance, data, terminal) fits it.
 const BLOB_CARRIER_LANE_RESERVE_EXCHANGES: usize = 3;
 const BLOB_CARRIER_LANE_RESERVE_BYTES: usize = 17_127;
 const BLOB_CARRIER_CONTACT_RESERVE_EXCHANGES: usize = 2 * BLOB_CARRIER_LANE_RESERVE_EXCHANGES;
@@ -638,7 +638,7 @@ fn mutable_classes_for_semantic(semantic_version: u16) -> &'static [MutableClass
 }
 
 const READY_RECONCILIATION_CLASSES: &str =
-    "event,state,record,blob-v7-stream,event-bridge-v6-opt-in";
+    "event,state,record,blob-v7-v8-profile4,event-bridge-v6-opt-in";
 
 const fn contact_reconciliation_classes(semantic_version: u16) -> &'static str {
     if semantic_version >= SEMANTIC_PROTOCOL_V7 {
@@ -981,8 +981,8 @@ pub struct SourceInterestSelector {
 impl SourceInterestSelector {
     /// Creates one topic/scope selector for mutable replication.
     ///
-    /// State and Record may include descendant scopes. The selected semantic-v5
-    /// Blob profile requires an exact scope so its protected content-key proof
+    /// State and Record may include descendant scopes. The selected semantic-v7/v8
+    /// profile-4 Blob lane requires an exact scope so its protected content-key proof
     /// can bind one unambiguous current epoch.
     pub const fn new(topic: Topic, scope: Scope, include_descendant_scopes: bool) -> Self {
         Self {
@@ -1027,9 +1027,11 @@ impl MutableSourceInterests {
         }
     }
 
-    /// Adds the explicit semantic-v5 Blob source/content selector set.
+    /// Adds the explicit Blob source/content selector set.
     ///
-    /// Keeping this additive preserves the semantic-v4 constructor contract:
+    /// Selected carrier transfer uses semantic-v7/v8 profile 4: v7 is
+    /// durable-only and v8 additionally admits authenticated finite custody.
+    /// Keeping this additive preserves the semantic-v4 constructor contract;
     /// callers which do not opt in disclose and receive no Blob identifiers.
     pub fn with_blob(mut self, blob: Vec<SourceInterestSelector>) -> Self {
         self.blob = blob;
@@ -1059,6 +1061,21 @@ impl MutableSourceInterests {
                 .collect(),
         )
     }
+}
+
+fn reject_unsupported_blob_intent(
+    semantic_version: u16,
+    interests: &MutableSourceInterests,
+) -> Result<(), NodeError> {
+    if (MIN_BLOB_NETWORK_SEMANTIC_VERSION..MIN_BLOB_RANGES_STREAM_SEMANTIC_VERSION)
+        .contains(&semantic_version)
+        && !interests.blob_selectors().is_empty()
+    {
+        return Err(NodeError::Protocol(
+            "Blob transfer intent requires authenticated semantic protocol v7 or later".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn protected_blob_interest(
@@ -1113,7 +1130,7 @@ pub struct NodeConfig {
     pub mission: UnprotectedReferenceMission,
     /// Exact manually admitted carrier-to-mission peer bindings.
     pub peers: Vec<MissionExpectedPeer>,
-    /// Explicit class-separated State, Record, and opt-in semantic-v5 Blob interests.
+    /// Explicit class-separated State, Record, and opt-in v7/v8 Blob interests.
     pub mutable_interests: MutableSourceInterests,
     /// Delay between bounded contacts.
     pub sync_interval: Duration,
@@ -2213,7 +2230,7 @@ impl EventContactWakeState {
         }
     }
 
-    #[allow(dead_code)] // Task 6 consumes this contact-insertion transition.
+    #[allow(dead_code)] // Reserved for the contact-insertion transition.
     fn arm_event_except(
         &mut self,
         peers: impl IntoIterator<Item = EndpointId>,
@@ -17985,7 +18002,7 @@ async fn run_node_actor_inner(
         "contacts_observed"
     };
     node_stdout!(
-        "STOP lifecycle=complete sync_status={} carrier_id={} mission_id={} contacts={} contact_errors={} direct_contacts={} relay_contacts={} unknown_path_contacts={} carrier_path_transitions={} carrier_path_transition_saturations={} path_observation=not-authorization opaque_items={} opaque_acceptance_markers={} events={} event_acceptance_markers={} route_cached_events={} controls={} applied_controls={} pending_controls={} control_highwater={} blobs={} blob_acceptance_markers={} blob_last_acceptance_marker={} blob_sealed_bytes={} blob_operations={} blob_operation_bytes={} blob_variants={} blob_finalized_variants={} blob_committed_chunks={} blob_committed_file_bytes={} blob_reserved_file_bytes={} pending_blobs={} blob_carrier_prefixes={} blob_carrier_fetch_cursors={} blob_network_staging_bytes={} blob_ranges_fetched={} blob_bytes_fetched={} blob_remaining={} blob_deferred={} mission_auth=hybrid-pq provisioning={} semantics=source-authenticated-event reconciliation_classes=event,state,record,blob-v5 controls_semantics=source-authenticated-flash",
+        "STOP lifecycle=complete sync_status={} carrier_id={} mission_id={} contacts={} contact_errors={} direct_contacts={} relay_contacts={} unknown_path_contacts={} carrier_path_transitions={} carrier_path_transition_saturations={} path_observation=not-authorization opaque_items={} opaque_acceptance_markers={} events={} event_acceptance_markers={} route_cached_events={} controls={} applied_controls={} pending_controls={} control_highwater={} blobs={} blob_acceptance_markers={} blob_last_acceptance_marker={} blob_sealed_bytes={} blob_operations={} blob_operation_bytes={} blob_variants={} blob_finalized_variants={} blob_committed_chunks={} blob_committed_file_bytes={} blob_reserved_file_bytes={} pending_blobs={} blob_carrier_prefixes={} blob_carrier_fetch_cursors={} blob_network_staging_bytes={} blob_ranges_fetched={} blob_bytes_fetched={} blob_remaining={} blob_deferred={} mission_auth=hybrid-pq provisioning={} semantics=source-authenticated-event reconciliation_classes=event,state,record,blob-v7-v8-profile4 controls_semantics=source-authenticated-flash",
         sync_status,
         local_id,
         format_node_id(config.mission.identity()),
@@ -23671,7 +23688,7 @@ fn settle_pending_blob_lifetime_unavailability_for_contact(
     verifier: &ReferenceEnvelopeSealer,
     source: BlobTransferId,
     blob_contact_mode: BlobContactMode,
-) -> Result<(), NodeError> {
+) -> Result<PendingBlobLifetimeTransition, NodeError> {
     if blob_contact_mode != BlobContactMode::CustodyV1 {
         return Err(NodeError::Protocol(
             "durable-only Blob contact became lifetime-unavailable".into(),
@@ -23700,7 +23717,7 @@ fn settle_pending_blob_lifetime_unavailability_for_contact(
             .remove_pending_blob(verifier, &claim)
             .map_err(|error| fatal_blob_coherence("retired pending Blob cache removal", error))?;
     }
-    Ok(())
+    Ok(transition)
 }
 
 fn node_blob_contact_policy_transition_error(error: &NodeError) -> bool {
@@ -26001,6 +26018,7 @@ async fn sync_authenticated_session(
         #[cfg(not(feature = "nearby-discovery"))]
         None => unreachable!("discovered peers require the nearby-discovery feature"),
     };
+    reject_unsupported_blob_intent(mission.semantic_version(), &mutable_interests)?;
     let mut receipt = authenticated_receipt(connection, &mission, handshake)?;
     #[cfg(test)]
     apply_test_preaccounted_contact_items(&mut receipt)?;
@@ -28314,6 +28332,7 @@ async fn serve_session(
         #[cfg(not(feature = "nearby-discovery"))]
         None => unreachable!("discovered peers require the nearby-discovery feature"),
     };
+    reject_unsupported_blob_intent(mission.semantic_version(), &mutable_interests)?;
     let mut receipt = authenticated_receipt(&connection, &mission, handshake)?;
     #[cfg(test)]
     apply_test_preaccounted_contact_items(&mut receipt)?;
@@ -32358,7 +32377,7 @@ mod tests {
         assert_eq!(mutable_classes_for_semantic(7), &MUTABLE_V5_CLASSES);
         assert_eq!(
             READY_RECONCILIATION_CLASSES,
-            "event,state,record,blob-v7-stream,event-bridge-v6-opt-in"
+            "event,state,record,blob-v7-v8-profile4,event-bridge-v6-opt-in"
         );
         assert_eq!(contact_reconciliation_classes(1), "event,state,record");
         assert_eq!(contact_reconciliation_classes(4), "event,state,record");
@@ -33552,6 +33571,14 @@ mod tests {
                         && claim.blob_id().as_bytes() == &[0x44; 32]
                         && claim.priority() == Priority::Routine
                         && claim.ttl_ms() == 1
+                        && claim.prior_cumulative_age_ms() == 0
+                        && claim.sender_sample()
+                            == CustodySample {
+                                clock_id: [0x55; 16],
+                                tick_ms: 0,
+                            }
+                        && claim.hop_delta_ms() == 0
+                        && claim.forwarding_age_ms() == 0
                 }),
                 "source-frame" => {
                     Frame::decode_for_semantic_version(&bytes, 8).is_ok_and(|frame| {
@@ -33596,7 +33623,7 @@ mod tests {
                 _ => panic!("{name}: unknown vector disposition {disposition}"),
             }
         }
-        assert_eq!((accepted, rejected), (7, 19));
+        assert_eq!((accepted, rejected), (7, 25));
     }
 
     #[test]
@@ -49656,9 +49683,9 @@ mod tests {
 
     #[test]
     fn semantic_blob_profile_four_resolves_to_version_scoped_contact_mode() {
-        // Mutation caught: deriving finite eligibility from semantic-v8 alone,
-        // or continuing Slice-5A suppression after authenticated profile-4
-        // negotiation, would expose or starve the wrong source set.
+        // Mutation caught: deriving finite eligibility from semantic-v8 alone
+        // or suppressing transfer after authenticated profile-4 negotiation
+        // would expose or starve the wrong source set.
         let negotiated = |semantic_version, offer: TransferProfileOfferV1| {
             let negotiated =
                 negotiate_transfer_profiles_for_semantic_version(semantic_version, &offer, &offer)
@@ -49911,10 +49938,10 @@ mod tests {
         fs::remove_dir_all(state).expect("finite startup cleanup");
     }
 
-    async fn assert_v5_v6_contact_leaves_blob_state_unchanged(semantic_version: u16) {
-        // Mutation caught: retaining the removed one-range Blob source/carrier
-        // lane for v5/v6 would stage a source or advance a Blob cursor before
-        // the unsupported carrier is rejected.
+    async fn assert_v5_v6_blob_intent_fails_before_blob_io(semantic_version: u16) {
+        // Mutation caught: silently omitting configured Blob intent on v5/v6,
+        // or retaining the removed one-range source/carrier lane, would either
+        // complete this contact or mutate Blob state before rejection.
         let services = control_test_services([0xe3; 32]);
         let authority = services.member.mission_authority_id();
         assert_eq!(services.other.mission_authority_id(), authority);
@@ -50108,9 +50135,9 @@ mod tests {
             None
         );
 
-        let (receiver_receipt, source_receipt) = with_test_semantic_version(
+        let (receiver_result, source_result) = with_test_semantic_version(
             semantic_version,
-            Box::pin(blob_contact_test_pair_with_caches(
+            Box::pin(blob_contact_test_pair_with_caches_results(
                 source_store.clone(),
                 services.member.clone(),
                 interests(),
@@ -50128,7 +50155,18 @@ mod tests {
         )
         .await;
 
-        assert_eq!(source_receipt.semantic_version, semantic_version);
+        for (role, result) in [("receiver", receiver_result), ("source", source_result)] {
+            match result {
+                Err(NodeError::Protocol(message)) => assert_eq!(
+                    message,
+                    "Blob transfer intent requires authenticated semantic protocol v7 or later",
+                    "{role} exact v5/v6 Blob rejection"
+                ),
+                other => panic!(
+                    "{role} v{semantic_version} Blob-intent contact did not fail exactly: {other:?}"
+                ),
+            }
+        }
         assert!(
             receiver_store
                 .blob_source_projection(finite)
@@ -50141,7 +50179,7 @@ mod tests {
                 .blob_source_projection(durable)
                 .expect("legacy durable receiver projection")
                 .is_none(),
-            "removed v5/v6 carrier must not stage durable Blob state: receiver={receiver_receipt:?}, source={source_receipt:?}"
+            "removed v5/v6 carrier must not stage durable Blob state"
         );
         assert_eq!(
             source_store
@@ -50184,6 +50222,30 @@ mod tests {
                 .blob_carrier_fetch_cursor(services.member.identity())
                 .expect("receiver cursor after contact"),
             None
+        );
+
+        let (receiver_non_blob, source_non_blob) = with_test_semantic_version(
+            semantic_version,
+            Box::pin(blob_contact_test_pair_with_caches_results(
+                source_store.clone(),
+                services.member.clone(),
+                MutableSourceInterests::default(),
+                test_event_route_cache(&source_store, &services.member),
+                receiver_store.clone(),
+                services.other.clone(),
+                MutableSourceInterests::default(),
+                test_event_route_cache(&receiver_store, &services.other),
+                None,
+                None,
+                None,
+                None,
+                0,
+            )),
+        )
+        .await;
+        assert!(
+            receiver_non_blob.is_ok() && source_non_blob.is_ok(),
+            "v{semantic_version} non-Blob contact must remain supported: receiver={receiver_non_blob:?}, source={source_non_blob:?}"
         );
 
         drop(source_store);
@@ -50246,9 +50308,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_blob_carrier_v5_v6_leaves_blob_state_and_cursors_unchanged() {
+    async fn v5_v6_blob_intent_fails_explicitly_before_blob_io() {
         for semantic_version in 5..=6 {
-            assert_v5_v6_contact_leaves_blob_state_unchanged(semantic_version).await;
+            assert!(
+                reject_unsupported_blob_intent(
+                    semantic_version,
+                    &MutableSourceInterests::default()
+                )
+                .is_ok(),
+                "v{semantic_version} non-Blob contacts remain supported"
+            );
+            assert_v5_v6_blob_intent_fails_before_blob_io(semantic_version).await;
         }
     }
 
@@ -53931,11 +54001,11 @@ mod tests {
     }
 
     #[test]
-    fn terminal_blob_poison_advances_scheduler_past_source_to_later_candidate() {
+    fn terminal_source_rotation_uses_maximum_object_before_later_candidate() {
         let mut missions = issue_missions(2);
         let peer = missions.pop().expect("scheduler peer mission");
         let owner = missions.pop().expect("scheduler owner mission");
-        let state = root("terminal-blob-poison-fairness");
+        let state = root("terminal-blob-source-rotation");
         fs::create_dir_all(&state).expect("terminal Blob fairness state");
         let store = Store::open_for_mission(
             state.join(STORE_FILE),
@@ -53945,7 +54015,7 @@ mod tests {
         let topic = Topic::new("opaque").expect("terminal Blob topic");
         let scope = Scope::new("test/runtime-contact").expect("terminal Blob scope");
         let mut sealer = open_test_sealer(&owner.credentials);
-        let (poison_source, poison_plan, manifest_last, maximum) = (0u8..32)
+        let (completed_source, completed_plan, manifest_last, maximum) = (0u8..32)
             .find_map(|salt| {
                 let plaintext = vec![salt; 96 * 1024];
                 let source = publish_test_blob(&store, &mut sealer, &topic, &scope, 1, &plaintext);
@@ -53968,7 +54038,7 @@ mod tests {
             })
             .expect("deterministic multi-carrier plan with manifest-last below maximum");
         let later_source = BlobTransferId::new([0xff; 32]);
-        assert!(poison_source < later_source);
+        assert!(completed_source < later_source);
         let mut later_object_bytes = [0xff; 33];
         later_object_bytes[0] = 2;
         let later_object = BlobCarrierObjectId::new(later_object_bytes).expect("later carrier ID");
@@ -53976,22 +54046,22 @@ mod tests {
 
         advance_terminal_blob_source_cursor(
             &store,
-            &poison_plan,
-            poison_source,
+            &completed_plan,
+            completed_source,
             Some((peer_id, None)),
         )
-        .expect("terminal poison advances its scheduler cursor");
+        .expect("terminal source rotation advances its scheduler cursor");
         let cursor = store
             .blob_carrier_fetch_cursor(peer_id)
-            .expect("terminal poison cursor")
-            .expect("terminal poison persisted a cursor");
-        assert_eq!(cursor.source(), poison_source);
+            .expect("terminal source-rotation cursor")
+            .expect("terminal source rotation persisted a cursor");
+        assert_eq!(cursor.source(), completed_source);
         assert_ne!(manifest_last, maximum);
         assert_eq!(cursor.object(), maximum);
 
         let mut candidates = vec![
             BlobRangeCandidate {
-                source: poison_source,
+                source: completed_source,
                 object: manifest_last,
                 total_len: 1,
                 offset: 0,

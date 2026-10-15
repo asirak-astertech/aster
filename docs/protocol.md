@@ -226,7 +226,7 @@ authentication.
 
 This profile amortizes the authority credential and ML-DSA source signature
 without removing post-quantum authentication. It is available only after the
-authenticated session selects semantic version 2, 3, 4, 5, 6, or 7. A batch has
+authenticated session selects semantic version 2 through 8. A batch has
 `2..64` items from one publisher with one data class, topic, scope, content-key
 epoch, and credential. Causal counters are nonzero and contiguous in item-index
 order.
@@ -524,7 +524,7 @@ stopped `SelectedBlobNode` retains synchronous streaming, while
 takes ownership of a nonempty regular file positioned at byte zero and admits
 at most 64 MiB/1,024 chunks; live read returns one freshly authenticated,
 zeroize-on-drop page of `1..=64 KiB`. These application chunk/page bounds are
-separate from the semantic-v5 carrier range bound of 16 KiB in §9.2.
+separate from the historical semantic-v5 carrier range bound of 16 KiB in §9.2.
 Neither surface treats a redb projection as authorization: it freshly verifies
 the selected source and current policy/lineage and requires the exact
 authenticated `BlobDepotCompletion` capability before opening that depot
@@ -539,10 +539,13 @@ lineage fences and accepted-publication replay fences are independently bounded
 by row and canonical encoded-byte caps; publication lifecycle rows have a
 separate row cap. Selected defaults are 65,536 rows/16 MiB per fence class and
 65,536 publication lifecycle rows. Typed variant references distinguish exact
-publication roots from exact pending-source roots. These are non-evictable
-security/accounting records, not TTL or reclamation policy, and semantic-v5
-source, carrier, and result bytes remain unchanged. This increment is durable-
-only: it adds no wire frame or public application operation.
+publication roots from exact pending-source roots. The fence records are
+non-evictable security/accounting authority and are never removed by TTL,
+retirement-evidence expiry, pressure recovery, or physical reclamation.
+Publication and operation lifecycle records separately carry live/retired
+state, retention and TTL deadlines, and conservative custody age. This adds no
+public application GC operation; selected lifecycle maintenance remains a
+bounded internal store/runtime responsibility.
 
 The manifest is the payload of a source-authenticated envelope whose signed
 header commits BlobID, nonzero chunk count, and a route Merkle root. Encrypted
@@ -824,15 +827,18 @@ lineage; a zero-lineage fence is corruption.
 The requester repeats the proof in every BlobRangeFetch, and the sender
 rechecks proof, route, revocation, source route lineage, and physical content
 lineage before advertising a source and before serving every range. The
-selected v5 lane is therefore direct between current content-capable peers; the
+historical v5 lane was therefore direct between content-capable peers; the
 reference route-only relay design in §8.4 and `envelope.md` is not selected
 here.
 
-The current selected `aster-node` schedules this grammar automatically on its
-direct-Iroh contacts after semantic-v5-or-v6 negotiation, control activation, and an
-exact configured Blob receive selector. Current validation coverage and its
-environment limits are tracked in the
-[requirements status](validation/requirements-status.md).
+The current selected `aster-node` retains this source phase and exact 16-KiB
+range tuple, but schedules carrier bytes only after semantic-v7/v8 profile-4
+negotiation, control activation, and an exact configured Blob receive selector.
+Semantic-v5/v6 carrier attempts fail before carrier IO. Profile 4 replaces the
+historical per-range Result/Ack and Finish/Finished dialogue below with the
+receipt-free multi-range stream in §9.4. Current validation coverage and its
+environment limits are tracked in the [requirements
+status](validation/requirements-status.md).
 
 For each receiver direction, the Blob source phase completes first through the
 class-separated mutable inventory/difference/Offer/Fetch/result/ack/finish
@@ -922,21 +928,25 @@ resume after restart, reconcile ambiguous filesystem state, and retain the
 variant's full accounting charge until finalization. Runtime startup executes
 one bounded page before Blob commands; periodic pages remain behind operational
 priority and yield between filesystem units. Capacity admission can perform one
-separately bounded, cursor-neutral pass over this already-unreferenced work and
-retry once. It never selects a live candidate. Live retirement,
-retention/retirement expiry, pressure eviction, and finite Blob TTL are not part
-of this increment. No garbage-collection operation is selected into the
-application/protocol surface or exposed as an end-user API; the store's
-doc-hidden bounded maintenance methods remain an internal integration seam.
+separately bounded, cursor-neutral pass over already-authorized unreferenced
+work and retry once. It does not select a new live victim in that physical-only
+pass. A separate bounded pressure transaction may logically retire an expired
+candidate or work strictly below the incoming priority, then issue exact
+deletion authority for the selected variant. Retirement-evidence expiry and
+finite-Blob TTL expiry use conservative lower-bound age and the same bounded
+maintenance substrate. No garbage-collection operation is selected into the
+application/protocol surface or exposed as an end-user API; the store's bounded
+maintenance methods remain an internal integration seam.
 
 `Normal` and every `AtLeast(priority)` run Blob source and carrier work because
 `AtLeast` filters Event emission only. `ReceiveOnly` initiates, requests,
 advertises, sends, accepts, reserves, and counts zero selected Blob work. This
 separate selected application layer has a durable metadata-only publication
 queue, but it does not alter this wire path or its configured interests. The
-selected profile defines no route-only Blob relay or custody, Blob TTL or
-retention expiry, live retirement, pressure eviction, or metadata-independent
-whole-byte identity or deduplication. These selected behaviors do not establish
+selected profile defines durable and finite Blob lifecycle, retention expiry,
+logical retirement, and lower-priority pressure recovery, but no route-only
+Blob relay/custody or metadata-independent whole-byte identity or deduplication.
+These selected behaviors do not establish
 large-file, physical-carrier, mixed-implementation, or release acceptance.
 
 The reference driver can initiate an exchange and can answer one through its
@@ -1026,6 +1036,21 @@ authenticated finite-TTL custody. See [receipt-free Blob ranges](blob-ranges-str
 for the versioned profile contract. A missing required profile, empty
 intersection, digest mismatch, or profile substitution fails closed.
 
+For each admitted Blob direction, profile 4 sends one protected `ABRS || 0x01`
+schedule containing at most 64 canonical `BlobRangeFetchV5` tuples and receives
+the exact domain-separated schedule hash as acceptance. The role-ordered
+uni-turn then carries exactly one protected `ABRD || 0x01` response per index,
+each repeating that hash and its index before a canonical `BlobRangeV5` Data or
+Unavailable response. It ends with protected `ABRE || 0x01`, the same hash, the
+scheduled count, and transport FIN. Wrong direction, tuple, hash, index, count,
+order, truncation, or trailing data fails closed. Every protected record binds
+the semantic-version-specific lane AAD, complete negotiated-profile digest,
+Blob lane, profile 4, and direction. A valid terminal authorizes completion,
+promotion, and one cursor outcome; it is not a receipt for remote storage.
+The stdlib-only same-team Python construction oracle is checked in at
+`conformance/vectors/blob-ranges-stream-v1.tsv`; the shared v7/v8 stream-record
+corpus is `conformance/vectors/blob-stream-records-v1.tsv`.
+
 Semantic-v8 custody allocates the
 following Blob-only extension to the existing mutable tags without allocating
 any new tag. After the existing length-prefixed source bytes in a Blob
@@ -1063,6 +1088,30 @@ Finite Blob inventory, offer/fetch scheduling, pending insertion, carrier work,
 cursor advancement, and promotion require semantic-v8 authenticated custody.
 Semantic-v7 profile 4 suppresses finite Blob transfer while retaining the same
 durable-only range-stream mechanics.
+
+The receiver persists the source TTL, authenticated age lower bound, continuity
+state, and exact semantic/profile provenance with the pending or published
+source. Every source, range, append, completion, promotion, service, read, and
+delivery boundary re-evaluates that state. Proven expiry atomically removes
+ordinary visibility. Expiry of a live publication creates retained retirement
+evidence and preserves its applicable physical-lineage and
+accepted-publication replay fences. Expiry of a pending source removes that
+source, its prefixes, and ordinary references while preserving its applicable
+physical-lineage fence; it does not invent a publication-retirement row. An
+ineligible policy or continuity failure instead withholds or rejects the exact
+work. None of those failures may publish or restore a staged prefix. Applicable
+permanent fences survive retirement and later retirement-evidence expiry.
+Retained retirement records expire after the configured 45-day conservative
+lower-bound interval.
+
+When admission reports a typed Blob capacity shortage, one bounded recovery
+attempt may atomically select expired work first or a live candidate strictly
+below the incoming priority. Selection is fixed to the rejected partition and
+the authenticated durable/custody visibility mode. Logical retirement precedes
+physical reclamation. Reclamation requires a persisted exact-variant deletion
+manifest and proceeds under independent row, file, and encoded-byte budgets;
+restart resumes that same manifest. Missing or delayed exact deletion authority
+fails closed and cannot claim release from another variant.
 
 Each Event direction then exchanges one `EventTurnPlanV1`: `PageActive`,
 `PageBlindActive`, `LegacyActive`, `Empty`, or `Suppressed`. `PageActive` binds
@@ -1331,10 +1380,13 @@ domain/generation deadline; a lost unanchored row uses the generation-zero,
 zero-clock, zero-tick sentinel. Each maintenance transaction processes at most
 the caller's existing 1,024-row limit, prioritizing sentinel and older-generation
 re-anchor work before current-generation due deadlines. Re-anchoring, age/index
-mutation, and retirement marking are atomic and restart-safe. The change is
-wire-neutral: custody claims and item encoding are unchanged. This behavior is
-currently exercised for Event/RouteEvent; finite Blob lifecycle work consumes
-the same policy in a later implementation.
+mutation, and retirement marking are atomic and restart-safe. Event/RouteEvent
+claims and item encoding remain unchanged. Semantic-v8 Blob profile 4 applies
+the same conservative lower-bound rule through its exact 208-byte custody
+claim: continuous local residence increases age, continuity loss is sticky and
+adds no guessed restart interval, a below-TTL unknown-age source is withheld,
+and a lower bound at or above TTL retires the exact publication or pending
+source. Semantic v7 profile 4 remains durable-only.
 
 Session counters/windows, full ItemID deduplication, publisher counter ledgers,
 mission epochs, and control-chain rollback checks ensure captured traffic is not
@@ -1396,13 +1448,13 @@ Emission modes are:
 - `AtLeast(p)`: Event application objects below `p` are withheld. It does not by
   itself disable configured contact initiation, the protocol/control work
   needed to authenticate and complete an allowed contact, semantic-v4/v5/v6/v7/v8
-  State/Record reconciliation, or semantic-v5/v6/v7/v8 Blob transfer; the threshold is
+  State/Record reconciliation, or semantic-v7/v8 profile-4 Blob transfer; the threshold is
   Event-only.
 - `ReceiveOnly`: no contact initiation, discovery, inventory disclosure, or
   application/control object transmission; mandatory connection
   authentication, acknowledgements, and bounded apply results may occur while
   ingesting authenticated inbound Event work. It initiates and discloses no
-  semantic-v4/v5/v6/v7/v8 State/Record lane or semantic-v5/v6/v7/v8 Blob lane.
+  semantic-v4/v5/v6/v7/v8 State/Record lane or semantic-v7/v8 profile-4 Blob lane.
 - `PassiveOnly`: zero framework-originated bytes; receives only unsolicited
   independently protected broadcast/push.
 
@@ -1914,9 +1966,9 @@ The semantic-version inheritance registry is normative:
 | `2` | v1 | compact batch and bridge objects |
 | `3` | v2 | session custody record |
 | `4` | v3 | State and Record reconciliation |
-| `5` | v4 | direct Blob transfer |
+| `5` | v4 | historical direct Blob frame allocation |
 | `6` | v5 ordinary lanes byte-for-byte | Event bridge transfer |
-| `7` | v6 byte-for-byte | per-lane transfer profiles and receipt-free Event pages |
+| `7` | v6 byte-for-byte | per-lane profiles, receipt-free Event pages, and durable Blob range streams |
 | `8` | v7 byte-for-byte except the lane AAD domain and Blob custody fields | authenticated finite Blob custody over `BlobRangesStreamV1` |
 
 An inherited version retains every earlier stable encoding and selected-lane
@@ -1936,32 +1988,39 @@ Semantics `2` through `8` additionally permit the reserved kinds `3`
 wrapper). Semantics `3` through `8` add the bounded session custody
 record in [envelope.md](envelope.md) §7.1; none allocates another stable object
 kind. Semantics `4` through `8` enable the §9.1 selected State/Record
-mechanics frames; semantics `5` through `8` enable the §9.2 selected Blob mechanics
-frames. Semantic `6` preserves all v5 ordinary-lane bytes and additionally
+mechanics frames; semantics `5` through `8` recognize the historical §9.2 Blob
+frame allocation, while selected carrier transfer requires the v7/v8 profile-4
+stream. Semantic `6` preserves all v5 ordinary-lane bytes and additionally
 enables the mutually opted-in §9.3 selected Event-bridge mechanics frames.
 Semantic `7` preserves all v6 mechanics and adds the §9.4 profile exchange and
-eligible receipt-free Event pages. A v1-v3 selected-node session filters all
+eligible receipt-free Event pages. Semantic `8` inherits those mechanics,
+changes the lane AAD domain, and adds authenticated finite Blob custody. A
+v1-v3 selected-node session filters all
 mutable frames, v4 filters all Blob frames, v1-v5 filter all v6 Event-bridge
 frames, and v1-v6 filter all v7 profile/page frames, completely.
 A v1 session filters
 those extended kinds before inventory-root construction and rejects them in
 messages, durable progress, and transfer events rather than silently processing
 v2/v3/v4/v5/v6/v7/v8 semantics. Semantic 1 also rejects envelope format 3 and compact batch
-authentication. Semantics 2, 3, 4, 5, 6, and 7 permit both the unchanged format-2
+authentication. Semantics 2 through 8 permit both the unchanged format-2
 singleton and the §6.1 format-3 batch representation; negotiated semantics
 never rewrite stored stable bytes.
 
 Durable ranged-transfer progress records the immutable semantic version under
-which the object was first admitted. A source object first admitted under v1 may
-resume on v1, v2, v3, v4, v5, v6, or v7; a source first admitted under v2,
-v3, v4, v5, v6, or v7 may resume only on v2, v3, v4, v5, v6, or v7. Recognized stable Blob carriers admitted
-under any supported version may resume on any supported version, while extended
-kinds `3..5` resume only on v2, v3, v4, v5, v6, or v7. Migrated progress
-without trustworthy origin-version provenance is suppressed rather than guessed.
-Selected mutable State/Record transfer itself remains v4/v5/v6/v7/v8-only,
-selected Blob mechanics remain v5/v6/v7/v8-only, and selected Event-bridge
-mechanics remain v6/v7/v8-only regardless of the stable source object's earlier compatibility
-provenance.
+which the object was first admitted. A source object first admitted under v1 is
+stored as compatible with every supported version; a source first admitted
+under v2 through v8 is stored as compatible only with v2 through v8. Recognized
+stable Blob carrier records preserve their supported origin-version provenance,
+while extended kinds `3..5` preserve v2-through-v8 provenance. These stored
+compatibility facts do not authorize network carrier I/O. Migrated progress
+without trustworthy origin-version provenance is suppressed rather than
+guessed. Selected mutable State/Record transfer remains v4/v5/v6/v7/v8-only.
+Actual selected Blob source and carrier resume requires semantic v7 or v8
+profile 4: durable exact prefixes are peer-neutral and may resume across v7/v8,
+while a finite pending source resumes only under v8 custody mode with compatible
+authenticated provenance.
+Selected Event-bridge mechanics remain v6/v7/v8-only regardless of the stable
+source object's earlier compatibility provenance.
 Eligibility filtering occurs before page limits so incompatible early rows
 cannot starve later compatible work.
 
@@ -2029,7 +2088,7 @@ outbound, and replay limits:
 | retained handshake flight | 1 entry | a causal authenticated next flight replaces or retires it |
 | combined pending logical bytes | 16 MiB | checked before every retry insert/refresh, outbox insert, and handshake replacement |
 | selected mutable object | 1 MiB | oversized State/Record bytes fail before durable admission; malformed or unauthorized bytes remain fatal |
-| semantic-v8 Blob custody claim | exactly 208 bytes; source field at most 211 bytes and result/ack field at most 33 bytes | wrong presence, length, context, digest, duplicate, truncation, or trailing bytes fail closed; finite admission remains inactive |
+| semantic-v8 Blob custody claim | exactly 208 bytes; source field at most 211 bytes and result/ack field at most 33 bytes | wrong presence, length, context, digest, duplicate, truncation, trailing bytes, or age overflow fail closed; a verified exact-context capability is required for finite admission and every lifecycle boundary |
 | selected mutable class | 4,096 rows and 16 MiB encoded source bytes, independently for State and Record | an otherwise valid new object receives `DeferredCapacity`; no existing mutable row is pruned |
 | mutable fairness cursor | 256 configured mission peers, 4 peer/class/local-mode rows each, 1,024 rows total | startup rejects an overbound configured set and prunes rows for peers no longer configured; ordinary data quota cannot consume the reserve |
 | live application command lane | 32 commands shared by Event, State, Record, and Blob; one queued command for the joined Blob worker | a full Blob worker queue returns explicit `ResourceLimit`; shutdown and zeroization close both admissions and join the worker |

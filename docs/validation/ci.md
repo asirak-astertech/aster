@@ -663,7 +663,9 @@ and source hashes are recorded in the
 [prior semantic-v3 custody requirements evidence](requirements-status.md#prior-semantic-v3-selected-event-custody-automated-evidence).
 
 This is current-code automated evidence, not a retained physical acceptance
-receipt. Finite TTL is Linux/Event/v3-format only, inherited in v3/v4/v5/v6/v7;
+receipt. That retained finite-TTL boundary is Linux/Event/v3-format only,
+inherited in v3-v8; semantic-v8 Blob finite custody/lifecycle is separate
+current-code evidence without retained credit.
 receive-only is not physical RF silence. V1/v2 deterministic whole-contact
 partials, generic cross-class priority eviction, selected State/Record custody
 or future TTL design (the current finite form rejects), long-offline and
@@ -671,8 +673,8 @@ many-node scale, mixed implementations, operational provisioning with a
 production backend or protected stock CLI/binding, and release gates remain
 open. Caller-provided protected Rust `NodeConfig` construction is tracked by the
 separate current-code gate below.
-Networked Blob was outside that Event-custody receipt; the separate semantic-v5
-software gate below does not relabel it.
+Networked Blob was outside that Event-custody receipt; the separate historical
+v5 compatibility and current v7/v8 stream/lifecycle gates below do not relabel it.
 
 The subsequent stopped protected-provisioning/control-administration Step 4
 gate is pinned separately in the
@@ -759,7 +761,8 @@ provider destruction is added. The post-enqueue cancellation cell is Unix-only.
 ## Semantic-v7 Event page current-code gate
 
 `V-EVENT-PAGES-V7` is an additive current-code gate. It checks semantic
-`[7,6,5,4,3,2,1]` selection and v7/v6 fallback, canonical per-lane profile
+`[8,7,6,5,4,3,2,1]` selection, v8/v7 page inheritance, and v7/v6 fallback,
+canonical per-lane profile
 negotiation, contextual record AAD, bounded ordered uni turns, receipt-free
 durable, finite-TTL, mixed, route-only, and blind ReceiveOnly Event convergence,
 finite custody-age admission without per-peer receipt/lease/retry state,
@@ -775,14 +778,14 @@ rows and 6 representative malformed REJECT rows; the `aster-node` vector tests
 regenerate it from the reference codecs and route every REJECT row through its
 corresponding decoder.
 
-The semantic-v4 State/Record gate is inherited unchanged by v5, v6, and v7 and
+The semantic-v4 State/Record gate is inherited unchanged through v8 and
 is additive to those frozen slices. The frozen v6 gate used default/highest 6
-with `[6, 5, 4, 3, 2, 1]`; the current v7 gate uses default/highest 7 with
-`[7, 6, 5, 4, 3, 2, 1]`. Semantic v6 preserves the v5 ordinary Event,
-State/Record, and Blob lanes byte-for-byte and adds only the mutually enabled
-Event-bridge mechanics lane. Selected mutable frames are absent in v1-v3,
-selected Blob frames are absent in v1-v4, and selected bridge frames are absent
-in v1-v5. Focused validation
+with `[6, 5, 4, 3, 2, 1]`; the current default/highest is 8 with
+`[8, 7, 6, 5, 4, 3, 2, 1]`. Semantic v6 preserves the historical v5 ordinary
+frame allocation and adds only the mutually enabled Event-bridge mechanics
+lane; selected Blob carrier IO now requires v7/v8 profile 4. Selected mutable
+frames are absent in v1-v3 and selected bridge frames are absent in v1-v5.
+Focused validation
 must cover the complete State/Record class and direction grammar, including all
 20 structured mutable tags in `selected_frame_decode`; exact offer
 `MutableApplyResult`, fetch `MutableFetchResult` plus required exact
@@ -1105,9 +1108,12 @@ implementation; scale/resource/soak result; State, Record, or Blob acceptance;
 post-policy fresh completion or beta delivery; indefinite retention/GC; release
 artifact; or production authorization.
 
-The semantic-v5 direct Blob gate is additive to the earlier stopped/local Blob
-gate. It must cover all Blob interest/source/range/result/ack/finish frame bytes,
-malformed and cross-tuple rejection, and v1-v4 zero-Blob behavior. Provider
+The historical semantic-v5 direct Blob gate is retained as codec and
+durable-storage compatibility evidence; Result/Ack/Finish is not current
+carrier behavior. The current network gate requires semantic-v7/v8 profile 4,
+the stdlib-only same-team construction oracle plus shared ABRS/ABRD/ABRE record vectors,
+malformed schedule/hash/index/count/terminal
+rejection, and v5/v6 pre-carrier failure. Provider
 tests require a current 32-byte peer content proof plus route authority and
 nonrevocation and reject route-only, wrong peer/topic/scope/epoch/authority,
 tamper, stale proof, and same-epoch replacement. Store tests require source-
@@ -1116,9 +1122,10 @@ before-carrier staging, contiguous peer-neutral prefixes of at most 16 KiB,
 fresh full-content/current-lineage completion, and zero ordinary visibility
 before atomic promotion. A new physical lineage for the same `(BlobID, content
 group, numeric epoch)` must fail with `PhysicalLineageConflict`; republish or
-resume requires an epoch advance. Finish/Finished is only the requester's
-remaining-count echo, while each exact Result/Ack binds accepted prefix
-progress. Read-only, writable, and terminal-preservation opens must cross-audit
+resume requires an epoch advance. Current range streaming has no per-range
+storage receipt; durable prefixes are the recovery authority, while a valid
+schedule-bound terminal plus FIN authorizes completion and one cursor outcome.
+Read-only, writable, and terminal-preservation opens must cross-audit
 pending source/manifest route/carriers against the depot plan and completed
 namespace, rejecting a changed plan, a self-consistent missing plan, or a
 pending/completed collision without repair. Writable predecessor migration must add all
@@ -1141,10 +1148,11 @@ second reopen must preserve the same bounded quota charge.
 Runtime races are part of the gate. One regression must pause exact restage
 between fresh authentication and cache insertion while an abort wins, then
 prove the shared source/store/cache lifecycle lock leaves neither an orphan
-claim nor an unclaimed durable source and requires no restart. Another must use
-a multi-carrier source whose manifest-last carrier is not its greatest ID and
-prove terminal poison advances to the lexicographic maximum so a later source
-is selected.
+claim nor an unclaimed durable source and requires no restart. A terminal
+content failure must abort only its exact pending source and leave the turn
+cursor-neutral. Separately, the successful terminal source-rotation helper must
+use a multi-carrier source whose manifest-last carrier is not its greatest ID
+and select the later source after advancing to that maximum.
 
 The final runtime gate is one small bounded three-node direct-Iroh case: source
 and first receiver make only partial carrier progress, runtime/store/provider
@@ -1173,7 +1181,7 @@ cargo test --locked -p aster-node runtime::tests::blob_source_carrier_reopen_res
 cargo test --locked -p aster-node runtime::tests::stale_pending_blob_cleanup_removes_visibility_but_retains_reserved_staging -- --exact
 cargo test --locked -p aster-node runtime::tests::pending_blob_abort_reconciles_concurrent_exact_restage_without_restart -- --exact
 cargo test --locked -p aster-node runtime::tests::blob_lifecycle_lock_serializes_delayed_projection_insert_and_abort -- --exact
-cargo test --locked -p aster-node runtime::tests::terminal_blob_poison_advances_scheduler_past_source_to_later_candidate -- --exact
+cargo test --locked -p aster-node runtime::tests::terminal_source_rotation_uses_maximum_object_before_later_candidate -- --exact
 cargo test --locked -p aster-node runtime::tests::authenticated_peer_without_scope_grant_learns_no_event_id_and_cannot_fetch -- --exact
 cargo check --locked --manifest-path fuzz/Cargo.toml --bin selected_frame_decode
 ```
@@ -1183,7 +1191,8 @@ all-open-path audit, and predecessor-migration results plus the frozen source
 manifest are recorded in the [prior semantic-v5 Blob requirements evidence](requirements-status.md#prior-semantic-v5-direct-blob-network-automated-evidence).
 Independent final audit found no remaining P0–P3. The repair retains the bounded
 non-public physical-lineage fence, serializes durable-source/cache transitions,
-and advances terminal cursor state to the lexicographic maximum. Exactly six
+keeps terminal failures cursor-neutral, and uses the lexicographic maximum for
+authorized terminal source rotation. Exactly six
 requirements moved to `implemented-uncredited`; this current-code automation
 creates no retained Blob receipt or `observed-bounded` credit and does not
 relabel historical Event/control evidence.
@@ -1614,7 +1623,7 @@ current code additionally has durable Event Consume/Carry selectors, live and
 stopped-state poll/ack, idempotent unsubscribe, verified gap inspection,
 bounded last-contact status, protected receiver-directed filtering, and
 separate live and stopped State and Record projections plus stopped Blob
-streaming and semantic-v5 direct Blob transfer/resume automation;
+streaming and semantic-v7/v8 profile-4 Blob transfer/resume automation;
 it does not turn the retained parent roots into PR-B, PR-C, State, Record, or
 Blob receipts. Those retained parent tests do not claim networked State/Record
 or Blob, remote Blob chunks, global convergence, generalized control

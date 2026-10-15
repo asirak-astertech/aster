@@ -2,7 +2,7 @@
 
 This is the shortest path to Aster's **selected live Blob application surface**,
 its durable metadata-delivery queue, its exclusive stopped streaming facade,
-and the semantic-v7 receipt-free streaming boundary for already-durable Blobs.
+and the semantic-v7/v8 receipt-free streaming boundary for Blob transfer.
 `RunningNode::selected_blobs()` returns a cloneable `SelectedBlobHandle`: an
 application may durably publish an owned regular file while the node has no
 peers, read one freshly authenticated plaintext page at a time, and consume
@@ -17,13 +17,13 @@ status; `delivery_status` reports local selector/delivery-ledger counts, while
 `transfer_status` reports audited local durable storage and receive progress.
 The exclusive `SelectedBlobNode` remains available when no runtime owns the same
 store and provides the same delivery lifecycle plus synchronous seekable-source
-publication and streaming `read_into`. Separately, semantic v5 reconciles
-already-durable Blob sources and direct carrier ranges between current
-content-capable peers. Both endpoints must support semantic-v7
+publication and streaming `read_into`. Separately, semantic v7/v8 profile 4
+reconciles Blob sources and direct carrier ranges between current
+content-capable peers. V7 admits durable work only; v8 also admits finite work
+with exact authenticated custody provenance. Both endpoints must support
 `BlobRangesStreamV1`; old Blob transfer has no fallback. Incompatible profile
-offers or older semantic Blob carrier attempts fail explicitly. `EventPagesV1`
-is Event-only. The default semantic offer remains `[7, 6, 5, 4, 3, 2, 1]`;
-v1-v4 emit zero Blob frames, and stable
+offers and v5/v6 carrier attempts fail before carrier IO. `EventPagesV1` is
+Event-only. The default semantic offer is `[8, 7, 6, 5, 4, 3, 2, 1]`; stable
 wire/ABI, source, manifest, and `ASTRBT01` formats remain version 1.
 
 ## Use the live actor API
@@ -187,7 +187,7 @@ are idempotent; tokens above the issued high-water, cross-subscription or
 cross-publication tokens, prior-tenure tokens, stale incarnations, malformed
 tokens, and removed/recreated selectors fail closed.
 `unsubscribe` removes the selector and its delivery ledger without changing
-configured semantic-v5 Blob interests.
+configured Blob network interests.
 
 Cancellation before enqueue cannot mutate the ledger. After enqueue, the
 worker may have committed: retry `subscribe` with the exact operation key to
@@ -284,7 +284,7 @@ let read = blobs.read_into(
 assert_eq!(read.id, published.id);
 ```
 
-## Opt in to semantic-v5 transfer
+## Opt in to semantic-v7/v8 transfer
 
 The runtime does not infer Blob receive intent from State/Record interests. Add
 an exact Blob selector to `NodeConfig::mutable_interests`; descendant scope is
@@ -298,27 +298,28 @@ let mutable_interests = MutableSourceInterests::new(state, record).with_blob(vec
 
 This composes with peerless live publication rather than changing its success
 condition. A source may publish through `selected_blobs()` with no peers, shut
-down, and later restart with an exact configured peer. On a v5 or v6 contact, a
-content-capable interested receiver can durably stage the source and missing
-carrier ranges, promote only after whole-Blob verification, and read the Blob
-through its own live handle. The receiver's completed publication and page
-reads survive another peerless restart.
+down, and later restart with an exact configured peer. On a v7 or v8 profile-4
+contact, a content-capable interested receiver can durably stage the source and
+missing carrier ranges, promote only after whole-Blob verification, and read
+the Blob through its own live handle. The receiver's completed publication and
+page reads survive another peerless restart.
 
 The provider turns that exact topic/scope and the current epoch into an opaque
-32-byte peer proof inside the protected v5-or-v6 contact. Every Blob inventory,
+32-byte peer proof inside the protected v7/v8 contact. Every Blob inventory,
 source, and range send requires the authenticated peer to have both the current
 content proof and current route authorization and to remain nonrevoked.
 Route-only peers cannot use the selected Blob lane. The source-envelope and
 complete manifest plan reconcile first; carrier requests begin only after that
 pending source is durably staged.
 
-Each carrier request extends one exact contiguous prefix by at most 16 KiB. The
-prefix is peer-neutral: its durable key is the source transfer ID plus strict
-kind-2 carrier ID, not the peer or session, so after runtime/store/provider-cache
-teardown and reopen any other eligible content peer can continue at the first
-missing byte. The requester's
-Finish remaining count is echoed for sequencing only; each exact Result/Ack
-tuple binds the accepted prefix.
+Each scheduled range extends one exact contiguous prefix by at most 16 KiB. A
+bounded `ABRS` schedule receives indexed Data or Unavailable `ABRD` records
+and one schedule-bound `ABRE` terminal plus FIN; there is no per-range storage
+Result/Ack. The prefix is peer-neutral: its durable key is the source transfer
+ID plus strict kind-2 carrier ID, not the peer or session, so after
+runtime/store/provider-cache teardown and reopen any other eligible content
+peer can continue at the first missing byte. A valid terminal authorizes the
+turn's completion and cursor outcome but is not proof of remote storage.
 
 Network admission is bounded to 64 MiB of plaintext and 1,024 chunks. Pending
 source/manifest/prefix state is bounded to 10,000 rows and 64 MiB. A pending
@@ -340,23 +341,26 @@ but deliberately retains the exact depot import, its expected or committed
 chunk rows, any chunk files and finalized digest already present, and their
 reserved/committed accounting. That bounded staging is not a publication and
 cannot be read or served; it remains charged to the configured depot byte,
-chunk, and variant quotas until a future explicit GC protocol. An exact-lineage
-retry can resume it, while a different lineage at the same numeric epoch still
-fails and must advance the epoch.
+chunk, and variant quotas until exact manifest-backed reclamation finalizes.
+Bounded maintenance can reclaim authorized unreferenced variants; an
+exact-lineage retry can resume retained staging, while a different lineage at
+the same numeric epoch still fails and must advance the epoch.
 
 Source/store/cache transitions are locally serialized. A successful abort
 removes the old authenticated claim, rereads durable source state, and freshly
-authenticates any exact concurrent restage before restoring its claim. Terminal
-multi-carrier scheduling advances past the lexicographically greatest carrier
-ID, not the last manifest record.
+authenticates any exact concurrent restage before restoring its claim. A
+terminal content-verification failure aborts only the exact pending source and
+is cursor-neutral. Successful terminal source rotation uses the
+lexicographically greatest carrier ID, not the last manifest record.
 
-Normal and `AtLeast` run the v5 lane because `AtLeast` filters Event only.
+Normal and `AtLeast` run eligible v7/v8 profile-4 Blob work because `AtLeast`
+filters Event only.
 `ReceiveOnly` advertises, requests, stages, promotes, and counts zero Blob work.
 The live handle does not change those contact rules and reports no Blob peer or
-convergence status. Route-only Blob relay/custody, finite Blob TTL/expiry, and
-a metadata-independent whole-byte identity are not implemented. Pressure
-recovery is a local durable-storage behavior only; it adds no Blob wire,
-supported public Blob API, or CLI control surface.
+convergence status. Semantic-v8 authenticated custody supplies finite Blob
+TTL/expiry and bounded strictly-lower-priority pressure recovery internally.
+Route-only Blob relay/custody, a metadata-independent whole-byte identity, and
+public Blob lifecycle API/CLI controls are not implemented.
 
 `publish` requires a seekable source because it makes two bounded passes. The
 first computes the whole-content and per-chunk digests with one bounded,
@@ -415,7 +419,7 @@ chunk record, durable per-chunk metadata rows, and epoch-specific import
 variants. Those bounds include both committed content and unfinished resumable
 imports, so abandoned but structurally valid staging retained after terminal or
 stale network cleanup continues to consume byte, chunk, and variant admission
-until a future explicit-GC policy is implemented.
+until exact manifest-backed physical reclamation finalizes.
 The defaults are 512 MiB, 100,000 chunk rows, and 4,096 variants. These limits
 do not account for redb allocation, directory blocks, snapshots, backups, swap,
 an attacker-created population of unrelated directory entries, or every host
@@ -442,9 +446,8 @@ Within an eligible partition, selection is deterministic: lower effective
 priority first; incomplete transfers before completed content; then expired
 finite work, live finite work by nearest final-reference deadline, and durable
 work last; followed by exact completion fraction, acceptance order, and exact
-identity. Current
-Blob TTL remains inactive, so present Blob work is durable; the complete order
-is encoded for future finite records without inventing expiry today.
+identity. Semantic-v8 finite work uses authenticated conservative lower-bound
+age; semantic-v7 work remains durable-only.
 Completion compares the durable carrier-prefix or committed-plaintext fraction
 exactly, rather than using floating point.
 
