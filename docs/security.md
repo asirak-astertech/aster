@@ -765,8 +765,11 @@ pressure recovery retire exact work as a bounded atomic unit; policy or
 continuity failure otherwise withholds or rejects it. Permanent fences remain,
 and retained retirement records expire after 45 days of accumulated
 conservative lower-bound age. Finite Blob TTL and bounded pressure recovery are
-selected under authenticated semantic-v8 custody. Route-only custody and public
-protocol/API/CLI lifecycle controls remain unimplemented.
+selected under authenticated semantic-v8 custody on Linux. The selected Linux
+local-agent and `asterctl` path exposes bounded Blob publish/read operations
+with durable or finite TTL. Route-only custody, public GC controls, Blob
+subscription/status RPCs and CLI commands, and FFI lifecycle controls remain
+unimplemented.
 
 ### Selected semantic-v6 Event-bridge isolation
 

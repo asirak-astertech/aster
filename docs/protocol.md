@@ -1105,13 +1105,16 @@ Retained retirement records expire after the configured 45-day conservative
 lower-bound interval.
 
 When admission reports a typed Blob capacity shortage, one bounded recovery
-attempt may atomically select expired work first or a live candidate strictly
-below the incoming priority. Selection is fixed to the rejected partition and
-the authenticated durable/custody visibility mode. Logical retirement precedes
-physical reclamation. Reclamation requires a persisted exact-variant deletion
-manifest and proceeds under independent row, file, and encoded-byte budgets;
-restart resumes that same manifest. Missing or delayed exact deletion authority
-fails closed and cannot claim release from another variant.
+attempt may atomically select work strictly below the incoming priority.
+Selection is fixed to the rejected partition and the authenticated
+durable/custody visibility mode. Within that partition, candidates order by
+lower effective priority, incomplete before completed work, then expired
+finite, live finite by nearest final-reference deadline, and durable work.
+Logical retirement precedes physical reclamation. Reclamation requires a
+persisted exact-variant deletion manifest and proceeds under independent row,
+file, and encoded-byte budgets; restart resumes that same manifest. Missing or
+delayed exact deletion authority fails closed and cannot claim release from
+another variant.
 
 Each Event direction then exchanges one `EventTurnPlanV1`: `PageActive`,
 `PageBlindActive`, `LegacyActive`, `Empty`, or `Suppressed`. `PageActive` binds

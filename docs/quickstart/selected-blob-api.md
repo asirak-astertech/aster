@@ -110,10 +110,13 @@ file provider.
 
 ## Use the local agent and `asterctl`
 
-The local `aster-agent` exposes native gRPC `PublishBlob` and `ReadBlob`
-streams backed by the same running node authority. Its plaintext listener is
-loopback-only. Supply exactly one bearer-token source to `asterctl`; a protected
-token file avoids placing the token in the command line:
+On Linux, the local `aster-agent` exposes native gRPC `PublishBlob` and
+`ReadBlob` streams backed by the same running node authority. Its plaintext
+listener is loopback-only. On non-Linux hosts, `ReadBlob` remains available to
+a capable native-gRPC client, while secure agent upload staging and
+`asterctl blob-read` finalization are unsupported. Supply exactly one
+bearer-token source to `asterctl`; a protected token file avoids placing the
+token in the command line:
 
 ```sh
 TOKEN_FILE=/run/aster/client.token
@@ -468,9 +471,9 @@ expiry. Finite transfer between peers remains restricted to semantic v8 with
 profile 4; v7 transfers durable Blob work only. Bounded strictly-lower-priority
 pressure recovery remains internal.
 Route-only Blob relay/custody, a metadata-independent whole-byte identity, and
-Blob TTL fields in the FFI surface are not implemented. The local agent and
-`asterctl` expose Blob publish/read TTL, but not the Rust Blob subscription or
-transfer-status operations.
+Blob TTL fields in the FFI surface are not implemented. The selected Linux
+local-agent and `asterctl` path exposes Blob publish/read TTL, but not the Rust
+Blob subscription or transfer-status operations.
 
 `publish` requires a seekable source because it makes two bounded passes. The
 first computes the whole-content and per-chunk digests with one bounded,
