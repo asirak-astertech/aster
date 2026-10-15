@@ -1,4 +1,9 @@
-use std::{collections::VecDeque, sync::Arc, time::Duration};
+use std::{
+    collections::VecDeque,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use aster_node::EventEmissionPolicy;
 use aster_node::application::{
@@ -11,7 +16,7 @@ use aster_node::application::{
     EventSubscriptionId, EventSubscriptionRequest, EventSyncStatus as NodeEventSyncStatus,
     EventUnsubscribe, NumberedEventPublishRequest, NumberedEventResult,
     PeerAuthorization as NodePeerAuthorization, Priority as NodePriority, Scope,
-    SelectedEventHandle, SelectedEventStatus, Topic,
+    SelectedBlobHandle, SelectedEventHandle, SelectedEventStatus, Topic,
 };
 use aster_redb_store::{CustodyRetirementReason, MAX_EVENT_PENDING_DELIVERIES};
 use connectrpc::{
@@ -21,6 +26,7 @@ use futures::StreamExt as _;
 
 use crate::{
     MAX_AGENT_RESPONSE_PROTO_BYTES, MAX_STREAM_BACKOFF_MS, MIN_STREAM_BACKOFF_MS, api,
+    blob_service::BlobConnectService,
     credentials::CredentialGeneration,
     error::{
         PublicOperation, connect_application_error, public_application_error_detail, public_error,
@@ -40,6 +46,7 @@ const PUBLISH_EVENTS_WINDOW: usize = 8;
 #[derive(Clone)]
 pub(crate) struct AsterConnectService {
     events: SelectedEventHandle,
+    blobs: Option<BlobConnectService>,
     configured_emission_policy: EventEmissionPolicy,
     credential_generation: Option<CredentialGeneration>,
     shutdown: tokio::sync::watch::Receiver<bool>,
@@ -55,16 +62,47 @@ impl AsterConnectService {
     ) -> Self {
         Self {
             events,
+            blobs: None,
             configured_emission_policy,
             credential_generation,
             shutdown,
         }
     }
 
+    /// Adds the running node's live Blob authority and validated state root.
+    pub(crate) fn with_blobs(
+        mut self,
+        blobs: SelectedBlobHandle,
+        state_root: &Path,
+    ) -> std::io::Result<Self> {
+        self.blobs = Some(BlobConnectService::new(blobs, state_root)?);
+        Ok(self)
+    }
+
     /// Builds the protocol router without exposing node internals.
     pub(crate) fn router(self) -> connectrpc::Router {
         Arc::new(self).register(connectrpc::Router::new())
     }
+}
+
+pub(crate) fn application_service_with_blobs(
+    events: SelectedEventHandle,
+    blobs: SelectedBlobHandle,
+    state_root: PathBuf,
+    configured_emission_policy: EventEmissionPolicy,
+    credential_generation: Option<CredentialGeneration>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> std::io::Result<connectrpc::ConnectRpcService<connectrpc::Router>> {
+    Ok(configured_service(
+        AsterConnectService::new(
+            events,
+            configured_emission_policy,
+            credential_generation,
+            shutdown,
+        )
+        .with_blobs(blobs, &state_root)?
+        .router(),
+    ))
 }
 
 pub(crate) fn application_service(
@@ -217,6 +255,16 @@ pub(crate) fn rejection_router() -> connectrpc::Router {
             "QueryEventGaps",
             rejection_handler::<api::QueryEventGapsRequest, api::QueryEventGapsResponse>(),
         )
+        .route_bidi_stream(
+            APPLICATION_SERVICE_NAME,
+            "PublishBlob",
+            rejection_handler::<api::PublishBlobRequest, api::PublishBlobResponse>(),
+        )
+        .route_bidi_stream(
+            APPLICATION_SERVICE_NAME,
+            "ReadBlob",
+            rejection_handler::<api::ReadBlobRequest, api::ReadBlobResponse>(),
+        )
 }
 
 #[allow(refining_impl_trait)]
@@ -241,6 +289,40 @@ impl api::AsterApplicationService for AsterConnectService {
             ),
             PublicOperation::GetStatus,
         )
+    }
+
+    async fn publish_blob(
+        &self,
+        ctx: RequestContext,
+        requests: connectrpc::InboundStream<api::PublishBlobRequest>,
+    ) -> ServiceResult<api::PublishBlobResponse> {
+        let blobs = self.blobs.as_ref().ok_or_else(|| {
+            public_error(
+                ErrorCode::FailedPrecondition,
+                api::PublicErrorReason::FailedPrecondition,
+                PublicOperation::PublishBlob,
+                false,
+                None,
+            )
+        })?;
+        blobs.publish(ctx, requests).await
+    }
+
+    async fn read_blob(
+        &self,
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, api::ReadBlobRequest>,
+    ) -> ServiceResult<ServiceStream<api::ReadBlobResponse>> {
+        let blobs = self.blobs.as_ref().ok_or_else(|| {
+            public_error(
+                ErrorCode::FailedPrecondition,
+                api::PublicErrorReason::FailedPrecondition,
+                PublicOperation::ReadBlob,
+                false,
+                None,
+            )
+        })?;
+        blobs.read(request.to_owned_message()).await
     }
 
     async fn publish_event(
@@ -1305,6 +1387,175 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[cfg(all(feature = "client", feature = "server", target_os = "linux"))]
+    #[tokio::test]
+    async fn combined_blob_staging_reopens_the_running_nodes_pinned_state_inode() {
+        use std::os::unix::fs::{MetadataExt as _, symlink};
+
+        let fixture = TestState::new();
+        let target = fixture.0.join("target");
+        let configured = fixture.0.join("configured-link");
+        let moved = fixture.0.join("moved-after-start");
+        fs::create_dir(&target).expect("state target");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700))
+            .expect("protect state target");
+        symlink(&target, &configured).expect("configured state symlink");
+        let mission = UnprotectedReferenceMission::from_bytes(
+            include_bytes!("../../../bindings/testdata/non-production-provisioning.bundle")
+                .to_vec(),
+        )
+        .expect("test mission");
+        let node = start_node(NodeConfig {
+            state: configured,
+            bind: "127.0.0.1:0".parse().expect("mesh bind"),
+            mission,
+            peers: Vec::new(),
+            mutable_interests: MutableSourceInterests::default(),
+            sync_interval: Duration::from_millis(50),
+            run_for: None,
+            application: NodeApplication::Relay,
+        })
+        .await
+        .expect("production node startup");
+        let pinned = fs::metadata(node.state_root()).expect("pinned state");
+        fs::rename(&target, &moved).expect("move pinned state");
+        fs::create_dir(&target).expect("replacement state");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700))
+            .expect("protect replacement state");
+
+        let (_shutdown, shutdown) = tokio::sync::watch::channel(false);
+        let service = AsterConnectService::new(
+            node.selected_events(),
+            EventEmissionPolicy::Normal,
+            None,
+            shutdown,
+        )
+        .with_blobs(node.selected_blobs(), node.state_root())
+        .expect("construct combined service from running-node authority");
+        let staging = service
+            .blobs
+            .as_ref()
+            .expect("combined Blob service")
+            .staging_directory_identity()
+            .expect("staging descriptor identity")
+            .expect("Linux staging descriptor");
+        assert_eq!(staging, (pinned.dev(), pinned.ino()));
+        let replacement = fs::metadata(&target).expect("replacement state");
+        assert_ne!(staging, (replacement.dev(), replacement.ino()));
+        assert!(moved.join("mesh.redb").is_file());
+        assert!(
+            target
+                .read_dir()
+                .expect("replacement entries")
+                .next()
+                .is_none()
+        );
+
+        fs::remove_dir(&target).expect("remove empty replacement state");
+        fs::rename(&moved, &target).expect("restore pinned state for orderly shutdown");
+        node.shutdown().await.expect("node shutdown");
+    }
+
+    #[cfg(all(feature = "client", feature = "server", not(target_os = "linux")))]
+    #[tokio::test]
+    async fn combined_handler_keeps_event_status_and_rejects_blob_before_inbound_poll() {
+        use std::task::Poll;
+
+        use buffa::view::HasMessageView as _;
+
+        let state = TestState::new();
+        let mission = UnprotectedReferenceMission::from_bytes(
+            include_bytes!("../../../bindings/testdata/non-production-provisioning.bundle")
+                .to_vec(),
+        )
+        .expect("test mission");
+        let node = start_node(NodeConfig {
+            state: state.0.clone(),
+            bind: "127.0.0.1:0".parse().expect("mesh bind"),
+            mission,
+            peers: Vec::new(),
+            mutable_interests: MutableSourceInterests::default(),
+            sync_interval: Duration::from_millis(50),
+            run_for: None,
+            application: NodeApplication::Relay,
+        })
+        .await
+        .expect("production node startup");
+        let (_shutdown, shutdown) = tokio::sync::watch::channel(false);
+        let service = AsterConnectService::new(
+            node.selected_events(),
+            EventEmissionPolicy::Normal,
+            None,
+            shutdown,
+        )
+        .with_blobs(node.selected_blobs(), node.state_root())
+        .expect("construct combined service without Linux staging");
+
+        let status_message = api::GetStatusRequest::default();
+        let status_body = bytes::Bytes::from(status_message.encode_to_vec());
+        let status_view = api::GetStatusRequest::decode_view(&status_body).expect("status view");
+        let status_request = ServiceRequest::from_parts(&status_view, &status_body);
+        let status = api::AsterApplicationService::get_status(
+            &service,
+            RequestContext::default(),
+            status_request,
+        )
+        .await
+        .expect("combined status handler");
+        assert_eq!(status.body.identity.len(), 32);
+
+        let event_message = api::PublishEventRequest {
+            operation_key: b"non-linux-handler-event".to_vec(),
+            topic: "chat.events".to_owned(),
+            scope: "mission/team/alpha".to_owned(),
+            priority: api::Priority::Routine.into(),
+            logical_key: b"non-linux".to_vec(),
+            payload: b"event remains live".to_vec(),
+            ..Default::default()
+        };
+        let event_body = bytes::Bytes::from(event_message.encode_to_vec());
+        let event_view = api::PublishEventRequest::decode_view(&event_body).expect("event view");
+        let event_request = ServiceRequest::from_parts(&event_view, &event_body);
+        let event = api::AsterApplicationService::publish_event(
+            &service,
+            RequestContext::default(),
+            event_request,
+        )
+        .await
+        .expect("combined Event handler");
+        assert!(event.body.inserted);
+
+        let polls = Arc::new(AtomicU64::new(0));
+        let observed = Arc::clone(&polls);
+        let inbound: connectrpc::InboundStream<api::PublishBlobRequest> =
+            Box::pin(futures::stream::poll_fn(move |_| {
+                observed.fetch_add(1, Ordering::Relaxed);
+                Poll::<
+                    Option<
+                        Result<connectrpc::StreamMessage<api::PublishBlobRequest>, ConnectError>,
+                    >,
+                >::Pending
+            }));
+        let error = api::AsterApplicationService::publish_blob(
+            &service,
+            RequestContext::default(),
+            inbound,
+        )
+        .await
+        .expect_err("unsupported publish fails at the handler boundary");
+        assert_public_detail(
+            &error,
+            "aster.application.v1alpha1.PublicErrorDetail",
+            ErrorCode::Unimplemented,
+            api::PublicErrorReason::UnsupportedValue,
+            "publish_blob",
+            false,
+        );
+        assert_eq!(polls.load(Ordering::Relaxed), 0);
+
+        node.shutdown().await.expect("node shutdown");
     }
 
     fn decode_base64(value: &str) -> Vec<u8> {

@@ -231,13 +231,16 @@ target/debug/aster node --state ./aster-state --bind 0.0.0.0:49100 \
 
 `--state-interest TOPIC@SCOPE`, `--record-interest TOPIC@SCOPE`, and
 `--blob-interest TOPIC@SCOPE` are repeatable, class-separated receive interests
-for already durable source objects. Blob is opt-in only in semantic v5 and its
+for already durable source objects. Blob is opt-in only for semantic v7/v8
+profile 4 and its
 selector is an exact topic/scope pair, not a descendant or wildcard match.
 Empty means receive-none. These selectors do not grant route or content access;
 the mission bundle must independently authorize the exact source, topic,
-scope, and current epoch. Eligible semantic-v5 direct-Iroh contacts
+scope, and current epoch. Eligible semantic-v7/v8 profile-4 direct-Iroh contacts
 automatically reconcile Blob sources and peer-neutral contiguous carrier ranges
-of at most 16 KiB.
+of at most 16 KiB. V7 is durable-only; v8 also admits authenticated finite-TTL
+custody. V5/v6 Blob intent fails before source or carrier IO and has no selected
+carrier fallback.
 
 Any stopped State/Record/Blob facade must be closed before the runtime owns the
 same store. Rust applications may instead call
@@ -399,7 +402,7 @@ reconciliation. Do not use `put` for source-authenticated mesh data.
 | `aster-redb-store` | Mission-bound audited control chain and atomic policy snapshots plus semantic Event/State/Record/Blob causal/operation state, durable Event, positive-current-version State, whole-key active-head Record, and metadata-only Blob publication delivery state, bounded Event route-only cache, durable terminal software-zeroization state, and a disjoint opaque compatibility namespace |
 | `aster-negentropy` | Bounded, clock-independent set difference over exact transfer IDs |
 | `aster-iroh` | Direct and operator-pinned controlled-relay endpoint lifecycle, carrier identity, and bounded exchange |
-| `aster-node` | Composition, mission-before-inventory and control-before-data ordering, peer route/interest filtering, exact control/Event/State/Record transfer, semantic-v5 direct Blob source/range automation, live Event/State/Record/Blob handles, durable application delivery, authority commands, sample applications, bounded same-UID Unix local zeroization lifecycle, and CLI |
+| `aster-node` | Composition, mission-before-inventory and control-before-data ordering, peer route/interest filtering, exact control/Event/State/Record transfer, semantic-v7/v8 profile-4 Blob source/range automation with v7 durable-only and v8 authenticated finite custody, live Event/State/Record/Blob handles, durable application delivery, authority commands, sample applications, bounded same-UID Unix local zeroization lifecycle, and CLI |
 | `aster-core` | Existing spec-verified hybrid mission session, control envelope, recipient-filtered rekey, and typed source-envelope Event/State/Record/Blob semantics, used rather than rewritten |
 
 Current validation coverage and open product gates are tracked in

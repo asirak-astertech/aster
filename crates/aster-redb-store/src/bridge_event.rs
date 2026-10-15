@@ -1797,7 +1797,7 @@ pub(crate) fn audit_bridge_tables_write(
         for (field, reconstructed) in bridge_counter_values(stats) {
             super::audit_or_initialize_counter(&mut metadata, field, reconstructed)?;
         }
-        require_aggregate_capacity(&metadata, limits, 0, 0)?;
+        require_aggregate_capacity(write, &metadata, limits, 0, 0)?;
     }
     if clear_process_liveness {
         clear_active_routes_write(write)?;

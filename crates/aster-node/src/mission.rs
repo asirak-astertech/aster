@@ -18,16 +18,17 @@ use aster_iroh::{
     Connection, EndpointId, SecretKey,
 };
 use aster_mesh::{
-    ApplicationProtection, AuthenticatedChannelBinding, ClassicalAuthenticatedSession,
+    ApplicationProtection, AuthenticatedBlobCustodySendContextV1, AuthenticatedChannelBinding,
+    BlobCustodyClaimV1, BlobCustodyDirectionV1, ClassicalAuthenticatedSession,
     ClassicalProvisioningBundle, ClassicalSessionInitiator, ClassicalSessionResponder,
     CustodyClaims, CustodyExpectation, MAX_PROTECTED_PROVISIONING_BYTES,
-    MAX_UNPROTECTED_PROVISIONING_BYTES, NodeId, ProvisioningBundle, ProvisioningLoadId,
-    ProvisioningProtectionError, ProvisioningSecretLoader, ProvisioningSecretRef,
-    ProvisioningSecretStoreError, ProvisioningUnprotector, ReferenceAuthenticatedSession,
-    ReferenceEnvelopeSealer, ReferenceSessionAwaitingFinished, ReferenceSessionInitiator,
-    ReferenceSessionResponder, ReferenceSessionResponderPending, SecurityProfileId,
-    UnprotectedProvisioning, VerifiedCustodyClaims, VerifiedSecurityProfile, engine::EnvelopeError,
-    load_provisioning_secret, unprotect_provisioning_artifact,
+    MAX_UNPROTECTED_PROVISIONING_BYTES, NodeId, OpenedBlobSourceFrameV1, ProvisioningBundle,
+    ProvisioningLoadId, ProvisioningProtectionError, ProvisioningSecretLoader,
+    ProvisioningSecretRef, ProvisioningSecretStoreError, ProvisioningUnprotector,
+    ReferenceAuthenticatedSession, ReferenceEnvelopeSealer, ReferenceSessionAwaitingFinished,
+    ReferenceSessionInitiator, ReferenceSessionResponder, ReferenceSessionResponderPending,
+    SecurityProfileId, UnprotectedProvisioning, VerifiedCustodyClaims, VerifiedSecurityProfile,
+    engine::EnvelopeError, load_provisioning_secret, unprotect_provisioning_artifact,
 };
 use std::{
     error::Error,
@@ -323,6 +324,56 @@ impl PreparedIdentityErasure {
     /// Descriptor to persist before invoking the irreversible operation.
     pub const fn target(&self) -> &SoftwareErasureTarget {
         &self.target
+    }
+
+    /// Rebinds only the durable recovery pathname to the stable canonical name
+    /// of the exact inode already retained by this prepared handle.
+    ///
+    /// Live destruction continues through the retained descriptor. The
+    /// canonical pathname is accepted only after it is proven to name that
+    /// same owner-controlled, uniquely linked regular file, so a durable
+    /// zeroization intent never depends on a process-local descriptor path.
+    #[cfg(unix)]
+    pub(crate) fn stabilize_recovery_target(&mut self) -> Result<(), SoftwareErasureError> {
+        use std::os::unix::{ffi::OsStrExt as _, fs::MetadataExt as _};
+
+        let mut artifact = self
+            .artifact
+            .lock()
+            .map_err(|_| SoftwareErasureError::StatePoisoned)?;
+        let live = artifact.preflight()?;
+        let stable_path = std::fs::canonicalize(live.path())?;
+        let live_parent = live
+            .path()
+            .parent()
+            .ok_or(SoftwareErasureError::InvalidDescriptor)?;
+        let stable_parent = stable_path
+            .parent()
+            .ok_or(SoftwareErasureError::InvalidDescriptor)?;
+        let live_parent_metadata = std::fs::metadata(live_parent)?;
+        let stable_parent_metadata = std::fs::metadata(stable_parent)?;
+        if !live_parent_metadata.is_dir()
+            || !stable_parent_metadata.is_dir()
+            || stable_parent_metadata.dev() != live_parent_metadata.dev()
+            || stable_parent_metadata.ino() != live_parent_metadata.ino()
+        {
+            return Err(SoftwareErasureError::Changed(stable_parent.to_path_buf()));
+        }
+        let stable_metadata = std::fs::symlink_metadata(&stable_path)?;
+        validate_artifact_metadata(&stable_path, &stable_metadata)?;
+        if stable_metadata.dev() != live.device()
+            || stable_metadata.ino() != live.inode()
+            || stable_metadata.len() != live.original_len()
+        {
+            return Err(SoftwareErasureError::Changed(stable_path));
+        }
+        let path_bytes = stable_path.as_os_str().as_bytes();
+        if path_bytes.is_empty() || path_bytes.len() > MAX_SOFTWARE_ERASURE_PATH_BYTES {
+            return Err(SoftwareErasureError::InvalidDescriptor);
+        }
+        artifact.target.path = stable_path;
+        self.target = artifact.target.clone();
+        Ok(())
     }
 
     /// Invalidates all wrapper clones and destroys the exact retained inode's contents.
@@ -1617,6 +1668,24 @@ impl MissionSessionInitiator {
         Self::start_with_admission(bundle, HybridPeerAdmission::exact(peer, observed_carrier)?)
     }
 
+    #[cfg(test)]
+    fn start_with_semantic_versions_for_test(
+        bundle: ProvisioningBundle,
+        peer: MissionPeerBinding,
+        observed_carrier: EndpointId,
+        supported_versions: Vec<u16>,
+    ) -> Result<(Self, MissionHandshakeFlight), MissionSessionError> {
+        let admission = HybridPeerAdmission::exact(peer, observed_carrier)?;
+        let (inner, flight) = ReferenceSessionInitiator::start_with_semantic_versions_for_test(
+            bundle,
+            supported_versions,
+        )?;
+        Ok((
+            Self { inner, admission },
+            MissionHandshakeFlight::new(flight),
+        ))
+    }
+
     fn start_discovered(
         bundle: ProvisioningBundle,
         observed_carrier: EndpointId,
@@ -1675,6 +1744,39 @@ pub(crate) async fn initiate_over_iroh_metered(
     peer: MissionPeerBinding,
 ) -> Result<(MissionSession, MissionHandshakeReceipt), MissionSessionError> {
     initiate_over_iroh_metered_with_admission(connection, bundle, Some(peer)).await
+}
+
+/// Test-only authenticated handshake representing an older implementation.
+#[cfg(test)]
+pub(crate) async fn initiate_over_iroh_metered_for_semantic_version(
+    connection: &Connection,
+    bundle: ProvisioningBundle,
+    peer: MissionPeerBinding,
+    semantic_version: u16,
+) -> Result<(MissionSession, MissionHandshakeReceipt), MissionSessionError> {
+    let result = async {
+        let (initiator, first) = MissionSessionInitiator::start_with_semantic_versions_for_test(
+            bundle,
+            peer,
+            connection.remote_id(),
+            vec![semantic_version],
+        )?;
+        let second = connection.request(first.as_bytes()).await?;
+        let (pending, third) = initiator.receive_server(&second)?;
+        let fourth = connection.request(third.as_bytes()).await?;
+        let receipt = MissionHandshakeReceipt::from_flights([
+            first.len(),
+            second.len(),
+            third.len(),
+            fourth.len(),
+        ]);
+        Ok((pending.receive_finished(&fourth)?, receipt))
+    }
+    .await;
+    if result.is_err() {
+        connection.close();
+    }
+    result
 }
 
 /// Runs a discovered-peer initiator handshake and receipts it only on full success.
@@ -2301,6 +2403,23 @@ impl MissionSession {
         self.inner.semantic_version()
     }
 
+    /// Non-secret identifier for this completed authenticated mission session.
+    pub(crate) const fn session_id(&self) -> [u8; 32] {
+        self.inner.session_id()
+    }
+
+    /// Mints one exact non-clone outbound Blob custody context.
+    pub(crate) fn mint_blob_custody_send_context(
+        &self,
+        direction: BlobCustodyDirectionV1,
+        exchange_id: u64,
+        finalization_charge_ms: u64,
+    ) -> Result<AuthenticatedBlobCustodySendContextV1, MissionSessionError> {
+        self.inner
+            .mint_blob_custody_send_context(direction, exchange_id, finalization_charge_ms)
+            .map_err(Into::into)
+    }
+
     /// Authority-signed route-grant commitments authenticated in the peer's
     /// mission credential by the completed handshake.
     ///
@@ -2323,9 +2442,53 @@ impl MissionSession {
         self.inner.open_frame(frame).map_err(Into::into)
     }
 
-    /// Protects one semantic-v7 record with exact negotiated profile, lane,
+    /// Protects one complete v8 Blob source-bearing frame in profile 4.
+    pub(crate) fn seal_blob_source_frame(
+        &mut self,
+        direction: BlobCustodyDirectionV1,
+        claim: Option<&BlobCustodyClaimV1>,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, MissionSessionError> {
+        self.inner
+            .seal_blob_source_frame(direction, claim, plaintext)
+            .map_err(Into::into)
+    }
+
+    /// Opens one complete v8 Blob source-bearing frame and returns its exact
+    /// finite-contact authority when a claim is present.
+    pub(crate) fn open_blob_source_frame(
+        &mut self,
+        direction: BlobCustodyDirectionV1,
+        frame: &[u8],
+    ) -> Result<OpenedBlobSourceFrameV1, MissionSessionError> {
+        self.inner
+            .open_blob_source_frame(direction, frame)
+            .map_err(Into::into)
+    }
+
+    /// Protects and records this endpoint's one canonical transfer-profile offer.
+    pub(crate) fn seal_transfer_profile_offer(
+        &mut self,
+        offer: &aster_mesh::TransferProfileOfferV1,
+    ) -> Result<Vec<u8>, MissionSessionError> {
+        self.inner
+            .seal_transfer_profile_offer(offer)
+            .map_err(Into::into)
+    }
+
+    /// Opens and records the peer's exact authenticated transfer-profile offer.
+    pub(crate) fn open_transfer_profile_offer(
+        &mut self,
+        frame: &[u8],
+    ) -> Result<aster_mesh::TransferProfileOfferV1, MissionSessionError> {
+        self.inner
+            .open_transfer_profile_offer(frame)
+            .map_err(Into::into)
+    }
+
+    /// Protects one semantic-v7-or-v8 record with exact negotiated profile, lane,
     /// and direction context as authenticated associated data.
-    pub(crate) fn seal_v7_application_frame(
+    pub(crate) fn seal_profiled_application_frame(
         &mut self,
         transfer_profile_digest: [u8; 32],
         lane: crate::event_pages::LaneId,
@@ -2333,16 +2496,21 @@ impl MissionSession {
         direction: crate::frame::EventDirection,
         plaintext: &[u8],
     ) -> Result<Vec<u8>, MissionSessionError> {
-        let context =
-            self.v7_application_record_context(transfer_profile_digest, lane, profile, direction)?;
+        let context = Self::lane_record_context(
+            self.semantic_version(),
+            transfer_profile_digest,
+            lane,
+            profile,
+            direction,
+        )?;
         self.inner
             .seal_frame_with_context(plaintext, &context)
             .map_err(Into::into)
     }
 
-    /// Opens one semantic-v7 record only under the exact negotiated profile,
+    /// Opens one semantic-v7-or-v8 record only under the exact negotiated profile,
     /// lane, and direction context supplied by the local state machine.
-    pub(crate) fn open_v7_application_frame(
+    pub(crate) fn open_profiled_application_frame(
         &mut self,
         transfer_profile_digest: [u8; 32],
         lane: crate::event_pages::LaneId,
@@ -2350,28 +2518,73 @@ impl MissionSession {
         direction: crate::frame::EventDirection,
         frame: &[u8],
     ) -> Result<Vec<u8>, MissionSessionError> {
-        let context =
-            self.v7_application_record_context(transfer_profile_digest, lane, profile, direction)?;
+        let context = Self::lane_record_context(
+            self.semantic_version(),
+            transfer_profile_digest,
+            lane,
+            profile,
+            direction,
+        )?;
         self.inner
             .open_frame_with_context(frame, &context)
             .map_err(Into::into)
     }
 
-    fn v7_application_record_context(
-        &self,
+    #[cfg(test)]
+    fn seal_v7_application_frame(
+        &mut self,
+        transfer_profile_digest: [u8; 32],
+        lane: crate::event_pages::LaneId,
+        profile: crate::event_pages::TransferProfileId,
+        direction: crate::frame::EventDirection,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, MissionSessionError> {
+        self.seal_profiled_application_frame(
+            transfer_profile_digest,
+            lane,
+            profile,
+            direction,
+            plaintext,
+        )
+    }
+
+    #[cfg(test)]
+    fn open_v7_application_frame(
+        &mut self,
+        transfer_profile_digest: [u8; 32],
+        lane: crate::event_pages::LaneId,
+        profile: crate::event_pages::TransferProfileId,
+        direction: crate::frame::EventDirection,
+        frame: &[u8],
+    ) -> Result<Vec<u8>, MissionSessionError> {
+        self.open_profiled_application_frame(
+            transfer_profile_digest,
+            lane,
+            profile,
+            direction,
+            frame,
+        )
+    }
+
+    fn lane_record_context(
+        semantic_version: u16,
         transfer_profile_digest: [u8; 32],
         lane: crate::event_pages::LaneId,
         profile: crate::event_pages::TransferProfileId,
         direction: crate::frame::EventDirection,
     ) -> Result<Vec<u8>, MissionSessionError> {
-        if self.semantic_version() != crate::event_pages::SEMANTIC_PROTOCOL_V7 {
-            return Err(MissionSessionError::Authentication(EnvelopeError(
-                "semantic-v7 record context is unavailable for this session".into(),
-            )));
-        }
+        let domain = match semantic_version {
+            crate::event_pages::SEMANTIC_PROTOCOL_V7 => b"ASTER/v7-lane-record/v1\0".as_slice(),
+            crate::event_pages::SEMANTIC_PROTOCOL_V8 => b"ASTER/v8-lane-record/v1\0".as_slice(),
+            _ => {
+                return Err(MissionSessionError::Authentication(EnvelopeError(
+                    "profiled record context is unavailable for this session".into(),
+                )));
+            }
+        };
         let mut context = Vec::with_capacity(24 + 2 + 32 + 2 + 2 + 1);
-        context.extend_from_slice(b"ASTER/v7-lane-record/v1\0");
-        context.extend_from_slice(&self.semantic_version().to_be_bytes());
+        context.extend_from_slice(domain);
+        context.extend_from_slice(&semantic_version.to_be_bytes());
         context.extend_from_slice(&transfer_profile_digest);
         context.extend_from_slice(&(lane as u16).to_be_bytes());
         context.extend_from_slice(&(profile as u16).to_be_bytes());
@@ -3365,6 +3578,79 @@ mod tests {
             receiver.open_application_frame(&ordinary).is_err(),
             "ordinary replay must still be rejected"
         );
+    }
+
+    #[test]
+    fn semantic_v8_lane_records_bind_the_v8_domain_and_reject_v7_substitution() {
+        let mut provisioner = ReferenceProvisioner::from_seed([0x44; 32]).expect("provisioner");
+        let initiator = issue(&mut provisioner, 1);
+        let responder = issue(&mut provisioner, 2);
+        let (mut sender, mut receiver) =
+            establish(&initiator, &responder).expect("establish semantic-v8 session");
+        assert_eq!(
+            sender.semantic_version(),
+            crate::event_pages::SEMANTIC_PROTOCOL_V8
+        );
+
+        let offer = crate::event_pages::TransferProfileOfferV1::for_semantic_version(
+            crate::event_pages::SEMANTIC_PROTOCOL_V8,
+        )
+        .expect("v8 transfer profiles");
+        let negotiated = crate::event_pages::negotiate_transfer_profiles(&offer, &offer)
+            .expect("negotiate v8 profiles");
+        let digest = crate::event_pages::transfer_profile_digest(&offer, &offer, &negotiated);
+        let lane = crate::event_pages::LaneId::Blob;
+        let profile = crate::event_pages::TransferProfileId::BlobRangesStreamV1;
+        let direction = EventDirection::ToSessionResponder;
+
+        let v8 = sender
+            .seal_profiled_application_frame(digest, lane, profile, direction, b"v8")
+            .expect("seal v8 lane record");
+        assert_eq!(
+            receiver
+                .open_profiled_application_frame(digest, lane, profile, direction, &v8)
+                .expect("open v8 lane record"),
+            b"v8"
+        );
+
+        let mut v7_context = b"ASTER/v7-lane-record/v1\0".to_vec();
+        v7_context.extend_from_slice(&crate::event_pages::SEMANTIC_PROTOCOL_V8.to_be_bytes());
+        v7_context.extend_from_slice(&digest);
+        v7_context.extend_from_slice(&(lane as u16).to_be_bytes());
+        v7_context.extend_from_slice(&(profile as u16).to_be_bytes());
+        v7_context.push(2);
+        let substituted = sender
+            .inner
+            .seal_frame_with_context(b"v7-substitution", &v7_context)
+            .expect("seal substituted v7-domain record");
+        assert!(
+            receiver
+                .open_profiled_application_frame(digest, lane, profile, direction, &substituted)
+                .is_err(),
+            "semantic-v8 lane record protection must reject the v7 AAD domain"
+        );
+    }
+
+    #[test]
+    fn semantic_v7_lane_record_context_stays_byte_identical() {
+        let digest = [0x51; 32];
+        let context = MissionSession::lane_record_context(
+            crate::event_pages::SEMANTIC_PROTOCOL_V7,
+            digest,
+            crate::event_pages::LaneId::Event,
+            crate::event_pages::TransferProfileId::EventPagesV1,
+            EventDirection::ToSessionResponder,
+        )
+        .expect("v7 lane context");
+        let mut expected = b"ASTER/v7-lane-record/v1\0".to_vec();
+        expected.extend_from_slice(&7u16.to_be_bytes());
+        expected.extend_from_slice(&digest);
+        expected.extend_from_slice(&(crate::event_pages::LaneId::Event as u16).to_be_bytes());
+        expected.extend_from_slice(
+            &(crate::event_pages::TransferProfileId::EventPagesV1 as u16).to_be_bytes(),
+        );
+        expected.push(2);
+        assert_eq!(context, expected);
     }
 
     fn finite_page_fixture(

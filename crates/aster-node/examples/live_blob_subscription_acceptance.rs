@@ -453,7 +453,11 @@ async fn run_attempt_one_child(arguments: &[OsString]) -> Result<(), DynError> {
     let delivery = page
         .deliveries
         .first()
-        .ok_or(AcceptanceFailure("attempt-one Blob delivery missing"))?;
+        .ok_or(AcceptanceFailure("attempt-one Blob delivery missing"))?
+        .content()
+        .ok_or(AcceptanceFailure(
+            "attempt-one unexpectedly returned a Blob retirement",
+        ))?;
     validate_delivery(delivery, expected_blob, 1, 1, Priority::Priority)?;
     persist_delivery_token(&token_path, delivery.token)?;
     let status = blobs.delivery_status().await?;
@@ -514,6 +518,10 @@ async fn run_attempt_two_child(arguments: &[OsString]) -> Result<(), DynError> {
         .deliveries
         .first()
         .ok_or(AcceptanceFailure("attempt-two retry Blob delivery missing"))?
+        .content()
+        .ok_or(AcceptanceFailure(
+            "attempt-two unexpectedly returned a Blob retirement",
+        ))?
         .clone();
     validate_delivery(&retry, expected_blob, 1, 2, Priority::Priority)?;
     let previous_token = consume_delivery_token(&token_path)?;
@@ -549,6 +557,10 @@ async fn run_attempt_two_child(arguments: &[OsString]) -> Result<(), DynError> {
         .deliveries
         .first()
         .ok_or(AcceptanceFailure("second Blob delivery missing"))?
+        .content()
+        .ok_or(AcceptanceFailure(
+            "second poll unexpectedly returned a Blob retirement",
+        ))?
         .clone();
     validate_delivery(&second, expected_blob, 2, 1, Priority::Immediate)?;
     require(

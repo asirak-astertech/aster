@@ -87,7 +87,7 @@ def corpus():
 
 
 def main():
-    offer = ('# aster-blob-ranges-stream-vectors/v1\tsemantic=7\toracle=python-stdlib\n'
+    offer = ('# aster-blob-ranges-stream-vectors/v1\tsemantic=7,8\toracle=python-stdlib\n'
              'ACCEPT\toffer-blob-stream-only-v1\t'
              '0105000501000100040100040003010001000201000100010200020001\n')
     outputs = {'blob-ranges-stream-v1.tsv': offer, 'blob-stream-records-v1.tsv': corpus()}

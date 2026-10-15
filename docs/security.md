@@ -30,7 +30,7 @@ Event/control evaluation slice, not a complete MVP/product profile:
 
 | Profile | Implemented boundary | Runtime status |
 |---|---|---|
-| `0x0001` `hybrid-pq-aster-record-v1` | Hybrid source/control objects, four-flight mission session, and `ASTRFR01` application records through semantic v7 | Stock selected node/runtime |
+| `0x0001` `hybrid-pq-aster-record-v1` | Hybrid source/control objects, four-flight mission session, and `ASTRFR01` application records through semantic v8 | Stock selected node/runtime |
 | `0x0002` `classical-p256-iroh-quic-v1` | Provisioned singleton policy, P-256 semantic-v1 Event/control objects, Iroh TLS-exporter-bound mission session, and raw QUIC application exchanges | Additive library/two-node mission path; not selected by stock `run_node` or CLI |
 
 Profile `0x0002` has no ML-DSA or ML-KEM operation in its runtime path and adds
@@ -281,7 +281,7 @@ are recorded separately in the
 - Canonical ordered semantic-version and complete-suite offers, with selection
   bound into the transcript, KDF, key confirmations, and hybrid authentication;
   there is no algorithm-by-algorithm mixing. The stable framing/profile remains
-  `1`, the default semantic offer is `[7, 6, 5, 4, 3, 2, 1]`, and profile 1
+  `1`, the default semantic offer is `[8, 7, 6, 5, 4, 3, 2, 1]`, and profile 1
   has one registered complete suite.
 - Semantic-v7 profile, plan, header, page, and terminal records bind semantic
   version, the canonical transfer-profile digest, lane, selected profile, and
@@ -295,15 +295,25 @@ are recorded separately in the
   only a send attempt, and later authenticated reconciliation determines the
   remaining difference.
 - Both classical and PQ signatures verify; failure is indistinguishable on wire.
-- A compact semantic-version-2/3/v4/v5/v6/v7 batch item is never authenticated by its P-256
+- A compact semantic-version-2/3/v4/v5/v6/v7/v8 batch item is never authenticated by its P-256
   suffix alone: the exact proof credential, authority hybrid signature, source
   hybrid root signature, ciphertext commitment, Merkle path, and item signature
   must all verify. Missing proof means bounded pending state, never delivery.
-- Selected Event/RouteEvent semantic-v3-format custody claims, used by v3, v4, v5, v6, and v7 sessions, use a distinct
+- Selected Event/RouteEvent semantic-v3-format custody claims, used by v3 through v8 sessions, use a distinct
   session-record AAD, bind the exact transfer/source fields, exchange, nonzero
   policy revision, session ID, and checked cumulative age, and are
   replay-checked before store admission.
-- Protected v3-format Event interests used in v3/v4/v5/v6/v7 `LegacyV6` bind an opaque receiver
+- Exact custody-clock continuity loss is sticky. Finite Event/RouteEvent data
+  stays non-forwardable below TTL, but later same-domain monotonic intervals
+  continue increasing a durable conservative lower bound. Unknown intervals
+  contribute zero, authenticated duplicates cannot rejuvenate data, and
+  arithmetic overflow saturates the lower bound. Once that lower bound reaches
+  TTL, expiry is certain and the existing bounded retirement path is safe.
+  Lost unanchored and prior-generation rows remain present in the audited
+  expiration index, so restart cannot strand them outside bounded maintenance.
+  This is a local storage/lifecycle change with no new wire evidence; Blob does
+  not gain finite lifecycle or route-only custody in this change.
+- Protected v3-format Event interests used in v3-v8 `LegacyV6` bind an opaque receiver
   selector generation.
   Receipts suppress only that generation; `Satisfied` hides Carry versus
   successful Consume, while `ContentAcceptancePending` reveals only that the
@@ -311,7 +321,7 @@ are recorded separately in the
   not a Byzantine peer-state high-water: an authenticated peer can still lie
   about its own retention or restore its own older state.
 - Durable partial-transfer progress preserves its first-admission semantic
-  version. Unknown provenance fails closed, and v2/v3/v4/v5/v6/v7-only objects cannot be
+  version. Unknown provenance fails closed, and v2-v8-only objects cannot be
   resumed or served through a selected-v1 session after restart.
 - Hybrid ephemeral establishment, transcript binding, explicit key confirmation,
   direction/purpose labels, and no 0-RTT data.
@@ -432,7 +442,7 @@ delegated signers.
 
 Both ordinary and bridge stores persist the authenticated signer. Ordinary
 controls share one chain head keyed by stable `authority_id`; bridge
-authorizations use their own semantic-v2/v3/v4/v5/v6/v7 chain, also keyed by that stable root
+authorizations use their own semantic-v2-v8 chain, also keyed by that stable root
 identifier. Neither creates a per-signer history. A signer revoked in the
 contiguous applied prefix cannot contribute another link. If activation reaches
 a staged link signed by an identity revoked earlier in that prefix, the
@@ -531,9 +541,9 @@ claimed or implemented.
 ### Selected semantic-v4 mutable availability and lineage
 
 State and Record reconciliation is enabled only after the hybrid mission
-session selects semantic version 4, 5, or 6. The v1-v3 Event compatibility paths do not
+session selects semantic version 4 through 8. The v1-v3 Event compatibility paths do not
 accept, act on, or expose mutable interests, inventory, IDs, objects, results,
-or finish counts. Within v4/v5/v6/v7, State and Record and both receiver directions are distinct
+or finish counts. Within v4-v8, State and Record and both receiver directions are distinct
 authenticated lanes. Cross-class/direction substitution, result/ack mismatch,
 and finish-remainder mismatch fail the contact.
 
@@ -567,20 +577,22 @@ contain metadata growth and prevent a fixed lexicographic prefix from starving
 later IDs across repeated partial contacts; they are not evidence of physical
 resource sufficiency or adversarial-link liveness.
 
-Normal and `AtLeast` run the v4/v5/v6/v7 State/Record lanes because `AtLeast` is an Event-only
+Normal and `AtLeast` run the v4-v8 State/Record lanes because `AtLeast` is an Event-only
 threshold. `ReceiveOnly` initiates no contact and discloses no mutable interest,
 inventory, ID, or object. Event last-contact status is deliberately separate
 and is not evidence that State/Record converged. Selected State/Record finite
 TTL is structurally rejected; no mutable forwarding-age/expiry security claim
 is made.
 
-### Selected semantic-v5 Blob authorization, staging, and visibility
+### Selected v7/v8 Blob authorization, staging, and visibility
 
 Selected Blob transfer is enabled only after the completed hybrid mission
-session selects semantic version 5 or 6. Versions 1 through 4 emit and accept
-zero selected Blob frames. V5 inherits all earlier Event and State/Record
-security rules, and v6 inherits that complete ordinary-lane behavior unchanged,
-without changing stable wire/profile, envelope, carrier, or ABI version 1.
+session selects semantic version 7 or 8 and both peers authenticate profile 4,
+`BlobRangesStreamV1`. Semantic v7 admits durable work only; v8 also admits
+finite work with an exact verified custody capability. V5/v6 retain historical
+Blob frame allocations but carrier attempts fail before carrier IO; they are
+not a fallback. Stable wire/profile, envelope, carrier, and ABI version 1 remain
+unchanged.
 
 The selected network path is direct between content-capable peers. A protected
 exact `(topic, scope, epoch)` interest includes an opaque 32-byte
@@ -614,6 +626,17 @@ byte, chunk, and variant caps. Exact-lineage retry may resume it; a missing
 physical lineage is corruption, and another lineage at the same numeric epoch
 still conflicts.
 
+The lineage witness is a permanent, non-evictable fence with its own row and
+encoded-byte cap. A separate permanent replay fence binds every accepted Blob
+publisher dot to the exact semantic ID, transfer ID, source length, and source
+digest under an independent row/byte cap. Live publication lifecycle rows have
+a third row cap, and exact variant references carry a typed publication or
+pending-source owner. Selected defaults are 65,536 rows and 16 MiB for each
+fence class, plus 65,536 publication lifecycle rows. Capacity exhaustion fails
+admission without removing an older fence or publication. These fences preserve
+durable replay and same-epoch lineage safety; they do not define retention time
+or authorize reclamation.
+
 The source envelope and complete manifest plan are authenticated and staged
 before any carrier range is requested. Prefix progress is durable under the
 exact `(source transfer ID, carrier ObjectID)` and is not owned by a peer or
@@ -625,10 +648,11 @@ typed deferral and does not evict accepted data or overwrite existing progress.
 Conflicting prefixes and identity, proof, manifest, lineage, AEAD, digest, and
 whole-Blob failures fail closed for the affected exact work.
 
-Terminal poison of a multi-carrier source advances the durable peer scheduler
-to the lexicographically greatest canonical carrier ID across that source. It
-MUST NOT use manifest-last as a proxy for the greatest ID, because that can
-strand a later eligible source behind adversarial manifest order.
+An authenticated terminal-content failure aborts only the exact pending source
+and its cached claim. The failed turn is cursor-neutral, so corruption cannot
+advance past unrelated work. Successful terminal source rotation, when the
+stream outcome authorizes it, uses the lexicographically greatest canonical
+carrier ID across that source rather than manifest-last.
 
 The authenticated source cache and durable pending-source lifecycle are one
 serialized security boundary. Staging, sender-cache repair, terminal or stale
@@ -641,7 +665,9 @@ aborted source or an abort from deleting the winner's authenticated claim.
 Blob carrier streaming has no per-range storage Result/Ack. Its authenticated
 terminal plus FIN proves only that the sender finished the scheduled attempts,
 not remote durability. Durable Store prefixes are the sole recovery authority.
-A missing terminal does not erase accepted bytes or undo a completed publication.
+A missing terminal retains accepted prefixes but authorizes no completion,
+publication, or cursor change; a later authenticated empty schedule may promote
+an already complete retained prefix without refetching bytes.
 Both peers must support `BlobRangesStreamV1`; incompatible offers fail before
 inventory, and older semantic Blob carrier attempts fail before carrier IO.
 
@@ -663,6 +689,13 @@ repair. Writable predecessor migration is likewise all-or-none: the four v5
 network tables may be added to the prior nine-table Blob schema only when the
 group is wholly absent and owner attribution is valid; read-only and partial-
 group opens never create or repair tables.
+
+Lifecycle migration follows the same fail-closed rule. Before changing a
+predecessor store, the implementation reconstructs all wrappers, typed roots,
+lineage and replay fences, accounting, and cursors; audits the base schema and
+physical depot; and preflights every lifecycle cap. Only one transaction makes
+that image authoritative. Current-schema open requires exact bidirectional
+agreement and never repairs a partial or contradictory lifecycle image.
 
 The application boundary uses the same authority rather than a second Blob
 store. `RunningNode::selected_blobs()` returns a cloneable handle whose publish
@@ -706,6 +739,37 @@ Normal and `AtLeast` run this lane because `AtLeast` is Event-only;
 `ReceiveOnly` sends, requests, stages, promotes, and counts zero Blob work.
 The local delivery-ledger counts are not Blob peer, contact, transfer-progress,
 or convergence status.
+
+Local publication, network staging, promotion, and abort update their ordinary
+Blob rows, causal authority, lifecycle accounting, permanent fences, and typed
+references within the corresponding redb transaction. Promotion moves an exact
+pending-source reference to a publication reference; abort removes the pending
+reference while retaining its lineage fence and depot import. No observer can
+see a publication without its replay/root authority or a pending source without
+its exact lineage/root authority after a successful commit.
+
+The persistent maintenance scheduler rotates fairly over six classes with
+independent nonzero row, file, and byte budgets. Startup runs one bounded turn;
+periodic turns run one at a time in a background worker only after operational
+actor work has had an opportunity to proceed. Before cursor advance, each page
+validates the lifecycle/accounting evidence it depends on and fails closed on a
+contradiction. Candidate discovery alone is not deletion authority. An exact
+unreferenced staging or completed variant must pass reference and lease
+revalidation before an atomic manifest admission removes captured depot rows.
+Physical deletion then uses descriptor-relative bounded units, records retryable
+failures without exposing paths, reconciles ambiguous restart state, and keeps
+all captured accounting charged until finalization. Operational work retains
+priority over periodic pages, while the capacity-only pass is cursor-neutral and
+never chooses live content. Proven expiry and eligible strictly lower-priority
+pressure recovery retire exact work as a bounded atomic unit; policy or
+continuity failure otherwise withholds or rejects it. Permanent fences remain,
+and retained retirement records expire after 45 days of accumulated
+conservative lower-bound age. Finite Blob TTL and bounded pressure recovery are
+selected under authenticated semantic-v8 custody on Linux. The selected Linux
+local-agent and `asterctl` path exposes bounded Blob publish/read operations
+with durable or finite TTL. Route-only custody, public GC controls, Blob
+subscription/status RPCs and CLI commands, and FFI lifecycle controls remain
+unimplemented.
 
 ### Selected semantic-v6 Event-bridge isolation
 

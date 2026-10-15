@@ -10,8 +10,11 @@ pub(super) enum Boundary {
     WrongAad,
     Revocation,
     AppendCapacity,
+    AppendCapacityLostTerminal,
     PrefixConflict,
     UnavailableGap,
+    SenderLifecycle,
+    BadTerminalAad,
 }
 
 pub(super) struct Fault {
@@ -22,6 +25,8 @@ pub(super) struct Fault {
     pub receiver_paused: tokio::sync::Notify,
     pub release_sender: tokio::sync::Notify,
     pub release_receiver: tokio::sync::Notify,
+    pub sender_schedule_ranges: AtomicU64,
+    pub sender_service_attempts: AtomicU64,
 }
 
 fn registry() -> &'static StdMutex<BTreeMap<usize, Arc<Fault>>> {
@@ -47,11 +52,28 @@ pub(super) fn install_boundary(
         receiver_paused: tokio::sync::Notify::new(),
         release_sender: tokio::sync::Notify::new(),
         release_receiver: tokio::sync::Notify::new(),
+        sender_schedule_ranges: AtomicU64::new(0),
+        sender_service_attempts: AtomicU64::new(0),
     });
     let mut registry = registry().lock().unwrap();
     registry.insert(sender as *const Store as usize, fault.clone());
     registry.insert(receiver as *const Store as usize, fault.clone());
     fault
+}
+
+pub(super) fn record_sender_schedule(store: &Store, ranges: usize) {
+    if let Some(fault) = get(store) {
+        fault.sender_schedule_ranges.store(
+            u64::try_from(ranges).expect("bounded Blob range count fits u64"),
+            Ordering::Release,
+        );
+    }
+}
+
+pub(super) fn record_sender_service_attempt(store: &Store) {
+    if let Some(fault) = get(store) {
+        fault.sender_service_attempts.fetch_add(1, Ordering::AcqRel);
+    }
 }
 
 pub(super) fn remove(store: &Store) {
@@ -74,12 +96,15 @@ fn second_data(plaintext: &[u8]) -> bool {
 }
 
 pub(super) fn write_digest(store: &Store, plaintext: &[u8], mut digest: [u8; 32]) -> [u8; 32] {
-    if second_data(plaintext)
-        && let Some(fault) = get(store)
-        && fault.boundary == Boundary::WrongAad
-    {
-        digest[0] ^= 1;
-        fault.fired.store(true, Ordering::Release);
+    if let Some(fault) = get(store) {
+        let wrong_data_aad = second_data(plaintext) && fault.boundary == Boundary::WrongAad;
+        let wrong_terminal_aad = plaintext.starts_with(b"ABRE\x01")
+            && plaintext.get(37..39) != Some(&[0, 0])
+            && fault.boundary == Boundary::BadTerminalAad;
+        if wrong_data_aad || wrong_terminal_aad {
+            digest[0] ^= 1;
+            fault.fired.store(true, Ordering::Release);
+        }
     }
     digest
 }
@@ -117,7 +142,10 @@ pub(super) fn append_boundary(
 ) -> Result<(), StoreError> {
     if index == 1
         && let Some(fault) = get(store)
-        && fault.boundary == Boundary::AppendCapacity
+        && matches!(
+            fault.boundary,
+            Boundary::AppendCapacity | Boundary::AppendCapacityLostTerminal
+        )
     {
         fault.fired.store(true, Ordering::Release);
         return Err(StoreError::Blob(
