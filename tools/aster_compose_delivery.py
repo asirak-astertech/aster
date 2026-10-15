@@ -30,10 +30,10 @@ MAX_COMPOSE_BYTES = 256 * 1024
 MAX_CONFIG_BYTES = 256 * 1024
 MAX_MANIFEST_BYTES = 64 * 1024
 COMPOSE_BUILD_WORKFLOW_SHA256 = (
-    "edad115d636c941bcd1cea12c61467958d82c4499222c4da10b7100526cef423"
+    "d9c017f142d59803a6103c346a9010f9113889efde8627d5ad70178913fa0827"
 )
 SETUP_BUILDX_ACTION = (
-    "docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e"
+    "docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069"
 )
 BUILDKIT_IMAGE = (
     "moby/buildkit:buildx-stable-1@sha256:"
@@ -162,7 +162,7 @@ def validate_workflow_policy(workflow: str, ci: str) -> None:
     buildx_setup = (
         "      - name: Set up pinned OCI-capable Buildx builder\n"
         "        id: buildx\n"
-        f"        uses: {SETUP_BUILDX_ACTION} # v4.3.0\n"
+        f"        uses: {SETUP_BUILDX_ACTION} # v4.4.1\n"
         "        with:\n"
         "          driver: docker-container\n"
         "          driver-opts: |\n"

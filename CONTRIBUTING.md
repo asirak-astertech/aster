@@ -26,7 +26,8 @@ mise run fuzz-smoke
 ## Change discipline
 
 - Keep `Cargo.lock` and `fuzz/Cargo.lock` synchronized with intentional manifest
-  changes.
+  changes. Run `sh tools/check-cargo-lockfiles.sh` to validate all committed Cargo
+  graphs without regenerating their lockfiles. Their dependency sets may differ.
 - Preserve wire compatibility or update the versioned protocol, conformance
   vectors, and compatibility tests in the same change.
 - Add deterministic regression tests for every corrected defect.
