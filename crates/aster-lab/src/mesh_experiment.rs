@@ -40,9 +40,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-#[cfg(all(test, feature = "libp2p-candidate"))]
-mod libp2p_candidate;
-
 #[cfg(test)]
 use aster_host::HostEvent;
 
