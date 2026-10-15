@@ -86,6 +86,7 @@ run = [
   "c++ -std=c++17 -Wall -Wextra -Werror -pedantic -Ibindings/c -fsyntax-only bindings/c/header_smoke.cpp",
   "cargo run --locked -p aster-conformance -- --self-test",
   "python3 conformance/python_wire_oracle.py conformance/vectors/wire-v1.tsv",
+  "python3 conformance/blob_stream_oracle.py",
   { task = "conformance-profile-v0-r2" },
   "python3 -m unittest discover -s bindings/python/tests",
   "python3 -m unittest discover -s lab/tests",
