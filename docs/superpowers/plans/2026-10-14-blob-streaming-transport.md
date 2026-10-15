@@ -4,11 +4,11 @@
 
 > **Clean Room — Privileged**
 
-**Goal:** Add an authenticated, credit-windowed, crash-resumable Aster Blob protocol that transfers configured 1-GiB-plus objects at a useful fraction of the available pipeline while Aster automatically chooses one eligible transport at a time.
+**Goal:** Add an authenticated, credit-windowed, crash-resumable Aster Blob protocol that transfers configured 1-GiB-plus objects at a useful fraction of the available pipeline. This plan's first milestone automatically chooses the sole eligible Iroh production adapter and recovers it safely; the design's best-available cross-transport claim remains gated on a second qualified production stream adapter.
 
-**Architecture:** Build semantic v9/profile `5` (`BlobStreamV1`) on the exact PR 71 range-stream and PR 47 lifecycle baseline. The new class-neutral stream grammar maps existing authenticated carriers into bounded whole-carrier extents, commits multiple verified carriers plus one cumulative checkpoint per durable batch, and drives one transport adapter at a time through a deterministic internal selector. Semantic v1-v8 and profile `4` remain byte-identical; Iroh is the first production adapter and retains ownership of its internal direct/relay path choice.
+**Architecture:** Build semantic v9/profile `5` (`BlobStreamV1`) on the exact PR 71 range-stream and PR 47 lifecycle baseline. The new class-neutral stream grammar maps existing authenticated carriers into bounded whole-carrier extents, commits multiple verified carriers plus one cumulative checkpoint per durable batch, and drives one transport adapter at a time through a deterministic internal selector. Semantic v1-v8 and profile `4` remain byte-identical; Iroh is the first production adapter and retains ownership of its internal direct/relay path choice. The first milestone delivers Iroh streaming/performance; best-available cross-transport selection is claimed only after a second independently usable production stream adapter is registered and qualified.
 
-**Tech Stack:** Rust 2024, Tokio, Iroh/QUIC ordered unidirectional turns, redb 4.2, Aster mission protection, PR 47 Blob lifecycle/depot APIs, cargo-fuzz, Python conformance/path-lab tooling, GitHub Actions, three Raspberry Pi CM4 devices.
+**Tech Stack:** Rust 2024, Tokio, Iroh/QUIC concurrent data/control streams, redb 4.2, Aster mission protection, PR 47 Blob lifecycle/depot APIs, cargo-fuzz, Python conformance/path-lab tooling, GitHub Actions, three Raspberry Pi CM4 devices.
 
 **Spec:** `docs/superpowers/specs/2026-10-14-blob-streaming-transport-design.md`
 
@@ -27,11 +27,11 @@
 - Carry data over exactly one selected transport adapter per logical attempt. No striping, speculative duplication, multipath scheduling, or multi-peer parallel download.
 - Use existing signed sources, manifests, physical lineage, carrier proofs, chunk records, and atomic promotion. A stream extent is scheduling, not a new integrity identity.
 - `StreamDataV1` contains a canonical manifest-ordered sequence of complete carriers. Checkpoints occur only after complete verified carriers; resume state is a contiguous next-carrier index, encoded offset, and generation.
-- Bound one extent at 1 MiB, validate peer lengths before allocation, and charge all live extent buffers to one global budget. Never allocate by whole-Blob length or advertised receive window.
+- Bound one extent at 1 MiB. Reserve a global header permit before header read and an exact global body permit after canonical length validation but before body read/allocation; release permits on every path. Bound queued records and sessions as well as payload buffers. Never allocate by whole-Blob length or advertised receive window.
 - Use checked `u64` arithmetic for lengths, offsets, credit, chunk counts, file accounting, and quota reservation. Configured policy must admit at least 2 GiB when storage quota permits.
 - Acknowledge only progress durable in synchronized chunk files, redb chunk markers, and the stream checkpoint. Files durable before a failed metadata transaction are non-authoritative until exact recovery verification.
 - Hold lifecycle leases only around one bounded extent read/verify/commit operation. An open network stream never leases the whole Blob.
-- Treat close/stall as retry/failover, unchanged absolute credit as backpressure, and integrity/protocol/lifecycle/store contradictions as typed terminal outcomes. Structural corruption is never absence, expiry, or retry.
+- Treat close or positive-credit stall as retry/failover, suspend the data-stall timer during zero-credit backpressure, and use a separate bounded authenticated liveness deadline. Prolonged healthy zero credit is deferred capacity, not transport failure. Integrity/protocol/lifecycle/store contradictions are typed terminal outcomes. Structural corruption is never absence, expiry, or retry.
 - Keep status/logs bounded and sanitized: no raw paths, credentials, peer-controlled error strings, or unbounded attempt history.
 - Do not run the full local workspace suite. Run each task's focused tests and use required final-SHA CI as broad integration evidence, recording workflow URL, run ID, commit, job conclusions, and artifact digests.
 - Preserve unrelated changes. Every task ends in a signed, reviewable commit.
@@ -42,7 +42,7 @@
 - **Crash and acknowledgement ordering:** tests in Tasks 2, 5, and 7 must prove bytes are acknowledged only after file and redb authority agree, one exact prefix survives every crash boundary, and settlement cannot repeat promotion or advance another cursor.
 - **Lifecycle and provenance transitions:** tests in Tasks 3 and 6 must preserve nondecreasing finite age, make profile-4-to-profile-5 adoption an atomic one-way upgrade, and retain PR 47 expiry, pressure, deletion, shared-variant, and evidence rules.
 - **Adversarial resource input:** tests in Tasks 2, 5, 6, and 8 must reject oversized/overflowing lengths before allocation, enforce global buffer/lease/quota limits, and keep metadata/checkpoint growth independent of Blob length.
-- **Selection and recovery claims:** tests in Tasks 4, 7, and 9 must enforce one active adapter, deterministic ranking, fresh attempt nonces, resume from receiver-durable progress only, bounded retransmission, and sanitized metrics while claiming only one production adapter.
+- **Selection and recovery claims:** tests in Tasks 4, 7, and 9 must enforce one active adapter, deterministic ranking, fresh authentication/negotiation/custody on each attempt, resume from receiver-durable progress only, bounded retransmission, and sanitized metrics. Iroh-only delivery claims reopen, not cross-transport failover; that claim requires Task 4's second-adapter gate.
 
 ---
 
@@ -131,6 +131,7 @@
 - Produces: tags `0xd6..0xdc`, accepted only in semantic v9 with selected profile 5.
 - Produces: pure `StreamSenderState` and `StreamReceiverState` transition APIs returning `Send`, `Persist`, `Promote`, `Retry`, or `Terminal` actions without I/O.
 - Produces: `MAX_STREAM_EXTENT_BYTES: usize = 1_048_576` plus a strict fixed-overhead-aware codec bound.
+- Produces: explicit bounded header/body decoding stages whose callers must reserve global memory before reading or allocating peer-declared bodies.
 
 - [ ] **Step 1: Write byte-exact failing codec tests**
 
@@ -148,7 +149,7 @@
 
 - [ ] **Step 4: Write failing pure transition tests**
 
-  Cover open/accept, pipelined extents under absolute credit, unchanged credit, cumulative checkpoints, duplicates, data below checkpoint, gaps/overlap, sequence mismatch, credit violation, attempt replay, finish/result/ack idempotence, and each typed terminal result.
+  Cover open/accept, pipelined extents under absolute credit, unchanged credit, cumulative checkpoints, multiple credit cycles without stream reopen, zero credit beyond the data-stall deadline, duplicates, data below checkpoint, gaps/overlap, sequence mismatch, credit violation, attempt replay, finish/result/ack idempotence, and each typed terminal result.
 
 - [ ] **Step 5: Run state tests and verify RED**
 
@@ -185,7 +186,7 @@
 - Modify: `crates/aster-node/src/mission.rs`
 - Modify: `crates/aster-node/src/stream_transfer.rs`
 - Modify: `crates/aster-node/src/runtime.rs`
-- Modify: `crates/aster-iroh/src/lib.rs` only if the existing additional uni-turn API lacks a bounded finish/reset observation
+- Modify: `crates/aster-iroh/src/lib.rs` to expose a concurrently open bounded data/control pair with finish/reset observation
 - Create: `conformance/vectors/blob-custody-v9.tsv`
 - Test: colocated core/node/Iroh tests
 
@@ -193,7 +194,7 @@
 - Produces: 208-byte `BlobCustodyClaimV2` with magic `ASTRBL09`, format version `2`, semantic version `9`, profile ID `5`, lane ID `4`, and the approved PR 47 fields/age semantics.
 - Produces: non-clone authenticated receive/send capabilities constructible only by a successfully opened v9/profile-5 record and consumable exactly once by Store admission.
 - Produces: `ApplicationRecordContext { semantic_version, transfer_profile_digest, lane, profile, direction, attempt_nonce, record_sequence }` under `ASTER/v9-lane-record/v1\0`; custody contact identity uses `ASTER/v9-blob-custody-contact/v2\0`.
-- Consumes: existing `Connection::begin_additional_uni_pair`, `open_send_uni`, `accept_uni`, `SendUniTurn::write_frame_checked`, `ReceiveUniTurn::read_frame`, and `skip_uni_turn`.
+- Consumes: existing Iroh connection primitives, extended to provide either one bounded bidirectional stream or two concurrently open bounded unidirectional streams with fixed data/control roles.
 - Preserves: v7/v8 contextual domains, `BlobCustodyClaimV1`, profile-4 bytes, and replay-window behavior.
 
 - [ ] **Step 1: Write failing custody-v2 vectors and capability tests**
@@ -216,7 +217,7 @@
 
 - [ ] **Step 5: Generalize mission protection and ordered-turn helpers**
 
-  Add the v9 profile-5 AAD domain and bounded long-lived record helpers. Reuse the PR 71 additional uni-turn mechanism; do not open one bidi request/response stream per extent.
+  Add the v9 profile-5 AAD domain and bounded long-lived record helpers. Keep sender-to-receiver data and receiver-to-sender credit/checkpoint control open concurrently for the attempt; do not serialize them as an ordered pair and do not reopen per extent or checkpoint.
 
 - [ ] **Step 6: Run focused custody/mission/Iroh tests and verify GREEN**
 
@@ -232,7 +233,7 @@
 
   Commit: `feat(protocol): bind v9 Blob custody and stream records`
 
-### Task 4: Add deterministic internal transport selection and failover
+### Task 4: Add deterministic internal transport selection and authenticated recovery
 
 **Files:**
 - Create: `crates/aster-node/src/stream_transport.rs`
@@ -242,14 +243,15 @@
 - Modify: `docs/transports.md`
 
 **Interfaces:**
-- Produces: `StreamTransportId::IrohQuicV1 = 1` and canonical supported-transport identifiers bound into `StreamOpenV1`.
+- Produces: `StreamTransportId::IrohQuicV1 = 1`; candidate support and peer locators come from authenticated configuration, provisioned peer records, or authenticated discovery before `StreamOpenV1`, not from a capability list first seen inside that frame.
 - Produces: internal object-safe `StreamTransportAdapter` methods for `id`, `eligibility`, `health`, `open_attempt`, and bounded record I/O, using boxed futures/project conventions without a new async-trait dependency.
 - Produces: `TransportSelector::rank(TransferRequirements, &[TransportCandidate]) -> Vec<TransportCandidate>` ordered by policy eligibility, stream support, health, configured priority, then stable ID. Direct/relay is an Iroh-local health observation, not a separately selectable transport.
-- Produces: `AttemptCoordinator` with one active adapter, fresh nonce per retry, receiver-durable checkpoint carry-forward, bounded retry/backoff, and aggregated sanitized metrics.
+- Produces: `AttemptCoordinator` with one active adapter, fresh peer/mission authentication, semantic/profile negotiation, nonce, transcript binding, and finite custody-v2 verification on every retry; receiver-durable checkpoint carry-forward happens only after those checks.
+- Claim gate: Iroh-only delivery demonstrates automatic choice of the sole eligible production adapter and authenticated reopen. Best-available cross-transport selection/failover requires a separately reviewed second production adapter satisfying the same reliable full-duplex stream contract; fake adapters cannot satisfy that gate.
 
 - [ ] **Step 1: Write failing selector tests with fake adapters**
 
-  Cover capability intersection, disabled/prohibited candidates, health, deterministic ties, one-active invariant, retryable close/stall, terminal protocol/integrity outcomes, exhaustion, cancellation, fresh nonces, and retransmission from checkpoint rather than last write.
+  Cover authenticated pre-open capability intersection, disabled/prohibited candidates, health, deterministic ties, one-active invariant, retryable close/positive-credit stall, zero-credit beyond the data-stall deadline, control-liveness failure, terminal protocol/integrity outcomes, exhaustion, cancellation, fresh authentication/transcript/nonces/custody, non-younger age merge, and retransmission from checkpoint rather than last write.
 
 - [ ] **Step 2: Run selector tests and verify RED**
 
@@ -259,11 +261,11 @@
 
 - [ ] **Step 3: Implement the adapter-neutral selector/coordinator**
 
-  Keep ranking inputs local and bounded; never accept peer scores. Make retry budget, stall deadline, and enablement configuration-owned while keeping protocol terminal results transport-neutral.
+  Keep ranking inputs local, authenticated, and bounded; never accept peer scores. Make retry budget, positive-credit stall deadline, control-liveness deadline, and enablement configuration-owned while keeping protocol terminal results transport-neutral.
 
 - [ ] **Step 4: Implement the first production adapter**
 
-  Wrap authenticated Iroh connections and Task 3 turns as `IrohQuicV1`. Expose Iroh direct/relay only as sanitized health/metrics while Iroh owns establishment and path changes.
+  Wrap authenticated Iroh connections and Task 3 concurrent data/control streams as `IrohQuicV1`. Expose Iroh direct/relay only as privileged sanitized health/metrics while Iroh owns establishment and path changes.
 
 - [ ] **Step 5: Run fake-failover and Iroh-reopen tests**
 
@@ -271,11 +273,11 @@
 
   Run: `cargo test --locked -p aster-node stream_iroh_adapter --lib -- --nocapture`
 
-  Expected: deterministic selection, one-active behavior, and checkpointed reopen pass.
+  Expected: deterministic selection, one-active behavior, multiple credit cycles without reopen, backpressure without false stall, and checkpointed authenticated reopen pass.
 
 - [ ] **Step 6: Document the shipped boundary**
 
-  State that the selector is protocol/runtime infrastructure with one production adapter; fake adapters prove policy mechanics but are not product transport support.
+  State that the selector is protocol/runtime infrastructure with one production adapter; fake adapters prove policy mechanics but are not product transport support. Explicitly withhold cross-transport selection/failover claims until a second production adapter and physical scenario are reviewed and complete.
 
 - [ ] **Step 7: Commit transport selection**
 
@@ -294,14 +296,15 @@
 - Produces: `BlobStreamCheckpoint { next_carrier_index: u64, durable_encoded_offset: u64, generation: u64 }`, one constant-sized row per pending source.
 - Produces: `BlobStreamLayout`, the checked separator-free concatenation of canonical carrier bytes in manifest-index order; checkpoints are carrier boundaries.
 - Produces: `VerifiedBlobStreamExtent`, one or more complete ordered verified carriers totaling at most the receiver extent bound.
+- Produces: `VerifiedBlobStreamCheckpointBatch`, complete verified carriers accumulated from one or more extents, with a 4-MiB default byte threshold, 250-ms default timer, and 8-MiB hard maximum; the receiver advertises any smaller limit.
 - Produces: `OwnedBlobStreamExtent` for bounded source reads and `BlobStreamCommitOutcome::{Advanced(BlobStreamCheckpoint), Duplicate(BlobStreamCheckpoint), Complete(BlobStreamCheckpoint)}` for receiver commits.
 - Produces: `Store::blob_stream_checkpoint_with_policy(&self, policy: &ControlPolicySnapshot, source: BlobTransferId, plan: &VerifiedBlobTransferPlan) -> Result<BlobStreamCheckpoint, StoreError>`.
-- Produces: `Store::commit_blob_stream_extent_with_policy(&self, policy: &ControlPolicySnapshot, source: BlobTransferId, plan: &VerifiedBlobTransferPlan, expected: BlobStreamCheckpoint, extent: VerifiedBlobStreamExtent) -> Result<BlobStreamCommitOutcome, StoreError>` with `Advanced`, `Duplicate`, or `Complete`.
+- Produces: `Store::commit_blob_stream_batch_with_policy(&self, policy: &ControlPolicySnapshot, source: BlobTransferId, plan: &VerifiedBlobTransferPlan, expected: BlobStreamCheckpoint, batch: VerifiedBlobStreamCheckpointBatch) -> Result<BlobStreamCommitOutcome, StoreError>` with `Advanced`, `Duplicate`, or `Complete`; exactly one redb transaction advances all carrier markers, counters, and the cumulative checkpoint for the batch.
 - Produces: `Store::read_completed_blob_stream_extent_with_policy(&self, policy: &ControlPolicySnapshot, completion: &VerifiedBlobContentCompletion, plan: &VerifiedBlobTransferPlan, checkpoint: BlobStreamCheckpoint, max_bytes: usize) -> Result<Option<OwnedBlobStreamExtent>, StoreError>`.
 
 - [ ] **Step 1: Write failing layout/checkpoint tests**
 
-  Cover zero/nonzero carriers, checked encoded-length sums, exact carrier boundaries, 64-MiB boundary, 1-GiB/2-GiB shapes, stale generation, forward skip, overlap, duplicate extent, wrong carrier order/proof, and constant-sized checkpoint rows.
+  Cover zero/nonzero carriers, checked encoded-length sums, exact carrier boundaries, 64-MiB boundary, 1-GiB/2-GiB shapes, multi-extent batches, byte/timer/hard bounds, stale generation, forward skip, overlap, duplicate extent, wrong carrier order/proof, and constant-sized checkpoint rows.
 
 - [ ] **Step 2: Run checkpoint tests and verify RED**
 
@@ -325,7 +328,7 @@
 
 - [ ] **Step 6: Implement files-first batch authority**
 
-  Synchronize exact chunk files/directories first, then commit chunk markers, counters, and cumulative checkpoint in one immediate-durability redb transaction. Recover/adopt orphaned files only after exact verification.
+  Synchronize every exact chunk file/directory in the bounded batch first, then commit all batch chunk markers, counters, and the one cumulative checkpoint in one immediate-durability redb transaction. Recover/adopt orphaned files only after exact verification. Keep the maximum uncheckpointed tail at or below the lesser of the advertised receive window and checkpoint-batch limit.
 
 - [ ] **Step 7: Remove per-carrier completion rescans from the stream path**
 
@@ -415,13 +418,14 @@
 **Interfaces:**
 - Consumes: profile-5 negotiation, custody-v2 capabilities, stream state machines, `AttemptCoordinator`, Store batch/checkpoint/provenance APIs, and PR 47 lifecycle outcomes.
 - Produces: source bounded-extent reader and receiver verifier/committer for one logical transfer.
-- Produces: bounded `BlobStreamTransferStatus` or compatible extension with phase, transport ID, attempt count, total/received/durable/retransmitted bytes, receive limit, checkpoint, rolling throughput, checkpoint latency, writer-commit count, failover recovery, and sanitized terminal category.
+- Produces: bounded public `BlobStreamTransferStatus` with phase, total/durable bytes, rolling throughput, and sanitized terminal category only.
+- Produces: separate privileged/operator telemetry with transport ID, candidate ranking, attempt count, received/retransmitted bytes, receive limit, checkpoint, checkpoint latency, writer-commit count, and failover recovery. These fields are not exposed through the public Blob application API.
 - Produces: v9 settlement that advances the existing publication cursor only after bound `StreamResultAck`.
 - Preserves: PR 71 profile-4 runtime, PR 47 public lifetime API, and all v1-v8 behavior.
 
 - [ ] **Step 1: Write failing small end-to-end runtime tests**
 
-  Cover v9/profile-5 negotiation, one/multiple carriers, multiple extents under credit, smaller receiver extents, zero/unchanged credit, final checkpoint, exact promotion, result/ack replay, finite v2 custody, and transport-blind application behavior.
+  Cover v9/profile-5 negotiation, one/multiple carriers, multiple extents and multiple replenishment cycles on one concurrent data/control pair, smaller receiver extents, zero/unchanged credit beyond the data-stall deadline without false failover, final checkpoint, exact promotion, result/ack replay, finite v2 custody, and transport-blind application behavior.
 
 - [ ] **Step 2: Run focused runtime tests and verify RED**
 
@@ -435,7 +439,7 @@
 
 - [ ] **Step 4: Write failing recovery and failover tests**
 
-  Close before data, within the uncheckpointed tail, after checkpoint, during finish, after promotion before result, and after result before ack. Restart sender/receiver, continue from another eligible content peer, require fresh nonce, and cap retransmission at the uncheckpointed batch.
+  Close before data, within the uncheckpointed tail, after checkpoint, during finish, after promotion before result, and after result before ack. Restart sender/receiver, continue from another eligible content peer, require fresh peer/mission authentication, semantic/profile negotiation, nonce/transcript binding and finite custody-v2 verification, merge age without rejuvenation, and cap retransmission at the uncheckpointed batch.
 
 - [ ] **Step 5: Implement reopen and idempotent settlement**
 
@@ -447,7 +451,7 @@
 
 - [ ] **Step 7: Add bounded status and contact metrics**
 
-  Add stable numeric fields/fixed enums and aggregate attempt history. Preserve PR 71 range counters with their existing meaning; add distinct profile-5 metrics and never log raw peer errors or paths.
+  Add stable numeric fields/fixed enums and aggregate attempt history. Keep only high-level transfer progress in the application status; put transport/checkpoint/commit/failover internals behind privileged diagnostics. Preserve PR 71 range counters with their existing meaning; add distinct profile-5 metrics and never log raw peer errors or paths.
 
 - [ ] **Step 8: Run focused runtime regressions and verify GREEN**
 
@@ -480,11 +484,12 @@
 - Produces: independent Python construction/validation for all v9 records and custody-v2 vectors.
 - Produces: deterministic incremental fixtures for 64-MiB boundary, 256 MiB, 1 GiB, and 2 GiB without two full in-memory copies.
 - Produces: counters for live/peak buffers, checkpoint transactions, carrier commits, retransmission, and promotion.
+- Produces: counters for header/body/session permits proving reservation precedes peer-controlled allocation and every completion/error/cancellation path releases capacity.
 - Produces: required small coverage plus a named large-Blob CI job with sufficient disk/time and retained bounded metrics.
 
 - [ ] **Step 1: Write failing small resource/commit-scaling tests**
 
-  Assert global buffer ceilings under concurrency, checkpoint-scale rather than frame/carrier-scale commits, checked quota arithmetic, exact content, bounded retransmission, and one promotion.
+  Assert global header/body/session ceilings under concurrency, no body allocation before reservation, exact permit release after malformed/truncated/cancelled sessions, checkpoint-scale rather than frame/carrier-scale commits, checked quota arithmetic, exact content, bounded retransmission, and one promotion.
 
 - [ ] **Step 2: Run small conformance tests and verify RED**
 
@@ -520,7 +525,7 @@
 
   Commit: `test(blob): cover large streaming recovery bounds`
 
-### Task 9: Extend path-lab for windowing and failover
+### Task 9: Extend path-lab for windowing and authenticated recovery
 
 **Files:**
 - Create: `docker/path-lab/scenarios/blob-streaming-netem.json`
@@ -531,7 +536,7 @@
 - Create: `docs/validation/blob-streaming-path-lab.md`
 
 **Interfaces:**
-- Produces: bounded netem scenarios for RTT, bandwidth, loss, disconnect, and receiver restart.
+- Produces: bounded netem scenarios for RTT, bandwidth, loss, Iroh disconnect/reopen, and receiver restart. A cross-transport scenario is added only with a second production adapter.
 - Produces: JSON metrics for payload throughput, bandwidth-delay product/window, checkpoint commits, retransmission tail, recovery, CPU, RSS, and storage.
 - Produces: assertions that throughput is not bounded by `16 KiB / RTT` and retry begins at the durable checkpoint.
 
@@ -551,7 +556,7 @@
 
 - [ ] **Step 4: Add required CI smoke scenarios**
 
-  Exercise RTT windowing and one checkpointed reconnect at small size. Reserve 256-MiB-plus attribution for large CI/manual/physical runs.
+  Exercise RTT windowing, multiple credit cycles on one data/control pair, zero-credit backpressure beyond the data-stall deadline, and one authenticated checkpointed reconnect at small size. Reserve 256-MiB-plus attribution for large CI/manual/physical runs.
 
 - [ ] **Step 5: Run controller and scenario validation**
 
@@ -587,7 +592,7 @@
 - Consumes: implemented v9/profile-5 behavior, independent vectors, PR 71/47 baseline semantics, CI artifacts, and production counters.
 - Produces: byte-exact normative v9/profile-5 and custody-v2 grammar with explicit v7/v8 preservation.
 - Produces: frozen procedure for `cm4-a`/`rpi4-1`, `cm4-b`/`rpi4-2`, and `cm4-support`/`rpi4-3`, assigning the third device failure-test/alternate-content-peer duties.
-- Produces: receipt schema for component baselines, 1-GiB/2-GiB bidirectional transfers, three-node resume, path failover, process recovery, lifecycle races, digest, CPU/RSS/storage, commits/latency, retransmission, and recovery.
+- Produces: receipt schema for component baselines, 1-GiB/2-GiB bidirectional transfers, three-node resume, Iroh path reopen, process recovery, lifecycle races, digest, CPU/RSS/storage, commits/latency, retransmission, and recovery; a separately gated cross-transport receipt section becomes required only after a second production adapter exists.
 
 - [ ] **Step 1: Verify canonical vectors against the normative model**
 
@@ -595,7 +600,7 @@
 
 - [ ] **Step 2: Document the implemented contract and decision**
 
-  Freeze exact tags/layouts/limits, distinguish carrier/extent/checkpoint, specify credit/resume/provenance upgrade, state one-production-adapter scope, and record why profile 4 was not mutated.
+  Freeze exact tags/layouts/limits, distinguish carrier/extent/checkpoint batch, specify concurrent data/control exchange, credit/resume/provenance upgrade, state the Iroh-only milestone and cross-transport claim gate, and record why profile 4 was not mutated.
 
 - [ ] **Step 3: Amend inventory and freeze the CM4 procedure**
 
@@ -607,7 +612,7 @@
 
 - [ ] **Step 5: Update traceability conservatively**
 
-  Separate implementation/CI conformance from physical performance. Do not mark 1-GiB/2-GiB throughput, failover, or CM4 qualification demonstrated without a checked receipt.
+  Separate implementation/CI conformance from physical performance. Do not mark 1-GiB/2-GiB throughput, Iroh recovery, or CM4 qualification demonstrated without a checked receipt. Never mark cross-transport selection/failover demonstrated without both a second production adapter and its checked receipt.
 
 - [ ] **Step 6: Run focused documentation/conformance checks**
 
@@ -625,7 +630,7 @@
 
 - [ ] **Step 8: Execute the physical procedure when all three CM4s are available**
 
-  Run 1-GiB/2-GiB both directions, three-node resume, path failover/reopen, process recovery, PR 47 lifecycle races, and exact digest verification. If devices are unavailable, leave this step and physical claims explicitly open.
+  Run 1-GiB/2-GiB both directions, three-node resume, Iroh path reopen, process recovery, PR 47 lifecycle races, and exact digest verification. If a second production adapter is present, also run cross-transport reselection with fresh authentication. If devices are unavailable, leave this step and physical claims explicitly open.
 
 - [ ] **Step 9: Commit documentation and validation contracts**
 
