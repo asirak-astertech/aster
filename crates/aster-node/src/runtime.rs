@@ -101,6 +101,10 @@ use zeroize::Zeroize as _;
 #[cfg(test)]
 #[path = "runtime/blob_progress_test.rs"]
 mod blob_progress_test;
+
+pub(crate) mod blob_ranges_stream;
+#[cfg(test)]
+mod blob_ranges_stream_test;
 #[cfg(test)]
 #[path = "runtime/convergence_test.rs"]
 mod convergence_test;
@@ -141,9 +145,9 @@ use crate::{
     },
     format_node_id, format_path_field, format_receipt_field,
     frame::{
-        BlobInterest, BlobInterestSelector, BlobObjectId, BlobRangeApplyDisposition,
-        BlobRangeDisposition, BridgeRouteDisposition, EventApplyDisposition, EventDirection,
-        EventInterest, EventInterestSelector, Frame, FrameEmissionPolicy, MAX_EVENT_INTEREST_BYTES,
+        BlobInterest, BlobInterestSelector, BlobObjectId, BlobRangeDisposition,
+        BridgeRouteDisposition, EventApplyDisposition, EventDirection, EventInterest,
+        EventInterestSelector, Frame, FrameEmissionPolicy, MAX_EVENT_INTEREST_BYTES,
         MAX_OBJECT_BYTES, MutableApplyDisposition, MutableClass, MutableTransferId,
     },
     mission::{
@@ -358,6 +362,10 @@ const EXCHANGE_FRAMES: usize = 2;
 const MIN_MUTABLE_SEMANTIC_VERSION: u16 = 4;
 const MIN_BLOB_NETWORK_SEMANTIC_VERSION: u16 = 5;
 const MIN_EVENT_BRIDGE_SEMANTIC_VERSION: u16 = 6;
+// Contact-driven pending cleanup belongs to the selected multi-range stream,
+// not the legacy v5/v6 Blob-network accounting boundary above.
+const MIN_BLOB_RANGES_STREAM_SEMANTIC_VERSION: u16 = SEMANTIC_PROTOCOL_V7;
+const _: () = assert!(MIN_BLOB_NETWORK_SEMANTIC_VERSION < MIN_BLOB_RANGES_STREAM_SEMANTIC_VERSION);
 const MAX_EVENT_BRIDGE_ROUTES_PER_DIRECTION: usize = 8;
 // Semantic v7 runs EventBridge after Event. Its selected runtime reserve proves
 // one opaque route in each direction plus both finishes; unsent routes remain
@@ -447,19 +455,10 @@ const BLOB_RANGE_FETCH_PLAINTEXT_BYTES: usize =
     4 + 1 + 1 + 32 + 33 + 8 + 8 + 4 + crate::frame::BLOB_CONTENT_PROOF_BYTES;
 const BLOB_RANGE_PLAINTEXT_MAX_BYTES: usize =
     4 + 1 + 1 + 32 + 33 + 8 + 8 + 4 + 1 + 4 + crate::frame::MAX_BLOB_RANGE_BYTES;
-const BLOB_RANGE_RESULT_PLAINTEXT_BYTES: usize = 4 + 1 + 1 + 32 + 33 + 8 + 8 + 4 + 1;
-const BLOB_CARRIER_FINISH_PLAINTEXT_BYTES: usize = 4 + 1 + 1 + 8;
-const BLOB_RANGE_FETCH_EXCHANGE_MAX_BYTES: usize = BLOB_RANGE_FETCH_PLAINTEXT_BYTES
-    + BLOB_RANGE_PLAINTEXT_MAX_BYTES
-    + 2 * APPLICATION_PROTECTION_OVERHEAD_BYTES;
-const BLOB_RANGE_RESULT_EXCHANGE_BYTES: usize =
-    2 * (BLOB_RANGE_RESULT_PLAINTEXT_BYTES + APPLICATION_PROTECTION_OVERHEAD_BYTES);
-const BLOB_CARRIER_FINISH_EXCHANGE_BYTES: usize =
-    2 * (BLOB_CARRIER_FINISH_PLAINTEXT_BYTES + APPLICATION_PROTECTION_OVERHEAD_BYTES);
+// Keep the established lane allocation: six protected frames and 17,127 bytes.
+// A one-range stream (schedule, acceptance, data, terminal) fits this allowance.
 const BLOB_CARRIER_LANE_RESERVE_EXCHANGES: usize = 3;
-const BLOB_CARRIER_LANE_RESERVE_BYTES: usize = BLOB_RANGE_FETCH_EXCHANGE_MAX_BYTES
-    + BLOB_RANGE_RESULT_EXCHANGE_BYTES
-    + BLOB_CARRIER_FINISH_EXCHANGE_BYTES;
+const BLOB_CARRIER_LANE_RESERVE_BYTES: usize = 17_127;
 const BLOB_CARRIER_CONTACT_RESERVE_EXCHANGES: usize = 2 * BLOB_CARRIER_LANE_RESERVE_EXCHANGES;
 const BLOB_CARRIER_CONTACT_RESERVE_BYTES: usize = 2 * BLOB_CARRIER_LANE_RESERVE_BYTES;
 const MUTABLE_V5_CONTACT_RESERVE_BYTES: usize = 2 * MUTABLE_INTEREST_EXCHANGE_MAX_BYTES
@@ -632,20 +631,20 @@ const MUTABLE_V5_CLASSES: [MutableClass; 3] = [
 
 fn mutable_classes_for_semantic(semantic_version: u16) -> &'static [MutableClass] {
     match semantic_version {
-        MIN_BLOB_NETWORK_SEMANTIC_VERSION.. => &MUTABLE_V5_CLASSES,
+        SEMANTIC_PROTOCOL_V7.. => &MUTABLE_V5_CLASSES,
         MIN_MUTABLE_SEMANTIC_VERSION.. => &MUTABLE_V4_CLASSES,
         _ => &[],
     }
 }
 
 const READY_RECONCILIATION_CLASSES: &str =
-    "event,state,record,blob-v5-opt-in,event-bridge-v6-opt-in";
+    "event,state,record,blob-v7-stream,event-bridge-v6-opt-in";
 
 const fn contact_reconciliation_classes(semantic_version: u16) -> &'static str {
-    if semantic_version >= MIN_EVENT_BRIDGE_SEMANTIC_VERSION {
+    if semantic_version >= SEMANTIC_PROTOCOL_V7 {
         "event,state,record,blob,event-bridge-opt-in"
-    } else if semantic_version >= MIN_BLOB_NETWORK_SEMANTIC_VERSION {
-        "event,state,record,blob"
+    } else if semantic_version >= MIN_EVENT_BRIDGE_SEMANTIC_VERSION {
+        "event,state,record,event-bridge-opt-in"
     } else {
         "event,state,record"
     }
@@ -676,10 +675,11 @@ fn post_event_reserve(semantic_version: u16) -> Option<ContactReserve> {
                 + EVENT_BRIDGE_CONTACT_RESERVE_FRAMES,
             protected_bytes: MUTABLE_V5_CONTACT_RESERVE_BYTES + EVENT_BRIDGE_CONTACT_RESERVE_BYTES,
         }),
-        MIN_BLOB_NETWORK_SEMANTIC_VERSION.. => Some(ContactReserve {
-            items: 6 * MUTABLE_LANE_GUARANTEED_ITEMS + 1,
-            protected_frames: MUTABLE_V5_CONTACT_RESERVE_EXCHANGES * EXCHANGE_FRAMES,
-            protected_bytes: MUTABLE_V5_CONTACT_RESERVE_BYTES,
+        MIN_EVENT_BRIDGE_SEMANTIC_VERSION => Some(ContactReserve {
+            items: 4 * MUTABLE_LANE_GUARANTEED_ITEMS + EVENT_BRIDGE_CONTACT_RESERVE_ITEMS,
+            protected_frames: MUTABLE_CONTACT_RESERVE_EXCHANGES * EXCHANGE_FRAMES
+                + EVENT_BRIDGE_CONTACT_RESERVE_FRAMES,
+            protected_bytes: MUTABLE_CONTACT_RESERVE_BYTES + EVENT_BRIDGE_CONTACT_RESERVE_BYTES,
         }),
         MIN_MUTABLE_SEMANTIC_VERSION.. => Some(ContactReserve {
             items: 4 * MUTABLE_LANE_GUARANTEED_ITEMS,
@@ -21577,8 +21577,8 @@ impl BlobContactMode {
             .and_then(|profiles| profiles.negotiated.profile(LaneId::Blob))
             .ok_or_else(|| NodeError::Protocol("Blob lane has no authenticated profile".into()))?;
         match (semantic_version, profile) {
-            (_, TransferProfileId::LegacyV6) => Ok(Self::DurableOnly),
-            (SEMANTIC_PROTOCOL_V8, TransferProfileId::BlobCustodyV1) => Ok(Self::CustodyV1),
+            (SEMANTIC_PROTOCOL_V7, TransferProfileId::BlobRangesStreamV1) => Ok(Self::DurableOnly),
+            (SEMANTIC_PROTOCOL_V8, TransferProfileId::BlobRangesStreamV1) => Ok(Self::CustodyV1),
             _ => Err(NodeError::Protocol(
                 "Blob lane selected an incompatible semantic/profile pair".into(),
             )),
@@ -21890,9 +21890,10 @@ fn mutable_future_reserve(
         .len()
         .checked_sub(mutable_class_index(semantic_version, class)?.saturating_add(1))
         .ok_or_else(|| NodeError::Protocol("mutable class order differs".into()))?;
-    let carrier_exchanges = usize::from(semantic_version >= MIN_BLOB_NETWORK_SEMANTIC_VERSION)
-        * BLOB_CARRIER_CONTACT_RESERVE_EXCHANGES;
-    let carrier_bytes = usize::from(semantic_version >= MIN_BLOB_NETWORK_SEMANTIC_VERSION)
+    let carrier_exchanges =
+        usize::from(semantic_version >= MIN_BLOB_RANGES_STREAM_SEMANTIC_VERSION)
+            * BLOB_CARRIER_CONTACT_RESERVE_EXCHANGES;
+    let carrier_bytes = usize::from(semantic_version >= MIN_BLOB_RANGES_STREAM_SEMANTIC_VERSION)
         * BLOB_CARRIER_CONTACT_RESERVE_BYTES;
     let exchanges = future_lanes
         .checked_mul(MUTABLE_LANE_FULL_GUARANTEE_EXCHANGES)
@@ -21941,9 +21942,10 @@ fn mutable_interest_reserve(
         .ok_or_else(|| NodeError::Protocol("mutable interest lane count overflow".into()))?;
     let fetch_lanes = remaining_classes;
     let future_interests = remaining_classes.saturating_sub(1);
-    let carrier_exchanges = usize::from(semantic_version >= MIN_BLOB_NETWORK_SEMANTIC_VERSION)
-        * BLOB_CARRIER_CONTACT_RESERVE_EXCHANGES;
-    let carrier_bytes = usize::from(semantic_version >= MIN_BLOB_NETWORK_SEMANTIC_VERSION)
+    let carrier_exchanges =
+        usize::from(semantic_version >= MIN_BLOB_RANGES_STREAM_SEMANTIC_VERSION)
+            * BLOB_CARRIER_CONTACT_RESERVE_EXCHANGES;
+    let carrier_bytes = usize::from(semantic_version >= MIN_BLOB_RANGES_STREAM_SEMANTIC_VERSION)
         * BLOB_CARRIER_CONTACT_RESERVE_BYTES;
     let exchanges = lanes
         .checked_mul(MUTABLE_LANE_FULL_GUARANTEE_EXCHANGES)
@@ -21992,9 +21994,10 @@ fn mutable_minimal_interest_reserve(
         .checked_mul(2)
         .ok_or_else(|| NodeError::Protocol("mutable minimal lane count overflow".into()))?;
     let future_interests = remaining_classes.saturating_sub(1);
-    let carrier_exchanges = usize::from(semantic_version >= MIN_BLOB_NETWORK_SEMANTIC_VERSION)
-        * BLOB_CARRIER_CONTACT_RESERVE_EXCHANGES;
-    let carrier_bytes = usize::from(semantic_version >= MIN_BLOB_NETWORK_SEMANTIC_VERSION)
+    let carrier_exchanges =
+        usize::from(semantic_version >= MIN_BLOB_RANGES_STREAM_SEMANTIC_VERSION)
+            * BLOB_CARRIER_CONTACT_RESERVE_EXCHANGES;
+    let carrier_bytes = usize::from(semantic_version >= MIN_BLOB_RANGES_STREAM_SEMANTIC_VERSION)
         * BLOB_CARRIER_CONTACT_RESERVE_BYTES;
     let exchanges = deferred_lanes
         .checked_add(future_interests)
@@ -23600,27 +23603,6 @@ fn canonical_blob_network_range(total_len: u64, offset: u64, requested_len: u32)
         && u64::from(requested_len) == range.min(total_len - offset)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BlobRangeServerPhase {
-    NeverAttempted,
-    PendingResult,
-    Settled,
-}
-
-impl BlobRangeServerPhase {
-    const fn permits_fetch(self) -> bool {
-        matches!(self, Self::NeverAttempted)
-    }
-
-    const fn permits_result(self) -> bool {
-        matches!(self, Self::PendingResult)
-    }
-
-    const fn permits_finish(self) -> bool {
-        matches!(self, Self::NeverAttempted | Self::Settled)
-    }
-}
-
 fn blob_terminal_content_error(error: &BlobError) -> bool {
     matches!(
         error,
@@ -24303,576 +24285,6 @@ const fn future_blob_carrier_lane_reserve(direction: EventDirection) -> (usize, 
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn sync_blob_carrier_lane(
-    store: &Store,
-    connection: &aster_iroh::Connection,
-    mission: &mut MissionSession,
-    verifier: &mut ReferenceEnvelopeSealer,
-    guard: &EventLaneGuard,
-    blob_contact_mode: BlobContactMode,
-    lane_direction: EventDirection,
-    local_interest: &BlobInterest,
-    _peer_interest: &BlobInterest,
-    receipt: &mut PeerReceipt,
-) -> Result<(), NodeError> {
-    guard.check(store)?;
-    let (future_lane_exchanges, future_lane_bytes) =
-        future_blob_carrier_lane_reserve(lane_direction);
-    let peer = mission.peer().mission_id();
-    let cursor = store.blob_carrier_fetch_cursor(peer)?;
-    let mut selected = selected_pending_blob_contact_work(
-        store,
-        guard,
-        verifier,
-        local_interest,
-        cursor.map(|cursor| cursor.source()),
-        blob_contact_mode,
-    )?;
-    let candidate = if let Some(work) = selected.as_mut() {
-        match recover_and_finalize_pending_blob(
-            store,
-            guard,
-            verifier,
-            work.source,
-            &work.blob,
-            &work.manifest_bytes,
-            &work.plan,
-            &mut work.carriers,
-            Some((peer, cursor)),
-            blob_contact_mode,
-        )? {
-            Some(PendingBlobRecoveryDisposition::DeferredLease) => {
-                receipt.blob_deferred = receipt.blob_deferred.saturating_add(1);
-                None
-            }
-            Some(PendingBlobRecoveryDisposition::Apply(
-                MutableApplyDisposition::DeferredCapacity,
-            )) => {
-                receipt.blob_deferred = receipt.blob_deferred.saturating_add(1);
-                // A fully installed source that cannot yet enter semantic
-                // publication remains retryable, but must not monopolize the
-                // durable per-peer source scheduler.
-                advance_terminal_blob_source_cursor(
-                    store,
-                    &work.plan,
-                    work.source,
-                    Some((peer, cursor)),
-                )?;
-                None
-            }
-            Some(PendingBlobRecoveryDisposition::Apply(
-                MutableApplyDisposition::Inserted | MutableApplyDisposition::Duplicate,
-            )) => None,
-            None => {
-                let status = work.carriers.first().copied().ok_or_else(|| {
-                    NodeError::FatalBlobCoherence(
-                        "selected pending Blob omitted both completion and carrier work".into(),
-                    )
-                })?;
-                let range = status.exact_complement().ok_or_else(|| {
-                    NodeError::FatalBlobCoherence(
-                        "selected pending Blob retained complete work after recovery".into(),
-                    )
-                })?;
-                let requested_len = u32::try_from(range.end - range.start).map_err(|_| {
-                    NodeError::Protocol("Blob range request length exceeds u32".into())
-                })?;
-                Some(BlobRangeCandidate {
-                    source: work.source,
-                    object: status.object(),
-                    total_len: status.total_len(),
-                    offset: range.start,
-                    requested_len,
-                    proof: work.proof,
-                })
-            }
-        }
-    } else {
-        None
-    };
-    if let Some(candidate) = candidate {
-        let reserve_exchanges = 2usize
-            .checked_add(future_lane_exchanges)
-            .ok_or_else(|| NodeError::Protocol("Blob carrier exchange reserve overflow".into()))?;
-        let reserve_bytes = BLOB_RANGE_RESULT_EXCHANGE_BYTES
-            .checked_add(BLOB_CARRIER_FINISH_EXCHANGE_BYTES)
-            .and_then(|bytes| bytes.checked_add(future_lane_bytes))
-            .ok_or_else(|| NodeError::Protocol("Blob carrier byte reserve overflow".into()))?;
-        if !exchange_preserves_reserve(
-            receipt,
-            BLOB_RANGE_FETCH_PLAINTEXT_BYTES,
-            BLOB_RANGE_PLAINTEXT_MAX_BYTES,
-            reserve_exchanges,
-            reserve_bytes,
-        )? {
-            return Err(NodeError::Protocol(
-                "contact lost the reserved Blob range settlement boundary".into(),
-            ));
-        }
-        let object_id = frame_blob_object_id(candidate.object)?;
-        guard.check(store)?;
-        let selected_projection =
-            selected
-                .as_ref()
-                .map(|work| &work.projection)
-                .ok_or_else(|| {
-                    NodeError::FatalBlobCoherence(
-                        "Blob range request lost its selected source authority".into(),
-                    )
-                })?;
-        let retained = blob_source_projection_for_contact(
-            store,
-            selected_projection.transfer_id,
-            blob_contact_mode,
-        )?;
-        if retained.as_ref().is_none_or(|retained| {
-            retained.retention != BlobSourceRetention::Pending
-                || retained.source != *selected_projection
-        }) {
-            return Err(NodeError::Protocol(
-                "Blob range request source lost current contact eligibility".into(),
-            ));
-        }
-        let response = request_mission_frame(
-            connection,
-            mission,
-            Frame::BlobRangeFetch {
-                direction: lane_direction,
-                source_id: candidate.source,
-                object_id,
-                total_len: candidate.total_len,
-                offset: candidate.offset,
-                requested_len: candidate.requested_len,
-                content_proof: candidate.proof,
-            },
-            receipt,
-        )
-        .await?;
-        let Frame::BlobRange {
-            direction,
-            source_id,
-            object_id: returned_object,
-            total_len,
-            offset,
-            requested_len,
-            disposition: range_disposition,
-            bytes,
-        } = response
-        else {
-            return Err(NodeError::Protocol(
-                "Blob range fetch received another response".into(),
-            ));
-        };
-        if direction != lane_direction
-            || source_id != candidate.source
-            || returned_object != object_id
-            || total_len != candidate.total_len
-            || offset != candidate.offset
-            || requested_len != candidate.requested_len
-        {
-            return Err(NodeError::Protocol(
-                "Blob range response crossed its exact tuple".into(),
-            ));
-        }
-        let (accepted_len, apply_disposition) = match range_disposition {
-            BlobRangeDisposition::Unavailable => {
-                if !bytes.is_empty() {
-                    return Err(NodeError::Protocol(
-                        "unavailable Blob range carried bytes".into(),
-                    ));
-                }
-                (0, BlobRangeApplyDisposition::Unavailable)
-            }
-            BlobRangeDisposition::Data => {
-                if bytes.len() != usize::try_from(candidate.requested_len).expect("u32 fits usize")
-                {
-                    return Err(NodeError::Protocol(
-                        "Blob range payload differs from its exact requested length".into(),
-                    ));
-                }
-                guard.check(store)?;
-                let cache = contact_mutable_route_cache(verifier)?;
-                let lifecycle = cache.lock_blob_lifecycle()?;
-                #[cfg(test)]
-                let append_trace = TestBlobAdmissionTrace::Append {
-                    source: candidate.source,
-                    object: candidate.object,
-                    total_len: candidate.total_len,
-                    offset: candidate.offset,
-                    bytes_sha256: Sha256::digest(&bytes).into(),
-                };
-                #[cfg(test)]
-                {
-                    cache.record_blob_carrier_append_attempt();
-                    cache.record_blob_admission_trace(append_trace.clone());
-                }
-                #[cfg(test)]
-                let appended =
-                    if fire_test_blob_contact_fault(TestBlobContactFault::AppendCoherence) {
-                        Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
-                            "injected Blob carrier append coherence failure",
-                        )))
-                    } else if selected
-                        .as_ref()
-                        .is_some_and(|work| work.blob.priority() == Priority::Flash)
-                        && (fire_test_blob_contact_fault(TestBlobContactFault::AppendCapacity)
-                            || fire_test_blob_contact_fault(
-                                TestBlobContactFault::AppendCapacityThenRetryCoherence,
-                            ))
-                    {
-                        Err(StoreError::Blob(
-                            BlobStoreError::NetworkStagingRowLimitExceeded {
-                                current: MAX_BLOB_NETWORK_STAGING_ROWS,
-                                incoming: 1,
-                                limit: MAX_BLOB_NETWORK_STAGING_ROWS,
-                            },
-                        ))
-                    } else {
-                        append_blob_carrier_prefix_for_contact(
-                            store,
-                            guard.policy(),
-                            candidate.source,
-                            candidate.object,
-                            candidate.total_len,
-                            candidate.offset,
-                            &bytes,
-                            blob_contact_mode,
-                        )
-                    };
-                #[cfg(not(test))]
-                let appended = append_blob_carrier_prefix_for_contact(
-                    store,
-                    guard.policy(),
-                    candidate.source,
-                    candidate.object,
-                    candidate.total_len,
-                    candidate.offset,
-                    &bytes,
-                    blob_contact_mode,
-                );
-                let appended = match appended {
-                    Err(error) if blob_apply_capacity_error(&error) => {
-                        let original = error;
-                        let selected_blob = &selected
-                            .as_ref()
-                            .ok_or_else(|| {
-                                NodeError::FatalBlobCoherence(
-                                    "settled Blob range lost its selected admission".into(),
-                                )
-                            })?
-                            .blob;
-                        let recovered = recover_blob_capacity_after_cleanup(
-                            store,
-                            verifier,
-                            &cache,
-                            &original,
-                            selected_blob.priority(),
-                            Some((
-                                selected_blob.topic(),
-                                selected_blob.scope(),
-                                selected_blob.blob_id(),
-                            )),
-                            0,
-                            0,
-                            contact_custody_sample()?,
-                            &lifecycle,
-                        )?;
-                        if recovered {
-                            #[cfg(test)]
-                            {
-                                cache.record_blob_carrier_append_attempt();
-                                cache.record_blob_admission_trace(append_trace);
-                            }
-                            #[cfg(test)]
-                            let retry = if fire_test_blob_contact_fault(
-                                TestBlobContactFault::AppendRetryCoherence,
-                            ) {
-                                Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
-                                    "injected Blob carrier append retry coherence failure",
-                                )))
-                            } else {
-                                append_blob_carrier_prefix_for_contact(
-                                    store,
-                                    guard.policy(),
-                                    candidate.source,
-                                    candidate.object,
-                                    candidate.total_len,
-                                    candidate.offset,
-                                    &bytes,
-                                    blob_contact_mode,
-                                )
-                            };
-                            #[cfg(not(test))]
-                            let retry = append_blob_carrier_prefix_for_contact(
-                                store,
-                                guard.policy(),
-                                candidate.source,
-                                candidate.object,
-                                candidate.total_len,
-                                candidate.offset,
-                                &bytes,
-                                blob_contact_mode,
-                            );
-                            match retry {
-                                Ok(outcome) => Ok(outcome),
-                                Err(retry) if equivalent_blob_capacity_error(&original, &retry) => {
-                                    Err(original)
-                                }
-                                Err(retry) => Err(retry),
-                            }
-                        } else {
-                            Err(original)
-                        }
-                    }
-                    outcome => outcome,
-                };
-                drop(lifecycle);
-                match appended {
-                    Ok(BlobCarrierAppendOutcome::Duplicate(status)) => {
-                        receipt.duplicates = receipt.duplicates.saturating_add(1);
-                        if status.complete() {
-                            let work = selected.as_mut().ok_or_else(|| {
-                                NodeError::FatalBlobCoherence(
-                                    "settled Blob range lost its selected source work".into(),
-                                )
-                            })?;
-                            let retained = work
-                                .carriers
-                                .iter_mut()
-                                .find(|retained| retained.object() == candidate.object)
-                                .ok_or_else(|| {
-                                    NodeError::FatalBlobCoherence(
-                                        "settled Blob range left its selected work snapshot".into(),
-                                    )
-                                })?;
-                            *retained = status;
-                            if matches!(
-                                recover_and_finalize_pending_blob(
-                                    store,
-                                    guard,
-                                    verifier,
-                                    work.source,
-                                    &work.blob,
-                                    &work.manifest_bytes,
-                                    &work.plan,
-                                    &mut work.carriers,
-                                    Some((peer, cursor)),
-                                    blob_contact_mode,
-                                )?,
-                                Some(
-                                    PendingBlobRecoveryDisposition::DeferredLease
-                                        | PendingBlobRecoveryDisposition::Apply(
-                                            MutableApplyDisposition::DeferredCapacity,
-                                        )
-                                )
-                            ) {
-                                receipt.blob_deferred = receipt.blob_deferred.saturating_add(1);
-                            }
-                        }
-                        (0, BlobRangeApplyDisposition::Duplicate)
-                    }
-                    Ok(BlobCarrierAppendOutcome::Appended(status)) => {
-                        // Observe the committed prefix before completion can
-                        // retire its staging row. This is test-only telemetry.
-                        #[cfg(test)]
-                        blob_progress_test::record(
-                            verifier.identity(),
-                            &selected.as_ref().expect("selected Blob work").blob,
-                            status,
-                        );
-                        receipt.blob_bytes_fetched = receipt
-                            .blob_bytes_fetched
-                            .checked_add(bytes.len())
-                            .ok_or_else(|| {
-                                NodeError::Protocol("Blob byte count overflow".into())
-                            })?;
-                        if status.complete() {
-                            let work = selected.as_mut().ok_or_else(|| {
-                                NodeError::FatalBlobCoherence(
-                                    "completed Blob range lost its selected source work".into(),
-                                )
-                            })?;
-                            let retained = work
-                                .carriers
-                                .iter_mut()
-                                .find(|retained| retained.object() == candidate.object)
-                                .ok_or_else(|| {
-                                    NodeError::FatalBlobCoherence(
-                                        "completed Blob range left its selected work snapshot"
-                                            .into(),
-                                    )
-                                })?;
-                            *retained = status;
-                            if matches!(
-                                recover_and_finalize_pending_blob(
-                                    store,
-                                    guard,
-                                    verifier,
-                                    work.source,
-                                    &work.blob,
-                                    &work.manifest_bytes,
-                                    &work.plan,
-                                    &mut work.carriers,
-                                    Some((peer, cursor)),
-                                    blob_contact_mode,
-                                )?,
-                                Some(
-                                    PendingBlobRecoveryDisposition::DeferredLease
-                                        | PendingBlobRecoveryDisposition::Apply(
-                                            MutableApplyDisposition::DeferredCapacity,
-                                        )
-                                )
-                            ) {
-                                receipt.blob_deferred = receipt.blob_deferred.saturating_add(1);
-                            }
-                            (candidate.requested_len, BlobRangeApplyDisposition::Complete)
-                        } else {
-                            (candidate.requested_len, BlobRangeApplyDisposition::Partial)
-                        }
-                    }
-                    Err(error) if blob_apply_capacity_error(&error) => {
-                        receipt.blob_deferred = receipt.blob_deferred.saturating_add(1);
-                        (0, BlobRangeApplyDisposition::DeferredCapacity)
-                    }
-                    Err(error) if blob_contact_policy_transition_error(&error) => {
-                        return Err(error.into());
-                    }
-                    Err(error @ StoreError::Blob(BlobStoreError::PendingSourceMissing)) => {
-                        return Err(error.into());
-                    }
-                    Err(error @ StoreError::Blob(BlobStoreError::CarrierPrefixConflict)) => {
-                        store
-                            .abort_blob_carrier_prefix(candidate.source, candidate.object)
-                            .map_err(NodeError::from)
-                            .map_err(|abort| {
-                                fatal_blob_coherence(
-                                    "conflicting Blob carrier prefix cleanup",
-                                    abort,
-                                )
-                            })?;
-                        return Err(error.into());
-                    }
-                    Err(error) => {
-                        return Err(fatal_blob_coherence(
-                            "authenticated Blob carrier prefix append",
-                            error.into(),
-                        ));
-                    }
-                }
-            }
-        };
-        let reserve_exchanges = 1usize
-            .checked_add(future_lane_exchanges)
-            .ok_or_else(|| NodeError::Protocol("Blob result exchange reserve overflow".into()))?;
-        let reserve_bytes = BLOB_CARRIER_FINISH_EXCHANGE_BYTES
-            .checked_add(future_lane_bytes)
-            .ok_or_else(|| NodeError::Protocol("Blob result byte reserve overflow".into()))?;
-        if !exchange_preserves_reserve(
-            receipt,
-            BLOB_RANGE_RESULT_PLAINTEXT_BYTES,
-            BLOB_RANGE_RESULT_PLAINTEXT_BYTES,
-            reserve_exchanges,
-            reserve_bytes,
-        )? {
-            return Err(NodeError::Protocol(
-                "contact lost the reserved Blob result acknowledgement boundary".into(),
-            ));
-        }
-        #[cfg(test)]
-        record_test_blob_contact_result_frame();
-        let acknowledgement = request_mission_frame(
-            connection,
-            mission,
-            Frame::BlobRangeResult {
-                direction: lane_direction,
-                source_id: candidate.source,
-                object_id,
-                total_len: candidate.total_len,
-                offset: candidate.offset,
-                accepted_len,
-                disposition: apply_disposition,
-            },
-            receipt,
-        )
-        .await?;
-        if acknowledgement
-            != (Frame::BlobRangeResultAck {
-                direction: lane_direction,
-                source_id: candidate.source,
-                object_id,
-                total_len: candidate.total_len,
-                offset: candidate.offset,
-                accepted_len,
-                disposition: apply_disposition,
-            })
-        {
-            return Err(NodeError::Protocol(
-                "Blob range result acknowledgement differs".into(),
-            ));
-        }
-        // An unavailable unit retains its exact durable turn: expected
-        // lifetime invisibility is not evidence that a later source/object
-        // was settled. Other typed outcomes remain scheduling evidence.
-        if apply_disposition != BlobRangeApplyDisposition::Unavailable {
-            let _ = store.compare_and_advance_blob_carrier_fetch_cursor(
-                peer,
-                cursor,
-                BlobCarrierFetchCursor::new(candidate.source, candidate.object),
-            )?;
-        }
-        if matches!(
-            apply_disposition,
-            BlobRangeApplyDisposition::Partial | BlobRangeApplyDisposition::Complete
-        ) {
-            receipt.blob_ranges_fetched = receipt
-                .blob_ranges_fetched
-                .checked_add(1)
-                .ok_or_else(|| NodeError::Protocol("Blob fetched range count overflow".into()))?;
-        }
-    }
-    let remaining = blob_carrier_remaining(store, guard, blob_contact_mode)?;
-    let remaining_wire = u64::try_from(remaining)
-        .map_err(|_| NodeError::Protocol("Blob remaining count exceeds u64".into()))?;
-    if !exchange_preserves_reserve(
-        receipt,
-        BLOB_CARRIER_FINISH_PLAINTEXT_BYTES,
-        BLOB_CARRIER_FINISH_PLAINTEXT_BYTES,
-        future_lane_exchanges,
-        future_lane_bytes,
-    )? {
-        return Err(NodeError::Protocol(
-            "contact lost the reserved symmetric Blob carrier lane".into(),
-        ));
-    }
-    let response = request_mission_frame(
-        connection,
-        mission,
-        Frame::BlobCarrierFinish {
-            direction: lane_direction,
-            remaining: remaining_wire,
-        },
-        receipt,
-    )
-    .await?;
-    if response
-        != (Frame::BlobCarrierFinished {
-            direction: lane_direction,
-            remaining: remaining_wire,
-        })
-    {
-        return Err(NodeError::Protocol(
-            "Blob carrier finish acknowledgement differs".into(),
-        ));
-    }
-    receipt.blob_remaining = receipt
-        .blob_remaining
-        .checked_add(remaining)
-        .ok_or_else(|| NodeError::Protocol("Blob remaining count overflow".into()))?;
-    add_unscheduled_mutable(receipt, remaining)?;
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
 fn serve_verified_blob_range(
     store: &Store,
     guard: &EventLaneGuard,
@@ -25180,170 +24592,6 @@ fn serve_verified_blob_range(
         None => Err(NodeError::FatalBlobCoherence(
             "served authenticated Blob disappeared during its physical range read".into(),
         )),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn serve_blob_carrier_lane(
-    store: &Store,
-    connection: &aster_iroh::Connection,
-    mission: &mut MissionSession,
-    verifier: &mut ReferenceEnvelopeSealer,
-    guard: &EventLaneGuard,
-    blob_contact_mode: BlobContactMode,
-    lane_direction: EventDirection,
-    _local_interest: &BlobInterest,
-    peer_interest: &BlobInterest,
-    receipt: &mut PeerReceipt,
-) -> Result<(), NodeError> {
-    let peer = mission.peer().mission_id();
-    let commitments = mission.peer_route_grant_commitments().to_vec();
-    let mut pending_result = None;
-    let mut phase = BlobRangeServerPhase::NeverAttempted;
-    loop {
-        guard.check(store)?;
-        let wire_budget = exchange_wire_budget(receipt)?;
-        let (complete, request_bytes, response_bytes) = respond_mission_frame(
-            connection,
-            mission,
-            wire_budget,
-            |frame, _, _mission| match frame {
-                Frame::BlobRangeFetch {
-                    direction,
-                    source_id,
-                    object_id,
-                    total_len,
-                    offset,
-                    requested_len,
-                    content_proof,
-                } if direction == lane_direction
-                    && pending_result.is_none()
-                    && phase.permits_fetch() =>
-                {
-                    let object = store_blob_object_id(object_id)?;
-                    let bytes = serve_verified_blob_range(
-                        store,
-                        guard,
-                        verifier,
-                        peer,
-                        &commitments,
-                        peer_interest,
-                        source_id,
-                        object,
-                        total_len,
-                        offset,
-                        requested_len,
-                        &content_proof,
-                        blob_contact_mode,
-                    )?;
-                    #[cfg(test)]
-                    record_test_blob_contact_result_frame();
-                    let disposition = if bytes.is_some() {
-                        BlobRangeDisposition::Data
-                    } else {
-                        BlobRangeDisposition::Unavailable
-                    };
-                    let bytes = bytes.unwrap_or_default();
-                    pending_result = Some((
-                        source_id,
-                        object_id,
-                        total_len,
-                        offset,
-                        requested_len,
-                        disposition,
-                    ));
-                    phase = BlobRangeServerPhase::PendingResult;
-                    Ok((
-                        Frame::BlobRange {
-                            direction: lane_direction,
-                            source_id,
-                            object_id,
-                            total_len,
-                            offset,
-                            requested_len,
-                            disposition,
-                            bytes,
-                        },
-                        false,
-                    ))
-                }
-                Frame::BlobRangeResult {
-                    direction,
-                    source_id,
-                    object_id,
-                    total_len,
-                    offset,
-                    accepted_len,
-                    disposition,
-                } if direction == lane_direction
-                    && pending_result.is_some()
-                    && phase.permits_result() =>
-                {
-                    let pending = pending_result.take().expect("checked pending result");
-                    if (source_id, object_id, total_len, offset)
-                        != (pending.0, pending.1, pending.2, pending.3)
-                        || match (pending.5, disposition) {
-                            (
-                                BlobRangeDisposition::Unavailable,
-                                BlobRangeApplyDisposition::Unavailable,
-                            ) => accepted_len != 0,
-                            (
-                                BlobRangeDisposition::Data,
-                                BlobRangeApplyDisposition::Partial
-                                | BlobRangeApplyDisposition::Complete,
-                            ) => accepted_len != pending.4,
-                            (
-                                BlobRangeDisposition::Data,
-                                BlobRangeApplyDisposition::Duplicate
-                                | BlobRangeApplyDisposition::DeferredCapacity,
-                            ) => accepted_len != 0,
-                            _ => true,
-                        }
-                    {
-                        return Err(NodeError::Protocol(
-                            "Blob range result differs from pending response".into(),
-                        ));
-                    }
-                    receipt.offered = receipt.offered.saturating_add(1);
-                    phase = BlobRangeServerPhase::Settled;
-                    Ok((
-                        Frame::BlobRangeResultAck {
-                            direction,
-                            source_id,
-                            object_id,
-                            total_len,
-                            offset,
-                            accepted_len,
-                            disposition,
-                        },
-                        false,
-                    ))
-                }
-                Frame::BlobCarrierFinish {
-                    direction,
-                    remaining,
-                } if direction == lane_direction
-                    && pending_result.is_none()
-                    && phase.permits_finish() =>
-                {
-                    Ok((
-                        Frame::BlobCarrierFinished {
-                            direction,
-                            remaining,
-                        },
-                        true,
-                    ))
-                }
-                _ => Err(NodeError::Protocol(
-                    "Blob carrier lane used an unauthorized phase operation".into(),
-                )),
-            },
-        )
-        .await?;
-        account(receipt, request_bytes, response_bytes)?;
-        if complete {
-            return Ok(());
-        }
     }
 }
 
@@ -25784,7 +25032,7 @@ async fn sync_mutable_classes(
         interests,
         blob_contact_mode,
     } = contact;
-    if mission.semantic_version() >= MIN_BLOB_NETWORK_SEMANTIC_VERSION {
+    if mission.semantic_version() >= MIN_BLOB_RANGES_STREAM_SEMANTIC_VERSION {
         let cache = contact_mutable_route_cache(verifier)?;
         cleanup_ineligible_pending_blobs(store, verifier, &cache)?;
         guard.check(store)?;
@@ -25812,9 +25060,9 @@ async fn sync_mutable_classes(
     if let Some((local, peer)) = blob_interests {
         // Carrier recovery is symmetric and direction-ordered: the initiator
         // first serves the responder's newly staged source, then fetches its
-        // own pending source from the responder. Each half settles at most one
-        // canonical range before its directional Finish.
-        serve_blob_carrier_lane(
+        // own pending source from the responder. Each half streams a bounded
+        // schedule followed by an authenticated terminal and FIN.
+        blob_ranges_stream::send(
             store,
             connection,
             mission,
@@ -25822,12 +25070,11 @@ async fn sync_mutable_classes(
             guard,
             blob_contact_mode,
             EventDirection::ToSessionResponder,
-            &local,
             &peer,
             receipt,
         )
         .await?;
-        sync_blob_carrier_lane(
+        blob_ranges_stream::receive(
             store,
             connection,
             mission,
@@ -25836,7 +25083,6 @@ async fn sync_mutable_classes(
             blob_contact_mode,
             EventDirection::ToSessionInitiator,
             &local,
-            &peer,
             receipt,
         )
         .await?;
@@ -26644,6 +25890,10 @@ async fn sync_authenticated_session(
     {
         EventReconciliationOutcome::Complete(reconciliation) => reconciliation,
         EventReconciliationOutcome::Deferred => {
+            if transfer_profiles.is_some() {
+                connection.skip_uni_turn()?;
+                connection.skip_uni_turn()?;
+            }
             if !matches!(remote_emission.policy, EventEmissionPolicy::ReceiveOnly) {
                 sync_mutable_classes(
                     store,
@@ -26807,6 +26057,8 @@ async fn sync_authenticated_session(
         {
             EventReconciliationOutcome::Complete(reconciliation) => reconciliation,
             EventReconciliationOutcome::Deferred => {
+                connection.skip_uni_turn()?;
+                connection.skip_uni_turn()?;
                 sync_mutable_classes(
                     store,
                     connection,
@@ -28779,7 +28031,7 @@ async fn serve_mutable_classes(
         interests,
         blob_contact_mode,
     } = contact;
-    if mission.semantic_version() >= MIN_BLOB_NETWORK_SEMANTIC_VERSION {
+    if mission.semantic_version() >= MIN_BLOB_RANGES_STREAM_SEMANTIC_VERSION {
         let cache = contact_mutable_route_cache(verifier)?;
         cleanup_ineligible_pending_blobs(store, verifier, &cache)?;
         guard.check(store)?;
@@ -28808,7 +28060,7 @@ async fn serve_mutable_classes(
         // Mirror the initiator's fixed order without role-dependent carrier
         // authority: fetch the responder-bound range, then serve the
         // initiator-bound range.
-        sync_blob_carrier_lane(
+        blob_ranges_stream::receive(
             store,
             connection,
             mission,
@@ -28817,11 +28069,10 @@ async fn serve_mutable_classes(
             blob_contact_mode,
             EventDirection::ToSessionResponder,
             &local,
-            &peer,
             receipt,
         )
         .await?;
-        serve_blob_carrier_lane(
+        blob_ranges_stream::send(
             store,
             connection,
             mission,
@@ -28829,7 +28080,6 @@ async fn serve_mutable_classes(
             guard,
             blob_contact_mode,
             EventDirection::ToSessionInitiator,
-            &local,
             &peer,
             receipt,
         )
@@ -28955,6 +28205,10 @@ async fn serve_session(
         EventReconciliationOutcome::Complete(reconciliation) => reconciliation,
         EventReconciliationOutcome::Deferred => {
             if !matches!(local_emission.policy, EventEmissionPolicy::ReceiveOnly) {
+                if transfer_profiles.is_some() {
+                    connection.skip_uni_turn()?;
+                    connection.skip_uni_turn()?;
+                }
                 serve_mutable_classes(
                     &store,
                     &connection,
@@ -29115,6 +28369,8 @@ async fn serve_session(
         {
             EventReconciliationOutcome::Complete(reconciliation) => reconciliation,
             EventReconciliationOutcome::Deferred => {
+                connection.skip_uni_turn()?;
+                connection.skip_uni_turn()?;
                 serve_mutable_classes(
                     &store,
                     &connection,
@@ -32889,23 +32145,29 @@ mod tests {
     }
 
     #[test]
-    fn mutable_v4_v5_and_bridge_v6_gate_budget_and_status_are_class_separated() {
+    fn mutable_v4_v6_and_blob_stream_v7_gate_budget_and_status_are_class_separated() {
         assert!(!supports_mutable_semantic(1));
         assert!(!supports_mutable_semantic(2));
         assert!(!supports_mutable_semantic(3));
         assert!(supports_mutable_semantic(4));
         assert!(mutable_classes_for_semantic(3).is_empty());
         assert_eq!(mutable_classes_for_semantic(4), &MUTABLE_V4_CLASSES);
-        assert_eq!(mutable_classes_for_semantic(5), &MUTABLE_V5_CLASSES);
+        assert_eq!(mutable_classes_for_semantic(5), &MUTABLE_V4_CLASSES);
+        assert_eq!(mutable_classes_for_semantic(6), &MUTABLE_V4_CLASSES);
+        assert_eq!(mutable_classes_for_semantic(7), &MUTABLE_V5_CLASSES);
         assert_eq!(
             READY_RECONCILIATION_CLASSES,
-            "event,state,record,blob-v5-opt-in,event-bridge-v6-opt-in"
+            "event,state,record,blob-v7-stream,event-bridge-v6-opt-in"
         );
         assert_eq!(contact_reconciliation_classes(1), "event,state,record");
         assert_eq!(contact_reconciliation_classes(4), "event,state,record");
-        assert_eq!(contact_reconciliation_classes(5), "event,state,record,blob");
+        assert_eq!(contact_reconciliation_classes(5), "event,state,record");
         assert_eq!(
             contact_reconciliation_classes(6),
+            "event,state,record,event-bridge-opt-in"
+        );
+        assert_eq!(
+            contact_reconciliation_classes(7),
             "event,state,record,blob,event-bridge-opt-in"
         );
         assert!(!mutable_classes_for_semantic(1).contains(&MutableClass::Blob));
@@ -32924,7 +32186,6 @@ mod tests {
         assert_eq!(MUTABLE_CONTACT_RESERVE_EXCHANGES, 532);
         assert_eq!(BLOB_RANGE_FETCH_PLAINTEXT_BYTES, 123);
         assert_eq!(BLOB_RANGE_PLAINTEXT_MAX_BYTES, 16_480);
-        assert_eq!(BLOB_RANGE_RESULT_PLAINTEXT_BYTES, 92);
         assert_eq!(BLOB_INTEREST_PLAINTEXT_MAX_BYTES, 76_807);
         assert_eq!(BLOB_INTEREST_EXCHANGE_MAX_BYTES, 153_718);
         assert_eq!(BLOB_CARRIER_LANE_RESERVE_BYTES, 17_127);
@@ -32940,6 +32201,34 @@ mod tests {
         assert_eq!(MUTABLE_V8_BLOB_TRANSFER_EXCHANGE_MAX_BYTES, 1_049_007);
         assert_eq!(MUTABLE_V8_BLOB_FETCH_RESULT_EXCHANGE_BYTES, 250);
         assert_eq!(MUTABLE_V8_CONTACT_RESERVE_BYTES, 32_407_284);
+        for semantic_version in [5, 6] {
+            assert_eq!(
+                mutable_interest_reserve(semantic_version, MutableClass::State)
+                    .expect("v5/v6 full mutable interest reserve"),
+                mutable_interest_reserve(4, MutableClass::State)
+                    .expect("v4 full mutable interest reserve"),
+                "v5/v6 must not reserve the semantic-v7 Blob range stream"
+            );
+            assert_eq!(
+                mutable_minimal_interest_reserve(semantic_version, MutableClass::State)
+                    .expect("v5/v6 minimal mutable interest reserve"),
+                mutable_minimal_interest_reserve(4, MutableClass::State)
+                    .expect("v4 minimal mutable interest reserve"),
+                "v5/v6 deferral must not reserve the semantic-v7 Blob range stream"
+            );
+            for direction in [
+                EventDirection::ToSessionResponder,
+                EventDirection::ToSessionInitiator,
+            ] {
+                assert_eq!(
+                    mutable_future_reserve(semantic_version, MutableClass::State, direction)
+                        .expect("v5/v6 future mutable reserve"),
+                    mutable_future_reserve(4, MutableClass::State, direction)
+                        .expect("v4 future mutable reserve"),
+                    "v5/v6 future lanes must not reserve the semantic-v7 Blob range stream"
+                );
+            }
+        }
         assert_eq!(
             future_blob_carrier_lane_reserve(EventDirection::ToSessionResponder),
             (3, 17_127)
@@ -32951,17 +32240,18 @@ mod tests {
         assert_eq!(
             post_event_reserve(5),
             Some(ContactReserve {
-                items: 7,
-                protected_frames: MUTABLE_V5_CONTACT_RESERVE_EXCHANGES * EXCHANGE_FRAMES,
-                protected_bytes: MUTABLE_V5_CONTACT_RESERVE_BYTES,
+                items: 4,
+                protected_frames: MUTABLE_CONTACT_RESERVE_EXCHANGES * EXCHANGE_FRAMES,
+                protected_bytes: MUTABLE_CONTACT_RESERVE_BYTES,
             })
         );
         assert_eq!(
             post_event_reserve(6),
             Some(ContactReserve {
-                items: 7,
-                protected_frames: MUTABLE_V5_CONTACT_RESERVE_EXCHANGES * EXCHANGE_FRAMES,
-                protected_bytes: MUTABLE_V5_CONTACT_RESERVE_BYTES,
+                items: 6,
+                protected_frames: MUTABLE_CONTACT_RESERVE_EXCHANGES * EXCHANGE_FRAMES
+                    + EVENT_BRIDGE_CONTACT_RESERVE_FRAMES,
+                protected_bytes: MUTABLE_CONTACT_RESERVE_BYTES + EVENT_BRIDGE_CONTACT_RESERVE_BYTES,
             })
         );
         assert_eq!(
@@ -33027,8 +32317,8 @@ mod tests {
                 .expect("v7 Event capacity");
         assert_eq!(v3_full_event_capacity, MAX_CONTACT_ITEMS);
         assert_eq!(v4_event_capacity, MAX_CONTACT_ITEMS - 4);
-        assert_eq!(v5_event_capacity, MAX_CONTACT_ITEMS - 7);
-        assert_eq!(v6_event_capacity, v5_event_capacity);
+        assert_eq!(v5_event_capacity, MAX_CONTACT_ITEMS - 4);
+        assert_eq!(v6_event_capacity, MAX_CONTACT_ITEMS - 6);
         assert_eq!(v7_event_capacity, MAX_CONTACT_ITEMS - 9);
         assert_eq!(
             event_bridge_route_send_limit(MIN_EVENT_BRIDGE_SEMANTIC_VERSION),
@@ -36534,10 +35824,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn profile_offer_server_preserves_application_error_over_carrier_wrapper() {
-        // Mutation caught: applying `?` to the carrier result before returning
-        // the captured mission error masks malformed/authentication failures as
-        // a generic carrier transport error.
+    async fn blob_stream_rejects_authenticated_legacy_offer_before_inventory() {
         let mut issued = issue_missions(2);
         let client_mission = issued.remove(0);
         let server_mission = issued.remove(0);
@@ -36574,9 +35861,14 @@ mod tests {
                 .expect("server handshake");
                 let mut receipt = authenticated_receipt(&connection, &mission, handshake)
                     .expect("server receipt");
-                serve_transfer_profiles(&connection, &mut mission, &mut receipt)
+                let _error = serve_transfer_profiles(&connection, &mut mission, &mut receipt)
                     .await
-                    .expect_err("malformed protected profile offer must fail closed")
+                    .expect_err("legacy Blob offer must fail");
+                assert_eq!(
+                    receipt.offered + receipt.fetched + receipt.blob_ranges_fetched,
+                    0
+                );
+                connection.close();
             }
         });
 
@@ -36587,7 +35879,7 @@ mod tests {
             })
             .await
             .expect("connect carrier");
-        let (mut mission, _) = initiate_over_iroh_metered(
+        let (mut mission, handshake) = initiate_over_iroh_metered(
             &connection,
             client_mission
                 .credentials
@@ -36597,22 +35889,39 @@ mod tests {
         )
         .await
         .expect("client handshake");
-        let malformed = mission
-            .seal_application_frame(b"not a canonical transfer-profile offer")
-            .expect("seal malformed protected profile offer");
-        assert!(
-            connection.request(&malformed).await.is_err(),
-            "the malformed exchange must remain fail-closed on the requester"
+        let mut receipt =
+            authenticated_receipt(&connection, &mission, handshake).expect("client receipt");
+        assert_eq!(receipt.protected_frames, 0);
+        // Historical offer is readable, but cannot select a Blob data path.
+        let legacy = TransferProfileOfferV1::decode(&[
+            1, 5, 0, 5, 1, 0, 1, 0, 4, 1, 0, 1, 0, 3, 1, 0, 1, 0, 2, 1, 0, 1, 0, 1, 1, 0, 1,
+        ])
+        .unwrap();
+        if let Ok(response) = request_mission_frame(
+            &connection,
+            &mut mission,
+            Frame::TransferProfileOffer(legacy.clone()),
+            &mut receipt,
+        )
+        .await
+        {
+            let Frame::TransferProfileOffer(peer) = response else {
+                panic!("profile exchange returned another grammar");
+            };
+            assert!(
+                negotiate_transfer_profiles_for_semantic_version(
+                    SEMANTIC_PROTOCOL_V7,
+                    &legacy,
+                    &peer,
+                )
+                .is_err()
+            );
+        }
+        server_task.await.unwrap();
+        assert_eq!(
+            receipt.offered + receipt.fetched + receipt.blob_ranges_fetched,
+            0
         );
-        let error = server_task.await.expect("server task");
-        assert!(
-            matches!(
-                error,
-                NodeError::Mission(MissionSessionError::Authentication(_))
-            ),
-            "the specific mission authentication error must survive the carrier rejection: {error}"
-        );
-
         client.close().await;
         server.close().await;
     }
@@ -36812,18 +36121,6 @@ mod tests {
             0,
             u32::try_from(range).expect("range fits u32")
         ));
-
-        let mut phase = BlobRangeServerPhase::NeverAttempted;
-        assert!(phase.permits_fetch());
-        assert!(phase.permits_finish());
-        phase = BlobRangeServerPhase::PendingResult;
-        assert!(!phase.permits_fetch());
-        assert!(phase.permits_result());
-        assert!(!phase.permits_finish());
-        phase = BlobRangeServerPhase::Settled;
-        assert!(!phase.permits_fetch());
-        assert!(!phase.permits_result());
-        assert!(phase.permits_finish());
     }
 
     #[test]
@@ -38140,6 +37437,7 @@ mod tests {
         let mut receipt = PeerReceipt {
             peer: Some(connection.remote_id()),
             mission_peer: Some(mission.peer().mission_id()),
+            semantic_version: mission.semantic_version(),
             ..PeerReceipt::default()
         };
         let transfer_profiles = sync_transfer_profiles(connection, mission, &mut receipt)
@@ -38484,6 +37782,7 @@ mod tests {
     }
 
     async fn defer_empty_mutable_classes(
+        credentials: &UnprotectedReferenceMission,
         connection: &aster_iroh::Connection,
         mission: &mut MissionSession,
         receipt: &mut PeerReceipt,
@@ -38529,48 +37828,55 @@ mod tests {
                 );
             }
         }
-        if mission.semantic_version() >= MIN_BLOB_NETWORK_SEMANTIC_VERSION {
-            let wire_budget = exchange_wire_budget(receipt).expect("Blob carrier wire budget");
-            let (complete, request_bytes, response_bytes) =
-                respond_mission_frame(connection, mission, wire_budget, |frame, _, _mission| {
-                    match frame {
-                        Frame::BlobCarrierFinish {
-                            direction: EventDirection::ToSessionResponder,
-                            remaining: 0,
-                        } => Ok((
-                            Frame::BlobCarrierFinished {
-                                direction: EventDirection::ToSessionResponder,
-                                remaining: 0,
-                            },
-                            true,
-                        )),
-                        _ => Err(NodeError::Protocol(
-                            "empty responder-bound Blob carrier lane differed".into(),
-                        )),
-                    }
-                })
-                .await
-                .expect("serve empty responder-bound Blob carrier lane");
-            assert!(complete);
-            account(receipt, request_bytes, response_bytes)
-                .expect("account empty responder-bound Blob carrier lane");
-            assert_eq!(
-                request_mission_frame(
-                    connection,
-                    mission,
-                    Frame::BlobCarrierFinish {
-                        direction: EventDirection::ToSessionInitiator,
-                        remaining: 0,
-                    },
-                    receipt,
-                )
-                .await
-                .expect("empty Blob carrier finish"),
-                Frame::BlobCarrierFinished {
-                    direction: EventDirection::ToSessionInitiator,
-                    remaining: 0,
-                }
-            );
+        if mission.semantic_version() >= SEMANTIC_PROTOCOL_V7 {
+            let state = root("empty-blob-stream-client");
+            fs::create_dir_all(&state).unwrap();
+            let store =
+                Store::open_for_mission(state.join(STORE_FILE), credentials.mission_authority_id())
+                    .unwrap();
+            let mut verifier = open_test_sealer(credentials);
+            let guard = EventLaneGuard::capture(
+                Arc::new(RwLock::new(())).read_owned().await,
+                &store,
+                verifier.identity(),
+                mission.peer().mission_id(),
+                0,
+            )
+            .unwrap();
+            let blob_contact_mode = if mission.semantic_version() == SEMANTIC_PROTOCOL_V8 {
+                BlobContactMode::CustodyV1
+            } else {
+                BlobContactMode::DurableOnly
+            };
+            blob_ranges_stream::send(
+                &store,
+                connection,
+                mission,
+                &mut verifier,
+                &guard,
+                blob_contact_mode,
+                EventDirection::ToSessionResponder,
+                &BlobInterest::empty(),
+                receipt,
+            )
+            .await
+            .unwrap();
+            blob_ranges_stream::receive(
+                &store,
+                connection,
+                mission,
+                &mut verifier,
+                &guard,
+                blob_contact_mode,
+                EventDirection::ToSessionInitiator,
+                &BlobInterest::empty(),
+                receipt,
+            )
+            .await
+            .unwrap();
+            drop(guard);
+            drop(store);
+            fs::remove_dir_all(state).unwrap();
         }
     }
 
@@ -49308,6 +48614,188 @@ mod tests {
         }
     }
 
+    include!("runtime/blob_ranges_stream_lanes_tests.rs");
+    include!("runtime/blob_ranges_stream_boundary_tests.rs");
+    include!("runtime/blob_ranges_stream_live_tests.rs");
+
+    #[tokio::test]
+    async fn blob_ranges_stream_completes_multiple_ranges_in_one_contact() {
+        blob_ranges_stream_completion_case(None).await;
+    }
+
+    #[tokio::test]
+    async fn blob_ranges_stream_interrupted_after_first_append_reopens_missing_only() {
+        blob_ranges_stream_completion_case(Some(false)).await;
+    }
+
+    #[tokio::test]
+    async fn blob_ranges_stream_interrupted_before_first_append_reopens_missing_only() {
+        blob_ranges_stream_completion_case(Some(true)).await;
+    }
+
+    async fn blob_ranges_stream_completion_case(interrupt: Option<bool>) {
+        let mut missions = issue_missions(2);
+        let a = missions.pop().unwrap();
+        let b = missions.pop().unwrap();
+        let authority = a.credentials.mission_authority_id();
+        let topic = Topic::new("opaque").unwrap();
+        let scope = Scope::new("test/runtime-contact").unwrap();
+        let interests = || {
+            MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
+                topic.clone(),
+                scope.clone(),
+                false,
+            )])
+        };
+        let a_root = root(&format!("blob-stream-source-{interrupt:?}"));
+        let b_root = root(&format!("blob-stream-receiver-{interrupt:?}"));
+        fs::create_dir_all(&a_root).unwrap();
+        fs::create_dir_all(&b_root).unwrap();
+        let a_store =
+            Arc::new(Store::open_for_mission(a_root.join(STORE_FILE), authority).unwrap());
+        let mut b_store =
+            Arc::new(Store::open_for_mission(b_root.join(STORE_FILE), authority).unwrap());
+        let plaintext = vec![0x5a; 96 * 1024];
+        let source = publish_test_blob(
+            &a_store,
+            &mut open_test_sealer(&a.credentials),
+            &topic,
+            &scope,
+            1,
+            &plaintext,
+        );
+        let mut committed_prefix = 0;
+        if let Some(before_append) = interrupt {
+            let fault = blob_ranges_stream_test::install(&a_store, &b_store, before_append);
+            let transfer = tokio::spawn({
+                let a_store = a_store.clone();
+                let b_store = b_store.clone();
+                let a_mission = a.credentials.clone();
+                let b_mission = b.credentials.clone();
+                let interests = interests();
+                async move {
+                    blob_contact_test_pair(
+                        a_store,
+                        a_mission,
+                        interests.clone(),
+                        b_store,
+                        b_mission,
+                        interests,
+                    )
+                    .await
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(10), async {
+                fault.sender_paused.notified().await;
+                fault.receiver_paused.notified().await;
+            })
+            .await
+            .expect("both endpoints paused with first range in flight and no terminal");
+            let pending = b_store.pending_blob_source(source).unwrap().unwrap();
+            let status = pending.carriers.iter().find_map(|carrier| {
+                b_store
+                    .blob_carrier_prefix_status(source, carrier.object)
+                    .unwrap()
+            });
+            committed_prefix = status.map_or(0, |status| status.prefix_len());
+            assert_eq!(
+                committed_prefix,
+                if before_append {
+                    0
+                } else {
+                    MAX_BLOB_NETWORK_RANGE_BYTES as u64
+                }
+            );
+            assert!(b_store.get_blob(source).unwrap().is_none());
+            fault.release_sender.notify_one();
+            fault.release_receiver.notify_one();
+            assert!(
+                transfer.await.is_err(),
+                "in-flight contact must fail, not settle"
+            );
+            blob_ranges_stream_test::remove(&a_store);
+            blob_ranges_stream_test::remove(&b_store);
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while Arc::strong_count(&b_store) != 1 || Arc::strong_count(&a_store) != 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("failed contact releases both Store handles");
+            drop(b_store);
+            b_store =
+                Arc::new(Store::open_for_mission(b_root.join(STORE_FILE), authority).unwrap());
+            let pending = b_store.pending_blob_source(source).unwrap().unwrap();
+            let prefix: u64 = pending
+                .carriers
+                .iter()
+                .filter_map(|carrier| {
+                    b_store
+                        .blob_carrier_prefix_status(source, carrier.object)
+                        .unwrap()
+                })
+                .map(|status| status.prefix_len())
+                .sum();
+            assert_eq!(prefix, committed_prefix);
+        }
+        let (received, _, _, _) = blob_contact_test_pair(
+            a_store.clone(),
+            a.credentials.clone(),
+            interests(),
+            b_store.clone(),
+            b.credentials.clone(),
+            interests(),
+        )
+        .await;
+        assert!(received.blob_ranges_fetched > 1, "{received:?}");
+        if interrupt.is_some() {
+            assert_eq!(received.fetched, 0, "resume reuses authenticated source");
+        }
+        let plan =
+            completed_test_blob_plan(&a_store, &mut open_test_sealer(&a.credentials), source);
+        let encrypted_total: u64 = plan
+            .carrier_ids()
+            .map(|object| plan.carrier_total_len(&object.wire_bytes()).unwrap())
+            .sum();
+        assert_eq!(
+            received.blob_bytes_fetched as u64,
+            encrypted_total - committed_prefix
+        );
+        assert_eq!(
+            received.duplicates, 0,
+            "resume requests only missing ciphertext"
+        );
+        assert_eq!(b_store.blob_inventory().unwrap(), vec![source]);
+        let stored = b_store.get_blob(source).unwrap().unwrap();
+        let mut sealer = open_test_sealer(&b.credentials);
+        let route = sealer.verify_blob(&stored.sealed).unwrap();
+        let BlobContentVerification::ContentVerified {
+            blob,
+            manifest_bytes,
+        } = sealer.verify_blob_content(route, &stored.sealed).unwrap()
+        else {
+            panic!("content grant")
+        };
+        let mut service = sealer
+            .blob_service_with_store(&scope, &topic, 1, b_store.blob_depot().unwrap())
+            .unwrap();
+        service
+            .install_verified_manifest(&blob, &manifest_bytes)
+            .unwrap();
+        let mut actual = Vec::new();
+        service
+            .reader_for_verified(&blob)
+            .unwrap()
+            .stream_into(&mut actual)
+            .unwrap();
+        assert_eq!(actual, plaintext);
+        drop(service);
+        drop(a_store);
+        drop(b_store);
+        fs::remove_dir_all(a_root).unwrap();
+        fs::remove_dir_all(b_root).unwrap();
+    }
+
     async fn blob_contact_test_pair(
         server_store: Arc<Store>,
         server_mission: UnprotectedReferenceMission,
@@ -49935,7 +49423,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_blob_modes_suppress_finite_while_v8_custody_enables_verified_transfer() {
+    fn semantic_blob_profile_three_resolves_to_version_scoped_contact_mode() {
         // Mutation caught: deriving finite eligibility from semantic-v8 alone,
         // or continuing Slice-5A suppression after authenticated profile-3
         // negotiation, would expose or starve the wrong source set.
@@ -49967,11 +49455,15 @@ mod tests {
                 .expect("v7 Blob mode"),
             BlobContactMode::DurableOnly
         );
-        let v8_legacy = negotiated(SEMANTIC_PROTOCOL_V8, TransferProfileOfferV1::legacy_only());
-        assert_eq!(
-            BlobContactMode::from_authenticated_profiles(SEMANTIC_PROTOCOL_V8, Some(&v8_legacy),)
-                .expect("v8 Legacy Blob mode"),
-            BlobContactMode::DurableOnly
+        assert!(
+            negotiate_transfer_profiles_for_semantic_version(
+                SEMANTIC_PROTOCOL_V8,
+                &TransferProfileOfferV1::for_semantic_version(SEMANTIC_PROTOCOL_V8)
+                    .expect("v8 transfer offer"),
+                &TransferProfileOfferV1::legacy_only(),
+            )
+            .is_err(),
+            "semantic v8 must not fall back to the removed Blob carrier"
         );
         let v8_custody = negotiated(
             SEMANTIC_PROTOCOL_V8,
@@ -49980,7 +49472,7 @@ mod tests {
         );
         let custody_mode =
             BlobContactMode::from_authenticated_profiles(SEMANTIC_PROTOCOL_V8, Some(&v8_custody))
-                .expect("v8 custody-capable Blob mode");
+                .expect("v8 custody-capable stream mode");
         assert_eq!(custody_mode, BlobContactMode::CustodyV1);
         assert!(custody_mode.finite_transfer_enabled());
         assert!(matches!(
@@ -50057,7 +49549,7 @@ mod tests {
                     tick_ms: 0,
                 },
                 SEMANTIC_PROTOCOL_V8 + 1,
-                TransferProfileId::BlobCustodyV1 as u16,
+                TransferProfileId::BlobRangesStreamV1 as u16,
             )
             .expect("stage unsupported received provenance");
         let all_visible = target
@@ -50187,10 +49679,10 @@ mod tests {
         fs::remove_dir_all(state).expect("finite startup cleanup");
     }
 
-    async fn assert_legacy_blob_contact_omits_finite_and_progresses_durable(semantic_version: u16) {
-        // Mutation caught: building reconciliation inventory from all visible
-        // Blob sources would disclose finite identifiers to a LegacyV6 peer
-        // and could consume bounded work before the durable source progresses.
+    async fn assert_v5_v6_contact_leaves_blob_state_unchanged(semantic_version: u16) {
+        // Mutation caught: retaining the removed one-range Blob source/carrier
+        // lane for v5/v6 would stage a source or advance a Blob cursor before
+        // the unsupported carrier is rejected.
         let services = control_test_services([0xe3; 32]);
         let authority = services.member.mission_authority_id();
         assert_eq!(services.other.mission_authority_id(), authority);
@@ -50239,35 +49731,168 @@ mod tests {
             1,
             b"durable must progress despite omitted finite Blob",
         );
+        let ineligible = publish_test_blob(
+            &source_store,
+            &mut source_sealer,
+            &topic,
+            &scope,
+            1,
+            &[0xe4; 96 * 1024],
+        );
+        let ineligible_sealed = source_store
+            .get_blob(ineligible)
+            .expect("legacy ineligible source lookup")
+            .expect("legacy ineligible source")
+            .sealed;
+        let mut receiver_verifier = open_test_sealer(&services.other);
+        let receiver_cache = Arc::new(
+            AuthenticatedEventRouteCache::empty_for_store(&receiver_verifier, &receiver_store)
+                .expect("legacy ineligible receiver cache"),
+        );
+        stage_test_pending_blob(
+            &receiver_store,
+            &receiver_cache,
+            &services.other,
+            ineligible,
+            &ineligible_sealed,
+        );
+        let ineligible_plan =
+            completed_test_blob_plan(&source_store, &mut source_sealer, ineligible);
+        let ineligible_carrier = {
+            let mut depot = source_store
+                .blob_depot()
+                .expect("legacy ineligible source depot");
+            aster_mesh::BlobStore::begin_blob_with_lineage(
+                &mut depot,
+                ineligible_plan.manifest(),
+                ineligible_plan.physical_lineage(),
+            )
+            .expect("activate legacy ineligible carrier plan");
+            ineligible_plan
+                .build_carrier(&mut depot, 0)
+                .expect("build legacy ineligible carrier")
+        };
+        let ineligible_object =
+            BlobCarrierObjectId::new(ineligible_carrier.object_id().wire_bytes())
+                .expect("legacy ineligible carrier object");
+        let ineligible_total = u64::try_from(ineligible_carrier.bytes().len())
+            .expect("legacy ineligible carrier length");
+        let ineligible_prefix_len = ineligible_carrier
+            .bytes()
+            .len()
+            .min(MAX_BLOB_NETWORK_RANGE_BYTES);
+        assert!(ineligible_prefix_len < ineligible_carrier.bytes().len());
+        let receiver_policy = receiver_store
+            .control_policy_snapshot()
+            .expect("legacy ineligible receiver policy");
+        receiver_store
+            .append_blob_carrier_prefix_with_policy(
+                &receiver_policy,
+                ineligible,
+                ineligible_object,
+                ineligible_total,
+                0,
+                &ineligible_carrier.bytes()[..ineligible_prefix_len],
+            )
+            .expect("append legacy ineligible pending prefix");
+        let pending_before = receiver_store
+            .pending_blob_source(ineligible)
+            .expect("legacy ineligible pending source before contact")
+            .expect("legacy ineligible pending row");
+        let prefix_before = receiver_store
+            .blob_carrier_prefix_status(ineligible, ineligible_object)
+            .expect("legacy ineligible prefix before contact")
+            .expect("legacy ineligible prefix row");
+
+        let recipients = vec![
+            ScopeRekeyRecipient::member(
+                services.authority.identity(),
+                vec![services.topic.clone()],
+            )
+            .expect("legacy authority rekey recipient"),
+            ScopeRekeyRecipient::member(services.member.identity(), vec![services.topic.clone()])
+                .expect("legacy source rekey recipient"),
+            ScopeRekeyRecipient::member(services.other.identity(), vec![services.topic.clone()])
+                .expect("legacy receiver rekey recipient"),
+        ];
+        let mut authority = open_test_sealer(&services.authority);
+        let (rekey, _) = authority
+            .seal_chained_scope_rekey_control_from_registry(
+                &services.registry,
+                0,
+                services.scope.clone(),
+                1,
+                recipients,
+                1,
+                None,
+            )
+            .expect("seal legacy same-epoch rekey");
+        let rekey_id = ControlTransferId::new(
+            authority
+                .verify_control(&rekey)
+                .expect("verify legacy same-epoch rekey")
+                .envelope_id(),
+        );
+        for (store, verifier, peer) in [
+            (
+                source_store.as_ref(),
+                &mut source_sealer,
+                services.authority.identity(),
+            ),
+            (
+                receiver_store.as_ref(),
+                &mut receiver_verifier,
+                services.authority.identity(),
+            ),
+        ] {
+            assert_eq!(
+                accept_received_control(store, verifier, peer, rekey_id, &rekey)
+                    .expect("activate legacy same-epoch rekey")
+                    .activated,
+                1
+            );
+        }
+        let source_cache = test_event_route_cache(&source_store, &services.member);
         source_store
             .blob_source_projection(finite)
             .expect("finite source projection")
             .expect("finite source exists");
-        let source_publications_before = source_store
+        let source_stats_before = source_store
             .blob_stats()
-            .expect("legacy source stats before contact")
-            .publications;
+            .expect("legacy source stats before contact");
+        let receiver_stats_before = receiver_store
+            .blob_stats()
+            .expect("legacy receiver stats before contact");
+        assert_eq!(
+            source_store
+                .blob_carrier_fetch_cursor(services.other.identity())
+                .expect("source cursor before contact"),
+            None
+        );
+        assert_eq!(
+            receiver_store
+                .blob_carrier_fetch_cursor(services.member.identity())
+                .expect("receiver cursor before contact"),
+            None
+        );
 
         let (receiver_receipt, source_receipt) = with_test_semantic_version(
             semantic_version,
-            with_test_transfer_profile_offer(
-                TransferProfileOfferV1::legacy_only(),
-                Box::pin(blob_contact_test_pair_with_caches(
-                    source_store.clone(),
-                    services.member.clone(),
-                    interests(),
-                    test_event_route_cache(&source_store, &services.member),
-                    receiver_store.clone(),
-                    services.other.clone(),
-                    interests(),
-                    test_event_route_cache(&receiver_store, &services.other),
-                    None,
-                    None,
-                    None,
-                    None,
-                    0,
-                )),
-            ),
+            Box::pin(blob_contact_test_pair_with_caches(
+                source_store.clone(),
+                services.member.clone(),
+                interests(),
+                source_cache,
+                receiver_store.clone(),
+                services.other.clone(),
+                interests(),
+                receiver_cache,
+                None,
+                None,
+                None,
+                None,
+                0,
+            )),
         )
         .await;
 
@@ -50283,16 +49908,50 @@ mod tests {
             receiver_store
                 .blob_source_projection(durable)
                 .expect("legacy durable receiver projection")
-                .is_some(),
-            "omitted finite work must not starve durable Blob progress: receiver={receiver_receipt:?}, source={source_receipt:?}"
+                .is_none(),
+            "removed v5/v6 carrier must not stage durable Blob state: receiver={receiver_receipt:?}, source={source_receipt:?}"
         );
         assert_eq!(
             source_store
                 .blob_stats()
-                .expect("legacy source stats after contact")
-                .publications,
-            source_publications_before,
-            "legacy omission must not retire finite source authority"
+                .expect("source stats after contact"),
+            source_stats_before,
+            "unsupported carrier must not mutate source Blob state"
+        );
+        assert_eq!(
+            receiver_store
+                .blob_stats()
+                .expect("receiver stats after contact"),
+            receiver_stats_before,
+            "unsupported carrier must not mutate receiver Blob state"
+        );
+        assert_eq!(
+            receiver_store
+                .pending_blob_source(ineligible)
+                .expect("legacy ineligible pending source after contact")
+                .expect("legacy ineligible pending row retained"),
+            pending_before,
+            "v5/v6 contact must not clean an ineligible pending Blob row"
+        );
+        assert_eq!(
+            receiver_store
+                .blob_carrier_prefix_status(ineligible, ineligible_object)
+                .expect("legacy ineligible prefix after contact")
+                .expect("legacy ineligible prefix retained"),
+            prefix_before,
+            "v5/v6 contact must not remove or rewrite an ineligible Blob prefix"
+        );
+        assert_eq!(
+            source_store
+                .blob_carrier_fetch_cursor(services.other.identity())
+                .expect("source cursor after contact"),
+            None
+        );
+        assert_eq!(
+            receiver_store
+                .blob_carrier_fetch_cursor(services.member.identity())
+                .expect("receiver cursor after contact"),
+            None
         );
 
         drop(source_store);
@@ -50355,12 +50014,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_blob_contact_v5_through_v8_omits_finite_and_progresses_durable() {
-        // Mutation caught: mode-only unit classification can pass while real
-        // handshake negotiation, transport threading, or version-specific
-        // reconciliation still exposes finite work or stalls durable work.
-        for semantic_version in 5..=SEMANTIC_PROTOCOL_V8 {
-            assert_legacy_blob_contact_omits_finite_and_progresses_durable(semantic_version).await;
+    async fn legacy_blob_carrier_v5_v6_leaves_blob_state_and_cursors_unchanged() {
+        for semantic_version in 5..=6 {
+            assert_v5_v6_contact_leaves_blob_state_unchanged(semantic_version).await;
         }
     }
 
@@ -50520,13 +50176,10 @@ mod tests {
                 contact.0,
                 contact.1,
             );
-            assert!(
-                receiver_store
-                    .pending_blob_source(finite)
-                    .expect("custody receiver pending projection")
-                    .is_some(),
-                "one bounded range must leave this multi-range source pending"
-            );
+            let pending_after_first_contact = receiver_store
+                .pending_blob_source(finite)
+                .expect("custody receiver pending projection")
+                .is_some();
             let (receiver_receipt, source_receipt) = if source_is_server {
                 (&contact.0, &contact.1)
             } else {
@@ -50534,11 +50187,15 @@ mod tests {
             };
             assert_eq!(receiver_receipt.inserted, 1);
             assert_eq!(receiver_receipt.duplicates, 0);
-            assert_eq!(receiver_receipt.blob_ranges_fetched, 1);
+            assert!(receiver_receipt.blob_ranges_fetched > 0);
+            assert!(
+                receiver_receipt.blob_ranges_fetched <= blob_ranges_stream::MAX_RANGES,
+                "one contact must stay inside the authenticated multi-range bound"
+            );
             assert!(receiver_receipt.blob_bytes_fetched > 0);
             assert_eq!(
                 source_receipt.offered, 2,
-                "the source offers one authenticated source and serves one carrier range"
+                "the source offers one authenticated source and serves one multi-range carrier turn"
             );
             let source_peer = services.other.identity();
             let receiver_peer = services.member.identity();
@@ -50597,8 +50254,12 @@ mod tests {
             ))
             .await;
             assert!(
-                fetched_ranges > 1,
-                "finite custody carrier must use multiple bounded ranges"
+                if pending_after_first_contact {
+                    fetched_ranges > receiver_receipt.blob_ranges_fetched
+                } else {
+                    fetched_ranges == receiver_receipt.blob_ranges_fetched
+                },
+                "convergence must continue only when bounded first-contact work remains"
             );
             assert!(
                 receiver_store
@@ -50795,6 +50456,14 @@ mod tests {
                 )])
             };
 
+            let initial_fault = blob_ranges_stream_test::install_boundary(
+                &source_store,
+                &receiver_store,
+                false,
+                blob_ranges_stream_test::Boundary::AppendCapacity,
+            );
+            initial_fault.release_sender.notify_one();
+            initial_fault.release_receiver.notify_one();
             let (first_receiver, _, _, _) = blob_contact_test_pair(
                 source_store.clone(),
                 services.member.clone(),
@@ -50804,9 +50473,12 @@ mod tests {
                 interests(),
             )
             .await;
-            assert_eq!(
-                first_receiver.blob_ranges_fetched, 1,
-                "{label}: first range"
+            assert!(initial_fault.fired.load(Ordering::Acquire));
+            blob_ranges_stream_test::remove(&source_store);
+            blob_ranges_stream_test::remove(&receiver_store);
+            assert!(
+                (1..=blob_ranges_stream::MAX_RANGES).contains(&first_receiver.blob_ranges_fetched),
+                "{label}: bounded first multi-range turn"
             );
             assert!(
                 receiver_store
@@ -50844,6 +50516,14 @@ mod tests {
                         completion_boundary_ready = true;
                         break;
                     }
+                    let setup_fault = blob_ranges_stream_test::install_boundary(
+                        &source_store,
+                        &receiver_store,
+                        false,
+                        blob_ranges_stream_test::Boundary::AppendCapacity,
+                    );
+                    setup_fault.release_sender.notify_one();
+                    setup_fault.release_receiver.notify_one();
                     let prepared = blob_contact_test_pair(
                         source_store.clone(),
                         services.member.clone(),
@@ -50853,7 +50533,14 @@ mod tests {
                         interests(),
                     )
                     .await;
-                    assert_eq!(prepared.0.blob_ranges_fetched, 1, "{label}: setup range");
+                    assert!(setup_fault.fired.load(Ordering::Acquire));
+                    blob_ranges_stream_test::remove(&source_store);
+                    blob_ranges_stream_test::remove(&receiver_store);
+                    assert!(
+                        (1..=blob_ranges_stream::MAX_RANGES)
+                            .contains(&prepared.0.blob_ranges_fetched),
+                        "{label}: bounded setup multi-range turn"
+                    );
                 }
                 assert!(
                     completion_boundary_ready,
@@ -50991,12 +50678,12 @@ mod tests {
                 receiver_cache.has_blob_claim_for_test(transfer),
                 "{label}: retained pending authority must keep its cache claim"
             );
+            let carrier_cursor_after = receiver_store
+                .blob_carrier_fetch_cursor(services.member.identity())
+                .expect("lifetime carrier cursor after fault");
             assert_eq!(
-                receiver_store
-                    .blob_carrier_fetch_cursor(services.member.identity())
-                    .expect("lifetime carrier cursor after fault"),
-                carrier_cursor_before,
-                "{label}: failed unit must not advance the carrier/source cursor"
+                carrier_cursor_after, carrier_cursor_before,
+                "{label}: the bounded fault fixture remains on its exact carrier object"
             );
             let fault_digest = fault_state
                 .logical_digest_after_fault()
@@ -51010,7 +50697,7 @@ mod tests {
                 assert_eq!(
                     receiver_store.test_blob_logical_digest(),
                     receiver_digest_before,
-                    "{label}: unavailable range must not mutate requester state"
+                    "{label}: unavailable multi-range data must not mutate requester state"
                 );
                 assert!(
                     receiver_store
@@ -51022,8 +50709,8 @@ mod tests {
                     fault_state
                         .result_frames_after_fault
                         .load(Ordering::Acquire),
-                    1,
-                    "{label}: service emits only the ordinary unavailable response"
+                    0,
+                    "{label}: multi-range unavailability emits no removed result/ACK frame"
                 );
             } else {
                 assert_eq!(
@@ -51222,6 +50909,14 @@ mod tests {
                     | Window::CompletedCacheRepairFinalComparison
             );
             if completed_source_window {
+                let initial_fault = blob_ranges_stream_test::install_boundary(
+                    &source_store,
+                    &receiver_store,
+                    false,
+                    blob_ranges_stream_test::Boundary::AppendCapacity,
+                );
+                initial_fault.release_sender.notify_one();
+                initial_fault.release_receiver.notify_one();
                 let (first_receiver, _, _, _) = blob_contact_test_pair(
                     source_store.clone(),
                     services.member.clone(),
@@ -51231,9 +50926,13 @@ mod tests {
                     interests(),
                 )
                 .await;
-                assert_eq!(
-                    first_receiver.blob_ranges_fetched, 1,
-                    "{label}: first range"
+                assert!(initial_fault.fired.load(Ordering::Acquire));
+                blob_ranges_stream_test::remove(&source_store);
+                blob_ranges_stream_test::remove(&receiver_store);
+                assert!(
+                    (1..=blob_ranges_stream::MAX_RANGES)
+                        .contains(&first_receiver.blob_ranges_fetched),
+                    "{label}: bounded first multi-range turn"
                 );
                 let fetched = Box::pin(complete_v8_finite_blob_carrier(
                     true,
@@ -51263,6 +50962,14 @@ mod tests {
                 window,
                 Window::OutboundLoad | Window::PostStage | Window::FinalComparison
             ) {
+                let initial_fault = blob_ranges_stream_test::install_boundary(
+                    &source_store,
+                    &receiver_store,
+                    false,
+                    blob_ranges_stream_test::Boundary::AppendCapacity,
+                );
+                initial_fault.release_sender.notify_one();
+                initial_fault.release_receiver.notify_one();
                 let (first_receiver, _, _, _) = blob_contact_test_pair(
                     source_store.clone(),
                     services.member.clone(),
@@ -51272,9 +50979,13 @@ mod tests {
                     interests(),
                 )
                 .await;
-                assert_eq!(
-                    first_receiver.blob_ranges_fetched, 1,
-                    "{label}: first range"
+                assert!(initial_fault.fired.load(Ordering::Acquire));
+                blob_ranges_stream_test::remove(&source_store);
+                blob_ranges_stream_test::remove(&receiver_store);
+                assert!(
+                    (1..=blob_ranges_stream::MAX_RANGES)
+                        .contains(&first_receiver.blob_ranges_fetched),
+                    "{label}: bounded first multi-range turn"
                 );
                 assert!(
                     receiver_store
@@ -51642,8 +51353,8 @@ mod tests {
                         fault_state
                             .result_frames_after_fault
                             .load(Ordering::Acquire),
-                        1,
-                        "{label}: service emits only ordinary Unavailable"
+                        0,
+                        "{label}: multi-range unavailability emits no removed result/ACK frame"
                     );
                 }
                 Window::PendingCacheRepair => {
@@ -52427,9 +52138,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v8_legacy_blob_contact_preserves_withheld_finite_pending_and_progresses_durable_carrier()
-     {
-        // Mutation caught: legacy startup cleanup, carrier scheduling, or
+    async fn v7_blob_stream_preserves_withheld_finite_pending_and_progresses_durable_carrier() {
+        // Mutation caught: v7 durable-only cleanup, carrier scheduling, or
         // contact-triggered capacity recovery over all visible sources would
         // resume, rewrite, abort, retire, or promote finite completed/pending
         // state instead of cleanly deferring and later progressing durable work.
@@ -52521,7 +52231,7 @@ mod tests {
                 .expect("stage finite legacy pending source"),
             BlobSourceStageOutcome::Inserted
         );
-        let finite_carrier = {
+        let (finite_carrier, finite_carrier_bytes) = {
             let mut depot = source_store.blob_depot().expect("finite source depot");
             aster_mesh::BlobStore::begin_blob_with_lineage(
                 &mut depot,
@@ -52529,9 +52239,28 @@ mod tests {
                 finite_plan.physical_lineage(),
             )
             .expect("activate finite source carrier plan");
-            finite_plan
-                .build_carrier(&mut depot, 0)
-                .expect("build finite source carrier")
+            let carriers = (0..finite_plan.manifest().chunk_count())
+                .map(|index| {
+                    finite_plan
+                        .build_carrier(&mut depot, index)
+                        .expect("build finite source carrier")
+                })
+                .collect::<Vec<_>>();
+            let total = carriers
+                .iter()
+                .try_fold(0u64, |total, carrier| {
+                    total.checked_add(
+                        u64::try_from(carrier.bytes().len()).expect("finite carrier length"),
+                    )
+                })
+                .expect("finite carrier byte total");
+            (
+                carriers
+                    .into_iter()
+                    .next()
+                    .expect("finite plan has a first carrier"),
+                total,
+            )
         };
         let finite_object = BlobCarrierObjectId::new(finite_carrier.object_id().wire_bytes())
             .expect("finite carrier object");
@@ -52542,6 +52271,9 @@ mod tests {
             .len()
             .min(MAX_BLOB_NETWORK_RANGE_BYTES);
         assert!(finite_prefix_len < finite_carrier.bytes().len());
+        let finite_remaining_before = finite_carrier_bytes
+            .checked_sub(u64::try_from(finite_prefix_len).expect("finite prefix length"))
+            .expect("finite remaining carrier bytes");
         let finite_prefix_before = match receiver_store
             .append_blob_carrier_prefix_with_policy(
                 &receiver_policy,
@@ -52576,10 +52308,14 @@ mod tests {
             Priority::Flash,
             &[0x6d; 96 * 1024],
         );
-        let append_fault = install_test_blob_contact_fault(
-            services.other.identity(),
-            TestBlobContactFault::AppendCapacity,
+        let append_fault = blob_ranges_stream_test::install_boundary(
+            &source_store,
+            &receiver_store,
+            false,
+            blob_ranges_stream_test::Boundary::AppendCapacity,
         );
+        append_fault.release_sender.notify_one();
+        append_fault.release_receiver.notify_one();
         let source_cache = test_event_route_cache(&source_store, &services.member);
         let receiver_cache = test_event_route_cache(&receiver_store, &services.other);
         assert!(receiver_cache.has_blob_claim_for_test(finite));
@@ -52592,8 +52328,8 @@ mod tests {
                 false,
             )])
         };
-        let (receiver_receipt, _) = with_test_transfer_profile_offer(
-            TransferProfileOfferV1::legacy_only(),
+        let (receiver_receipt, _) = with_test_semantic_version(
+            SEMANTIC_PROTOCOL_V7,
             Box::pin(blob_contact_test_pair_with_caches(
                 source_store.clone(),
                 services.member.clone(),
@@ -52613,6 +52349,8 @@ mod tests {
         .await;
 
         assert!(append_fault.fired.load(Ordering::Acquire));
+        blob_ranges_stream_test::remove(&source_store);
+        blob_ranges_stream_test::remove(&receiver_store);
         assert!(receiver_cache.has_blob_claim_for_test(finite));
         assert!(receiver_cache.has_blob_claim_for_test(finite_completed));
         assert_eq!(
@@ -52629,7 +52367,7 @@ mod tests {
                 .expect("finite pending prefix after legacy contact")
                 .expect("finite pending prefix retained after legacy contact"),
             finite_prefix_before,
-            "legacy carrier service must not resume or rewrite withheld finite prefix progress"
+            "v7 durable-only service must not resume or rewrite withheld finite prefix progress"
         );
         assert_eq!(
             receiver_store
@@ -52644,8 +52382,8 @@ mod tests {
             "finite-only pressure recovery must cleanly defer the durable append"
         );
 
-        let (receiver_receipt, _) = with_test_transfer_profile_offer(
-            TransferProfileOfferV1::legacy_only(),
+        let (receiver_receipt, _) = with_test_semantic_version(
+            SEMANTIC_PROTOCOL_V7,
             Box::pin(blob_contact_test_pair_with_caches(
                 source_store.clone(),
                 services.member.clone(),
@@ -52694,19 +52432,19 @@ mod tests {
         assert!(receiver_receipt.blob_ranges_fetched > 0);
         assert!(receiver_receipt.blob_bytes_fetched > 0);
 
-        // Drain only the durable source while repeatedly negotiating the
-        // legacy profile. The pre-existing finite prefix and its exact
+        // Drain only the durable source over the semantic-v7 stream. The
+        // pre-existing finite prefix and its exact
         // lifecycle fingerprint must remain byte-for-byte stable.
         for _ in 0..16 {
             let retained = receiver_store
                 .blob_source_projection(durable)
-                .expect("durable legacy convergence projection")
-                .expect("durable legacy convergence source");
+                .expect("durable v7 convergence projection")
+                .expect("durable v7 convergence source");
             if matches!(retained.retention, BlobSourceRetention::Completed { .. }) {
                 break;
             }
-            let (receiver_receipt, _, _, _) = with_test_transfer_profile_offer(
-                TransferProfileOfferV1::legacy_only(),
+            let (receiver_receipt, _, _, _) = with_test_semantic_version(
+                SEMANTIC_PROTOCOL_V7,
                 Box::pin(blob_contact_test_pair(
                     source_store.clone(),
                     services.member.clone(),
@@ -52717,19 +52455,22 @@ mod tests {
                 )),
             )
             .await;
-            assert!(receiver_receipt.blob_ranges_fetched <= 1);
+            assert!(
+                receiver_receipt.blob_ranges_fetched <= blob_ranges_stream::MAX_RANGES,
+                "v7 durable-only stream stays inside the authenticated range bound"
+            );
             assert_eq!(
                 receiver_store
                     .blob_source_projection(finite)
-                    .expect("finite pending projection during legacy convergence")
-                    .expect("finite pending retained during legacy convergence"),
+                    .expect("finite pending projection during v7 convergence")
+                    .expect("finite pending retained during v7 convergence"),
                 finite_before
             );
             assert_eq!(
                 receiver_store
                     .blob_carrier_prefix_status(finite, finite_object)
-                    .expect("finite prefix during legacy convergence")
-                    .expect("finite prefix retained during legacy convergence"),
+                    .expect("finite prefix during v7 convergence")
+                    .expect("finite prefix retained during v7 convergence"),
                 finite_prefix_before
             );
         }
@@ -52742,7 +52483,7 @@ mod tests {
             BlobSourceRetention::Completed { .. }
         ));
 
-        // Restart after the legacy contacts, then negotiate authenticated v8
+        // Restart after the v7 contacts, then negotiate authenticated v8
         // custody. Eligibility comes from the durable pending row rather than
         // an in-memory lease or the preceding contact's profile.
         drop(receiver_store);
@@ -52788,13 +52529,13 @@ mod tests {
             resumed
                 .negotiated_transfer_profiles
                 .map(|profiles| profiles[3]),
-            Some(TransferProfileId::BlobCustodyV1 as u16),
+            Some(TransferProfileId::BlobRangesStreamV1 as u16),
             "resume must negotiate the finite-capable Blob profile"
         );
         assert_eq!(resumed.fetched, 0, "resume must not restage the source");
-        assert_eq!(
-            resumed.blob_ranges_fetched, 1,
-            "custody resume receiver={resumed:?} source={resume_source:?}"
+        assert!(
+            (1..=blob_ranges_stream::MAX_RANGES).contains(&resumed.blob_ranges_fetched),
+            "bounded custody resume receiver={resumed:?} source={resume_source:?}"
         );
         assert!(resumed.blob_bytes_fetched > 0);
         match receiver_store
@@ -52808,13 +52549,27 @@ mod tests {
                         .expect("resumed finite range length"),
                 "custody resume must append at the exact durable complement"
             ),
-            None => assert_eq!(
-                finite_total,
-                finite_prefix_before.prefix_len()
-                    + u64::try_from(resumed.blob_bytes_fetched)
-                        .expect("committed resumed finite range length"),
-                "a completed first carrier must consume exactly its remaining complement"
-            ),
+            None => {
+                let fetched = u64::try_from(resumed.blob_bytes_fetched)
+                    .expect("committed resumed finite range length");
+                let first_remaining = finite_total
+                    .checked_sub(finite_prefix_before.prefix_len())
+                    .expect("first finite carrier remaining bytes");
+                assert!(
+                    (first_remaining..=finite_remaining_before).contains(&fetched),
+                    "a multi-range resume must consume the first exact complement without exceeding all remaining carriers"
+                );
+                if receiver_store
+                    .pending_blob_source(finite)
+                    .expect("finite pending state after multi-range resume")
+                    .is_none()
+                {
+                    assert_eq!(
+                        fetched, finite_remaining_before,
+                        "promotion requires every remaining carrier byte"
+                    );
+                }
+            }
         }
 
         for _ in 0..16 {
@@ -52893,6 +52648,14 @@ mod tests {
         // First make the completed source the session initiator. Its mutable
         // offer stages B as the responder, which must then fetch one range in
         // the responder-bound carrier lane during this same contact.
+        let fault = blob_ranges_stream_test::install_boundary(
+            &a_store,
+            &b_store,
+            false,
+            blob_ranges_stream_test::Boundary::AppendCapacity,
+        );
+        fault.release_sender.notify_one();
+        fault.release_receiver.notify_one();
         let (source_client, b_server, _, _) = blob_contact_test_pair(
             b_store.clone(),
             b.credentials.clone(),
@@ -52902,6 +52665,9 @@ mod tests {
             interests(),
         )
         .await;
+        assert!(fault.fired.load(Ordering::Acquire));
+        blob_ranges_stream_test::remove(&a_store);
+        blob_ranges_stream_test::remove(&b_store);
         assert_eq!(source_client.blob_ranges_fetched, 0);
         assert_eq!(b_server.blob_ranges_fetched, 1);
         assert!(b_server.blob_bytes_fetched > 0);
@@ -52961,6 +52727,14 @@ mod tests {
             1
         );
 
+        let fault = blob_ranges_stream_test::install_boundary(
+            &a_store,
+            &c_store,
+            false,
+            blob_ranges_stream_test::Boundary::AppendCapacity,
+        );
+        fault.release_sender.notify_one();
+        fault.release_receiver.notify_one();
         let (c_first, _, source_cache, _) = blob_contact_test_pair(
             a_store.clone(),
             a.credentials.clone(),
@@ -52970,7 +52744,10 @@ mod tests {
             interests(),
         )
         .await;
-        assert_eq!(source_cache.blob_source_depot_authenticated_opens(), 0);
+        assert!(fault.fired.load(Ordering::Acquire));
+        blob_ranges_stream_test::remove(&a_store);
+        blob_ranges_stream_test::remove(&c_store);
+        assert_eq!(source_cache.blob_source_depot_authenticated_opens(), 1);
         assert_eq!(c_first.fetched, 1, "C fetches the source exactly once");
         assert_eq!(c_first.blob_ranges_fetched, 1);
         assert_eq!(
@@ -53022,39 +52799,19 @@ mod tests {
             c_resume.fetched, 0,
             "different completed peer must not retransmit the staged source"
         );
-        assert_eq!(c_resume.blob_ranges_fetched, 1);
-        let after_resume = c_store
-            .blob_carrier_prefix_status(source, progressed_object)
-            .expect("resumed C prefix status");
-        if let Some(status) = after_resume {
-            assert_eq!(
-                status.prefix_len(),
-                prefix_before_reopen + u64::try_from(c_resume.blob_bytes_fetched).unwrap(),
-                "different peer starts at the exact durable complement"
-            );
-        }
-
-        for _ in 0..16 {
-            if c_store
-                .blob_stats()
-                .expect("C convergence stats")
-                .publications
-                == 1
-            {
-                break;
-            }
-            let (client, _, source_cache, _) = blob_contact_test_pair(
-                b_store.clone(),
-                b.credentials.clone(),
-                interests(),
-                c_store.clone(),
-                c.credentials.clone(),
-                interests(),
-            )
-            .await;
-            assert_eq!(client.fetched, 0, "resumed C never refetches the source");
-            assert_eq!(source_cache.blob_source_depot_authenticated_opens(), 0);
-        }
+        assert!(c_resume.blob_ranges_fetched > 1);
+        assert_eq!(c_resume.duplicates, 0);
+        let plan =
+            completed_test_blob_plan(&b_store, &mut open_test_sealer(&b.credentials), source);
+        let total: u64 = plan
+            .carrier_ids()
+            .map(|object| plan.carrier_total_len(&object.wire_bytes()).unwrap())
+            .sum();
+        assert_eq!(
+            c_resume.blob_bytes_fetched as u64,
+            total - prefix_before_reopen,
+            "different peer fetches exactly the durable complement in one stream"
+        );
         let final_stats = c_store.blob_stats().expect("C final Blob stats");
         assert_eq!(final_stats.publications, 1);
         assert_eq!(final_stats.pending_sources, 0);
@@ -53339,6 +53096,14 @@ mod tests {
                     false,
                 )])
             };
+            let fault = blob_ranges_stream_test::install_boundary(
+                &source_store,
+                &receiver_store,
+                false,
+                blob_ranges_stream_test::Boundary::AppendCapacity,
+            );
+            fault.release_sender.notify_one();
+            fault.release_receiver.notify_one();
             let (partial, _, _, _) = blob_contact_test_pair(
                 source_store.clone(),
                 services.member.clone(),
@@ -53348,6 +53113,9 @@ mod tests {
                 interests(),
             )
             .await;
+            assert!(fault.fired.load(Ordering::Acquire));
+            blob_ranges_stream_test::remove(&source_store);
+            blob_ranges_stream_test::remove(&receiver_store);
             assert_eq!(partial.fetched, 1, "{label} stages one exact source");
             assert_eq!(partial.blob_ranges_fetched, 1);
             let staged = receiver_store
@@ -54003,6 +53771,16 @@ mod tests {
         cache
     }
 
+    fn legacy_event_with_blob_stream_offer() -> TransferProfileOfferV1 {
+        TransferProfileOfferV1::from_lanes(vec![
+            (LaneId::EventBridge, vec![TransferProfileId::LegacyV6]),
+            (LaneId::Blob, vec![TransferProfileId::BlobRangesStreamV1]),
+            (LaneId::Record, vec![TransferProfileId::LegacyV6]),
+            (LaneId::State, vec![TransferProfileId::LegacyV6]),
+            (LaneId::Event, vec![TransferProfileId::LegacyV6]),
+        ])
+    }
+
     async fn with_test_transfer_profile_offer<F>(
         offer: TransferProfileOfferV1,
         future: F,
@@ -54043,7 +53821,253 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn current_stack_near_two_mib_events_each_direction() {
+        // The fixture's hybrid source-authentication envelope is just over 10 KiB.
+        // Reserve 11 KiB (the smallest whole-KiB margin that fits), and check the
+        // actual sealed size before contact rather than changing the wire limit.
+        current_stack_event_regression("near-two-mib", MAX_OBJECT_BYTES - 11 * 1024, 2, false)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn current_stack_exact_64_kib_event_after_fresh_auth_reconnect() {
+        current_stack_event_regression("64-kib-reconnect", 64 * 1024, 1, true).await;
+    }
+
+    async fn current_stack_event_regression(
+        label: &str,
+        payload_size: usize,
+        count: usize,
+        reconnect: bool,
+    ) {
+        let services = control_test_services([0xd7; 32]);
+        let states = [
+            root(&format!("{label}-server")),
+            root(&format!("{label}-client")),
+        ];
+        let missions = [services.member, services.other];
+        let mut stores = Vec::new();
+        let mut endpoints = Vec::new();
+        for (index, state) in states.iter().enumerate() {
+            fs::create_dir_all(state).expect("isolated store parent");
+            let store = Arc::new(
+                Store::open_for_mission(
+                    state.join(STORE_FILE),
+                    missions[index].mission_authority_id(),
+                )
+                .expect("mission store"),
+            );
+            seed_test_event_subscription(
+                &store,
+                EventSubscriptionMode::Consume,
+                &services.topic,
+                &services.scope,
+                b"current-stack-consume",
+            );
+            stores.push(store);
+            endpoints.push(
+                Endpoint::bind(
+                    aster_iroh::SecretKey::generate(),
+                    EndpointConfig::direct("127.0.0.1:0".parse().expect("loopback")),
+                )
+                .await
+                .expect("persistent endpoint"),
+            );
+        }
+        let node = |index: usize| TestForwardingNode {
+            store: stores[index].clone(),
+            mission: missions[index].clone(),
+            policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+            clock: NodeCustodyClock::injected([0xd7 + index as u8; 16], 0, 0),
+            reconciliation_exchanges_before_defer: None,
+            preopen_custody_races: vec![],
+        };
+        let ids = [endpoints[0].id(), endpoints[1].id()];
+        let addresses = [loopback(&endpoints[0]), loopback(&endpoints[1])];
+        if reconnect {
+            let (client, server, _, _) = contact_test_pair_on_endpoints(
+                &endpoints[0],
+                &endpoints[1],
+                missions[1].identity(),
+                node(0),
+                node(1),
+            )
+            .await;
+            assert_eq!(client.expect("first client authentication").fetched, 0);
+            assert_eq!(server.expect("first server authentication").fetched, 0);
+        }
+        let mut publications = Vec::new();
+        for index in 0..2 {
+            let mut sealer = open_test_sealer(&missions[index]);
+            for ordinal in 0..count {
+                let payload = vec![0x40 + (index * count + ordinal) as u8; payload_size];
+                let id = publish_test_epoch_one_event_with_payload(
+                    &stores[index],
+                    &mut sealer,
+                    &services.topic,
+                    &services.scope,
+                    format!("{label}-{index}-{ordinal}").as_bytes(),
+                    &payload,
+                    Priority::Routine,
+                );
+                let sealed_size = stores[index]
+                    .get_event(id)
+                    .expect("published lookup")
+                    .expect("published Event")
+                    .sealed
+                    .len();
+                assert!(
+                    sealed_size <= MAX_OBJECT_BYTES,
+                    "sealed Event {sealed_size} exceeds {MAX_OBJECT_BYTES}"
+                );
+                let overhead = sealed_size
+                    .checked_sub(payload_size)
+                    .expect("envelope overhead");
+                assert!(overhead > 10 * 1024 && overhead <= 11 * 1024);
+                eprintln!("current-stack payload={payload_size} sealed={sealed_size}");
+                publications.push((index, id, payload));
+            }
+        }
+        if reconnect {
+            // The carrier is unchanged, but a fresh mission check must reject the
+            // wrong expected identity before newly published Events can be delivered.
+            let (client, server, client_inserted, server_inserted) =
+                contact_test_pair_on_endpoints(
+                    &endpoints[0],
+                    &endpoints[1],
+                    services.excluded.identity(),
+                    node(0),
+                    node(1),
+                )
+                .await;
+            assert!(client.is_err());
+            assert!(matches!(
+                server,
+                Err(NodeError::Mission(
+                    MissionSessionError::MissionIdentityMismatch { .. }
+                ))
+            ));
+            assert!(!client_inserted.load(Ordering::SeqCst));
+            assert!(!server_inserted.load(Ordering::SeqCst));
+            for (source, id, _) in &publications {
+                assert!(
+                    stores[1 - source]
+                        .get_event(*id)
+                        .expect("denied lookup")
+                        .is_none()
+                );
+            }
+        }
+        let (client, server, client_inserted, server_inserted) = contact_test_pair_on_endpoints(
+            &endpoints[0],
+            &endpoints[1],
+            missions[1].identity(),
+            node(0),
+            node(1),
+        )
+        .await;
+        let client = client.expect("authenticated client transfer");
+        let server = server.expect("authenticated server transfer");
+        assert_eq!(client.fetched, count);
+        assert_eq!(server.fetched, count);
+        assert_eq!(client.offered, count);
+        assert_eq!(server.offered, count);
+        assert!(client_inserted.load(Ordering::SeqCst));
+        assert!(server_inserted.load(Ordering::SeqCst));
+        for (source, id, expected) in &publications {
+            let receiver = 1 - source;
+            let stored = stores[receiver]
+                .get_event(*id)
+                .expect("received lookup")
+                .expect("received Event");
+            let original = stores[*source]
+                .get_event(*id)
+                .expect("source lookup")
+                .expect("source Event");
+            assert_eq!(stored.sealed, original.sealed);
+            let mut verifier = open_test_sealer(&missions[receiver]);
+            let route = verifier
+                .verify_event(&stored.sealed)
+                .expect("source authentication");
+            let EventContentVerification::ContentVerified { payload, .. } = verifier
+                .verify_event_content(route, &stored.sealed)
+                .expect("content authentication")
+            else {
+                panic!("receiver must have a content grant")
+            };
+            assert_eq!(&payload, expected);
+            assert_eq!(payload.len(), payload_size);
+        }
+        assert_eq!([endpoints[0].id(), endpoints[1].id()], ids);
+        assert_eq!(
+            [loopback(&endpoints[0]), loopback(&endpoints[1])],
+            addresses
+        );
+        let (client, server, _, _) = contact_test_pair_on_endpoints(
+            &endpoints[0],
+            &endpoints[1],
+            missions[1].identity(),
+            node(0),
+            node(1),
+        )
+        .await;
+        assert_eq!(client.expect("converged client").fetched, 0);
+        assert_eq!(server.expect("converged server").fetched, 0);
+        for store in &stores {
+            assert_eq!(
+                store.event_count().expect("exact final count"),
+                (2 * count) as u64
+            );
+        }
+        for endpoint in endpoints {
+            endpoint.close().await;
+        }
+        drop(stores);
+        for state in states {
+            fs::remove_dir_all(state).expect("store cleanup");
+        }
+    }
+
     async fn contact_test_pair_with_forwarding_results_tracked(
+        server_node: TestForwardingNode,
+        client_node: TestForwardingNode,
+    ) -> (
+        Result<CompletedPeerContact, NodeError>,
+        Result<CompletedPeerContact, NodeError>,
+        Arc<AtomicBool>,
+        Arc<AtomicBool>,
+    ) {
+        let server = Endpoint::bind(
+            aster_iroh::SecretKey::generate(),
+            EndpointConfig::direct("127.0.0.1:0".parse().expect("server address")),
+        )
+        .await
+        .expect("server endpoint");
+        let client = Endpoint::bind(
+            aster_iroh::SecretKey::generate(),
+            EndpointConfig::direct("127.0.0.1:0".parse().expect("client address")),
+        )
+        .await
+        .expect("client endpoint");
+        let expected_client = client_node.mission.identity();
+        let result = contact_test_pair_on_endpoints(
+            &server,
+            &client,
+            expected_client,
+            server_node,
+            client_node,
+        )
+        .await;
+        client.close().await;
+        server.close().await;
+        result
+    }
+
+    async fn contact_test_pair_on_endpoints(
+        server: &Endpoint,
+        client: &Endpoint,
+        expected_client: NodeId,
         server_node: TestForwardingNode,
         client_node: TestForwardingNode,
     ) -> (
@@ -54072,28 +54096,17 @@ mod tests {
         let client_event_route_cache = test_event_route_cache(&client_store, &client_mission);
         let server_event_inserted = Arc::new(AtomicBool::new(false));
         let client_event_inserted = Arc::new(AtomicBool::new(false));
-        let server = Endpoint::bind(
-            aster_iroh::SecretKey::generate(),
-            EndpointConfig::direct("127.0.0.1:0".parse().expect("server address")),
-        )
-        .await
-        .expect("server endpoint");
-        let client = Endpoint::bind(
-            aster_iroh::SecretKey::generate(),
-            EndpointConfig::direct("127.0.0.1:0".parse().expect("client address")),
-        )
-        .await
-        .expect("client endpoint");
         let server_task = tokio::spawn({
             let server = server.clone();
             let store = server_store;
             let credentials = server_mission.clone();
             let allowed = BTreeSet::from([client.id()]);
-            let peer = MissionPeerBinding::new(client.id(), client_mission.identity());
+            let peer = MissionPeerBinding::new(client.id(), expected_client);
             let event_inserted = server_event_inserted.clone();
             async move {
                 let connection = server.accept(&allowed).await.expect("accept carrier");
-                CONTACT_EVENT_INSERTED
+                let closing_connection = connection.clone();
+                let result = CONTACT_EVENT_INSERTED
                     .scope(
                         event_inserted,
                         with_test_contact_hooks(
@@ -54115,7 +54128,8 @@ mod tests {
                             }),
                         ),
                     )
-                    .await
+                    .await;
+                (result, closing_connection)
             }
         });
         let snapshot = client_policy.snapshot().expect("client policy snapshot");
@@ -54126,14 +54140,14 @@ mod tests {
                     client_defer,
                     client_races,
                     sync_once_with_forwarding(
-                        &client,
+                        client,
                         OutboundContact {
                             store: client_store,
                             mission: client_mission,
                             peer: MissionExpectedPeer {
                                 carrier: ExpectedPeer {
                                     id: server.id(),
-                                    address: loopback(&server),
+                                    address: loopback(server),
                                 },
                                 mission: server_mission.identity(),
                             }
@@ -54153,9 +54167,9 @@ mod tests {
                 ),
             )
             .await;
-        let server_receipt = server_task.await.expect("server task");
-        client.close().await;
-        server.close().await;
+        let (server_receipt, connection) = server_task.await.expect("server task");
+        // Both production contacts have finished before disconnecting; endpoints survive.
+        connection.close();
         (
             client_receipt,
             server_receipt,
@@ -54917,7 +54931,7 @@ mod tests {
             .expect("custody policy before contact");
         let authorization_count = Arc::new(AtomicU64::new(0));
         let (client, server) = with_test_transfer_profile_offer(
-            TransferProfileOfferV1::legacy_only(),
+            legacy_event_with_blob_stream_offer(),
             contact_test_pair_with_forwarding_results(
                 TestForwardingNode {
                     store: server_store.clone(),
@@ -55031,7 +55045,7 @@ mod tests {
         let writer_hold = Arc::new(TestCustodyWriterHold::new());
         let authorization_count = Arc::new(AtomicU64::new(0));
         let (client, server) = with_test_transfer_profile_offer(
-            TransferProfileOfferV1::legacy_only(),
+            legacy_event_with_blob_stream_offer(),
             contact_test_pair_with_forwarding_results(
                 TestForwardingNode {
                     store: server_store.clone(),
@@ -55512,7 +55526,7 @@ mod tests {
         );
 
         let (client, server) = with_test_transfer_profile_offer(
-            TransferProfileOfferV1::legacy_only(),
+            legacy_event_with_blob_stream_offer(),
             contact_test_pair_with_forwarding_results(
                 TestForwardingNode {
                     store: server_store.clone(),
@@ -55987,7 +56001,7 @@ mod tests {
             TransferProfileId::EventPagesV1 as u16,
             TransferProfileId::LegacyV6 as u16,
             TransferProfileId::LegacyV6 as u16,
-            TransferProfileId::BlobCustodyV1 as u16,
+            TransferProfileId::BlobRangesStreamV1 as u16,
             TransferProfileId::LegacyV6 as u16,
         ]);
         assert_eq!(
@@ -57725,7 +57739,7 @@ mod tests {
         let receiver_clock_id = [0x4f; 16];
 
         let (first_receiver, first_source) = with_test_transfer_profile_offer(
-            TransferProfileOfferV1::legacy_only(),
+            legacy_event_with_blob_stream_offer(),
             contact_test_pair_with_forwarding(
                 TestForwardingNode {
                     store: source_store.clone(),
@@ -59567,8 +59581,9 @@ mod tests {
             matching_interest.clone(),
         )
         .await;
-        if mission.semantic_version() >= SEMANTIC_PROTOCOL_V7 {
-            defer_empty_mutable_classes(&connection, &mut mission, &mut receipt).await;
+        if mission.semantic_version() == SEMANTIC_PROTOCOL_V7 {
+            defer_empty_mutable_classes(&client_mission, &connection, &mut mission, &mut receipt)
+                .await;
             assert_eq!(
                 request_mission_frame(
                     &connection,
@@ -59652,7 +59667,13 @@ mod tests {
                 .expect("complete source-push lane without disclosure");
                 assert!(complete);
                 account(&mut receipt, request_bytes, response_bytes).expect("account v3 finish");
-                defer_empty_mutable_classes(&connection, &mut mission, &mut receipt).await;
+                defer_empty_mutable_classes(
+                    &client_mission,
+                    &connection,
+                    &mut mission,
+                    &mut receipt,
+                )
+                .await;
                 // This low-level client drives the protocol without
                 // `sync_authenticated_session`, so it must perform the initiator's
                 // completion handshake after consuming the final response.

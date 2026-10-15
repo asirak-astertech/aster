@@ -121,8 +121,8 @@ actor has exited and must close before a new actor starts.
 
 For a semantic-v7 contact, the first protected exchange negotiates a transfer
 profile independently for Event, State, Record, Blob, and EventBridge. Every
-lane must offer `LegacyV6`; only Event may additionally select
-`EventPagesV1`. Exact Event differences and bounded blind traffic into a
+non-Blob lane offers `LegacyV6`; Event may additionally select
+`EventPagesV1`. Blob requires `BlobRangesStreamV1`, with no legacy fallback. Exact Event differences and bounded blind traffic into a
 ReceiveOnly peer can then move in one ordered bounded unidirectional turn.
 Finite entries carry session-authenticated cumulative age, while durable and
 tombstone entries carry no age wrapper. The receiver commits each complete page

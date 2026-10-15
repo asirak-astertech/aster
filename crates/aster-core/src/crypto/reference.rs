@@ -4923,7 +4923,7 @@ impl ReferenceAuthenticatedSession {
             || direction != expected_direction
             || finalization_charge_ms == 0
             || profiles.negotiated.profile(TransferLaneId::Blob)
-                != Some(TransferProfileId::BlobCustodyV1)
+                != Some(TransferProfileId::BlobRangesStreamV1)
         {
             return Err(blob_custody_contact_unavailable());
         }
@@ -5105,7 +5105,7 @@ impl ReferenceAuthenticatedSession {
         if self.semantic_version != SEMANTIC_PROTOCOL_V8
             || direction != expected_direction
             || profiles.negotiated.profile(TransferLaneId::Blob)
-                != Some(TransferProfileId::BlobCustodyV1)
+                != Some(TransferProfileId::BlobRangesStreamV1)
         {
             return Err(blob_custody_contact_unavailable());
         }
@@ -5152,7 +5152,7 @@ impl ReferenceAuthenticatedSession {
         if self.semantic_version != SEMANTIC_PROTOCOL_V8
             || direction != expected_direction
             || profiles.negotiated.profile(TransferLaneId::Blob)
-                != Some(TransferProfileId::BlobCustodyV1)
+                != Some(TransferProfileId::BlobRangesStreamV1)
         {
             return Err(blob_custody_contact_unavailable());
         }
@@ -5213,7 +5213,7 @@ impl ReferenceAuthenticatedSession {
         if self.semantic_version != SEMANTIC_PROTOCOL_V8
             || direction != expected_direction
             || profiles.negotiated.profile(TransferLaneId::Blob)
-                != Some(TransferProfileId::BlobCustodyV1)
+                != Some(TransferProfileId::BlobRangesStreamV1)
             || claim.session_transcript() != self.session_id
             || claim.direction() != direction
         {
@@ -5247,7 +5247,7 @@ impl ReferenceAuthenticatedSession {
         if self.semantic_version != SEMANTIC_PROTOCOL_V8
             || direction != expected_direction
             || profiles.negotiated.profile(TransferLaneId::Blob)
-                != Some(TransferProfileId::BlobCustodyV1)
+                != Some(TransferProfileId::BlobRangesStreamV1)
         {
             return Err(blob_custody_contact_unavailable());
         }
@@ -10675,37 +10675,26 @@ mod tests {
         let mut literal = literal_blob_custody_claim();
 
         let (mut legacy_sender, mut legacy_receiver) = pair();
-        authenticate_offers(&mut legacy_sender, &mut legacy_receiver, &current, &legacy);
-        literal[14..46].copy_from_slice(&legacy_sender.session_id);
-        literal[54] = direction as u8;
-        let legacy_claim = crate::BlobCustodyClaimV1::decode(&literal).expect("literal claim");
-        assert!(
-            legacy_sender
-                .seal_blob_custody_frame(direction, &legacy_claim)
-                .is_err(),
-            "a Legacy-selected Blob lane must not mint profile-3 records"
+        let request = legacy_sender
+            .seal_transfer_profile_offer(&current)
+            .expect("stream offer request");
+        assert_eq!(
+            legacy_receiver
+                .open_transfer_profile_offer(&request)
+                .expect("authenticated stream offer"),
+            current
         );
-        let legacy_negotiated = negotiate_transfer_profiles_for_semantic_version(
-            SEMANTIC_PROTOCOL_V8,
-            &current,
-            &legacy,
-        )
-        .expect("Legacy-selected semantic-v8 profiles");
-        let legacy_digest = transfer_profile_digest(&current, &legacy, &legacy_negotiated);
-        let legacy_context = blob_custody_lane_record_context(legacy_digest, direction);
-        let forged_profile_three = legacy_sender
-            .seal_frame_with_context(&legacy_claim.encode(), &legacy_context)
-            .expect("generic frame in a caller-selected profile-3 context");
         assert!(
             legacy_receiver
-                .open_blob_custody_frame(direction, &forged_profile_three)
+                .seal_transfer_profile_offer(&legacy)
                 .is_err(),
-            "a Legacy-selected Blob lane must not open or mint profile-3 authority"
+            "a legacy-only Blob offer must fail before any profile-3 record can be minted"
         );
 
         let (mut sender, mut receiver) = pair();
         authenticate_offers(&mut sender, &mut receiver, &current, &current);
         literal[14..46].copy_from_slice(&sender.session_id);
+        literal[54] = direction as u8;
         let claim = crate::BlobCustodyClaimV1::decode(&literal).expect("session-bound claim");
         let substituted_context = blob_custody_lane_record_context([0xa5; 32], direction);
         let substituted = sender
@@ -10722,7 +10711,7 @@ mod tests {
             &current,
             &current,
         )
-        .expect("BlobCustodyV1-selected semantic-v8 profiles");
+        .expect("BlobRangesStreamV1-selected semantic-v8 profiles");
         let digest = transfer_profile_digest(&current, &current, &negotiated);
         let mut substituted_profile = blob_custody_lane_record_context(digest, direction);
         let profile_offset = substituted_profile.len() - 3;
@@ -10751,7 +10740,7 @@ mod tests {
         );
         assert_eq!(
             sender.negotiated_transfer_profile(crate::TransferLaneId::Blob),
-            Some(crate::TransferProfileId::BlobCustodyV1)
+            Some(crate::TransferProfileId::BlobRangesStreamV1)
         );
 
         // Mutation caught: protecting only an adjacent claim record, accepting
@@ -10804,7 +10793,7 @@ mod tests {
         assert_eq!(outbound.semantic_version(), SEMANTIC_PROTOCOL_V8);
         assert_eq!(
             outbound.profile_id(),
-            TransferProfileId::BlobCustodyV1 as u16
+            TransferProfileId::BlobRangesStreamV1 as u16
         );
         assert_eq!(outbound.session_transcript(), source_sender.session_id());
         assert_eq!(outbound.exchange_id(), 73);

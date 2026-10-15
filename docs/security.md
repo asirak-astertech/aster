@@ -659,10 +659,12 @@ the exact durable projection, and freshly authenticates any concurrent exact
 restage before reinsertion. This prevents a delayed cache write from reviving an
 aborted source or an abort from deleting the winner's authenticated claim.
 
-BlobCarrierFinish reports the requester's remaining count and Finished only
-echoes it. That pair closes sequencing; it is not independent evidence of the
-requester's disk state. Exact BlobRangeResult/BlobRangeResultAck tuples are the
-peer-visible evidence for each accepted durable prefix.
+Blob carrier streaming has no per-range storage Result/Ack. Its authenticated
+terminal plus FIN proves only that the sender finished the scheduled attempts,
+not remote durability. Durable Store prefixes are the sole recovery authority.
+A missing terminal does not erase accepted bytes or undo a completed publication.
+Both peers must support `BlobRangesStreamV1`; incompatible offers fail before
+inventory, and older semantic Blob carrier attempts fail before carrier IO.
 
 Pending bytes confer no publication authority. Promotion requires the exact
 pending plan, all verified canonical carriers, a matching physical depot

@@ -49,7 +49,7 @@ The current handshake negotiates semantic versions `8`, `7`, `6`, `5`, `4`, `3`,
 | `5` | v4 | direct Blob transfer |
 | `6` | v5 ordinary lanes byte-for-byte | Event bridge transfer |
 | `7` | v6 byte-for-byte | per-lane transfer profiles and receipt-free Event pages |
-| `8` | v7 byte-for-byte except the v8 Blob offer and lane AAD domain | `BlobCustodyV1` negotiation allocation; finite Blob transfer remains suppressed under `LegacyV6` |
+| `8` | v7 byte-for-byte except the lane AAD domain and Blob custody fields | authenticated finite Blob custody over `BlobRangesStreamV1` |
 """
 
 
@@ -173,7 +173,7 @@ class ProtocolVersionContractTests(unittest.TestCase):
 
     def test_v8_must_inherit_v7_except_its_allocated_surfaces(self) -> None:
         damaged = protocol_contract().replace(
-            "v7 byte-for-byte except the v8 Blob offer and lane AAD domain", "v7"
+            "v7 byte-for-byte except the lane AAD domain and Blob custody fields", "v7"
         )
         with self.assertRaisesRegex(CHECKER.ContractViolation, "v8 inheritance"):
             self.validate(protocol=damaged)

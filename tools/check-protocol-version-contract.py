@@ -22,8 +22,8 @@ PROTOCOL_ROWS = {
     6: ("v5 ordinary lanes byte-for-byte", "Event bridge transfer"),
     7: ("v6 byte-for-byte", "per-lane transfer profiles and receipt-free Event pages"),
     8: (
-        "v7 byte-for-byte except the v8 Blob offer and lane AAD domain",
-        "`BlobCustodyV1` negotiation allocation; finite Blob transfer remains suppressed under `LegacyV6`",
+        "v7 byte-for-byte except the lane AAD domain and Blob custody fields",
+        "authenticated finite Blob custody over `BlobRangesStreamV1`",
     ),
 }
 CDDL_ALIASES = {
@@ -142,7 +142,7 @@ def parse_protocol(protocol: str) -> None:
         )
     if rows[8][0] != PROTOCOL_ROWS[8][0]:
         fail(
-            "protocol v8 inheritance must preserve v7 bytes except the allocated Blob offer and AAD domain; "
+            "protocol v8 inheritance must preserve v7 bytes except the lane AAD domain and Blob custody fields; "
             f"found {rows[8][0]!r}"
         )
     if rows != PROTOCOL_ROWS:

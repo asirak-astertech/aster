@@ -49,7 +49,7 @@ impl TransferLaneId {
 pub enum TransferProfileId {
     LegacyV6 = 1,
     EventPagesV1 = 2,
-    BlobCustodyV1 = 3,
+    BlobRangesStreamV1 = 3,
 }
 
 impl TransferProfileId {
@@ -58,7 +58,7 @@ impl TransferProfileId {
         match value {
             1 => Some(Self::LegacyV6),
             2 => Some(Self::EventPagesV1),
-            3 => Some(Self::BlobCustodyV1),
+            3 => Some(Self::BlobRangesStreamV1),
             _ => None,
         }
     }
@@ -91,44 +91,14 @@ pub struct TransferProfileOfferV1 {
 impl TransferProfileOfferV1 {
     pub fn for_semantic_version(semantic_version: u16) -> Result<Self, TransferProfileError> {
         match semantic_version {
-            SEMANTIC_PROTOCOL_V7 => Ok(Self::current()),
-            SEMANTIC_PROTOCOL_V8 => Ok(Self {
-                lanes: vec![
-                    (
-                        TransferLaneId::EventBridge as u16,
-                        vec![TransferProfileId::LegacyV6 as u16],
-                    ),
-                    (
-                        TransferLaneId::Blob as u16,
-                        vec![
-                            TransferProfileId::BlobCustodyV1 as u16,
-                            TransferProfileId::LegacyV6 as u16,
-                        ],
-                    ),
-                    (
-                        TransferLaneId::Record as u16,
-                        vec![TransferProfileId::LegacyV6 as u16],
-                    ),
-                    (
-                        TransferLaneId::State as u16,
-                        vec![TransferProfileId::LegacyV6 as u16],
-                    ),
-                    (
-                        TransferLaneId::Event as u16,
-                        vec![
-                            TransferProfileId::EventPagesV1 as u16,
-                            TransferProfileId::LegacyV6 as u16,
-                        ],
-                    ),
-                ],
-            }),
+            SEMANTIC_PROTOCOL_V7 | SEMANTIC_PROTOCOL_V8 => Ok(Self::current()),
             _ => Err(TransferProfileError::invalid(
                 "transfer-profile exchange requires semantic v7 or v8",
             )),
         }
     }
 
-    /// Semantic-v7 offer; all non-Event lanes retain LegacyV6.
+    /// Semantic-v7/v8 offer; Blob uses the receipt-free range stream.
     pub fn current() -> Self {
         Self {
             lanes: vec![
@@ -138,7 +108,7 @@ impl TransferProfileOfferV1 {
                 ),
                 (
                     TransferLaneId::Blob as u16,
-                    vec![TransferProfileId::LegacyV6 as u16],
+                    vec![TransferProfileId::BlobRangesStreamV1 as u16],
                 ),
                 (
                     TransferLaneId::Record as u16,
@@ -244,7 +214,10 @@ impl TransferProfileOfferV1 {
                 continue;
             };
             known_lanes.insert(lane);
-            if !profiles.contains(&(TransferProfileId::LegacyV6 as u16)) {
+            if !profiles.contains(&(TransferProfileId::LegacyV6 as u16))
+                && !(lane == TransferLaneId::Blob
+                    && profiles.contains(&(TransferProfileId::BlobRangesStreamV1 as u16)))
+            {
                 return Err(TransferProfileError::invalid(
                     "every fixed lane must offer LegacyV6",
                 ));
@@ -257,10 +230,10 @@ impl TransferProfileOfferV1 {
                 ));
             }
             if lane != TransferLaneId::Blob
-                && profiles.contains(&(TransferProfileId::BlobCustodyV1 as u16))
+                && profiles.contains(&(TransferProfileId::BlobRangesStreamV1 as u16))
             {
                 return Err(TransferProfileError::invalid(
-                    "BlobCustodyV1 is valid only for the Blob lane",
+                    "BlobRangesStreamV1 is valid only for the Blob lane",
                 ));
             }
         }
@@ -393,15 +366,7 @@ pub fn negotiate_transfer_profiles_for_semantic_version(
             "transfer-profile exchange requires semantic v7 or v8",
         ));
     }
-    let negotiated = negotiate_transfer_profiles(initiator, responder)?;
-    if semantic_version < SEMANTIC_PROTOCOL_V8
-        && negotiated.profile(TransferLaneId::Blob) == Some(TransferProfileId::BlobCustodyV1)
-    {
-        return Err(TransferProfileError::invalid(
-            "BlobCustodyV1 requires semantic v8",
-        ));
-    }
-    Ok(negotiated)
+    negotiate_transfer_profiles(initiator, responder)
 }
 
 fn profiles_for(
@@ -487,5 +452,55 @@ impl<'a> OfferReader<'a> {
                 "transfer-profile offer has trailing bytes",
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn semantic_blob_profile_three_is_resolved_by_authenticated_version() {
+        let v7 = TransferProfileOfferV1::for_semantic_version(SEMANTIC_PROTOCOL_V7)
+            .expect("semantic-v7 offer");
+        let v8 = TransferProfileOfferV1::for_semantic_version(SEMANTIC_PROTOCOL_V8)
+            .expect("semantic-v8 offer");
+
+        for (semantic_version, offer) in [(SEMANTIC_PROTOCOL_V7, v7), (SEMANTIC_PROTOCOL_V8, v8)] {
+            assert_eq!(
+                offer
+                    .known_lanes()
+                    .into_iter()
+                    .find(|(lane, _)| *lane == TransferLaneId::Blob),
+                Some((
+                    TransferLaneId::Blob,
+                    vec![TransferProfileId::BlobRangesStreamV1],
+                )),
+                "semantic v{semantic_version} must select the same stream mechanics"
+            );
+            assert_eq!(
+                negotiate_transfer_profiles_for_semantic_version(semantic_version, &offer, &offer,)
+                    .expect("matching stream profiles")
+                    .profile(TransferLaneId::Blob),
+                Some(TransferProfileId::BlobRangesStreamV1),
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_v7_does_not_fall_back_to_removed_blob_carrier() {
+        let current = TransferProfileOfferV1::for_semantic_version(SEMANTIC_PROTOCOL_V7)
+            .expect("semantic-v7 offer");
+        let historical = TransferProfileOfferV1::legacy_only();
+
+        assert!(
+            negotiate_transfer_profiles_for_semantic_version(
+                SEMANTIC_PROTOCOL_V7,
+                &current,
+                &historical,
+            )
+            .is_err(),
+            "profile negotiation must fail before Blob carrier I/O"
+        );
     }
 }

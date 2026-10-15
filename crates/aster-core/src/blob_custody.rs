@@ -60,7 +60,7 @@ impl BlobCustodyDirectionV1 {
 }
 
 /// Opaque proof that one peer record was authenticated and replay-checked in
-/// the semantic-v8 `BlobCustodyV1` lane domain.
+/// the semantic-v8 `BlobRangesStreamV1` custody lane domain.
 ///
 /// Construction is core-private. Public callers can receive this value only
 /// from `ReferenceAuthenticatedSession::open_blob_custody_frame` after an

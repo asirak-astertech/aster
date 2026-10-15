@@ -1550,7 +1550,7 @@ impl BlobContactEligibility {
                         },
                     ..
                 },
-            ) => profile_id == aster_mesh::TransferProfileId::BlobCustodyV1 as u16,
+            ) => profile_id == aster_mesh::TransferProfileId::BlobRangesStreamV1 as u16,
             (Self::CustodyV1, BlobLifetime::Finite { .. }) => false,
         }
     }
@@ -1701,7 +1701,7 @@ impl VerifiedFiniteBlobAdmission {
             receiver_sample,
             provenance: BlobFiniteProvenance::NetworkV1 {
                 semantic_version: 8,
-                profile_id: aster_mesh::TransferProfileId::BlobCustodyV1 as u16,
+                profile_id: aster_mesh::TransferProfileId::BlobRangesStreamV1 as u16,
             },
         }
     }
@@ -1729,7 +1729,7 @@ impl VerifiedFiniteBlobAdmission {
             receiver_sample,
             provenance: BlobFiniteProvenance::NetworkV1 {
                 semantic_version: 8,
-                profile_id: aster_mesh::TransferProfileId::BlobCustodyV1 as u16,
+                profile_id: aster_mesh::TransferProfileId::BlobRangesStreamV1 as u16,
             },
         }
     }
@@ -1793,7 +1793,7 @@ fn validate_blob_lifetime(lifetime: BlobLifetime) -> Result<(), StoreError> {
     };
     // Preserve well-formed v8+ network provenance as opaque historical data.
     // Contact authority is deliberately stricter and admits only exact
-    // semantic-v8/BlobCustodyV1; future provenance must remain retainable but
+    // semantic-v8/BlobRangesStreamV1 custody; future provenance must remain retainable but
     // non-forwardable by this runtime.
     if ttl_ms == 0
         || age
@@ -3606,7 +3606,7 @@ impl Store {
     ///
     /// This cannot mint runtime/contact authority. It derives every immutable
     /// claim field and the positive TTL from an already content-verified exact
-    /// source, fixes provenance to semantic-v8 `BlobCustodyV1`, and delegates
+    /// source, fixes provenance to semantic-v8 `BlobRangesStreamV1`, and delegates
     /// immediately to the production staging transaction.
     #[cfg(any(test, feature = "test-utils"))]
     #[doc(hidden)]
@@ -4224,7 +4224,7 @@ impl Store {
     }
 
     /// Loads one exact source eligible for an authenticated semantic-v8
-    /// `BlobCustodyV1` contact. Durable and locally originated finite sources
+    /// semantic-v8 custody contact. Durable and locally originated finite sources
     /// remain eligible; received finite sources must retain exact v8/profile-3
     /// provenance and a currently live lower-bound lifetime.
     #[doc(hidden)]
@@ -4262,7 +4262,7 @@ impl Store {
     }
 
     /// Revalidates one retained projection for an authenticated semantic-v8
-    /// `BlobCustodyV1` contact. Exact provenance and finite lifetime visibility
+    /// semantic-v8 custody contact. Exact provenance and finite lifetime visibility
     /// are checked in the same read snapshot as the retained metadata and
     /// sealed-byte comparison.
     #[doc(hidden)]
@@ -4413,7 +4413,7 @@ impl Store {
         self.require_live()?;
         let authority = self.require_bound_mission()?;
         if context.semantic_version != 8
-            || context.profile_id != aster_mesh::TransferProfileId::BlobCustodyV1 as u16
+            || context.profile_id != aster_mesh::TransferProfileId::BlobRangesStreamV1 as u16
             || context.finalization_charge_ms == 0
         {
             return Err(blob_error(BlobStoreError::PendingSourceConflict));
@@ -4499,7 +4499,7 @@ impl Store {
             BlobFiniteProvenance::NetworkV1 {
                 semantic_version: 8,
                 profile_id,
-            } if profile_id == aster_mesh::TransferProfileId::BlobCustodyV1 as u16 => {}
+            } if profile_id == aster_mesh::TransferProfileId::BlobRangesStreamV1 as u16 => {}
             BlobFiniteProvenance::NetworkV1 { .. } => {
                 return Err(blob_error(BlobStoreError::PendingSourceConflict));
             }
@@ -4690,7 +4690,7 @@ impl Store {
             sealed,
             BlobCustodySendContextFields {
                 semantic_version: 8,
-                profile_id: aster_mesh::TransferProfileId::BlobCustodyV1 as u16,
+                profile_id: aster_mesh::TransferProfileId::BlobRangesStreamV1 as u16,
                 session_transcript,
                 exchange_id,
                 direction,
@@ -5698,6 +5698,34 @@ impl Store {
             }
             Some(_) | None => Ok(None),
         }
+    }
+
+    /// Corrupts a test-owned prefix's source binding without changing its size.
+    /// Exercises real append and abort coherence failures, not injected results.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn test_corrupt_blob_carrier_prefix_source(
+        &self,
+        source: BlobTransferId,
+        object: BlobCarrierObjectId,
+    ) -> Result<(), StoreError> {
+        let write = self.database.begin_write()?;
+        let key = blob_carrier_prefix_key(source, object);
+        let mut table = write.open_table(BLOB_CARRIER_PREFIXES)?;
+        let encoded = table
+            .get(key.as_slice())?
+            .expect("test prefix exists")
+            .value()
+            .to_vec();
+        let mut record = decode_blob_carrier_prefix(&encoded)?;
+        let mut other = *source.as_bytes();
+        other[0] ^= 1;
+        record.source = BlobTransferId::new(other);
+        let encoded = encode_blob_carrier_prefix(&record)?;
+        table.insert(key.as_slice(), encoded.as_slice())?;
+        drop(table);
+        write.commit()?;
+        Ok(())
     }
 
     /// Atomically clears only one exact carrier object's durable progress.
@@ -18494,7 +18522,7 @@ mod tests {
             },
             provenance: BlobFiniteProvenance::NetworkV1 {
                 semantic_version: 8,
-                profile_id: aster_mesh::TransferProfileId::BlobCustodyV1 as u16,
+                profile_id: aster_mesh::TransferProfileId::BlobRangesStreamV1 as u16,
             },
         };
 
@@ -18787,7 +18815,7 @@ mod tests {
             },
             provenance: BlobFiniteProvenance::NetworkV1 {
                 semantic_version: 8,
-                profile_id: aster_mesh::TransferProfileId::BlobCustodyV1 as u16,
+                profile_id: aster_mesh::TransferProfileId::BlobRangesStreamV1 as u16,
             },
         };
         let metadata = BlobMetadata {
@@ -19243,7 +19271,7 @@ mod tests {
             },
             provenance: BlobFiniteProvenance::NetworkV1 {
                 semantic_version: 8,
-                profile_id: aster_mesh::TransferProfileId::BlobCustodyV1 as u16,
+                profile_id: aster_mesh::TransferProfileId::BlobRangesStreamV1 as u16,
             },
         };
         let policy = target
@@ -19342,7 +19370,7 @@ mod tests {
             },
             provenance: BlobFiniteProvenance::NetworkV1 {
                 semantic_version: 8,
-                profile_id: aster_mesh::TransferProfileId::BlobCustodyV1 as u16,
+                profile_id: aster_mesh::TransferProfileId::BlobRangesStreamV1 as u16,
             },
         };
         assert_eq!(pending_lifetime(&target), pending_merged);
@@ -19810,7 +19838,7 @@ mod tests {
             },
             provenance: BlobFiniteProvenance::NetworkV1 {
                 semantic_version: 8,
-                profile_id: aster_mesh::TransferProfileId::BlobCustodyV1 as u16,
+                profile_id: aster_mesh::TransferProfileId::BlobRangesStreamV1 as u16,
             },
         };
         // Mutation caught: returning Duplicate before committing the accepted
@@ -37636,7 +37664,7 @@ mod tests {
                 "v8-custody",
                 finite(BlobFiniteProvenance::NetworkV1 {
                     semantic_version: 8,
-                    profile_id: aster_mesh::TransferProfileId::BlobCustodyV1 as u16,
+                    profile_id: aster_mesh::TransferProfileId::BlobRangesStreamV1 as u16,
                 }),
                 false,
                 true,
@@ -37654,7 +37682,7 @@ mod tests {
                 "v7-custody-profile-number",
                 finite(BlobFiniteProvenance::NetworkV1 {
                     semantic_version: 7,
-                    profile_id: aster_mesh::TransferProfileId::BlobCustodyV1 as u16,
+                    profile_id: aster_mesh::TransferProfileId::BlobRangesStreamV1 as u16,
                 }),
                 false,
                 false,
@@ -37663,7 +37691,7 @@ mod tests {
                 "future-version-custody-profile-number",
                 finite(BlobFiniteProvenance::NetworkV1 {
                     semantic_version: 9,
-                    profile_id: aster_mesh::TransferProfileId::BlobCustodyV1 as u16,
+                    profile_id: aster_mesh::TransferProfileId::BlobRangesStreamV1 as u16,
                 }),
                 false,
                 false,
