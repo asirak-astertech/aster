@@ -19,7 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Stream multiple Blob ranges per contact without per-range acknowledgements. Breaking change: both nodes must be updated.
+- Faster Blob transfers. Breaking change: both nodes must be updated.
 - Replaced libp2p-based tests with Event delivery and reconnection tests using Iroh. Removed the unused libp2p provider and its dependencies.
 - Fixed a test failure caused by `iroh` in the checkout directory name.
 - Upgrade dependencies: Iroh 1.3.0 (public DNS disabled)
