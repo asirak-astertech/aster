@@ -9,7 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use aster_mesh::{NodeId, Scope, Topic};
+use aster_mesh::{BlobId, NodeId, Scope, Topic};
 use redb::{
     MultimapTableHandle, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
     TableHandle,
@@ -24,8 +24,8 @@ use super::{
     blob_subscription_identity_write, blob_subscription_projection_matches_write,
     blob_subscription_projection_read, blob_subscription_retirement_generation_read,
     blob_subscription_retirement_read, blob_subscription_retirement_write, enforce_live_write,
-    read_mission_binding, read_mission_binding_read, require_control_policy_read,
-    require_control_policy_write,
+    read_mission_binding, read_mission_binding_read, require_blob_publication_visible_write,
+    require_control_policy_read, require_control_policy_write,
 };
 
 /// Audited inverse of Blob forward acceptance markers used only for bounded scans.
@@ -70,18 +70,18 @@ const BLOB_DELIVERY_CURSOR_VERSION: u8 = 1;
 const BLOB_DELIVERY_TOKEN_VERSION: u8 = 1;
 const BLOB_RETIREMENT_DELIVERY_RECORD_VERSION: u8 = 3;
 const BLOB_RETIREMENT_ACKNOWLEDGEMENT_VERSION: u8 = 3;
-#[allow(dead_code)] // Internal Task-4 token dispatch; public Task-6 API remains inactive.
+#[allow(dead_code)]
 const BLOB_RETIREMENT_DELIVERY_TOKEN_VERSION: u8 = 2;
 const BLOB_SUBSCRIPTION_ID_DOMAIN: &[u8] = b"aster/blob-subscription-id/v1";
 const BLOB_DELIVERY_TOKEN_DOMAIN: &[u8] = b"aster/blob-delivery-token/v1";
-#[allow(dead_code)] // Internal Task-4 token dispatch; public Task-6 API remains inactive.
+#[allow(dead_code)]
 const BLOB_RETIREMENT_DELIVERY_TOKEN_DOMAIN: &[u8] = b"aster/blob-retirement-delivery-token/v2";
 const BLOB_DELIVERY_TOKEN_COUNTER_BYTES: usize = 1 + (3 * 8);
 const BLOB_PENDING_DELIVERY_RECORD_BYTES: usize = 1 + 32 + (2 * 8);
 const BLOB_RETIREMENT_DELIVERY_KEY_BYTES: usize = 32 + 32 + 8;
 const BLOB_RETIREMENT_DELIVERY_ORDER_KEY_BYTES: usize = 32 + 8 + 32 + 8;
 const BLOB_RETIREMENT_DELIVERY_RECORD_BYTES: usize = 1 + (3 * 8) + 1;
-#[allow(dead_code)] // Internal Task-4 receipt codec; public Task-6 API remains inactive.
+#[allow(dead_code)]
 const BLOB_RETIREMENT_ACKNOWLEDGEMENT_BYTES: usize = 1 + (2 * 8);
 
 /// Maximum byte length of one durable Blob subscription operation key.
@@ -313,17 +313,22 @@ impl BlobDeliveryToken {
     /// Its subscription and Blob binding is revalidated by acknowledgement.
     pub fn from_bytes(bytes: [u8; BLOB_DELIVERY_TOKEN_BYTES]) -> Result<Self, StoreError> {
         let token = Self(bytes);
-        if token.0[0] != BLOB_DELIVERY_TOKEN_VERSION
-            || token.incarnation() == 0
-            || token.tenure() == 0
-            || token.attempt() == 0
-        {
+        let counters_valid =
+            token.incarnation() != 0 && token.tenure() != 0 && token.attempt() != 0;
+        let version_valid = token.0[0] == BLOB_DELIVERY_TOKEN_VERSION
+            || (token.0[0] == BLOB_RETIREMENT_DELIVERY_TOKEN_VERSION && token.attempt() >= 2);
+        if !counters_valid || !version_valid {
             return Err(StoreError::InvalidBlobDeliveryToken);
         }
         Ok(token)
     }
 
-    #[allow(dead_code)] // Internal Task-4 token dispatch; public Task-6 API remains inactive.
+    #[doc(hidden)]
+    pub const fn is_retirement(self) -> bool {
+        self.0[0] == BLOB_RETIREMENT_DELIVERY_TOKEN_VERSION
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn from_retirement_bytes(
         bytes: [u8; BLOB_DELIVERY_TOKEN_BYTES],
     ) -> Result<Self, StoreError> {
@@ -377,16 +382,35 @@ pub struct BlobSubscriptionDeliveryPage {
     pub has_more: bool,
 }
 
-#[allow(dead_code)] // Internal Task-4 poll seam; public Task-6 API remains inactive.
+/// Stable public projection of one authenticated Blob retirement reason.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlobRetirementReason {
+    Expired,
+    Invalidated,
+    Evicted,
+}
+
+impl From<super::blob::lifecycle::RetirementReason> for BlobRetirementReason {
+    fn from(reason: super::blob::lifecycle::RetirementReason) -> Self {
+        match reason {
+            super::blob::lifecycle::RetirementReason::Expired => Self::Expired,
+            super::blob::lifecycle::RetirementReason::Invalidated => Self::Invalidated,
+            super::blob::lifecycle::RetirementReason::Evicted => Self::Evicted,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct BlobRetirementPollPlan {
+#[doc(hidden)]
+pub struct BlobRetirementPollPlan {
     policy: ControlPolicySnapshot,
     subscription: BlobSubscriptionId,
     incarnation: u64,
+    delivery_limit: usize,
     candidates: Vec<BlobRetirementPollCandidate>,
 }
 
-#[allow(dead_code)] // Internal Task-4 poll seam; public Task-6 API remains inactive.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct BlobRetirementPollCandidate {
     semantic_id: BlobSemanticId,
@@ -396,10 +420,17 @@ struct BlobRetirementPollCandidate {
     reason: super::blob::lifecycle::RetirementReason,
 }
 
-#[allow(dead_code)] // Internal Task-4 poll seam; public Task-6 API remains inactive.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct BlobRetirementDelivery {
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[doc(hidden)]
+pub struct BlobRetirementDelivery {
     pub(crate) semantic_id: BlobSemanticId,
+    pub(crate) blob_id: BlobId,
+    pub(crate) publisher: aster_mesh::NodeId,
+    pub(crate) publisher_counter: u64,
+    pub(crate) topic: aster_mesh::Topic,
+    pub(crate) scope: aster_mesh::Scope,
+    pub(crate) priority: aster_mesh::Priority,
+    pub(crate) ttl_ms: Option<u64>,
     pub(crate) acceptance_marker: u64,
     pub(crate) subscription_incarnation: u64,
     pub(crate) retirement_generation: u64,
@@ -408,10 +439,53 @@ pub(crate) struct BlobRetirementDelivery {
     pub(crate) token: BlobDeliveryToken,
 }
 
-#[allow(dead_code)] // Internal Task-4 poll seam; public Task-6 API remains inactive.
+impl BlobRetirementDelivery {
+    pub const fn semantic_id(&self) -> BlobSemanticId {
+        self.semantic_id
+    }
+    pub const fn blob_id(&self) -> BlobId {
+        self.blob_id
+    }
+    pub const fn publisher(&self) -> aster_mesh::NodeId {
+        self.publisher
+    }
+    pub const fn publisher_counter(&self) -> u64 {
+        self.publisher_counter
+    }
+    pub const fn topic(&self) -> &aster_mesh::Topic {
+        &self.topic
+    }
+    pub const fn scope(&self) -> &aster_mesh::Scope {
+        &self.scope
+    }
+    pub const fn priority(&self) -> aster_mesh::Priority {
+        self.priority
+    }
+    pub const fn ttl_ms(&self) -> Option<u64> {
+        self.ttl_ms
+    }
+    pub const fn acceptance_marker(&self) -> u64 {
+        self.acceptance_marker
+    }
+    pub const fn retirement_generation(&self) -> u64 {
+        self.retirement_generation
+    }
+    pub const fn attempt(&self) -> u64 {
+        self.attempt
+    }
+    pub fn reason(&self) -> BlobRetirementReason {
+        self.reason.into()
+    }
+    pub const fn token(&self) -> BlobDeliveryToken {
+        self.token
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct BlobRetirementDeliveryPage {
-    pub(crate) deliveries: Vec<BlobRetirementDelivery>,
+#[doc(hidden)]
+pub struct BlobRetirementDeliveryPage {
+    pub deliveries: Vec<BlobRetirementDelivery>,
+    pub has_more: bool,
 }
 
 /// Idempotent acknowledgement result for one semantic Blob delivery.
@@ -906,6 +980,37 @@ impl Store {
         {
             return Err(StoreError::BlobSelectorGenerationChanged);
         }
+        let mut retirement_start = [0u8; BLOB_RETIREMENT_DELIVERY_ORDER_KEY_BYTES];
+        retirement_start[..32].copy_from_slice(plan.subscription.as_bytes());
+        let mut retirement_end = [0xff; BLOB_RETIREMENT_DELIVERY_ORDER_KEY_BYTES];
+        retirement_end[..32].copy_from_slice(plan.subscription.as_bytes());
+        let retirement_order = write.open_table(BLOB_RETIREMENT_DELIVERY_ORDER)?;
+        let pending_retirement = {
+            let mut rows = retirement_order.range::<&[u8]>((
+                std::ops::Bound::Included(retirement_start.as_slice()),
+                std::ops::Bound::Included(retirement_end.as_slice()),
+            ))?;
+            rows.next().transpose()?.map(|(key, value)| {
+                if !value.value().is_empty() {
+                    return Err(StoreError::BlobInvariant(
+                        "Blob retirement-delivery order value is not empty",
+                    ));
+                }
+                let (subscription, _, _, _) =
+                    parse_blob_retirement_delivery_order_key(key.value())?;
+                if subscription != plan.subscription {
+                    return Err(StoreError::BlobInvariant(
+                        "Blob retirement-delivery order escaped its subscription prefix",
+                    ));
+                }
+                Ok(())
+            })
+        };
+        if let Some(result) = pending_retirement {
+            result?;
+            return Err(StoreError::BlobSubscriptionPlanChanged);
+        }
+        drop(retirement_order);
         let durable_candidates = blob_subscription_candidates_write(
             &write,
             plan.subscription,
@@ -1166,6 +1271,9 @@ impl Store {
         token: BlobDeliveryToken,
     ) -> Result<BlobDeliveryAck, StoreError> {
         let token = BlobDeliveryToken::from_bytes(*token.as_bytes())?;
+        if token.is_retirement() {
+            return Err(StoreError::InvalidBlobDeliveryToken);
+        }
         let token = validate_blob_delivery_token_binding(subscription, semantic_id, token)?;
         self.require_live()?;
         let authority = self.require_bound_mission()?;
@@ -1246,6 +1354,7 @@ impl Store {
             validate_blob_delivery_token_attempt(token.attempt, receipt.attempts)?;
             return Ok(BlobDeliveryAck::AlreadyAcknowledged);
         }
+        require_blob_publication_visible_write(&write, blob.transfer_id)?;
         if retirement.is_some() || matches!(delivery_state, Some(BlobDeliveryRecord::Retired(_))) {
             return Err(StoreError::Blob(super::BlobStoreError::ExpiredOrRetired));
         }
@@ -1347,8 +1456,8 @@ impl Store {
         Ok(BlobDeliveryAck::Acknowledged)
     }
 
-    #[allow(dead_code)] // Internal Task-4 poll seam; public Task-6 API remains inactive.
-    pub(crate) fn prepare_blob_retirement_poll_with_policy(
+    #[doc(hidden)]
+    pub fn prepare_blob_retirement_poll_with_policy(
         &self,
         policy: &ControlPolicySnapshot,
         subscription: BlobSubscriptionId,
@@ -1381,6 +1490,9 @@ impl Store {
             std::ops::Bound::Included(start.as_slice()),
             std::ops::Bound::Included(end.as_slice()),
         ))? {
+            if candidates.len() == delivery_limit {
+                break;
+            }
             let (key, value) = row?;
             if !value.value().is_empty() {
                 return Err(StoreError::BlobInvariant(
@@ -1430,20 +1542,18 @@ impl Store {
                 current_attempt: delivery.current_attempt,
                 reason: delivery.reason,
             });
-            if candidates.len() == delivery_limit {
-                break;
-            }
         }
         Ok(BlobRetirementPollPlan {
             policy: *policy,
             subscription,
             incarnation: record.incarnation,
+            delivery_limit,
             candidates,
         })
     }
 
-    #[allow(dead_code)] // Internal Task-4 poll seam; public Task-6 API remains inactive.
-    pub(crate) fn commit_blob_retirement_poll_with_policy(
+    #[doc(hidden)]
+    pub fn commit_blob_retirement_poll_with_policy(
         &self,
         policy: &ControlPolicySnapshot,
         plan: &BlobRetirementPollPlan,
@@ -1468,6 +1578,56 @@ impl Store {
                 received: plan.incarnation,
             });
         }
+        let mut start = [0u8; BLOB_RETIREMENT_DELIVERY_ORDER_KEY_BYTES];
+        start[..32].copy_from_slice(plan.subscription.as_bytes());
+        let mut end = [0xff; BLOB_RETIREMENT_DELIVERY_ORDER_KEY_BYTES];
+        end[..32].copy_from_slice(plan.subscription.as_bytes());
+        let order = write.open_table(BLOB_RETIREMENT_DELIVERY_ORDER)?;
+        let mut observed = Vec::with_capacity(plan.candidates.len().saturating_add(1));
+        for row in order
+            .range::<&[u8]>((
+                std::ops::Bound::Included(start.as_slice()),
+                std::ops::Bound::Included(end.as_slice()),
+            ))?
+            .take(plan.candidates.len().saturating_add(1))
+        {
+            let (key, value) = row?;
+            if !value.value().is_empty() {
+                return Err(StoreError::BlobInvariant(
+                    "Blob retirement-delivery order value is not empty",
+                ));
+            }
+            let (ordered_subscription, marker, semantic, generation) =
+                parse_blob_retirement_delivery_order_key(key.value())?;
+            if ordered_subscription != plan.subscription {
+                return Err(StoreError::BlobInvariant(
+                    "Blob retirement-delivery order escaped its subscription prefix",
+                ));
+            }
+            observed.push((marker, semantic, generation));
+        }
+        if observed.len() < plan.candidates.len()
+            || !plan
+                .candidates
+                .iter()
+                .zip(&observed)
+                .all(|(candidate, observed)| {
+                    observed
+                        == &(
+                            candidate.acceptance_marker,
+                            candidate.semantic_id,
+                            candidate.retirement_generation,
+                        )
+                })
+        {
+            return Err(StoreError::BlobSubscriptionPlanChanged);
+        }
+        if plan.candidates.len() < plan.delivery_limit && observed.len() != plan.candidates.len() {
+            return Err(StoreError::BlobSubscriptionPlanChanged);
+        }
+        let has_more =
+            plan.candidates.len() == plan.delivery_limit && observed.len() > plan.candidates.len();
+        drop(order);
         let mut deliveries = Vec::with_capacity(plan.candidates.len());
         for candidate in &plan.candidates {
             let key = blob_retirement_delivery_key(
@@ -1511,6 +1671,13 @@ impl Store {
                 .insert(key.as_slice(), encoded.as_slice())?;
             deliveries.push(BlobRetirementDelivery {
                 semantic_id: candidate.semantic_id,
+                blob_id: identity.blob_id,
+                publisher: identity.publisher,
+                publisher_counter: identity.publisher_counter,
+                topic: identity.topic,
+                scope: identity.scope,
+                priority: identity.priority,
+                ttl_ms: identity.ttl_ms,
                 acceptance_marker: candidate.acceptance_marker,
                 subscription_incarnation: plan.incarnation,
                 retirement_generation: candidate.retirement_generation,
@@ -1526,11 +1693,14 @@ impl Store {
             });
         }
         write.commit()?;
-        Ok(BlobRetirementDeliveryPage { deliveries })
+        Ok(BlobRetirementDeliveryPage {
+            deliveries,
+            has_more,
+        })
     }
 
-    #[allow(dead_code)] // Internal Task-4 acknowledgement seam; public Task-6 API remains inactive.
-    pub(crate) fn acknowledge_blob_retirement_with_policy(
+    #[doc(hidden)]
+    pub fn acknowledge_blob_retirement_with_policy(
         &self,
         policy: &ControlPolicySnapshot,
         subscription: BlobSubscriptionId,
@@ -1689,7 +1859,7 @@ impl Store {
     }
 }
 
-#[allow(dead_code)] // Internal Task-4 acknowledgement seam; public Task-6 API remains inactive.
+#[allow(dead_code)]
 fn validate_blob_retirement_attempt(received: u64, maximum: u64) -> Result<(), StoreError> {
     if received < 2 || received > maximum {
         return Err(StoreError::BlobDeliveryAttemptChanged {
@@ -1875,6 +2045,9 @@ fn blob_subscription_candidates_write(
             .checked_add(1)
             .ok_or(StoreError::AcceptanceMarkerExhausted)?;
         let transfer = parse_blob_subscription_transfer_id(transfer.value())?;
+        if super::blob_subscription_lifetime_hidden_write(write, transfer)? {
+            continue;
+        }
         let identity = super::blob_subscription_identity_for_transfer_write(write, transfer)?
             .ok_or(StoreError::BlobInvariant(
                 "Blob acceptance-order index points to a missing Blob",
@@ -2055,7 +2228,7 @@ struct BlobDeliveryTokenParts {
     attempt: u64,
 }
 
-#[allow(dead_code)] // Internal Task-4 token dispatch; public Task-6 API remains inactive.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct BlobRetirementDeliveryTokenParts {
     subscription_incarnation: u64,
@@ -2109,7 +2282,7 @@ fn validate_blob_delivery_token_binding(
     Ok(parts)
 }
 
-#[allow(dead_code)] // Internal Task-4 token dispatch; public Task-6 API remains inactive.
+#[allow(dead_code)]
 pub(crate) fn blob_retirement_delivery_token(
     subscription: BlobSubscriptionId,
     semantic_id: BlobSemanticId,
@@ -2134,7 +2307,7 @@ pub(crate) fn blob_retirement_delivery_token(
     BlobDeliveryToken(bytes)
 }
 
-#[allow(dead_code)] // Internal Task-4 token dispatch; public Task-6 API remains inactive.
+#[allow(dead_code)]
 fn validate_blob_retirement_delivery_token_binding(
     subscription: BlobSubscriptionId,
     semantic_id: BlobSemanticId,
@@ -2429,7 +2602,7 @@ fn decode_blob_retirement_delivery_record(
     Ok(record)
 }
 
-#[allow(dead_code)] // Internal Task-4 receipt codec; public Task-6 API remains inactive.
+#[allow(dead_code)]
 fn encode_blob_retirement_acknowledgement_record(
     record: BlobRetirementAcknowledgementRecord,
 ) -> Vec<u8> {
@@ -4743,7 +4916,10 @@ mod tests {
             attempt_two.as_bytes()[0],
             BLOB_RETIREMENT_DELIVERY_TOKEN_VERSION
         );
-        assert!(BlobDeliveryToken::from_bytes(*attempt_two.as_bytes()).is_err());
+        assert_eq!(
+            BlobDeliveryToken::from_bytes(*attempt_two.as_bytes()).unwrap(),
+            attempt_two
+        );
         assert_eq!(
             BlobDeliveryToken::from_retirement_bytes(*attempt_two.as_bytes()).unwrap(),
             attempt_two

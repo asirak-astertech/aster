@@ -21,7 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lifecycle accounting with audit-first atomic predecessor migration.
 - Persistent six-class Blob maintenance discovery with independently nonzero
   row/file/byte budgets, durable fair cursors, and automatic bounded startup and
-  periodic background turns. This does not activate finite Blob TTL.
+  periodic background turns.
 - Bounded Blob pressure recovery for the exact rejected publication,
   network-staging, or depot partition. It evicts only strictly lower-priority
   work in deterministic incomplete-before-completed order, then expiry class
@@ -29,8 +29,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   identity, and never skips an oversized first
   atomic candidate, reconciles local caches, and retries admission once.
   Deletion remains manifest-backed and resumable, with depot capacity charged
-  until physical finalization. Finite Blob TTL remains inactive. Blob wire
-  bytes, supported public Blob API, and CLI behavior are unchanged.
+  until physical finalization.
+- Rust selected-Blob finite publication options, exact original-TTL echoes,
+  page-bounded lifecycle checks, and tagged content/retirement delivery with
+  separately bound acknowledgement tokens. CLI, RPC, Protobuf, and FFI Blob
+  lifetime fields remain unchanged.
 
 ### Changed
 
@@ -47,11 +50,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   clock-continuity loss. Finite Event/RouteEvent rows remain withheld below TTL,
   re-anchor through the existing bounded expiration index across restarts, and
   expire once their conservative lower bound reaches TTL. The change is
-  wire-neutral; finite Blob TTL and expiry remain separate follow-up work.
+  wire-neutral.
 - Made local Blob admission, network staging, publication promotion, and pending
   abort transactionally update their lifecycle fences, typed roots, counters,
-  and ordinary visibility without changing semantic-v5 wire bytes or public
-  application behavior.
+  and ordinary visibility without changing semantic-v5 wire bytes or durable
+  publication behavior.
+- Deliberately changed the Rust `BlobDeliveryPage::deliveries` field from
+  `Vec<BlobDelivery>` to `Vec<BlobDeliveryItem>` so one bounded page can carry
+  either content metadata or a retirement notice. This is a Rust source
+  compatibility break; callers must match the tagged delivery item.
 
 ### Security
 

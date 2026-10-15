@@ -142,8 +142,9 @@ completed variants, atomically retires current-policy-invalidated publications
 and their aliases, and expires those retained retirement records after 45 days
 of accumulated conservative lower-bound age. Blob admission can also perform
 one bounded, partition-specific pressure-recovery attempt for strictly
-lower-priority Blob work; it does not activate finite Blob TTL, route-only
-custody, or public protocol/API/CLI lifecycle controls. See the
+lower-priority Blob work. The selected Rust API activates finite Blob TTL and
+tagged retirement notices; route-only custody, public GC controls, and Blob
+lifetime fields in CLI/RPC/Protobuf/FFI remain open. See the
 [current implementation boundary](../README.md#current-implementation-boundary).
 
 ### Priority and TTL

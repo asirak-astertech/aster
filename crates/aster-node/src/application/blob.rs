@@ -23,9 +23,9 @@ use std::{
 
 use aster_mesh::{
     BlobContentVerification, BlobError, BlobId as CoreBlobId, BlobMetadata as CoreBlobMetadata,
-    ContentVerifiedBlobEnvelope, MAX_BLOB_MEDIA_TYPE_BYTES, MAX_BLOB_SCHEMA_ID_BYTES, NodeId,
-    PreparedBlob, Priority, ReferenceEnvelopeSealer, SELECTED_BLOB_CHUNK_SIZE, Scope, Topic,
-    prepare_blob,
+    ContentVerifiedBlobEnvelope, CustodySample, MAX_BLOB_MEDIA_TYPE_BYTES,
+    MAX_BLOB_SCHEMA_ID_BYTES, NodeId, PreparedBlob, Priority, ReferenceEnvelopeSealer,
+    SELECTED_BLOB_CHUNK_SIZE, Scope, Topic, prepare_blob,
 };
 #[cfg(test)]
 use aster_redb_store::{BlobCapacityGcTarget, BlobMaintenanceBudget};
@@ -41,7 +41,7 @@ use aster_redb_store::{
     MAX_NETWORK_BLOB_CHUNKS, Store, StoreError, StoreLimits, StoredBlob,
 };
 pub use aster_redb_store::{
-    BlobDepotLimits, BlobGcFailureCategory, BlobGcRetryState, BlobGcStatus,
+    BlobDepotLimits, BlobGcFailureCategory, BlobGcRetryState, BlobGcStatus, BlobRetirementReason,
 };
 use tokio::sync::{mpsc, oneshot};
 use zeroize::{Zeroize as _, Zeroizing};
@@ -434,12 +434,14 @@ impl BlobPollRequest {
 
 /// Opaque acknowledgement identity for one exact Blob delivery retry.
 ///
-/// Tokens bind the subscription incarnation, publication identity, delivery
-/// tenure, and one issued attempt. A token from an earlier retry remains valid
-/// while that same publication tenure is pending, which permits crash-safe
-/// acknowledgement; it cannot cross a later tenure, subscription incarnation,
-/// publication, or subscription. Applications may persist the canonical bytes
-/// without learning or reconstructing the binding fields.
+/// Content tokens bind the subscription incarnation, publication identity,
+/// delivery tenure, and one issued attempt. Retirement tokens instead bind the
+/// retirement generation and its issued attempt. A token from an earlier retry
+/// remains valid while that same content tenure or retirement evidence remains
+/// active, which permits crash-safe acknowledgement; it cannot cross a later
+/// tenure or generation, subscription incarnation, publication, or
+/// subscription. Applications may persist the canonical bytes without learning
+/// or reconstructing the binding fields.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct BlobDeliveryToken(StoreBlobDeliveryToken);
 
@@ -494,6 +496,8 @@ pub struct BlobDelivery {
     pub topic: Topic,
     pub scope: Scope,
     pub priority: Priority,
+    /// Original source-authenticated TTL; `None` means durable.
+    pub ttl_ms: Option<u64>,
     pub total_len: u64,
     pub media_type: Option<String>,
     pub schema_id: Vec<u8>,
@@ -507,14 +511,59 @@ pub struct BlobDelivery {
     pub token: BlobDeliveryToken,
 }
 
+/// Metadata-only notice that one previously delivered publication retired.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlobRetirementDelivery {
+    pub publication: BlobPublicationId,
+    pub id: BlobId,
+    pub publisher: NodeId,
+    pub publisher_counter: u64,
+    pub topic: Topic,
+    pub scope: Scope,
+    pub priority: Priority,
+    /// Original source-authenticated TTL; `None` means durable.
+    pub ttl_ms: Option<u64>,
+    pub acceptance_marker: u64,
+    pub reason: BlobRetirementReason,
+    pub retirement_generation: u64,
+    pub attempt: u64,
+    pub token: BlobDeliveryToken,
+}
+
+/// One tagged content or retirement notification.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BlobDeliveryItem {
+    Content(BlobDelivery),
+    Retirement(BlobRetirementDelivery),
+}
+
+impl BlobDeliveryItem {
+    pub const fn content(&self) -> Option<&BlobDelivery> {
+        match self {
+            Self::Content(delivery) => Some(delivery),
+            Self::Retirement(_) => None,
+        }
+    }
+
+    pub const fn retirement(&self) -> Option<&BlobRetirementDelivery> {
+        match self {
+            Self::Content(_) => None,
+            Self::Retirement(delivery) => Some(delivery),
+        }
+    }
+}
+
 /// Bounded source-authenticated immutable-publication delivery result.
 ///
-/// Pending attempts are returned first and otherwise ordered by this
-/// receiver's durable acceptance markers. That order is local bookkeeping,
-/// not publisher-counter, causal, source-acceptance, or global/network order.
+/// A page contains exactly one delivery family: pending retirements win over
+/// content, so content remains pending for a later page whenever a retirement
+/// page is returned. Within either family, pending attempts are returned first
+/// and otherwise ordered by this receiver's durable acceptance markers. That
+/// order is local bookkeeping, not publisher-counter, causal,
+/// source-acceptance, or global/network order. `has_more` covers both families.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct BlobDeliveryPage {
-    pub deliveries: Vec<BlobDelivery>,
+    pub deliveries: Vec<BlobDeliveryItem>,
     pub has_more: bool,
 }
 
@@ -647,13 +696,46 @@ pub struct BlobPublishRequest {
     pub schema_id: Vec<u8>,
 }
 
-/// Successful durable Blob publication without manifest or provider details.
+/// Additive lifetime selection for one Blob publication.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BlobPublishOptions {
+    ttl_ms: Option<u64>,
+}
+
+impl BlobPublishOptions {
+    /// Selects durable, non-expiring publication.
+    pub const fn durable() -> Self {
+        Self { ttl_ms: None }
+    }
+
+    /// Selects a positive original lifetime in milliseconds.
+    pub const fn finite_ttl_ms(ttl_ms: u64) -> Result<Self, ApplicationError> {
+        if ttl_ms == 0 {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::InvalidRequest,
+                "blob publish",
+            ));
+        }
+        Ok(Self {
+            ttl_ms: Some(ttl_ms),
+        })
+    }
+
+    /// Returns the exact original lifetime, never a remaining lifetime.
+    pub const fn ttl_ms(self) -> Option<u64> {
+        self.ttl_ms
+    }
+}
+
+/// Successful Blob publication without manifest or provider details.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BlobPublishResult {
     pub id: BlobId,
     pub publisher: NodeId,
     pub publisher_counter: u64,
     pub priority: Priority,
+    /// Original source-authenticated TTL; `None` means durable.
+    pub ttl_ms: Option<u64>,
     pub total_len: u64,
     pub media_type: Option<String>,
     pub schema_id: Vec<u8>,
@@ -694,10 +776,13 @@ pub struct BlobReadPageRequest {
 /// caller custody and may outlive node shutdown or zeroization. Closing live
 /// admission prevents new pages; it cannot erase caller-owned copies.
 pub struct BlobReadPage {
+    publication: BlobPublicationId,
     pub id: BlobId,
     pub publisher: NodeId,
     pub publisher_counter: u64,
     pub priority: Priority,
+    /// Original source-authenticated TTL; `None` means durable.
+    pub ttl_ms: Option<u64>,
     pub total_len: u64,
     pub media_type: Option<String>,
     pub schema_id: Vec<u8>,
@@ -738,6 +823,7 @@ impl fmt::Debug for BlobReadPage {
             .field("publisher", &self.publisher)
             .field("publisher_counter", &self.publisher_counter)
             .field("priority", &self.priority)
+            .field("ttl_ms", &self.ttl_ms)
             .field("total_len", &self.total_len)
             .field("media_type", &self.media_type)
             .field("schema_id", &self.schema_id)
@@ -763,6 +849,8 @@ pub struct BlobReadResult {
     pub publisher: NodeId,
     pub publisher_counter: u64,
     pub priority: Priority,
+    /// Original source-authenticated TTL; `None` means durable.
+    pub ttl_ms: Option<u64>,
     pub total_len: u64,
     pub media_type: Option<String>,
     pub schema_id: Vec<u8>,
@@ -855,11 +943,23 @@ impl SelectedBlobHandle {
         request: BlobPublishRequest,
         source: fs::File,
     ) -> Result<BlobPublishResult, ApplicationError> {
+        self.publish_with_options(request, BlobPublishOptions::durable(), source)
+            .await
+    }
+
+    /// Durably publishes one regular file with an explicit lifetime choice.
+    pub async fn publish_with_options(
+        &self,
+        request: BlobPublishRequest,
+        options: BlobPublishOptions,
+        source: fs::File,
+    ) -> Result<BlobPublishResult, ApplicationError> {
         validate_live_publish_request(&request)?;
         let (response, received) = oneshot::channel();
         self.send(
             SelectedBlobCommand::Publish {
                 request,
+                options,
                 source,
                 response,
             },
@@ -1025,6 +1125,7 @@ impl SelectedBlobHandle {
 pub(crate) enum SelectedBlobCommand {
     Publish {
         request: BlobPublishRequest,
+        options: BlobPublishOptions,
         source: fs::File,
         response: oneshot::Sender<Result<BlobPublishResult, ApplicationError>>,
     },
@@ -1176,6 +1277,7 @@ struct VerifiedBlobDeliveryMetadata {
     topic: Topic,
     scope: Scope,
     priority: Priority,
+    ttl_ms: Option<u64>,
     total_len: u64,
     media_type: Option<String>,
     schema_id: Vec<u8>,
@@ -1193,6 +1295,7 @@ impl VerifiedBlobDeliveryMetadata {
             topic: self.topic,
             scope: self.scope,
             priority: self.priority,
+            ttl_ms: self.ttl_ms,
             total_len: self.total_len,
             media_type: self.media_type,
             schema_id: self.schema_id,
@@ -1431,12 +1534,13 @@ impl SelectedBlobNode {
         match command {
             SelectedBlobCommand::Publish {
                 request,
+                options,
                 source,
                 response,
             } => {
                 let mut fatal = None;
-                let result =
-                    self.publish_live_with_admission(request, source, admission, &mut fatal);
+                let result = self
+                    .publish_live_with_admission(request, options, source, admission, &mut fatal);
                 if let Some(error) = fatal {
                     drop(response);
                     Err(error)
@@ -1560,8 +1664,19 @@ impl SelectedBlobNode {
         request: BlobPublishRequest,
         source: &mut R,
     ) -> Result<BlobPublishResult, ApplicationError> {
+        self.publish_with_options(request, BlobPublishOptions::durable(), source)
+    }
+
+    /// Streams, encrypts, and durably publishes one immutable Blob with an explicit lifetime.
+    pub fn publish_with_options<R: Read + Seek>(
+        &mut self,
+        request: BlobPublishRequest,
+        options: BlobPublishOptions,
+        source: &mut R,
+    ) -> Result<BlobPublishResult, ApplicationError> {
+        let initial_sample = self.finite_publish_initial_sample(options)?;
         let retry_request = request.clone();
-        match self.publish_inner(request, source, None, None, None) {
+        match self.publish_inner(request, options, initial_sample, source, None, None, None) {
             Err(BlobPublishAttemptError::Capacity { error, context }) => {
                 if source.seek(std::io::SeekFrom::Start(0)).is_err() {
                     return Err(blob_store_application_error("blob publish", error));
@@ -1580,6 +1695,8 @@ impl SelectedBlobNode {
                 }
                 match self.publish_inner(
                     retry_request,
+                    options,
+                    initial_sample,
                     source,
                     None,
                     Some(&lifecycle),
@@ -1608,7 +1725,13 @@ impl SelectedBlobNode {
     ) -> Result<BlobPublishResult, ApplicationError> {
         let admission = AtomicBool::new(true);
         let mut fatal = None;
-        let result = self.publish_live_with_admission(request, source, &admission, &mut fatal);
+        let result = self.publish_live_with_admission(
+            request,
+            BlobPublishOptions::durable(),
+            source,
+            &admission,
+            &mut fatal,
+        );
         if let Some(error) = fatal {
             Err(application_error("blob publish", error))
         } else {
@@ -1619,6 +1742,7 @@ impl SelectedBlobNode {
     fn publish_live_with_admission(
         &mut self,
         request: BlobPublishRequest,
+        options: BlobPublishOptions,
         mut source: fs::File,
         admission: &AtomicBool,
         fatal: &mut Option<NodeError>,
@@ -1626,6 +1750,7 @@ impl SelectedBlobNode {
         if !admission.load(Ordering::Acquire) {
             return Err(actor_unavailable("blob publish"));
         }
+        let initial_sample = self.finite_publish_initial_sample(options)?;
         if source
             .stream_position()
             .map_err(|error| application_error("blob publish", error.into()))?
@@ -1680,8 +1805,15 @@ impl SelectedBlobNode {
             start_zero_seeks: 0,
         };
         let retry_request = request.clone();
-        let result = match self.publish_inner(request, &mut source, Some(&mut context), None, None)
-        {
+        let result = match self.publish_inner(
+            request,
+            options,
+            initial_sample,
+            &mut source,
+            Some(&mut context),
+            None,
+            None,
+        ) {
             Err(BlobPublishAttemptError::Capacity {
                 error,
                 context: recovery,
@@ -1704,6 +1836,8 @@ impl SelectedBlobNode {
                     context.require_admission()?;
                     match self.publish_inner(
                         retry_request,
+                        options,
+                        initial_sample,
                         &mut source,
                         Some(&mut context),
                         Some(&lifecycle),
@@ -1729,6 +1863,25 @@ impl SelectedBlobNode {
             self.last_live_publish_source_bytes_read = source.total_bytes_read;
         }
         result
+    }
+
+    fn finite_publish_initial_sample(
+        &self,
+        options: BlobPublishOptions,
+    ) -> Result<Option<CustodySample>, ApplicationError> {
+        if options.ttl_ms().is_none() {
+            return Ok(None);
+        }
+        if !self.custody_clock.supports_finite_ttl() {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::UnsupportedValue,
+                "blob publish",
+            ));
+        }
+        self.custody_clock
+            .sample()
+            .map(Some)
+            .map_err(|error| application_error("blob publish", error))
     }
 
     fn recover_capacity_while_locked(
@@ -1774,6 +1927,8 @@ impl SelectedBlobNode {
     fn publish_inner<R: Read + Seek>(
         &mut self,
         request: BlobPublishRequest,
+        options: BlobPublishOptions,
+        initial_sample: Option<CustodySample>,
         source: &mut R,
         mut live: Option<&mut LivePublishContext<'_>>,
         held_lifecycle: Option<&std::sync::MutexGuard<'_, ()>>,
@@ -1864,12 +2019,13 @@ impl SelectedBlobNode {
                 );
             }
         }
-        let intent = BlobPublicationIntent::new(
+        let intent = BlobPublicationIntent::new_with_ttl(
             self.identity(),
             topic.clone(),
             scope.clone(),
             priority,
             prepared.id(),
+            options.ttl_ms(),
         )
         .map_err(|error| application_error("blob publish", error.into()))?;
         let operation_request = BlobOperationRequest::new(&operation, &intent);
@@ -1896,6 +2052,15 @@ impl SelectedBlobNode {
                 }
             }
         };
+        if options.ttl_ms().is_some() {
+            let retry_sample = self
+                .custody_clock
+                .sample()
+                .map_err(|error| application_error("blob publish", error))?;
+            self.store
+                .observe_blob_custody_sample(retry_sample)
+                .map_err(|error| application_error("blob publish", error.into()))?;
+        }
         let operation_preflight = {
             #[cfg(test)]
             if std::mem::replace(&mut self.live_operation_preflight_coherence_fault, false) {
@@ -2024,7 +2189,14 @@ impl SelectedBlobNode {
 
         let reservation = self
             .store
-            .reserve_blob_with_policy(&policy, self.identity(), &topic, &scope)
+            .reserve_local_blob_with_policy(
+                &policy,
+                self.identity(),
+                &topic,
+                &scope,
+                options.ttl_ms(),
+                initial_sample,
+            )
             .map_err(|error| application_error("blob publish", error.into()))?;
         let manifest_len = u64::try_from(finished.manifest_bytes().len()).map_err(|_| {
             ApplicationError::new(ApplicationErrorKind::ResourceLimit, "blob publish")
@@ -2099,13 +2271,23 @@ impl SelectedBlobNode {
         if let Some(context) = live.as_deref_mut() {
             context.require_admission()?;
         }
-        let outcome = match self.store.commit_reserved_blob_once_with_policy(
+        let final_sample = if options.ttl_ms().is_some() {
+            Some(
+                self.custody_clock
+                    .sample()
+                    .map_err(|error| application_error("blob publish", error))?,
+            )
+        } else {
+            None
+        };
+        let outcome = match self.store.commit_reserved_local_blob_once_with_policy(
             &policy,
             &operation_request,
             &reservation,
             &verified.blob,
             &sealed.bytes,
             &completion,
+            final_sample,
         ) {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -2219,6 +2401,11 @@ impl SelectedBlobNode {
     pub fn poll(&mut self, request: BlobPollRequest) -> Result<BlobDeliveryPage, ApplicationError> {
         let request = request.validate()?;
         for _ in 0..MAX_SELECTED_BLOB_PLAN_RETRIES {
+            let source_route_cache = Arc::clone(&self.source_route_cache);
+            let _lifecycle = source_route_cache
+                .lock_blob_lifecycle()
+                .map_err(|error| application_error("blob poll", error))?;
+            self.observe_current_blob_custody_sample("blob poll")?;
             let policy = self.current_policy("blob poll")?;
             let plan = self
                 .store
@@ -2227,6 +2414,14 @@ impl SelectedBlobNode {
                     request.subscription.into_store(),
                     request.delivery_limit,
                     request.scan_limit,
+                )
+                .map_err(|error| application_error("blob poll", error.into()))?;
+            let retirement_plan = self
+                .store
+                .prepare_blob_retirement_poll_with_policy(
+                    &policy,
+                    request.subscription.into_store(),
+                    request.delivery_limit,
                 )
                 .map_err(|error| application_error("blob poll", error.into()))?;
             if plan.subscription() != request.subscription.into_store() {
@@ -2392,6 +2587,7 @@ impl SelectedBlobNode {
                     topic: opened.blob.topic().clone(),
                     scope: opened.blob.scope().clone(),
                     priority: opened.blob.priority(),
+                    ttl_ms: opened.blob.ttl_ms(),
                     total_len: opened.blob.manifest().total_len(),
                     media_type: metadata.media_type().map(str::to_owned),
                     schema_id: metadata.schema_id().to_vec(),
@@ -2405,6 +2601,77 @@ impl SelectedBlobNode {
                     ));
                 }
                 selection.deliverable.push(projection.semantic_id);
+            }
+
+            // Retirements are one delivery family and always win the page. Verify
+            // the content plan first so the combined lookahead is exact rather
+            // than merely reporting that unverified content candidates exist.
+            let content_has_more = plan.candidates().iter().any(|candidate| {
+                selection
+                    .deliverable
+                    .contains(&candidate.projection().semantic_id)
+                    && candidate.acknowledged_attempt().is_none()
+            });
+            self.observe_current_blob_custody_sample("blob poll")?;
+            let rechecked_plan = self
+                .store
+                .prepare_blob_subscription_poll_with_policy(
+                    &policy,
+                    request.subscription.into_store(),
+                    request.delivery_limit,
+                    request.scan_limit,
+                )
+                .map_err(|error| application_error("blob poll", error.into()))?;
+            let rechecked_retirement_plan = self
+                .store
+                .prepare_blob_retirement_poll_with_policy(
+                    &policy,
+                    request.subscription.into_store(),
+                    request.delivery_limit,
+                )
+                .map_err(|error| application_error("blob poll", error.into()))?;
+            if rechecked_plan != plan || rechecked_retirement_plan != retirement_plan {
+                continue;
+            }
+            let retirement_page = match self
+                .store
+                .commit_blob_retirement_poll_with_policy(&policy, &retirement_plan)
+            {
+                Ok(page) => page,
+                Err(
+                    StoreError::BlobSubscriptionPlanChanged
+                    | StoreError::BlobSelectorGenerationChanged
+                    | StoreError::ControlPolicyChanged,
+                ) => continue,
+                Err(error) => return Err(application_error("blob poll", error.into())),
+            };
+            if !retirement_page.deliveries.is_empty() {
+                let has_more = retirement_page.has_more || content_has_more;
+                let deliveries = retirement_page
+                    .deliveries
+                    .into_iter()
+                    .map(|delivery| {
+                        BlobDeliveryItem::Retirement(BlobRetirementDelivery {
+                            publication: BlobPublicationId::from_store(delivery.semantic_id()),
+                            id: BlobId::from_core(delivery.blob_id()),
+                            publisher: delivery.publisher(),
+                            publisher_counter: delivery.publisher_counter(),
+                            topic: delivery.topic().clone(),
+                            scope: delivery.scope().clone(),
+                            priority: delivery.priority(),
+                            ttl_ms: delivery.ttl_ms(),
+                            acceptance_marker: delivery.acceptance_marker(),
+                            reason: delivery.reason(),
+                            retirement_generation: delivery.retirement_generation(),
+                            attempt: delivery.attempt(),
+                            token: BlobDeliveryToken::from_store(delivery.token()),
+                        })
+                    })
+                    .collect();
+                return Ok(BlobDeliveryPage {
+                    deliveries,
+                    has_more,
+                });
             }
 
             let committed = match self
@@ -2445,7 +2712,9 @@ impl SelectedBlobNode {
                     .blob_depot_for_authenticated_read(&metadata.completion)
                     .and_then(|mut depot| depot.recheck_completion(&metadata.completion))
                     .map_err(|error| application_error("blob poll", error.into()))?;
-                deliveries.push(metadata.into_delivery(delivery.attempt, delivery.token));
+                deliveries.push(BlobDeliveryItem::Content(
+                    metadata.into_delivery(delivery.attempt, delivery.token),
+                ));
             }
             return Ok(BlobDeliveryPage {
                 deliveries,
@@ -2465,17 +2734,30 @@ impl SelectedBlobNode {
         publication: BlobPublicationId,
         token: BlobDeliveryToken,
     ) -> Result<BlobAcknowledgement, ApplicationError> {
+        let source_route_cache = Arc::clone(&self.source_route_cache);
+        let _lifecycle = source_route_cache
+            .lock_blob_lifecycle()
+            .map_err(|error| application_error("blob acknowledge", error))?;
+        self.observe_current_blob_custody_sample("blob acknowledge")?;
         let policy = self.current_policy("blob acknowledge")?;
-        match self
-            .store
-            .acknowledge_blob_delivery_with_policy(
+        let token = token.into_store();
+        let acknowledged = if token.is_retirement() {
+            self.store.acknowledge_blob_retirement_with_policy(
                 &policy,
                 subscription.into_store(),
                 publication.into_store(),
-                token.into_store(),
+                token,
             )
-            .map_err(|error| application_error("blob acknowledge", error.into()))?
-        {
+        } else {
+            self.store.acknowledge_blob_delivery_with_policy(
+                &policy,
+                subscription.into_store(),
+                publication.into_store(),
+                token,
+            )
+        }
+        .map_err(|error| application_error("blob acknowledge", error.into()))?;
+        match acknowledged {
             StoreBlobDeliveryAck::Acknowledged => Ok(BlobAcknowledgement::Acknowledged),
             StoreBlobDeliveryAck::AlreadyAcknowledged => {
                 Ok(BlobAcknowledgement::AlreadyAcknowledged)
@@ -2526,19 +2808,30 @@ impl SelectedBlobNode {
         let _lifecycle = source_route_cache
             .lock_blob_lifecycle()
             .map_err(|error| application_error("blob transfer status", error))?;
+        let sample = self.observe_current_blob_custody_sample("blob transfer status")?;
         let snapshot = self
             .store
             .pending_blob_transfer_progress_with_policy(&policy)
             .map_err(|error| application_error("blob transfer status", error.into()))?;
         let gc = self
             .store
-            .blob_gc_status(Some(
-                self.custody_clock
-                    .sample()
-                    .map_err(|error| application_error("blob transfer status", error))?,
-            ))
+            .blob_gc_status(Some(sample))
             .map_err(|error| application_error("blob transfer status", error.into()))?;
         self.map_transfer_status(snapshot, gc)
+    }
+
+    fn observe_current_blob_custody_sample(
+        &self,
+        operation: &'static str,
+    ) -> Result<CustodySample, ApplicationError> {
+        let sample = self
+            .custody_clock
+            .sample()
+            .map_err(|error| application_error(operation, error))?;
+        self.store
+            .observe_blob_custody_sample(sample)
+            .map_err(|error| application_error(operation, error.into()))?;
+        Ok(sample)
     }
 
     fn map_transfer_status(
@@ -2599,66 +2892,90 @@ impl SelectedBlobNode {
         request: BlobReadRequest,
         output: &mut W,
     ) -> Result<BlobReadResult, ApplicationError> {
-        let policy = self.current_policy("blob read")?;
-        let epoch = self.active_epoch(&request.scope, "blob read")?;
-        self.require_blob_grants(&request.topic, &request.scope, epoch, "blob read")?;
-        let plan = self
-            .store
-            .prepare_blob_read_with_policy(
-                &policy,
-                &request.topic,
-                &request.scope,
-                request.id.into_core(),
-            )
-            .map_err(|error| application_error("blob read", error.into()))?;
-        let selected = self.verify_read_plan(&plan, epoch)?;
-        self.store
-            .require_blob_read_plan_with_policy(&policy, &plan)
-            .map_err(|error| application_error("blob read", error.into()))?;
-        self.store
-            .blob_depot()
-            .and_then(|mut depot| depot.completed_blob(&selected.blob, &selected.manifest_bytes))
-            .map_err(|error| application_error("blob read", error.into()))?;
-        let mut service = self
-            .verifier
-            .blob_service_with_store(
-                selected.blob.scope(),
-                selected.blob.topic(),
-                selected.blob.key_epoch(),
-                self.store
-                    .blob_depot()
-                    .map_err(|error| application_error("blob read", error.into()))?,
-            )
-            .map_err(|error| application_error("blob read", error.into()))?;
-        service
-            .install_verified_manifest(&selected.blob, &selected.manifest_bytes)
-            .map_err(|error| blob_core_error("blob read", error))?;
-        let mut reader = service
-            .reader_for_verified(&selected.blob)
-            .map_err(|error| blob_core_error("blob read", error))?;
-        let stats = reader
-            .stream_into(output)
-            .map_err(|error| blob_core_error("blob read", error))?;
-        if stats.plaintext_bytes != selected.blob.manifest().total_len()
-            || stats.verified_chunks != selected.blob.manifest().chunk_count()
-        {
-            return Err(ApplicationError::new(
-                ApplicationErrorKind::Integrity,
-                "blob read",
-            ));
+        let admission = AtomicBool::new(true);
+        let mut offset = 0_u64;
+        let mut verified_chunks = 0_u64;
+        let mut peak_working_buffer_bytes = 0_usize;
+        let mut identity = None;
+        loop {
+            let mut fatal = None;
+            let page = self
+                .read_page_with_admission(
+                    BlobReadPageRequest {
+                        blob: request.clone(),
+                        offset,
+                        max_bytes: MAX_SELECTED_BLOB_PAGE_BYTES,
+                    },
+                    &admission,
+                    None,
+                    &mut fatal,
+                )
+                .map_err(|error| ApplicationError::new(error.kind(), "blob read"))?;
+            if fatal.is_some() {
+                return Err(ApplicationError::new(
+                    ApplicationErrorKind::Integrity,
+                    "blob read",
+                ));
+            }
+            let page_identity = (
+                page.publication,
+                page.id,
+                page.publisher,
+                page.publisher_counter,
+                page.priority,
+                page.ttl_ms,
+                page.total_len,
+                page.media_type.clone(),
+                page.schema_id.clone(),
+                page.acceptance_marker,
+            );
+            if let Some(initial) = identity.as_ref() {
+                if initial != &page_identity {
+                    return Err(ApplicationError::new(
+                        ApplicationErrorKind::Integrity,
+                        "blob read",
+                    ));
+                }
+            } else {
+                identity = Some(page_identity);
+            }
+            output.write_all(page.as_bytes()).map_err(|_| {
+                ApplicationError::new(ApplicationErrorKind::StateUnavailable, "blob read")
+            })?;
+            peak_working_buffer_bytes = peak_working_buffer_bytes.max(page.len());
+            verified_chunks = verified_chunks.checked_add(1).ok_or_else(|| {
+                ApplicationError::new(ApplicationErrorKind::Integrity, "blob read")
+            })?;
+            offset = page.next_offset();
+            if page.complete {
+                break;
+            }
         }
-        let metadata = selected.blob.manifest().metadata();
+        let (
+            _publication,
+            id,
+            publisher,
+            publisher_counter,
+            priority,
+            ttl_ms,
+            total_len,
+            media_type,
+            schema_id,
+            acceptance_marker,
+        ) = identity
+            .ok_or_else(|| ApplicationError::new(ApplicationErrorKind::Integrity, "blob read"))?;
         Ok(BlobReadResult {
-            id: BlobId::from_core(selected.blob.blob_id()),
-            publisher: selected.blob.publisher(),
-            publisher_counter: selected.blob.dot().counter,
-            priority: selected.blob.priority(),
-            total_len: selected.blob.manifest().total_len(),
-            media_type: metadata.media_type().map(str::to_owned),
-            schema_id: metadata.schema_id().to_vec(),
-            acceptance_marker: selected.acceptance_marker,
-            verified_chunks: stats.verified_chunks,
-            peak_working_buffer_bytes: stats.peak_working_buffer_bytes,
+            id,
+            publisher,
+            publisher_counter,
+            priority,
+            ttl_ms,
+            total_len,
+            media_type,
+            schema_id,
+            acceptance_marker,
+            verified_chunks,
+            peak_working_buffer_bytes,
         })
     }
 
@@ -2688,6 +3005,13 @@ impl SelectedBlobNode {
         if live_blob_read_cancelled(admission, response) {
             return Err(actor_unavailable("blob read page"));
         }
+        self.store
+            .observe_blob_custody_sample(
+                self.custody_clock
+                    .sample()
+                    .map_err(|error| application_error("blob read page", error))?,
+            )
+            .map_err(|error| application_error("blob read page", error.into()))?;
         if request.max_bytes == 0 || request.max_bytes > MAX_SELECTED_BLOB_PAGE_BYTES {
             return Err(ApplicationError::new(
                 ApplicationErrorKind::InvalidRequest,
@@ -2888,10 +3212,12 @@ impl SelectedBlobNode {
         )?;
         let metadata = selected.stored.blob.manifest().metadata();
         let page = BlobReadPage {
+            publication: BlobPublicationId::from_store(selected.stored.semantic_id),
             id: BlobId::from_core(selected.stored.blob.blob_id()),
             publisher: selected.stored.blob.publisher(),
             publisher_counter: selected.stored.blob.dot().counter,
             priority: selected.stored.blob.priority(),
+            ttl_ms: selected.stored.blob.ttl_ms(),
             total_len,
             media_type: metadata.media_type().map(str::to_owned),
             schema_id: metadata.schema_id().to_vec(),
@@ -3280,67 +3606,7 @@ impl SelectedBlobNode {
         Ok(())
     }
 
-    fn verify_read_plan(
-        &mut self,
-        plan: &BlobReadPlan,
-        current_epoch: u64,
-    ) -> Result<VerifiedStoredBlob, ApplicationError> {
-        let mut active = Vec::with_capacity(plan.candidates().len());
-        let mut selected: Option<VerifiedStoredBlob> = None;
-        for candidate in plan.candidates() {
-            let stored = self
-                .store
-                .load_blob_read_candidate_with_policy(plan.control_policy(), candidate)
-                .map_err(|error| application_error("blob read", error.into()))?;
-            let verified =
-                self.verify_stored_blob(&stored, None, current_epoch, "blob read", false)?;
-            Self::require_blob_plan_claims(plan, &verified)?;
-            let revoked = self
-                .store
-                .is_control_principal_revoked(verified.blob.publisher())
-                .map_err(|error| application_error("blob read", error.into()))?;
-            let is_active = !revoked && verified.blob.key_epoch() == current_epoch;
-            active.push(is_active);
-            if is_active
-                && selected
-                    .as_ref()
-                    .is_none_or(|current| verified.semantic_id > current.semantic_id)
-            {
-                selected = Some(verified);
-            }
-        }
-        let selected_id = selected.as_ref().map(|selected| selected.semantic_id);
-        for (candidate, active) in plan.candidates().iter().zip(active) {
-            let expected = if !active {
-                None
-            } else if Some(candidate.projection().semantic_id) == selected_id {
-                Some(BlobPublicationDisposition::Current)
-            } else {
-                Some(BlobPublicationDisposition::Alternate)
-            };
-            if candidate.disposition() != expected {
-                return Err(ApplicationError::new(
-                    ApplicationErrorKind::Integrity,
-                    "blob read",
-                ));
-            }
-        }
-        let selected = selected.ok_or_else(|| {
-            ApplicationError::new(ApplicationErrorKind::UnauthorizedOrRevoked, "blob read")
-        })?;
-        if plan
-            .current()
-            .map(|candidate| candidate.projection().semantic_id)
-            != Some(selected.semantic_id)
-        {
-            return Err(ApplicationError::new(
-                ApplicationErrorKind::Integrity,
-                "blob read",
-            ));
-        }
-        Ok(selected)
-    }
-
+    #[cfg(test)]
     fn require_blob_plan_claims(
         plan: &BlobReadPlan,
         verified: &VerifiedStoredBlob,
@@ -3580,6 +3846,7 @@ impl SelectedBlobNode {
             publisher: stored.header.stamp.dot.publisher,
             publisher_counter: stored.header.stamp.dot.counter,
             priority: stored.header.priority,
+            ttl_ms: stored.header.ttl_ms,
             total_len: prepared.total_len(),
             media_type: metadata.media_type().map(str::to_owned),
             schema_id: metadata.schema_id().to_vec(),
@@ -3675,6 +3942,7 @@ fn blob_publish_result(blob: &VerifiedStoredBlob, inserted: bool) -> BlobPublish
         publisher: blob.blob.publisher(),
         publisher_counter: blob.blob.dot().counter,
         priority: blob.blob.priority(),
+        ttl_ms: blob.blob.ttl_ms(),
         total_len: blob.blob.manifest().total_len(),
         media_type: metadata.media_type().map(str::to_owned),
         schema_id: metadata.schema_id().to_vec(),
@@ -3869,6 +4137,593 @@ mod tests {
     use crate::application::SelectedEventNode;
 
     static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
+
+    fn content_delivery(item: &BlobDeliveryItem) -> &BlobDelivery {
+        item.content().expect("content Blob delivery")
+    }
+
+    #[test]
+    fn blob_publish_options_preserve_exact_positive_ttl() {
+        assert_eq!(BlobPublishOptions::default(), BlobPublishOptions::durable());
+        assert_eq!(BlobPublishOptions::durable().ttl_ms(), None);
+        assert_eq!(
+            BlobPublishOptions::finite_ttl_ms(1)
+                .expect("positive minimum TTL")
+                .ttl_ms(),
+            Some(1)
+        );
+        assert_eq!(
+            BlobPublishOptions::finite_ttl_ms(u64::MAX)
+                .expect("positive maximum TTL")
+                .ttl_ms(),
+            Some(u64::MAX)
+        );
+        assert_eq!(
+            BlobPublishOptions::finite_ttl_ms(0)
+                .expect_err("zero TTL must be rejected")
+                .kind(),
+            ApplicationErrorKind::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn finite_publish_unsupported_clock_rejects_before_source_io_or_mutation() {
+        let root = TestRoot::new("finite-unsupported-clock");
+        let mut node = selected_node(&root);
+        node.custody_clock = NodeCustodyClock::open_from_linux_boot_id(node.identity(), None)
+            .expect("unsupported process-local custody clock");
+        assert!(!node.custody_clock.supports_finite_ttl());
+        let before = node.store.blob_stats().expect("pre-rejection stats");
+        let mut source = CountingCursor::new(payload(17));
+
+        let error = node
+            .publish_with_options(
+                request(b"blob/finite-unsupported-clock"),
+                BlobPublishOptions::finite_ttl_ms(1_000).expect("positive TTL"),
+                &mut source,
+            )
+            .expect_err("finite publication requires a supported custody clock");
+
+        assert_eq!(error.kind(), ApplicationErrorKind::UnsupportedValue);
+        assert_eq!(source.bytes_read, 0);
+        assert_eq!(
+            node.store.blob_stats().expect("post-rejection stats"),
+            before
+        );
+    }
+
+    #[test]
+    fn finite_publish_echoes_ttl_and_operation_identity_rejects_lifetime_changes() {
+        let root = TestRoot::new("finite-publish-api");
+        let mut node = selected_node(&root);
+        node.custody_clock = NodeCustodyClock::injected([0xd1; 16], 1_000, 1);
+        let bytes = payload(SELECTED_BLOB_CHUNK_SIZE as usize + 7);
+        let publish_request = request(b"blob/finite-publish-api");
+        let finite = BlobPublishOptions::finite_ttl_ms(60_000).expect("positive TTL");
+
+        let elapsed = node
+            .publish_with_options(
+                request(b"blob/finite-publish-elapsed-before-commit"),
+                BlobPublishOptions::finite_ttl_ms(1).expect("positive TTL"),
+                &mut Cursor::new(bytes.clone()),
+            )
+            .expect_err("staging time reaching the TTL must prevent publication");
+        assert_eq!(elapsed.kind(), ApplicationErrorKind::ExpiredOrRetired);
+        let elapsed_stats = node
+            .store
+            .blob_stats()
+            .expect("stats after elapsed publication");
+        assert_eq!(elapsed_stats.publications, 0);
+        assert_eq!(elapsed_stats.operations, 0);
+        assert_eq!(elapsed_stats.variants, 1);
+
+        let published = node
+            .publish_with_options(
+                publish_request.clone(),
+                finite,
+                &mut Cursor::new(bytes.clone()),
+            )
+            .expect("publish finite Blob");
+        assert_eq!(published.ttl_ms, Some(60_000));
+
+        let replay = node
+            .publish_with_options(
+                publish_request.clone(),
+                finite,
+                &mut Cursor::new(bytes.clone()),
+            )
+            .expect("replay exact finite Blob");
+        assert!(!replay.inserted);
+        assert_eq!(replay.ttl_ms, Some(60_000));
+
+        let durable_conflict = node
+            .publish(publish_request.clone(), &mut Cursor::new(bytes.clone()))
+            .expect_err("finite operation cannot replay as durable");
+        assert_eq!(durable_conflict.kind(), ApplicationErrorKind::Conflict);
+        let ttl_conflict = node
+            .publish_with_options(
+                publish_request,
+                BlobPublishOptions::finite_ttl_ms(60_001).expect("different positive TTL"),
+                &mut Cursor::new(bytes.clone()),
+            )
+            .expect_err("finite operation cannot replay with a different TTL");
+        assert_eq!(ttl_conflict.kind(), ApplicationErrorKind::Conflict);
+
+        let mut output = Vec::new();
+        let read = node
+            .read_into(
+                BlobReadRequest {
+                    id: published.id,
+                    topic: blob_topic(),
+                    scope: blob_scope(),
+                },
+                &mut output,
+            )
+            .expect("read finite Blob");
+        assert_eq!(output, bytes);
+        assert_eq!(read.ttl_ms, Some(60_000));
+    }
+
+    #[test]
+    fn durable_wrapper_and_explicit_options_share_exact_operation_semantics() {
+        let root = TestRoot::new("durable-publish-wrapper-equivalence");
+        let mut node = selected_node(&root);
+        let bytes = payload(37);
+        let publish_request = request(b"blob/durable-wrapper-equivalence");
+
+        let published = node
+            .publish(publish_request.clone(), &mut Cursor::new(bytes.clone()))
+            .expect("publish through durable wrapper");
+        let replayed = node
+            .publish_with_options(
+                publish_request,
+                BlobPublishOptions::durable(),
+                &mut Cursor::new(bytes),
+            )
+            .expect("replay through explicit durable options");
+
+        assert!(published.inserted);
+        assert!(!replayed.inserted);
+        assert_eq!(published.ttl_ms, None);
+        assert_eq!(replayed.ttl_ms, None);
+        assert_eq!(published.id, replayed.id);
+        assert_eq!(published.publisher, replayed.publisher);
+        assert_eq!(published.publisher_counter, replayed.publisher_counter);
+        assert_eq!(published.acceptance_marker, replayed.acceptance_marker);
+    }
+
+    #[test]
+    fn maximum_finite_ttl_has_an_unreachable_saturated_deadline() {
+        let root = TestRoot::new("finite-maximum-ttl");
+        let mut node = selected_node(&root);
+        node.custody_clock = NodeCustodyClock::injected([0xd5; 16], 1_000, 0);
+
+        let published = node
+            .publish_with_options(
+                request(b"blob/finite-maximum-ttl"),
+                BlobPublishOptions::finite_ttl_ms(u64::MAX).expect("maximum positive TTL"),
+                &mut Cursor::new(payload(41)),
+            )
+            .expect("publish maximum finite TTL");
+
+        assert_eq!(published.ttl_ms, Some(u64::MAX));
+        let read = node
+            .read_into(
+                BlobReadRequest {
+                    id: published.id,
+                    topic: blob_topic(),
+                    scope: blob_scope(),
+                },
+                &mut Vec::new(),
+            )
+            .expect("maximum finite TTL remains live");
+        assert_eq!(read.ttl_ms, Some(u64::MAX));
+    }
+
+    #[test]
+    fn exact_finite_retry_rechecks_expiry_stopped_live_and_after_reopen() {
+        let bytes = payload(43);
+
+        let stopped_root = TestRoot::new("finite-retry-expired-stopped");
+        let mut stopped = selected_node(&stopped_root);
+        stopped.custody_clock = NodeCustodyClock::injected([0xd6; 16], 1_000, 0);
+        let stopped_request = request(b"blob/finite-retry-expired-stopped");
+        stopped
+            .publish_with_options(
+                stopped_request.clone(),
+                BlobPublishOptions::finite_ttl_ms(50).expect("positive TTL"),
+                &mut Cursor::new(bytes.clone()),
+            )
+            .expect("publish stopped retry fixture");
+        stopped
+            .custody_clock
+            .set_injected_tick(1_050)
+            .expect("advance stopped custody clock");
+        let stopped_error = stopped
+            .publish_with_options(
+                stopped_request,
+                BlobPublishOptions::finite_ttl_ms(50).expect("positive TTL"),
+                &mut Cursor::new(bytes.clone()),
+            )
+            .expect_err("stopped exact retry cannot revive an expired publication");
+        assert_eq!(stopped_error.kind(), ApplicationErrorKind::ExpiredOrRetired);
+
+        let live_root = TestRoot::new("finite-retry-expired-live");
+        let mut live = selected_node(&live_root);
+        live.custody_clock = NodeCustodyClock::injected([0xd7; 16], 2_000, 0);
+        let live_request = request(b"blob/finite-retry-expired-live");
+        let source_path = live_root.path().join("finite-retry-expired-live.bin");
+        fs::write(&source_path, &bytes).expect("write live finite source");
+        let admission = AtomicBool::new(true);
+        let mut fatal = None;
+        live.publish_live_with_admission(
+            live_request.clone(),
+            BlobPublishOptions::finite_ttl_ms(50).expect("positive TTL"),
+            fs::File::open(&source_path).expect("open live finite source"),
+            &admission,
+            &mut fatal,
+        )
+        .expect("publish live retry fixture");
+        assert!(fatal.is_none());
+        live.custody_clock
+            .set_injected_tick(2_050)
+            .expect("advance live custody clock");
+        let live_error = live
+            .publish_live_with_admission(
+                live_request,
+                BlobPublishOptions::finite_ttl_ms(50).expect("positive TTL"),
+                fs::File::open(&source_path).expect("reopen live finite source"),
+                &admission,
+                &mut fatal,
+            )
+            .expect_err("live exact retry cannot revive an expired publication");
+        assert_eq!(live_error.kind(), ApplicationErrorKind::ExpiredOrRetired);
+        assert!(
+            fatal.is_none(),
+            "ordinary expiry is not a coherence failure"
+        );
+
+        let reopen_root = TestRoot::new("finite-retry-expired-reopen");
+        let reopen_request = request(b"blob/finite-retry-expired-reopen");
+        {
+            let mut node = selected_node(&reopen_root);
+            node.custody_clock = NodeCustodyClock::injected([0xd8; 16], 3_000, 0);
+            node.publish_with_options(
+                reopen_request.clone(),
+                BlobPublishOptions::finite_ttl_ms(50).expect("positive TTL"),
+                &mut Cursor::new(bytes.clone()),
+            )
+            .expect("publish reopen retry fixture");
+        }
+        let mut reopened = selected_node(&reopen_root);
+        reopened.custody_clock = NodeCustodyClock::injected([0xd8; 16], 3_050, 0);
+        let reopen_error = reopened
+            .publish_with_options(
+                reopen_request,
+                BlobPublishOptions::finite_ttl_ms(50).expect("positive TTL"),
+                &mut Cursor::new(bytes),
+            )
+            .expect_err("reopened exact retry cannot revive an expired publication");
+        assert_eq!(reopen_error.kind(), ApplicationErrorKind::ExpiredOrRetired);
+    }
+
+    #[test]
+    fn stopped_finite_read_never_opens_a_later_page_after_expiry() {
+        let root = TestRoot::new("finite-read-page-boundary");
+        let mut node = selected_node(&root);
+        node.custody_clock = NodeCustodyClock::injected([0xd2; 16], 100, 1);
+        let bytes = payload(2 * SELECTED_BLOB_CHUNK_SIZE as usize + 11);
+        let published = node
+            .publish_with_options(
+                request(b"blob/finite-read-page-boundary"),
+                BlobPublishOptions::finite_ttl_ms(4).expect("positive TTL"),
+                &mut Cursor::new(bytes),
+            )
+            .expect("publish finite boundary Blob");
+        let mut output = Vec::new();
+        let error = node
+            .read_into(
+                BlobReadRequest {
+                    id: published.id,
+                    topic: blob_topic(),
+                    scope: blob_scope(),
+                },
+                &mut output,
+            )
+            .expect_err("later page must not open at the exact TTL boundary");
+        assert_eq!(error.kind(), ApplicationErrorKind::ExpiredOrRetired);
+        assert_eq!(output.len(), SELECTED_BLOB_CHUNK_SIZE as usize);
+    }
+
+    #[test]
+    fn missing_blob_read_is_not_found_without_retirement_evidence() {
+        let root = TestRoot::new("missing-read-not-found");
+        let mut node = selected_node(&root);
+        let error = node
+            .read_into(
+                BlobReadRequest {
+                    id: BlobId::from_bytes([0xe4; 32]),
+                    topic: blob_topic(),
+                    scope: blob_scope(),
+                },
+                &mut Vec::new(),
+            )
+            .expect_err("unknown Blob has no retained retirement evidence");
+        assert_eq!(error.kind(), ApplicationErrorKind::NotFound);
+    }
+
+    #[test]
+    fn finite_publish_reopens_with_exact_ttl_and_shares_durable_physical_variant() {
+        let root = TestRoot::new("finite-reopen-shared-variant");
+        let bytes = payload(SELECTED_BLOB_CHUNK_SIZE as usize + 29);
+        let finite_id = {
+            let mut node = selected_node(&root);
+            node.custody_clock = NodeCustodyClock::injected([0xd4; 16], 1_000, 1);
+            let finite = node
+                .publish_with_options(
+                    request(b"blob/finite-reopen"),
+                    BlobPublishOptions::finite_ttl_ms(10_000).expect("positive TTL"),
+                    &mut Cursor::new(bytes.clone()),
+                )
+                .expect("publish finite Blob before restart");
+            finite.id
+        };
+
+        let mut reopened = selected_node(&root);
+        reopened.custody_clock = NodeCustodyClock::injected([0xd4; 16], 1_100, 1);
+        let mut output = Vec::new();
+        let read = reopened
+            .read_into(
+                BlobReadRequest {
+                    id: finite_id,
+                    topic: blob_topic(),
+                    scope: blob_scope(),
+                },
+                &mut output,
+            )
+            .expect("read shared physical variant after restart");
+        assert_eq!(output, bytes);
+        assert_eq!(read.ttl_ms, Some(10_000));
+
+        let durable = reopened
+            .publish(
+                request(b"blob/durable-shared-variant"),
+                &mut Cursor::new(bytes.clone()),
+            )
+            .expect("publish durable reference to same immutable bytes");
+        assert_eq!(finite_id, durable.id);
+        let stats = reopened.store.blob_stats().expect("mixed lifetime stats");
+        assert_eq!(stats.publications, 2);
+        assert_eq!(stats.variants, 1);
+
+        let expired_sample = CustodySample {
+            clock_id: [0xd4; 16],
+            tick_ms: 11_001,
+        };
+        for _ in 0..16 {
+            reopened
+                .store
+                .run_blob_maintenance_turn_with_sample(
+                    BlobMaintenanceBudget::new(64, 16, 128 * 1024 * 1024)
+                        .expect("shared-variant maintenance budget"),
+                    Some(expired_sample),
+                )
+                .expect("retire only finite shared-variant member");
+        }
+        let stats = reopened
+            .store
+            .blob_stats()
+            .expect("post-expiry shared-variant stats");
+        assert_eq!(stats.publications, 1);
+        assert_eq!(stats.variants, 1);
+        let durable_read = reopened
+            .read_into(
+                BlobReadRequest {
+                    id: durable.id,
+                    topic: blob_topic(),
+                    scope: blob_scope(),
+                },
+                &mut Vec::new(),
+            )
+            .expect("durable member remains readable after finite retirement");
+        assert_eq!(durable_read.ttl_ms, None);
+    }
+
+    #[test]
+    fn finite_retirement_delivery_is_tagged_and_acknowledged_with_v2_token() {
+        let root = TestRoot::new("finite-retirement-delivery");
+        let mut node = selected_node(&root);
+        node.custody_clock = NodeCustodyClock::injected([0xd3; 16], 100, 1);
+        let subscription = node
+            .subscribe(subscription_request(b"blob/finite-retirement-selector"))
+            .expect("subscribe before finite publication");
+        let published = node
+            .publish_with_options(
+                request(b"blob/finite-retirement-publication"),
+                BlobPublishOptions::finite_ttl_ms(50).expect("positive TTL"),
+                &mut Cursor::new(payload(17)),
+            )
+            .expect("publish finite retirement fixture");
+        let durable = node
+            .publish(
+                request(b"blob/finite-retirement-durable-follower"),
+                &mut Cursor::new(payload(19)),
+            )
+            .expect("publish durable follower");
+        let content_page = node
+            .poll(BlobPollRequest {
+                subscription: subscription.id,
+                delivery_limit: 1,
+                scan_limit: 4,
+            })
+            .expect("poll finite content");
+        assert!(content_page.has_more);
+        let content = content_delivery(&content_page.deliveries[0]);
+        assert_eq!(content.ttl_ms, Some(50));
+        let old_token = content.token;
+        let publication = content.publication;
+
+        let expired_sample = CustodySample {
+            clock_id: [0xd3; 16],
+            tick_ms: 151,
+        };
+        node.custody_clock
+            .set_injected_tick(expired_sample.tick_ms)
+            .expect("advance custody clock past finite TTL");
+        let durable_before_maintenance = node
+            .poll(BlobPollRequest {
+                subscription: subscription.id,
+                delivery_limit: 1,
+                scan_limit: 4,
+            })
+            .expect("poll hides expired content without maintenance");
+        assert_eq!(durable_before_maintenance.deliveries.len(), 1);
+        assert_eq!(
+            content_delivery(&durable_before_maintenance.deliveries[0]).id,
+            durable.id
+        );
+        let old_ack = node
+            .acknowledge(subscription.id, publication, old_token)
+            .expect_err("hidden finite publication cannot be acknowledged as content");
+        assert_eq!(old_ack.kind(), ApplicationErrorKind::ExpiredOrRetired);
+
+        for _ in 0..16 {
+            node.store
+                .run_blob_maintenance_turn_with_sample(
+                    BlobMaintenanceBudget::new(64, 16, 128 * 1024 * 1024)
+                        .expect("retirement maintenance budget"),
+                    Some(expired_sample),
+                )
+                .expect("retire expired finite Blob");
+        }
+
+        let retired_read = node
+            .read_into(
+                BlobReadRequest {
+                    id: published.id,
+                    topic: blob_topic(),
+                    scope: blob_scope(),
+                },
+                &mut Vec::new(),
+            )
+            .expect_err("retained retirement evidence distinguishes expiry from absence");
+        assert_eq!(retired_read.kind(), ApplicationErrorKind::ExpiredOrRetired);
+        let status = node
+            .transfer_status()
+            .expect("status after finite retirement");
+        assert_eq!(status.retained_publications, 1);
+        assert!(status.pending.is_empty());
+
+        let retirement_page = node
+            .poll(BlobPollRequest {
+                subscription: subscription.id,
+                delivery_limit: 1,
+                scan_limit: 4,
+            })
+            .expect("poll retirement notice");
+        assert_eq!(retirement_page.deliveries.len(), 1);
+        assert!(
+            retirement_page.has_more,
+            "authenticated durable content remains after the retirement-first page"
+        );
+        let retirement = retirement_page.deliveries[0]
+            .retirement()
+            .expect("tagged retirement delivery");
+        assert_eq!(retirement.publication, publication);
+        assert_eq!(retirement.id, published.id);
+        assert_eq!(retirement.ttl_ms, Some(50));
+        assert_eq!(retirement.reason, BlobRetirementReason::Expired);
+        assert!(retirement.retirement_generation > 0);
+        assert!(retirement.attempt >= 2);
+        assert_eq!(
+            node.acknowledge(subscription.id, publication, retirement.token)
+                .expect("acknowledge retirement"),
+            BlobAcknowledgement::Acknowledged
+        );
+        assert_eq!(
+            node.acknowledge(subscription.id, publication, retirement.token)
+                .expect("retry retirement acknowledgement"),
+            BlobAcknowledgement::AlreadyAcknowledged
+        );
+        let durable_page = node
+            .poll(BlobPollRequest {
+                subscription: subscription.id,
+                delivery_limit: 1,
+                scan_limit: 4,
+            })
+            .expect("poll durable content after retirement family");
+        let durable_delivery = durable_page.deliveries[0]
+            .content()
+            .expect("content follows retirement family");
+        assert_eq!(durable_delivery.id, durable.id);
+        assert_eq!(durable_delivery.ttl_ms, None);
+        assert!(!durable_page.has_more);
+    }
+
+    #[test]
+    fn poll_hides_finite_publication_after_custody_continuity_loss() {
+        let root = TestRoot::new("finite-poll-continuity-loss");
+        let mut node = selected_node(&root);
+        node.custody_clock = NodeCustodyClock::injected([0xd9; 16], 100, 0);
+        let subscription = node
+            .subscribe(subscription_request(b"blob/finite-poll-continuity-loss"))
+            .expect("subscribe before finite publication");
+        node.publish_with_options(
+            request(b"blob/finite-poll-continuity-loss"),
+            BlobPublishOptions::finite_ttl_ms(10_000).expect("positive TTL"),
+            &mut Cursor::new(payload(47)),
+        )
+        .expect("publish finite continuity fixture");
+
+        node.custody_clock = NodeCustodyClock::injected([0xda; 16], 100, 0);
+        let page = node
+            .poll(BlobPollRequest {
+                subscription: subscription.id,
+                delivery_limit: 1,
+                scan_limit: 4,
+            })
+            .expect("poll after custody-domain transition");
+
+        assert!(page.deliveries.is_empty());
+        assert!(!page.has_more);
+    }
+
+    #[test]
+    fn transfer_status_observes_finite_expiry_without_maintenance() {
+        let root = TestRoot::new("finite-status-observes-expiry");
+        let mut node = selected_node(&root);
+        node.custody_clock = NodeCustodyClock::injected([0xdb; 16], 1_000, 0);
+        let published = node
+            .publish_with_options(
+                request(b"blob/finite-status-observes-expiry"),
+                BlobPublishOptions::finite_ttl_ms(50).expect("positive TTL"),
+                &mut Cursor::new(payload(53)),
+            )
+            .expect("publish finite status fixture");
+
+        node.custody_clock
+            .set_injected_tick(1_050)
+            .expect("advance status custody clock");
+        let status = node
+            .transfer_status()
+            .expect("status observes current custody sample");
+        assert_eq!(status.retained_publications, 1);
+        node.custody_clock
+            .set_injected_tick(1_000)
+            .expect("rewind injected reader below persisted high-water");
+
+        let error = node
+            .read_into(
+                BlobReadRequest {
+                    id: published.id,
+                    topic: blob_topic(),
+                    scope: blob_scope(),
+                },
+                &mut Vec::new(),
+            )
+            .expect_err("status-persisted expiry cannot be revived by a lower later sample");
+        assert_eq!(error.kind(), ApplicationErrorKind::ExpiredOrRetired);
+    }
 
     struct TestRoot(PathBuf);
 
@@ -4444,7 +5299,7 @@ mod tests {
                 .expect("poll first Blob publication");
             assert_eq!(first_page.deliveries.len(), 1);
             assert!(first_page.has_more);
-            let first_delivery = &first_page.deliveries[0];
+            let first_delivery = content_delivery(&first_page.deliveries[0]);
             assert_eq!(first_delivery.id, first.id);
             assert_eq!(first_delivery.acceptance_marker, first.acceptance_marker);
             assert_eq!(first_delivery.publisher, first.publisher);
@@ -4468,21 +5323,18 @@ mod tests {
                 .expect("retry unacknowledged Blob publication");
             assert_eq!(retried.deliveries.len(), 1);
             assert!(retried.has_more);
-            assert_eq!(retried.deliveries[0].publication, first_publication);
-            assert_eq!(retried.deliveries[0].attempt, 2);
-            assert_ne!(retried.deliveries[0].token, prior_attempt);
+            let retried_delivery = content_delivery(&retried.deliveries[0]);
+            assert_eq!(retried_delivery.publication, first_publication);
+            assert_eq!(retried_delivery.attempt, 2);
+            assert_ne!(retried_delivery.token, prior_attempt);
             assert_eq!(
                 node.acknowledge(subscription.id, first_publication, prior_attempt)
                     .expect("an earlier same-tenure token remains crash-safe"),
                 BlobAcknowledgement::Acknowledged
             );
             assert_eq!(
-                node.acknowledge(
-                    subscription.id,
-                    first_publication,
-                    retried.deliveries[0].token,
-                )
-                .expect("the latest same-tenure token is idempotent"),
+                node.acknowledge(subscription.id, first_publication, retried_delivery.token,)
+                    .expect("the latest same-tenure token is idempotent"),
                 BlobAcknowledgement::AlreadyAcknowledged
             );
 
@@ -4495,7 +5347,7 @@ mod tests {
                 .expect("poll second Blob publication");
             assert_eq!(second_page.deliveries.len(), 1);
             assert!(!second_page.has_more);
-            let second_delivery = &second_page.deliveries[0];
+            let second_delivery = content_delivery(&second_page.deliveries[0]);
             assert_eq!(second_delivery.id, second.id);
             assert_eq!(second_delivery.acceptance_marker, second.acceptance_marker);
             assert_eq!(second_delivery.publisher_counter, second.publisher_counter);
@@ -4625,14 +5477,11 @@ mod tests {
             .await
             .expect("live Blob poll");
         assert_eq!(page.deliveries.len(), 1);
-        assert_eq!(page.deliveries[0].id, published.id);
+        let delivery = content_delivery(&page.deliveries[0]);
+        assert_eq!(delivery.id, published.id);
         assert_eq!(
             handle
-                .acknowledge(
-                    subscription.id,
-                    page.deliveries[0].publication,
-                    page.deliveries[0].token,
-                )
+                .acknowledge(subscription.id, delivery.publication, delivery.token,)
                 .await
                 .expect("live Blob acknowledgement"),
             BlobAcknowledgement::Acknowledged
@@ -4668,6 +5517,57 @@ mod tests {
         );
         drop(handle);
         worker.await.expect("join live Blob subscription worker");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_blob_handle_publishes_and_reads_exact_finite_ttl() {
+        let root = TestRoot::new("live-finite-publish");
+        let source_path = root.path().join("finite-source.bin");
+        let bytes = payload(SELECTED_BLOB_CHUNK_SIZE as usize + 9);
+        fs::write(&source_path, &bytes).expect("write finite live source");
+        let mut node = selected_node(&root);
+        node.custody_clock = NodeCustodyClock::injected([0xd4; 16], 1_000, 1);
+        let identity = node.identity();
+        let mission_authority = node.mission_authority();
+        let admission = Arc::new(AtomicBool::new(true));
+        let worker_admission = Arc::clone(&admission);
+        let (commands, mut received) = mpsc::channel(2);
+        let handle = SelectedBlobHandle::new(commands, admission, identity, mission_authority);
+        let worker = tokio::task::spawn_blocking(move || {
+            while let Some(command) = received.blocking_recv() {
+                let SelectedApplicationCommand::Blob(command) = command else {
+                    panic!("live finite test received another application class");
+                };
+                node.execute_live(command, &worker_admission)
+                    .expect("execute live finite command");
+            }
+        });
+
+        let published = handle
+            .publish_with_options(
+                request(b"blob/live-finite-publish"),
+                BlobPublishOptions::finite_ttl_ms(60_000).expect("positive TTL"),
+                fs::File::open(&source_path).expect("open finite live source"),
+            )
+            .await
+            .expect("publish finite live Blob");
+        assert_eq!(published.ttl_ms, Some(60_000));
+        let page = handle
+            .read_page(BlobReadPageRequest {
+                blob: BlobReadRequest {
+                    id: published.id,
+                    topic: blob_topic(),
+                    scope: blob_scope(),
+                },
+                offset: 0,
+                max_bytes: MAX_SELECTED_BLOB_PAGE_BYTES,
+            })
+            .await
+            .expect("read finite live page");
+        assert_eq!(page.ttl_ms, Some(60_000));
+        assert_eq!(page.as_bytes(), &bytes[..MAX_SELECTED_BLOB_PAGE_BYTES]);
+        drop(handle);
+        worker.await.expect("join finite live worker");
     }
 
     #[test]
@@ -4725,17 +5625,12 @@ mod tests {
             })
             .expect("poll current-epoch Blob publication");
         assert_eq!(delivered.deliveries.len(), 1);
-        assert_eq!(delivered.deliveries[0].id, current.id);
-        assert_eq!(
-            delivered.deliveries[0].publisher_counter,
-            current.publisher_counter
-        );
-        assert_eq!(
-            delivered.deliveries[0].acceptance_marker,
-            current.acceptance_marker
-        );
+        let delivery = content_delivery(&delivered.deliveries[0]);
+        assert_eq!(delivery.id, current.id);
+        assert_eq!(delivery.publisher_counter, current.publisher_counter);
+        assert_eq!(delivery.acceptance_marker, current.acceptance_marker);
         assert_ne!(
-            delivered.deliveries[0].acceptance_marker,
+            delivery.acceptance_marker,
             old_publication.acceptance_marker
         );
     }
@@ -5000,6 +5895,7 @@ mod tests {
         let (response, received) = oneshot::channel();
         let command = SelectedBlobCommand::Publish {
             request: request(b"blob/live-precommit-cache-poison"),
+            options: BlobPublishOptions::durable(),
             source: fs::File::open(&source_path).expect("open live poison source"),
             response,
         };
@@ -5114,7 +6010,7 @@ mod tests {
             })
             .expect("hidden postcommit attempt remains retryable");
         assert_eq!(retried.deliveries.len(), 1);
-        assert_eq!(retried.deliveries[0].attempt, 2);
+        assert_eq!(content_delivery(&retried.deliveries[0]).attempt, 2);
     }
 
     #[test]
@@ -5140,6 +6036,7 @@ mod tests {
         let (response, received) = oneshot::channel();
         let command = SelectedBlobCommand::Publish {
             request,
+            options: BlobPublishOptions::durable(),
             source: fs::File::open(&source_path).expect("open retry live source"),
             response,
         };
@@ -5172,6 +6069,7 @@ mod tests {
         node.execute_live(
             SelectedBlobCommand::Publish {
                 request: request(b"blob/live-depot-quota"),
+                options: BlobPublishOptions::durable(),
                 source: fs::File::open(source_path).expect("open quota source"),
                 response,
             },
@@ -6061,6 +6959,7 @@ mod tests {
         let (response, received) = oneshot::channel();
         let publish_command = SelectedBlobCommand::Publish {
             request: request(b"blob/live-orphan-operation"),
+            options: BlobPublishOptions::durable(),
             source: fs::File::open(&source_path).expect("open orphan-operation source"),
             response,
         };

@@ -41,8 +41,9 @@
 //! Policy-invalidated live publications retire atomically with their operation
 //! and delivery aliases; permanent fences remain, and the retained retirement
 //! records expire after 45 days of accumulated conservative lower-bound age.
-//! This does not activate finite Blob TTL and adds no supported public Blob
-//! API, wire, CLI, or route-only custody surface.
+//! The selected Rust Blob API activates finite TTL and tagged retirement
+//! delivery on top of this lifecycle state. CLI, RPC, Protobuf, FFI, public GC,
+//! and route-only custody surfaces remain outside this crate's supported boundary.
 
 #![forbid(unsafe_code)]
 

@@ -67,12 +67,13 @@ mod record;
 mod state;
 pub(crate) use blob::SelectedBlobCommand;
 pub use blob::{
-    BLOB_DELIVERY_TOKEN_BYTES, BlobAcknowledgement, BlobDelivery, BlobDeliveryPage,
-    BlobDeliveryStatus, BlobDeliveryToken, BlobDepotLimits, BlobGcFailureCategory,
-    BlobGcRetryState, BlobGcStatus, BlobId, BlobPollRequest, BlobPublicationId, BlobPublishRequest,
-    BlobPublishResult, BlobReadPage, BlobReadPageRequest, BlobReadRequest, BlobReadResult,
-    BlobSubscription, BlobSubscriptionId, BlobSubscriptionRequest, BlobTransferPhase,
-    BlobTransferStatus, BlobUnsubscribe, MAX_SELECTED_BLOB_DELIVERIES,
+    BLOB_DELIVERY_TOKEN_BYTES, BlobAcknowledgement, BlobDelivery, BlobDeliveryItem,
+    BlobDeliveryPage, BlobDeliveryStatus, BlobDeliveryToken, BlobDepotLimits,
+    BlobGcFailureCategory, BlobGcRetryState, BlobGcStatus, BlobId, BlobPollRequest,
+    BlobPublicationId, BlobPublishOptions, BlobPublishRequest, BlobPublishResult, BlobReadPage,
+    BlobReadPageRequest, BlobReadRequest, BlobReadResult, BlobRetirementDelivery,
+    BlobRetirementReason, BlobSubscription, BlobSubscriptionId, BlobSubscriptionRequest,
+    BlobTransferPhase, BlobTransferStatus, BlobUnsubscribe, MAX_SELECTED_BLOB_DELIVERIES,
     MAX_SELECTED_BLOB_PAGE_BYTES, MAX_SELECTED_BLOB_SUBSCRIPTION_SCAN,
     MAX_SELECTED_LIVE_BLOB_BYTES, MAX_SELECTED_LIVE_BLOB_CHUNKS, PendingBlobTransferStatus,
     SelectedBlobHandle, SelectedBlobNode, SelectedBlobOptions,
@@ -113,6 +114,10 @@ const MAX_SELECTED_EVENT_PLAN_RETRIES: usize = 4;
 #[non_exhaustive]
 pub enum ApplicationErrorKind {
     InvalidRequest,
+    /// A well-formed value requires functionality unavailable on this host.
+    UnsupportedValue,
+    /// No live or retained retirement evidence identifies the requested value.
+    NotFound,
     RequestRejected,
     UnauthorizedOrRevoked,
     PolicyUnsettled,
@@ -181,6 +186,8 @@ impl fmt::Display for ApplicationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let disposition = match self.kind {
             ApplicationErrorKind::InvalidRequest => "invalid application request",
+            ApplicationErrorKind::UnsupportedValue => "unsupported application request value",
+            ApplicationErrorKind::NotFound => "selected application value was not found",
             ApplicationErrorKind::RequestRejected => "request rejected by selected data policy",
             ApplicationErrorKind::UnauthorizedOrRevoked => {
                 "application identity or selected data is not currently authorized"
@@ -2604,6 +2611,7 @@ fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
         // integrity failure rather than a caller-actionable request result.
         StoreError::Bridge(_) => ApplicationErrorKind::Integrity,
         StoreError::Custody(error) => custody_store_error_kind(error),
+        StoreError::BlobDeliveryNotFound => ApplicationErrorKind::NotFound,
         StoreError::InvalidEventOperationKey { .. }
         | StoreError::InvalidStateOperationKey { .. }
         | StoreError::InvalidRecordOperationKey { .. }
@@ -2634,7 +2642,6 @@ fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
         | StoreError::RecordDeliveryAttemptChanged { .. }
         | StoreError::BlobSubscriptionNotFound
         | StoreError::BlobSubscriptionPollLimitExceeded { .. }
-        | StoreError::BlobDeliveryNotFound
         | StoreError::InvalidBlobDeliveryToken
         | StoreError::BlobDeliveryTokenBindingMismatch
         | StoreError::BlobSubscriptionIncarnationChanged { .. }
@@ -2850,6 +2857,7 @@ fn blob_store_error_kind(error: &BlobStoreError) -> ApplicationErrorKind {
         BlobStoreError::PublisherRevoked(_)
         | BlobStoreError::KeyEpochStale { .. }
         | BlobStoreError::KeyEpochNotActive { .. } => ApplicationErrorKind::UnauthorizedOrRevoked,
+        BlobStoreError::NotFound => ApplicationErrorKind::NotFound,
         BlobStoreError::ExpiredOrRetired => ApplicationErrorKind::ExpiredOrRetired,
         BlobStoreError::ReservationChanged
         | BlobStoreError::ReadPlanChanged
