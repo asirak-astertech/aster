@@ -3599,6 +3599,7 @@ pub struct RunningNode {
     selected_records: SelectedRecordHandle,
     selected_blobs: SelectedBlobHandle,
     selected_controls: SelectedControlHandle,
+    state_root: PinnedNodeStateRoot,
     application_admission: Arc<AtomicBool>,
     emission_policy: Arc<LiveEmissionPolicy>,
     #[cfg(feature = "nearby-discovery")]
@@ -3779,6 +3780,15 @@ impl RunningNode {
     /// Returns the cloneable, one-command live authority-control handle.
     pub fn selected_controls(&self) -> SelectedControlHandle {
         self.selected_controls.clone()
+    }
+
+    /// Returns the exact directory authority used by this node's durable store.
+    ///
+    /// On Linux this path names a pinned directory descriptor, so later
+    /// renames or replacements of the configured pathname cannot redirect a
+    /// colocated service to another state root.
+    pub fn state_root(&self) -> &Path {
+        &self.state_root.path
     }
 
     /// Returns the stable current emission policy and its monotonic revision.
@@ -4932,7 +4942,8 @@ fn prepare_stopped_zeroization(
     let mission_authority = mission.mission_authority_id();
     let identity = NodeIdentity::load_existing(state)?;
     let mission = mission.prepare_software_erasure()?;
-    let identity = identity.prepare_software_erasure()?;
+    let mut identity = identity.prepare_software_erasure()?;
+    identity.stabilize_recovery_target()?;
     let intent = ZeroizationIntent::new(mission.target().to_bytes(), identity.target().to_bytes())?;
     Ok(PreparedSoftwareZeroization {
         intent,
@@ -4951,7 +4962,8 @@ fn prepare_live_zeroization(
 ) -> Result<PreparedSoftwareZeroization, NodeError> {
     let mission_authority = mission.mission_authority_id();
     let mission = mission.prepare_software_erasure()?;
-    let identity = identity.prepare_software_erasure()?;
+    let mut identity = identity.prepare_software_erasure()?;
+    identity.stabilize_recovery_target()?;
     let mission_path = fs::canonicalize(mission.target().path())?;
     if !request.mission_matches(
         &mission_path,
@@ -5057,6 +5069,12 @@ fn drive_zeroization_cleanup(
             ));
         }
         cleanup.mark_mission_destroyed()?;
+        #[cfg(test)]
+        if std::env::var_os("ASTER_TEST_CRASH_AFTER_MISSION_ERASURE")
+            .is_some_and(|value| value == "1")
+        {
+            std::process::exit(87);
+        }
     }
     if let Some(handle) = identity_handle.as_mut() {
         let receipt = handle.destroy_contents()?;
@@ -5153,7 +5171,7 @@ fn require_operator_target(
     } else {
         std::env::current_dir()?.join(supplied)
     };
-    if supplied != target.path() {
+    if supplied != target.path() && fs::canonicalize(&supplied)? != target.path() {
         return Err(NodeError::Configuration(format!(
             "zeroization {label} path differs from the durable exact target"
         )));
@@ -13519,6 +13537,7 @@ struct LocalZeroizationControl {
     socket_device: u64,
     socket_inode: u64,
     state: LocalPathIdentity,
+    state_authority: PathBuf,
     store_device: u64,
     store_inode: u64,
 }
@@ -13564,9 +13583,17 @@ struct LocalZeroizationRequest;
 
 #[cfg(unix)]
 impl LocalZeroizationControl {
+    #[cfg(test)]
     fn bind(state: &Path, store_path: &Path) -> Result<Self, NodeError> {
         let control_directory = local_zeroization_control_directory(true)?;
         Self::bind_with_control_directory(state, store_path, control_directory)
+    }
+
+    fn bind_pinned(state: &Path, store_path: &Path) -> Result<Self, NodeError> {
+        let control_directory = local_zeroization_control_directory(true)?;
+        let state_authority = state.to_path_buf();
+        let state = local_state_identity_following_pinned_authority(state)?;
+        Self::bind_with_identities(state, state_authority, store_path, control_directory)
     }
 
     #[cfg(test)]
@@ -13579,12 +13606,23 @@ impl LocalZeroizationControl {
         Self::bind_with_control_directory(state, store_path, control_directory)
     }
 
+    #[cfg(test)]
     fn bind_with_control_directory(
         state: &Path,
         store_path: &Path,
         control_directory: LocalPathIdentity,
     ) -> Result<Self, NodeError> {
         let state = local_state_identity(state)?;
+        let state_authority = state.canonical_path.clone();
+        Self::bind_with_identities(state, state_authority, store_path, control_directory)
+    }
+
+    fn bind_with_identities(
+        state: LocalPathIdentity,
+        state_authority: PathBuf,
+        store_path: &Path,
+        control_directory: LocalPathIdentity,
+    ) -> Result<Self, NodeError> {
         let (store_device, store_inode) = local_store_identity(store_path)?;
         let socket_path = local_zeroization_socket_path(
             &control_directory.canonical_path,
@@ -13603,6 +13641,7 @@ impl LocalZeroizationControl {
             socket_device: socket.dev(),
             socket_inode: socket.ino(),
             state,
+            state_authority,
             store_device,
             store_inode,
         })
@@ -13665,13 +13704,13 @@ impl LocalZeroizationControl {
                 "local zeroization control directory changed while control was live".into(),
             ));
         }
-        let state = local_state_identity(&self.state.canonical_path)?;
-        if state != self.state {
+        let state = local_state_identity_following_pinned_authority(&self.state_authority)?;
+        if state.device != self.state.device || state.inode != self.state.inode {
             return Err(NodeError::Configuration(
                 "node state directory changed while local zeroization control was live".into(),
             ));
         }
-        let store_path = self.state.canonical_path.join(STORE_FILE);
+        let store_path = self.state_authority.join(STORE_FILE);
         let (device, inode) = local_store_identity(&store_path)?;
         if device != self.store_device || inode != self.store_inode {
             return Err(NodeError::Configuration(
@@ -13686,6 +13725,35 @@ impl LocalZeroizationControl {
         }
         Ok(())
     }
+}
+
+#[cfg(unix)]
+fn local_state_identity_following_pinned_authority(
+    path: &Path,
+) -> Result<LocalPathIdentity, NodeError> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let metadata = fs::metadata(path)?;
+    if !metadata.is_dir()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.permissions().mode() & 0o022 != 0
+    {
+        return Err(NodeError::Configuration(
+            "pinned node state directory is not owner controlled".into(),
+        ));
+    }
+    let canonical_path = fs::canonicalize(path)?;
+    let canonical = fs::metadata(&canonical_path)?;
+    if canonical.dev() != metadata.dev() || canonical.ino() != metadata.ino() {
+        return Err(NodeError::Configuration(
+            "pinned node state directory changed while resolving".into(),
+        ));
+    }
+    Ok(LocalPathIdentity {
+        canonical_path,
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
 }
 
 #[cfg(unix)]
@@ -15276,6 +15344,7 @@ async fn start_node_with_shutdown_ownership(
         selected_records,
         selected_blobs,
         selected_controls,
+        state_root: ready.state_root,
         application_admission,
         emission_policy,
         #[cfg(feature = "nearby-discovery")]
@@ -15629,8 +15698,109 @@ struct NodeActorChannels {
 
 struct NodeReady {
     bound_sockets: Vec<SocketAddr>,
+    state_root: PinnedNodeStateRoot,
     #[cfg(feature = "nearby-discovery")]
     nearby_discovery_stop: Option<NearbyDiscoveryControl>,
+}
+
+#[derive(Clone)]
+struct PinnedNodeStateRoot {
+    path: PathBuf,
+    #[cfg(target_os = "linux")]
+    _directory: Arc<File>,
+}
+
+#[cfg(test)]
+struct PinnedStateRootTestHook {
+    configured: PathBuf,
+    action: Box<dyn FnOnce(&Path) + Send>,
+}
+
+#[cfg(test)]
+static PINNED_STATE_ROOT_TEST_HOOK: StdMutex<Option<PinnedStateRootTestHook>> = StdMutex::new(None);
+
+#[cfg(test)]
+fn install_pinned_state_root_test_hook(
+    configured: PathBuf,
+    action: impl FnOnce(&Path) + Send + 'static,
+) {
+    let mut hook = PINNED_STATE_ROOT_TEST_HOOK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(
+        hook.is_none(),
+        "pinned state-root test hook already installed"
+    );
+    *hook = Some(PinnedStateRootTestHook {
+        configured,
+        action: Box::new(action),
+    });
+}
+
+#[cfg(test)]
+fn run_pinned_state_root_test_hook(configured: &Path, authority: &Path) {
+    let action = {
+        let mut hook = PINNED_STATE_ROOT_TEST_HOOK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if hook
+            .as_ref()
+            .is_some_and(|hook| hook.configured == configured)
+        {
+            hook.take().map(|hook| hook.action)
+        } else {
+            None
+        }
+    };
+    if let Some(action) = action {
+        action(authority);
+    }
+}
+
+fn pin_node_state_root(configured: &Path) -> Result<PinnedNodeStateRoot, NodeError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700).create(configured)?;
+    }
+    #[cfg(not(unix))]
+    fs::create_dir_all(configured)?;
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd as _;
+
+        // Deliberately follow an accepted configured symlink exactly once,
+        // then route every node-owned durable open through this descriptor.
+        let directory = Arc::new(File::from(
+            rustix::fs::openat(
+                rustix::fs::CWD,
+                configured,
+                rustix::fs::OFlags::PATH
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map_err(io::Error::from)?,
+        ));
+        if !directory.metadata()?.is_dir() {
+            return Err(NodeError::Configuration(
+                "node state root is not a directory".into(),
+            ));
+        }
+        let path = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
+        Ok(PinnedNodeStateRoot {
+            path,
+            _directory: directory,
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(PinnedNodeStateRoot {
+            path: configured.to_path_buf(),
+        })
+    }
 }
 
 #[cfg_attr(not(feature = "nearby-discovery"), allow(dead_code))]
@@ -15839,6 +16009,9 @@ async fn run_node_actor_inner(
         })
         .transpose()?;
     let direct_peer_missions = validate_node_config(&config)?;
+    let state_root = pin_node_state_root(&config.state)?;
+    #[cfg(test)]
+    run_pinned_state_root_test_hook(&config.state, &state_root.path);
     validate_forwarding_config(&forwarding)?;
     let (peer_missions, configured_peers) =
         configured_runtime_peers(&config, &forwarding, direct_peer_missions)?;
@@ -15851,11 +16024,10 @@ async fn run_node_actor_inner(
     let automatic_admission =
         automatic_nearby.then(|| AutomaticNearbyAdmission::new(config.mission.identity()));
     let mission_authority = config.mission.mission_authority_id();
-    fs::create_dir_all(&config.state)?;
     // Bind durable semantic/cache state before creating carrier identity or a
     // network endpoint. Reopening with another mission authority fails through
     // redb's read-only preflight before migration or state/network mutation.
-    let store_path = config.state.join(STORE_FILE);
+    let store_path = state_root.path.join(STORE_FILE);
     #[cfg(unix)]
     match fs::symlink_metadata(&store_path) {
         Ok(_) => {
@@ -16007,7 +16179,7 @@ async fn run_node_actor_inner(
         custody_clock.clone(),
     );
     let initial_status_metrics = SelectedEventStoreMetrics::read(&store)?;
-    let identity = NodeIdentity::load_or_create(&config.state)?;
+    let identity = NodeIdentity::load_or_create(&state_root.path)?;
     let local_id = identity.id();
     if allowed.contains(&local_id) {
         return Err(NodeError::Configuration(
@@ -16015,7 +16187,7 @@ async fn run_node_actor_inner(
         ));
     }
     #[cfg(unix)]
-    let zeroization_control = LocalZeroizationControl::bind(&config.state, &store_path)?;
+    let zeroization_control = LocalZeroizationControl::bind_pinned(&state_root.path, &store_path)?;
     let endpoint_config = EndpointConfig::direct(config.bind);
     let endpoint = match &forwarding.controlled_relay {
         Some(routing) if routing.relay_only => {
@@ -16172,6 +16344,7 @@ async fn run_node_actor_inner(
     let owner_ready = ready
         .send(NodeReady {
             bound_sockets,
+            state_root: state_root.clone(),
             #[cfg(feature = "nearby-discovery")]
             nearby_discovery_stop: nearby_discovery_stop.clone(),
         })
@@ -17872,7 +18045,7 @@ async fn run_node_actor_inner(
             );
         }
         let mission_path = plan.mission.target().path().to_path_buf();
-        let result = finish_live_zeroization(store, plan, &config.state, &mission_path);
+        let result = finish_live_zeroization(store, plan, &state_root.path, &mission_path);
         match result {
             Ok(completed) => {
                 receipt.items = completed.preserved.items;
@@ -38676,7 +38849,11 @@ mod tests {
         let root = root("zeroize-live-selected-event-actor");
         let state = root.join("state");
         let mission_path = root.join("mission.bundle");
-        fs::create_dir_all(&state).expect("state");
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&state)
+            .expect("owner-only state");
         let blob_source = root.join("zeroized-live-blob.bin");
         let blob_bytes = (0..(aster_mesh::SELECTED_BLOB_CHUNK_SIZE as usize + 37))
             .map(|index| (index % 251) as u8)
@@ -39310,7 +39487,10 @@ mod tests {
     #[tokio::test]
     async fn stopped_zeroization_preserves_rows_and_replays_idempotently() {
         let state = root("zeroize-preserves-rows");
-        fs::create_dir_all(&state).expect("state");
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&state)
+            .expect("owner-only state");
         let identity = NodeIdentity::load_or_create(&state).expect("identity");
         drop(identity);
         let mission_path = state.join("mission.bundle");
@@ -39351,6 +39531,190 @@ mod tests {
             .expect("issue local mission");
         UnprotectedReferenceMission::from_bytes(bundle.to_bytes().expect("encode bundle"))
             .expect("parse local mission")
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn live_zeroization_crash_resumes_symlinked_identity_from_stable_target() {
+        use std::os::unix::fs::symlink;
+
+        const CHILD: &str = "ASTER_TEST_LIVE_ZEROIZATION_CRASH_CHILD";
+        const STATE: &str = "ASTER_TEST_LIVE_ZEROIZATION_CRASH_STATE";
+        const AUTHORITY: &str = "ASTER_TEST_LIVE_ZEROIZATION_CRASH_AUTHORITY";
+        const MISSION: &str = "ASTER_TEST_LIVE_ZEROIZATION_CRASH_MISSION";
+
+        if std::env::var_os(CHILD).is_some_and(|value| value == "1") {
+            let configured = PathBuf::from(std::env::var_os(STATE).expect("child state"));
+            let authority = PathBuf::from(std::env::var_os(AUTHORITY).expect("child authority"));
+            let mission_path = PathBuf::from(std::env::var_os(MISSION).expect("child mission"));
+            let mission =
+                UnprotectedReferenceMission::load(&mission_path).expect("child mission load");
+            let node = start_node(NodeConfig {
+                state: configured.clone(),
+                bind: "127.0.0.1:0".parse().expect("child bind"),
+                mission,
+                peers: Vec::new(),
+                mutable_interests: MutableSourceInterests::default(),
+                sync_interval: Duration::from_millis(50),
+                run_for: None,
+                application: NodeApplication::Relay,
+            })
+            .await
+            .expect("child production node startup");
+            assert!(node.state_root().starts_with("/proc/self/fd/"));
+            match zeroize_node(&authority, &mission_path, Duration::from_secs(5)).await {
+                Ok(receipt) => {
+                    panic!("crash hook did not terminate the child process: {receipt:?}")
+                }
+                Err(error) => panic!("live zeroization did not reach crash hook: {error}"),
+            }
+        }
+
+        let fixture = root("live-zeroization-stable-crash-target");
+        let target = fixture.join("target");
+        let configured = fixture.join("configured-link");
+        let mission_path = fixture.join("mission.bundle");
+        fs::create_dir_all(&fixture).expect("fixture root");
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&target)
+            .expect("state target");
+        symlink(&target, &configured).expect("accepted configured state symlink");
+        persist_zeroization_test_mission(&mission_path, 0xc7);
+
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .arg("runtime::tests::live_zeroization_crash_resumes_symlinked_identity_from_stable_target")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(CHILD, "1")
+            .env(STATE, &configured)
+            .env(AUTHORITY, &target)
+            .env(MISSION, &mission_path)
+            .env("ASTER_TEST_CRASH_AFTER_MISSION_ERASURE", "1")
+            .output()
+            .expect("run crash-boundary child");
+        assert_eq!(
+            output.status.code(),
+            Some(87),
+            "child did not exit at the durable boundary\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let store_path = target.join(STORE_FILE);
+        let cleanup = Store::open_for_zeroization(&store_path).expect("open terminal cleanup");
+        let intent = cleanup
+            .zeroization_intent()
+            .expect("durable terminal intent");
+        let identity_target = decode_zeroization_target(
+            intent,
+            ZeroizationArtifact::CarrierIdentity,
+            SoftwareSecretArtifact::CarrierIdentity,
+        )
+        .expect("decode durable identity target");
+        assert_eq!(identity_target.path(), target.join("identity.key"));
+        assert!(
+            !identity_target.path().starts_with("/proc/self/fd/"),
+            "durable intent must not retain one process's descriptor namespace"
+        );
+        assert_eq!(
+            cleanup.zeroization_state(),
+            StoreZeroizationState::MissionDestroyed
+        );
+        drop(cleanup);
+        assert_eq!(
+            fs::metadata(&mission_path)
+                .expect("mission tombstone")
+                .len(),
+            0
+        );
+        assert_eq!(
+            fs::metadata(target.join("identity.key"))
+                .expect("pending identity")
+                .len(),
+            32
+        );
+
+        let resumed = zeroize_node(&target, &mission_path, Duration::from_secs(5))
+            .await
+            .expect("new process authority resumes exact terminal cleanup");
+        assert_eq!(resumed.state, SoftwareZeroizationState::Complete);
+        assert!(resumed.mission_destroyed && resumed.identity_destroyed);
+        assert_eq!(
+            fs::metadata(target.join("identity.key"))
+                .expect("identity tombstone")
+                .len(),
+            0
+        );
+        fs::remove_dir_all(fixture).expect("cleanup fixture");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn production_startup_pins_state_before_store_identity_and_zeroization_open() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = root("pinned-state-root-production");
+        let configured = fixture.join("fresh");
+        let config = |state: PathBuf| NodeConfig {
+            state,
+            bind: "127.0.0.1:0".parse().expect("bind"),
+            mission: test_mission(),
+            peers: Vec::new(),
+            mutable_interests: MutableSourceInterests::default(),
+            sync_interval: Duration::from_millis(50),
+            run_for: None,
+            application: NodeApplication::Relay,
+        };
+
+        let fresh = start_node(config(configured.clone()))
+            .await
+            .expect("fresh absent state root starts");
+        assert!(configured.is_dir());
+        assert_eq!(
+            fs::metadata(fresh.state_root()).unwrap().ino(),
+            fs::metadata(&configured).unwrap().ino()
+        );
+        fresh.shutdown().await.expect("fresh node shutdown");
+
+        let target = fixture.join("target");
+        let configured_link = fixture.join("linked");
+        let moved = fixture.join("moved-after-pin");
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&target)
+            .expect("symlink target");
+        symlink(&target, &configured_link).expect("configured symlink");
+        let hook_target = target.clone();
+        let hook_moved = moved.clone();
+        install_pinned_state_root_test_hook(configured_link.clone(), move |authority| {
+            let pinned_inode = fs::metadata(authority).expect("pinned authority").ino();
+            fs::rename(&hook_target, &hook_moved).expect("rename pinned directory");
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&hook_target)
+                .expect("replacement directory");
+            assert_eq!(
+                fs::metadata(authority).expect("authority after swap").ino(),
+                pinned_inode
+            );
+            assert_ne!(
+                fs::metadata(&hook_target).expect("replacement").ino(),
+                pinned_inode
+            );
+        });
+
+        let node = start_node(config(configured_link))
+            .await
+            .expect("accepted symlink remains pinned through downstream opens");
+        let pinned_inode = fs::metadata(node.state_root()).unwrap().ino();
+        assert_eq!(pinned_inode, fs::metadata(&moved).unwrap().ino());
+        assert_ne!(pinned_inode, fs::metadata(&target).unwrap().ino());
+        assert!(moved.join(STORE_FILE).is_file());
+        assert!(moved.join("identity.key").is_file());
+        assert!(fs::read_dir(&target).unwrap().next().is_none());
+        node.shutdown().await.expect("pinned node shutdown");
+        fs::remove_dir_all(fixture).expect("cleanup fixture");
     }
 
     #[cfg(unix)]

@@ -144,6 +144,31 @@ fn blob_publish_requires_a_regular_nonempty_source() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn blob_publish_rejects_a_writerless_fifo_without_blocking_preflight() {
+    let fifo = TestPath::new("fifo");
+    assert!(
+        Command::new("mkfifo")
+            .arg(fifo.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let output = Command::new("timeout")
+        .arg("1")
+        .arg(env!("CARGO_BIN_EXE_asterctl"))
+        .args(publish_args(fifo.path()))
+        .output()
+        .expect("run asterctl with timeout");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("source must be a regular file")
+    );
+}
+
 #[test]
 fn blob_read_rejects_an_existing_output_without_clobbering_it() {
     let output_path = source(b"keep me");

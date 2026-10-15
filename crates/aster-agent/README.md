@@ -128,7 +128,13 @@ links that exact open inode to the requested new path. Unsupported platforms or
 filesystems fail closed. The caller's publish source and completed read output
 remain caller-owned files outside node zeroization custody; zeroizing the node
 does not erase either file. The agent's upload staging is separate, private,
-unlinked before payload acceptance, and currently Linux-only.
+unlinked before payload acceptance, and currently Linux-only. On Linux the
+configured state root (including an accepted symlink) is resolved once and the
+node start is verified against that exact device/inode before Blob staging uses
+the pinned descriptor; later path replacement cannot redirect either side. On
+other supported Unix platforms the existing Event and status service still
+starts, while Blob publish fails with a fixed unsupported response before
+consuming stream bytes.
 
 This agent increment provides Blob publish and read only. Blob subscription,
 poll, acknowledgement, transfer-status commands, and Blob FFI lifetime fields

@@ -326,6 +326,56 @@ impl PreparedIdentityErasure {
         &self.target
     }
 
+    /// Rebinds only the durable recovery pathname to the stable canonical name
+    /// of the exact inode already retained by this prepared handle.
+    ///
+    /// Live destruction continues through the retained descriptor. The
+    /// canonical pathname is accepted only after it is proven to name that
+    /// same owner-controlled, uniquely linked regular file, so a durable
+    /// zeroization intent never depends on a process-local descriptor path.
+    #[cfg(unix)]
+    pub(crate) fn stabilize_recovery_target(&mut self) -> Result<(), SoftwareErasureError> {
+        use std::os::unix::{ffi::OsStrExt as _, fs::MetadataExt as _};
+
+        let mut artifact = self
+            .artifact
+            .lock()
+            .map_err(|_| SoftwareErasureError::StatePoisoned)?;
+        let live = artifact.preflight()?;
+        let stable_path = std::fs::canonicalize(live.path())?;
+        let live_parent = live
+            .path()
+            .parent()
+            .ok_or(SoftwareErasureError::InvalidDescriptor)?;
+        let stable_parent = stable_path
+            .parent()
+            .ok_or(SoftwareErasureError::InvalidDescriptor)?;
+        let live_parent_metadata = std::fs::metadata(live_parent)?;
+        let stable_parent_metadata = std::fs::metadata(stable_parent)?;
+        if !live_parent_metadata.is_dir()
+            || !stable_parent_metadata.is_dir()
+            || stable_parent_metadata.dev() != live_parent_metadata.dev()
+            || stable_parent_metadata.ino() != live_parent_metadata.ino()
+        {
+            return Err(SoftwareErasureError::Changed(stable_parent.to_path_buf()));
+        }
+        let stable_metadata = std::fs::symlink_metadata(&stable_path)?;
+        validate_artifact_metadata(&stable_path, &stable_metadata)?;
+        if stable_metadata.dev() != live.device()
+            || stable_metadata.ino() != live.inode()
+            || stable_metadata.len() != live.original_len()
+        {
+            return Err(SoftwareErasureError::Changed(stable_path));
+        }
+        let path_bytes = stable_path.as_os_str().as_bytes();
+        if path_bytes.is_empty() || path_bytes.len() > MAX_SOFTWARE_ERASURE_PATH_BYTES {
+            return Err(SoftwareErasureError::InvalidDescriptor);
+        }
+        artifact.target.path = stable_path;
+        self.target = artifact.target.clone();
+        Ok(())
+    }
+
     /// Invalidates all wrapper clones and destroys the exact retained inode's contents.
     ///
     /// Callers must first close and drop every endpoint that received an

@@ -1,4 +1,5 @@
 use crate::{api, auth::Token, blob_publish, blob_read, operation_key::Key};
+use buffa::Message as _;
 use connectrpc::{
     Protocol,
     client::{ClientConfig, Http2Connection, HttpClient, SharedHttp2Connection},
@@ -34,6 +35,7 @@ pub struct MutationError {
     reason: &'static str,
     unknown: bool,
     hint: &'static str,
+    retryable_rejection: bool,
 }
 
 impl MutationError {
@@ -59,7 +61,20 @@ impl MutationError {
             reason: code.as_str(),
             unknown: !rejected,
             hint: rpc_hint(code),
+            retryable_rejection: false,
         }
+    }
+
+    fn rpc_error(error: &connectrpc::ConnectError, expected_operation: &str) -> Self {
+        let mut classified = Self::rpc(error.code);
+        let Some(detail) = public_error_detail(error, expected_operation) else {
+            return classified;
+        };
+        if is_definite_publish_rejection(error.code, detail.reason.as_known()) {
+            classified.unknown = false;
+            classified.retryable_rejection = detail.retryable;
+        }
+        classified
     }
 
     fn unknown(reason: &'static str) -> Self {
@@ -67,6 +82,7 @@ impl MutationError {
             reason,
             unknown: true,
             hint: "",
+            retryable_rejection: false,
         }
     }
 
@@ -93,9 +109,186 @@ impl MutationError {
                 key.retry_instruction()
             )
         } else {
-            format!("{method} failed: {}{}", self.reason, self.hint)
+            let retry = if self.retryable_rejection {
+                format!("\n{}", key.retry_instruction())
+            } else {
+                String::new()
+            };
+            format!("{method} failed: {}{}{}", self.reason, self.hint, retry)
         }
     }
+}
+
+fn is_definite_publish_rejection(
+    code: connectrpc::ErrorCode,
+    reason: Option<api::PublicErrorReason>,
+) -> bool {
+    use api::PublicErrorReason as Reason;
+    use connectrpc::ErrorCode as Code;
+
+    matches!(
+        (code, reason),
+        (
+            Code::InvalidArgument,
+            Some(Reason::MalformedInput | Reason::UnsupportedValue)
+        ) | (Code::Unimplemented, Some(Reason::UnsupportedValue))
+            | (Code::Aborted, Some(Reason::OperationKeyConflict))
+            | (
+                Code::NotFound,
+                Some(Reason::MissingDurableObject | Reason::ExpiredOrRetired)
+            )
+            | (Code::PermissionDenied, Some(Reason::FailedPrecondition))
+            | (Code::FailedPrecondition, Some(Reason::FailedPrecondition))
+            | (
+                Code::ResourceExhausted,
+                Some(Reason::ResourceExhaustion | Reason::OperationCapacityExhausted)
+            )
+    )
+}
+
+fn public_error_detail(
+    error: &connectrpc::ConnectError,
+    expected_operation: &str,
+) -> Option<api::PublicErrorDetail> {
+    let [detail] = error.details.as_slice() else {
+        return None;
+    };
+    if detail.debug.is_some()
+        || !matches!(
+            detail.type_url.as_str(),
+            api::PublicErrorDetail::TYPE_URL
+                | <api::PublicErrorDetail as buffa::MessageName>::FULL_NAME
+        )
+    {
+        return None;
+    }
+    let value = decode_base64(detail.value.as_deref()?)?;
+    let decoded = api::PublicErrorDetail::decode_from_slice(&value).ok()?;
+    let reason = decoded.reason.as_known()?;
+    if decoded.operation != expected_operation
+        || reason == api::PublicErrorReason::Unspecified
+        || !valid_public_error_pair(error.code, expected_operation, reason)
+    {
+        return None;
+    }
+    Some(decoded)
+}
+
+fn valid_public_error_pair(
+    code: connectrpc::ErrorCode,
+    operation: &str,
+    reason: api::PublicErrorReason,
+) -> bool {
+    use api::PublicErrorReason as Reason;
+    use connectrpc::ErrorCode as Code;
+
+    let common = matches!(
+        (code, reason),
+        (
+            Code::InvalidArgument,
+            Reason::MalformedInput | Reason::UnsupportedValue
+        ) | (Code::Unimplemented, Reason::UnsupportedValue)
+            | (Code::PermissionDenied, Reason::FailedPrecondition)
+            | (
+                Code::Unavailable,
+                Reason::FailedPrecondition | Reason::StateUnavailable
+            )
+            | (Code::DataLoss | Code::Internal, Reason::Internal)
+            | (
+                Code::ResourceExhausted,
+                Reason::ResourceExhaustion | Reason::OperationCapacityExhausted
+            )
+    );
+    common
+        || match operation {
+            "publish_blob" => matches!(
+                (code, reason),
+                (Code::Aborted, Reason::OperationKeyConflict)
+                    | (Code::FailedPrecondition, Reason::FailedPrecondition)
+                    | (
+                        Code::NotFound,
+                        Reason::MissingDurableObject | Reason::ExpiredOrRetired
+                    )
+            ),
+            "read_blob" => matches!(
+                (code, reason),
+                (
+                    Code::NotFound,
+                    Reason::MissingDurableObject | Reason::ExpiredOrRetired
+                )
+            ),
+            _ => false,
+        }
+}
+
+fn decode_base64(value: &str) -> Option<Vec<u8>> {
+    fn sextet(byte: u8) -> Option<u8> {
+        match byte {
+            b'A'..=b'Z' => Some(byte - b'A'),
+            b'a'..=b'z' => Some(byte - b'a' + 26),
+            b'0'..=b'9' => Some(byte - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+
+    if value.is_empty() {
+        return None;
+    }
+    let padding = if value.ends_with("==") {
+        2
+    } else if value.ends_with('=') {
+        1
+    } else {
+        0
+    };
+    if (padding != 0 && !value.len().is_multiple_of(4)) || (padding == 0 && value.len() % 4 == 1) {
+        return None;
+    }
+    let unpadded = &value[..value.len() - padding];
+    if unpadded.as_bytes().contains(&b'=') {
+        return None;
+    }
+    let bytes = unpadded.as_bytes();
+    if bytes.len() % 4 == 1
+        || (padding == 2 && bytes.len() % 4 != 2)
+        || (padding == 1 && bytes.len() % 4 != 3)
+    {
+        return None;
+    }
+    let mut output = Vec::with_capacity((bytes.len() * 3) / 4);
+    for chunk in bytes.chunks(4) {
+        let a = sextet(chunk[0])?;
+        let b = sextet(chunk[1])?;
+        if chunk.len() == 2 && b & 0x0f != 0 {
+            return None;
+        }
+        output.push((a << 2) | (b >> 4));
+        if chunk.len() > 2 {
+            let c = sextet(chunk[2])?;
+            if chunk.len() == 3 && c & 0x03 != 0 {
+                return None;
+            }
+            output.push((b << 4) | (c >> 2));
+            if chunk.len() > 3 {
+                output.push((c << 6) | sextet(chunk[3])?);
+            }
+        }
+    }
+    Some(output)
+}
+
+fn describe_blob_read_error(error: &connectrpc::ConnectError) -> String {
+    let reason = public_error_detail(error, "read_blob")
+        .and_then(|detail| detail.reason.as_known())
+        .map(|reason| match reason {
+            api::PublicErrorReason::MissingDurableObject => "missing Blob",
+            api::PublicErrorReason::ExpiredOrRetired => "Blob expired or retired",
+            _ => error.code.as_str(),
+        })
+        .unwrap_or_else(|| error.code.as_str());
+    format!("ReadBlob failed: {reason}{}", rpc_hint(error.code))
 }
 
 pub fn query_client(
@@ -223,7 +416,7 @@ pub async fn publish_blob(
         return Err(MutationError::unknown(reason));
     }
     let response = result
-        .map_err(|error| MutationError::rpc(error.code))?
+        .map_err(|error| MutationError::rpc_error(&error, "publish_blob"))?
         .into_owned();
     if !blob_publish::receipt_matches(&requested, &response) {
         return Err(MutationError::unknown("invalid publication receipt"));
@@ -244,11 +437,11 @@ pub async fn read_blob(
         let mut stream = blob_client(address, token, timeout)
             .read_blob(request)
             .await
-            .map_err(|error| describe_rpc_error("ReadBlob", error.code))?;
+            .map_err(|error| describe_blob_read_error(&error))?;
         while let Some(page) = stream
             .message()
             .await
-            .map_err(|error| describe_rpc_error("ReadBlob", error.code))?
+            .map_err(|error| describe_blob_read_error(&error))?
         {
             let page = page.to_owned_message();
             validator.accept(&page).map_err(str::to_owned)?;
@@ -457,6 +650,179 @@ mod tests {
         );
     }
 
+    fn public_error(
+        code: connectrpc::ErrorCode,
+        reason: api::PublicErrorReason,
+        operation: &str,
+        retryable: bool,
+    ) -> connectrpc::ConnectError {
+        connectrpc::ConnectError::new(code, "secret remote diagnostic").with_detail(
+            connectrpc::ErrorDetail::from_message(
+                api::PublicErrorDetail::TYPE_URL,
+                &api::PublicErrorDetail {
+                    reason: reason.into(),
+                    operation: operation.to_owned(),
+                    retryable,
+                    ..Default::default()
+                },
+            ),
+        )
+    }
+
+    #[test]
+    fn typed_blob_rejection_is_not_an_unknown_outcome() {
+        let key = crate::operation_key::Selection::Explicit("blob-key".into())
+            .resolve()
+            .unwrap();
+        let error = public_error(
+            connectrpc::ErrorCode::ResourceExhausted,
+            api::PublicErrorReason::ResourceExhaustion,
+            "publish_blob",
+            false,
+        );
+        assert_eq!(
+            MutationError::rpc_error(&error, "publish_blob").describe("PublishBlob", &key),
+            "PublishBlob failed: resource_exhausted"
+        );
+        let retryable = public_error(
+            connectrpc::ErrorCode::ResourceExhausted,
+            api::PublicErrorReason::ResourceExhaustion,
+            "publish_blob",
+            true,
+        );
+        assert_eq!(
+            MutationError::rpc_error(&retryable, "publish_blob").describe("PublishBlob", &key),
+            "PublishBlob failed: resource_exhausted\nretry the identical request with --operation-key=blob-key"
+        );
+        let uncertain = public_error(
+            connectrpc::ErrorCode::Unavailable,
+            api::PublicErrorReason::StateUnavailable,
+            "publish_blob",
+            true,
+        );
+        assert!(
+            MutationError::rpc_error(&uncertain, "publish_blob")
+                .describe("PublishBlob", &key)
+                .starts_with("PublishBlob outcome unknown: unavailable")
+        );
+    }
+
+    #[test]
+    fn typed_blob_read_distinguishes_missing_from_expired_without_remote_text() {
+        let missing = public_error(
+            connectrpc::ErrorCode::NotFound,
+            api::PublicErrorReason::MissingDurableObject,
+            "read_blob",
+            false,
+        );
+        assert_eq!(
+            describe_blob_read_error(&missing),
+            "ReadBlob failed: missing Blob"
+        );
+        let expired = public_error(
+            connectrpc::ErrorCode::NotFound,
+            api::PublicErrorReason::ExpiredOrRetired,
+            "read_blob",
+            false,
+        );
+        assert_eq!(
+            describe_blob_read_error(&expired),
+            "ReadBlob failed: Blob expired or retired"
+        );
+    }
+
+    #[test]
+    fn malformed_or_unexpected_public_details_remain_code_only_and_redacted() {
+        let error = connectrpc::ConnectError::new(
+            connectrpc::ErrorCode::ResourceExhausted,
+            "secret remote diagnostic",
+        )
+        .with_detail(connectrpc::ErrorDetail {
+            type_url: "type.googleapis.com/attacker.Error".into(),
+            value: Some("not-protobuf".into()),
+            debug: Some(serde_json::json!({"operation": "attacker-controlled"})),
+        });
+        let key = crate::operation_key::Selection::Explicit("blob-key".into())
+            .resolve()
+            .unwrap();
+        let rendered =
+            MutationError::rpc_error(&error, "publish_blob").describe("PublishBlob", &key);
+        assert!(rendered.starts_with("PublishBlob outcome unknown: resource_exhausted"));
+        assert!(!rendered.contains("secret"));
+        assert!(!rendered.contains("attacker"));
+
+        let wrong_operation = public_error(
+            connectrpc::ErrorCode::ResourceExhausted,
+            api::PublicErrorReason::ResourceExhaustion,
+            "attacker-operation",
+            true,
+        );
+        assert!(
+            MutationError::rpc_error(&wrong_operation, "publish_blob")
+                .describe("PublishBlob", &key)
+                .starts_with("PublishBlob outcome unknown: resource_exhausted")
+        );
+        let unknown_reason = connectrpc::ConnectError::new(
+            connectrpc::ErrorCode::ResourceExhausted,
+            "secret remote diagnostic",
+        )
+        .with_detail(connectrpc::ErrorDetail::from_message(
+            api::PublicErrorDetail::TYPE_URL,
+            &api::PublicErrorDetail {
+                reason: buffa::EnumValue::Unknown(71),
+                operation: "publish_blob".to_owned(),
+                retryable: true,
+                ..Default::default()
+            },
+        ));
+        assert!(
+            MutationError::rpc_error(&unknown_reason, "publish_blob")
+                .describe("PublishBlob", &key)
+                .starts_with("PublishBlob outcome unknown: resource_exhausted")
+        );
+
+        assert!(decode_base64("AA=").is_none());
+        assert!(decode_base64("A/==").is_none());
+        assert!(decode_base64("AAAA====").is_none());
+    }
+
+    #[test]
+    fn contradictory_typed_codes_cannot_override_conservative_blob_outcomes() {
+        let key = crate::operation_key::Selection::Explicit("blob-key".into())
+            .resolve()
+            .unwrap();
+        for code in [
+            connectrpc::ErrorCode::Unavailable,
+            connectrpc::ErrorCode::DeadlineExceeded,
+            connectrpc::ErrorCode::Internal,
+        ] {
+            let publish = public_error(
+                code,
+                api::PublicErrorReason::ResourceExhaustion,
+                "publish_blob",
+                true,
+            );
+            let rendered =
+                MutationError::rpc_error(&publish, "publish_blob").describe("PublishBlob", &key);
+            assert!(
+                rendered.starts_with(&format!("PublishBlob outcome unknown: {}", code.as_str()))
+            );
+            assert!(rendered.contains("retry the identical request"));
+            assert!(!rendered.contains("secret remote diagnostic"));
+
+            let read = public_error(
+                code,
+                api::PublicErrorReason::ExpiredOrRetired,
+                "read_blob",
+                true,
+            );
+            let rendered = describe_blob_read_error(&read);
+            assert!(rendered.starts_with(&format!("ReadBlob failed: {}", code.as_str())));
+            assert!(!rendered.contains("expired"));
+            assert!(!rendered.contains("secret remote diagnostic"));
+        }
+    }
+
     #[tokio::test]
     async fn blob_native_http2_fixture_covers_multi_page_publish_and_read_clients() {
         let payload = vec![0x5a; blob_publish::CHUNK_BYTES + 1];
@@ -571,15 +937,14 @@ mod tests {
         std::fs::remove_file(destination).unwrap();
     }
 
-    async fn publish_error(code: connectrpc::ErrorCode) -> MutationError {
+    async fn publish_error(error: connectrpc::ConnectError) -> MutationError {
         let router = connectrpc::Router::new().route_client_stream(
             SERVICE,
             "PublishBlob",
             connectrpc::client_streaming_handler_fn(
-                move |_ctx, _requests: connectrpc::ServiceStream<api::PublishBlobRequest>| async move {
-                    Err::<connectrpc::Response<api::PublishBlobResponse>, _>(
-                        connectrpc::ConnectError::new(code, "secret fixture detail"),
-                    )
+                move |_ctx, _requests: connectrpc::ServiceStream<api::PublishBlobRequest>| {
+                    let error = error.clone();
+                    async move { Err::<connectrpc::Response<api::PublishBlobResponse>, _>(error) }
                 },
             ),
         );
@@ -606,16 +971,59 @@ mod tests {
         let key = crate::operation_key::Selection::Explicit("blob-key".into())
             .resolve()
             .unwrap();
-        let rejected = publish_error(connectrpc::ErrorCode::InvalidArgument).await;
+        let rejected = publish_error(connectrpc::ConnectError::new(
+            connectrpc::ErrorCode::InvalidArgument,
+            "secret fixture detail",
+        ))
+        .await;
         assert_eq!(
             rejected.describe("PublishBlob", &key),
             "PublishBlob failed: invalid_argument"
         );
-        let uncertain = publish_error(connectrpc::ErrorCode::Unavailable).await;
+        let uncertain = publish_error(connectrpc::ConnectError::new(
+            connectrpc::ErrorCode::Unavailable,
+            "secret fixture detail",
+        ))
+        .await;
         assert_eq!(
             uncertain.describe("PublishBlob", &key),
             "PublishBlob outcome unknown: unavailable\nCheck that aster-agent is running and that --host and --port are correct.\nretry the identical request with --operation-key=blob-key"
         );
+    }
+
+    #[tokio::test]
+    async fn blob_native_http2_fixture_uses_only_valid_typed_public_errors() {
+        let key = crate::operation_key::Selection::Explicit("blob-key".into())
+            .resolve()
+            .unwrap();
+        let rejected = publish_error(public_error(
+            connectrpc::ErrorCode::ResourceExhausted,
+            api::PublicErrorReason::ResourceExhaustion,
+            "publish_blob",
+            true,
+        ))
+        .await;
+        assert_eq!(
+            rejected.describe("PublishBlob", &key),
+            "PublishBlob failed: resource_exhausted\nretry the identical request with --operation-key=blob-key"
+        );
+
+        let malformed = publish_error(
+            connectrpc::ConnectError::new(
+                connectrpc::ErrorCode::ResourceExhausted,
+                "secret fixture detail",
+            )
+            .with_detail(connectrpc::ErrorDetail {
+                type_url: "type.googleapis.com/attacker.Error".into(),
+                value: Some("not-protobuf".into()),
+                debug: None,
+            }),
+        )
+        .await;
+        let rendered = malformed.describe("PublishBlob", &key);
+        assert!(rendered.starts_with("PublishBlob outcome unknown: resource_exhausted"));
+        assert!(!rendered.contains("secret"));
+        assert!(!rendered.contains("attacker"));
     }
 
     #[tokio::test]
@@ -690,14 +1098,6 @@ mod tests {
         assert!(error.contains("ReadBlob failed: unavailable"), "{error}");
         assert!(!error.contains("secret fixture detail"), "{error}");
         assert!(!destination.exists());
-        let parent = destination.parent().unwrap();
-        assert!(std::fs::read_dir(parent).unwrap().all(|entry| {
-            !entry
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .starts_with(&format!(".asterctl-blob-{}-", std::process::id()))
-        }));
         fixture.stop().await;
     }
 

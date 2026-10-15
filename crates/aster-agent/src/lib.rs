@@ -48,6 +48,8 @@ pub const MAX_AGENT_MESSAGE_BYTES: usize = 1024 * 1024;
 pub const MAX_AGENT_ELEMENT_MEMORY_BYTES: usize = 4 * 1024 * 1024;
 /// Maximum encoded protobuf response before protocol-specific framing.
 pub const MAX_AGENT_RESPONSE_PROTO_BYTES: u32 = 2 * 1024 * 1024;
+/// Stable maximum payload carried by one Blob RPC frame or read response.
+pub const BLOB_RPC_FRAME_BYTES: usize = 64 * 1024;
 /// Minimum accepted delay following any delivered or caught-up streaming poll.
 pub const MIN_STREAM_BACKOFF_MS: u32 = 100;
 /// Maximum accepted delay following any delivered or caught-up streaming poll.
@@ -96,14 +98,17 @@ impl BoundAgent {
     }
 
     /// Serves the Event and Blob routes from one running node authority.
-    pub async fn serve_with_blobs(
+    pub fn serve_with_blobs(
         self,
         events: SelectedEventHandle,
         blobs: SelectedBlobHandle,
         state_root: std::path::PathBuf,
         token: ClientToken,
         shutdown: tokio::sync::watch::Receiver<bool>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<
+        impl std::future::Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send,
+        std::io::Error,
+    > {
         let service = event_service::application_service_with_blobs(
             events,
             blobs,
@@ -112,7 +117,7 @@ impl BoundAgent {
             None,
             shutdown.clone(),
         )?;
-        self.serve_service(service, token, shutdown).await
+        Ok(async move { self.serve_service(service, token, shutdown).await })
     }
 
     async fn serve_service(

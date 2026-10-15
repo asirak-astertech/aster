@@ -1,21 +1,24 @@
-use std::{future::Future, io::SeekFrom, path::Path, sync::Arc};
+use std::{
+    future::Future,
+    io::{Seek as _, SeekFrom, Write as _},
+    path::Path,
+    sync::Arc,
+};
 
 use aster_mesh::{MAX_BLOB_MEDIA_TYPE_BYTES, MAX_BLOB_SCHEMA_ID_BYTES};
 use aster_node::application::{
     BlobId, BlobPublishOptions, BlobPublishRequest as NodeBlobPublishRequest, BlobPublishResult,
     BlobReadPage, BlobReadPageRequest, BlobReadRequest as NodeBlobReadRequest,
-    MAX_SELECTED_BLOB_PAGE_BYTES, MAX_SELECTED_LIVE_BLOB_BYTES, Priority, Scope,
-    SelectedBlobHandle, Topic,
+    MAX_SELECTED_LIVE_BLOB_BYTES, Priority, Scope, SelectedBlobHandle, Topic,
 };
 use aster_redb_store::MAX_BLOB_OPERATION_KEY_BYTES;
 use connectrpc::{ConnectError, ErrorCode, RequestContext, Response, ServiceResult, ServiceStream};
 use futures::StreamExt as _;
-use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _};
 use tokio::sync::OwnedSemaphorePermit;
 use zeroize::Zeroizing;
 
 use crate::{
-    api,
+    BLOB_RPC_FRAME_BYTES, api,
     error::{PublicOperation, connect_blob_application_error, public_error},
 };
 
@@ -24,15 +27,16 @@ const UPLOAD_PERMITS: usize = 1;
 #[derive(Clone)]
 pub(crate) struct BlobConnectService {
     blobs: SelectedBlobHandle,
-    staging: Arc<PinnedStagingDirectory>,
+    staging: Option<Arc<PinnedStagingDirectory>>,
     uploads: Arc<tokio::sync::Semaphore>,
 }
 
 impl BlobConnectService {
     pub(crate) fn new(blobs: SelectedBlobHandle, state_root: &Path) -> std::io::Result<Self> {
+        let staging = open_optional_staging(state_root)?.map(Arc::new);
         Ok(Self {
             blobs,
-            staging: Arc::new(PinnedStagingDirectory::open(state_root)?),
+            staging,
             uploads: Arc::new(tokio::sync::Semaphore::new(UPLOAD_PERMITS)),
         })
     }
@@ -43,6 +47,11 @@ impl BlobConnectService {
         mut requests: connectrpc::InboundStream<api::PublishBlobRequest>,
     ) -> ServiceResult<api::PublishBlobResponse> {
         let operation = PublicOperation::PublishBlob;
+        let staging = self
+            .staging
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| unsupported_transport(operation))?;
         if ctx.protocol() == Some(connectrpc::Protocol::GrpcWeb) {
             return Err(unsupported_transport(operation));
         }
@@ -56,27 +65,15 @@ impl BlobConnectService {
         let permit = Arc::clone(&self.uploads)
             .try_acquire_owned()
             .map_err(|_| resource_exhausted(operation))?;
-        let staging = Arc::clone(&self.staging);
-        let total_len = grammar.total_len;
-        let (file, permit) = tokio::task::spawn_blocking(move || {
-            open_private_staging(&staging, total_len).map(|file| (file, permit))
-        })
-        .await
-        .map_err(|_| state_unavailable(operation))??;
-        let mut file = tokio::fs::File::from_std(file);
+        let mut writer = BlockingUploadWriter::start(staging, grammar.total_len, permit).await?;
 
         while let Some(frame) = requests.next().await {
             let frame = frame.map_err(|_| malformed(operation))?.to_owned_message();
             let chunk = Zeroizing::new(grammar.accept(frame)?);
-            file.write_all(&chunk)
-                .await
-                .map_err(|_| state_unavailable(operation))?;
+            writer.write(chunk).await?;
         }
         grammar.finish()?;
-        file.seek(SeekFrom::Start(0))
-            .await
-            .map_err(|_| state_unavailable(operation))?;
-        let file = file.into_std().await;
+        let (file, permit) = writer.finish().await?;
         let blobs = self.blobs.clone();
         let result = await_upload_with_permit(permit, async move {
             blobs
@@ -113,7 +110,7 @@ impl BlobConnectService {
                 .read_page(BlobReadPageRequest {
                     blob: state.request.clone(),
                     offset: state.offset,
-                    max_bytes: MAX_SELECTED_BLOB_PAGE_BYTES,
+                    max_bytes: BLOB_RPC_FRAME_BYTES,
                 })
                 .await
                 .map_err(|error| connect_blob_application_error(error, operation))?;
@@ -130,7 +127,7 @@ impl BlobConnectService {
             let complete = page.complete;
             let page_len = u64::try_from(page.len()).map_err(|_| internal(operation))?;
             if page.offset.checked_add(page_len) != Some(next_offset)
-                || page.len() > MAX_SELECTED_BLOB_PAGE_BYTES
+                || page.len() > BLOB_RPC_FRAME_BYTES
                 || complete != (next_offset == observed.total_len)
             {
                 return Err(internal(operation));
@@ -145,6 +142,25 @@ impl BlobConnectService {
             Ok(Some((response, state)))
         });
         Response::stream_ok(responses)
+    }
+
+    #[cfg(all(test, target_os = "linux", feature = "client", feature = "server"))]
+    pub(crate) fn staging_directory_identity(&self) -> std::io::Result<Option<(u64, u64)>> {
+        self.staging
+            .as_ref()
+            .map(|staging| {
+                let stat = rustix::fs::fstat(&staging.descriptor).map_err(std::io::Error::from)?;
+                Ok((stat.st_dev, stat.st_ino))
+            })
+            .transpose()
+    }
+}
+
+fn open_optional_staging(state_root: &Path) -> std::io::Result<Option<PinnedStagingDirectory>> {
+    match PinnedStagingDirectory::open(state_root) {
+        Ok(staging) => Ok(Some(staging)),
+        Err(error) if error.kind() == std::io::ErrorKind::Unsupported => Ok(None),
+        Err(error) => Err(error),
     }
 }
 
@@ -161,7 +177,7 @@ impl PinnedStagingDirectory {
 
             let descriptor = rustix::fs::open(
                 state_root,
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
                 Mode::empty(),
             )
             .map_err(std::io::Error::from)?;
@@ -176,6 +192,149 @@ impl PinnedStagingDirectory {
             ))
         }
     }
+}
+
+enum WriterCommand {
+    Write(
+        Zeroizing<Vec<u8>>,
+        tokio::sync::oneshot::Sender<std::io::Result<()>>,
+    ),
+    Finish(tokio::sync::oneshot::Sender<std::io::Result<PreparedUpload>>),
+}
+
+struct PreparedUpload {
+    file: Option<std::fs::File>,
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+impl PreparedUpload {
+    fn new(file: std::fs::File, permit: OwnedSemaphorePermit) -> Self {
+        Self {
+            file: Some(file),
+            permit: Some(permit),
+        }
+    }
+
+    fn into_parts(mut self) -> (std::fs::File, OwnedSemaphorePermit) {
+        let file = self.file.take().expect("prepared upload owns its file");
+        let permit = self.permit.take().expect("prepared upload owns its permit");
+        (file, permit)
+    }
+}
+
+impl Drop for PreparedUpload {
+    fn drop(&mut self) {
+        // Capacity becomes reusable only after the staging descriptor is gone.
+        drop(self.file.take());
+        drop(self.permit.take());
+    }
+}
+
+struct BlockingUploadWriter {
+    commands: tokio::sync::mpsc::Sender<WriterCommand>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl BlockingUploadWriter {
+    async fn start(
+        staging: Arc<PinnedStagingDirectory>,
+        total_len: u64,
+        permit: OwnedSemaphorePermit,
+    ) -> Result<Self, ConnectError> {
+        let (commands, receiver) = tokio::sync::mpsc::channel(1);
+        let (ready_send, ready_receive) = tokio::sync::oneshot::channel();
+        let task = tokio::task::spawn_blocking(move || {
+            let mut permit = Some(permit);
+            let file = open_private_staging(&staging, total_len);
+            match file {
+                Ok(file) => {
+                    if ready_send.send(Ok(())).is_ok() {
+                        run_blocking_writer(
+                            file,
+                            permit.take().expect("starting writer owns upload permit"),
+                            receiver,
+                        );
+                    } else {
+                        drop(file);
+                        drop(permit.take());
+                    }
+                }
+                Err(error) => {
+                    let _ = ready_send.send(Err(error));
+                    drop(permit.take());
+                }
+            }
+        });
+        ready_receive
+            .await
+            .map_err(|_| state_unavailable(PublicOperation::PublishBlob))??;
+        Ok(Self { commands, task })
+    }
+
+    async fn write(&mut self, bytes: Zeroizing<Vec<u8>>) -> Result<(), ConnectError> {
+        let (send, receive) = tokio::sync::oneshot::channel();
+        self.commands
+            .send(WriterCommand::Write(bytes, send))
+            .await
+            .map_err(|_| state_unavailable(PublicOperation::PublishBlob))?;
+        receive
+            .await
+            .map_err(|_| state_unavailable(PublicOperation::PublishBlob))?
+            .map_err(|_| state_unavailable(PublicOperation::PublishBlob))
+    }
+
+    async fn finish(self) -> Result<(std::fs::File, OwnedSemaphorePermit), ConnectError> {
+        let (send, receive) = tokio::sync::oneshot::channel();
+        self.commands
+            .send(WriterCommand::Finish(send))
+            .await
+            .map_err(|_| state_unavailable(PublicOperation::PublishBlob))?;
+        let result = receive
+            .await
+            .map_err(|_| state_unavailable(PublicOperation::PublishBlob))?
+            .map_err(|_| state_unavailable(PublicOperation::PublishBlob))?;
+        self.task
+            .await
+            .map_err(|_| state_unavailable(PublicOperation::PublishBlob))?;
+        Ok(result.into_parts())
+    }
+}
+
+fn run_blocking_writer(
+    file: std::fs::File,
+    permit: OwnedSemaphorePermit,
+    mut commands: tokio::sync::mpsc::Receiver<WriterCommand>,
+) {
+    let mut file = Some(file);
+    let mut permit = Some(permit);
+    while let Some(command) = commands.blocking_recv() {
+        match command {
+            WriterCommand::Write(bytes, completed) => {
+                let result = file
+                    .as_mut()
+                    .expect("writer owns its file until finish")
+                    .write_all(&bytes);
+                let _ = completed.send(result);
+            }
+            WriterCommand::Finish(completed) => {
+                let result = match file
+                    .as_mut()
+                    .expect("writer owns its file until finish")
+                    .seek(SeekFrom::Start(0))
+                {
+                    Ok(_) => Ok(PreparedUpload::new(
+                        file.take().expect("rewound writer file"),
+                        permit.take().expect("writer permit is owned until finish"),
+                    )),
+                    Err(error) => Err(error),
+                };
+                let _ = completed.send(result);
+                break;
+            }
+        }
+    }
+    drop(file.take());
+    drop(permit);
 }
 
 async fn await_upload_with_permit<T, F>(
@@ -270,7 +429,7 @@ impl UploadGrammar {
         else {
             return Err(malformed(operation));
         };
-        if chunk.is_empty() || chunk.len() > MAX_SELECTED_BLOB_PAGE_BYTES {
+        if chunk.is_empty() || chunk.len() > BLOB_RPC_FRAME_BYTES {
             return Err(malformed(operation));
         }
         let chunk_len = u64::try_from(chunk.len()).map_err(|_| malformed(operation))?;
@@ -278,7 +437,7 @@ impl UploadGrammar {
             .total_len
             .checked_sub(self.received)
             .ok_or_else(|| malformed(operation))?;
-        let canonical_len = remaining.min(MAX_SELECTED_BLOB_PAGE_BYTES as u64);
+        let canonical_len = remaining.min(BLOB_RPC_FRAME_BYTES as u64);
         if chunk_len != canonical_len {
             return Err(malformed(operation));
         }
@@ -307,8 +466,7 @@ impl UploadGrammar {
 
 fn maximum_chunk_frames_for_len(total_len: u64) -> Result<u64, ConnectError> {
     let operation = PublicOperation::PublishBlob;
-    let chunk_bytes =
-        u64::try_from(MAX_SELECTED_BLOB_PAGE_BYTES).map_err(|_| internal(operation))?;
+    let chunk_bytes = u64::try_from(BLOB_RPC_FRAME_BYTES).map_err(|_| internal(operation))?;
     total_len
         .checked_sub(1)
         .and_then(|value| value.checked_div(chunk_bytes))
@@ -466,6 +624,22 @@ fn open_private_staging(
         use rustix::fs::{AtFlags, FallocateFlags, Mode, OFlags};
 
         let operation = PublicOperation::PublishBlob;
+        match rustix::fs::openat(
+            &staging.descriptor,
+            ".",
+            OFlags::RDWR | OFlags::TMPFILE | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        ) {
+            Ok(descriptor) => {
+                rustix::fs::fallocate(&descriptor, FallocateFlags::empty(), 0, total_len)
+                    .map_err(classify_fallocate_error)?;
+                return Ok(std::fs::File::from(descriptor));
+            }
+            Err(
+                rustix::io::Errno::OPNOTSUPP | rustix::io::Errno::NOSYS | rustix::io::Errno::INVAL,
+            ) => {}
+            Err(_) => return Err(state_unavailable(operation)),
+        }
         for _ in 0..16 {
             let mut nonce = [0_u8; 16];
             getrandom::fill(&mut nonce).map_err(|_| internal(operation))?;
@@ -489,7 +663,7 @@ fn open_private_staging(
                 return Err(state_unavailable(operation));
             }
             rustix::fs::fallocate(&descriptor, FallocateFlags::empty(), 0, total_len)
-                .map_err(|_| resource_exhausted(operation))?;
+                .map_err(classify_fallocate_error)?;
             return Ok(std::fs::File::from(descriptor));
         }
         Err(state_unavailable(operation))
@@ -498,6 +672,25 @@ fn open_private_staging(
     {
         let _ = (staging, total_len);
         Err(state_unavailable(PublicOperation::PublishBlob))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn classify_fallocate_error(error: rustix::io::Errno) -> ConnectError {
+    match error {
+        rustix::io::Errno::NOSPC | rustix::io::Errno::DQUOT => {
+            resource_exhausted(PublicOperation::PublishBlob)
+        }
+        rustix::io::Errno::OPNOTSUPP | rustix::io::Errno::NOSYS | rustix::io::Errno::INVAL => {
+            public_error(
+                ErrorCode::FailedPrecondition,
+                api::PublicErrorReason::UnsupportedValue,
+                PublicOperation::PublishBlob,
+                false,
+                None,
+            )
+        }
+        _ => state_unavailable(PublicOperation::PublishBlob),
     }
 }
 
@@ -573,7 +766,7 @@ mod tests {
     };
 
     #[cfg(target_os = "linux")]
-    use std::os::unix::{fs::MetadataExt as _, fs::symlink};
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
 
     #[cfg(target_os = "linux")]
     use aster_mesh::{ProvisioningAccess, ReferenceProvisioner};
@@ -604,6 +797,7 @@ mod tests {
                 std::process::id()
             ));
             fs::create_dir(&path).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
             Self(path)
         }
     }
@@ -807,8 +1001,92 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocking_writer_reports_the_final_write_failure_before_releasing_capacity() {
+        let uploads = Arc::new(Semaphore::new(1));
+        let permit = Arc::clone(&uploads).try_acquire_owned().unwrap();
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .unwrap();
+        let (commands, receiver) = tokio::sync::mpsc::channel(1);
+        let task = tokio::task::spawn_blocking(move || run_blocking_writer(file, permit, receiver));
+        let (completed, result) = tokio::sync::oneshot::channel();
+        commands
+            .send(WriterCommand::Write(Zeroizing::new(vec![0x5a]), completed))
+            .await
+            .unwrap();
+
+        assert!(result.await.unwrap().is_err());
+        assert!(Arc::clone(&uploads).try_acquire_owned().is_err());
+        drop(commands);
+        task.await.unwrap();
+        assert!(Arc::clone(&uploads).try_acquire_owned().is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_blocking_write_keeps_capacity_until_current_io_and_cleanup_finish() {
+        use std::os::fd::AsRawFd as _;
+
+        let uploads = Arc::new(Semaphore::new(1));
+        let permit = Arc::clone(&uploads).try_acquire_owned().unwrap();
+        let fixture = StagingTestRoot::new();
+        let file_path = fixture.0.join("writer-cleanup");
+        let file = fs::File::create(&file_path).unwrap();
+        let descriptor_path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+        let (commands, receiver) = tokio::sync::mpsc::channel(1);
+        let task = tokio::task::spawn_blocking(move || run_blocking_writer(file, permit, receiver));
+        let (completed, _result) = tokio::sync::oneshot::channel();
+        commands
+            .send(WriterCommand::Write(Zeroizing::new(vec![0x7b]), completed))
+            .await
+            .unwrap();
+
+        assert!(Arc::clone(&uploads).try_acquire_owned().is_err());
+        assert!(descriptor_path.exists());
+        drop(commands);
+        let reacquired = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if descriptor_path.exists() {
+                    assert!(Arc::clone(&uploads).try_acquire_owned().is_err());
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                if let Ok(permit) = Arc::clone(&uploads).try_acquire_owned() {
+                    break permit;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("writer cleanup deadline");
+        task.await.unwrap();
+        drop(reacquired);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fallocate_failures_distinguish_capacity_from_unsupported_filesystems() {
+        assert_eq!(
+            classify_fallocate_error(rustix::io::Errno::NOSPC).code,
+            ErrorCode::ResourceExhausted
+        );
+        assert_eq!(
+            classify_fallocate_error(rustix::io::Errno::DQUOT).code,
+            ErrorCode::ResourceExhausted
+        );
+        assert_eq!(
+            classify_fallocate_error(rustix::io::Errno::OPNOTSUPP).code,
+            ErrorCode::FailedPrecondition
+        );
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn staging_uses_pinned_directory_after_configured_path_is_replaced() {
+        use std::os::fd::AsRawFd as _;
+
         let fixture = StagingTestRoot::new();
         let configured = fixture.0.join("configured");
         let pinned_location = fixture.0.join("pinned");
@@ -822,8 +1100,14 @@ mod tests {
 
         let file = open_private_staging(&staging, 4096).unwrap();
         let metadata = file.metadata().unwrap();
+        let descriptor_target =
+            fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).unwrap();
         assert_eq!(metadata.len(), 4096);
         assert_eq!(metadata.mode() & 0o777, 0o600);
+        assert!(
+            descriptor_target.starts_with(&pinned_location),
+            "the anonymous staging inode must belong to the pinned directory"
+        );
         assert!(
             fs::read_dir(&pinned_location).unwrap().next().is_none(),
             "the pinned directory must not retain a linked staging name"
@@ -832,6 +1116,34 @@ mod tests {
             fs::read_dir(&redirect).unwrap().next().is_none(),
             "path replacement must not redirect staging"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn staging_accepts_a_configured_symlink_but_pins_its_exact_target() {
+        let fixture = StagingTestRoot::new();
+        let target = fixture.0.join("target");
+        let configured = fixture.0.join("configured");
+        let replacement = fixture.0.join("replacement");
+        fs::create_dir(&target).unwrap();
+        fs::create_dir(&replacement).unwrap();
+        symlink(&target, &configured).unwrap();
+
+        let staging = PinnedStagingDirectory::open(&configured).unwrap();
+        fs::remove_file(&configured).unwrap();
+        symlink(&replacement, &configured).unwrap();
+
+        let file = open_private_staging(&staging, 4096).unwrap();
+        assert_eq!(
+            file.metadata().unwrap().dev(),
+            fs::metadata(&target).unwrap().dev()
+        );
+        assert!(fs::read_dir(&replacement).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn rpc_blob_frame_size_is_a_stable_agent_contract() {
+        assert_eq!(crate::BLOB_RPC_FRAME_BYTES, 64 * 1024);
     }
 
     #[cfg(target_os = "linux")]
@@ -849,21 +1161,13 @@ mod tests {
         );
     }
 
-    #[cfg(not(target_os = "linux"))]
-    #[test]
-    fn staging_is_explicitly_unsupported_before_service_start() {
-        let error = PinnedStagingDirectory::open(std::path::Path::new("."))
-            .err()
-            .expect("non-Linux staging must fail closed");
-        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
-    }
-
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn lazy_read_reauthenticates_expiry_between_pages() {
         let fixture = StagingTestRoot::new();
         let state_root = fixture.0.join("state");
         fs::create_dir(&state_root).unwrap();
+        fs::set_permissions(&state_root, fs::Permissions::from_mode(0o700)).unwrap();
         let access = ProvisioningAccess::member(
             Scope::new("mission/team/alpha").unwrap(),
             vec![1],

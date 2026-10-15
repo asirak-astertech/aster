@@ -128,10 +128,14 @@ stdout contains metadata and never Blob plaintext.
 
 Both text formats use exactly `TTL: durable` or `TTL: MILLISECONDS ms`. Finite
 JSON includes `"ttlMs": "MILLISECONDS"`; durable JSON omits `ttlMs`.
-`blob-publish --json` also includes `operation_key`. An identical retry with the
-same key and file is successful with `inserted: false`. If a publish result is
-unusable or its TTL does not exactly match the request, the outcome is unknown;
-retry the identical request using the same operation key.
+`blob-publish --json` also includes `operation_key`. A retry after an earlier
+commit returns `inserted: false`; a retry after a request that did not commit
+may return `inserted: true`. A retained publication that has expired or been
+retired is reported as expired/retired, while reuse of a key after its retained
+record has been removed follows the agent's then-current operation-key policy.
+If a publish result is unusable or its TTL does not exactly match the request,
+the outcome is unknown; retry the identical request using the same operation
+key.
 
 See [asterctl-blob-publish(1)](asterctl-blob-publish.1) and
 [asterctl-blob-read(1)](asterctl-blob-read.1).
