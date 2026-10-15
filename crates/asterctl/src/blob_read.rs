@@ -317,6 +317,7 @@ fn publish_open_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
     use std::fs::{self, OpenOptions};
 
     #[cfg(target_os = "linux")]
@@ -409,6 +410,7 @@ mod tests {
         assert!(complete.accept(&one).is_err());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn blob_read_removes_partial_output_unless_finish_succeeds() {
         let path =
@@ -428,6 +430,7 @@ mod tests {
         fs::remove_file(path).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn blob_read_finalization_never_replaces_a_destination_created_during_transfer() {
         let path = std::env::temp_dir().join(format!(
@@ -472,6 +475,7 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn blob_read_never_creates_a_named_partial_file() {
         let directory = std::env::temp_dir().join(format!(
