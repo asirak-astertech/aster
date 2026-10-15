@@ -1,17 +1,21 @@
-# Local ConnectRPC Event agent quickstart
+# Local application agent quickstart
 
 > ****
 
-`aster-agent` is an Event-only, out-of-process application boundary over the
-running selected Aster node. It serves Connect, gRPC, and gRPC-Web on
-plaintext loopback TCP and exposes high-level status, publish, query, durable
-subscription, poll, stream, acknowledgement, deletion, and gap operations. It
-does not expose keys, sealed content, carriers, transport choice,
-reconciliation messages, or mission provisioning over RPC.
+`aster-agent` is an out-of-process application boundary over the running
+selected Aster node. It serves Event operations through Connect, gRPC, and
+gRPC-Web on plaintext loopback TCP. On Linux, it additionally serves bounded
+Blob publish/read streams through native gRPC. On non-Linux hosts, `ReadBlob`
+remains available to a capable native-gRPC client, but `PublishBlob` is
+unsupported because secure upload staging is Linux-only; `asterctl blob-read`
+also requires Linux anonymous-file finalization. It does not expose keys,
+sealed content, carriers, transport choice, reconciliation messages, or
+mission provisioning over RPC.
 
 The customer profile is single-scope, accepts exact manual peers, and permits
-at most one customer-controlled pinned connectivity relay. It does not include
-State, Record, Blob, automatic discovery, bridges, or multi-scope forwarding.
+at most one customer-controlled pinned connectivity relay. The agent does not
+include State or Record operations, Blob subscription/status operations,
+automatic discovery, bridges, or multi-scope forwarding.
 
 ## Choose the correct runtime boundary
 

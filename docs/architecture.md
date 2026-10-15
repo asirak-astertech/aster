@@ -146,7 +146,8 @@ deadlines, and every age/checkpoint/index change commits atomically. This avoids
 both wall-clock reconstruction and an unbounded restart scan. Reaching TTL on
 the conservative lower bound feeds the existing marked-then-retired Event
 lifecycle, including lease drain. Wire claims and durable item encoding do not
-change. Blob finite lifetime and Blob route-only custody remain later work.
+change. On Linux, semantic-v8 Blob uses the same conservative lower-bound
+lifetime model; Blob route-only custody remains later work.
 
 Each mission-authenticated contact runs class-separated State and Record
 Negentropy/fetch lanes after its control and Event lanes. A receiver supplies
@@ -444,8 +445,10 @@ exact work as one bounded atomic unit; policy or continuity failures otherwise
 withhold or reject it. Permanent fences remain, and retained retirement records
 expire after 45 days of accumulated conservative lower-bound age. Finite Blob
 TTL and bounded strictly-lower-priority pressure recovery are selected under
-semantic-v8 custody. Route-only custody and public protocol/API/CLI lifecycle
-controls remain unimplemented.
+semantic-v8 custody on Linux. The selected Linux local-agent and `asterctl`
+path exposes bounded Blob publish/read operations with durable or finite TTL.
+Route-only custody, public GC controls, Blob subscription/status RPCs and CLI
+commands, and FFI lifecycle controls remain unimplemented.
 
 ## Live application command and status flow
 

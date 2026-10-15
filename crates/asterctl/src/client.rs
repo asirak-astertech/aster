@@ -537,7 +537,6 @@ pub async fn subscribe(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(target_os = "linux")]
     use std::{
         future::poll_fn,
         sync::{Arc, Mutex},
@@ -597,7 +596,6 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
     fn receipt(metadata: &api::PublishBlobMetadata) -> api::PublishBlobResponse {
         api::PublishBlobResponse {
             id: vec![1; 32],
@@ -614,7 +612,6 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
     fn read_page(offset: u64, chunk: Vec<u8>, complete: bool) -> api::ReadBlobResponse {
         api::ReadBlobResponse {
             id: vec![1; 32],
@@ -830,7 +827,6 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn blob_native_http2_fixture_covers_multi_page_publish_and_read_clients() {
         let payload = vec![0x5a; blob_publish::CHUNK_BYTES + 1];
@@ -878,8 +874,10 @@ mod tests {
             );
         let fixture = Fixture::start(router).await;
         let source = test_path("source");
+        #[cfg(target_os = "linux")]
         let destination = test_path("destination");
         let _ = std::fs::remove_file(&source);
+        #[cfg(target_os = "linux")]
         let _ = std::fs::remove_file(&destination);
         std::fs::write(&source, &payload).unwrap();
 
@@ -922,26 +920,30 @@ mod tests {
             ));
         }
 
-        let request = api::ReadBlobRequest {
-            id: vec![1; 32],
-            topic: "imagery.maps".into(),
-            scope: "mission/team/alpha".into(),
-            ..Default::default()
-        };
-        let read = read_blob(
-            fixture.address,
-            &token(),
-            request,
-            destination.clone(),
-            Duration::from_secs(2),
-        )
-        .await
-        .unwrap();
-        assert_eq!(read.total_len, payload.len() as u64);
-        assert_eq!(std::fs::read(&destination).unwrap(), payload);
+        #[cfg(target_os = "linux")]
+        {
+            let request = api::ReadBlobRequest {
+                id: vec![1; 32],
+                topic: "imagery.maps".into(),
+                scope: "mission/team/alpha".into(),
+                ..Default::default()
+            };
+            let read = read_blob(
+                fixture.address,
+                &token(),
+                request,
+                destination.clone(),
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+            assert_eq!(read.total_len, payload.len() as u64);
+            assert_eq!(std::fs::read(&destination).unwrap(), payload);
+        }
 
         fixture.stop().await;
         std::fs::remove_file(source).unwrap();
+        #[cfg(target_os = "linux")]
         std::fs::remove_file(destination).unwrap();
     }
 

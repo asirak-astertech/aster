@@ -115,6 +115,12 @@ and release authorization remain open. Existing evidence statuses do not move.
 
 ## Current capability outcomes
 
+Blob finite custody and the complete local-agent/`asterctl` file workflow in
+the rows below are selected Linux mechanisms. On non-Linux hosts, the agent's
+`ReadBlob` RPC remains available to a capable native-gRPC client, but secure
+agent upload staging, finite custody, and `asterctl blob-read` finalization are
+unsupported.
+
 | Outcome | Current maturity | Demonstrable progress | Next material outcome | Explicitly not claimed |
 |---|---|---|---|---|
 | **Causal correctness and bounded data lifecycle** | **Partial** | The selected lane retains bounded direct-observation causal schedules, class-specific limits, Linux Event custody age/expiry/quota evidence, and focused transactional rollback/restart mechanisms. Experimental numbered Event publication now bounds each surviving SDK client's local result ledger with `allocated_through`, sparse individual acknowledgement, fenced recovery sessions, and retained commit receipts after TTL cleanup. This is current-code evidence only. The [current schema](../protocol.md#7-causality) deliberately does not provide complete transitive causality; aggregate frontier, accepted-dot, and Event-sequence ledgers lack aggregate bounds and retirement protocols. Selected State/Record finite lifecycle remains open; selected Blob finite TTL, expiry, retirement evidence, and strictly-lower-priority pressure recovery now exist as current-code mechanisms without retained acceptance credit. | Complete coherent application-client ownership and lost-journal/client-retirement design for numbered publication; before broader multi-hop mutable or bridge claims, record the accepted causality/trust and authenticated checkpoint/retirement design; then retain Blob lifecycle behavior and implement the remaining cross-class TTL, tombstone and staging retention, garbage collection, and pressure behavior with crash and long-partition tests. | Numbered subscription/delivery ownership, lost-journal reconstruction, administrative client retirement, retained target evidence, complete transitive causality, bounded aggregate causal history, finite State/Record retention, retained Blob lifecycle acceptance, complete process-crash/power-loss recovery, long-offline recovery, difference-proportional local work, or release acceptance. |

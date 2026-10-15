@@ -143,8 +143,10 @@ and their aliases, and expires those retained retirement records after 45 days
 of accumulated conservative lower-bound age. Blob admission can also perform
 one bounded, partition-specific pressure-recovery attempt for strictly
 lower-priority Blob work. The selected Rust API activates finite Blob TTL and
-tagged retirement notices; route-only custody, public GC controls, and Blob
-lifetime fields in CLI/RPC/Protobuf/FFI remain open. See the
+tagged retirement notices on the selected Linux path. On Linux, the local agent
+and `asterctl` expose bounded Blob publish/read operations with durable or
+finite TTL. Route-only custody, public GC controls, Blob subscription/status
+RPCs and CLI commands, and Blob lifetime fields in the FFI remain open. See the
 [current implementation boundary](../README.md#current-implementation-boundary).
 
 ### Priority and TTL
@@ -158,8 +160,9 @@ Priority and time-to-live answer different questions:
 
 A high-priority item may still expire quickly. A low-priority item may be
 durable. Applications should choose both explicitly. Finite TTL is currently a
-selected Linux Event capability; selected State, Record, and Blob remain
-durable-only. See the normative [TTL rules](protocol.md#10-ttl-and-freshness-without-synchronized-clocks).
+selected Linux Event capability and a semantic-v8 Blob capability on Linux;
+selected State and Record remain durable-only. See the normative
+[TTL rules](protocol.md#10-ttl-and-freshness-without-synchronized-clocks).
 
 ### Emission policy
 
