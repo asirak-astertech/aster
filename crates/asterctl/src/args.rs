@@ -1,4 +1,6 @@
 use crate::auth::Token;
+use crate::blob_publish::Publication as BlobPublication;
+use crate::blob_read::Read as BlobRead;
 use crate::publish::Publication;
 use crate::query::Query;
 use crate::subscribe::Subscription;
@@ -18,6 +20,8 @@ Introspect and control Aster nodes through a running Aster agent.
 COMMANDS:
   status            Display node status (default)
   publish           Publish an Event
+  blob-publish      Publish a file as a Blob
+  blob-read         Read a Blob to a new file
   query             Query stored Events
   subscribe         Create an Event subscription
   subscriptions     List Event subscriptions
@@ -53,6 +57,8 @@ pub struct Options {
 pub enum Command {
     Help,
     PublishHelp,
+    BlobPublishHelp,
+    BlobReadHelp,
     QueryHelp,
     SubscribeHelp,
     SubscriptionsHelp,
@@ -61,6 +67,8 @@ pub enum Command {
     Subscriptions(Options),
     Unsubscribe(Options, Vec<u8>),
     Publish(Options, Box<Publication>),
+    BlobPublish(Options, Box<BlobPublication>),
+    BlobRead(Options, BlobRead),
     Query(Options, Query),
     Subscribe(Options, Subscription),
 }
@@ -76,6 +84,8 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
     let mut unsubscribe = false;
     let mut subscription_id = None;
     let mut publication: Option<Publication> = None;
+    let mut blob_publication: Option<BlobPublication> = None;
+    let mut blob_read: Option<BlobRead> = None;
     let mut query: Option<Query> = None;
     let mut subscription: Option<Subscription> = None;
     let mut positional = false;
@@ -115,6 +125,10 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
                 }
                 return Ok(if publication.is_some() {
                     Command::PublishHelp
+                } else if blob_publication.is_some() {
+                    Command::BlobPublishHelp
+                } else if blob_read.is_some() {
+                    Command::BlobReadHelp
                 } else if query.is_some() {
                     Command::QueryHelp
                 } else if subscription.is_some() {
@@ -130,25 +144,105 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
             "unsubscribe"
                 if inline.is_none()
                     && !status
+                    && publication.is_none()
+                    && blob_publication.is_none()
+                    && blob_read.is_none()
                     && query.is_none()
+                    && subscription.is_none()
                     && !subscriptions
                     && !unsubscribe =>
             {
                 unsubscribe = true;
             }
-            "subscriptions" if inline.is_none() && !status && query.is_none() && !subscriptions => {
+            "subscriptions"
+                if inline.is_none()
+                    && !status
+                    && publication.is_none()
+                    && blob_publication.is_none()
+                    && blob_read.is_none()
+                    && query.is_none()
+                    && subscription.is_none()
+                    && !subscriptions
+                    && !unsubscribe =>
+            {
                 subscriptions = true;
             }
-            "status" if inline.is_none() && !status && query.is_none() && !subscriptions => {
+            "status"
+                if inline.is_none()
+                    && !status
+                    && publication.is_none()
+                    && blob_publication.is_none()
+                    && blob_read.is_none()
+                    && query.is_none()
+                    && subscription.is_none()
+                    && !subscriptions
+                    && !unsubscribe =>
+            {
                 status = true
             }
-            "publish" if inline.is_none() && !status && query.is_none() && !subscriptions => {
+            "publish"
+                if inline.is_none()
+                    && !status
+                    && publication.is_none()
+                    && blob_publication.is_none()
+                    && blob_read.is_none()
+                    && query.is_none()
+                    && subscription.is_none()
+                    && !subscriptions
+                    && !unsubscribe =>
+            {
                 publication = Some(Publication::default())
             }
-            "query" if inline.is_none() && !status && query.is_none() && !subscriptions => {
+            "blob-publish"
+                if inline.is_none()
+                    && !status
+                    && publication.is_none()
+                    && blob_publication.is_none()
+                    && query.is_none()
+                    && subscription.is_none()
+                    && !subscriptions
+                    && !unsubscribe
+                    && blob_read.is_none() =>
+            {
+                blob_publication = Some(BlobPublication::default())
+            }
+            "blob-read"
+                if inline.is_none()
+                    && !status
+                    && publication.is_none()
+                    && blob_read.is_none()
+                    && query.is_none()
+                    && subscription.is_none()
+                    && !subscriptions
+                    && !unsubscribe
+                    && blob_publication.is_none() =>
+            {
+                blob_read = Some(BlobRead::default())
+            }
+            "query"
+                if inline.is_none()
+                    && !status
+                    && publication.is_none()
+                    && blob_publication.is_none()
+                    && blob_read.is_none()
+                    && query.is_none()
+                    && subscription.is_none()
+                    && !subscriptions
+                    && !unsubscribe =>
+            {
                 query = Some(Query::default())
             }
-            "subscribe" if inline.is_none() && !status && query.is_none() && !subscriptions => {
+            "subscribe"
+                if inline.is_none()
+                    && !status
+                    && publication.is_none()
+                    && blob_publication.is_none()
+                    && blob_read.is_none()
+                    && query.is_none()
+                    && subscription.is_none()
+                    && !subscriptions
+                    && !unsubscribe =>
+            {
                 subscription = Some(Subscription::default())
             }
             "--" if inline.is_none() && (publication.is_some() || subscription.is_some()) => {
@@ -221,6 +315,49 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
                     publication.set_option(name, value)?;
                 }
             }
+            "--file" if blob_publication.is_some() => {
+                if !command_options.insert(name.to_owned()) {
+                    return Err(format!("{name} must not be repeated"));
+                }
+                let value = option_value(name, inline, &mut args)?;
+                blob_publication
+                    .as_mut()
+                    .expect("Blob publish command")
+                    .set_file(value.into())?;
+            }
+            "--topic" | "--scope" | "--priority" | "--media-type" | "--schema-id" | "--ttl-ms"
+            | "--operation-key"
+                if blob_publication.is_some() =>
+            {
+                if !command_options.insert(name.to_owned()) {
+                    return Err(format!("{name} must not be repeated"));
+                }
+                let value = text_option_value(name, inline, &mut args)?;
+                blob_publication
+                    .as_mut()
+                    .expect("Blob publish command")
+                    .set_option(name, value)?;
+            }
+            "--output" if blob_read.is_some() => {
+                if !command_options.insert(name.to_owned()) {
+                    return Err(format!("{name} must not be repeated"));
+                }
+                let value = option_value(name, inline, &mut args)?;
+                blob_read
+                    .as_mut()
+                    .expect("Blob read command")
+                    .set_output(value.into())?;
+            }
+            "--id" | "--topic" | "--scope" if blob_read.is_some() => {
+                if !command_options.insert(name.to_owned()) {
+                    return Err(format!("{name} must not be repeated"));
+                }
+                let value = text_option_value(name, inline, &mut args)?;
+                blob_read
+                    .as_mut()
+                    .expect("Blob read command")
+                    .set_option(name, value)?;
+            }
             "--topic" | "--scope" | "--publisher" | "--logical-key" | "--limit"
                 if query.is_some() =>
             {
@@ -254,6 +391,12 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
     if let Some(publication) = &publication {
         publication.validate()?;
     }
+    if let Some(publication) = &blob_publication {
+        publication.validate()?;
+    }
+    if let Some(read) = &blob_read {
+        read.validate()?;
+    }
     if let Some(subscription) = &subscription {
         subscription.validate()?;
     }
@@ -269,6 +412,10 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
     };
     Ok(if let Some(publication) = publication {
         Command::Publish(options, Box::new(publication))
+    } else if let Some(publication) = blob_publication {
+        Command::BlobPublish(options, Box::new(publication))
+    } else if let Some(read) = blob_read {
+        Command::BlobRead(options, read)
     } else if let Some(query) = query {
         Command::Query(options, query)
     } else if let Some(subscription) = subscription {
@@ -516,5 +663,31 @@ mod tests {
                 b"a=b"
             );
         }
+    }
+
+    #[test]
+    fn rejects_repeated_blob_commands() {
+        assert!(
+            arguments(&[
+                "blob-publish",
+                "blob-publish",
+                "--file=/tmp/blob",
+                "--topic=x",
+                "--scope=x",
+                "--operation-key=test",
+            ])
+            .is_err()
+        );
+        assert!(
+            arguments(&[
+                "blob-read",
+                "blob-read",
+                "--id=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+                "--topic=x",
+                "--scope=x",
+                "--output=/tmp/blob",
+            ])
+            .is_err()
+        );
     }
 }

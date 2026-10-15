@@ -21,8 +21,14 @@ zeroize.workspace = true
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix.workspace = true
+
 [build-dependencies]
 connectrpc-build.workspace = true
+
+[dev-dependencies]
+connectrpc = { workspace = true, features = ["client", "json", "server"] }
 
 [lints]
 workspace = true

@@ -483,6 +483,7 @@ dependencies = [
  "getrandom 0.4.3",
  "http",
  "libc",
+ "rustix",
  "serde",
  "serde_json",
  "tokio",
