@@ -2981,7 +2981,7 @@ impl Store {
         )
     }
 
-    /// Mints an exact completion capability for a semantic-v8/profile-3
+    /// Mints an exact completion capability for a semantic-v8/profile-4
     /// contact only while the retained completed source remains CustodyV1
     /// eligible and lifetime-visible in the same Store read snapshot.
     #[doc(hidden)]
@@ -4246,7 +4246,7 @@ impl Store {
         self.pending_blob_source_with_eligibility(source, BlobContactEligibility::DurableOnly, true)
     }
 
-    /// Loads one exact pending source for a semantic-v8/profile-3 contact.
+    /// Loads one exact pending source for a semantic-v8/profile-4 contact.
     #[doc(hidden)]
     pub fn custody_v1_pending_blob_source(
         &self,
@@ -4303,7 +4303,7 @@ impl Store {
 
     /// Loads one exact source eligible for an authenticated semantic-v8
     /// semantic-v8 custody contact. Durable and locally originated finite sources
-    /// remain eligible; received finite sources must retain exact v8/profile-3
+    /// remain eligible; received finite sources must retain exact v8/profile-4
     /// provenance and a currently live lower-bound lifetime.
     #[doc(hidden)]
     pub fn custody_v1_blob_source_projection(
@@ -4992,7 +4992,7 @@ impl Store {
         )
     }
 
-    /// Visits only sources eligible for an exact semantic-v8/profile-3
+    /// Visits only sources eligible for an exact semantic-v8/profile-4
     /// custody contact. Unsupported received finite provenance is omitted
     /// before inventory ordering and cache repair.
     #[doc(hidden)]
@@ -18905,7 +18905,7 @@ mod tests {
             },
             provenance: BlobFiniteProvenance::NetworkV1 {
                 semantic_version: 8,
-                profile_id: 3,
+                profile_id: 4,
             },
         };
         let mut expected = vec![2];
@@ -18917,7 +18917,7 @@ mod tests {
         expected.extend_from_slice(&11u64.to_be_bytes());
         expected.push(1);
         expected.extend_from_slice(&8u16.to_be_bytes());
-        expected.extend_from_slice(&3u16.to_be_bytes());
+        expected.extend_from_slice(&4u16.to_be_bytes());
 
         // Mutation caught: changing field order, omitting sticky continuity,
         // or accepting an implicit profile changes this literal canonical form.
@@ -19597,7 +19597,7 @@ mod tests {
                 .lifetime
         };
         // Mutation caught: staging or reopen cannot discard authenticated age,
-        // exact TTL, or semantic-v8/profile-3 provenance.
+        // exact TTL, or semantic-v8/profile-4 provenance.
         assert_eq!(pending_lifetime(&target), expected);
         let before_pending_duplicate_stats = target.blob_stats().expect("pending duplicate stats");
         let pending_later_sample = CustodySample {
@@ -20501,7 +20501,7 @@ mod tests {
         };
         let provenance = BlobFiniteProvenance::NetworkV1 {
             semantic_version: 8,
-            profile_id: 3,
+            profile_id: 4,
         };
         let stored = BlobLifetime::Finite {
             ttl_ms: 10_000,

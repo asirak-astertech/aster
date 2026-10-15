@@ -1525,7 +1525,7 @@ mod tests {
             vec![
                 1, 5, // codec version and lane count
                 0, 5, 1, 0, 1, // EventBridge: LegacyV6
-                0, 4, 1, 0, 3, // Blob: BlobRangesStreamV1
+                0, 4, 1, 0, 4, // Blob: BlobRangesStreamV1
                 0, 3, 1, 0, 1, // Record: LegacyV6
                 0, 2, 1, 0, 1, // State: LegacyV6
                 0, 1, 2, 0, 2, 0, 1, // Event: EventPagesV1, LegacyV6
@@ -1932,7 +1932,7 @@ mod tests {
         let encoded = TransferProfileOfferV1::current().encode().unwrap();
         assert_eq!(
             format!(
-                "# aster-blob-ranges-stream-vectors/v1\tsemantic=7\toracle=self\nACCEPT\toffer-blob-stream-only-v1\t{}\n",
+                "# aster-blob-ranges-stream-vectors/v1\tsemantic=7\toracle=python-stdlib\nACCEPT\toffer-blob-stream-only-v1\t{}\n",
                 vector_hex(&encoded)
             ),
             include_str!("../../../conformance/vectors/blob-ranges-stream-v1.tsv")
@@ -1948,7 +1948,15 @@ mod tests {
         let current = TransferProfileOfferV1::current();
         let legacy = legacy_only_offer();
         let selected = negotiate_transfer_profiles(&current, &current).unwrap();
-        assert_eq!(selected.profile(LaneId::Blob).unwrap() as u16, 3);
+        assert_eq!(selected.profile(LaneId::Blob).unwrap() as u16, 4);
+        assert_eq!(TransferProfileId::decode(3), None);
+        let mut reserved = current.encode().unwrap();
+        reserved[9] = 2;
+        reserved[10..12].copy_from_slice(&3u16.to_be_bytes());
+        reserved.splice(12..12, 1u16.to_be_bytes());
+        let reserved = TransferProfileOfferV1::decode(&reserved).unwrap();
+        assert!(negotiate_transfer_profiles(&current, &reserved).is_err());
+        assert!(negotiate_transfer_profiles(&reserved, &current).is_err());
         for (left, right) in [(&current, &legacy), (&legacy, &current)] {
             let error = negotiate_transfer_profiles(left, right).unwrap_err();
             assert!(

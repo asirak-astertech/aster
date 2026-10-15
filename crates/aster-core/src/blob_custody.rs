@@ -11,7 +11,7 @@ pub const BLOB_CUSTODY_CLAIM_V1_BYTES: usize = 208;
 const MAGIC: &[u8; 8] = b"ASTRBL08";
 const FORMAT_VERSION: u16 = 1;
 const SEMANTIC_VERSION: u16 = 8;
-const PROFILE_ID: u16 = 3;
+const PROFILE_ID: u16 = 4;
 const BLOB_LANE_ID: u16 = 4;
 const V8_LANE_RECORD_DOMAIN: &[u8] = b"ASTER/v8-lane-record/v1\0";
 const CONTACT_ID_DOMAIN: &[u8] = b"ASTER/v8-blob-custody-contact/v1\0";
@@ -64,7 +64,7 @@ impl BlobCustodyDirectionV1 {
 ///
 /// Construction is core-private. Public callers can receive this value only
 /// from `ReferenceAuthenticatedSession::open_blob_custody_frame` after an
-/// authenticated profile-3 Blob-lane record open succeeds.
+/// authenticated profile-4 Blob-lane record open succeeds.
 #[derive(Debug, Eq, PartialEq)]
 pub struct AuthenticatedBlobCustodyContactV1 {
     semantic_version: u16,
@@ -78,7 +78,7 @@ pub struct AuthenticatedBlobCustodyContactV1 {
 }
 
 /// Opaque one-use outbound context from an authenticated semantic-v8,
-/// profile-3 Blob session.
+/// profile-4 Blob session.
 ///
 /// Construction is core-private and the type is deliberately non-`Clone`.
 /// Store authorization consumes it so raw session, exchange, direction, and
@@ -540,7 +540,7 @@ impl BlobCustodyClaimV1 {
 ///
 /// let forged = AuthenticatedBlobCustodyContactV1 {
 ///     semantic_version: 8,
-///     profile_id: 3,
+///     profile_id: 4,
 ///     session_transcript: [0x11; 32],
 ///     transfer_profile_digest: [0x22; 32],
 ///     direction: BlobCustodyDirectionV1::ToSessionResponder,
@@ -671,8 +671,8 @@ impl<'a> ClaimReader<'a> {
 mod tests {
     use super::*;
 
-    const MINIMUM_HEX: &str = "41535452424c30380001000800031111111111111111111111111111111111111111111111111111111111111111000000000000000001222222222222222222222222222222222222222222222222222222222222222200000000000000013333333333333333333333333333333333333333333333333333333333333333444444444444444444444444444444444444444444444444444444444444444400000000000000000100000000000000005555555555555555555555555555555500000000000000000000000000000000";
-    const MAXIMUM_HEX: &str = "41535452424c3038000100080003ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff02eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeffffffffffffffffddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc03ffffffffffffffffffffffffffffffffbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbffffffffffffffff0000000000000000";
+    const MINIMUM_HEX: &str = "41535452424c30380001000800041111111111111111111111111111111111111111111111111111111111111111000000000000000001222222222222222222222222222222222222222222222222222222222222222200000000000000013333333333333333333333333333333333333333333333333333333333333333444444444444444444444444444444444444444444444444444444444444444400000000000000000100000000000000005555555555555555555555555555555500000000000000000000000000000000";
+    const MAXIMUM_HEX: &str = "41535452424c3038000100080004ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff02eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeffffffffffffffffddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc03ffffffffffffffffffffffffffffffffbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbffffffffffffffff0000000000000000";
 
     fn literal_hex<const N: usize>(encoded: &str) -> [u8; N] {
         assert_eq!(encoded.len(), N * 2, "literal vector width");
@@ -710,7 +710,7 @@ mod tests {
         assert_eq!(claim.forwarding_age_ms(), 0);
         assert_eq!(
             claim.digest(),
-            literal_hex::<32>("97db5c5cadc102f7f58ceeea9a0bbbc6bf18429016bb0033582eea682cbcfe95")
+            literal_hex::<32>("f67036c97bafaa550c8615b901e30a9dbcb5555984678985dd521736af00546f")
         );
 
         let maximum = literal_hex::<208>(MAXIMUM_HEX);
@@ -730,7 +730,7 @@ mod tests {
         assert_eq!(claim.forwarding_age_ms(), u64::MAX);
         assert_eq!(
             claim.digest(),
-            literal_hex::<32>("aa7dbfa6fc8c912af579a4d979c8091c5b25750a2cacf23dcd93a5f9c299a09b")
+            literal_hex::<32>("5763e2b03b5dce40dd28cc57a439dd4d14cb55520902eb4a50a60d2c81b9c033")
         );
     }
 

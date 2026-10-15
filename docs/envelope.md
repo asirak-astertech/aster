@@ -992,7 +992,7 @@ bytes:
 magic                           "ASTRBL08"         8
 format_version                  u16 = 1             2
 semantic_version                u16 = 8             2
-profile_id                      u16 = 3             2
+profile_id                      u16 = 4             2
 session_transcript              32 bytes           32
 exchange_id                     u64                 8
 direction                       u8 = 1 or 2          1
@@ -1425,7 +1425,7 @@ profile, or direction MUST fail authentication. The profile offer and every
 negotiated `LegacyV6` Event/State/Record/EventBridge frame keep the ordinary exact ASCII
 application AAD `"aster/transport-frame/v1"`; v1-v6 bytes remain unchanged.
 Blob source metadata also retains ordinary AAD, while carrier streaming binds
-lane `4`, profile `3`, and its exact direction. The selected runtime no longer
+lane `4`, profile `4`, and its exact direction. The selected runtime no longer
 executes legacy Blob carrier Result/Ack or Finish/Finished exchanges; their
 historical byte definitions below are not a fallback path.
 

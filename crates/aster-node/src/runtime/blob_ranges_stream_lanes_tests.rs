@@ -99,7 +99,7 @@ async fn blob_ranges_stream_saturated_six_mutable_directions() {
         );
         assert!(receipt.handshake_frames + receipt.protected_frames <= MAX_CONTACT_FRAMES);
         assert!(receipt.handshake_bytes + receipt.protected_bytes <= MAX_CONTACT_BYTES);
-        assert_eq!(receipt.negotiated_transfer_profiles.unwrap()[3], 3);
+        assert_eq!(receipt.negotiated_transfer_profiles.unwrap()[3], 4);
     }
     for index in 0..2 {
         assert!(

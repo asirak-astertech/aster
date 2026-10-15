@@ -13410,7 +13410,7 @@ fn accept_received_mutable_for_contact(
 ) -> Result<(MutableApplyDisposition, Option<[u8; 32]>), NodeError> {
     if custody.is_some() && !blob_contact_mode.finite_transfer_enabled() {
         return Err(NodeError::Protocol(
-            "Blob custody authority arrived outside negotiated profile 3".into(),
+            "Blob custody authority arrived outside negotiated profile 4".into(),
         ));
     }
     accept_received_mutable(store, guard, verifier, admission, id, bytes, custody)
@@ -24423,6 +24423,7 @@ const fn future_blob_carrier_lane_reserve(direction: EventDirection) -> (usize, 
     }
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn serve_verified_blob_range(
     store: &Store,
@@ -24438,6 +24439,47 @@ fn serve_verified_blob_range(
     requested_len: u32,
     proof: &[u8; crate::frame::BLOB_CONTENT_PROOF_BYTES],
     blob_contact_mode: BlobContactMode,
+) -> Result<Option<Vec<u8>>, NodeError> {
+    serve_verified_blob_range_in_schedule(
+        store,
+        guard,
+        verifier,
+        peer,
+        commitments,
+        peer_interest,
+        source,
+        object,
+        total_len,
+        offset,
+        requested_len,
+        proof,
+        blob_contact_mode,
+        &mut None,
+    )
+}
+
+struct AuthenticatedBlobRangeSource {
+    sealed: Vec<u8>,
+    blob: ContentVerifiedBlobEnvelope,
+    plan: VerifiedBlobTransferPlan,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn serve_verified_blob_range_in_schedule(
+    store: &Store,
+    guard: &EventLaneGuard,
+    verifier: &mut ReferenceEnvelopeSealer,
+    peer: NodeId,
+    commitments: &[[u8; 32]],
+    peer_interest: &BlobInterest,
+    source: BlobTransferId,
+    object: BlobCarrierObjectId,
+    total_len: u64,
+    offset: u64,
+    requested_len: u32,
+    proof: &[u8; crate::frame::BLOB_CONTENT_PROOF_BYTES],
+    blob_contact_mode: BlobContactMode,
+    authenticated: &mut Option<AuthenticatedBlobRangeSource>,
 ) -> Result<Option<Vec<u8>>, NodeError> {
     guard.check(store)?;
     if !canonical_blob_network_range(total_len, offset, requested_len) {
@@ -24565,42 +24607,62 @@ fn serve_verified_blob_range(
             "served bounded Blob source escaped the selected network source cap".into(),
         ));
     }
-    #[cfg(test)]
-    cache.record_blob_range_source_authentication();
-    let route = verifier
-        .verify_blob(&stored.sealed)
-        .map_err(NodeError::from)
-        .map_err(|error| fatal_blob_coherence("served Blob source authentication", error))?;
-    if BlobTransferId::new(route.envelope_id()) != source {
-        return Err(NodeError::FatalBlobCoherence(
-            "served Blob source identity changed".into(),
-        ));
-    }
-    let BlobContentVerification::ContentVerified {
-        blob,
-        manifest_bytes,
-    } = verifier
-        .verify_blob_content(route, &stored.sealed)
-        .map_err(NodeError::from)
-        .map_err(|error| fatal_blob_coherence("served Blob content authentication", error))?
-    else {
-        return Err(NodeError::FatalBlobCoherence(
-            "served Blob lost its content grant".into(),
-        ));
-    };
-    let plan = blob
-        .transfer_plan(&manifest_bytes)
-        .map_err(|error| {
-            NodeError::Protocol(format!("served Blob transfer plan is invalid: {error}"))
-        })
-        .map_err(|error| fatal_blob_coherence("served Blob transfer plan", error))?;
-    if plan.manifest().total_len() > MAX_NETWORK_BLOB_BYTES
-        || plan.manifest().chunk_count() > MAX_NETWORK_BLOB_CHUNKS
+    // Only immutable cryptographic results live for this bounded schedule.
+    // Reload and compare exact durable bytes on every range; all current
+    // authority, lineage, completion and depot checks below remain per-range.
+    if let Some(prior) = authenticated.as_ref()
+        && prior.sealed != stored.sealed
     {
         return Err(NodeError::FatalBlobCoherence(
-            "served bounded Blob plan escaped the selected network manifest caps".into(),
+            "served Blob source changed within its schedule".into(),
         ));
     }
+    if authenticated.is_none() {
+        #[cfg(test)]
+        cache.record_blob_range_source_authentication();
+        let route = verifier
+            .verify_blob(&stored.sealed)
+            .map_err(NodeError::from)
+            .map_err(|error| fatal_blob_coherence("served Blob source authentication", error))?;
+        if BlobTransferId::new(route.envelope_id()) != source {
+            return Err(NodeError::FatalBlobCoherence(
+                "served Blob source identity changed".into(),
+            ));
+        }
+        let BlobContentVerification::ContentVerified {
+            blob,
+            manifest_bytes,
+        } = verifier
+            .verify_blob_content(route, &stored.sealed)
+            .map_err(NodeError::from)
+            .map_err(|error| fatal_blob_coherence("served Blob content authentication", error))?
+        else {
+            return Err(NodeError::FatalBlobCoherence(
+                "served Blob lost its content grant".into(),
+            ));
+        };
+        let plan = blob
+            .transfer_plan(&manifest_bytes)
+            .map_err(|error| {
+                NodeError::Protocol(format!("served Blob transfer plan is invalid: {error}"))
+            })
+            .map_err(|error| fatal_blob_coherence("served Blob transfer plan", error))?;
+        if plan.manifest().total_len() > MAX_NETWORK_BLOB_BYTES
+            || plan.manifest().chunk_count() > MAX_NETWORK_BLOB_CHUNKS
+        {
+            return Err(NodeError::FatalBlobCoherence(
+                "served bounded Blob plan escaped the selected network manifest caps".into(),
+            ));
+        }
+        *authenticated = Some(AuthenticatedBlobRangeSource {
+            sealed: stored.sealed.clone(),
+            blob,
+            plan,
+        });
+    }
+    let AuthenticatedBlobRangeSource { blob, plan, .. } =
+        authenticated.as_ref().expect("authenticated above");
+
     let (still_current, completion) = cache
         .verify_completed_blob_source_claim(
             verifier,
@@ -24618,7 +24680,7 @@ fn serve_verified_blob_range(
         return Ok(None);
     }
     ensure_mutable_active(store, blob.publisher(), blob.scope(), blob.key_epoch())?;
-    let lineage = verifier.verify_current_blob_lineage(&blob)?;
+    let lineage = verifier.verify_current_blob_lineage(blob)?;
     let final_selector = peer_interest
         .selector(blob.topic(), blob.scope())
         .filter(|selector| selector.epoch() == blob.key_epoch())
@@ -33451,9 +33513,9 @@ mod tests {
         // optional fields, losing context binding, or trusting a wrong digest.
         let document = include_str!("../../../conformance/vectors/blob-custody-v8.tsv");
         let exact_digest = [
-            0x97, 0xdb, 0x5c, 0x5c, 0xad, 0xc1, 0x02, 0xf7, 0xf5, 0x8c, 0xee, 0xea, 0x9a, 0x0b,
-            0xbb, 0xc6, 0xbf, 0x18, 0x42, 0x90, 0x16, 0xbb, 0x00, 0x33, 0x58, 0x2e, 0xea, 0x68,
-            0x2c, 0xbc, 0xfe, 0x95,
+            0xf6, 0x70, 0x36, 0xc9, 0x7b, 0xaf, 0xaa, 0x55, 0x0c, 0x86, 0x15, 0xb9, 0x01, 0xe3,
+            0x0a, 0x9d, 0xbc, 0xb5, 0x55, 0x59, 0x84, 0x67, 0x89, 0x85, 0xdd, 0x52, 0x17, 0x36,
+            0xaf, 0x00, 0x54, 0x6f,
         ];
         let mut accepted = 0usize;
         let mut rejected = 0usize;
@@ -48891,7 +48953,7 @@ mod tests {
                 .sum();
             assert_eq!(prefix, committed_prefix);
         }
-        let (received, _, _, _) = blob_contact_test_pair(
+        let (received, _, sender_cache, _) = blob_contact_test_pair(
             a_store.clone(),
             a.credentials.clone(),
             interests(),
@@ -48901,6 +48963,11 @@ mod tests {
         )
         .await;
         assert!(received.blob_ranges_fetched > 1, "{received:?}");
+        assert_eq!(sender_cache.blob_range_source_authentications(), 1);
+        assert_eq!(
+            sender_cache.blob_range_depot_rechecks(),
+            received.blob_ranges_fetched as u64
+        );
         if interrupt.is_some() {
             assert_eq!(received.fetched, 0, "resume reuses authenticated source");
         }
@@ -49051,10 +49118,14 @@ mod tests {
             preaccounted_contact_items,
         )
         .await;
-        (
-            client.expect("Blob client contact").receipt,
-            server.expect("Blob server contact").receipt,
-        )
+        match (client, server) {
+            (Ok(client), Ok(server)) => (client.receipt, server.receipt),
+            (client, server) => panic!(
+                "Blob contact errors: client={:?}, server={:?}",
+                client.err(),
+                server.err()
+            ),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -49281,6 +49352,9 @@ mod tests {
                 ),
             )
             .await;
+        if client_receipt.is_err() {
+            client.close().await;
+        }
         let server_receipt = server_task.await.expect("Blob server task");
         client.close().await;
         server.close().await;
@@ -49581,9 +49655,9 @@ mod tests {
     }
 
     #[test]
-    fn semantic_blob_profile_three_resolves_to_version_scoped_contact_mode() {
+    fn semantic_blob_profile_four_resolves_to_version_scoped_contact_mode() {
         // Mutation caught: deriving finite eligibility from semantic-v8 alone,
-        // or continuing Slice-5A suppression after authenticated profile-3
+        // or continuing Slice-5A suppression after authenticated profile-4
         // negotiation, would expose or starve the wrong source set.
         let negotiated = |semantic_version, offer: TransferProfileOfferV1| {
             let negotiated =
@@ -49646,7 +49720,7 @@ mod tests {
     async fn custody_runtime_inventory_and_exact_load_omit_unsupported_received_provenance() {
         // Mutation caught: using the all-visible visitor or projection for a
         // custody contact inventories and reloads finite state whose received
-        // provenance was never admitted under exact semantic-v8/profile-3.
+        // provenance was never admitted under exact semantic-v8/profile-4.
         let services = control_test_services([0xc7; 32]);
         let authority = services.member.mission_authority_id();
         let source_state = root("unsupported-custody-provenance-source");
@@ -50180,7 +50254,7 @@ mod tests {
 
     #[tokio::test]
     async fn v8_custody_blob_offer_object_and_carrier_promote_exact_publication() {
-        // Mutation caught: leaving profile-3 finite transfer suppressed, using
+        // Mutation caught: leaving profile-4 finite transfer suppressed, using
         // an unprotected/raw claim, or staging before exact claim verification
         // would fail one of the two real source directions or admit no finite
         // pending authority at all.

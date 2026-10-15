@@ -1,5 +1,67 @@
 use super::*;
 
+#[test]
+fn python_constructed_stream_record_vectors() {
+    let direction = EventDirection::ToSessionResponder;
+    let single = BlobRangeCandidate {
+        total_len: 1,
+        requested_len: 1,
+        ..candidate(0)
+    };
+    let digest =
+        schedule_hash(&encode_schedule(&[single], direction, SEMANTIC_PROTOCOL_V7).unwrap());
+    let mut count = 0;
+    for line in include_str!("../../../../conformance/vectors/blob-stream-records-v1.tsv")
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+    {
+        let fields: Vec<_> = line.split('\t').collect();
+        let bytes: Vec<u8> = fields[3]
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect();
+        let accepted = match fields[1] {
+            "schedule" => decode_schedule(&bytes, direction, SEMANTIC_PROTOCOL_V7).map(|ranges| {
+                assert_eq!(
+                    encode_schedule(&ranges, direction, SEMANTIC_PROTOCOL_V7).unwrap(),
+                    bytes
+                );
+            }),
+            "terminal" => check_envelope(&bytes, END_PREFIX, digest, 1).and_then(|tail| {
+                if tail.is_empty() {
+                    Ok(())
+                } else {
+                    Err(invalid("trailing terminal"))
+                }
+            }),
+            "data" => (|| {
+                let payload = check_envelope(&bytes, DATA_PREFIX, digest, 0)?;
+                let frame = Frame::decode_for_semantic_version(payload, SEMANTIC_PROTOCOL_V7)?;
+                decode_range_response(payload, direction, &single, SEMANTIC_PROTOCOL_V7)?;
+                assert_eq!(
+                    frame
+                        .encode_for_semantic_version(SEMANTIC_PROTOCOL_V7)
+                        .unwrap(),
+                    payload
+                );
+                Ok(())
+            })(),
+            _ => panic!("unknown vector kind"),
+        }
+        .is_ok();
+        assert_eq!(
+            accepted,
+            fields[0] == "ACCEPT",
+            "{} {}",
+            fields[1],
+            fields[2]
+        );
+        count += 1;
+    }
+    assert_eq!(count, 37);
+}
+
 fn candidate(offset: u64) -> BlobRangeCandidate {
     BlobRangeCandidate {
         source: BlobTransferId::new([1; 32]),

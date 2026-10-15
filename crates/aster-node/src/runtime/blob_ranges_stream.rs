@@ -236,6 +236,37 @@ fn decode_schedule(
     Ok(ranges)
 }
 
+fn decode_range_response(
+    payload: &[u8],
+    direction: EventDirection,
+    candidate: &BlobRangeCandidate,
+    semantic_version: u16,
+) -> Result<(BlobRangeDisposition, Vec<u8>), NodeError> {
+    let Frame::BlobRange {
+        direction: actual,
+        source_id,
+        object_id,
+        total_len,
+        offset,
+        requested_len,
+        disposition,
+        bytes,
+    } = Frame::decode_for_semantic_version(payload, semantic_version)?
+    else {
+        return Err(invalid("expected range data"));
+    };
+    if actual != direction
+        || source_id != candidate.source
+        || store_blob_object_id(object_id)? != candidate.object
+        || total_len != candidate.total_len
+        || offset != candidate.offset
+        || requested_len != candidate.requested_len
+    {
+        return Err(invalid("response differs from exact requested tuple"));
+    }
+    Ok((disposition, bytes))
+}
+
 fn schedule_hash(bytes: &[u8]) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash.update(b"ASTER/blob-ranges-stream/schedule/v1\0");
@@ -387,28 +418,8 @@ pub(super) async fn receive(
             .read(&mut turn, mission, MAX_DATA_BYTES, receipt)
             .await?;
         let payload = check_envelope(&bytes, DATA_PREFIX, digest, index)?;
-        let Frame::BlobRange {
-            direction: actual,
-            source_id,
-            object_id,
-            total_len,
-            offset,
-            requested_len,
-            disposition,
-            bytes,
-        } = Frame::decode_for_semantic_version(payload, context.semantic_version)?
-        else {
-            return Err(invalid("expected range data"));
-        };
-        if actual != direction
-            || source_id != candidate.source
-            || store_blob_object_id(object_id)? != candidate.object
-            || total_len != candidate.total_len
-            || offset != candidate.offset
-            || requested_len != candidate.requested_len
-        {
-            return Err(invalid("response differs from exact requested tuple"));
-        }
+        let (disposition, bytes) =
+            decode_range_response(payload, direction, candidate, context.semantic_version)?;
         if disposition == BlobRangeDisposition::Unavailable {
             discard_remaining = true;
             terminal_range_cursor_eligible = false;
@@ -695,6 +706,7 @@ pub(super) async fn send(
         .open_send_uni(deadline, event_turn_wire_budget(receipt, context.reserve)?)
         .await?;
     let mut unavailable_remaining = false;
+    let mut authenticated = None;
     for (index, candidate) in ranges.iter().enumerate() {
         context.check()?;
         let bytes = if unavailable_remaining {
@@ -702,7 +714,7 @@ pub(super) async fn send(
         } else {
             #[cfg(test)]
             blob_ranges_stream_test::record_sender_service_attempt(store);
-            serve_verified_blob_range(
+            serve_verified_blob_range_in_schedule(
                 store,
                 guard,
                 verifier,
@@ -716,6 +728,7 @@ pub(super) async fn send(
                 candidate.requested_len,
                 &candidate.proof,
                 context.blob_contact_mode,
+                &mut authenticated,
             )?
         };
         #[cfg(test)]

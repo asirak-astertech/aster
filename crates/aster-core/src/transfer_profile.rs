@@ -49,7 +49,8 @@ impl TransferLaneId {
 pub enum TransferProfileId {
     LegacyV6 = 1,
     EventPagesV1 = 2,
-    BlobRangesStreamV1 = 3,
+    // 3 remains reserved for the approved BlobCustodyV1 design.
+    BlobRangesStreamV1 = 4,
 }
 
 impl TransferProfileId {
@@ -58,7 +59,7 @@ impl TransferProfileId {
         match value {
             1 => Some(Self::LegacyV6),
             2 => Some(Self::EventPagesV1),
-            3 => Some(Self::BlobRangesStreamV1),
+            4 => Some(Self::BlobRangesStreamV1),
             _ => None,
         }
     }
@@ -460,7 +461,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn semantic_blob_profile_three_is_resolved_by_authenticated_version() {
+    fn semantic_blob_profile_four_is_resolved_by_authenticated_version() {
         let v7 = TransferProfileOfferV1::for_semantic_version(SEMANTIC_PROTOCOL_V7)
             .expect("semantic-v7 offer");
         let v8 = TransferProfileOfferV1::for_semantic_version(SEMANTIC_PROTOCOL_V8)
