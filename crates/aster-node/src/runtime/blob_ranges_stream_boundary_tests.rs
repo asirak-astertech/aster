@@ -68,7 +68,13 @@ async fn stream_prefix_conflict_cleanup(corrupt_source: bool) {
         b_store
             .append_blob_carrier_prefix_with_policy(&policy, source, object, total, 0, &bytes)
             .unwrap();
-        if corrupt_source {
+    }
+    if corrupt_source {
+        // Seed every legitimate prefix before corrupting any one of them: the
+        // pressure invariant correctly prevents subsequent setup writes after
+        // it observes the first malformed row.
+        for id in plan.carrier_ids() {
+            let object = BlobCarrierObjectId::new(id.wire_bytes()).unwrap();
             // One corrupt binding causes real append AND real abort failures.
             // No synthetic error or fatal-wrapper helper substitutes for either.
             b_store
@@ -92,7 +98,7 @@ async fn stream_prefix_conflict_cleanup(corrupt_source: bool) {
     assert!(b_store.get_blob(source).unwrap().is_none());
     if corrupt_source {
         assert!(
-            matches!(&error, NodeError::FatalBlobCoherence(message) if message.contains("conflicting Blob carrier prefix cleanup")),
+            matches!(&error, NodeError::FatalBlobCoherence(message) if message.contains("conflicting Blob carrier prefix cleanup") || message.contains("Blob pressure carrier prefix contradicts its pending source")),
             "cleanup error lost fatal classification: {error:?}"
         );
         assert!(actor_fatal_contact_error(&error, b.identity()));
