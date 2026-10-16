@@ -13,6 +13,19 @@ feature and an already running agent at `127.0.0.1:8181`; pass its provisioned
 client token (without the `Bearer ` prefix). See the
 [agent quickstart](../../docs/quickstart/connect-agent.md) for local setup.
 
+Blob API access is independent of network receive policy. Strict schema v1/v2
+configuration defaults absent or empty `mesh.blob_interests` to receive none.
+A nonempty list accepts at most 256 unique canonical exact `TOPIC@SCOPE`
+selectors and requires explicit nonzero `storage.blob_depot.max_bytes`,
+`max_chunks`, and `max_variants`; all of these fields are restart-only. Mission
+route/content authorization remains authoritative, and authenticated peers can
+observe exact configured topic/scope interest metadata under the current
+policy. `receive_only` retains the selectors in configuration but performs
+zero Blob network work. Receiving through the mesh does not create an
+application subscription, and the agent does not expose the separate Rust Blob
+subscription surface. Older agents reject the new fields, so rollback must
+restore the older configuration shape as well as the executable.
+
 ### Connect client and borrowed response
 
 `view()` borrows fields from the response buffer. Keep the response alive while
@@ -139,6 +152,11 @@ consuming stream bytes.
 This agent increment provides Blob publish and read only. Blob subscription,
 poll, acknowledgement, transfer-status commands, and Blob FFI lifetime fields
 remain outside this surface.
+
+The legacy binary flag `--blob-interest TOPIC@SCOPE` is repeatable but exists
+only for development/migration mode. Customer service deployments use strict
+schema v1 or v2 configuration; neither form grants public API access or creates
+an application subscription.
 
 ### Pipelined durable Event publication
 
