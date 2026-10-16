@@ -16,6 +16,7 @@ pub(crate) mod lease;
 pub(crate) mod lifecycle;
 #[allow(dead_code)]
 pub(crate) mod pressure;
+mod stream;
 
 pub use lifecycle::{
     BlobLifecycleLimits, BlobMaintenanceBudget, BlobMaintenanceCandidate, BlobMaintenanceClass,
@@ -23,6 +24,11 @@ pub use lifecycle::{
 };
 #[doc(hidden)]
 pub use pressure::BlobCapacityRecoveryResult;
+pub use stream::{
+    BlobStreamCheckpoint, BlobStreamCommitOutcome, DEFAULT_BLOB_STREAM_CHECKPOINT_BATCH_BYTES,
+    DEFAULT_BLOB_STREAM_CHECKPOINT_INTERVAL, MAX_BLOB_STREAM_CHECKPOINT_BATCH_BYTES,
+    VerifiedBlobStreamCheckpointBatch,
+};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -77,6 +83,8 @@ pub(crate) const BLOB_NETWORK_METADATA: TableDefinition<&str, u64> =
 // both ordinary semantic quotas and the network byte/row staging partition.
 pub(crate) const BLOB_CARRIER_FETCH_CURSORS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.blob-carrier-fetch-cursors.v1");
+pub(crate) const BLOB_STREAM_CHECKPOINTS: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("aster.blob-stream-checkpoints.v1");
 
 pub(crate) const BLOB_ITEM_COUNT: &str = "semantic_blob_item_count";
 pub(crate) const BLOB_TOTAL_BYTES: &str = "semantic_blob_total_bytes";
@@ -14816,6 +14824,8 @@ pub(crate) fn blob_schema_present_write(
         .iter()
         .filter(|table| existing.contains(**table))
         .count();
+    let legacy_network_schema = network[..4].iter().all(|table| existing.contains(*table))
+        && !existing.contains(network[4]);
     let metadata = write.open_table(METADATA)?;
     let global = blob_global_metadata_fields();
     let global_present = global
@@ -14830,14 +14840,16 @@ pub(crate) fn blob_schema_present_write(
         return Ok(false);
     }
     if legacy_present != legacy.len()
-        || !matches!(network_present, 0 | 4)
+        || !(network_present == 0
+            || network_present == network.len()
+            || (network_present == 4 && legacy_network_schema))
         || global_present.iter().any(|present| !present)
     {
         return Err(blob_error(BlobStoreError::SchemaInvariant(
             "mission-scoped Blob schema group is incomplete",
         )));
     }
-    if network_present == 0 {
+    if network_present < network.len() {
         initialize_blob_network_schema(write)?;
     }
     Ok(true)
@@ -15377,6 +15389,8 @@ pub(crate) fn inspect_blob_tables_read(
         .iter()
         .filter(|table| existing.contains(**table))
         .count();
+    let legacy_network_schema = network[..4].iter().all(|table| existing.contains(*table))
+        && !existing.contains(network[4]);
     let metadata = read.open_table(METADATA)?;
     let global = blob_global_metadata_fields();
     let global_present = global
@@ -15390,7 +15404,9 @@ pub(crate) fn inspect_blob_tables_read(
         return Ok(BlobAuditSnapshot::default());
     }
     if legacy_present != legacy.len()
-        || !matches!(network_present, 0 | 4)
+        || !(network_present == 0
+            || network_present == network.len()
+            || (network_present == 4 && legacy_network_schema))
         || global_present.iter().any(|present| !present)
     {
         return Err(blob_error(BlobStoreError::SchemaInvariant(
@@ -16024,6 +16040,7 @@ fn initialize_blob_network_schema(write: &redb::WriteTransaction) -> Result<(), 
     let _ = write.open_table(BLOB_PENDING_SOURCES)?;
     let _ = write.open_table(BLOB_CARRIER_PREFIXES)?;
     let _ = write.open_table(BLOB_CARRIER_FETCH_CURSORS)?;
+    let _ = write.open_table(BLOB_STREAM_CHECKPOINTS)?;
     let mut metadata = write.open_table(BLOB_NETWORK_METADATA)?;
     if metadata.get(BLOB_NETWORK_SCHEMA_VERSION_FIELD)?.is_none() {
         metadata.insert(
@@ -16050,21 +16067,22 @@ fn legacy_blob_table_names() -> [&'static str; 9] {
     ]
 }
 
-fn network_blob_table_names() -> [&'static str; 4] {
+fn network_blob_table_names() -> [&'static str; 5] {
     [
         BLOB_PENDING_SOURCES.name(),
         BLOB_CARRIER_PREFIXES.name(),
         BLOB_NETWORK_METADATA.name(),
         BLOB_CARRIER_FETCH_CURSORS.name(),
+        BLOB_STREAM_CHECKPOINTS.name(),
     ]
 }
 
-fn blob_table_names() -> [&'static str; 13] {
+fn blob_table_names() -> [&'static str; 14] {
     let legacy = legacy_blob_table_names();
     let network = network_blob_table_names();
     [
         legacy[0], legacy[1], legacy[2], legacy[3], legacy[4], legacy[5], legacy[6], legacy[7],
-        legacy[8], network[0], network[1], network[2], network[3],
+        legacy[8], network[0], network[1], network[2], network[3], network[4],
     ]
 }
 
@@ -21443,6 +21461,161 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn blob_stream_checkpoint_batch_commits_whole_carriers_and_one_boundary() {
+        let source_root = BlobTestRoot::new("stream-checkpoint-source");
+        let target_root = BlobTestRoot::new("stream-checkpoint-target");
+        let mut services = blob_services(0xa7);
+        let source = Store::open_for_mission(&source_root.database, services.authority)
+            .expect("stream source store");
+        let target = Store::open_for_mission(&target_root.database, services.authority)
+            .expect("stream target store");
+        let plaintext = vec![0x5a; SELECTED_BLOB_CHUNK_SIZE as usize * 3 + 19];
+        let prepared = prepared_blob(&plaintext);
+        let proof = prepare_blob_proof(&source, &mut services, &prepared, &plaintext, 1);
+        let plan = proof
+            .blob
+            .transfer_plan(&proof.manifest_bytes)
+            .expect("stream transfer plan");
+        let policy = target.control_policy_snapshot().expect("stream policy");
+        let transfer = BlobTransferId::new(proof.blob.envelope_id());
+        target
+            .stage_verified_blob_source_with_policy(&policy, &proof.blob, &proof.sealed, &plan)
+            .expect("stage stream source");
+        assert_eq!(
+            target
+                .blob_stream_checkpoint_with_policy(&policy, transfer, &plan)
+                .expect("initial checkpoint"),
+            BlobStreamCheckpoint::default()
+        );
+
+        let owned = {
+            let mut source_depot = source.blob_depot().expect("stream source depot");
+            CoreBlobStore::begin_blob_with_lineage(
+                &mut source_depot,
+                plan.manifest(),
+                plan.physical_lineage(),
+            )
+            .expect("activate stream source");
+            plan.read_stream_extent(&mut source_depot, 0, 1024 * 1024)
+                .expect("read whole-carrier extent")
+                .expect("nonempty stream extent")
+        };
+        let verified = plan
+            .verify_stream_extent(&owned, 1024 * 1024)
+            .expect("verify whole-carrier extent");
+        let batch = VerifiedBlobStreamCheckpointBatch::from_extents(
+            [verified],
+            DEFAULT_BLOB_STREAM_CHECKPOINT_BATCH_BYTES,
+        )
+        .expect("checkpoint batch");
+        let outcome = target
+            .commit_blob_stream_batch_with_policy(
+                &policy,
+                transfer,
+                &plan,
+                BlobStreamCheckpoint::default(),
+                batch,
+            )
+            .expect("commit stream batch");
+        let BlobStreamCommitOutcome::Complete(checkpoint) = outcome else {
+            panic!("all carriers must complete the stream")
+        };
+        assert_eq!(checkpoint.next_carrier_index, plan.manifest().chunk_count());
+        assert_eq!(checkpoint.generation, 1);
+        assert_eq!(
+            target
+                .blob_stream_checkpoint_with_policy(&policy, transfer, &plan)
+                .expect("durable checkpoint"),
+            checkpoint
+        );
+        let stats = target.blob_stats().expect("stream target stats");
+        assert_eq!(stats.committed_chunks, plan.manifest().chunk_count());
+        assert_eq!(stats.finalized_variants, 1);
+    }
+
+    #[test]
+    fn blob_stream_batch_fault_never_acknowledges_an_unmarked_rename() {
+        let source_root = BlobTestRoot::new("stream-batch-fault-source");
+        let target_root = BlobTestRoot::new("stream-batch-fault-target");
+        let mut services = blob_services(0xa8);
+        let source = Store::open_for_mission(&source_root.database, services.authority)
+            .expect("fault source store");
+        let target = Store::open_for_mission(&target_root.database, services.authority)
+            .expect("fault target store");
+        let plaintext = vec![0x6b; 8_193];
+        let prepared = prepared_blob(&plaintext);
+        let proof = prepare_blob_proof(&source, &mut services, &prepared, &plaintext, 1);
+        let plan = proof
+            .blob
+            .transfer_plan(&proof.manifest_bytes)
+            .expect("fault transfer plan");
+        let policy = target.control_policy_snapshot().expect("fault policy");
+        let transfer = BlobTransferId::new(proof.blob.envelope_id());
+        target
+            .stage_verified_blob_source_with_policy(&policy, &proof.blob, &proof.sealed, &plan)
+            .expect("stage fault source");
+        let batch = {
+            let mut source_depot = source.blob_depot().expect("fault source depot");
+            CoreBlobStore::begin_blob_with_lineage(
+                &mut source_depot,
+                plan.manifest(),
+                plan.physical_lineage(),
+            )
+            .expect("activate fault source");
+            let owned = plan
+                .read_stream_extent(&mut source_depot, 0, 1024 * 1024)
+                .expect("read fault extent")
+                .expect("fault extent");
+            let verified = plan
+                .verify_stream_extent(&owned, 1024 * 1024)
+                .expect("verify fault extent");
+            VerifiedBlobStreamCheckpointBatch::from_extents(
+                [verified],
+                DEFAULT_BLOB_STREAM_CHECKPOINT_BATCH_BYTES,
+            )
+            .expect("fault batch")
+        };
+
+        depot::inject_test_fault(&target_root.path, depot::DepotFaultPoint::Renamed);
+        target
+            .commit_blob_stream_batch_with_policy(
+                &policy,
+                transfer,
+                &plan,
+                BlobStreamCheckpoint::default(),
+                batch.clone(),
+            )
+            .expect_err("rename fault interrupts before checkpoint");
+        assert_eq!(
+            target
+                .blob_stream_checkpoint_with_policy(&policy, transfer, &plan)
+                .expect("checkpoint after fault"),
+            BlobStreamCheckpoint::default()
+        );
+        assert_eq!(
+            target.blob_stats().expect("fault stats").committed_chunks,
+            0
+        );
+        drop(target);
+
+        let reopened = Store::open_for_mission(&target_root.database, services.authority)
+            .expect("reopen fault target");
+        let policy = reopened.control_policy_snapshot().expect("reopen policy");
+        assert!(matches!(
+            reopened
+                .commit_blob_stream_batch_with_policy(
+                    &policy,
+                    transfer,
+                    &plan,
+                    BlobStreamCheckpoint::default(),
+                    batch,
+                )
+                .expect("retry exact stream batch"),
+            BlobStreamCommitOutcome::Complete(_)
+        ));
     }
 
     fn assert_durable_contact_rejects_without_mutation<T>(

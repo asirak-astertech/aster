@@ -18,7 +18,7 @@ use std::sync::{Arc, MutexGuard};
 
 use aster_mesh::{
     BlobChunkRecord, BlobManifest, BlobMetadata as CoreBlobMetadata, BlobPhysicalLineage,
-    BlobStore as CoreBlobStore, ContentVerifiedBlobEnvelope,
+    BlobStore as CoreBlobStore, ContentVerifiedBlobEnvelope, VerifiedBlobTransferObject,
 };
 use redb::{ReadableTable, ReadableTableMetadata};
 
@@ -677,6 +677,87 @@ pub struct BlobDepot<'a> {
     read_authorized_variant: Option<BlobVariantId>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(super) struct PreparedBlobStreamCarrier {
+    pub index: u64,
+    pub record: BlobChunkRecord,
+    pub committed_file_bytes: u64,
+    pub already_committed: bool,
+}
+
+pub(super) fn commit_prepared_stream_markers_write(
+    write: &redb::WriteTransaction,
+    variant: BlobVariantId,
+    prepared: &[PreparedBlobStreamCarrier],
+) -> Result<(), StoreError> {
+    let mut added_bytes = 0_u64;
+    let mut added_chunks = 0_u64;
+    for carrier in prepared {
+        let key = chunk_key(variant, carrier.index);
+        let mut state = write
+            .open_table(BLOB_CHUNKS)?
+            .get(key.as_slice())?
+            .map(|row| decode_chunk_state(row.value()))
+            .transpose()?
+            .ok_or_else(|| {
+                blob_error(BlobStoreError::DepotIntegrity(
+                    "prepared stream carrier lost its durable state",
+                ))
+            })?;
+        if state.committed == Some(carrier.record) {
+            if state.committed_file_bytes != carrier.committed_file_bytes {
+                return Err(blob_error(BlobStoreError::DepotIntegrity(
+                    "duplicate stream carrier file accounting differs",
+                )));
+            }
+            continue;
+        }
+        if carrier.already_committed
+            || state.committed.is_some()
+            || state.expected != Some(carrier.record)
+        {
+            return Err(blob_error(BlobStoreError::DepotIntegrity(
+                "prepared stream carrier conflicts with its marker",
+            )));
+        }
+        state.committed = Some(carrier.record);
+        state.committed_file_bytes = carrier.committed_file_bytes;
+        let encoded = encode_chunk_state(state);
+        write
+            .open_table(BLOB_CHUNKS)?
+            .insert(key.as_slice(), encoded.as_slice())?;
+        added_bytes = added_bytes
+            .checked_add(carrier.committed_file_bytes)
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+        added_chunks = added_chunks
+            .checked_add(1)
+            .ok_or(StoreError::ItemCountAccountingOverflow)?;
+    }
+    if added_chunks != 0 {
+        let mut metadata = write.open_table(BLOB_DEPOT_METADATA)?;
+        let bytes = metadata
+            .get(DEPOT_COMMITTED_FILE_BYTES)?
+            .map_or(0, |row| row.value());
+        let chunks = metadata
+            .get(DEPOT_COMMITTED_CHUNK_COUNT)?
+            .map_or(0, |row| row.value());
+        metadata.insert(
+            DEPOT_COMMITTED_FILE_BYTES,
+            bytes
+                .checked_add(added_bytes)
+                .ok_or(StoreError::PayloadByteAccountingOverflow)?,
+        )?;
+        metadata.insert(
+            DEPOT_COMMITTED_CHUNK_COUNT,
+            chunks
+                .checked_add(added_chunks)
+                .ok_or(StoreError::ItemCountAccountingOverflow)?,
+        )?;
+    }
+    super::pressure::reconcile_variant_write(write, variant)?;
+    Ok(())
+}
+
 /// Capability-gated, mutation-incapable adapter for one finalized Blob variant.
 ///
 /// This deliberately implements the generic core store seam so authenticated
@@ -823,6 +904,187 @@ impl CoreBlobStore for AuthenticatedBlobReadDepot<'_> {
 }
 
 impl<'a> BlobDepot<'a> {
+    /// Makes every file in one bounded stream batch durable without publishing
+    /// any new committed marker. The caller must atomically install the
+    /// returned markers with the cumulative stream checkpoint.
+    pub(super) fn prepare_verified_stream_batch(
+        &mut self,
+        carriers: &[VerifiedBlobTransferObject],
+    ) -> Result<Vec<PreparedBlobStreamCarrier>, StoreError> {
+        let active = self.active.ok_or_else(|| {
+            blob_error(BlobStoreError::DepotIntegrity(
+                "Blob stream batch has no active import",
+            ))
+        })?;
+        for carrier in carriers {
+            self.ensure_chunk_record(active, carrier.index(), carrier.record())?;
+            if usize::try_from(carrier.record().ciphertext_len()).ok()
+                != Some(carrier.ciphertext().len())
+                || <[u8; 32]>::from(Sha256::digest(carrier.ciphertext()))
+                    != *carrier.record().ciphertext_sha256()
+            {
+                return Err(blob_error(BlobStoreError::DepotIntegrity(
+                    "verified stream carrier bytes differ from their record",
+                )));
+            }
+        }
+        self.stage_stream_expected_records(active, carriers)?;
+
+        let variant = self
+            .root
+            .open_child_directory(&hex32(active.variant_id.as_bytes()), true)?;
+        let mut prepared = Vec::with_capacity(carriers.len());
+        for carrier in carriers {
+            let index = carrier.index();
+            let record = carrier.record();
+            let state = self.load_chunk(active, index)?.ok_or_else(|| {
+                blob_error(BlobStoreError::DepotIntegrity(
+                    "stream carrier lost its expected durable record",
+                ))
+            })?;
+            let file_name = chunk_file_name(index);
+            if state.committed == Some(record) {
+                verify_chunk_file(
+                    &variant,
+                    &file_name,
+                    active,
+                    index,
+                    record,
+                    state.committed_file_bytes,
+                )?;
+                prepared.push(PreparedBlobStreamCarrier {
+                    index,
+                    record,
+                    committed_file_bytes: state.committed_file_bytes,
+                    already_committed: true,
+                });
+                continue;
+            }
+            if state.committed.is_some() || state.expected != Some(record) {
+                return Err(blob_error(BlobStoreError::DepotIntegrity(
+                    "stream carrier conflicts with durable chunk state",
+                )));
+            }
+            variant.unlink_file_if_exists_no_sync(&file_name)?;
+            let encoded = encode_chunk_file(active, index, record, carrier.ciphertext())?;
+            let committed_file_bytes = u64::try_from(encoded.len())
+                .map_err(|_| StoreError::PayloadByteAccountingOverflow)?;
+            variant.write_atomic_without_directory_sync(&file_name, &encoded)?;
+            prepared.push(PreparedBlobStreamCarrier {
+                index,
+                record,
+                committed_file_bytes,
+                already_committed: false,
+            });
+        }
+        // One directory barrier publishes every rename in the batch before
+        // any database marker or checkpoint can become authoritative.
+        variant.sync()?;
+        maybe_inject_fault(&variant.path, DepotFaultPoint::DirectorySynced)?;
+        Ok(prepared)
+    }
+
+    fn stage_stream_expected_records(
+        &self,
+        active: ActiveImport,
+        carriers: &[VerifiedBlobTransferObject],
+    ) -> Result<(), StoreError> {
+        let write = self.store.database.begin_write()?;
+        enforce_live_write(&write)?;
+        super::deletion::require_variant_available_write(&write, active.variant_id)?;
+        super::pressure::require_variant_write(&write, active.variant_id)?;
+        let import = load_import_write(&write, active.variant_id)?
+            .ok_or_else(|| blob_error(BlobStoreError::DepotIntegrity("Blob import disappeared")))?;
+        if import.blob_id != active.blob_id
+            || import.content_group != active.content_group
+            || import.epoch != active.epoch
+            || import.total_len != active.total_len
+            || import.chunk_count != active.chunk_count
+            || import.physical_lineage != active.physical_lineage
+        {
+            return Err(blob_error(BlobStoreError::DepotIntegrity(
+                "active Blob stream import changed",
+            )));
+        }
+        let admission = depot_admission_usage_write(&write)?;
+        let mut added_rows = 0_u64;
+        let mut added_reserved = 0_u64;
+        for carrier in carriers {
+            let key = chunk_key(active.variant_id, carrier.index());
+            let existing = write
+                .open_table(BLOB_CHUNKS)?
+                .get(key.as_slice())?
+                .map(|row| decode_chunk_state(row.value()))
+                .transpose()?;
+            let mut state = existing.unwrap_or_default();
+            let record = carrier.record();
+            if state
+                .plaintext_digest
+                .is_some_and(|digest| digest != *record.plaintext_sha256())
+                || state.expected.is_some_and(|expected| expected != record)
+                || state.committed.is_some_and(|committed| committed != record)
+            {
+                return Err(blob_error(BlobStoreError::DepotIntegrity(
+                    "stream carrier differs from durable expected metadata",
+                )));
+            }
+            if existing.is_none() {
+                added_rows = added_rows
+                    .checked_add(1)
+                    .ok_or(StoreError::ItemCountAccountingOverflow)?;
+            }
+            if state.expected.is_none() {
+                added_reserved = added_reserved
+                    .checked_add(chunk_file_len(record)?)
+                    .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+            }
+            state.plaintext_digest = Some(*record.plaintext_sha256());
+            state.expected = Some(record);
+            let encoded = encode_chunk_state(state);
+            write
+                .open_table(BLOB_CHUNKS)?
+                .insert(key.as_slice(), encoded.as_slice())?;
+        }
+        if admission
+            .chunks
+            .checked_add(added_rows)
+            .ok_or(StoreError::ItemCountAccountingOverflow)?
+            > self.store.blob_depot_limits.max_chunks
+        {
+            return Err(blob_error(BlobStoreError::DepotChunkLimitExceeded {
+                current: admission.chunks,
+                limit: self.store.blob_depot_limits.max_chunks,
+            }));
+        }
+        if admission
+            .reserved_bytes
+            .checked_add(added_reserved)
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?
+            > self.store.blob_depot_limits.max_bytes
+        {
+            return Err(blob_error(BlobStoreError::DepotByteLimitExceeded {
+                current: admission.reserved_bytes,
+                incoming: added_reserved,
+                limit: self.store.blob_depot_limits.max_bytes,
+            }));
+        }
+        if added_reserved != 0 {
+            let mut metadata = write.open_table(BLOB_DEPOT_METADATA)?;
+            let reserved = metadata
+                .get(DEPOT_RESERVED_FILE_BYTES)?
+                .map_or(0, |row| row.value());
+            metadata.insert(
+                DEPOT_RESERVED_FILE_BYTES,
+                reserved
+                    .checked_add(added_reserved)
+                    .ok_or(StoreError::PayloadByteAccountingOverflow)?,
+            )?;
+        }
+        super::pressure::reconcile_variant_write(&write, active.variant_id)?;
+        write.commit()?;
+        Ok(())
+    }
+
     pub(super) fn acquire_local_import_attempt(
         &mut self,
         staging: BlobTransferId,
@@ -2446,7 +2708,13 @@ pub(crate) fn prepare_depot_owner_token_write(
         .iter()
         .filter(|table| existing.contains(**table))
         .count();
-    if legacy.iter().any(|table| !existing.contains(*table)) || !matches!(network_present, 0 | 4) {
+    let legacy_network_schema = network[..4].iter().all(|table| existing.contains(*table))
+        && !existing.contains(network[4]);
+    if legacy.iter().any(|table| !existing.contains(*table))
+        || !(network_present == 0
+            || network_present == network.len()
+            || (network_present == 4 && legacy_network_schema))
+    {
         return Err(blob_error(BlobStoreError::SchemaInvariant(
             "mission-scoped Blob schema group is incomplete",
         )));
@@ -6421,6 +6689,18 @@ impl OwnedDirectory {
 
     #[cfg(unix)]
     fn write_atomic(&self, final_name: &str, bytes: &[u8]) -> Result<(), StoreError> {
+        self.write_atomic_without_directory_sync(final_name, bytes)?;
+        self.sync()?;
+        maybe_inject_fault(&self.path, DepotFaultPoint::DirectorySynced)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn write_atomic_without_directory_sync(
+        &self,
+        final_name: &str,
+        bytes: &[u8],
+    ) -> Result<(), StoreError> {
         let temp_name = format!(
             "{TEMP_PREFIX}{}-{}",
             std::process::id(),
@@ -6451,15 +6731,23 @@ impl OwnedDirectory {
             return Err(blob_error(BlobStoreError::Io(error.into())));
         }
         maybe_inject_fault(&self.path, DepotFaultPoint::Renamed)?;
-        self.file
-            .sync_all()
-            .map_err(|error| blob_error(BlobStoreError::Io(error)))?;
-        maybe_inject_fault(&self.path, DepotFaultPoint::DirectorySynced)?;
         Ok(())
     }
 
     #[cfg(not(unix))]
     fn write_atomic(&self, final_name: &str, bytes: &[u8]) -> Result<(), StoreError> {
+        self.write_atomic_without_directory_sync(final_name, bytes)?;
+        self.sync()?;
+        maybe_inject_fault(&self.path, DepotFaultPoint::DirectorySynced)?;
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn write_atomic_without_directory_sync(
+        &self,
+        final_name: &str,
+        bytes: &[u8],
+    ) -> Result<(), StoreError> {
         let temp = self.path.join(format!(
             "{TEMP_PREFIX}{}-{}",
             std::process::id(),
@@ -6475,8 +6763,6 @@ impl OwnedDirectory {
         maybe_inject_fault(&self.path, DepotFaultPoint::TempSynced)?;
         std::fs::rename(&temp, &final_path)?;
         maybe_inject_fault(&self.path, DepotFaultPoint::Renamed)?;
-        File::open(&self.path)?.sync_all()?;
-        maybe_inject_fault(&self.path, DepotFaultPoint::DirectorySynced)?;
         Ok(())
     }
 
