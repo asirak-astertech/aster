@@ -556,8 +556,37 @@ On the packaged test device:
 ```
 
 Restart the packaged device after its configuration change and permit UDP 8183
-in applicable host policy. Use Step 5 above on Docker and Debian Steps 7–8 on
-the device to publish, query, and read in both directions. A peer-side query
+in applicable host policy. Create the matching receiver subscriptions before
+publishing. For Docker-to-device checks, every Docker command keeps the remote
+mesh override:
+
+```sh
+docker compose -f "$ASTER_COMPOSE_FILE" -f "$ASTER_REMOTE_MESH_FILE" \
+  run --rm asterctl --json publish \
+  --topic chat.events --scope mission/team/alpha --priority routine \
+  --operation-key compose-peer-event-001 "Docker to device check"
+docker compose -f "$ASTER_COMPOSE_FILE" -f "$ASTER_REMOTE_MESH_FILE" \
+  run --rm asterctl --timeout 30 --json blob-publish \
+  --file /transfer/map.bin --topic imagery.maps \
+  --scope mission/team/alpha --priority routine \
+  --operation-key compose-peer-map-001
+```
+
+Use Debian Steps 7–8 on the device to query the Event and read the returned
+Blob ID. For device-to-Docker checks, publish with the Debian commands, then
+use the returned IDs with the same override on Docker:
+
+```sh
+docker compose -f "$ASTER_COMPOSE_FILE" -f "$ASTER_REMOTE_MESH_FILE" \
+  run --rm asterctl --json query \
+  --topic chat.events --scope mission/team/alpha
+docker compose -f "$ASTER_COMPOSE_FILE" -f "$ASTER_REMOTE_MESH_FILE" \
+  run --rm asterctl --timeout 30 --json blob-read \
+  --id '<DEVICE_BLOB_ID>' --topic imagery.maps \
+  --scope mission/team/alpha --output /transfer/device-map.bin
+```
+
+Compare each received Blob with its source using `sha256sum`. A peer-side query
 and matching Blob hashes—not contact counters alone—prove transfer.
 
 ### Compose boundaries
@@ -573,6 +602,7 @@ and matching Blob hashes—not contact counters alone—prove transfer.
 
 For rotation, create and select a new generation, repeat validation and
 preflight, then force-create and verify. Do not use `docker compose restart`.
+For the default closed profile:
 
 ```sh
 docker compose -f "$ASTER_COMPOSE_FILE" \
@@ -585,6 +615,19 @@ Stop or remove this project's containers and network:
 ```sh
 docker compose -f "$ASTER_COMPOSE_FILE" stop -t 40 aster-agent
 docker compose -f "$ASTER_COMPOSE_FILE" down
+```
+
+Remote-mesh lifecycle commands:
+
+```sh
+docker compose -f "$ASTER_COMPOSE_FILE" -f "$ASTER_REMOTE_MESH_FILE" \
+  up -d --force-recreate aster-agent
+docker compose -f "$ASTER_COMPOSE_FILE" -f "$ASTER_REMOTE_MESH_FILE" \
+  run --rm verify
+docker compose -f "$ASTER_COMPOSE_FILE" -f "$ASTER_REMOTE_MESH_FILE" \
+  stop -t 40 aster-agent
+docker compose -f "$ASTER_COMPOSE_FILE" -f "$ASTER_REMOTE_MESH_FILE" \
+  down
 ```
 
 `down` preserves host state and credential generations. Use the
