@@ -11708,6 +11708,21 @@ fn blob_claim_fits_contact_bound(
         && claim.chunk_count <= limits.max_chunks()
 }
 
+fn blob_plan_fits_contact_bound(
+    store: &Store,
+    plan: &VerifiedBlobTransferPlan,
+    mode: Option<BlobContactMode>,
+) -> bool {
+    let total_len = plan.manifest().total_len();
+    let chunk_count = plan.manifest().chunk_count();
+    if mode == Some(BlobContactMode::StreamV1) {
+        let limits = store.blob_depot_limits();
+        total_len <= limits.max_bytes() && chunk_count <= limits.max_chunks()
+    } else {
+        total_len <= MAX_NETWORK_BLOB_BYTES && chunk_count <= MAX_NETWORK_BLOB_CHUNKS
+    }
+}
+
 fn repair_blob_sender_cache_miss(
     store: &Store,
     verifier: &mut ReferenceEnvelopeSealer,
@@ -12318,8 +12333,7 @@ fn load_verified_mutable_for_peer(
                 NodeError::Protocol(format!("outbound Blob transfer plan is invalid: {error}"))
             })
             .map_err(|error| fatal_blob_coherence("outbound Blob transfer plan", error))?;
-        if plan.manifest().total_len() > MAX_NETWORK_BLOB_BYTES
-            || plan.manifest().chunk_count() > MAX_NETWORK_BLOB_CHUNKS
+        if !blob_plan_fits_contact_bound(store, &plan, Some(blob_contact_mode))
             || !claim.matches_verified(&blob, &stored.sealed)
         {
             return Err(NodeError::FatalBlobCoherence(
@@ -13285,9 +13299,7 @@ fn accept_received_mutable(
             let plan = blob.transfer_plan(&manifest_bytes).map_err(|error| {
                 NodeError::Protocol(format!("received Blob transfer plan is invalid: {error}"))
             })?;
-            if plan.manifest().total_len() > MAX_NETWORK_BLOB_BYTES
-                || plan.manifest().chunk_count() > MAX_NETWORK_BLOB_CHUNKS
-            {
+            if !blob_plan_fits_contact_bound(store, &plan, blob_contact_mode) {
                 return Err(NodeError::Protocol(
                     "received Blob manifest exceeds selected network bounds".into(),
                 ));
@@ -23430,9 +23442,7 @@ fn load_pending_blob_plan(
             NodeError::Protocol(format!("pending Blob transfer plan is invalid: {error}"))
         })
         .map_err(|error| fatal_blob_coherence("pending Blob transfer plan", error))?;
-    if plan.manifest().total_len() > MAX_NETWORK_BLOB_BYTES
-        || plan.manifest().chunk_count() > MAX_NETWORK_BLOB_CHUNKS
-    {
+    if !blob_plan_fits_contact_bound(store, &plan, Some(blob_contact_mode)) {
         return Err(NodeError::FatalBlobCoherence(
             "pending Blob plan exceeds selected network bounds".into(),
         ));
@@ -49527,7 +49537,12 @@ mod tests {
             Arc::new(Store::open_for_mission(source_root.join(STORE_FILE), authority).unwrap());
         let receiver_store =
             Arc::new(Store::open_for_mission(receiver_root.join(STORE_FILE), authority).unwrap());
-        let plaintext = vec![0x5a; 16 * 1_048_576];
+        let size_mib = std::env::var("ASTER_TEST_BLOB_STREAM_MIB")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| (1..=256).contains(value))
+            .unwrap_or(16);
+        let plaintext = vec![0x5a; size_mib * 1_048_576];
         let source = publish_test_blob(
             &source_store,
             &mut open_test_sealer(&source_mission.credentials),
