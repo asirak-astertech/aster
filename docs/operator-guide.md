@@ -627,35 +627,375 @@ custody; copy the result into approved custody and remove staging files under
 site policy when they are no longer needed. Node zeroization does not erase
 those external files.
 
-## Use the Docker Compose option
+## Deploy one agent with Docker Compose
 
 The Compose profile is a separate installation choice, not an alternate
-runtime flag for the Debian binary. Follow the
-[Compose operator procedure](release/docker-compose.md) for the complete
-sequence:
+runtime flag for the Debian binary. One Compose project owns exactly one agent
+identity, credential generation, configuration, and state directory. Never
+scale the service, share these paths with another project, or reuse one
+generation for another agent.
 
-1. select the native `amd64` or `arm64` workflow artifact;
-2. verify `SHA256SUMS`, source revision, architecture, and image identities;
-3. import the agent and administration image archives;
-4. prepare one user-owned state directory and protected input files;
-5. create one immutable credential generation from the issued bundle and
-   bearer token;
-6. review a schema-v2 configuration and record its SHA-256;
-7. render and inspect the exact Compose model;
-8. run the no-network preflight;
-9. force-create the agent; and
-10. run the authenticated generation verifier.
+These examples provide the normal setup sequence. The
+[complete Compose operator procedure](release/docker-compose.md) remains
+authoritative for artifact evidence, custody, rotation, backup, recovery, and
+cleanup.
 
-Do not scale or replicate the service: one Compose project owns one identity,
-credential generation, and state directory. The current Compose images do not
-contain `asterctl`, and the application listener remains loopback-only inside
-the agent container's network namespace. The packaged interactive Event/Blob
-commands in this guide therefore apply to the Debian path. A Compose
-application integration needs a separately reviewed client deployment in the
-same protected network boundary; the repository does not currently ship that
-operator sidecar.
+### Check Compose prerequisites
 
-## Routine service operations
+Use a Linux host with Docker Engine and Docker Compose v2. The examples also
+use GitHub CLI, Git, `jq`, Python 3, OpenSSL, and standard checksum utilities.
+The invoking user must be a non-root user authorized to use the selected
+Docker daemon:
+
+```sh
+docker version
+docker compose version
+gh --version
+git --version
+jq --version
+python3 --version
+openssl version
+test "$(id -u)" -ne 0
+test "$(id -g)" -ne 0
+```
+
+No Docker host profile is qualified yet. Rootless Docker, Docker Desktop,
+remote contexts, user-namespace remapping, alternate filesystems, and
+mandatory-access-control combinations require separate site evaluation.
+Compose file-backed secrets do not provide encryption at rest.
+
+### Download, verify, and import the release
+
+Select the successful `Build: Compose images` workflow artifact for the
+reviewed source revision and the deployment host's native architecture. The
+following connected-host example uses GitHub CLI; a disconnected site may
+download on an approved staging host and transfer the complete artifact
+directory:
+
+```sh
+case "$(uname -m)" in
+  x86_64) export ASTER_RELEASE_ARCH=amd64 ;;
+  aarch64|arm64) export ASTER_RELEASE_ARCH=arm64 ;;
+  *) printf 'unsupported release architecture\n' >&2; exit 1 ;;
+esac
+
+export ASTER_SOURCE_REVISION='<reviewed-40-lowercase-hex>'
+export ASTER_WORKFLOW_RUN='<successful-workflow-run-id>'
+export ASTER_ARTIFACT_DIR="$(pwd -P)/aster-compose-images-$ASTER_RELEASE_ARCH-$ASTER_SOURCE_REVISION"
+
+mkdir "$ASTER_ARTIFACT_DIR"
+gh run download "$ASTER_WORKFLOW_RUN" \
+  --repo defenseunicorns/aster \
+  --name "aster-compose-images-$ASTER_RELEASE_ARCH-$ASTER_SOURCE_REVISION" \
+  --dir "$ASTER_ARTIFACT_DIR"
+cd "$ASTER_ARTIFACT_DIR"
+sha256sum --check SHA256SUMS
+test "$(jq -er '.source_revision' release-manifest.json)" = \
+  "$ASTER_SOURCE_REVISION"
+test "$(jq -er '.architecture' release-manifest.json)" = \
+  "linux/$ASTER_RELEASE_ARCH"
+```
+
+Import both Docker archives, resolve their immutable local image IDs, and
+retain those values for every later command:
+
+```sh
+docker image load --input \
+  "aster-compose-agent-$ASTER_RELEASE_ARCH.docker.tar"
+docker image load --input \
+  "aster-compose-admin-$ASTER_RELEASE_ARCH.docker.tar"
+
+ASTER_AGENT_TAG="$(jq -er '.images.agent.transport_tag' release-manifest.json)"
+ASTER_ADMIN_TAG="$(jq -er '.images.admin.transport_tag' release-manifest.json)"
+export ASTER_AGENT_IMAGE_DIGEST="$(docker image inspect \
+  --format '{{.Id}}' "$ASTER_AGENT_TAG")"
+export ASTER_ADMIN_IMAGE_DIGEST="$(docker image inspect \
+  --format '{{.Id}}' "$ASTER_ADMIN_TAG")"
+
+ASTER_AGENT_CONFIG_DIGEST="$(jq -er \
+  '.images.agent.config_digest' release-manifest.json)"
+ASTER_AGENT_MANIFEST_DIGEST="$(jq -er \
+  '.images.agent.manifest_digest' release-manifest.json)"
+ASTER_ADMIN_CONFIG_DIGEST="$(jq -er \
+  '.images.admin.config_digest' release-manifest.json)"
+ASTER_ADMIN_MANIFEST_DIGEST="$(jq -er \
+  '.images.admin.manifest_digest' release-manifest.json)"
+
+case "$ASTER_AGENT_IMAGE_DIGEST" in
+  "$ASTER_AGENT_CONFIG_DIGEST"|"$ASTER_AGENT_MANIFEST_DIGEST") ;;
+  *) printf 'agent image identity mismatch\n' >&2; exit 1 ;;
+esac
+case "$ASTER_ADMIN_IMAGE_DIGEST" in
+  "$ASTER_ADMIN_CONFIG_DIGEST"|"$ASTER_ADMIN_MANIFEST_DIGEST") ;;
+  *) printf 'admin image identity mismatch\n' >&2; exit 1 ;;
+esac
+```
+
+Do not deploy mutable transport tags. The packaged `compose.yaml` and
+`agent.example.json` are the deployment inputs used below.
+
+### Prepare one deployment's paths and credentials
+
+Choose a unique site name. Create every persistent path as the same non-root
+user that will run Compose:
+
+```sh
+export ASTER_UID="$(id -u)" ASTER_GID="$(id -g)"
+export COMPOSE_PROJECT_NAME=aster-site-a
+export ASTER_DEPLOYMENT_ROOT="$(pwd -P)/$COMPOSE_PROJECT_NAME"
+export ASTER_GENERATION_PARENT="$ASTER_DEPLOYMENT_ROOT/credential-generations"
+export ASTER_STATE_DIR="$ASTER_DEPLOYMENT_ROOT/state"
+export ASTER_TOKEN_INPUT="$ASTER_DEPLOYMENT_ROOT/input/client-token"
+export ASTER_BUNDLE_INPUT="$ASTER_DEPLOYMENT_ROOT/input/mission.astpb03"
+export ASTER_COMPOSE_FILE="$ASTER_ARTIFACT_DIR/compose.yaml"
+
+install -d -m 0700 "$ASTER_DEPLOYMENT_ROOT" \
+  "$ASTER_GENERATION_PARENT" "$ASTER_STATE_DIR" \
+  "$ASTER_DEPLOYMENT_ROOT/input"
+umask 077
+openssl rand -hex 32 > "$ASTER_TOKEN_INPUT"
+install -m 0600 /protected/inbox/node.astpb03 "$ASTER_BUNDLE_INPUT"
+```
+
+Replace `/protected/inbox/node.astpb03` with this node's authority-issued
+bundle. For a disposable evaluation, it may instead name one node bundle from
+the earlier `playground-init` example. Do not use another agent's bundle. The
+token grants local application API access; it does not create mission
+membership.
+
+### Create and inspect the credential generation
+
+The administration image reads the canonical bundle on standard input and the
+token through a read-only file mount:
+
+```sh
+docker run --rm --network none --read-only --cap-drop ALL \
+  --security-opt no-new-privileges \
+  --user "$ASTER_UID:$ASTER_GID" \
+  --mount "type=bind,src=$ASTER_GENERATION_PARENT,dst=/host/generations" \
+  --mount "type=bind,src=$ASTER_TOKEN_INPUT,dst=/host/input/client-token,readonly" \
+  --interactive "$ASTER_ADMIN_IMAGE_DIGEST" \
+  /usr/local/bin/aster-compose-credential-admin create \
+  --output-parent /host/generations \
+  --token-file /host/input/client-token < "$ASTER_BUNDLE_INPUT"
+```
+
+Record the printed `generation=<64-lowercase-hex>` value and select the exact
+new directory:
+
+```sh
+export ASTER_CREDENTIAL_GENERATION_DIR="$ASTER_GENERATION_PARENT/generation-<64-hex>"
+test -d "$ASTER_CREDENTIAL_GENERATION_DIR"
+jq . "$ASTER_CREDENTIAL_GENERATION_DIR/manifest.json"
+find "$ASTER_CREDENTIAL_GENERATION_DIR" -maxdepth 1 \
+  -printf '%u:%g %m links=%n %f\n'
+```
+
+Credential files must belong to `$ASTER_UID:$ASTER_GID`, have mode `0400` or
+`0600`, and have one hard link. The manifest contains non-secret identifiers;
+do not print the other generation files. This `create` operation packages an
+existing mission bundle into Compose custody—it does not issue a bundle.
+
+### Configure an isolated agent
+
+Install the packaged template into the deployment directory:
+
+```sh
+export ASTER_AGENT_CONFIG_FILE="$ASTER_DEPLOYMENT_ROOT/agent.json"
+install -m 0644 "$ASTER_ARTIFACT_DIR/agent.example.json" \
+  "$ASTER_AGENT_CONFIG_FILE"
+```
+
+The shipped template is a complete isolated-node example. Its essential
+values are:
+
+```json
+{
+  "schema_version": 2,
+  "state": {"directory": "/var/lib/aster"},
+  "application": {"listen": "127.0.0.1:8181"},
+  "health": {"listen": "127.0.0.1:8182"},
+  "mesh": {
+    "bind": "0.0.0.0:8183",
+    "sync_interval_ms": 500,
+    "emission_policy": "normal",
+    "blob_interests": [],
+    "peers": []
+  },
+  "credentials": {
+    "client_token_file": "/run/secrets/aster-client-token",
+    "mission_activation_file": "/run/secrets/aster-mission-activation"
+  },
+  "storage": {
+    "max_items": 10000,
+    "max_payload_bytes": 67108864,
+    "blob_depot": {
+      "max_bytes": 67108864,
+      "max_chunks": 4096,
+      "max_variants": 64
+    },
+    "operations": {
+      "max_records": 1000000,
+      "max_logical_bytes": 201326592,
+      "emergency_reserve": 10000
+    }
+  }
+}
+```
+
+Edit only documented schema-v2 fields. Keep the state and credential paths
+exactly as shown because those are the container mount locations. After review,
+record the configuration hash:
+
+```sh
+sha256sum "$ASTER_AGENT_CONFIG_FILE"
+export ASTER_AGENT_CONFIG_SHA256='<reviewed-64-lowercase-hex>'
+```
+
+### Validate, preflight, start, and verify
+
+The release artifact does not currently include the daemon-free delivery
+validator. Obtain the source tree for the exact reviewed
+`ASTER_SOURCE_REVISION` through the site's approved source-delivery process.
+For a connected evaluation host, the equivalent GitHub CLI example is:
+
+```sh
+export ASTER_SOURCE_DIR="$(pwd -P)/aster-source-$ASTER_SOURCE_REVISION"
+gh repo clone defenseunicorns/aster "$ASTER_SOURCE_DIR"
+git -C "$ASTER_SOURCE_DIR" checkout --detach "$ASTER_SOURCE_REVISION"
+test "$(git -C "$ASTER_SOURCE_DIR" rev-parse HEAD)" = \
+  "$ASTER_SOURCE_REVISION"
+```
+
+Point `ASTER_VALIDATOR` at that tree's
+`tools/aster_compose_delivery.py`. The validator source must match the release
+revision:
+
+```sh
+export ASTER_VALIDATOR="$ASTER_SOURCE_DIR/tools/aster_compose_delivery.py"
+test -f "$ASTER_VALIDATOR"
+python3 "$ASTER_VALIDATOR" "$ASTER_COMPOSE_FILE"
+docker compose -f "$ASTER_COMPOSE_FILE" config --format json \
+  > /tmp/aster-compose.rendered.json
+```
+
+Inspect the rendered model before activation. It must contain the two immutable
+image IDs, the selected numeric UID/GID, the exact state directory, the exact
+configuration file, and exactly three files from the selected generation. It
+must not contain credential bytes, a Docker socket, host namespaces, added
+capabilities, or replica configuration.
+
+Run the isolated preflight, create the agent, and run the authenticated
+generation verifier:
+
+```sh
+docker compose -f "$ASTER_COMPOSE_FILE" run --rm preflight
+docker compose -f "$ASTER_COMPOSE_FILE" \
+  up -d --force-recreate aster-agent
+docker compose -f "$ASTER_COMPOSE_FILE" run --rm verify
+```
+
+Proceed only when preflight succeeds, `docker compose ps` reports the agent as
+healthy, and the verifier prints `VERIFY status=pass`:
+
+```sh
+docker compose -f "$ASTER_COMPOSE_FILE" ps
+docker compose -f "$ASTER_COMPOSE_FILE" logs --tail 100 aster-agent
+```
+
+The verifier proves that an authenticated status response names the selected
+credential generation. It does not prove peer reachability, data transfer,
+host qualification, authorization correctness, or backup recovery.
+
+Common setup failures remain fail-closed:
+
+| Result | Check |
+| --- | --- |
+| `image-reference-mutable` | Use the immutable image IDs obtained from `docker image inspect`, not the transport tags |
+| `config-digest-mismatch` | Recompute the reviewed hash after an intentional configuration edit; otherwise restore the reviewed file |
+| generation or state ownership failure | Run every preparation and Compose command as the same selected non-root UID/GID; do not loosen permissions |
+| preflight failure | Keep the agent stopped and correct the reported configuration, credential, or mount condition |
+| agent remains unhealthy | Inspect bounded agent logs and confirm the selected generation, config hash, and state directory; do not delete state |
+| verifier rejects the generation | Confirm the running container was force-created with the selected generation rather than restarted |
+
+### Configure two Compose agents
+
+Create two completely separate deployment roots, project names, state
+directories, credential generations, and configuration files. The peer entries
+use the same identity form as Debian. Agent A names Agent B:
+
+```json
+"peers": [
+  "<NODE_B_CARRIER_ID>@<NODE_B_REACHABLE_IP>:8183=<NODE_B_MISSION_ID>"
+]
+```
+
+Agent B names Agent A:
+
+```json
+"peers": [
+  "<NODE_A_CARRIER_ID>@<NODE_A_REACHABLE_IP>:8183=<NODE_A_MISSION_ID>"
+]
+```
+
+For Blob receipt, add an exact authorized selector to the receiving agent, for
+example:
+
+```json
+"blob_interests": [
+  "imagery.maps@mission/team/alpha"
+]
+```
+
+The canonical Compose profile does not publish UDP 8183 to the host and gives
+each project its own project network. Therefore these paired configuration
+fragments are not, by themselves, a runnable two-host or two-project mesh. A
+site needs a separately reviewed network design and corresponding validated
+Compose model before either address is reachable. Do not interpret successful
+local health or generation verification as a two-node transfer result.
+
+### Understand the current application-use boundary
+
+The scratch runtime image contains no shell, `curl`, or `asterctl`. The
+application and health listeners bind to container loopback and the canonical
+model publishes neither listener to the host. Consequently, the Debian
+`asterctl` Event and Blob commands cannot be run against this Compose profile.
+
+`docker compose run verify` is the only packaged authenticated API consumer;
+it checks generation identity and status, not Event or Blob operations. Actual
+application use requires a separately reviewed client sidecar or application
+inside the same protected network namespace. The repository does not currently
+ship that integration, so this guide does not claim an end-to-end Compose data
+transfer example.
+
+### Rotate, stop, and remove containers
+
+For token or mission-credential rotation, create a new immutable generation,
+select it in `ASTER_CREDENTIAL_GENERATION_DIR`, update the reviewed
+configuration hash if configuration changed, and repeat validation, rendered
+model inspection, preflight, force-create, and verification. Do not use
+`docker compose restart`; it does not apply a changed generation:
+
+```sh
+docker compose -f "$ASTER_COMPOSE_FILE" run --rm preflight
+docker compose -f "$ASTER_COMPOSE_FILE" \
+  up -d --force-recreate aster-agent
+docker compose -f "$ASTER_COMPOSE_FILE" run --rm verify
+```
+
+Stop the agent gracefully or remove only this project's containers and network:
+
+```sh
+docker compose -f "$ASTER_COMPOSE_FILE" stop -t 40 aster-agent
+docker compose -f "$ASTER_COMPOSE_FILE" down
+```
+
+`down` preserves the host state directory and credential generations. Follow
+the complete Compose procedure for authorized backup, restore, retention, and
+logical destruction. Never delete state to clear an error or include live
+state in a backup without first stopping the agent.
+
+## Operate the Debian systemd service
 
 ### Stop or restart
 
