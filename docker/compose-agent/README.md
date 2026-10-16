@@ -67,8 +67,8 @@ filesystem must contain only `aster-agent`, `aster-compose-healthcheck`, the
 license, and notices. It must not contain `/bin/sh`, a package database,
 systemd units or libraries, `aster-compose-credential-admin`, a compiler, a
 Cargo cache, or credential fixtures. The admin image contains only its two
-commands plus the same notices; neither image may contain generation files or
-secret fixtures.
+administration helpers, `asterctl`, and the same notices; neither image may
+contain generation files or secret fixtures.
 
 ## Render and operate
 

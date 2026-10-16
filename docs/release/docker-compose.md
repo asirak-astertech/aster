@@ -132,9 +132,9 @@ local tags above. Both registry digests and verified local image IDs are
 immutable deployment inputs; mutable tags remain invalid. The manually
 triggered `build-compose-images.yml` workflow is packaging automation, not
 runtime qualification. It retains architecture-specific Docker-loadable
-archives, digest-pinned OCI archives, and four binary-rooted CycloneDX SBOMs
-grouped as the two-binary agent image set and two-binary administration image
-set. Each
+archives, digest-pinned OCI archives, and five binary-rooted CycloneDX SBOMs
+grouped as the two-binary agent image set and three-binary administration image
+set, which includes `asterctl`. Each
 SBOM retains its binary component identity, carries the corresponding OCI
 digest as an explicit property, passes schema and root/dependency license
 checks, and is listed in the release manifest. The bundle also retains

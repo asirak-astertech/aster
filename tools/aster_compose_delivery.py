@@ -30,7 +30,7 @@ MAX_COMPOSE_BYTES = 256 * 1024
 MAX_CONFIG_BYTES = 256 * 1024
 MAX_MANIFEST_BYTES = 64 * 1024
 COMPOSE_BUILD_WORKFLOW_SHA256 = (
-    "fdec504900629415e4e76f662d4f6d6b79fbde016f6257071651ea4ca1c816d1"
+    "7431b9cd1ad80b7089a52271ea3bd91b3e1e6367098f4d8137592c012dd0e5d5"
 )
 SETUP_BUILDX_ACTION = (
     "docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069"
@@ -203,6 +203,7 @@ def validate_workflow_policy(workflow: str, ci: str) -> None:
         "aster-compose-healthcheck_bin.cdx.json",
         "aster-compose-credential-admin_bin.cdx.json",
         "aster-compose-verify_bin.cdx.json",
+        "asterctl_bin.cdx.json",
     )
     required = (
         "--describe binaries",
@@ -257,7 +258,8 @@ def validate_workflow_policy(workflow: str, ci: str) -> None:
     if workflow.count("python3 tools/inspect_aster_compose_oci.py") != 4:
         raise ValidationError("compose-delivery-policy-invalid")
     if (
-        workflow.count("--builder ${{ steps.buildx.outputs.name }}") != 4
+        workflow.count("--describe binaries") != 2
+        or workflow.count("--builder ${{ steps.buildx.outputs.name }}") != 4
         or workflow.count("--platform ${{ matrix.platform }}") != 4
         or workflow.count("--provenance=mode=max") != 2
         or workflow.count("--provenance=false") != 2
@@ -290,7 +292,7 @@ def validate_runtime_dockerfiles(agent: str, admin: str) -> None:
 
     profiles = (
         (agent, ("aster-agent", "aster-compose-healthcheck")),
-        (admin, ("aster-compose-credential-admin", "aster-compose-verify")),
+        (admin, ("aster-compose-credential-admin", "aster-compose-verify", "asterctl")),
     )
     for source, binaries in profiles:
         if "\r" in source or "\t" in source:
