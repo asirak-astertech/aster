@@ -1,214 +1,82 @@
-# Aster operator guide
+# Aster operator runbook
 
-This guide is for an operator who needs to install and use Aster without
-building software or writing an application. It uses the packaged
-`aster-agent` service and the `asterctl` command to move Events and Blobs
-between explicitly provisioned Linux nodes.
+Use this runbook to install and operate Aster without building software or
+writing an application. The Debian package is the complete interactive path.
+The Docker Compose profile supports deployment and health verification but not
+interactive Event or Blob commands.
 
 > [!IMPORTANT]
 > Aster is an evaluation-stage reference implementation, not a
-> production-authorized system. The commands below operate the implemented
-> evaluation boundary; they do not replace mission authorization, deployment
-> approval, target-device qualification, backup policy, or physical
-> sanitization procedures.
+> production-authorized system. Follow site approval, credential custody,
+> backup, and device-sanitization policy.
 
-## What this guide covers
+## 1. Before you start
 
-By the end of the Debian-package path, you can:
+### Choose a deployment
 
-- install an Aster node and its command-line client;
-- install separately issued mission authorization and an application bearer
-  token;
-- configure one node or two explicit peers;
-- check service health and authenticated status;
-- publish and inspect Events;
-- publish, transfer, and retrieve durable or finite-lifetime Blobs; and
-- stop, restart, rotate the application token, and diagnose common failures.
-
-The public agent currently exposes Event operations plus Blob publication and
-reading. It does not expose State or Record operations, Blob subscriptions, or
-peer/convergence status over the operator API.
-
-## Understand the two credentials
-
-Aster uses two independent forms of authentication. Do not substitute one for
-the other.
-
-| Credential | Purpose | Who supplies it |
+| Option | Use it when | What works |
 | --- | --- | --- |
-| Mission provisioning bundle and reference | Establish the node's mission identity, authority, and keys and authorize its permitted peers, topics, and scopes | The mission or security authority |
-| Application bearer token | Allows a local `asterctl` or application client to call the loopback agent API | The deployment operator or site credential service |
+| Ubuntu 24.04 `.deb` | A human operator needs a local CLI | systemd service, health checks, `asterctl`, Event and Blob examples |
+| Docker Compose | The site uses Docker and immutable file-backed credential generations | preflight, agent startup, health, authenticated generation verification |
+| Source checkout | A developer needs to change or integrate Aster | Use the [quickstarts](quickstart/README.md), not this runbook |
 
-The bearer token does not make a node a mission member. Mission credentials do
-not grant a local process access to the agent API. Both must be valid before
-normal operation.
+Neither packaged path is a production release. Use a reviewed artifact for the
+correct architecture and retain its checksum and source revision.
 
-## Choose an installation option
+### Collect these inputs
 
-| Option | Use it when | Operator boundary |
-| --- | --- | --- |
-| Ubuntu 24.04 `.deb` | A human needs `asterctl`, systemd service management, and direct local Event/Blob use | Recommended path for this guide; package artifacts are evaluation candidates |
-| Docker Compose release bundle | A site already operates Docker and wants the dedicated immutable file-secret profile | Provides deployment, preflight, health, and authenticated generation verification; the current scratch images do not package an interactive `asterctl` client or publish the loopback application port to the host |
-| Source checkout | A developer is evaluating or changing Aster | Requires Rust and repository tooling; use the quickstarts instead of this operator guide |
+- One mission bundle issued for this node.
+- The approved topic and scope.
+- For Debian, the retained install and load operation IDs.
+- For each peer: carrier ID, reachable `IP:PORT`, and mission node ID.
+- For Blob receipt: the exact approved `TOPIC@SCOPE` selector and depot limits.
 
-Neither package path is a production release. Obtain artifacts from a reviewed
-revision and preserve the artifact checksum, source revision, architecture,
-and approval record supplied by the release owner.
+Each node needs its own identity, bundle, state, and operation IDs.
 
-## Information required before installation
+### Understand the two credentials
 
-Obtain the following before changing a node:
+| Credential | Purpose |
+| --- | --- |
+| Mission bundle | Establishes mission identity and authorizes peers, topics, scopes, and keys |
+| Application token | Authorizes a local client to call the agent API |
 
-1. A reviewed Aster package or Compose release bundle for the host
-   architecture.
-2. One authorized mission provisioning bundle for this node, delivered by the
-   site's protected channel, or a disposable evaluation bundle created as
-   described below.
-3. The retained install and load operation IDs that belong to that bundle.
-4. The topic and scope the node may publish or receive, for example
-   `chat.events` and `mission/team/alpha`.
-5. For every explicit peer:
-   - its 64-hex-character carrier identity;
-   - its reachable IP address and UDP port; and
-   - its 64-hex-character mission node identity.
-6. If the node will receive Blobs, the exact authorized Blob topic and scope
-   and approved local depot limits.
+The token does not grant mission membership. The mission bundle does not grant
+local API access.
 
-Do not invent peer identities or copy another node's state, configuration,
-credentials, or operation IDs. Every node needs independent custody.
+`aster-credential-admin install` and
+`aster-compose-credential-admin create` install an existing bundle; they do
+not issue one. Production authority-side issuance is not yet provided. See
+[issue #96](https://github.com/defenseunicorns/aster/issues/96).
 
-## Choose how the mission bundle is supplied
-
-Aster separates **issuance** from **installation**. The
-`aster-credential-admin install` command and the
-`aster-compose-credential-admin create` command consume an existing canonical
-`ASTRPB03` mission bundle and place it into their deployment's credential
-custody. Despite the Compose command's name, neither command creates a mission,
-acts as a mission authority, or grants new access.
-
-| Deployment | Operational bundle source | Repository evaluation option | How the node consumes it |
-| --- | --- | --- | --- |
-| Ubuntu `.deb` with systemd | The mission authority supplies one node-specific `ASTRPB03` bundle over a protected channel | The packaged `aster playground-init` command creates a disposable 2–32-node mission | Import the selected node's bundle with `aster-credential-admin install`, then install its matching carrier identity |
-| Docker Compose | The mission authority supplies one node-specific `ASTRPB03` bundle and the site creates a separate application token | A bundle from a disposable `playground-init` run can be used as the protected input to exercise generation creation | `aster-compose-credential-admin create` produces one immutable credential generation from the bundle and token |
-| Source checkout | The mission authority supplies a bundle only when an explicitly approved development integration requires it | Run `playground-init`, or use the checked-in public binding-test fixture for its narrowly documented tests | Development commands may read an owner-only file through `--mission-bundle-unprotected-reference`; this makes no protected-custody claim |
-
-There is currently no supported repository command for production authority-side
-bundle issuance. An operational authority must create, retain, recover, and
-destroy its issuer state outside these node installation tools. Do not use an
-evaluation generator, public fixture, copied node bundle, or node-side
-credential administrator as a substitute.
-
-### Create bundles for a Debian evaluation
-
-Create every member of one evaluation mission in a single run on a controlled
-host. Running the command independently on two hosts creates unrelated mission
-authorities that cannot authenticate each other:
+For a disposable two-node evaluation only, create both nodes in one run:
 
 ```sh
 umask 077
 aster playground-init --nodes 2 --root /tmp/aster-evaluation-mission
 ```
 
-The root must not already exist. The command accepts 2 through 32 nodes and
-prints each node's public carrier and mission identifiers. Each `node-N`
-directory contains two sensitive files:
+Each `node-N` directory contains `identity.key` and
+`mission.unprotected-reference.bundle`. The generated mission authorizes only
+`mesh.messages@demo/playground`; it does not authorize the Event and Blob
+examples below. See the
+[two-Raspberry-Pi lab](quickstart/two-raspberry-pi-ci-package-lab.md) for the
+complete evaluation import procedure.
 
-| File | Purpose |
-| --- | --- |
-| `identity.key` | That node's carrier identity |
-| `mission.unprotected-reference.bundle` | That node's plaintext canonical `ASTRPB03` mission bundle |
+## 2. Debian package runbook
 
-Assign exactly one complete `node-N` directory to each host and transfer it
-through an approved protected channel. The generated mission has fixed scope
-`demo/playground`, fixed topic `mesh.messages`, epoch 1, and all-member grants.
-It is suitable only for disposable interoperability evaluation; it cannot
-create an operational role model or authorize the `imagery.maps` Blob examples
-later in this guide.
+### Step 1: install the package
 
-For a complete package example that imports each bundle into systemd protected
-credentials, installs the matching carrier identity, configures reciprocal
-peers, and removes the plaintext staging material, follow the
-[two-Raspberry-Pi package lab](quickstart/two-raspberry-pi-ci-package-lab.md).
-Generate and retain distinct install and load operation IDs for every node as
-that procedure specifies.
-
-### Supply a bundle to a Compose deployment
-
-Place an authority-issued bundle, or one selected node bundle from the
-disposable evaluation above, at the protected input path used by the Compose
-procedure:
-
-```sh
-export ASTER_BUNDLE_INPUT="$ASTER_DEPLOYMENT_ROOT/input/mission.astpb03"
-install -m 0600 \
-  /protected/inbox/node.astpb03 "$ASTER_BUNDLE_INPUT"
-```
-
-Then follow [Create an immutable generation](release/docker-compose.md#create-an-immutable-generation).
-That command reads the bundle on standard input and combines it with a separate
-application token. Its output is a deployable credential generation, not a new
-mission bundle. Remove the input bundle under site policy after the generation
-and deployment have been verified.
-
-### Create or select a source-development bundle
-
-From a source checkout, the same evaluation generator is available through
-Cargo:
-
-```sh
-umask 077
-cargo run --locked -p aster-node --bin aster -- \
-  playground-init --nodes 2 --root /tmp/aster-source-mission
-```
-
-Use each generated node bundle with the matching generated carrier identity.
-For binding tests only, the repository also contains
-`bindings/testdata/non-production-provisioning.bundle`; it has public,
-disposable credentials and narrowly fixed test grants. The
-[development agent example](quickstart/connect-agent.md#exercise-the-repository-development-path)
-shows the plaintext compatibility flag. Neither file-based source path
-exercises systemd or Compose protected credential custody.
-
-## Install the Ubuntu package
-
-These steps assume Ubuntu 24.04 and a reviewed package named
-`aster_VERSION_ARCH.deb` in the current directory.
-
-First verify the checksum supplied by the release owner. The expected value
-must come from a separately reviewed manifest or approval record:
+Verify the checksum against a separately reviewed value, then install:
 
 ```sh
 sha256sum ./aster_VERSION_ARCH.deb
-```
-
-Install the package and the two standard command-line utilities used below:
-
-```sh
 sudo apt install ./aster_VERSION_ARCH.deb curl openssl
 ```
 
-The package creates these paths but leaves the service stopped and disabled:
+The package leaves `aster-agent.service` stopped and disabled. Do not start it
+until authentication and configuration are ready.
 
-| Purpose | Path or identity |
-| --- | --- |
-| Service | `aster-agent.service` |
-| Service account | `aster:aster` |
-| Agent | `/usr/bin/aster-agent` |
-| Operator client | `/usr/bin/asterctl` |
-| Mission credential administrator | `/usr/sbin/aster-credential-admin` |
-| Configuration | `/etc/aster/agent.json` |
-| Application token | `/etc/aster/agent-credentials/client-token` |
-| Mission reference | `/etc/aster/agent-credentials/mission-reference` |
-| Durable node state | `/var/lib/aster-agent` |
-
-Do not start the service yet.
-
-## Set up authentication
-
-### Create the local application token
-
-Generate a token without putting its value in the command line, environment,
-or terminal output:
+### Step 2: create the application token
 
 ```sh
 umask 077
@@ -220,76 +88,48 @@ rm -- "$ASTER_TOKEN_STAGE"
 unset ASTER_TOKEN_STAGE
 ```
 
-The token file may contain only 32–256 ASCII letters, digits, or `-._~`, plus
-one trailing line ending. The hexadecimal command above produces an accepted
-64-character token. Prefer `--token-file`; passing a literal token through
-`--token` can expose it in shell history and process listings.
+Always use `--token-file`. Do not put the token in command arguments, logs, or
+tickets.
 
-### Install the mission credential
+### Step 3: install the mission credential
 
-Mission credential installation is a stopped-service security operation. The
-authorized bundle is not generated by `asterctl` and must not be replaced by a
-repository test bundle.
+Keep the service stopped:
 
-1. Keep the service stopped and confirm that no process remains:
+```sh
+sudo systemctl stop aster-agent.service
+sudo systemctl show aster-agent.service \
+  --property=ActiveState,SubState,MainPID,ControlPID
+```
 
-   ```sh
-   sudo systemctl stop aster-agent.service
-   sudo systemctl show aster-agent.service \
-     --property=ActiveState,SubState,MainPID,ControlPID
-   ```
+Continue only when the service is inactive and both process IDs are zero. On a
+new host, initialize the systemd credential key once:
 
-   Continue only when the service is inactive and both process IDs are zero.
+```sh
+sudo systemd-creds setup
+```
 
-2. If this is the first installation on the host, initialize the systemd host
-   credential key once:
+Do not replace an existing host key. Follow
+[Install and hand off the reference](mvp/raspberry-pi-provider-v2-operations.md#operation-1-install-and-hand-off-the-reference)
+using this node's bundle and retained operation IDs. Then confirm the reference
+permissions without printing its contents:
 
-   ```sh
-   sudo systemd-creds setup
-   ```
+```sh
+sudo stat --format='%U:%G %a %n' \
+  /etc/aster/agent-credentials/mission-reference
+```
 
-   Do not replace an existing host key. Loss of an existing key requires the
-   documented recovery procedure.
+Expected owner and mode: `aster:aster 600`.
 
-3. Use the exact
-   [provider install and reference-handoff procedure](mvp/raspberry-pi-provider-v2-operations.md#operation-1-install-and-hand-off-the-reference).
-   That procedure passes the authorized bundle on a protected descriptor,
-   invokes `aster-credential-admin install` with the retained install and load
-   operation IDs, validates the complete success result, and atomically writes
-   the service-readable mission reference.
+### Step 4: configure the node
 
-4. Confirm the resulting service-readable reference has the required ownership and
-   mode without printing its contents:
-
-   ```sh
-   sudo stat --format='%U:%G %a %n' \
-     /etc/aster/agent-credentials/mission-reference
-   ```
-
-   The expected result is `aster:aster 600` followed by the path.
-
-Never place provisioning-bundle bytes, bearer-token bytes, or the decoded
-mission reference in this guide, a ticket, a log, shell tracing, or command
-arguments.
-
-## Configure a packaged node
-
-Edit `/etc/aster/agent.json` as root. This baseline receives no network Blobs
-until an exact interest is added. Replace every angle-bracket placeholder
-before validation:
+Write `/etc/aster/agent.json` and replace the load-operation placeholder:
 
 ```json
 {
   "schema_version": 1,
-  "state": {
-    "directory": "/var/lib/aster-agent"
-  },
-  "application": {
-    "listen": "127.0.0.1:8181"
-  },
-  "health": {
-    "listen": "127.0.0.1:8182"
-  },
+  "state": {"directory": "/var/lib/aster-agent"},
+  "application": {"listen": "127.0.0.1:8181"},
+  "health": {"listen": "127.0.0.1:8182"},
   "mesh": {
     "bind": "0.0.0.0:8183",
     "emission_policy": "normal",
@@ -319,37 +159,28 @@ before validation:
 }
 ```
 
-The capacity values are the repository's bounded evaluation values, not a
-production sizing recommendation. The load operation must exactly match the
-retained operation used when the mission reference was installed.
+The capacity values are evaluation defaults, not production sizing guidance.
 
-Set the configuration's ownership and permissions:
+Set permissions and validate:
 
 ```sh
 sudo chown root:aster /etc/aster/agent.json
 sudo chmod 0640 /etc/aster/agent.json
-```
-
-Validate it as the service account:
-
-```sh
 sudo -u aster /usr/bin/aster-agent \
   --check-config /etc/aster/agent.json
 ```
 
-Exit status `0` with no output means the configuration and referenced files
-passed static validation. It does not prove that mission loading, networking,
-or readiness will succeed.
+Exit status `0` with no output means static validation passed.
 
-## Configure two explicit peers
+### Step 5: add peers and Blob interests
 
-Each node needs the other node's exact descriptor in `mesh.peers`:
+Each node independently names its peer:
 
 ```text
 CARRIER_ID@IP:PORT=MISSION_NODE_ID_HEX64
 ```
 
-For example, Node A's configuration points at Node B:
+Node A example:
 
 ```json
 "peers": [
@@ -357,33 +188,12 @@ For example, Node A's configuration points at Node B:
 ]
 ```
 
-Node B points independently at Node A:
+Node B uses Node A's values. Replace the documentation IP with a reachable site
+address and permit UDP 8183 through the site firewall. Keep application and
+health ports on loopback.
 
-```json
-"peers": [
-  "<NODE_A_CARRIER_ID>@192.0.2.10:8183=<NODE_A_MISSION_ID>"
-]
-```
-
-Replace the documentation-only `192.0.2.0/24` addresses with reachable site
-addresses. Permit the configured mesh traffic through site firewalls. Keep
-the application and health listeners on loopback; never expose their
-plaintext ports as remote services. A remote operator should connect to the
-host and run `asterctl` locally, or use a separately approved authenticated
-tunnel terminating on that host.
-
-Peer configuration only supplies coordinates and expected identities. The
-mission credential must independently authorize the peer, topic, scope, and
-direction of use.
-
-Configuration changes to peers, emission policy, Blob interests, depot
-limits, or mission material require a restart.
-
-## Configure Blob receipt
-
-Local Blob publication and reading work without a mesh receive interest. To
-allow Node B to request a specific Blob lane from peers, configure the exact
-topic and exact scope on Node B:
+To receive a Blob lane, add the exact authorized selector on the receiving
+node:
 
 ```json
 "blob_interests": [
@@ -391,65 +201,33 @@ topic and exact scope on Node B:
 ]
 ```
 
-Keep all three nonzero `storage.blob_depot` limits in the same configuration.
-An empty or absent list receives no Blob network work. Wildcards, descendant
-scopes, duplicates, and more than 256 selectors are rejected.
+The selector requests data; it does not grant authorization. Empty interests
+mean no Blob network receipt. Peer, interest, emission-policy, depot, and
+mission changes require a restart.
 
-The selector is receive policy, not authorization. Mission authorization and
-the current epoch and revocation state still decide whether transfer is
-allowed. An authenticated peer can observe the exact topic and scope interest
-metadata, so enable only reviewed interests.
-
-The `imagery.maps@mission/team/alpha` examples require bundles issued with
-that exact Blob authorization. Bundles from `playground-init` authorize only
-`mesh.messages@demo/playground`; changing the JSON selector or CLI arguments
-does not add authority grants.
-
-`receive_only` is not a way to receive Blobs in the current profile: while
-that mode is active, the configured selectors remain stored for a later
-normal-mode restart but the node performs no Blob network work.
-
-## Start and verify the service
-
-Start the agent and wait for readiness:
+### Step 6: start and verify
 
 ```sh
 sudo systemctl start aster-agent.service
-curl --fail --silent --output /dev/null \
-  http://127.0.0.1:8182/livez
-curl --fail --silent --output /dev/null \
-  http://127.0.0.1:8182/readyz
-```
-
-Both commands must exit successfully. `/livez` only shows that the process is
-alive. `/readyz` means the local durable authority and application listener
-accept work; it does not mean a peer is reachable or synchronized.
-
-Make the authenticated status call:
-
-```sh
+curl --fail --silent --output /dev/null http://127.0.0.1:8182/livez
+curl --fail --silent --output /dev/null http://127.0.0.1:8182/readyz
 sudo -u aster /usr/bin/asterctl \
   --token-file /etc/aster/agent-credentials/client-token status
 ```
 
-Review at least:
-
-- node and mission identities are present;
-- configured and effective emission modes are the intended values;
-- peer authorization is active;
-- authenticated-contact and failed-contact counters are reasonable;
-- storage and publication-operation usage remain below their limits; and
-- delivery pressure is not saturated.
-
-After validation, enable start at boot if that matches site policy:
+`readyz` proves local readiness, not peer connectivity. Review identities,
+emission mode, peer authorization, contact counters, storage use, and delivery
+pressure. Enable boot start only after validation:
 
 ```sh
 sudo systemctl enable aster-agent.service
 ```
 
-## Publish and verify an Event
+### Step 7: test an Event
 
-Run this command on Node A:
+The bundle must authorize `chat.events@mission/team/alpha`.
+
+Publish on Node A:
 
 ```sh
 sudo -u aster /usr/bin/asterctl \
@@ -462,10 +240,7 @@ sudo -u aster /usr/bin/asterctl \
   "Node A operator check"
 ```
 
-`Published locally` means Node A durably committed the Event. It does not mean
-Node B received it.
-
-Query Node A's local store:
+Query locally on Node A, then on Node B after authenticated contact:
 
 ```sh
 sudo -u aster /usr/bin/asterctl \
@@ -473,82 +248,24 @@ sudo -u aster /usr/bin/asterctl \
   query --topic chat.events --scope mission/team/alpha
 ```
 
-After an authenticated contact, run the same query locally on Node B. Seeing
-the exact Event in Node B's query is application-level evidence that Node B
-stored it. Contact counters or successful publication on Node A are not
-substitutes for that check.
+Seeing the Event on Node B proves that Node B stored it. A local publication or
+contact counter alone does not.
 
-### Publish a finite-lifetime Event
+For a 60-second Event, add:
 
-The following Event is valid for 60 seconds from its original publication
-lifetime:
-
-```sh
-sudo -u aster /usr/bin/asterctl \
-  --token-file /etc/aster/agent-credentials/client-token \
-  publish \
-  --topic chat.events \
-  --scope mission/team/alpha \
-  --priority priority \
-  --ttl-ms 60000 \
-  --operation-key operator-check-ttl-001 \
-  "This Event expires"
+```text
+--ttl-ms 60000
 ```
 
-The lifetime does not restart after forwarding or process restart. Once
-expired, the Event is withheld from queries, delivery, and forwarding and is
-later removed by maintenance.
+If publication times out, retry the identical request on the same node with
+the same operation key, payload, and options.
 
-### Retry an uncertain publication
+### Step 8: test a Blob
 
-If a timeout or disconnect leaves the outcome unknown, repeat the identical
-request against the same node with the same operation key, payload, and
-options. Do not change the key to make the command succeed. An identical retry
-returns the already committed result when the first attempt succeeded.
+The bundle and receiving interest must authorize
+`imagery.maps@mission/team/alpha`.
 
-`--operation-key auto` prints a generated key before sending, but human
-operators should normally choose and record an explicit key before the first
-attempt.
-
-## Create and inspect an Event subscription
-
-Create a persistent subscription:
-
-```sh
-sudo -u aster /usr/bin/asterctl \
-  --token-file /etc/aster/agent-credentials/client-token \
-  subscribe \
-  --scope mission/team/alpha \
-  --operation-key operator-chat-reader-001 \
-  chat.events
-```
-
-List subscriptions:
-
-```sh
-sudo -u aster /usr/bin/asterctl \
-  --token-file /etc/aster/agent-credentials/client-token subscriptions
-```
-
-The CLI can create, list, and delete Event subscriptions. It does not provide
-the application delivery poll/stream and acknowledgement workflow; consuming
-at-least-once deliveries requires an application client using the agent API.
-For a manual transfer check, use `query` on the receiving node.
-
-To delete a subscription, copy its printed ID and run:
-
-```sh
-sudo -u aster /usr/bin/asterctl \
-  --token-file /etc/aster/agent-credentials/client-token \
-  unsubscribe '<SUBSCRIPTION_ID>'
-```
-
-## Publish, transfer, and retrieve a Blob
-
-Blob publication accepts one nonempty regular file. Keep the file unchanged
-until the command finishes. `asterctl` runs as the `aster` account in these
-examples, so stage operator-owned files in a protected directory that account
-can access. Do not use the Aster state directory as an exchange directory:
+Stage the input for the `aster` service account:
 
 ```sh
 sudo install -d -o aster -g aster -m 0700 /run/aster-operator
@@ -556,7 +273,7 @@ sudo install -o aster -g aster -m 0600 \
   /secure/input/map.bin /run/aster-operator/map.bin
 ```
 
-On Node A, publish a durable Blob:
+Publish on Node A:
 
 ```sh
 sudo -u aster /usr/bin/asterctl \
@@ -571,23 +288,9 @@ sudo -u aster /usr/bin/asterctl \
   --operation-key map-001
 ```
 
-Record the printed Blob ID. Publication streams bounded chunks and does not
-load the complete file into memory. The protocol does not define a 64-MiB
-maximum, but the current selected backend may reject a file above its
-configured implementation limit.
+Record the Blob ID. For a one-hour Blob, add `--ttl-ms 3600000`.
 
-For a Blob that expires after one hour, add:
-
-```text
---ttl-ms 3600000
-```
-
-Do not use a new operation key to retry an uncertain result. Retry with the
-same file bytes and every original publication option.
-
-If Node B has the exact Blob receive interest, authorization, depot capacity,
-and a successful authenticated contact, prepare its protected output directory
-and retrieve the Blob locally on Node B:
+Read on Node B:
 
 ```sh
 sudo install -d -o aster -g aster -m 0700 /run/aster-operator
@@ -601,13 +304,7 @@ sudo -u aster /usr/bin/asterctl \
   --output /run/aster-operator/received-map.bin
 ```
 
-The destination must not already exist. On Linux, `asterctl` writes an
-anonymous temporary file, verifies the complete authenticated stream, syncs
-it, and atomically publishes the requested new path. A failed or incomplete
-read leaves no named partial output.
-
-After the read succeeds, record the first hash on Node A and the second hash on
-Node B, then compare the two values:
+The output path must not already exist. Compare the files:
 
 ```sh
 # Node A
@@ -617,137 +314,63 @@ sha256sum /run/aster-operator/map.bin
 sha256sum /run/aster-operator/received-map.bin
 ```
 
-Matching hashes plus a successful authenticated read prove equality of those
-two files. A successful contact or a local publication receipt alone does not
-prove remote Blob availability.
+Matching hashes prove equality of those two files. Remove staging files under
+site policy after moving required output into approved custody.
 
-The current agent caps an RPC at 30 seconds even when a longer client timeout
-is requested. Operator input and completed output remain outside Aster node
-custody; copy the result into approved custody and remove staging files under
-site policy when they are no longer needed. Node zeroization does not erase
-those external files.
-
-## Deploy one agent with Docker Compose
-
-The Compose profile is a separate installation choice, not an alternate
-runtime flag for the Debian binary. One Compose project owns exactly one agent
-identity, credential generation, configuration, and state directory. Never
-scale the service, share these paths with another project, or reuse one
-generation for another agent.
-
-These examples provide the normal setup sequence. The
-[complete Compose operator procedure](release/docker-compose.md) remains
-authoritative for artifact evidence, custody, rotation, backup, recovery, and
-cleanup.
-
-### Check Compose prerequisites
-
-Use a Linux host with Docker Engine and Docker Compose v2. The examples also
-use GitHub CLI, Git, `jq`, Python 3, OpenSSL, and standard checksum utilities.
-The invoking user must be a non-root user authorized to use the selected
-Docker daemon:
+### Optional: manage Event subscriptions
 
 ```sh
-docker version
-docker compose version
-gh --version
-git --version
-jq --version
-python3 --version
-openssl version
-test "$(id -u)" -ne 0
-test "$(id -g)" -ne 0
+sudo -u aster /usr/bin/asterctl \
+  --token-file /etc/aster/agent-credentials/client-token \
+  subscribe --scope mission/team/alpha \
+  --operation-key operator-chat-reader-001 chat.events
+
+sudo -u aster /usr/bin/asterctl \
+  --token-file /etc/aster/agent-credentials/client-token subscriptions
+
+sudo -u aster /usr/bin/asterctl \
+  --token-file /etc/aster/agent-credentials/client-token \
+  unsubscribe '<SUBSCRIPTION_ID>'
 ```
 
-No Docker host profile is qualified yet. Rootless Docker, Docker Desktop,
-remote contexts, user-namespace remapping, alternate filesystems, and
-mandatory-access-control combinations require separate site evaluation.
-Compose file-backed secrets do not provide encryption at rest.
+The CLI manages subscriptions but does not poll or acknowledge deliveries. An
+application client is required for the at-least-once delivery workflow.
 
-### Download, verify, and import the release
+## 3. Docker Compose runbook
 
-Select the successful `Build: Compose images` workflow artifact for the
-reviewed source revision and the deployment host's native architecture. The
-following connected-host example uses GitHub CLI; a disconnected site may
-download on an approved staging host and transfer the complete artifact
-directory:
+The canonical profile deploys one agent per Compose project. Do not scale it or
+share state, credentials, or identity between projects.
+
+### Step 1: verify and import the release
+
+Follow [Download and verify a release bundle](release/docker-compose.md#download-and-verify-a-release-bundle).
+That procedure selects `amd64` or `arm64`, verifies checksums and metadata,
+loads both images, and produces these immutable values:
 
 ```sh
-case "$(uname -m)" in
-  x86_64) export ASTER_RELEASE_ARCH=amd64 ;;
-  aarch64|arm64) export ASTER_RELEASE_ARCH=arm64 ;;
-  *) printf 'unsupported release architecture\n' >&2; exit 1 ;;
-esac
-
-export ASTER_SOURCE_REVISION='<reviewed-40-lowercase-hex>'
-export ASTER_WORKFLOW_RUN='<successful-workflow-run-id>'
-export ASTER_ARTIFACT_DIR="$(pwd -P)/aster-compose-images-$ASTER_RELEASE_ARCH-$ASTER_SOURCE_REVISION"
-
-mkdir "$ASTER_ARTIFACT_DIR"
-gh run download "$ASTER_WORKFLOW_RUN" \
-  --repo defenseunicorns/aster \
-  --name "aster-compose-images-$ASTER_RELEASE_ARCH-$ASTER_SOURCE_REVISION" \
-  --dir "$ASTER_ARTIFACT_DIR"
-cd "$ASTER_ARTIFACT_DIR"
-sha256sum --check SHA256SUMS
-test "$(jq -er '.source_revision' release-manifest.json)" = \
-  "$ASTER_SOURCE_REVISION"
-test "$(jq -er '.architecture' release-manifest.json)" = \
-  "linux/$ASTER_RELEASE_ARCH"
+export ASTER_AGENT_IMAGE_DIGEST='sha256:<verified-agent-image-id>'
+export ASTER_ADMIN_IMAGE_DIGEST='sha256:<verified-admin-image-id>'
+export ASTER_ARTIFACT_DIR='/absolute/path/to/verified-compose-artifact'
+export ASTER_COMPOSE_FILE="$ASTER_ARTIFACT_DIR/compose.yaml"
 ```
 
-Import both Docker archives, resolve their immutable local image IDs, and
-retain those values for every later command:
+The release artifact does not currently include the delivery validator. Keep a
+reviewed source tree at the same revision available for Step 4.
 
-```sh
-docker image load --input \
-  "aster-compose-agent-$ASTER_RELEASE_ARCH.docker.tar"
-docker image load --input \
-  "aster-compose-admin-$ASTER_RELEASE_ARCH.docker.tar"
+### Step 2: prepare one deployment
 
-ASTER_AGENT_TAG="$(jq -er '.images.agent.transport_tag' release-manifest.json)"
-ASTER_ADMIN_TAG="$(jq -er '.images.admin.transport_tag' release-manifest.json)"
-export ASTER_AGENT_IMAGE_DIGEST="$(docker image inspect \
-  --format '{{.Id}}' "$ASTER_AGENT_TAG")"
-export ASTER_ADMIN_IMAGE_DIGEST="$(docker image inspect \
-  --format '{{.Id}}' "$ASTER_ADMIN_TAG")"
-
-ASTER_AGENT_CONFIG_DIGEST="$(jq -er \
-  '.images.agent.config_digest' release-manifest.json)"
-ASTER_AGENT_MANIFEST_DIGEST="$(jq -er \
-  '.images.agent.manifest_digest' release-manifest.json)"
-ASTER_ADMIN_CONFIG_DIGEST="$(jq -er \
-  '.images.admin.config_digest' release-manifest.json)"
-ASTER_ADMIN_MANIFEST_DIGEST="$(jq -er \
-  '.images.admin.manifest_digest' release-manifest.json)"
-
-case "$ASTER_AGENT_IMAGE_DIGEST" in
-  "$ASTER_AGENT_CONFIG_DIGEST"|"$ASTER_AGENT_MANIFEST_DIGEST") ;;
-  *) printf 'agent image identity mismatch\n' >&2; exit 1 ;;
-esac
-case "$ASTER_ADMIN_IMAGE_DIGEST" in
-  "$ASTER_ADMIN_CONFIG_DIGEST"|"$ASTER_ADMIN_MANIFEST_DIGEST") ;;
-  *) printf 'admin image identity mismatch\n' >&2; exit 1 ;;
-esac
-```
-
-Do not deploy mutable transport tags. The packaged `compose.yaml` and
-`agent.example.json` are the deployment inputs used below.
-
-### Prepare one deployment's paths and credentials
-
-Choose a unique site name. Create every persistent path as the same non-root
-user that will run Compose:
+Run as the same non-root user that will operate Compose:
 
 ```sh
 export ASTER_UID="$(id -u)" ASTER_GID="$(id -g)"
+test "$ASTER_UID" -ne 0
+test "$ASTER_GID" -ne 0
 export COMPOSE_PROJECT_NAME=aster-site-a
 export ASTER_DEPLOYMENT_ROOT="$(pwd -P)/$COMPOSE_PROJECT_NAME"
 export ASTER_GENERATION_PARENT="$ASTER_DEPLOYMENT_ROOT/credential-generations"
 export ASTER_STATE_DIR="$ASTER_DEPLOYMENT_ROOT/state"
 export ASTER_TOKEN_INPUT="$ASTER_DEPLOYMENT_ROOT/input/client-token"
 export ASTER_BUNDLE_INPUT="$ASTER_DEPLOYMENT_ROOT/input/mission.astpb03"
-export ASTER_COMPOSE_FILE="$ASTER_ARTIFACT_DIR/compose.yaml"
 
 install -d -m 0700 "$ASTER_DEPLOYMENT_ROOT" \
   "$ASTER_GENERATION_PARENT" "$ASTER_STATE_DIR" \
@@ -757,16 +380,9 @@ openssl rand -hex 32 > "$ASTER_TOKEN_INPUT"
 install -m 0600 /protected/inbox/node.astpb03 "$ASTER_BUNDLE_INPUT"
 ```
 
-Replace `/protected/inbox/node.astpb03` with this node's authority-issued
-bundle. For a disposable evaluation, it may instead name one node bundle from
-the earlier `playground-init` example. Do not use another agent's bundle. The
-token grants local application API access; it does not create mission
-membership.
+Replace the bundle path with this node's authority-issued bundle.
 
-### Create and inspect the credential generation
-
-The administration image reads the canonical bundle on standard input and the
-token through a read-only file mount:
+### Step 3: create a credential generation
 
 ```sh
 docker run --rm --network none --read-only --cap-drop ALL \
@@ -780,297 +396,131 @@ docker run --rm --network none --read-only --cap-drop ALL \
   --token-file /host/input/client-token < "$ASTER_BUNDLE_INPUT"
 ```
 
-Record the printed `generation=<64-lowercase-hex>` value and select the exact
-new directory:
+Record the printed generation and select it:
 
 ```sh
 export ASTER_CREDENTIAL_GENERATION_DIR="$ASTER_GENERATION_PARENT/generation-<64-hex>"
 test -d "$ASTER_CREDENTIAL_GENERATION_DIR"
 jq . "$ASTER_CREDENTIAL_GENERATION_DIR/manifest.json"
-find "$ASTER_CREDENTIAL_GENERATION_DIR" -maxdepth 1 \
-  -printf '%u:%g %m links=%n %f\n'
 ```
 
-Credential files must belong to `$ASTER_UID:$ASTER_GID`, have mode `0400` or
-`0600`, and have one hard link. The manifest contains non-secret identifiers;
-do not print the other generation files. This `create` operation packages an
-existing mission bundle into Compose custody—it does not issue a bundle.
+Do not print the other generation files. This command installs an existing
+bundle; it does not issue one.
 
-### Configure an isolated agent
+### Step 4: configure and start
 
-Install the packaged template into the deployment directory:
+Copy and edit the packaged schema-v2 example:
 
 ```sh
 export ASTER_AGENT_CONFIG_FILE="$ASTER_DEPLOYMENT_ROOT/agent.json"
 install -m 0644 "$ASTER_ARTIFACT_DIR/agent.example.json" \
   "$ASTER_AGENT_CONFIG_FILE"
-```
-
-The shipped template is a complete isolated-node example. Its essential
-values are:
-
-```json
-{
-  "schema_version": 2,
-  "state": {"directory": "/var/lib/aster"},
-  "application": {"listen": "127.0.0.1:8181"},
-  "health": {"listen": "127.0.0.1:8182"},
-  "mesh": {
-    "bind": "0.0.0.0:8183",
-    "sync_interval_ms": 500,
-    "emission_policy": "normal",
-    "blob_interests": [],
-    "peers": []
-  },
-  "credentials": {
-    "client_token_file": "/run/secrets/aster-client-token",
-    "mission_activation_file": "/run/secrets/aster-mission-activation"
-  },
-  "storage": {
-    "max_items": 10000,
-    "max_payload_bytes": 67108864,
-    "blob_depot": {
-      "max_bytes": 67108864,
-      "max_chunks": 4096,
-      "max_variants": 64
-    },
-    "operations": {
-      "max_records": 1000000,
-      "max_logical_bytes": 201326592,
-      "emergency_reserve": 10000
-    }
-  }
-}
-```
-
-Edit only documented schema-v2 fields. Keep the state and credential paths
-exactly as shown because those are the container mount locations. After review,
-record the configuration hash:
-
-```sh
 sha256sum "$ASTER_AGENT_CONFIG_FILE"
 export ASTER_AGENT_CONFIG_SHA256='<reviewed-64-lowercase-hex>'
+export ASTER_VALIDATOR='/reviewed/aster-source/tools/aster_compose_delivery.py'
 ```
 
-### Validate, preflight, start, and verify
-
-The release artifact does not currently include the daemon-free delivery
-validator. Obtain the source tree for the exact reviewed
-`ASTER_SOURCE_REVISION` through the site's approved source-delivery process.
-For a connected evaluation host, the equivalent GitHub CLI example is:
+Keep the container state and credential paths from the template unchanged.
+Add only reviewed peers, Blob interests, and capacity values. Then run:
 
 ```sh
-export ASTER_SOURCE_DIR="$(pwd -P)/aster-source-$ASTER_SOURCE_REVISION"
-gh repo clone defenseunicorns/aster "$ASTER_SOURCE_DIR"
-git -C "$ASTER_SOURCE_DIR" checkout --detach "$ASTER_SOURCE_REVISION"
-test "$(git -C "$ASTER_SOURCE_DIR" rev-parse HEAD)" = \
-  "$ASTER_SOURCE_REVISION"
-```
-
-Point `ASTER_VALIDATOR` at that tree's
-`tools/aster_compose_delivery.py`. The validator source must match the release
-revision:
-
-```sh
-export ASTER_VALIDATOR="$ASTER_SOURCE_DIR/tools/aster_compose_delivery.py"
-test -f "$ASTER_VALIDATOR"
 python3 "$ASTER_VALIDATOR" "$ASTER_COMPOSE_FILE"
 docker compose -f "$ASTER_COMPOSE_FILE" config --format json \
   > /tmp/aster-compose.rendered.json
-```
-
-Inspect the rendered model before activation. It must contain the two immutable
-image IDs, the selected numeric UID/GID, the exact state directory, the exact
-configuration file, and exactly three files from the selected generation. It
-must not contain credential bytes, a Docker socket, host namespaces, added
-capabilities, or replica configuration.
-
-Run the isolated preflight, create the agent, and run the authenticated
-generation verifier:
-
-```sh
 docker compose -f "$ASTER_COMPOSE_FILE" run --rm preflight
 docker compose -f "$ASTER_COMPOSE_FILE" \
   up -d --force-recreate aster-agent
 docker compose -f "$ASTER_COMPOSE_FILE" run --rm verify
-```
-
-Proceed only when preflight succeeds, `docker compose ps` reports the agent as
-healthy, and the verifier prints `VERIFY status=pass`:
-
-```sh
 docker compose -f "$ASTER_COMPOSE_FILE" ps
-docker compose -f "$ASTER_COMPOSE_FILE" logs --tail 100 aster-agent
 ```
 
-The verifier proves that an authenticated status response names the selected
-credential generation. It does not prove peer reachability, data transfer,
-host qualification, authorization correctness, or backup recovery.
+Proceed only when preflight passes, the agent is healthy, and the verifier
+prints `VERIFY status=pass`.
 
-Common setup failures remain fail-closed:
+### Current Compose limits
 
-| Result | Check |
-| --- | --- |
-| `image-reference-mutable` | Use the immutable image IDs obtained from `docker image inspect`, not the transport tags |
-| `config-digest-mismatch` | Recompute the reviewed hash after an intentional configuration edit; otherwise restore the reviewed file |
-| generation or state ownership failure | Run every preparation and Compose command as the same selected non-root UID/GID; do not loosen permissions |
-| preflight failure | Keep the agent stopped and correct the reported configuration, credential, or mount condition |
-| agent remains unhealthy | Inspect bounded agent logs and confirm the selected generation, config hash, and state directory; do not delete state |
-| verifier rejects the generation | Confirm the running container was force-created with the selected generation rather than restarted |
+- The scratch image has no shell, `curl`, or `asterctl`.
+- Application and health listeners are container-loopback-only.
+- The canonical model does not publish mesh UDP 8183 to the host.
+- Separate projects use separate networks.
 
-### Configure two Compose agents
+Therefore this profile has no supported interactive Event/Blob or multi-project
+transfer example. Those require a separately reviewed client and network
+integration. Local health and generation verification do not prove transfer.
 
-Create two completely separate deployment roots, project names, state
-directories, credential generations, and configuration files. The peer entries
-use the same identity form as Debian. Agent A names Agent B:
+### Rotate or stop
 
-```json
-"peers": [
-  "<NODE_B_CARRIER_ID>@<NODE_B_REACHABLE_IP>:8183=<NODE_B_MISSION_ID>"
-]
-```
-
-Agent B names Agent A:
-
-```json
-"peers": [
-  "<NODE_A_CARRIER_ID>@<NODE_A_REACHABLE_IP>:8183=<NODE_A_MISSION_ID>"
-]
-```
-
-For Blob receipt, add an exact authorized selector to the receiving agent, for
-example:
-
-```json
-"blob_interests": [
-  "imagery.maps@mission/team/alpha"
-]
-```
-
-The canonical Compose profile does not publish UDP 8183 to the host and gives
-each project its own project network. Therefore these paired configuration
-fragments are not, by themselves, a runnable two-host or two-project mesh. A
-site needs a separately reviewed network design and corresponding validated
-Compose model before either address is reachable. Do not interpret successful
-local health or generation verification as a two-node transfer result.
-
-### Understand the current application-use boundary
-
-The scratch runtime image contains no shell, `curl`, or `asterctl`. The
-application and health listeners bind to container loopback and the canonical
-model publishes neither listener to the host. Consequently, the Debian
-`asterctl` Event and Blob commands cannot be run against this Compose profile.
-
-`docker compose run verify` is the only packaged authenticated API consumer;
-it checks generation identity and status, not Event or Blob operations. Actual
-application use requires a separately reviewed client sidecar or application
-inside the same protected network namespace. The repository does not currently
-ship that integration, so this guide does not claim an end-to-end Compose data
-transfer example.
-
-### Rotate, stop, and remove containers
-
-For token or mission-credential rotation, create a new immutable generation,
-select it in `ASTER_CREDENTIAL_GENERATION_DIR`, update the reviewed
-configuration hash if configuration changed, and repeat validation, rendered
-model inspection, preflight, force-create, and verification. Do not use
-`docker compose restart`; it does not apply a changed generation:
+For rotation, create and select a new generation, repeat validation and
+preflight, then force-create and verify. Do not use `docker compose restart`.
 
 ```sh
-docker compose -f "$ASTER_COMPOSE_FILE" run --rm preflight
 docker compose -f "$ASTER_COMPOSE_FILE" \
   up -d --force-recreate aster-agent
 docker compose -f "$ASTER_COMPOSE_FILE" run --rm verify
 ```
 
-Stop the agent gracefully or remove only this project's containers and network:
+Stop or remove this project's containers and network:
 
 ```sh
 docker compose -f "$ASTER_COMPOSE_FILE" stop -t 40 aster-agent
 docker compose -f "$ASTER_COMPOSE_FILE" down
 ```
 
-`down` preserves the host state directory and credential generations. Follow
-the complete Compose procedure for authorized backup, restore, retention, and
-logical destruction. Never delete state to clear an error or include live
-state in a backup without first stopping the agent.
+`down` preserves host state and credential generations. Use the
+[complete Compose procedure](release/docker-compose.md) for backup, restore,
+retention, and authorized cleanup.
 
-## Operate the Debian systemd service
+## 4. Routine operations
 
-### Stop or restart
+### Debian service
 
 ```sh
-sudo systemctl stop aster-agent.service
+sudo systemctl status aster-agent.service
 sudo systemctl restart aster-agent.service
+sudo systemctl stop aster-agent.service
 ```
 
-A graceful stop first removes readiness and drains bounded accepted work.
-Do not delete the state directory to clear an error or reclaim capacity; doing
-so destroys durability and restart claims.
+For token rotation and protected backup/recovery, follow the
+[provider operations runbook](mvp/raspberry-pi-provider-v2-operations.md).
+Configuration and mission changes require a restart.
 
-### Rotate only the application token
-
-Create the replacement beside the active file, publish it with an atomic
-same-directory rename, then reload:
+### Check CLI syntax
 
 ```sh
-umask 077
-ASTER_TOKEN_STAGE="$(sudo mktemp \
-  /etc/aster/agent-credentials/.client-token.XXXXXX)"
-openssl rand -hex 32 | sudo tee "$ASTER_TOKEN_STAGE" >/dev/null
-sudo chown aster:aster "$ASTER_TOKEN_STAGE"
-sudo chmod 0600 "$ASTER_TOKEN_STAGE"
-sudo sync -f "$ASTER_TOKEN_STAGE"
-sudo mv -T "$ASTER_TOKEN_STAGE" \
-  /etc/aster/agent-credentials/client-token
-sudo sync -f /etc/aster/agent-credentials
-unset ASTER_TOKEN_STAGE
-sudo systemctl reload aster-agent.service
+asterctl --help
+asterctl COMMAND --help
 ```
 
-Confirm the new token works and the prior token no longer works. A failed
-reload retains the old token and Ready state. Mission credentials, peers,
-emission mode, depot limits, and Blob interests require a restart and their
-own approved procedures.
+The Debian package also installs command-specific man pages, such as
+`man asterctl-blob-publish`.
 
-### Back up and recover
+## 5. Troubleshooting
 
-Back up durable state and provider material only into the site's approved
-encrypted custody. Stop the service first and follow the
-[provider backup and recovery procedure](mvp/raspberry-pi-provider-v2-operations.md#5-back-up-and-recover-the-exact-current-generation).
-Copying only `/var/lib/aster-agent`, only the mission reference, or only the
-encrypted provider file is not a complete recoverable node.
-
-## Troubleshooting
-
-| Observation | Meaning and action |
+| Symptom | Action |
 | --- | --- |
-| `--check-config` fails | Correct the named sanitized rule category. Check JSON shape, absolute paths, ownership, permissions, operation ID, peers, Blob interests, and depot limits. Do not loosen file permissions. |
-| `/livez` is unavailable or `503` | The service is absent or failed. Keep application traffic stopped and inspect `systemctl status aster-agent.service` and approved sanitized telemetry. |
-| `/readyz` is `503` | The node is starting, draining, or failed. Wait for Ready or correct startup/provisioning failure. Peer absence alone does not make an offline-first node unready. |
-| `asterctl` reports authentication failure | Use the token file configured for this node, check owner/mode, and confirm a token rotation did not replace it. Do not print the token. |
-| Publication outcome is unknown | Retry the identical request on the same node with the same operation key. Do not create a new key. |
-| Event is present on Node A but absent on Node B | Check both nodes' status, reciprocal peer coordinates, mission authorization, network reachability, emission mode, expiry, and contact results. Publication on A proves only A's local commit. |
-| Blob is absent on Node B | In addition to peer and authorization checks, confirm Node B has the exact `TOPIC@SCOPE` Blob interest, normal emission mode, and available byte/chunk/variant depot capacity, then restart after configuration changes. |
-| `blob-read` rejects the destination | Use Linux and a destination filesystem supporting anonymous temporary files and descriptor-relative linking. Choose a path that does not already exist. |
-| `OPERATION_CAPACITY_EXHAUSTED` | Stop new publication. Preserve the state directory and existing operation keys; do not retry with new keys or raise limits during the evaluation. |
-| Pending deliveries reach the documented boundary | Stop increasing workload and repair or drain the consuming application. Creating a subscription without consuming and acknowledging it can add pressure. |
+| Configuration validation fails | Correct the reported JSON, path, owner, mode, peer, interest, or capacity rule; do not loosen permissions |
+| `/livez` fails | Inspect `systemctl status aster-agent.service` and sanitized logs |
+| `/readyz` returns `503` | Wait for startup or correct credential/configuration failure; peer absence alone does not make an offline node unready |
+| `asterctl` authentication fails | Confirm the configured token file, ownership, mode, and latest rotation |
+| Publication result is unknown | Retry the identical request on the same node with the same operation key |
+| Event is absent on Node B | Check readiness, reciprocal peers, mission authorization, UDP reachability, emission mode, expiry, and authenticated contact |
+| Blob is absent on Node B | Also check the exact Blob interest and depot byte/chunk/variant capacity |
+| `blob-read` rejects output | Use Linux and a new destination path on a filesystem supporting the required atomic operation |
+| Compose preflight fails | Keep the agent stopped and correct the reported config, credential, ownership, or mount condition |
+| Compose verifier rejects generation | Force-create the agent with the selected generation; do not restart it |
+| Operation capacity is exhausted | Stop new publication and preserve state and operation keys; do not retry with new keys |
 
-For exact configuration fields and limits, see the
-[schema-v1 reference](reference/aster-agent-config-v1.md). For complete CLI
-syntax, run `asterctl --help`, `asterctl COMMAND --help`, or read the packaged
-man pages such as `man asterctl-blob-publish`.
+## 6. What checks prove
 
-## What successful checks do and do not prove
-
-| Check | It proves | It does not prove |
+| Check | Proves | Does not prove |
 | --- | --- | --- |
-| Configuration validation | The document and referenced files satisfy static rules | Mission provider loading or runtime readiness |
-| `/readyz` returns `200` | Local durable authority and application listener accept work | Peer connectivity or convergence |
-| `asterctl publish` succeeds | The local node durably committed the Event | Any peer received it |
-| Authenticated contact counter increases | A mission-authenticated contact occurred | A particular Event or Blob was stored remotely |
-| Query on Node B finds the Event | Node B's application view contains that Event | Every eligible node converged |
-| Blob read on Node B succeeds | Node B returned a complete authenticated Blob matching the requested identity and metadata | Production transfer performance or arbitrary-peer recovery |
+| Static config validation | Document and referenced files satisfy static rules | Credential loading or runtime readiness |
+| `/readyz` succeeds | Local durable authority and API accept work | Peer connectivity or convergence |
+| Local publish succeeds | The local node committed the object | A peer received it |
+| Authenticated contact increases | A mission-authenticated contact occurred | A specific Event or Blob transferred |
+| Node B query finds an Event | Node B stored that Event | Every eligible node converged |
+| Node B reads and hashes a Blob | Node B returned the requested complete Blob | Production performance or arbitrary-peer recovery |
+| Compose verifier passes | Running agent uses the selected credential generation | Data transfer or host qualification |
 
-Retain exact receipts, timestamps, package hashes, configuration hashes, and
-the devices involved when a result will be used as evaluation evidence.
+Retain exact receipts, timestamps, artifact and configuration hashes, and the
+devices involved when a result will be used as evaluation evidence.
