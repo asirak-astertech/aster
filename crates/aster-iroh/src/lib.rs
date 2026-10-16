@@ -5401,4 +5401,93 @@ mod tests {
             }
         ));
     }
+
+    /// Measurement-only ceiling for the profile-5 long-lived data/control shape.
+    #[tokio::test]
+    #[ignore = "explicit 1 GiB loopback performance measurement"]
+    async fn concurrent_stream_ceiling_transfers_one_gib_with_reverse_checkpoints() {
+        const TOTAL: u64 = 1 << 30;
+        const EXTENT: usize = 1 << 20;
+        const CHECKPOINT: u64 = 8 << 20;
+
+        let (server, client, receiver, sender) = direct_connection_pair().await;
+        let receiver_inner = receiver.inner.clone();
+        let receive_task = tokio::spawn(async move {
+            let mut data = receiver_inner
+                .accept_uni()
+                .await
+                .expect("accept data stream");
+            let mut control = receiver_inner
+                .open_uni()
+                .await
+                .expect("open control stream");
+            let mut buffer = vec![0u8; EXTENT];
+            let mut received = 0u64;
+            let mut next_checkpoint = CHECKPOINT;
+            while received < TOTAL {
+                let count = data
+                    .read(&mut buffer)
+                    .await
+                    .expect("read data stream")
+                    .expect("data EOF after declared length");
+                received += u64::try_from(count).expect("read count fits u64");
+                if received >= next_checkpoint || received == TOTAL {
+                    control
+                        .write_all(&received.to_be_bytes())
+                        .await
+                        .expect("write checkpoint");
+                    next_checkpoint = received.saturating_add(CHECKPOINT);
+                }
+            }
+            assert_eq!(data.read(&mut buffer).await.expect("read EOF"), None);
+            control.finish().expect("finish control stream");
+            received
+        });
+
+        let started = std::time::Instant::now();
+        let mut data = sender.inner.open_uni().await.expect("open data stream");
+        let sender_inner = sender.inner.clone();
+        let checkpoint_task = tokio::spawn(async move {
+            let mut control = sender_inner
+                .accept_uni()
+                .await
+                .expect("accept control stream");
+            let mut buffer = [0u8; 8];
+            let mut observed = 0u64;
+            loop {
+                let mut filled = 0;
+                while filled < buffer.len() {
+                    match control
+                        .read(&mut buffer[filled..])
+                        .await
+                        .expect("read checkpoint")
+                    {
+                        Some(count) => filled += count,
+                        None if filled == 0 => return observed,
+                        None => panic!("checkpoint record was truncated"),
+                    }
+                }
+                observed = u64::from_be_bytes(buffer);
+            }
+        });
+        let extent = vec![0xa5; EXTENT];
+        for _ in 0..TOTAL / EXTENT as u64 {
+            data.write_all(&extent).await.expect("write extent");
+        }
+        data.finish().expect("finish data stream");
+        let received = receive_task.await.expect("receive task");
+        let checkpoint = checkpoint_task.await.expect("checkpoint task");
+        let elapsed = started.elapsed();
+        assert_eq!(received, TOTAL);
+        assert_eq!(checkpoint, TOTAL);
+        let mib_per_second = TOTAL as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64();
+        eprintln!(
+            "stream_ceiling bytes={TOTAL} elapsed_ns={} mib_per_second={mib_per_second:.3}",
+            elapsed.as_nanos()
+        );
+
+        sender.close();
+        client.close().await;
+        server.close().await;
+    }
 }
