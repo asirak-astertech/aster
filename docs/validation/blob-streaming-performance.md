@@ -82,6 +82,11 @@ failover while Iroh is the only production adapter. These counters make the
 same quantities observable during the eventual three-CM4 procedure without
 placing transport details in the public Blob application API.
 
+A post-instrumentation 256-MiB release rerun completed in 23.721 seconds
+(10.79 MiB/s), within one percent of the preceding 23.514-second run. The
+bounded per-checkpoint observations therefore showed no material loopback
+throughput regression in this fixture.
+
 ```text
 ASTER_TEST_BLOB_STREAM_MIB=256 cargo test --release --locked -p aster-node live_blob_stream_v9_completes_retained_sixteen_mib_shape_in_one_contact --lib -- --nocapture
 ```
