@@ -32,6 +32,9 @@ No Docker host profile is qualified. Rootless Docker, Docker Desktop, remote
 contexts, user namespace remapping, and other host variants are unqualified;
 there is no runtime harness that automatically accepts or rejects them. Docker
 Swarm is excluded. See the complete [manual operator procedure](../../docs/release/docker-compose.md).
+The CI artifact includes this Compose model, its remote-mesh override,
+configuration template, and daemon-free validator; operator use requires no
+source checkout or local image build.
 
 ## Example image build commands
 
@@ -107,6 +110,9 @@ docker compose -f docker/compose-agent/compose.yaml \
 Configure the remote peer with that host address and published UDP port, and
 permit the port in applicable host firewall policy. Omitting the override
 keeps the default deployment closed to inbound host traffic.
+
+For copyable status, Event, durable Blob, finite-TTL Blob, agent-replacement,
+and physical-peer commands, use the [operator runbook](../../docs/operator-guide.md#3-docker-compose-runbook).
 
 Credential rotation always uses `up -d --force-recreate`. `docker compose
 restart` is not a supported rotation operation because it does not apply a new

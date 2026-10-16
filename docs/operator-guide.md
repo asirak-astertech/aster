@@ -1,9 +1,8 @@
 # Aster operator runbook
 
 Use this runbook to install and operate Aster without building software or
-writing an application. The Debian package is the complete interactive path.
-The Docker Compose profile supports deployment and health verification but not
-interactive Event or Blob commands.
+writing an application. Both packaged paths include `asterctl` for Event and
+Blob operations.
 
 > [!IMPORTANT]
 > Aster is an evaluation-stage reference implementation, not a
@@ -17,7 +16,7 @@ interactive Event or Blob commands.
 | Option | Use it when | What works |
 | --- | --- | --- |
 | Ubuntu 24.04 `.deb` | A human operator needs a local CLI | systemd service, health checks, `asterctl`, Event and Blob examples |
-| Docker Compose | The site uses Docker and immutable file-backed credential generations | preflight, agent startup, health, authenticated generation verification |
+| Docker Compose | The site uses Docker and immutable file-backed credential generations | preflight, agent startup, verification, `asterctl`, Event and Blob examples |
 | Source checkout | A developer needs to change or integrate Aster | Use the [quickstarts](quickstart/README.md), not this runbook |
 
 Neither packaged path is a production release. Use a reviewed artifact for the
@@ -352,10 +351,12 @@ export ASTER_AGENT_IMAGE_DIGEST='sha256:<verified-agent-image-id>'
 export ASTER_ADMIN_IMAGE_DIGEST='sha256:<verified-admin-image-id>'
 export ASTER_ARTIFACT_DIR='/absolute/path/to/verified-compose-artifact'
 export ASTER_COMPOSE_FILE="$ASTER_ARTIFACT_DIR/compose.yaml"
+export ASTER_REMOTE_MESH_FILE="$ASTER_ARTIFACT_DIR/compose.remote-mesh.yaml"
+export ASTER_VALIDATOR="$ASTER_ARTIFACT_DIR/aster_compose_delivery.py"
 ```
 
-The release artifact does not currently include the delivery validator. Keep a
-reviewed source tree at the same revision available for Step 4.
+These files and the `asterctl`-containing admin image come from the same
+checksummed CI artifact. No source checkout or local image build is used below.
 
 ### Step 2: prepare one deployment
 
@@ -369,11 +370,12 @@ export COMPOSE_PROJECT_NAME=aster-site-a
 export ASTER_DEPLOYMENT_ROOT="$(pwd -P)/$COMPOSE_PROJECT_NAME"
 export ASTER_GENERATION_PARENT="$ASTER_DEPLOYMENT_ROOT/credential-generations"
 export ASTER_STATE_DIR="$ASTER_DEPLOYMENT_ROOT/state"
+export ASTER_TRANSFER_DIR="$ASTER_DEPLOYMENT_ROOT/transfer"
 export ASTER_TOKEN_INPUT="$ASTER_DEPLOYMENT_ROOT/input/client-token"
 export ASTER_BUNDLE_INPUT="$ASTER_DEPLOYMENT_ROOT/input/mission.astpb03"
 
 install -d -m 0700 "$ASTER_DEPLOYMENT_ROOT" \
-  "$ASTER_GENERATION_PARENT" "$ASTER_STATE_DIR" \
+  "$ASTER_GENERATION_PARENT" "$ASTER_STATE_DIR" "$ASTER_TRANSFER_DIR" \
   "$ASTER_DEPLOYMENT_ROOT/input"
 umask 077
 openssl rand -hex 32 > "$ASTER_TOKEN_INPUT"
@@ -417,7 +419,6 @@ install -m 0644 "$ASTER_ARTIFACT_DIR/agent.example.json" \
   "$ASTER_AGENT_CONFIG_FILE"
 sha256sum "$ASTER_AGENT_CONFIG_FILE"
 export ASTER_AGENT_CONFIG_SHA256='<reviewed-64-lowercase-hex>'
-export ASTER_VALIDATOR='/reviewed/aster-source/tools/aster_compose_delivery.py'
 ```
 
 Keep the container state and credential paths from the template unchanged.
@@ -437,16 +438,112 @@ docker compose -f "$ASTER_COMPOSE_FILE" ps
 Proceed only when preflight passes, the agent is healthy, and the verifier
 prints `VERIFY status=pass`.
 
-### Current Compose limits
+### Step 5: run Event and Blob checks
 
-- The scratch image has no shell, `curl`, or `asterctl`.
+The bundle must authorize `chat.events@mission/team/alpha` and
+`imagery.maps@mission/team/alpha`. Publish and query an Event:
+
+```sh
+docker compose -f "$ASTER_COMPOSE_FILE" run --rm asterctl --json publish \
+  --topic chat.events --scope mission/team/alpha --priority routine \
+  --operation-key compose-event-001 "Compose operator check"
+docker compose -f "$ASTER_COMPOSE_FILE" run --rm asterctl --json query \
+  --topic chat.events --scope mission/team/alpha
+```
+
+Stage a nonempty file, publish it, and record the returned Blob ID:
+
+```sh
+install -m 0600 /secure/input/map.bin "$ASTER_TRANSFER_DIR/map.bin"
+docker compose -f "$ASTER_COMPOSE_FILE" run --rm asterctl \
+  --timeout 30 --json blob-publish --file /transfer/map.bin \
+  --topic imagery.maps --scope mission/team/alpha --priority routine \
+  --media-type application/octet-stream --operation-key compose-map-001
+```
+
+Read to a new output path and compare the files:
+
+```sh
+docker compose -f "$ASTER_COMPOSE_FILE" run --rm asterctl \
+  --timeout 30 --json blob-read --id '<BLOB_ID>' \
+  --topic imagery.maps --scope mission/team/alpha \
+  --output /transfer/received-map.bin
+sha256sum "$ASTER_TRANSFER_DIR/map.bin" \
+  "$ASTER_TRANSFER_DIR/received-map.bin"
+```
+
+Matching hashes prove byte equality. To check finite lifetime, publish another
+Blob with a unique operation key and `--ttl-ms 60000`, read it before expiry,
+then confirm a later read reports expiry rather than returning content.
+
+### Step 6: verify durable data after agent replacement
+
+```sh
+docker compose -f "$ASTER_COMPOSE_FILE" \
+  up -d --force-recreate aster-agent
+docker compose -f "$ASTER_COMPOSE_FILE" run --rm verify
+docker compose -f "$ASTER_COMPOSE_FILE" run --rm asterctl --json query \
+  --topic chat.events --scope mission/team/alpha
+docker compose -f "$ASTER_COMPOSE_FILE" run --rm asterctl \
+  --timeout 30 blob-read --id '<BLOB_ID>' \
+  --topic imagery.maps --scope mission/team/alpha \
+  --output /transfer/received-map-after-replace.bin
+sha256sum "$ASTER_TRANSFER_DIR/map.bin" \
+  "$ASTER_TRANSFER_DIR/received-map-after-replace.bin"
+```
+
+The query and matching hashes demonstrate local durable recovery for those
+objects; they do not prove peer transfer.
+
+### Step 7: connect this Docker node to a test device
+
+Keep the default deployment closed unless a remote peer is required. For a
+reviewed ZeroTier test, bind the mesh port only to this host's ZeroTier IPv4:
+
+```sh
+export ASTER_MESH_BIND_ADDRESS='<THIS_HOST_ZEROTIER_IPV4>'
+export ASTER_MESH_PUBLISHED_PORT=8183
+docker compose -f "$ASTER_COMPOSE_FILE" -f "$ASTER_REMOTE_MESH_FILE" \
+  config --format json > /tmp/aster-compose.remote.rendered.json
+docker compose -f "$ASTER_COMPOSE_FILE" -f "$ASTER_REMOTE_MESH_FILE" \
+  run --rm preflight
+docker compose -f "$ASTER_COMPOSE_FILE" -f "$ASTER_REMOTE_MESH_FILE" \
+  up -d --force-recreate aster-agent
+docker compose -f "$ASTER_COMPOSE_FILE" -f "$ASTER_REMOTE_MESH_FILE" \
+  run --rm verify
+```
+
+Configure reciprocal authenticated peers and the exact Blob interest. In the
+Docker node's `agent.json`:
+
+```json
+"peers": [
+  "<DEVICE_CARRIER_ID>@<DEVICE_ZEROTIER_IPV4>:8183=<DEVICE_MISSION_ID>"
+],
+"blob_interests": ["imagery.maps@mission/team/alpha"]
+```
+
+On the packaged test device:
+
+```json
+"peers": [
+  "<DOCKER_CARRIER_ID>@<THIS_HOST_ZEROTIER_IPV4>:8183=<DOCKER_MISSION_ID>"
+],
+"blob_interests": ["imagery.maps@mission/team/alpha"]
+```
+
+Restart the packaged device after its configuration change and permit UDP 8183
+in applicable host policy. Use Step 5 above on Docker and Debian Steps 7–8 on
+the device to publish, query, and read in both directions. A peer-side query
+and matching Blob hashes—not contact counters alone—prove transfer.
+
+### Compose boundaries
+
 - Application and health listeners are container-loopback-only.
-- The canonical model does not publish mesh UDP 8183 to the host.
-- Separate projects use separate networks.
-
-Therefore this profile has no supported interactive Event/Blob or multi-project
-transfer example. Those require a separately reviewed client and network
-integration. Local health and generation verification do not prove transfer.
+- The default file publishes no host port; remote mesh exposure is opt-in.
+- `asterctl` receives only the client token and `/transfer`, not agent state or
+  mission provisioning credentials.
+- Separate projects remain separate one-agent deployments.
 
 ### Rotate or stop
 

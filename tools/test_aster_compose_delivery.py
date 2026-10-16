@@ -675,6 +675,51 @@ class ScopeReductionTests(DeliveryTestCase):
 
 
 class RepositoryPolicyTests(unittest.TestCase):
+    def test_operator_runbook_has_artifact_only_compose_cli_examples(self):
+        runbook = (REPOSITORY / "docs/operator-guide.md").read_text()
+        required = (
+            "compose.yaml",
+            "compose.remote-mesh.yaml",
+            "ASTER_TRANSFER_DIR",
+            "aster_compose_delivery.py",
+            "ASTER_ADMIN_IMAGE_DIGEST",
+            'docker compose -f "$ASTER_COMPOSE_FILE" run --rm asterctl',
+            " publish ",
+            " query ",
+            "blob-publish",
+            "blob-read",
+            "--ttl-ms",
+            "sha256sum",
+            "up -d --force-recreate aster-agent",
+        )
+        for value in required:
+            with self.subTest(value=value):
+                self.assertIn(value, runbook)
+        self.assertNotIn(
+            "no supported interactive Event/Blob",
+            runbook,
+        )
+        self.assertNotIn(
+            "The scratch image has no shell, `curl`, or `asterctl`.",
+            runbook,
+        )
+
+    def test_release_artifact_includes_the_daemon_free_validator(self):
+        workflow = (REPOSITORY / ".github/workflows/build-compose-images.yml").read_text()
+        self.assertIn(
+            "cp tools/aster_compose_delivery.py "
+            "target/compose-release/aster_compose_delivery.py",
+            workflow,
+        )
+        self.assertIn(
+            'validator:{file:"aster_compose_delivery.py",sha256:$validator_sha256}',
+            workflow,
+        )
+        self.assertIn(
+            "target/compose-release/aster_compose_delivery.py",
+            workflow,
+        )
+
     def test_release_artifact_records_remote_mesh_override_digest(self):
         workflow = (REPOSITORY / ".github/workflows/build-compose-images.yml").read_text()
         self.assertIn(
@@ -840,6 +885,8 @@ class RepositoryPolicyTests(unittest.TestCase):
         self.assertEqual(workflow.count("--result-file"), 2)
         self.assertEqual(workflow.count("compose.remote-mesh.yaml"), 6)
         self.assertEqual(workflow.count("remote_mesh_sha256"), 3)
+        self.assertEqual(workflow.count("aster_compose_delivery.py"), 6)
+        self.assertEqual(workflow.count("validator_sha256"), 3)
         self.assertIn("aster-compose-image-release/v2", workflow)
         self.assertIn("docker_image_id", workflow)
         self.assertLess(
