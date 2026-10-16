@@ -226,6 +226,17 @@ sudo systemctl enable aster-agent.service
 
 The bundle must authorize `chat.events@mission/team/alpha`.
 
+Before publication, create the durable subscription on receiving Node B. Allow
+at least one successful authenticated contact after creating it so the route is
+available to Node A:
+
+```sh
+sudo -u aster /usr/bin/asterctl \
+  --token-file /etc/aster/agent-credentials/client-token \
+  subscribe --scope mission/team/alpha \
+  --operation-key operator-chat-reader-001 chat.events
+```
+
 Publish on Node A:
 
 ```sh
@@ -316,7 +327,7 @@ sha256sum /run/aster-operator/received-map.bin
 Matching hashes prove equality of those two files. Remove staging files under
 site policy after moving required output into approved custody.
 
-### Optional: manage Event subscriptions
+### Manage additional Event subscriptions
 
 ```sh
 sudo -u aster /usr/bin/asterctl \
@@ -332,8 +343,10 @@ sudo -u aster /usr/bin/asterctl \
   unsubscribe '<SUBSCRIPTION_ID>'
 ```
 
-The CLI manages subscriptions but does not poll or acknowledge deliveries. An
-application client is required for the at-least-once delivery workflow.
+Cross-node Event transfer requires a matching durable subscription on the
+receiver before publication. The CLI manages subscriptions but does not poll or
+acknowledge deliveries. An application client is required for the at-least-once
+delivery workflow.
 
 ## 3. Docker Compose runbook
 
@@ -448,7 +461,10 @@ prints `VERIFY status=pass`.
 ### Step 5: run Event and Blob checks
 
 The bundle must authorize `chat.events@mission/team/alpha` and
-`imagery.maps@mission/team/alpha`. Publish and query an Event:
+`imagery.maps@mission/team/alpha`. A local publish/query needs no subscription;
+for a peer-transfer check, create the matching subscription on the receiving
+node before publication and allow authenticated contact after creation. Publish
+and query an Event:
 
 ```sh
 docker compose -f "$ASTER_COMPOSE_FILE" run --rm asterctl --json publish \
@@ -608,9 +624,9 @@ The Debian package also installs command-specific man pages, such as
 | `/readyz` returns `503` | Wait for startup or correct credential/configuration failure; peer absence alone does not make an offline node unready |
 | `asterctl` authentication fails | Confirm the configured token file, ownership, mode, and latest rotation |
 | Publication result is unknown | Retry the identical request on the same node with the same operation key |
-| Event is absent on Node B | Check readiness, reciprocal peers, mission authorization, UDP reachability, emission mode, expiry, and authenticated contact |
+| Event is absent on Node B | Confirm Node B created the matching subscription before publication, then check readiness, reciprocal peers, mission authorization, UDP reachability, emission mode, expiry, and authenticated contact |
 | Blob is absent on Node B | Also check the exact Blob interest and depot byte/chunk/variant capacity |
-| `blob-read` rejects output | Use Linux and a new destination path on a filesystem supporting the required atomic operation |
+| `blob-read` rejects output | Use Linux and a new path in a current-user-owned directory that is not group/other-writable and supports named staging, atomic no-replace rename, and directory synchronization; if it reports post-publication sync failure, verify the destination before retrying |
 | Compose preflight fails | Keep the agent stopped and correct the reported config, credential, ownership, or mount condition |
 | Compose verifier rejects generation | Force-create the agent with the selected generation; do not restart it |
 | Operation capacity is exhausted | Stop new publication and preserve state and operation keys; do not retry with new keys |
