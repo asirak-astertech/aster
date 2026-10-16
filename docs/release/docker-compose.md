@@ -138,8 +138,9 @@ set, which includes `asterctl`. Each
 SBOM retains its binary component identity, carries the corresponding OCI
 digest as an explicit property, passes schema and root/dependency license
 checks, and is listed in the release manifest. The bundle also retains
-`LICENSE`, notices, `compose.yaml`, the `agent.example.json` configuration
-template, their digests, architecture, source revision, builder versions,
+`LICENSE`, notices, `compose.yaml`, the opt-in `compose.remote-mesh.yaml`, the
+`agent.example.json` configuration template, their digests, architecture,
+source revision, builder versions,
 checksums, and build provenance. A repository-owned bounded static
 inspector selects the requested Linux `amd64` or Linux `arm64` image manifest
 instead of provenance attestations, checks the config and exact scratch
@@ -277,6 +278,28 @@ The `asterctl` service uses the same admin image, shares the agent network
 namespace, and receives only the selected client token plus the operator-owned
 transfer directory. Arguments after the service name replace its default
 `status` command while retaining the fixed token-file entrypoint.
+
+## Opt in to remote mesh traffic
+
+The default Compose file publishes no host port. For a reviewed physical-peer
+test, bind UDP 8183 only to the intended host IPv4 interface and add the shipped
+override to all lifecycle commands:
+
+```sh
+export ASTER_MESH_BIND_ADDRESS='<reviewed-host-ipv4>'
+export ASTER_MESH_PUBLISHED_PORT=8183
+docker compose -f compose.yaml -f compose.remote-mesh.yaml config --format json
+docker compose -f compose.yaml -f compose.remote-mesh.yaml run --rm preflight
+docker compose -f compose.yaml -f compose.remote-mesh.yaml \
+  up -d --force-recreate aster-agent
+docker compose -f compose.yaml -f compose.remote-mesh.yaml run --rm verify
+```
+
+The bind address is required and the published port must be in `1..65535`.
+Configure the other Aster node with the host address and published UDP port,
+and permit that UDP port in applicable host firewall policy. The override does
+not make ZeroTier or any other carrier trusted; Aster authentication remains
+required.
 
 ## Rotate, roll back, and retain
 

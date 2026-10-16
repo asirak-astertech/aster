@@ -9,6 +9,7 @@ import argparse
 import copy
 from dataclasses import dataclass
 import hashlib
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -30,7 +31,7 @@ MAX_COMPOSE_BYTES = 256 * 1024
 MAX_CONFIG_BYTES = 256 * 1024
 MAX_MANIFEST_BYTES = 64 * 1024
 COMPOSE_BUILD_WORKFLOW_SHA256 = (
-    "7431b9cd1ad80b7089a52271ea3bd91b3e1e6367098f4d8137592c012dd0e5d5"
+    "7fa447bdbbcb5fcad220af3d33b4fead6371528136cf90784ee26ab36ec601e9"
 )
 SETUP_BUILDX_ACTION = (
     "docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069"
@@ -230,6 +231,8 @@ def validate_workflow_policy(workflow: str, ci: str) -> None:
         "tar -xOf",
         "release-manifest.json",
         "SHA256SUMS",
+        "compose.remote-mesh.yaml",
+        "remote_mesh_override",
         "agent.example.json",
         "credential-canary-scan",
         "python3 tools/inspect_aster_compose_oci.py",
@@ -276,6 +279,11 @@ def validate_workflow_policy(workflow: str, ci: str) -> None:
     ):
         raise ValidationError("compose-delivery-policy-invalid")
     if workflow.count("release-manifest.json") != 6 or workflow.count("SHA256SUMS") != 3:
+        raise ValidationError("compose-delivery-policy-invalid")
+    if (
+        workflow.count("compose.remote-mesh.yaml") != 6
+        or workflow.count("remote_mesh_sha256") != 3
+    ):
         raise ValidationError("compose-delivery-policy-invalid")
     if workflow.count("agent.example.json") != 5:
         raise ValidationError("compose-delivery-policy-invalid")
@@ -350,6 +358,10 @@ def validate_repository_policy(repository: Path) -> None:
     validate_runtime_dockerfiles(
         (repository / "docker/compose-agent/Dockerfile.agent").read_text(),
         (repository / "docker/compose-agent/Dockerfile.admin").read_text(),
+    )
+    validate_remote_mesh_override(
+        repository / "docker/compose-agent/compose.remote-mesh.yaml",
+        {"ASTER_MESH_BIND_ADDRESS": "127.0.0.1"},
     )
 
 
@@ -569,6 +581,45 @@ def _load_compose_model(raw: bytes) -> dict[str, Any]:
     if model != _expected_compose_model():
         raise ValidationError("compose-model-semantics-invalid")
     return model
+
+
+def validate_remote_mesh_override(
+    override_path: Path, environment: Mapping[str, str]
+) -> None:
+    """Validate the exact opt-in host exposure and its explicit bind inputs."""
+
+    expected = {
+        "services": {
+            "aster-agent": {
+                "ports": [
+                    "${ASTER_MESH_BIND_ADDRESS:?required}:"
+                    "${ASTER_MESH_PUBLISHED_PORT:-8183}:8183/udp"
+                ]
+            }
+        }
+    }
+    try:
+        raw = override_path.resolve(strict=True).read_bytes()
+    except OSError as error:
+        raise ValidationError("mesh-override-unavailable") from error
+    if len(raw) > MAX_COMPOSE_BYTES:
+        raise ValidationError("mesh-override-noncanonical")
+    model = _strict_json(raw, "mesh-override-noncanonical")
+    if raw != _canonical_json(model) or model != expected:
+        raise ValidationError("mesh-override-noncanonical")
+
+    bind_address = environment.get("ASTER_MESH_BIND_ADDRESS", "")
+    if not bind_address:
+        raise ValidationError("mesh-bind-address-required")
+    try:
+        ipaddress.IPv4Address(bind_address)
+    except ipaddress.AddressValueError as error:
+        raise ValidationError("mesh-bind-address-invalid") from error
+    published_port = environment.get("ASTER_MESH_PUBLISHED_PORT", "8183")
+    if not re.fullmatch(r"[0-9]+", published_port):
+        raise ValidationError("mesh-published-port-invalid")
+    if not 1 <= int(published_port) <= 65535:
+        raise ValidationError("mesh-published-port-invalid")
 
 
 def _parse_identity(value: str | None) -> int:
