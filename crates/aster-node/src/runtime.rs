@@ -3141,6 +3141,13 @@ impl LiveEmissionPolicy {
     }
 }
 
+/// Stable profile-5 transport identifier for operator contact metrics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u16)]
+pub enum BlobStreamTransport {
+    IrohQuicV1 = 1,
+}
+
 /// Metrics for one completed contact from this local node's point of view.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PeerReceipt {
@@ -3196,6 +3203,24 @@ pub struct PeerReceipt {
     pub blob_remaining: usize,
     /// Blob range attempts deferred by a typed durable capacity boundary.
     pub blob_deferred: usize,
+    /// Profile-5 attempts completed during this contact.
+    pub blob_stream_attempts: u16,
+    /// Stable selected profile-5 adapter, absent when no stream attempt ran.
+    pub blob_stream_transport: Option<BlobStreamTransport>,
+    /// Authenticated profile-5 data bytes observed by this receiver.
+    pub blob_stream_received_bytes: u64,
+    /// Bytes resent before a durable checkpoint during this contact.
+    pub blob_stream_retransmitted_bytes: u64,
+    /// Greatest absolute receive limit advertised during this contact.
+    pub blob_stream_receive_limit_bytes: u64,
+    /// Greatest Store-confirmed cumulative profile-5 checkpoint.
+    pub blob_stream_checkpoint_bytes: u64,
+    /// Greatest observed Store checkpoint commit latency.
+    pub blob_stream_checkpoint_latency_ms: u64,
+    /// Durable profile-5 writer commits completed during this contact.
+    pub blob_stream_writer_commits: u32,
+    /// Attempts that resumed through a different eligible adapter.
+    pub blob_stream_failover_recoveries: u16,
     /// Mission-control transfers offered from local durable state.
     pub controls_offered: usize,
     /// Mission-control transfers fetched from the remote durable state.
@@ -3248,6 +3273,70 @@ pub struct PeerReceipt {
     pub bridge_delivered: usize,
     /// Locally selected bridge routes deferred by the per-direction contact bound.
     pub bridge_remaining: usize,
+}
+
+impl PeerReceipt {
+    fn account_blob_stream_attempt(
+        &mut self,
+        attempt: blob_stream::BlobStreamAttemptOutcome,
+    ) -> Result<(), NodeError> {
+        let metrics = attempt.metrics;
+        let attempts = self
+            .blob_stream_attempts
+            .checked_add(1)
+            .ok_or_else(|| NodeError::Protocol("Blob stream attempt count overflow".into()))?;
+        let transport = match self.blob_stream_transport {
+            Some(existing) if existing != metrics.transport => {
+                return Err(NodeError::Protocol(
+                    "Blob stream contact used multiple transport identifiers".into(),
+                ));
+            }
+            Some(existing) => Some(existing),
+            None => Some(metrics.transport),
+        };
+        let received_bytes = self
+            .blob_stream_received_bytes
+            .checked_add(metrics.received_bytes)
+            .ok_or_else(|| {
+                NodeError::Protocol("Blob stream received byte count overflow".into())
+            })?;
+        let retransmitted_bytes = self
+            .blob_stream_retransmitted_bytes
+            .checked_add(metrics.retransmitted_bytes)
+            .ok_or_else(|| {
+                NodeError::Protocol("Blob stream retransmitted byte count overflow".into())
+            })?;
+        let receive_limit_bytes = self
+            .blob_stream_receive_limit_bytes
+            .max(metrics.receive_limit_bytes);
+        let checkpoint_bytes = self
+            .blob_stream_checkpoint_bytes
+            .max(metrics.checkpoint_bytes);
+        let checkpoint_latency_ms = self
+            .blob_stream_checkpoint_latency_ms
+            .max(metrics.checkpoint_latency_ms);
+        let writer_commits = self
+            .blob_stream_writer_commits
+            .checked_add(metrics.writer_commits)
+            .ok_or_else(|| {
+                NodeError::Protocol("Blob stream writer commit count overflow".into())
+            })?;
+        let failover_recoveries = self
+            .blob_stream_failover_recoveries
+            .checked_add(metrics.failover_recoveries)
+            .ok_or_else(|| NodeError::Protocol("Blob stream failover count overflow".into()))?;
+
+        self.blob_stream_attempts = attempts;
+        self.blob_stream_transport = transport;
+        self.blob_stream_received_bytes = received_bytes;
+        self.blob_stream_retransmitted_bytes = retransmitted_bytes;
+        self.blob_stream_receive_limit_bytes = receive_limit_bytes;
+        self.blob_stream_checkpoint_bytes = checkpoint_bytes;
+        self.blob_stream_checkpoint_latency_ms = checkpoint_latency_ms;
+        self.blob_stream_writer_commits = writer_commits;
+        self.blob_stream_failover_recoveries = failover_recoveries;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3360,6 +3449,22 @@ pub struct NodeReceipt {
     pub blob_remaining: u64,
     /// Blob range attempts deferred by durable capacity.
     pub blob_deferred: u64,
+    /// Completed profile-5 attempts across successful contacts.
+    pub blob_stream_attempts: u64,
+    /// Authenticated profile-5 bytes received across successful contacts.
+    pub blob_stream_received_bytes: u64,
+    /// Profile-5 bytes retransmitted across successful contacts.
+    pub blob_stream_retransmitted_bytes: u64,
+    /// Greatest absolute profile-5 receive limit observed.
+    pub blob_stream_receive_limit_bytes: u64,
+    /// Greatest cumulative durable profile-5 checkpoint observed.
+    pub blob_stream_checkpoint_bytes: u64,
+    /// Greatest profile-5 checkpoint commit latency observed.
+    pub blob_stream_checkpoint_latency_ms: u64,
+    /// Durable profile-5 writer commits across successful contacts.
+    pub blob_stream_writer_commits: u64,
+    /// Cross-transport profile-5 recovery attempts across successful contacts.
+    pub blob_stream_failover_recoveries: u64,
     /// Final application-visible Blob publication count.
     pub blobs: u64,
     /// Final paired Blob acceptance marker count.
@@ -3562,34 +3667,79 @@ fn account_data_receipt(total: &mut NodeReceipt, contact: &PeerReceipt) -> Resul
 }
 
 fn account_blob_receipt(total: &mut NodeReceipt, contact: &PeerReceipt) -> Result<(), NodeError> {
-    total.blob_ranges_fetched = total
+    let blob_ranges_fetched = total
         .blob_ranges_fetched
         .checked_add(
             u64::try_from(contact.blob_ranges_fetched)
                 .map_err(|_| NodeError::Protocol("contact Blob range count exceeds u64".into()))?,
         )
         .ok_or_else(|| NodeError::Protocol("aggregate Blob range count overflow".into()))?;
-    total.blob_bytes_fetched = total
+    let blob_bytes_fetched = total
         .blob_bytes_fetched
         .checked_add(
             u64::try_from(contact.blob_bytes_fetched)
                 .map_err(|_| NodeError::Protocol("contact Blob byte count exceeds u64".into()))?,
         )
         .ok_or_else(|| NodeError::Protocol("aggregate Blob byte count overflow".into()))?;
-    total.blob_remaining =
+    let blob_remaining =
         total
             .blob_remaining
             .checked_add(u64::try_from(contact.blob_remaining).map_err(|_| {
                 NodeError::Protocol("contact Blob remaining count exceeds u64".into())
             })?)
             .ok_or_else(|| NodeError::Protocol("aggregate Blob remaining count overflow".into()))?;
-    total.blob_deferred =
+    let blob_deferred =
         total
             .blob_deferred
             .checked_add(u64::try_from(contact.blob_deferred).map_err(|_| {
                 NodeError::Protocol("contact Blob deferral count exceeds u64".into())
             })?)
             .ok_or_else(|| NodeError::Protocol("aggregate Blob deferral count overflow".into()))?;
+    let blob_stream_attempts = total
+        .blob_stream_attempts
+        .checked_add(u64::from(contact.blob_stream_attempts))
+        .ok_or_else(|| NodeError::Protocol("aggregate Blob stream attempt overflow".into()))?;
+    let blob_stream_received_bytes = total
+        .blob_stream_received_bytes
+        .checked_add(contact.blob_stream_received_bytes)
+        .ok_or_else(|| {
+            NodeError::Protocol("aggregate Blob stream received bytes overflow".into())
+        })?;
+    let blob_stream_retransmitted_bytes = total
+        .blob_stream_retransmitted_bytes
+        .checked_add(contact.blob_stream_retransmitted_bytes)
+        .ok_or_else(|| {
+            NodeError::Protocol("aggregate Blob stream retransmitted bytes overflow".into())
+        })?;
+    let blob_stream_writer_commits = total
+        .blob_stream_writer_commits
+        .checked_add(u64::from(contact.blob_stream_writer_commits))
+        .ok_or_else(|| {
+            NodeError::Protocol("aggregate Blob stream writer commits overflow".into())
+        })?;
+    let blob_stream_failover_recoveries = total
+        .blob_stream_failover_recoveries
+        .checked_add(u64::from(contact.blob_stream_failover_recoveries))
+        .ok_or_else(|| NodeError::Protocol("aggregate Blob stream failovers overflow".into()))?;
+
+    total.blob_ranges_fetched = blob_ranges_fetched;
+    total.blob_bytes_fetched = blob_bytes_fetched;
+    total.blob_remaining = blob_remaining;
+    total.blob_deferred = blob_deferred;
+    total.blob_stream_attempts = blob_stream_attempts;
+    total.blob_stream_received_bytes = blob_stream_received_bytes;
+    total.blob_stream_retransmitted_bytes = blob_stream_retransmitted_bytes;
+    total.blob_stream_receive_limit_bytes = total
+        .blob_stream_receive_limit_bytes
+        .max(contact.blob_stream_receive_limit_bytes);
+    total.blob_stream_checkpoint_bytes = total
+        .blob_stream_checkpoint_bytes
+        .max(contact.blob_stream_checkpoint_bytes);
+    total.blob_stream_checkpoint_latency_ms = total
+        .blob_stream_checkpoint_latency_ms
+        .max(contact.blob_stream_checkpoint_latency_ms);
+    total.blob_stream_writer_commits = blob_stream_writer_commits;
+    total.blob_stream_failover_recoveries = blob_stream_failover_recoveries;
     Ok(())
 }
 
@@ -25775,7 +25925,7 @@ async fn sync_mutable_classes(
                 ));
             }
             if let Some(selection) = to_responder.selection {
-                let _ = blob_stream::send(
+                let outcome = blob_stream::send(
                     store,
                     connection,
                     mission,
@@ -25787,6 +25937,7 @@ async fn sync_mutable_classes(
                     profile_digest,
                 )
                 .await?;
+                receipt.account_blob_stream_attempt(outcome)?;
             }
             let to_initiator = blob_stream::select_receive_plan(
                 store,
@@ -25808,7 +25959,7 @@ async fn sync_mutable_classes(
                 ));
             }
             if let Some(selection) = to_initiator.selection {
-                let _ = blob_stream::receive(
+                let outcome = blob_stream::receive(
                     store,
                     connection,
                     mission,
@@ -25819,6 +25970,7 @@ async fn sync_mutable_classes(
                     profile_digest,
                 )
                 .await?;
+                receipt.account_blob_stream_attempt(outcome)?;
             }
             return Ok(());
         }
@@ -28896,7 +29048,7 @@ async fn serve_mutable_classes(
             }
             account(receipt, request_bytes, response_bytes)?;
             if let Some(selection) = to_responder {
-                let _ = blob_stream::receive(
+                let outcome = blob_stream::receive(
                     store,
                     connection,
                     mission,
@@ -28907,6 +29059,7 @@ async fn serve_mutable_classes(
                     profile_digest,
                 )
                 .await?;
+                receipt.account_blob_stream_attempt(outcome)?;
             }
             let wire_budget = exchange_wire_budget(receipt)?;
             let mut to_initiator = None;
@@ -28943,7 +29096,7 @@ async fn serve_mutable_classes(
             }
             account(receipt, request_bytes, response_bytes)?;
             if let Some(selection) = to_initiator {
-                let _ = blob_stream::send(
+                let outcome = blob_stream::send(
                     store,
                     connection,
                     mission,
@@ -28955,6 +29108,7 @@ async fn serve_mutable_classes(
                     profile_digest,
                 )
                 .await?;
+                receipt.account_blob_stream_attempt(outcome)?;
             }
             return Ok(());
         }
@@ -32613,6 +32767,12 @@ mod tests {
             receiptful_event_offers: 6,
             mutable_remaining: 5,
             deferred_mutable_lanes: 1,
+            blob_stream_attempts: 1,
+            blob_stream_received_bytes: 10,
+            blob_stream_receive_limit_bytes: 20,
+            blob_stream_checkpoint_bytes: 10,
+            blob_stream_checkpoint_latency_ms: 3,
+            blob_stream_writer_commits: 2,
             ..PeerReceipt::default()
         };
         let second = PeerReceipt {
@@ -32629,11 +32789,19 @@ mod tests {
             receiptful_event_offers: 23,
             mutable_remaining: 17,
             deferred_mutable_lanes: 2,
+            blob_stream_attempts: 2,
+            blob_stream_received_bytes: 30,
+            blob_stream_receive_limit_bytes: 40,
+            blob_stream_checkpoint_bytes: 30,
+            blob_stream_checkpoint_latency_ms: 5,
+            blob_stream_writer_commits: 4,
             ..PeerReceipt::default()
         };
 
         account_data_receipt(&mut total, &first).expect("first successful contact");
+        account_blob_receipt(&mut total, &first).expect("first Blob contact metrics");
         account_data_receipt(&mut total, &second).expect("second successful contact");
+        account_blob_receipt(&mut total, &second).expect("second Blob contact metrics");
 
         assert_eq!(total.data_offered, 9);
         assert_eq!(total.data_fetched, 14);
@@ -32648,6 +32816,12 @@ mod tests {
         assert_eq!(total.receiptful_event_offers, 29);
         assert_eq!(total.mutable_remaining, 22);
         assert_eq!(total.deferred_mutable_lanes, 3);
+        assert_eq!(total.blob_stream_attempts, 3);
+        assert_eq!(total.blob_stream_received_bytes, 40);
+        assert_eq!(total.blob_stream_receive_limit_bytes, 40);
+        assert_eq!(total.blob_stream_checkpoint_bytes, 30);
+        assert_eq!(total.blob_stream_checkpoint_latency_ms, 5);
+        assert_eq!(total.blob_stream_writer_commits, 6);
     }
 
     #[test]
@@ -32672,6 +32846,31 @@ mod tests {
                 if message == "aggregate data fetched count overflow"
         ));
         assert_eq!(total, before);
+    }
+
+    #[test]
+    fn blob_stream_contact_metrics_fail_atomically_on_overflow() {
+        let mut receipt = PeerReceipt {
+            blob_stream_received_bytes: u64::MAX,
+            ..PeerReceipt::default()
+        };
+        let before = receipt.clone();
+        let attempt = blob_stream::BlobStreamAttemptOutcome {
+            code: crate::stream_transfer::StreamResultCode::Promoted,
+            metrics: blob_stream::BlobStreamAttemptMetrics {
+                transport: BlobStreamTransport::IrohQuicV1,
+                received_bytes: 1,
+                retransmitted_bytes: 0,
+                receive_limit_bytes: 8,
+                checkpoint_bytes: 4,
+                checkpoint_latency_ms: 1,
+                writer_commits: 1,
+                failover_recoveries: 0,
+            },
+        };
+
+        assert!(receipt.account_blob_stream_attempt(attempt).is_err());
+        assert_eq!(receipt, before);
     }
 
     #[test]
@@ -49578,6 +49777,24 @@ mod tests {
         );
         assert_eq!(received.blob_ranges_fetched, 0);
         assert_eq!(sent.blob_ranges_fetched, 0);
+        assert_eq!(received.blob_stream_attempts, 1);
+        assert_eq!(sent.blob_stream_attempts, 1);
+        assert_eq!(
+            received.blob_stream_transport,
+            Some(BlobStreamTransport::IrohQuicV1)
+        );
+        assert_eq!(
+            sent.blob_stream_transport,
+            Some(BlobStreamTransport::IrohQuicV1)
+        );
+        assert!(received.blob_stream_received_bytes >= plaintext.len() as u64);
+        assert_eq!(
+            received.blob_stream_checkpoint_bytes,
+            received.blob_stream_received_bytes
+        );
+        assert!(received.blob_stream_receive_limit_bytes >= plaintext.len() as u64);
+        assert!(received.blob_stream_writer_commits > 0);
+        assert_eq!(sent.blob_stream_received_bytes, 0);
         eprintln!(
             "live_blob_stream_v9 bytes={} elapsed_ms={}",
             plaintext.len(),

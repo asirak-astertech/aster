@@ -21,9 +21,9 @@
 //! Record additionally use class-specific, explicitly interested reconciliation
 //! lanes. Blob transfer uses semantic v7/v8 profile 4: v7 is durable-only and
 //! v8 adds authenticated finite custody. Semantic v9 allocates profile 5 for
-//! the distinct bounded stream driver and fails closed until that driver is
-//! active. Semantic v5/v6 Blob intent fails instead of falling back to a
-//! historical carrier path.
+//! the distinct bounded stream driver; durable Blob streaming is active while
+//! finite custody-v2 composition remains fail-closed. Semantic v5/v6 Blob
+//! intent fails instead of falling back to a historical carrier path.
 //! Shutdown and zeroization close live application
 //! admission before releasing the actor's store authority, so retained handles
 //! fail closed with [`application::ApplicationErrorKind::StateUnavailable`].
@@ -61,7 +61,7 @@ pub use mission::{
     respond_classical_over_iroh,
 };
 pub use runtime::{
-    ControlPublicationReceipt, DemoScenario, EventEmissionPolicy,
+    BlobStreamTransport, ControlPublicationReceipt, DemoScenario, EventEmissionPolicy,
     MAX_CUSTODY_FINALIZATION_CHARGE_MS, MissionExpectedPeer, MutableSourceInterests,
     NodeApplication, NodeBootstrapError, NodeBootstrapErrorKind, NodeConfig, NodeConfigOptions,
     NodeError, NodeOperatorOutputPolicy, NodeReceipt, PeerReceipt, RunningNode,

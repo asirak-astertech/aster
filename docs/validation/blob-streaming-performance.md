@@ -74,6 +74,13 @@ three-CM4 run remains the device acceptance authority.
 The deterministic test defaults to 16 MiB. Development measurements can select
 a bounded 1–256 MiB payload through `ASTER_TEST_BLOB_STREAM_MIB`; the cap avoids
 turning an accidental environment value into an unbounded local allocation.
+The production receiver now retains bounded completed-contact metrics for the
+selected transport, attempt count, authenticated received bytes, greatest
+absolute receive limit and durable checkpoint, maximum checkpoint commit
+latency, and writer-commit count. Reopen is not counted as cross-transport
+failover while Iroh is the only production adapter. These counters make the
+same quantities observable during the eventual three-CM4 procedure without
+placing transport details in the public Blob application API.
 
 ```text
 ASTER_TEST_BLOB_STREAM_MIB=256 cargo test --release --locked -p aster-node live_blob_stream_v9_completes_retained_sixteen_mib_shape_in_one_contact --lib -- --nocapture

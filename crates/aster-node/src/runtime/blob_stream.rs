@@ -30,12 +30,31 @@ use sha2::{Digest as _, Sha256};
 use std::{sync::Arc, time::Duration};
 
 use super::{
-    BlobContactMode, CompletedBlobStreamSource, EventDirection, EventLaneGuard,
-    MutableApplyDisposition, NodeError, PendingBlobRecoveryDisposition, ReferenceEnvelopeSealer,
-    abort_pending_blob_with_cached_claim, load_completed_blob_stream_source,
-    load_pending_blob_plan, next_pending_blob_source_for_contact, pending_blob_claim_is_current,
+    BlobContactMode, BlobStreamTransport, CompletedBlobStreamSource, EventDirection,
+    EventLaneGuard, MutableApplyDisposition, NodeError, PendingBlobRecoveryDisposition,
+    ReferenceEnvelopeSealer, abort_pending_blob_with_cached_claim,
+    load_completed_blob_stream_source, load_pending_blob_plan,
+    next_pending_blob_source_for_contact, pending_blob_claim_is_current,
     recover_and_finalize_pending_blob,
 };
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct BlobStreamAttemptMetrics {
+    pub(super) transport: BlobStreamTransport,
+    pub(super) received_bytes: u64,
+    pub(super) retransmitted_bytes: u64,
+    pub(super) receive_limit_bytes: u64,
+    pub(super) checkpoint_bytes: u64,
+    pub(super) checkpoint_latency_ms: u64,
+    pub(super) writer_commits: u32,
+    pub(super) failover_recoveries: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct BlobStreamAttemptOutcome {
+    pub(super) code: StreamResultCode,
+    pub(super) metrics: BlobStreamAttemptMetrics,
+}
 
 const STREAM_ATTEMPT_DEADLINE: Duration = Duration::from_secs(30 * 60);
 const STREAM_RECEIVE_WINDOW_BYTES: u64 = 8 * 1_048_576;
@@ -468,7 +487,7 @@ pub(super) async fn send(
     selection: BlobStreamPlanSelectionV1,
     peer_interest: &BlobInterest,
     profile_digest: [u8; 32],
-) -> Result<StreamResultCode, NodeError> {
+) -> Result<BlobStreamAttemptOutcome, NodeError> {
     let source = selection.source_id;
     let (loaded, layout) =
         load_authorized_send_source(store, mission, verifier, guard, selection, peer_interest)?;
@@ -491,7 +510,7 @@ pub(super) async fn send(
     let policy = guard.policy().clone();
     let completion = loaded.completion.clone();
     let plan = &loaded.plan;
-    drive_sender_attempt(
+    let code = drive_sender_attempt(
         attempt,
         mission,
         profile_digest,
@@ -520,7 +539,20 @@ pub(super) async fn send(
             Ok(extent.encoded_bytes())
         },
     )
-    .await
+    .await?;
+    Ok(BlobStreamAttemptOutcome {
+        code,
+        metrics: BlobStreamAttemptMetrics {
+            transport: BlobStreamTransport::IrohQuicV1,
+            received_bytes: 0,
+            retransmitted_bytes: 0,
+            receive_limit_bytes: 0,
+            checkpoint_bytes: selection.durable_offset,
+            checkpoint_latency_ms: 0,
+            writer_commits: 0,
+            failover_recoveries: 0,
+        },
+    })
 }
 
 /// Receives one exact durable source selected by the receiver's authenticated
@@ -536,7 +568,7 @@ pub(super) async fn receive(
     direction: EventDirection,
     selection: BlobStreamPlanSelectionV1,
     profile_digest: [u8; 32],
-) -> Result<StreamResultCode, NodeError> {
+) -> Result<BlobStreamAttemptOutcome, NodeError> {
     guard.check(store)?;
     let source = selection.source_id;
     let (blob, manifest_bytes, plan) =
@@ -585,7 +617,11 @@ pub(super) async fn receive(
     let promote_manifest = manifest_bytes.clone();
     let manifest_digest = *plan.manifest_digest();
     let mut expected_checkpoint = checkpoint;
-    drive_receiver_attempt(
+    let mut received_bytes = 0_u64;
+    let mut greatest_receive_limit = receive_limit;
+    let mut greatest_checkpoint_latency_ms = 0_u64;
+    let mut writer_commits = 0_u32;
+    let code = drive_receiver_attempt(
         attempt,
         mission,
         profile_digest,
@@ -599,6 +635,7 @@ pub(super) async fn receive(
         STREAM_CHECKPOINT_BATCH_BYTES,
         |_, frames| {
             guard.check(store)?;
+            let commit_started = std::time::Instant::now();
             let next = commit_received_batch(
                 store,
                 &policy,
@@ -608,6 +645,16 @@ pub(super) async fn receive(
                 frames,
                 STREAM_CHECKPOINT_BATCH_BYTES as usize,
             )?;
+            greatest_checkpoint_latency_ms = greatest_checkpoint_latency_ms
+                .max(u64::try_from(commit_started.elapsed().as_millis()).unwrap_or(u64::MAX));
+            writer_commits = writer_commits
+                .checked_add(1)
+                .ok_or_else(|| protocol("writer commit count overflow"))?;
+            received_bytes = frames.iter().try_fold(received_bytes, |total, frame| {
+                total
+                    .checked_add(frame.bytes.len() as u64)
+                    .ok_or_else(|| protocol("received byte count overflow"))
+            })?;
             expected_checkpoint = next;
             let (_, new_limit) = layout.carrier_boundary_at_or_before(
                 next.durable_encoded_offset
@@ -615,6 +662,7 @@ pub(super) async fn receive(
                     .unwrap_or(u64::MAX)
                     .min(layout.total_encoded_len()),
             );
+            greatest_receive_limit = greatest_receive_limit.max(new_limit);
             Ok((next.durable_encoded_offset, next.generation, new_limit))
         },
         |_| {
@@ -649,7 +697,22 @@ pub(super) async fn receive(
             Ok((code, result_digest(source, manifest_digest, code)))
         },
     )
-    .await
+    .await?;
+    Ok(BlobStreamAttemptOutcome {
+        code,
+        metrics: BlobStreamAttemptMetrics {
+            transport: BlobStreamTransport::IrohQuicV1,
+            received_bytes,
+            retransmitted_bytes: 0,
+            receive_limit_bytes: greatest_receive_limit,
+            checkpoint_bytes: expected_checkpoint.durable_encoded_offset,
+            checkpoint_latency_ms: greatest_checkpoint_latency_ms,
+            writer_commits,
+            // A nonzero reopen is recovery, but it is not cross-transport
+            // failover while IrohQuicV1 is the only production adapter.
+            failover_recoveries: 0,
+        },
+    })
 }
 
 /// Verifies every received separator-free extent against the exact plan and

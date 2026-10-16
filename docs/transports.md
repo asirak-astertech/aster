@@ -492,7 +492,12 @@ descending order:
   never a reinterpretation or in-attempt downgrade of profile 4. Its
   `0xdd..0xde` receiver-authored pre-open plan, `0xd6..0xdc` attempt records,
   v9 custody/record protection, concurrent Iroh data/control pair, durable
-  checkpoint recovery, and internal one-adapter selector are implemented.
+  checkpoint recovery, internal one-adapter selector, and bounded completed-
+  contact metrics are implemented. The metrics use a stable transport ID and
+  numeric attempt, received/retransmitted byte, receive-limit, checkpoint,
+  checkpoint-latency, writer-commit, and failover-recovery fields. They never
+  contain raw paths or peer error text. Finite-TTL custody-v2 runtime
+  composition and cross-transport failover remain fail-closed.
 - **Semantic version 8** inherits semantic-v7 profile
   negotiation and receipt-free Event pages, while profile 4 adds authenticated
   finite-TTL Blob custody and bounded lower-priority pressure recovery.
