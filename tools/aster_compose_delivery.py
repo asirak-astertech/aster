@@ -454,6 +454,11 @@ def _expected_compose_model() -> dict[str, Any]:
         "source": "${ASTER_STATE_DIR:?required}",
         "target": "/var/lib/aster",
     }]
+    transfer_bind = [{
+        "type": "bind",
+        "source": "${ASTER_TRANSFER_DIR:?required}",
+        "target": "/transfer",
+    }]
     return {
         "x-aster-metadata": {
             "copyright": "Copyright 2026 Defense Unicorns, Inc.",
@@ -509,6 +514,21 @@ def _expected_compose_model() -> dict[str, Any]:
                     "target": "/run/aster-generation/manifest.json",
                     "read_only": True,
                 }],
+                "depends_on": {"aster-agent": {"condition": "service_healthy"}},
+            },
+            "asterctl": {
+                **copy.deepcopy(runtime),
+                "image": "${ASTER_ADMIN_IMAGE_DIGEST:?required}",
+                "pull_policy": "never",
+                "network_mode": "service:aster-agent",
+                "entrypoint": [
+                    "/usr/local/bin/asterctl",
+                    "--token-file",
+                    "/run/secrets/aster-client-token",
+                ],
+                "command": ["status"],
+                "secrets": [copy.deepcopy(secrets[0])],
+                "volumes": transfer_bind,
                 "depends_on": {"aster-agent": {"condition": "service_healthy"}},
             },
         },
@@ -584,6 +604,25 @@ def _capture_state_directory(raw_path: str | None, uid: int, gid: int) -> None:
         raise ValidationError("state-directory-ownership-invalid")
     if stat.S_IMODE(lexical.st_mode) != 0o700:
         raise ValidationError("state-directory-mode-invalid")
+
+
+def _capture_transfer_directory(raw_path: str | None, uid: int, gid: int) -> None:
+    if not raw_path:
+        raise ValidationError("transfer-directory-required")
+    supplied = Path(raw_path)
+    if not supplied.is_absolute():
+        raise ValidationError("transfer-directory-absolute")
+    try:
+        lexical = supplied.lstat()
+        resolved = supplied.resolve(strict=True)
+    except OSError as error:
+        raise ValidationError("transfer-directory-invalid") from error
+    if stat.S_ISLNK(lexical.st_mode) or resolved != supplied or not stat.S_ISDIR(lexical.st_mode):
+        raise ValidationError("transfer-directory-invalid")
+    if lexical.st_uid != uid or lexical.st_gid != gid:
+        raise ValidationError("transfer-directory-ownership-invalid")
+    if stat.S_IMODE(lexical.st_mode) != 0o700:
+        raise ValidationError("transfer-directory-mode-invalid")
 
 
 def _identity(metadata: os.stat_result) -> FileIdentity:
@@ -737,6 +776,7 @@ def build_plan(compose_path: Path, environment: Mapping[str, str]) -> DeliveryPl
         environment.get("ASTER_CREDENTIAL_GENERATION_DIR"), uid, gid,
     )
     _capture_state_directory(environment.get("ASTER_STATE_DIR"), uid, gid)
+    _capture_transfer_directory(environment.get("ASTER_TRANSFER_DIR"), uid, gid)
     agent_image = environment.get("ASTER_AGENT_IMAGE_DIGEST", "")
     admin_image = environment.get("ASTER_ADMIN_IMAGE_DIGEST", "")
     if not _immutable_image_reference(agent_image) or not _immutable_image_reference(
@@ -769,6 +809,8 @@ def _example_environment() -> tuple[tempfile.TemporaryDirectory[str], dict[str, 
     generation.chmod(0o500)
     state = Path(temporary.name) / "state"
     state.mkdir(mode=0o700)
+    transfer = Path(temporary.name) / "transfer"
+    transfer.mkdir(mode=0o700)
     uid = os.getuid() or 65534
     gid = os.getgid() or 65534
     if os.getuid() == 0:
@@ -787,6 +829,7 @@ def _example_environment() -> tuple[tempfile.TemporaryDirectory[str], dict[str, 
         "ASTER_ADMIN_IMAGE_DIGEST": "example.invalid/aster-admin@sha256:" + "2" * 64,
         "ASTER_CREDENTIAL_GENERATION_DIR": str(generation),
         "ASTER_STATE_DIR": str(state),
+        "ASTER_TRANSFER_DIR": str(transfer),
     }
     environment["ASTER_AGENT_CONFIG_SHA256"] = hashlib.sha256(
         Path(environment["ASTER_AGENT_CONFIG_FILE"]).read_bytes()

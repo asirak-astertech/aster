@@ -60,6 +60,8 @@ def canonical_model():
     config_digest = {"ASTER_AGENT_CONFIG_SHA256": "${ASTER_AGENT_CONFIG_SHA256:?required}"}
     state_bind = [{"type": "bind", "source": "${ASTER_STATE_DIR:?required}",
                    "target": "/var/lib/aster"}]
+    transfer_bind = [{"type": "bind", "source": "${ASTER_TRANSFER_DIR:?required}",
+                      "target": "/transfer"}]
     return {
         "x-aster-metadata": {
             "copyright": "Copyright 2026 Defense Unicorns, Inc.",
@@ -96,6 +98,17 @@ def canonical_model():
                 "volumes": [{"type": "bind",
                              "source": "${ASTER_CREDENTIAL_GENERATION_DIR:?required}/manifest.json",
                              "target": "/run/aster-generation/manifest.json", "read_only": True}],
+                "depends_on": {"aster-agent": {"condition": "service_healthy"}},
+            },
+            "asterctl": {
+                **copy.deepcopy(runtime), "image": "${ASTER_ADMIN_IMAGE_DIGEST:?required}",
+                "pull_policy": "never",
+                "network_mode": "service:aster-agent",
+                "entrypoint": ["/usr/local/bin/asterctl", "--token-file",
+                               "/run/secrets/aster-client-token"],
+                "command": ["status"],
+                "secrets": [copy.deepcopy(secrets[0])],
+                "volumes": transfer_bind,
                 "depends_on": {"aster-agent": {"condition": "service_healthy"}},
             },
         },
@@ -139,6 +152,8 @@ class Fixture:
         self.config_path.write_text(json.dumps({"schema_version": 2}) + "\n")
         self.state = root / "state"
         self.state.mkdir(mode=0o700)
+        self.transfer = root / "transfer"
+        self.transfer.mkdir(mode=0o700)
 
     def env(self) -> dict[str, str]:
         return {
@@ -153,6 +168,7 @@ class Fixture:
             "ASTER_ADMIN_IMAGE_DIGEST": ADMIN_IMAGE,
             "ASTER_CREDENTIAL_GENERATION_DIR": str(self.generation),
             "ASTER_STATE_DIR": str(self.state),
+            "ASTER_TRANSFER_DIR": str(self.transfer),
         }
 
     def rewrite(self, old: str, new: str) -> None:
@@ -357,7 +373,10 @@ class StaticComposePolicyTests(DeliveryTestCase):
         # Break caught: restoring the former initializer would require
         # container root/CAP_CHOWN despite the Docker-only operator contract.
         model = self.fixture.model
-        self.assertEqual(set(model["services"]), {"aster-agent", "preflight", "verify"})
+        self.assertEqual(
+            set(model["services"]),
+            {"aster-agent", "preflight", "verify", "asterctl"},
+        )
         self.assertNotIn("volumes", model)
         for service in model["services"].values():
             self.assertNotEqual(service.get("user"), "0:0")
@@ -380,6 +399,58 @@ class StaticComposePolicyTests(DeliveryTestCase):
 
         plan = self.validate().render()
         self.assertIn('"project_name":"aster-test-a"', plan)
+
+    def test_asterctl_is_one_shot_token_only_and_shares_agent_network(self):
+        service = self.fixture.model["services"]["asterctl"]
+        self.assertEqual(service["image"], "${ASTER_ADMIN_IMAGE_DIGEST:?required}")
+        self.assertEqual(service["network_mode"], "service:aster-agent")
+        self.assertEqual(
+            service["entrypoint"],
+            [
+                "/usr/local/bin/asterctl",
+                "--token-file",
+                "/run/secrets/aster-client-token",
+            ],
+        )
+        self.assertEqual(service["command"], ["status"])
+        self.assertEqual(
+            service["secrets"],
+            [{"source": "aster-client-token", "target": "/run/secrets/aster-client-token"}],
+        )
+        self.assertEqual(
+            service["volumes"],
+            [{"type": "bind", "source": "${ASTER_TRANSFER_DIR:?required}",
+              "target": "/transfer"}],
+        )
+        self.assertEqual(
+            service["depends_on"],
+            {"aster-agent": {"condition": "service_healthy"}},
+        )
+        self.assertNotIn("configs", service)
+        self.assertEqual(service["restart"], "no")
+
+    def test_requires_an_absolute_user_owned_private_transfer_directory(self):
+        for value, code in (
+            (None, "transfer-directory-required"),
+            ("transfer", "transfer-directory-absolute"),
+            (str(self.fixture.root / "missing-transfer"), "transfer-directory-invalid"),
+        ):
+            with self.subTest(value=value):
+                env = self.fixture.env()
+                if value is None:
+                    env.pop("ASTER_TRANSFER_DIR")
+                else:
+                    env["ASTER_TRANSFER_DIR"] = value
+                self.assert_rejected(code, env)
+
+        self.fixture.transfer.chmod(0o755)
+        self.assert_rejected("transfer-directory-mode-invalid")
+        self.fixture.transfer.chmod(0o700)
+        link = self.fixture.root / "transfer-link"
+        link.symlink_to(self.fixture.transfer, target_is_directory=True)
+        env = self.fixture.env()
+        env["ASTER_TRANSFER_DIR"] = str(link)
+        self.assert_rejected("transfer-directory-invalid", env)
 
     def test_rejects_mutable_or_missing_image_references(self):
         for key, value in (
@@ -406,7 +477,7 @@ class StaticComposePolicyTests(DeliveryTestCase):
 
     def test_requires_pull_policy_never_on_every_service(self):
         self.validate()
-        for service in ("preflight", "aster-agent", "verify"):
+        for service in ("preflight", "aster-agent", "verify", "asterctl"):
             for value in (None, "missing", "always"):
                 with self.subTest(service=service, value=value):
                     def mutation(model, service=service, value=value):

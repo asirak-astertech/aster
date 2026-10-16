@@ -165,10 +165,11 @@ test "$ASTER_UID" -ne 0 && test "$ASTER_GID" -ne 0
 export ASTER_DEPLOYMENT_ROOT="$(pwd -P)/aster-site-a"
 export ASTER_GENERATION_PARENT="$ASTER_DEPLOYMENT_ROOT/credential-generations"
 export ASTER_STATE_DIR="$ASTER_DEPLOYMENT_ROOT/state"
+export ASTER_TRANSFER_DIR="$ASTER_DEPLOYMENT_ROOT/transfer"
 export ASTER_TOKEN_INPUT="$ASTER_DEPLOYMENT_ROOT/input/client-token"
 export ASTER_BUNDLE_INPUT="$ASTER_DEPLOYMENT_ROOT/input/mission.astpb03"
 install -d -m 0700 "$ASTER_DEPLOYMENT_ROOT" "$ASTER_GENERATION_PARENT" \
-  "$ASTER_STATE_DIR" "$ASTER_DEPLOYMENT_ROOT/input"
+  "$ASTER_STATE_DIR" "$ASTER_TRANSFER_DIR" "$ASTER_DEPLOYMENT_ROOT/input"
 chmod 0600 "$ASTER_TOKEN_INPUT" "$ASTER_BUNDLE_INPUT"
 ```
 
@@ -232,21 +233,23 @@ closed if Compose later mounts different bytes. The validator also rejects a mis
 and records the name. The render command is `docker compose config --format json`;
 the explicit file option above selects the checked-in model. Confirm
 that the rendered state mount binds the exact reviewed `ASTER_STATE_DIR` to
-`/var/lib/aster` and that the rendered service and network names carry the same
-project prefix. These remain project-qualified Compose resources. Reusing a
+`/var/lib/aster`, the CLI transfer mount binds the exact reviewed
+`ASTER_TRANSFER_DIR` to `/transfer`, and the rendered service and network names
+carry the same project prefix. These remain project-qualified Compose resources. Reusing a
 project name means intentionally addressing that existing deployment; it never
 creates a second agent.
 
-Inspect the render for the two image digests, numeric identity, one exact state
-bind mount, and exactly three sources below the selected generation. It must not
+Inspect the render for the two image digests, numeric identity, the exact state
+and transfer bind mounts, and exactly three sources below the selected generation. It must not
 contain credential bytes, a Docker socket, host namespaces, extra capabilities,
 or Swarm `deploy` configuration.
 
 ## Run preflight
 
-The validator requires `ASTER_STATE_DIR` to be an absolute, non-symlinked
-directory owned by `ASTER_UID:ASTER_GID` with exact mode `0700`. No service runs
-as container root and no service receives an added capability.
+The validator requires `ASTER_STATE_DIR` and `ASTER_TRANSFER_DIR` to be
+absolute, non-symlinked directories owned by `ASTER_UID:ASTER_GID` with exact
+mode `0700`. No service runs as container root and no service receives an added
+capability.
 
 ```sh
 docker compose -f docker/compose-agent/compose.yaml run --rm preflight
@@ -261,6 +264,7 @@ Do not proceed after any preflight failure.
 ```sh
 docker compose -f docker/compose-agent/compose.yaml up -d --force-recreate aster-agent
 docker compose -f docker/compose-agent/compose.yaml run --rm verify
+docker compose -f docker/compose-agent/compose.yaml run --rm asterctl --json status
 ```
 
 The verify helper makes an authenticated status request and compares the
@@ -268,6 +272,11 @@ returned `credential_generation` with the selected manifest. `VERIFY
 status=pass` confirms that comparison; it does not authorize rollback or
 qualify the host. Never use plain `docker compose restart` for rotation because
 restart does not apply changed Compose configuration.
+
+The `asterctl` service uses the same admin image, shares the agent network
+namespace, and receives only the selected client token plus the operator-owned
+transfer directory. Arguments after the service name replace its default
+`status` command while retaining the fixed token-file entrypoint.
 
 ## Rotate, roll back, and retain
 
