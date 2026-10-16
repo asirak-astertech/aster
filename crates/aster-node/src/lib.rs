@@ -43,6 +43,8 @@ mod runtime;
 pub mod stream_pipeline;
 #[allow(dead_code)] // Activated by the profile-5 runtime driver in Task 7.
 mod stream_transfer;
+#[allow(dead_code)] // Activated by the profile-5 runtime driver in Task 7.
+mod stream_transport;
 
 pub use aster_redb_store::{BlobDepotLimits, CustodyQuota, StoreLimits};
 pub use control_admin::{

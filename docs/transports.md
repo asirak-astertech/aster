@@ -460,20 +460,41 @@ core owns fragmentation, handshake, replay defense, exact reconciliation,
 source verification, and reducers.
 
 Use the `Link` trait and existing IP/BTLE adapters as semantic and test migration
-sources. The selected node does not yet expose the final multi-carrier adapter
-contract, so a new production adapter must not create a second persistence,
-reconciliation, authentication, or scheduling authority. Use the
+sources. The selected node now has an internal stream-adapter and deterministic
+selector seam, but `IrohQuicV1` is its only production stream adapter. Candidate
+support and locators must come from local configuration, provisioned peer data,
+or authenticated discovery before `StreamOpen`; peer-supplied ranking is never
+accepted. The selector filters policy and stream-contract eligibility, then
+orders health, configured priority, and stable adapter ID. Exactly one adapter
+carries a logical attempt. Iroh direct versus relay remains an Iroh-local path
+observation, not two selectable Aster transports.
+
+Fake adapters validate ranking, retry, cancellation, terminal outcomes, and
+checkpoint carry-forward, but they are not product transport support. This
+milestone may claim automatic selection of the sole eligible Iroh adapter and
+authenticated Iroh reopen. It must not claim best-available cross-transport
+selection or failover until a second independently usable production adapter
+and its physical scenario are reviewed. A new production adapter must not
+create a second persistence, reconciliation, authentication, or scheduling
+authority. Use the
 [binding pattern](bindings/pattern.md) for a language API.
 
 ## Semantic protocol versions you may see
 
 Aster separates stable bytes from negotiated behavior. The current selected
-implementation offers semantic versions `[8, 7, 6, 5, 4, 3, 2, 1]` in that
+implementation offers semantic versions `[9, 8, 7, 6, 5, 4, 3, 2, 1]` in that
 descending order:
 
 - **Replication wire/profile version 1** identifies the current encoding and
   fixed security-object family.
-- **Semantic version 8** is offered first. It inherits semantic-v7 profile
+- **Semantic version 9** is offered first. It preserves v1-v8 stable bytes and
+  selects Blob profile 5 `BlobStreamV1`. Profile 5 is a distinct allocation,
+  never a reinterpretation or in-attempt downgrade of profile 4. Its
+  `0xd6..0xdc` records, v9 custody/record protection, concurrent Iroh
+  data/control pair, and internal one-adapter selector are implemented. The
+  selected runtime still fails closed until its storage/lifecycle stream driver
+  is active.
+- **Semantic version 8** inherits semantic-v7 profile
   negotiation and receipt-free Event pages, while profile 4 adds authenticated
   finite-TTL Blob custody and bounded lower-priority pressure recovery.
 - **Semantic version 7** remains a compatibility option. After the four-flight mission
