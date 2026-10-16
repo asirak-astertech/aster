@@ -175,8 +175,13 @@ install -d -m 0700 "$ASTER_DEPLOYMENT_ROOT" "$ASTER_GENERATION_PARENT" \
 chmod 0600 "$ASTER_TOKEN_INPUT" "$ASTER_BUNDLE_INPUT"
 ```
 
-Protect the bundle input under site policy. Confirm that both inputs belong to
-the intended issuance and authorization transaction before creation.
+Protect both inputs under site policy. The generation creator wraps the token
+for the provider-aware agent, while Compose mounts the owner-only plaintext
+`ASTER_TOKEN_INPUT` only into the one-shot `asterctl` service. The validator
+requires this input to be an absolute, singly linked, owner-matched regular
+file with mode `0400` or `0600` and valid token contents. Confirm that both
+inputs belong to the intended issuance and authorization transaction before
+creation.
 
 ## Create an immutable generation
 
@@ -204,8 +209,13 @@ Credential files must be exactly `0400` or `0600`, singly linked, and unchanged.
 
 ```sh
 export ASTER_CREDENTIAL_GENERATION_DIR="$ASTER_GENERATION_PARENT/generation-<64-hex>"
+chmod 0500 "$ASTER_CREDENTIAL_GENERATION_DIR"
 find "$ASTER_CREDENTIAL_GENERATION_DIR" -maxdepth 1 -printf '%u:%g %m %f\n'
 ```
+
+The host-side `chmod` is idempotent and closes the directory if a desktop
+bind-mount implementation did not preserve the creator container's final
+`0500` mode. Stop if ownership, file modes, or the validator still disagree.
 
 ## Configure and validate without a daemon lifecycle test
 

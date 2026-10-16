@@ -30,7 +30,7 @@ REPOSITORY = MODULE_PATH.parents[1]
 COMPOSE = REPOSITORY / "docker/compose-agent/compose.yaml"
 REMOTE_MESH = REPOSITORY / "docker/compose-agent/compose.remote-mesh.yaml"
 MISE = REPOSITORY / "mise.toml"
-TOKEN_CANARY = "task6-token-canary-do-not-print"
+TOKEN_CANARY = "task6-token-canary-do-not-print-0000"
 GENERATION = "generation-" + "a" * 64
 AGENT_IMAGE = "registry.example/aster-agent@sha256:" + "b" * 64
 ADMIN_IMAGE = "registry.example/aster-admin@sha256:" + "c" * 64
@@ -57,6 +57,10 @@ def canonical_model():
         {"source": "aster-mission-activation", "target": "/run/secrets/aster-mission-activation"},
         {"source": "aster-provisioning-bundle", "target": "/run/secrets/aster-provisioning-bundle"},
     ]
+    operator_token = {
+        "source": "aster-operator-client-token",
+        "target": "/run/secrets/aster-client-token",
+    }
     config = [{"source": "aster-agent-config", "target": "/etc/aster/agent.json", "mode": 292}]
     config_digest = {"ASTER_AGENT_CONFIG_SHA256": "${ASTER_AGENT_CONFIG_SHA256:?required}"}
     state_bind = [{"type": "bind", "source": "${ASTER_STATE_DIR:?required}",
@@ -108,7 +112,7 @@ def canonical_model():
                 "entrypoint": ["/usr/local/bin/asterctl", "--token-file",
                                "/run/secrets/aster-client-token"],
                 "command": ["status"],
-                "secrets": [copy.deepcopy(secrets[0])],
+                "secrets": [copy.deepcopy(operator_token)],
                 "volumes": transfer_bind,
                 "depends_on": {"aster-agent": {"condition": "service_healthy"}},
             },
@@ -118,6 +122,7 @@ def canonical_model():
             "aster-client-token": {"file": "${ASTER_CREDENTIAL_GENERATION_DIR:?required}/aster-client-token"},
             "aster-mission-activation": {"file": "${ASTER_CREDENTIAL_GENERATION_DIR:?required}/aster-mission-activation"},
             "aster-provisioning-bundle": {"file": "${ASTER_CREDENTIAL_GENERATION_DIR:?required}/aster-provisioning-bundle"},
+            "aster-operator-client-token": {"file": "${ASTER_TOKEN_INPUT:?required}"},
         },
     }
 
@@ -168,6 +173,9 @@ class Fixture:
         self.state.mkdir(mode=0o700)
         self.transfer = root / "transfer"
         self.transfer.mkdir(mode=0o700)
+        self.token_input = root / "client-token-input"
+        self.token_input.write_text(TOKEN_CANARY)
+        self.token_input.chmod(0o600)
 
     def env(self) -> dict[str, str]:
         return {
@@ -183,6 +191,7 @@ class Fixture:
             "ASTER_CREDENTIAL_GENERATION_DIR": str(self.generation),
             "ASTER_STATE_DIR": str(self.state),
             "ASTER_TRANSFER_DIR": str(self.transfer),
+            "ASTER_TOKEN_INPUT": str(self.token_input),
         }
 
     def rewrite(self, old: str, new: str) -> None:
@@ -452,7 +461,16 @@ class StaticComposePolicyTests(DeliveryTestCase):
         self.assertEqual(service["command"], ["status"])
         self.assertEqual(
             service["secrets"],
-            [{"source": "aster-client-token", "target": "/run/secrets/aster-client-token"}],
+            [{"source": "aster-operator-client-token",
+              "target": "/run/secrets/aster-client-token"}],
+        )
+        self.assertEqual(
+            self.fixture.model["secrets"]["aster-client-token"],
+            {"file": "${ASTER_CREDENTIAL_GENERATION_DIR:?required}/aster-client-token"},
+        )
+        self.assertEqual(
+            self.fixture.model["secrets"]["aster-operator-client-token"],
+            {"file": "${ASTER_TOKEN_INPUT:?required}"},
         )
         self.assertEqual(
             service["volumes"],
@@ -488,6 +506,40 @@ class StaticComposePolicyTests(DeliveryTestCase):
         env = self.fixture.env()
         env["ASTER_TRANSFER_DIR"] = str(link)
         self.assert_rejected("transfer-directory-invalid", env)
+
+    def test_requires_an_owner_only_valid_plaintext_operator_token_input(self):
+        for value, code in (
+            (None, "operator-token-required"),
+            ("client-token", "operator-token-absolute"),
+            (str(self.fixture.root / "missing-token"), "operator-token-invalid"),
+        ):
+            with self.subTest(value=value):
+                env = self.fixture.env()
+                if value is None:
+                    env.pop("ASTER_TOKEN_INPUT")
+                else:
+                    env["ASTER_TOKEN_INPUT"] = value
+                self.assert_rejected(code, env)
+
+        self.fixture.token_input.chmod(0o644)
+        self.assert_rejected("operator-token-mode-invalid")
+        self.fixture.token_input.chmod(0o600)
+
+        link = self.fixture.root / "client-token-link"
+        link.symlink_to(self.fixture.token_input)
+        env = self.fixture.env()
+        env["ASTER_TOKEN_INPUT"] = str(link)
+        self.assert_rejected("operator-token-invalid", env)
+
+        for value in (
+            b"x" * 31,
+            b"x" * 32 + b"/",
+            b"\xff" * 32,
+            b"x" * 259,
+        ):
+            with self.subTest(size=len(value)):
+                self.fixture.token_input.write_bytes(value)
+                self.assert_rejected("operator-token-contents-invalid")
 
     def test_rejects_mutable_or_missing_image_references(self):
         for key, value in (
@@ -683,6 +735,7 @@ class RepositoryPolicyTests(unittest.TestCase):
             "ASTER_TRANSFER_DIR",
             "aster_compose_delivery.py",
             "ASTER_ADMIN_IMAGE_DIGEST",
+            'chmod 0500 "$ASTER_CREDENTIAL_GENERATION_DIR"',
             'docker compose -f "$ASTER_COMPOSE_FILE" run --rm asterctl',
             " publish ",
             " query ",
