@@ -27080,9 +27080,14 @@ async fn serve_connection_with_forwarding(
         captured: emission_snapshot,
         custody_clock,
     };
+    let deadline = if mutable_interests.blob_selectors().is_empty() {
+        CONTACT_DEADLINE
+    } else {
+        BLOB_CONTACT_DEADLINE
+    };
     let close = connection.clone();
     match timeout(
-        CONTACT_DEADLINE,
+        deadline,
         CONTACT_EVENT_ROUTE_CACHE.scope(
             event_route_cache,
             CONTACT_EMISSION_GUARD.scope(

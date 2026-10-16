@@ -57,6 +57,15 @@ same focused run passed after all three boundaries were routed through the
 authenticated contact mode and configured profile-5 limits. This is retained
 as a size-dependent regression finding, not discarded as benchmark noise.
 
+An 8-MiB checkpoint-batch experiment was rejected. Carrier-boundary alignment
+can make an 8-MiB absolute receive window slightly smaller than an 8-MiB batch,
+so neither endpoint reaches the transition that grants more credit. The driver
+retains 4-MiB batches and now has a compile-time invariant requiring room for a
+maximum extent beyond the batch threshold. The experiment also exposed that
+the inbound wrapper still used the legacy 30-second total deadline; inbound and
+outbound Blob contacts now select the same bounded Blob-aware deadline. A final
+256-MiB rerun passed in 23.514 seconds after both corrections.
+
 These results demonstrate the production driver's local feasibility and are
 roughly 19–25 times faster than the measured profile-4 baseline. They do not
 qualify UAS radio behavior or Raspberry Pi CM4/Jetson performance. The required

@@ -41,6 +41,10 @@ const STREAM_ATTEMPT_DEADLINE: Duration = Duration::from_secs(30 * 60);
 const STREAM_RECEIVE_WINDOW_BYTES: u64 = 8 * 1_048_576;
 const STREAM_CHECKPOINT_BATCH_BYTES: u32 = 4 * 1_048_576;
 const STREAM_RECORD_BUDGET_BYTES: usize = 256;
+const _: () = assert!(
+    STREAM_CHECKPOINT_BATCH_BYTES as u64 + MAX_STREAM_EXTENT_BYTES as u64
+        <= STREAM_RECEIVE_WINDOW_BYTES
+);
 
 fn protocol(error: impl std::fmt::Display) -> NodeError {
     NodeError::Protocol(format!("Blob stream: {error}"))
