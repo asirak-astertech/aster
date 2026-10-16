@@ -225,7 +225,7 @@
       ],
       "secrets": [
         {
-          "source": "aster-client-token",
+          "source": "aster-operator-client-token",
           "target": "/run/secrets/aster-client-token"
         }
       ],
@@ -257,6 +257,9 @@
     },
     "aster-provisioning-bundle": {
       "file": "${ASTER_CREDENTIAL_GENERATION_DIR:?required}/aster-provisioning-bundle"
+    },
+    "aster-operator-client-token": {
+      "file": "${ASTER_TOKEN_INPUT:?required}"
     }
   }
 }

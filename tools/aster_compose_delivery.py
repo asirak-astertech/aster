@@ -464,6 +464,10 @@ def _expected_compose_model() -> dict[str, Any]:
         {"source": "aster-mission-activation", "target": "/run/secrets/aster-mission-activation"},
         {"source": "aster-provisioning-bundle", "target": "/run/secrets/aster-provisioning-bundle"},
     ]
+    operator_token = {
+        "source": "aster-operator-client-token",
+        "target": "/run/secrets/aster-client-token",
+    }
     config = [{"source": "aster-agent-config", "target": "/etc/aster/agent.json", "mode": 292}]
     config_digest = {
         "ASTER_AGENT_CONFIG_SHA256": "${ASTER_AGENT_CONFIG_SHA256:?required}"
@@ -546,7 +550,7 @@ def _expected_compose_model() -> dict[str, Any]:
                     "/run/secrets/aster-client-token",
                 ],
                 "command": ["status"],
-                "secrets": [copy.deepcopy(secrets[0])],
+                "secrets": [copy.deepcopy(operator_token)],
                 "volumes": transfer_bind,
                 "depends_on": {"aster-agent": {"condition": "service_healthy"}},
             },
@@ -563,6 +567,9 @@ def _expected_compose_model() -> dict[str, Any]:
             },
             "aster-provisioning-bundle": {
                 "file": "${ASTER_CREDENTIAL_GENERATION_DIR:?required}/aster-provisioning-bundle"
+            },
+            "aster-operator-client-token": {
+                "file": "${ASTER_TOKEN_INPUT:?required}"
             },
         },
     }
@@ -581,6 +588,9 @@ def _load_compose_model(raw: bytes) -> dict[str, Any]:
         },
         "aster-provisioning-bundle": {
             "file": "${ASTER_CREDENTIAL_GENERATION_DIR:?required}/aster-provisioning-bundle"
+        },
+        "aster-operator-client-token": {
+            "file": "${ASTER_TOKEN_INPUT:?required}"
         },
     }
     if model.get("secrets") != expected_sources:
@@ -681,6 +691,45 @@ def _capture_transfer_directory(raw_path: str | None, uid: int, gid: int) -> Non
         raise ValidationError("transfer-directory-ownership-invalid")
     if stat.S_IMODE(lexical.st_mode) != 0o700:
         raise ValidationError("transfer-directory-mode-invalid")
+
+
+def _capture_operator_token(raw_path: str | None, uid: int, gid: int) -> None:
+    if not raw_path:
+        raise ValidationError("operator-token-required")
+    path = Path(raw_path)
+    if not path.is_absolute():
+        raise ValidationError("operator-token-absolute")
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+        try:
+            before = os.fstat(descriptor)
+            if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+                raise ValidationError("operator-token-invalid")
+            if before.st_uid != uid or before.st_gid != gid:
+                raise ValidationError("operator-token-ownership-invalid")
+            if stat.S_IMODE(before.st_mode) not in (0o400, 0o600):
+                raise ValidationError("operator-token-mode-invalid")
+            if before.st_size > 258:
+                raise ValidationError("operator-token-contents-invalid")
+            token = _read_fd_bounded(descriptor, 258)
+            after = os.fstat(descriptor)
+            if _identity(before) != _identity(after):
+                raise ValidationError("operator-token-invalid")
+        finally:
+            os.close(descriptor)
+    except ValidationError:
+        raise
+    except OSError as error:
+        raise ValidationError("operator-token-invalid") from error
+    token = token.rstrip(b"\r\n")
+    if not 32 <= len(token) <= 256 or any(
+        not (byte in b"-._~" or chr(byte).isascii() and chr(byte).isalnum())
+        for byte in token
+    ):
+        raise ValidationError("operator-token-contents-invalid")
 
 
 def _identity(metadata: os.stat_result) -> FileIdentity:
@@ -833,6 +882,7 @@ def build_plan(compose_path: Path, environment: Mapping[str, str]) -> DeliveryPl
     _capture_generation(
         environment.get("ASTER_CREDENTIAL_GENERATION_DIR"), uid, gid,
     )
+    _capture_operator_token(environment.get("ASTER_TOKEN_INPUT"), uid, gid)
     _capture_state_directory(environment.get("ASTER_STATE_DIR"), uid, gid)
     _capture_transfer_directory(environment.get("ASTER_TRANSFER_DIR"), uid, gid)
     agent_image = environment.get("ASTER_AGENT_IMAGE_DIGEST", "")
@@ -869,6 +919,9 @@ def _example_environment() -> tuple[tempfile.TemporaryDirectory[str], dict[str, 
     state.mkdir(mode=0o700)
     transfer = Path(temporary.name) / "transfer"
     transfer.mkdir(mode=0o700)
+    token_input = Path(temporary.name) / "client-token-input"
+    token_input.write_text("non-secret-example-client-token-00000000")
+    token_input.chmod(0o600)
     uid = os.getuid() or 65534
     gid = os.getgid() or 65534
     if os.getuid() == 0:
@@ -888,6 +941,7 @@ def _example_environment() -> tuple[tempfile.TemporaryDirectory[str], dict[str, 
         "ASTER_CREDENTIAL_GENERATION_DIR": str(generation),
         "ASTER_STATE_DIR": str(state),
         "ASTER_TRANSFER_DIR": str(transfer),
+        "ASTER_TOKEN_INPUT": str(token_input),
     }
     environment["ASTER_AGENT_CONFIG_SHA256"] = hashlib.sha256(
         Path(environment["ASTER_AGENT_CONFIG_FILE"]).read_bytes()

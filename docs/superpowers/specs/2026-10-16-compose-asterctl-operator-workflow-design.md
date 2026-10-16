@@ -40,7 +40,11 @@ The service:
 - joins `network_mode: service:aster-agent` so the local agent remains bound
   only inside its existing network namespace;
 - depends on the agent health check;
-- mounts only `aster-client-token` from the credential generation;
+- mounts only the owner-only plaintext token at
+  `${ASTER_TOKEN_INPUT:?required}` through a distinct
+  `aster-operator-client-token` Compose secret; the generation-bound
+  `aster-client-token` remains reserved for the provider-aware agent and
+  verifier because it is a protected binary envelope, not CLI input;
 - mounts `${ASTER_TRANSFER_DIR:?required}` at `/transfer` for operator Blob
   input and output;
 - uses an entrypoint equivalent to
@@ -104,4 +108,3 @@ wire protocol or public RPC. Existing digest-pinned deployment remains
 compatible after adding the required `ASTER_TRANSFER_DIR` variable for the
 new service. No production authorization, generalized ZeroTier dependency,
 NAT traversal claim, large-Blob threshold, or supported throughput is claimed.
-
