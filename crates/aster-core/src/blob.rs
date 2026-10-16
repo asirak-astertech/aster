@@ -674,6 +674,14 @@ impl BlobStreamLayout {
             .and_then(|index| self.boundaries.get(index).copied())
     }
 
+    /// Returns the carrier index for one exact canonical encoded boundary.
+    pub fn carrier_index_at_offset(&self, encoded_offset: u64) -> Option<u64> {
+        self.boundaries
+            .binary_search(&encoded_offset)
+            .ok()
+            .and_then(|index| u64::try_from(index).ok())
+    }
+
     /// Whether the index and offset identify the same canonical boundary.
     pub fn contains_checkpoint(&self, carrier_index: u64, encoded_offset: u64) -> bool {
         self.carrier_offset(carrier_index) == Some(encoded_offset)
@@ -5976,6 +5984,8 @@ mod tests {
         assert_eq!(layout.carrier_offset(1), Some(7));
         assert_eq!(layout.carrier_offset(2), Some(18));
         assert_eq!(layout.carrier_offset(3), Some(31));
+        assert_eq!(layout.carrier_index_at_offset(18), Some(2));
+        assert_eq!(layout.carrier_index_at_offset(17), None);
         assert!(!layout.contains_checkpoint(2, 17));
 
         for total in [64_u64 << 20, 1_u64 << 30, 2_u64 << 30] {

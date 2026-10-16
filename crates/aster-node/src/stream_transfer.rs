@@ -512,6 +512,21 @@ impl StreamSenderState {
     pub(crate) const fn transport_lost(&self) -> StreamAction {
         StreamAction::Retry(StreamRetry::TransportLost)
     }
+    pub(crate) const fn durable_offset(&self) -> u64 {
+        self.durable
+    }
+    pub(crate) const fn next_offset(&self) -> u64 {
+        self.next
+    }
+    pub(crate) const fn receive_limit(&self) -> u64 {
+        self.limit
+    }
+    pub(crate) const fn max_extent_bytes(&self) -> u32 {
+        self.max_extent
+    }
+    pub(crate) const fn checkpoint_generation(&self) -> u64 {
+        self.generation
+    }
     pub(crate) fn accept(&mut self, x: StreamAcceptV1) -> Result<(), StreamError> {
         self.identity(&x.transfer_id, &x.attempt_nonce)?;
         if x.sequence != 0
