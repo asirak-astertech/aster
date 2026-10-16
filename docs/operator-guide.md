@@ -383,6 +383,10 @@ install -m 0600 /protected/inbox/node.astpb03 "$ASTER_BUNDLE_INPUT"
 ```
 
 Replace the bundle path with this node's authority-issued bundle.
+Keep `$ASTER_TOKEN_INPUT` owner-only: the credential generator wraps a copy
+for the agent, while the one-shot `asterctl` service mounts this plaintext
+input as its only credential. Regenerate and retain the matching input when
+rotating the API token.
 
 ### Step 3: create a credential generation
 
@@ -403,11 +407,14 @@ Record the printed generation and select it:
 ```sh
 export ASTER_CREDENTIAL_GENERATION_DIR="$ASTER_GENERATION_PARENT/generation-<64-hex>"
 test -d "$ASTER_CREDENTIAL_GENERATION_DIR"
+chmod 0500 "$ASTER_CREDENTIAL_GENERATION_DIR"
 jq . "$ASTER_CREDENTIAL_GENERATION_DIR/manifest.json"
 ```
 
 Do not print the other generation files. This command installs an existing
-bundle; it does not issue one.
+bundle; it does not issue one. The explicit host-side mode enforcement is
+idempotent and covers engines whose bind-mount layer does not preserve the
+container's final directory-mode change.
 
 ### Step 4: configure and start
 
@@ -541,7 +548,8 @@ and matching Blob hashes—not contact counters alone—prove transfer.
 
 - Application and health listeners are container-loopback-only.
 - The default file publishes no host port; remote mesh exposure is opt-in.
-- `asterctl` receives only the client token and `/transfer`, not agent state or
+- `asterctl` receives only the owner-only plaintext client token and
+  `/transfer`, not the generation's protected token envelope, agent state, or
   mission provisioning credentials.
 - Separate projects remain separate one-agent deployments.
 

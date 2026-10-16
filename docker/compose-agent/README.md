@@ -123,7 +123,10 @@ token and selected non-secret manifest, and has no state-directory access.
 All services run as the invoking user's numeric UID/GID with every capability
 dropped. The operator creates `ASTER_STATE_DIR` and `ASTER_TRANSFER_DIR` with
 mode `0700`; the validator rejects missing, relative, symlinked, differently
-owned, or differently moded paths. The CLI service receives only the client
-token and transfer bind, shares the agent network namespace, and prefixes each
-command with `asterctl --token-file /run/secrets/aster-client-token`. No host
-root or `sudo` access is part of this profile.
+owned, or differently moded paths. It also validates the owner-only plaintext
+`ASTER_TOKEN_INPUT`; the CLI service mounts that input through the distinct
+`aster-operator-client-token` secret because the generation-bound token is a
+provider envelope. The CLI otherwise receives only the transfer bind, shares
+the agent network namespace, and prefixes each command with
+`asterctl --token-file /run/secrets/aster-client-token`. No host root or
+`sudo` access is part of this profile.
