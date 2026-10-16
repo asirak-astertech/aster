@@ -1018,7 +1018,8 @@ initiator sends and the responder returns one protected canonical
 `EventPagesV1`, `3` reserved for `BlobCustodyV1` (not implemented), `4`
 `BlobRangesStreamV1`, and `5` `BlobStreamV1`. Lanes and profiles are strictly
 descending and unique. Event, State, Record, and EventBridge MUST offer
-`LegacyV6`. Blob offers MUST contain `LegacyV6` or `BlobRangesStreamV1`;
+`LegacyV6`. Blob offers MUST contain `LegacyV6`, `BlobRangesStreamV1`, or
+`BlobStreamV1`;
 semantic v7/v8 offers only `BlobRangesStreamV1`, while semantic v9 offers only
 `BlobStreamV1`. Only Event may offer `EventPagesV1`, and only Blob may offer
 `BlobRangesStreamV1` or `BlobStreamV1`. Unknown
@@ -1046,10 +1047,40 @@ an active profile-5 attempt is never downgraded into profile 4.
 Semantic v9 reserves mechanics tags `0xd6` `StreamOpenV1`, `0xd7`
 `StreamAcceptV1`, `0xd8` `StreamDataV1`, `0xd9` `StreamCheckpointV1`, `0xda`
 `StreamFinishV1`, `0xdb` `StreamResultV1`, and `0xdc` `StreamResultAckV1` for
-profile 5. Allocation alone does not activate those records: until the bounded
-stream grammar and runtime driver are present, profile-5 Blob work fails closed
-before carrier I/O. Tags `0xd1..0xd5` and every semantic-v7/v8 byte retain their
-existing meanings.
+profile 5. The bounded grammar is implemented, but allocation and parsing alone
+do not activate it: until the runtime driver is present, profile-5 Blob work
+fails closed before carrier I/O. Tags `0xd1..0xd5` and every semantic-v7/v8 byte
+retain their existing meanings.
+
+The profile-5 mechanics prefix is `"ASM\x01" || tag`. All integers are
+unsigned big-endian. The attempt tuple used after `StreamOpenV1` is
+`transfer_id[32] || attempt_nonce[32] || sequence u64`. A zero attempt nonce,
+unknown class/direction/result value, truncation, trailing bytes, arithmetic
+overflow, or a record decoded outside semantic v9/profile 5 fails closed.
+
+The canonical record bodies are:
+
+| Tag | Body after prefix and tag |
+| --- | --- |
+| `0xd6` StreamOpenV1 | `class u8 || direction u8 || semantic_version u16 = 9 || profile_id u16 = 5 || session_transcript[32] || exchange_id u64 || transfer_id[32] || source_transfer_id[32] || publication_id[32] || variant_id[32] || total_len u64 || attempt_nonce[32] || checkpoint_generation u64 || custody_present u8 || custody_digest[32] iff present` |
+| `0xd7` StreamAcceptV1 | `attempt tuple || durable_offset u64 || checkpoint_generation u64 || absolute_receive_limit u64 || max_extent_bytes u32 || checkpoint_batch_bytes u32` |
+| `0xd8` StreamDataV1 | `attempt tuple || offset u64 || extent_len u32 || extent[extent_len]` |
+| `0xd9` StreamCheckpointV1 | `attempt tuple || durable_offset u64 || checkpoint_generation u64 || absolute_receive_limit u64` |
+| `0xda` StreamFinishV1 | `attempt tuple || final_offset u64` |
+| `0xdb` StreamResultV1 | `attempt tuple || final_offset u64 || result_code u8 || result_digest[32]` |
+| `0xdc` StreamResultAckV1 | `attempt tuple || result_digest[32]` |
+
+`class = 1` is Blob. Result codes are `1` Promoted, `2` AlreadyPresent, `3`
+DeferredCapacity, `4` RetiredExpired, `5` RejectedPolicy, and `6`
+IntegrityFailure. Extents are nonempty and at most 1,048,576 bytes;
+checkpoint batches are nonzero and at most 8 MiB. A reader MUST consume and
+validate the fixed 89-byte StreamData header, reserve the exact declared body
+against the global streaming budget, and only then read or allocate the body.
+Credit is an absolute offset and never decreases within an attempt. Durable
+offsets and checkpoint generations never move backward. Reopen uses a fresh
+nonce and resumes only from the receiver's durable offset. Duplicate terminal
+records replay the same digest-bound result or acknowledgement and never repeat
+promotion.
 
 For each admitted Blob direction, profile 4 sends one protected `ABRS || 0x01`
 schedule containing at most 64 canonical `BlobRangeFetchV5` tuples and receives

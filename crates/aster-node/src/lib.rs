@@ -42,6 +42,8 @@ mod frame;
 mod identity;
 pub mod mission;
 mod runtime;
+#[allow(dead_code)] // Activated by the profile-5 runtime driver in Task 7.
+mod stream_transfer;
 
 pub use aster_redb_store::{BlobDepotLimits, CustodyQuota, StoreLimits};
 pub use control_admin::{
@@ -315,6 +317,13 @@ pub fn fuzz_decode_mechanics_frame_for_semantic_version(
         frame
     );
     true
+}
+
+/// Exercises semantic-v9/profile-5 stream decoding and pure transitions.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_stream_transfer_decode(input: &[u8]) {
+    stream_transfer::fuzz_decode(input);
 }
 
 #[cfg(test)]

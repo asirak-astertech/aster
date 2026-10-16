@@ -11,6 +11,7 @@ use crate::NodeError;
 use crate::event_pages::{
     ChangePageV7, ChangeTurnFinishedV1, ChangeTurnHeaderV1, EventTurnPlanV1, TransferProfileOfferV1,
 };
+use crate::stream_transfer::{STREAM_TAGS, StreamFrame};
 
 const MAGIC: &[u8; 4] = b"ASM\x01";
 pub(crate) const MECHANICS_FRAME_PREFIX_BYTES: usize = MAGIC.len() + 1;
@@ -884,6 +885,8 @@ pub(crate) enum Frame {
     ChangeTurnHeader(ChangeTurnHeaderV1),
     ChangePage(ChangePageV7),
     ChangeTurnFinished(ChangeTurnFinishedV1),
+    #[allow(dead_code)] // Activated by the profile-5 runtime driver.
+    Stream(StreamFrame),
 }
 
 impl Frame {
@@ -1516,6 +1519,11 @@ impl Frame {
                         .map_err(|error| NodeError::Protocol(error.to_string()))?,
                 );
             }
+            Self::Stream(_) => {
+                return Err(NodeError::Protocol(
+                    "stream frame requires an authenticated semantic/profile context".into(),
+                ));
+            }
         }
         Ok(output)
     }
@@ -1535,6 +1543,34 @@ impl Frame {
         } else {
             self.encode()
         }
+    }
+
+    #[allow(dead_code)] // Activated by the profile-5 runtime driver.
+    pub(crate) fn encode_for_semantic_profile(
+        &self,
+        semantic_version: u16,
+        profile_id: u16,
+    ) -> Result<Vec<u8>, NodeError> {
+        match self {
+            Self::Stream(frame) => frame
+                .encode_for_context(semantic_version, profile_id)
+                .map_err(|error| NodeError::Protocol(error.to_string())),
+            _ => self.encode_for_semantic_version(semantic_version),
+        }
+    }
+
+    #[allow(dead_code)] // Activated by the profile-5 runtime driver.
+    pub(crate) fn decode_for_semantic_profile(
+        input: &[u8],
+        semantic_version: u16,
+        profile_id: u16,
+    ) -> Result<Self, NodeError> {
+        if input.len() >= 5 && STREAM_TAGS.contains(&input[4]) {
+            return StreamFrame::decode_for_context(semantic_version, profile_id, input)
+                .map(Self::Stream)
+                .map_err(|error| NodeError::Protocol(error.to_string()));
+        }
+        Self::decode_for_semantic_version(input, semantic_version)
     }
 
     pub(crate) fn decode_for_semantic_version(
