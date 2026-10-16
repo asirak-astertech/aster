@@ -8,7 +8,8 @@ gRPC-Web on plaintext loopback TCP. On Linux, it additionally serves bounded
 Blob publish/read streams through native gRPC. On non-Linux hosts, `ReadBlob`
 remains available to a capable native-gRPC client, but `PublishBlob` is
 unsupported because secure upload staging is Linux-only; `asterctl blob-read`
-also requires Linux anonymous-file finalization. It does not expose keys,
+also requires Linux atomic no-replace output finalization in an owner-controlled
+directory. It does not expose keys,
 sealed content, carriers, transport choice, reconciliation messages, or
 mission provisioning over RPC.
 
