@@ -49,6 +49,8 @@ mod blob;
 mod blob;
 #[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
 mod blob_custody;
+#[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
+mod blob_custody_v2;
 #[cfg(all(feature = "sqlite-store", feature = "adapter-sdk"))]
 pub mod causal;
 #[cfg(all(feature = "sqlite-store", not(feature = "adapter-sdk")))]
@@ -155,6 +157,12 @@ pub use blob_custody::{
     AuthenticatedBlobCustodyContactV1, AuthenticatedBlobCustodySendContextV1,
     BLOB_CUSTODY_CLAIM_V1_BYTES, BlobCustodyClaimV1, BlobCustodyDirectionV1, BlobCustodyError,
     BlobCustodyTransferId, OpenedBlobSourceFrameV1, VerifiedBlobCustodyClaimV1,
+};
+#[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
+pub use blob_custody_v2::{
+    ApplicationRecordContext, AuthenticatedBlobCustodyContactV2,
+    AuthenticatedBlobCustodySendContextV2, BLOB_CUSTODY_CLAIM_V2_BYTES, BlobCustodyClaimV2,
+    VerifiedBlobCustodyClaimV2,
 };
 #[cfg(feature = "reference-session")]
 pub use bridge_adapter::{
