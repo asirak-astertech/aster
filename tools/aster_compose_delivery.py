@@ -31,7 +31,7 @@ MAX_COMPOSE_BYTES = 256 * 1024
 MAX_CONFIG_BYTES = 256 * 1024
 MAX_MANIFEST_BYTES = 64 * 1024
 COMPOSE_BUILD_WORKFLOW_SHA256 = (
-    "7fa447bdbbcb5fcad220af3d33b4fead6371528136cf90784ee26ab36ec601e9"
+    "dc5b706de7bed54cf236404e9e0150ce264b6f04d35a1ce8549dc02050c28980"
 )
 SETUP_BUILDX_ACTION = (
     "docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069"
@@ -233,6 +233,8 @@ def validate_workflow_policy(workflow: str, ci: str) -> None:
         "SHA256SUMS",
         "compose.remote-mesh.yaml",
         "remote_mesh_override",
+        "aster_compose_delivery.py",
+        "validator_sha256",
         "agent.example.json",
         "credential-canary-scan",
         "python3 tools/inspect_aster_compose_oci.py",
@@ -283,6 +285,11 @@ def validate_workflow_policy(workflow: str, ci: str) -> None:
     if (
         workflow.count("compose.remote-mesh.yaml") != 6
         or workflow.count("remote_mesh_sha256") != 3
+    ):
+        raise ValidationError("compose-delivery-policy-invalid")
+    if (
+        workflow.count("aster_compose_delivery.py") != 6
+        or workflow.count("validator_sha256") != 3
     ):
         raise ValidationError("compose-delivery-policy-invalid")
     if workflow.count("agent.example.json") != 5:
