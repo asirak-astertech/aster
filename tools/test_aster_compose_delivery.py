@@ -567,6 +567,31 @@ class ScopeReductionTests(DeliveryTestCase):
 
 
 class RepositoryPolicyTests(unittest.TestCase):
+    def test_admin_artifact_ships_asterctl_with_admin_bound_sbom(self):
+        dockerfile = (REPOSITORY / "docker/compose-agent/Dockerfile.admin").read_text()
+        workflow = (REPOSITORY / ".github/workflows/build-compose-images.yml").read_text()
+
+        self.assertIn("-p asterctl", dockerfile)
+        self.assertIn("--bin asterctl", dockerfile)
+        self.assertIn(
+            "/out/rootfs/usr/local/bin/asterctl",
+            dockerfile,
+        )
+        self.assertIn(
+            "cargo cyclonedx --format json --spec-version 1.5 --describe binaries \\\n"
+            "            --manifest-path crates/asterctl/Cargo.toml",
+            workflow,
+        )
+        self.assertIn(
+            "bind_sbom target/compose-release/asterctl_bin.cdx.json "
+            "asterctl \"$admin_digest\"",
+            workflow,
+        )
+        self.assertIn(
+            '"aster-compose-verify_bin.cdx.json","asterctl_bin.cdx.json"',
+            workflow,
+        )
+
     def test_runtime_dockerfiles_copy_one_prepared_rootfs(self):
         agent = (REPOSITORY / "docker/compose-agent/Dockerfile.agent").read_text()
         admin = (REPOSITORY / "docker/compose-agent/Dockerfile.admin").read_text()
@@ -675,6 +700,7 @@ class RepositoryPolicyTests(unittest.TestCase):
         self.assertEqual(
             workflow.count("--build-arg SOURCE_DATE_EPOCH=946684800"), 4
         )
+        self.assertEqual(workflow.count("--describe binaries"), 2)
         self.assertEqual(workflow.count("oci-artifact=true"), 2)
         self.assertEqual(workflow.count("--output type=docker"), 2)
         self.assertEqual(workflow.count("docker image load --input"), 2)

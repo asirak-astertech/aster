@@ -144,12 +144,15 @@ jobs:
         run: |
           cargo cyclonedx --format json --spec-version 1.5 --describe binaries \
             --manifest-path crates/aster-compose-credentials/Cargo.toml
+          cargo cyclonedx --format json --spec-version 1.5 --describe binaries \
+            --manifest-path crates/asterctl/Cargo.toml
           agent_digest=$(jq -er '."containerimage.digest"' target/compose-release/agent-build-metadata.json)
           admin_digest=$(jq -er '."containerimage.digest"' target/compose-release/admin-build-metadata.json)
           install -m 0444 crates/aster-compose-credentials/aster-compose-agent_bin.cdx.json target/compose-release/
           install -m 0444 crates/aster-compose-credentials/aster-compose-healthcheck_bin.cdx.json target/compose-release/
           install -m 0444 crates/aster-compose-credentials/aster-compose-credential-admin_bin.cdx.json target/compose-release/
           install -m 0444 crates/aster-compose-credentials/aster-compose-verify_bin.cdx.json target/compose-release/
+          install -m 0444 crates/asterctl/asterctl_bin.cdx.json target/compose-release/
           bind_sbom() {
             sbom=$1
             binary=$2
@@ -171,6 +174,7 @@ jobs:
           bind_sbom target/compose-release/aster-compose-healthcheck_bin.cdx.json aster-compose-healthcheck "$agent_digest"
           bind_sbom target/compose-release/aster-compose-credential-admin_bin.cdx.json aster-compose-credential-admin "$admin_digest"
           bind_sbom target/compose-release/aster-compose-verify_bin.cdx.json aster-compose-verify "$admin_digest"
+          bind_sbom target/compose-release/asterctl_bin.cdx.json asterctl "$admin_digest"
           cp LICENSE THIRD_PARTY_NOTICES.md target/compose-release/
 
       - name: Record release inputs, builder versions, and Compose digest
@@ -215,7 +219,7 @@ jobs:
             --arg compose_sha256 "$compose_digest" \
             --arg config_template_sha256 "$config_template_digest" \
             --arg arch "${{ matrix.arch }}" \
-            '{schema:$schema,source_revision:$source_revision,architecture:$architecture,images:{agent:{oci_index_digest:$agent_oci_digest,manifest_digest:$agent_manifest_digest,config_digest:$agent_config_digest,docker_image_id:$agent_docker_image_id,transport_tag:$agent_tag,oci:("aster-compose-agent-"+$arch+".oci"),docker:("aster-compose-agent-"+$arch+".docker.tar"),sbom_set:["aster-compose-agent_bin.cdx.json","aster-compose-healthcheck_bin.cdx.json"]},admin:{oci_index_digest:$admin_oci_digest,manifest_digest:$admin_manifest_digest,config_digest:$admin_config_digest,docker_image_id:$admin_docker_image_id,transport_tag:$admin_tag,oci:("aster-compose-admin-"+$arch+".oci"),docker:("aster-compose-admin-"+$arch+".docker.tar"),sbom_set:["aster-compose-credential-admin_bin.cdx.json","aster-compose-verify_bin.cdx.json"]}},compose:{file:"compose.yaml",sha256:$compose_sha256,config_template:{file:"agent.example.json",sha256:$config_template_sha256}}}' \
+            '{schema:$schema,source_revision:$source_revision,architecture:$architecture,images:{agent:{oci_index_digest:$agent_oci_digest,manifest_digest:$agent_manifest_digest,config_digest:$agent_config_digest,docker_image_id:$agent_docker_image_id,transport_tag:$agent_tag,oci:("aster-compose-agent-"+$arch+".oci"),docker:("aster-compose-agent-"+$arch+".docker.tar"),sbom_set:["aster-compose-agent_bin.cdx.json","aster-compose-healthcheck_bin.cdx.json"]},admin:{oci_index_digest:$admin_oci_digest,manifest_digest:$admin_manifest_digest,config_digest:$admin_config_digest,docker_image_id:$admin_docker_image_id,transport_tag:$admin_tag,oci:("aster-compose-admin-"+$arch+".oci"),docker:("aster-compose-admin-"+$arch+".docker.tar"),sbom_set:["aster-compose-credential-admin_bin.cdx.json","aster-compose-verify_bin.cdx.json","asterctl_bin.cdx.json"]}},compose:{file:"compose.yaml",sha256:$compose_sha256,config_template:{file:"agent.example.json",sha256:$config_template_sha256}}}' \
             > target/compose-release/release-manifest.json
           cd target/compose-release
           sha256sum ./* > SHA256SUMS
@@ -236,6 +240,7 @@ jobs:
             target/compose-release/aster-compose-healthcheck_bin.cdx.json \
             target/compose-release/aster-compose-credential-admin_bin.cdx.json \
             target/compose-release/aster-compose-verify_bin.cdx.json \
+            target/compose-release/asterctl_bin.cdx.json \
             target/compose-release/LICENSE \
             target/compose-release/THIRD_PARTY_NOTICES.md \
             target/compose-release/compose.yaml \
