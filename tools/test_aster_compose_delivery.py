@@ -727,6 +727,50 @@ class ScopeReductionTests(DeliveryTestCase):
 
 
 class RepositoryPolicyTests(unittest.TestCase):
+    def test_blob_read_operator_docs_describe_portable_named_staging(self):
+        for path in (
+            REPOSITORY / "crates/asterctl/asterctl-blob-read.1",
+            REPOSITORY / "crates/aster-agent/README.md",
+        ):
+            source = path.read_text()
+            with self.subTest(path=path):
+                self.assertIn("owner-controlled", source)
+                self.assertIn("mode-0600", source)
+                self.assertIn("best-effort", source)
+                self.assertNotIn("O_TMPFILE", source)
+                self.assertNotIn("anonymous temporary", source)
+                self.assertNotIn("No named partial path exists", source)
+
+    def test_cross_device_runbook_keeps_remote_mesh_override_on_cli_commands(self):
+        runbook = (REPOSITORY / "docs/operator-guide.md").read_text()
+        cross_device = runbook.split(
+            "### Step 7: connect this Docker node to a test device", 1
+        )[1].split("### Compose boundaries", 1)[0]
+        self.assertNotIn("Use Step 5 above", cross_device)
+        self.assertGreaterEqual(
+            cross_device.count('-f "$ASTER_REMOTE_MESH_FILE"'),
+            8,
+        )
+        for command in (" publish ", " query ", "blob-publish", "blob-read"):
+            with self.subTest(command=command):
+                self.assertIn(command, cross_device)
+
+        remote_lifecycle = runbook.split(
+            "Remote-mesh lifecycle commands:", 1
+        )[1].split("`down` preserves", 1)[0]
+        self.assertEqual(
+            remote_lifecycle.count('-f "$ASTER_REMOTE_MESH_FILE"'),
+            4,
+        )
+        for command in (
+            "up -d --force-recreate aster-agent",
+            "run --rm verify",
+            "stop -t 40 aster-agent",
+            "down",
+        ):
+            with self.subTest(command=command):
+                self.assertIn(command, remote_lifecycle)
+
     def test_operator_runbook_has_artifact_only_compose_cli_examples(self):
         runbook = (REPOSITORY / "docs/operator-guide.md").read_text()
         required = (
