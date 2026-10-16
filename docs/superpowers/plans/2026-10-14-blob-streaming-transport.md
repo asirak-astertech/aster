@@ -19,7 +19,7 @@
 - Label project communications and retained review artifacts `Clean Room — Privileged`.
 - Start a new isolated worktree at reviewed PR 47 head `04de641bfb3d647290ffffabe40ec284d9865a95`, which contains exact PR 71 head `c17213a50a598b85c3fe672b7195a03b476b07ab`. Recheck both heads before work and rebase onto their final ordered merges before handoff.
 - Carry forward documentation commits only. Do not merge, cherry-pick, or build on superseded implementation commits `4f7ffb3e..212269b4` from `docs/blob-streaming-protocol-design`.
-- Allocate semantic protocol version `9`, transfer-profile ID `5` (`BlobStreamV1`), and mechanics tags `0xd6..0xdc`. Keep profile `3` reserved and profile `4` as `BlobRangesStreamV1` for semantic v7/v8.
+- Allocate semantic protocol version `9`, transfer-profile ID `5` (`BlobStreamV1`), attempt-record tags `0xd6..0xdc`, and mission-protected pre-open plan tags `0xdd..0xde`. Keep profile `3` reserved and profile `4` as `BlobRangesStreamV1` for semantic v7/v8.
 - Preserve semantic-v1 through semantic-v8 bytes and behavior exactly. Semantic v9's Blob offer is `[5]`; mixed-version contacts select v8/profile 4 or v7/profile 4 through semantic negotiation, never by downgrading an active profile-5 attempt.
 - Reuse PR 47 lifetime, age, lease, pressure, retirement, deletion-fence, reclamation, and public Rust API authority. Do not create a parallel lifecycle model.
 - Compose with PR 95's operator workflow after its final reviewed merge: preserve restart-only exact Blob receive interests, the explicit-depot requirement, `receive_only` suppression, hardened incremental `asterctl blob-read` publication, and opt-in Compose mesh exposure. None of those surfaces selects a transport or grants mission authority.
@@ -80,7 +80,7 @@
 
 - [ ] **Step 1: Recheck the base and allocation registries**
 
-  Confirm the implementation base contains exact reviewed PR 71 and PR 47 heads or their final merge commits. Inspect open PRs for semantic v9, profile `5`, tags `0xd6..0xdc`, and Decision 0046 conflicts. Stop for a design amendment if any allocation is no longer free.
+  Confirm the implementation base contains exact reviewed PR 71 and PR 47 heads or their final merge commits. Inspect open PRs for semantic v9, profile `5`, tags `0xd6..0xde`, and Decision 0046 conflicts. Stop for a design amendment if any allocation is no longer free.
 
 - [ ] **Step 2: Write failing semantic-version and profile tests**
 
@@ -432,6 +432,7 @@
 - Produces: bounded public `BlobStreamTransferStatus` with phase, total/durable bytes, rolling throughput, and sanitized terminal category only.
 - Produces: separate privileged/operator telemetry with transport ID, candidate ranking, attempt count, received/retransmitted bytes, receive limit, checkpoint, checkpoint latency, writer-commit count, and failover recovery. These fields are not exposed through the public Blob application API.
 - Produces: v9 settlement that advances the existing publication cursor only after bound `StreamResultAck`.
+- Produces: mission-protected `BlobStreamPlanV1`/reply (`0xdd..0xde`) so the receiver selects exact source/checkpoint independently of metadata differences before every attempt.
 - Preserves: PR 71 profile-4 runtime, PR 47 public lifetime API, and all v1-v8 behavior.
 
 - [ ] **Step 1: Write failing small end-to-end runtime tests**
@@ -516,7 +517,7 @@
 
 - [ ] **Step 4: Extend independent vectors and hostile coverage**
 
-  Add Python-generated v9/custody-v2 records, all seven tags to structured fuzzing, and hostile length/offset/credit/sequence/generation/settlement/allocation cases.
+  Add Python-generated v9/custody-v2 records, all seven attempt tags plus both pre-open plan tags to structured fuzzing, and hostile length/offset/credit/sequence/generation/settlement/allocation cases.
 
 - [ ] **Step 5: Add CI partitioning without weakening gates**
 

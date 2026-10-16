@@ -7,6 +7,7 @@ use crate::application::{
     BlobStreamTerminalCategory, BlobStreamTransferPhase, BlobStreamTransferStatus,
 };
 use crate::{
+    frame::{BlobInterest, BlobStreamPlanSelectionV1, BlobStreamPlanV1},
     mission::MissionSession,
     stream_transfer::{
         MAX_STREAM_CHECKPOINT_BATCH_BYTES, MAX_STREAM_EXTENT_BYTES, StreamAction, StreamDataV1,
@@ -31,7 +32,9 @@ use std::{sync::Arc, time::Duration};
 use super::{
     BlobContactMode, CompletedBlobStreamSource, EventDirection, EventLaneGuard,
     MutableApplyDisposition, NodeError, PendingBlobRecoveryDisposition, ReferenceEnvelopeSealer,
-    load_completed_blob_stream_source, load_pending_blob_plan, recover_and_finalize_pending_blob,
+    abort_pending_blob_with_cached_claim, load_completed_blob_stream_source,
+    load_pending_blob_plan, next_pending_blob_source_for_contact, pending_blob_claim_is_current,
+    recover_and_finalize_pending_blob,
 };
 
 const STREAM_ATTEMPT_DEADLINE: Duration = Duration::from_secs(30 * 60);
@@ -188,6 +191,7 @@ pub(super) async fn drive_sender_attempt<R>(
     profile_digest: [u8; 32],
     direction: EventDirection,
     open: StreamOpenV1,
+    expected_checkpoint: BlobStreamPlanSelectionV1,
     mut read_extent: R,
 ) -> Result<StreamResultCode, NodeError>
 where
@@ -215,6 +219,13 @@ where
     else {
         return Err(protocol("first control record is not acceptance"));
     };
+    if accepted.durable_offset != expected_checkpoint.durable_offset
+        || accepted.checkpoint_generation != expected_checkpoint.checkpoint_generation
+    {
+        return Err(protocol(
+            "acceptance differs from the authenticated pre-open plan",
+        ));
+    }
     state.accept(accepted).map_err(protocol)?;
 
     let mut finish_sent = false;
@@ -318,22 +329,81 @@ fn stream_open(
     }
 }
 
-/// Sends one exact durable source selected by the authenticated metadata lane.
-/// The first runtime milestone intentionally permits only the initial
-/// generation; resumable source selection is added with the authenticated
-/// pre-open recovery exchange rather than guessing receiver state.
-pub(super) async fn send(
+pub(super) fn select_receive_plan(
     store: &Store,
-    connection: &aster_iroh::Connection,
-    mission: &mut MissionSession,
     verifier: &mut ReferenceEnvelopeSealer,
     guard: &EventLaneGuard,
     direction: EventDirection,
-    source: BlobTransferId,
-    profile_digest: [u8; 32],
-) -> Result<StreamResultCode, NodeError> {
+    local_interest: &BlobInterest,
+) -> Result<BlobStreamPlanV1, NodeError> {
     guard.check(store)?;
-    let loaded = load_completed_blob_stream_source(store, verifier, source)?
+    let Some(projection) = next_pending_blob_source_for_contact(
+        store,
+        guard.policy(),
+        None,
+        BlobContactMode::StreamV1,
+    )?
+    else {
+        return Ok(BlobStreamPlanV1 {
+            direction,
+            selection: None,
+        });
+    };
+    let source = projection.transfer_id;
+    if local_interest
+        .selector(&projection.topic, &projection.scope)
+        .filter(|selector| selector.epoch() == projection.epoch)
+        .is_none()
+    {
+        if pending_blob_claim_is_current(store, verifier, &projection, BlobContactMode::StreamV1)? {
+            abort_pending_blob_with_cached_claim(store, verifier, source)?;
+        }
+        return Ok(BlobStreamPlanV1 {
+            direction,
+            selection: None,
+        });
+    }
+    let Some((blob, _, plan)) =
+        load_pending_blob_plan(store, verifier, source, BlobContactMode::StreamV1)?
+    else {
+        return Err(protocol("selected pending source became unavailable"));
+    };
+    if blob.ttl_ms().is_some() {
+        return Err(protocol(
+            "finite pending source requires authenticated custody-v2 stream authority",
+        ));
+    }
+    let layout = BlobStreamLayout::from_plan(&plan).map_err(protocol)?;
+    let checkpoint = store.blob_stream_checkpoint_with_policy(guard.policy(), source, &plan)?;
+    if !layout.contains_checkpoint(
+        checkpoint.next_carrier_index,
+        checkpoint.durable_encoded_offset,
+    ) {
+        return Err(protocol(
+            "durable checkpoint is outside the selected Blob layout",
+        ));
+    }
+    Ok(BlobStreamPlanV1 {
+        direction,
+        selection: Some(BlobStreamPlanSelectionV1 {
+            source_id: source,
+            next_carrier_index: checkpoint.next_carrier_index,
+            durable_offset: checkpoint.durable_encoded_offset,
+            checkpoint_generation: checkpoint.generation,
+        }),
+    })
+}
+
+fn load_authorized_send_source(
+    store: &Store,
+    mission: &MissionSession,
+    verifier: &mut ReferenceEnvelopeSealer,
+    guard: &EventLaneGuard,
+    selection: BlobStreamPlanSelectionV1,
+    peer_interest: &BlobInterest,
+) -> Result<(CompletedBlobStreamSource, BlobStreamLayout), NodeError> {
+    guard.check(store)?;
+    let loaded = load_completed_blob_stream_source(store, verifier, selection.source_id)?
         .ok_or_else(|| protocol("selected completed source is unavailable"))?;
     if loaded.blob.ttl_ms().is_some() {
         return Err(protocol(
@@ -341,7 +411,71 @@ pub(super) async fn send(
         ));
     }
     let layout = BlobStreamLayout::from_plan(&loaded.plan).map_err(protocol)?;
-    let open = stream_open(mission, direction, source, &loaded, &layout, 1);
+    if !layout.contains_checkpoint(selection.next_carrier_index, selection.durable_offset) {
+        return Err(protocol(
+            "pre-open checkpoint is outside the completed Blob layout",
+        ));
+    }
+    let selector = peer_interest
+        .selector(loaded.blob.topic(), loaded.blob.scope())
+        .filter(|selector| selector.epoch() == loaded.blob.key_epoch())
+        .ok_or_else(|| protocol("pre-open source is outside peer interest"))?;
+    let peer = mission.peer().mission_id();
+    let commitments = mission.peer_route_grant_commitments();
+    if !verifier.peer_can_route(
+        peer,
+        commitments,
+        loaded.blob.scope(),
+        loaded.blob.key_epoch(),
+    ) || !verifier.peer_can_open_blob_content(
+        peer,
+        commitments,
+        loaded.blob.scope(),
+        loaded.blob.topic(),
+        loaded.blob.key_epoch(),
+        selector.content_proof(),
+    ) {
+        return Err(protocol("peer lost exact pre-open Blob entitlement"));
+    }
+    Ok((loaded, layout))
+}
+
+pub(super) fn validate_send_plan(
+    store: &Store,
+    mission: &MissionSession,
+    verifier: &mut ReferenceEnvelopeSealer,
+    guard: &EventLaneGuard,
+    selection: BlobStreamPlanSelectionV1,
+    peer_interest: &BlobInterest,
+) -> Result<(), NodeError> {
+    load_authorized_send_source(store, mission, verifier, guard, selection, peer_interest)?;
+    Ok(())
+}
+
+/// Sends one exact durable source selected by the receiver's authenticated
+/// pre-open plan.
+pub(super) async fn send(
+    store: &Store,
+    connection: &aster_iroh::Connection,
+    mission: &mut MissionSession,
+    verifier: &mut ReferenceEnvelopeSealer,
+    guard: &EventLaneGuard,
+    direction: EventDirection,
+    selection: BlobStreamPlanSelectionV1,
+    peer_interest: &BlobInterest,
+    profile_digest: [u8; 32],
+) -> Result<StreamResultCode, NodeError> {
+    let source = selection.source_id;
+    let (loaded, layout) =
+        load_authorized_send_source(store, mission, verifier, guard, selection, peer_interest)?;
+    let open = stream_open(
+        mission,
+        direction,
+        source,
+        &loaded,
+        &layout,
+        selection.checkpoint_generation,
+    );
     let adapter = selected_iroh_adapter(connection)?;
     let attempt = adapter
         .open_attempt(open_request(
@@ -359,6 +493,7 @@ pub(super) async fn send(
         profile_digest,
         direction,
         open,
+        selection,
         move |offset, maximum| {
             let layout = BlobStreamLayout::from_plan(plan).map_err(protocol)?;
             let next_carrier_index = layout
@@ -367,7 +502,7 @@ pub(super) async fn send(
             let checkpoint = BlobStreamCheckpoint {
                 next_carrier_index,
                 durable_encoded_offset: offset,
-                generation: 1,
+                generation: selection.checkpoint_generation,
             };
             let extent = store
                 .read_completed_blob_stream_extent_with_policy(
@@ -384,9 +519,9 @@ pub(super) async fn send(
     .await
 }
 
-/// Receives one exact durable source selected by the authenticated metadata
-/// lane, commits bounded whole-carrier batches, and promotes only after the
-/// final durable checkpoint.
+/// Receives one exact durable source selected by the receiver's authenticated
+/// pre-open plan, commits bounded whole-carrier batches, and promotes only
+/// after the final durable checkpoint.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn receive(
     store: &Store,
@@ -395,10 +530,11 @@ pub(super) async fn receive(
     verifier: &mut ReferenceEnvelopeSealer,
     guard: &EventLaneGuard,
     direction: EventDirection,
-    source: BlobTransferId,
+    selection: BlobStreamPlanSelectionV1,
     profile_digest: [u8; 32],
 ) -> Result<StreamResultCode, NodeError> {
     guard.check(store)?;
+    let source = selection.source_id;
     let (blob, manifest_bytes, plan) =
         load_pending_blob_plan(store, verifier, source, BlobContactMode::StreamV1)?
             .ok_or_else(|| protocol("selected pending source is unavailable"))?;
@@ -409,6 +545,14 @@ pub(super) async fn receive(
     }
     let layout = BlobStreamLayout::from_plan(&plan).map_err(protocol)?;
     let checkpoint = store.blob_stream_checkpoint_with_policy(guard.policy(), source, &plan)?;
+    if checkpoint.next_carrier_index != selection.next_carrier_index
+        || checkpoint.durable_encoded_offset != selection.durable_offset
+        || checkpoint.generation != selection.checkpoint_generation
+    {
+        return Err(protocol(
+            "durable checkpoint changed after the pre-open plan",
+        ));
+    }
     let nonce = attempt_nonce(
         mission.session_id(),
         direction,

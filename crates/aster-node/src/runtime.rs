@@ -149,7 +149,7 @@ use crate::{
     },
     format_node_id, format_path_field, format_receipt_field,
     frame::{
-        BlobInterest, BlobInterestSelector, BlobObjectId, BlobRangeDisposition,
+        BlobInterest, BlobInterestSelector, BlobObjectId, BlobRangeDisposition, BlobStreamPlanV1,
         BridgeRouteDisposition, EventApplyDisposition, EventDirection, EventInterest,
         EventInterestSelector, Frame, FrameEmissionPolicy, MAX_EVENT_INTEREST_BYTES,
         MAX_OBJECT_BYTES, MutableApplyDisposition, MutableClass, MutableTransferId,
@@ -25747,7 +25747,24 @@ async fn sync_mutable_classes(
             let profile_digest = receipt.transfer_profile_digest.ok_or_else(|| {
                 NodeError::Protocol("Blob stream profile digest is missing".into())
             })?;
-            if let Some(source) = exchange.to_responder {
+            let query = BlobStreamPlanV1 {
+                direction: EventDirection::ToSessionResponder,
+                selection: None,
+            };
+            let response =
+                request_mission_frame(connection, mission, Frame::BlobStreamPlan(query), receipt)
+                    .await?;
+            let Frame::BlobStreamPlanReply(to_responder) = response else {
+                return Err(NodeError::Protocol(
+                    "Blob stream plan query received another response".into(),
+                ));
+            };
+            if to_responder.direction != EventDirection::ToSessionResponder {
+                return Err(NodeError::Protocol(
+                    "Blob stream plan reply crossed directions".into(),
+                ));
+            }
+            if let Some(selection) = to_responder.selection {
                 let _ = blob_stream::send(
                     store,
                     connection,
@@ -25755,12 +25772,32 @@ async fn sync_mutable_classes(
                     verifier,
                     guard,
                     EventDirection::ToSessionResponder,
-                    source,
+                    selection,
+                    &exchange.peer_interest,
                     profile_digest,
                 )
                 .await?;
             }
-            if let Some(source) = exchange.to_initiator {
+            let to_initiator = blob_stream::select_receive_plan(
+                store,
+                verifier,
+                guard,
+                EventDirection::ToSessionInitiator,
+                &exchange.local_interest,
+            )?;
+            let response = request_mission_frame(
+                connection,
+                mission,
+                Frame::BlobStreamPlan(to_initiator),
+                receipt,
+            )
+            .await?;
+            if response != Frame::BlobStreamPlanReply(to_initiator) {
+                return Err(NodeError::Protocol(
+                    "Blob stream plan acknowledgement differs".into(),
+                ));
+            }
+            if let Some(selection) = to_initiator.selection {
                 let _ = blob_stream::receive(
                     store,
                     connection,
@@ -25768,7 +25805,7 @@ async fn sync_mutable_classes(
                     verifier,
                     guard,
                     EventDirection::ToSessionInitiator,
-                    source,
+                    selection,
                     profile_digest,
                 )
                 .await?;
@@ -28807,7 +28844,43 @@ async fn serve_mutable_classes(
             let profile_digest = receipt.transfer_profile_digest.ok_or_else(|| {
                 NodeError::Protocol("Blob stream profile digest is missing".into())
             })?;
-            if let Some(source) = exchange.to_responder {
+            let wire_budget = exchange_wire_budget(receipt)?;
+            let mut to_responder = None;
+            let (complete, request_bytes, response_bytes) =
+                respond_mission_frame(connection, mission, wire_budget, |frame, _, _| {
+                    let Frame::BlobStreamPlan(query) = frame else {
+                        return Err(NodeError::Protocol(
+                            "Blob stream plan phase received another request".into(),
+                        ));
+                    };
+                    if query
+                        != (BlobStreamPlanV1 {
+                            direction: EventDirection::ToSessionResponder,
+                            selection: None,
+                        })
+                    {
+                        return Err(NodeError::Protocol(
+                            "Blob stream responder plan query differs".into(),
+                        ));
+                    }
+                    let plan = blob_stream::select_receive_plan(
+                        store,
+                        verifier,
+                        guard,
+                        EventDirection::ToSessionResponder,
+                        &exchange.local_interest,
+                    )?;
+                    to_responder = plan.selection;
+                    Ok((Frame::BlobStreamPlanReply(plan), true))
+                })
+                .await?;
+            if !complete {
+                return Err(NodeError::Protocol(
+                    "Blob stream responder plan did not complete".into(),
+                ));
+            }
+            account(receipt, request_bytes, response_bytes)?;
+            if let Some(selection) = to_responder {
                 let _ = blob_stream::receive(
                     store,
                     connection,
@@ -28815,12 +28888,46 @@ async fn serve_mutable_classes(
                     verifier,
                     guard,
                     EventDirection::ToSessionResponder,
-                    source,
+                    selection,
                     profile_digest,
                 )
                 .await?;
             }
-            if let Some(source) = exchange.to_initiator {
+            let wire_budget = exchange_wire_budget(receipt)?;
+            let mut to_initiator = None;
+            let (complete, request_bytes, response_bytes) =
+                respond_mission_frame(connection, mission, wire_budget, |frame, _, mission| {
+                    let Frame::BlobStreamPlan(plan) = frame else {
+                        return Err(NodeError::Protocol(
+                            "Blob stream plan phase received another request".into(),
+                        ));
+                    };
+                    if plan.direction != EventDirection::ToSessionInitiator {
+                        return Err(NodeError::Protocol(
+                            "Blob stream initiator plan crossed directions".into(),
+                        ));
+                    }
+                    if let Some(selection) = plan.selection {
+                        blob_stream::validate_send_plan(
+                            store,
+                            mission,
+                            verifier,
+                            guard,
+                            selection,
+                            &exchange.peer_interest,
+                        )?;
+                    }
+                    to_initiator = plan.selection;
+                    Ok((Frame::BlobStreamPlanReply(plan), true))
+                })
+                .await?;
+            if !complete {
+                return Err(NodeError::Protocol(
+                    "Blob stream initiator plan did not complete".into(),
+                ));
+            }
+            account(receipt, request_bytes, response_bytes)?;
+            if let Some(selection) = to_initiator {
                 let _ = blob_stream::send(
                     store,
                     connection,
@@ -28828,7 +28935,8 @@ async fn serve_mutable_classes(
                     verifier,
                     guard,
                     EventDirection::ToSessionInitiator,
-                    source,
+                    selection,
+                    &exchange.peer_interest,
                     profile_digest,
                 )
                 .await?;
@@ -48300,6 +48408,62 @@ mod tests {
         claim
     }
 
+    fn stage_test_pending_blob_stream_v9(
+        store: &Store,
+        cache: &AuthenticatedEventRouteCache,
+        mission: &UnprotectedReferenceMission,
+        source: BlobTransferId,
+        sealed: &[u8],
+    ) -> AuthenticatedBlobRouteClaim {
+        let mut verifier = open_test_sealer(mission);
+        let route = verifier
+            .verify_blob(sealed)
+            .expect("verify pending v9 test Blob route");
+        assert_eq!(BlobTransferId::new(route.envelope_id()), source);
+        let BlobContentVerification::ContentVerified {
+            blob,
+            manifest_bytes,
+        } = verifier
+            .verify_blob_content(route, sealed)
+            .expect("verify pending v9 test Blob content")
+        else {
+            panic!("pending v9 test Blob lost content access");
+        };
+        let plan = blob
+            .transfer_plan(&manifest_bytes)
+            .expect("pending v9 test Blob plan");
+        let policy = store
+            .control_policy_snapshot()
+            .expect("pending v9 test Blob policy");
+        let _lifecycle = cache
+            .lock_blob_lifecycle()
+            .expect("pending v9 test Blob lifecycle lock");
+        assert!(matches!(
+            store
+                .stage_verified_durable_blob_stream_v9_with_policy(&policy, &blob, sealed, &plan,)
+                .expect("stage pending v9 test Blob"),
+            BlobSourceStageOutcome::Inserted | BlobSourceStageOutcome::Duplicate
+        ));
+        let projection = store
+            .blob_source_projection(source)
+            .expect("pending v9 test Blob projection lookup")
+            .expect("pending v9 test Blob projection");
+        assert_eq!(projection.retention, BlobSourceRetention::Pending);
+        let claim = AuthenticatedBlobRouteClaim::from_verified(
+            store,
+            &blob,
+            sealed,
+            &projection.source,
+            projection.retention,
+            None,
+        )
+        .expect("pending v9 test Blob claim");
+        cache
+            .insert_blob(&verifier, claim.clone())
+            .expect("cache pending v9 test Blob claim");
+        claim
+    }
+
     #[test]
     fn pending_blob_cleanup_fails_closed_on_exact_cache_contradictions() {
         #[derive(Clone, Copy, Debug)]
@@ -49399,6 +49563,136 @@ mod tests {
             plaintext.len(),
             started.elapsed().as_millis()
         );
+        drop(source_store);
+        drop(receiver_store);
+        fs::remove_dir_all(source_root).unwrap();
+        fs::remove_dir_all(receiver_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_blob_stream_v9_reopens_an_existing_pending_source_without_metadata_difference() {
+        let mut missions = issue_missions(2);
+        let source_mission = missions.pop().unwrap();
+        let receiver_mission = missions.pop().unwrap();
+        let authority = source_mission.credentials.mission_authority_id();
+        let topic = Topic::new("opaque").unwrap();
+        let scope = Scope::new("test/runtime-contact").unwrap();
+        let interests = || {
+            MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
+                topic.clone(),
+                scope.clone(),
+                false,
+            )])
+        };
+        let source_root = root("blob-stream-v9-reopen-source");
+        let receiver_root = root("blob-stream-v9-reopen-receiver");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::create_dir_all(&receiver_root).unwrap();
+        let source_store =
+            Arc::new(Store::open_for_mission(source_root.join(STORE_FILE), authority).unwrap());
+        let receiver_store =
+            Arc::new(Store::open_for_mission(receiver_root.join(STORE_FILE), authority).unwrap());
+        let plaintext = vec![0x6b; 2 * 1_048_576];
+        let source = publish_test_blob(
+            &source_store,
+            &mut open_test_sealer(&source_mission.credentials),
+            &topic,
+            &scope,
+            1,
+            &plaintext,
+        );
+        let sealed = source_store
+            .get_blob(source)
+            .unwrap()
+            .expect("completed v9 reopen source")
+            .sealed;
+        let source_cache = test_event_route_cache(&source_store, &source_mission.credentials);
+        let receiver_cache = test_event_route_cache(&receiver_store, &receiver_mission.credentials);
+        stage_test_pending_blob_stream_v9(
+            &receiver_store,
+            &receiver_cache,
+            &receiver_mission.credentials,
+            source,
+            &sealed,
+        );
+        let mut source_verifier = open_test_sealer(&source_mission.credentials);
+        let route = source_verifier.verify_blob(&sealed).unwrap();
+        let BlobContentVerification::ContentVerified {
+            blob,
+            manifest_bytes,
+        } = source_verifier.verify_blob_content(route, &sealed).unwrap()
+        else {
+            panic!("v9 reopen source lost content access");
+        };
+        let plan = blob.transfer_plan(&manifest_bytes).unwrap();
+        let receiver_policy = receiver_store.control_policy_snapshot().unwrap();
+        let initial = receiver_store
+            .blob_stream_checkpoint_with_policy(&receiver_policy, source, &plan)
+            .unwrap();
+        let owned = {
+            let mut depot = source_store.blob_depot().unwrap();
+            aster_mesh::BlobStore::begin_blob_with_lineage(
+                &mut depot,
+                plan.manifest(),
+                plan.physical_lineage(),
+            )
+            .unwrap();
+            plan.read_stream_extent(&mut depot, 0, 1_048_576)
+                .unwrap()
+                .expect("first v9 recovery extent")
+        };
+        let verified = plan.verify_stream_extent(&owned, 1_048_576).unwrap();
+        let batch = aster_redb_store::VerifiedBlobStreamCheckpointBatch::from_extents(
+            [verified],
+            4 * 1_048_576,
+        )
+        .unwrap();
+        let checkpoint = match receiver_store
+            .commit_blob_stream_batch_with_policy(&receiver_policy, source, &plan, initial, batch)
+            .unwrap()
+        {
+            aster_redb_store::BlobStreamCommitOutcome::Advanced(checkpoint) => checkpoint,
+            outcome => panic!("first recovery extent unexpectedly completed: {outcome:?}"),
+        };
+        assert!(checkpoint.durable_encoded_offset > 0);
+        assert!(checkpoint.next_carrier_index > 0);
+        assert_eq!(checkpoint.generation, initial.generation + 1);
+
+        let (client, server) = TEST_SEMANTIC_VERSION
+            .scope(
+                std::cell::Cell::new(Some(SEMANTIC_PROTOCOL_V9)),
+                blob_contact_test_pair_with_caches_results(
+                    source_store.clone(),
+                    source_mission.credentials,
+                    interests(),
+                    source_cache,
+                    receiver_store.clone(),
+                    receiver_mission.credentials,
+                    interests(),
+                    receiver_cache,
+                    None,
+                    None,
+                    None,
+                    None,
+                    0,
+                ),
+            )
+            .await;
+        assert!(
+            client.is_ok() && server.is_ok(),
+            "v9 pre-open recovery failed: client={client:?} server={server:?}"
+        );
+        assert!(
+            receiver_store.get_blob(source).unwrap().is_some(),
+            "pre-existing pending source was not selected and promoted"
+        );
+        assert!(
+            receiver_store
+                .pending_blob_source(source)
+                .unwrap()
+                .is_none()
+        );
+
         drop(source_store);
         drop(receiver_store);
         fs::remove_dir_all(source_root).unwrap();

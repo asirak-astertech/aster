@@ -490,10 +490,9 @@ descending order:
 - **Semantic version 9** is offered first. It preserves v1-v8 stable bytes and
   selects Blob profile 5 `BlobStreamV1`. Profile 5 is a distinct allocation,
   never a reinterpretation or in-attempt downgrade of profile 4. Its
-  `0xd6..0xdc` records, v9 custody/record protection, concurrent Iroh
-  data/control pair, and internal one-adapter selector are implemented. The
-  selected runtime still fails closed until its storage/lifecycle stream driver
-  is active.
+  `0xdd..0xde` receiver-authored pre-open plan, `0xd6..0xdc` attempt records,
+  v9 custody/record protection, concurrent Iroh data/control pair, durable
+  checkpoint recovery, and internal one-adapter selector are implemented.
 - **Semantic version 8** inherits semantic-v7 profile
   negotiation and receipt-free Event pages, while profile 4 adds authenticated
   finite-TTL Blob custody and bounded lower-priority pressure recovery.

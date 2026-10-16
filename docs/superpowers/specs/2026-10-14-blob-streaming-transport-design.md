@@ -66,8 +66,9 @@ reserved for the earlier `BlobCustodyV1` design, profile `4` is
 semantic v8 uses the same raw range stream with authenticated finite-TTL
 custody. PR 47 derives runtime policy from the authenticated
 `(semantic_version, profile_id)` pair. This design therefore allocates semantic
-version `9`, transfer-profile ID `5` (`BlobStreamV1`), and mechanics tags
-`0xd6..0xdc`, all unassigned in the reviewed heads. It does not reinterpret or
+version `9`, transfer-profile ID `5` (`BlobStreamV1`), attempt-record tags
+`0xd6..0xdc`, and pre-open plan tags `0xdd..0xde`, all unassigned in the
+reviewed heads. It does not reinterpret or
 rewrite semantic-v7/v8 profile-4 bytes.
 
 PR 71 is a valuable compatibility baseline but does not satisfy this design by
@@ -228,6 +229,7 @@ The receiver's logical transfer progresses through:
 ```text
 SourceAuthenticated
     -> PendingAdmitted
+    -> ResumePlanned
     -> StreamOpening
     -> Streaming
     -> Verifying
@@ -244,7 +246,24 @@ Only `Promoted` content is visible to ordinary application reads. `Settled`
 means the bound terminal result exchange has completed sufficiently for the
 sender to advance its durable publication cursor.
 
-## Streaming exchange and allocation
+## Pre-open planning, streaming exchange, and allocation
+
+The receiver, as the durable checkpoint authority, selects the exact pending
+source before every attempt. `BlobStreamPlanV1` (`0xdd`) and
+`BlobStreamPlanReplyV1` (`0xde`) are ordinary mission-protected semantic-v9
+records. They bind the logical direction and either no work or the exact source
+transfer ID, next carrier index, durable encoded offset, and nonzero checkpoint
+generation. The session initiator sends the plan for an initiator-bound
+transfer and sends an empty query for a responder-bound transfer; the responder
+echoes the former after validating source availability and returns its own
+receiver-authored selection for the latter. A sender validates the selected
+source against the peer's authenticated Blob interest before opening a stream.
+
+This exchange is independent of metadata reconciliation. An already-staged
+pending source therefore reopens after a process/contact restart even when the
+two metadata inventories are equal. The plan checkpoint must equal the
+receiver's current Store checkpoint at attempt open, and `StreamAccept` must
+echo the planned offset and generation. Any mismatch fails closed.
 
 The following semantic-v9/profile-5 frames use mechanics tags `0xd6..0xdc` in
 order: `StreamOpen`, `StreamAccept`, `StreamData`, `StreamCheckpoint`,

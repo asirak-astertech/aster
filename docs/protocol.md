@@ -1050,10 +1050,22 @@ an active profile-5 attempt is never downgraded into profile 4.
 Semantic v9 reserves mechanics tags `0xd6` `StreamOpenV1`, `0xd7`
 `StreamAcceptV1`, `0xd8` `StreamDataV1`, `0xd9` `StreamCheckpointV1`, `0xda`
 `StreamFinishV1`, `0xdb` `StreamResultV1`, and `0xdc` `StreamResultAckV1` for
-profile 5. The bounded grammar is implemented, but allocation and parsing alone
-do not activate it: until the runtime driver is present, profile-5 Blob work
-fails closed before carrier I/O. Tags `0xd1..0xd5` and every semantic-v7/v8 byte
-retain their existing meanings.
+profile 5. Semantic v9 also reserves ordinary mission-protected mechanics tags
+`0xdd` `BlobStreamPlanV1` and `0xde` `BlobStreamPlanReplyV1`. Tags `0xd1..0xd5`
+and every semantic-v7/v8 byte retain their existing meanings.
+
+Before each profile-5 attempt, the receiver selects the exact durable resume
+point independently of metadata reconciliation. A plan body is `direction u8 ||
+selection_present u8`; when present it continues with `source_transfer_id[32]
+|| next_carrier_index u64 || durable_offset u64 || checkpoint_generation u64`.
+The generation is nonzero, and carrier index and offset are either both zero or
+both nonzero. An absent selection has no trailing fields. Both tags are invalid
+before semantic v9. The responder returns `BlobStreamPlanReplyV1`; for an
+initiator-bound transfer it exactly echoes a sender-validated request, while
+for a responder-bound transfer it answers an empty query with the responder's
+receiver-authored selection. `StreamAcceptV1` must repeat the planned durable
+offset and generation. This permits restart recovery when metadata inventories
+already match and prevents either endpoint from guessing receiver progress.
 
 The profile-5 mechanics prefix is `"ASM\x01" || tag`. All integers are
 unsigned big-endian. The attempt tuple used after `StreamOpenV1` is
@@ -2221,7 +2233,7 @@ and visible quota/eviction policy. Evictions and conflicts surface to the app.
 | semantic-v7/v8/v9 lane | 1 Event, 2 State, 3 Record, 4 Blob, 5 EventBridge; critical extension bit `0x8000` |
 | semantic-v7/v8/v9 transfer profile | 1 `LegacyV6`, 2 `EventPagesV1`, 3 reserved `BlobCustodyV1` (not offered or selected), 4 `BlobRangesStreamV1` (Blob only; v7 durable-only, v8 authenticated custody), 5 `BlobStreamV1` (Blob only; v9); critical extension bit `0x8000` |
 | semantic-v7/v8 mechanics tag | `0xd1` TransferProfileOfferV1, `0xd2` EventTurnPlanV1, `0xd3` ChangeTurnHeaderV1, `0xd4` ChangePageV7, `0xd5` ChangeTurnFinishedV1 |
-| semantic-v9 allocated stream tag | `0xd6` StreamOpenV1, `0xd7` StreamAcceptV1, `0xd8` StreamDataV1, `0xd9` StreamCheckpointV1, `0xda` StreamFinishV1, `0xdb` StreamResultV1, `0xdc` StreamResultAckV1; invalid before v9/profile 5 and not runtime-active until the stream grammar lands |
+| semantic-v9 Blob stream tag | `0xd6` StreamOpenV1, `0xd7` StreamAcceptV1, `0xd8` StreamDataV1, `0xd9` StreamCheckpointV1, `0xda` StreamFinishV1, `0xdb` StreamResultV1, `0xdc` StreamResultAckV1 (profile-5 context); `0xdd` BlobStreamPlanV1 and `0xde` BlobStreamPlanReplyV1 (mission-protected pre-open context); all invalid before v9 |
 | source envelope format | 2 singleton hybrid authentication; semantics 2 through 9 add 3 content-committing batch authentication |
 | batch authentication mode | 1 exact proof reference, Merkle path, and P-256 item signature |
 | suite | `0x0001` provisional hybrid reference suite |
