@@ -724,6 +724,18 @@ impl OwnedBlobStreamExtent {
     pub fn carriers(&self) -> &[BuiltBlobTransferObject] {
         &self.carriers
     }
+
+    /// Flattens this bounded extent into its canonical separator-free wire
+    /// representation. The checked extent length remains the allocation bound.
+    pub fn encoded_bytes(&self) -> Vec<u8> {
+        let capacity = usize::try_from(self.encoded_len).unwrap_or(0);
+        let mut encoded = Vec::with_capacity(capacity);
+        for carrier in &self.carriers {
+            encoded.extend_from_slice(carrier.bytes());
+        }
+        debug_assert_eq!(encoded.len() as u64, self.encoded_len);
+        encoded
+    }
 }
 
 /// A bounded extent whose complete carriers were authenticated against one
@@ -1838,6 +1850,50 @@ impl VerifiedBlobTransferPlan {
             encoded_offset: extent.encoded_offset,
             carriers: verified,
             encoded_len,
+        })
+    }
+
+    /// Authenticates separator-free stream bytes at one exact carrier
+    /// boundary. Each carrier length comes from the authenticated manifest, so
+    /// a partial trailing carrier or bytes crossing the declared extent fail
+    /// before any durable capability is returned.
+    pub fn verify_stream_bytes(
+        &self,
+        first_carrier_index: u64,
+        encoded_offset: u64,
+        bytes: &[u8],
+        max_bytes: usize,
+    ) -> Result<VerifiedBlobStreamExtent, BlobError> {
+        if bytes.is_empty() || bytes.len() > max_bytes {
+            return Err(BlobError::InvalidManifest);
+        }
+        let layout = BlobStreamLayout::from_plan(self)?;
+        if !layout.contains_checkpoint(first_carrier_index, encoded_offset) {
+            return Err(BlobError::AuthenticationFailed);
+        }
+        let mut carriers = Vec::new();
+        let mut cursor = 0_usize;
+        let mut index = first_carrier_index;
+        while cursor < bytes.len() {
+            if index >= layout.carrier_count() {
+                return Err(BlobError::InvalidManifest);
+            }
+            let id = self.carrier_id(index)?;
+            let length = usize::try_from(self.carrier_total_len(&id.wire_bytes())?)
+                .map_err(|_| BlobError::LengthOverflow)?;
+            let end = cursor
+                .checked_add(length)
+                .ok_or(BlobError::LengthOverflow)?;
+            let carrier = bytes.get(cursor..end).ok_or(BlobError::InvalidManifest)?;
+            carriers.push(self.verify_carrier(&id.wire_bytes(), carrier)?);
+            cursor = end;
+            index = index.checked_add(1).ok_or(BlobError::LengthOverflow)?;
+        }
+        Ok(VerifiedBlobStreamExtent {
+            first_carrier_index,
+            encoded_offset,
+            carriers,
+            encoded_len: u64::try_from(bytes.len()).map_err(|_| BlobError::LengthOverflow)?,
         })
     }
 
@@ -5928,5 +5984,22 @@ mod tests {
             assert_eq!(shape.total_encoded_len(), total);
         }
         assert!(BlobStreamLayout::from_lengths(&[u64::MAX, 1]).is_err());
+
+        let extent = OwnedBlobStreamExtent {
+            first_carrier_index: 0,
+            encoded_offset: 0,
+            carriers: vec![
+                BuiltBlobTransferObject {
+                    object_id: BlobCarrierId(ObjectId::for_blob_chunk_digest([1; 32])),
+                    bytes: vec![1, 2],
+                },
+                BuiltBlobTransferObject {
+                    object_id: BlobCarrierId(ObjectId::for_blob_chunk_digest([2; 32])),
+                    bytes: vec![3, 4, 5],
+                },
+            ],
+            encoded_len: 5,
+        };
+        assert_eq!(extent.encoded_bytes(), vec![1, 2, 3, 4, 5]);
     }
 }

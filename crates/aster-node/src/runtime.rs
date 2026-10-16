@@ -105,6 +105,8 @@ mod blob_progress_test;
 pub(crate) mod blob_ranges_stream;
 #[cfg(test)]
 mod blob_ranges_stream_test;
+#[allow(dead_code)] // Activated as the profile-5 driver is wired through Task 7.
+mod blob_stream;
 #[cfg(test)]
 #[path = "runtime/convergence_test.rs"]
 mod convergence_test;
@@ -10067,6 +10069,13 @@ fn blob_completion_capability_for_contact(
             manifest_bytes,
             sealed,
         ),
+        BlobContactMode::StreamV1 => store.custody_v2_completed_retained_blob(
+            projection,
+            retention,
+            blob,
+            manifest_bytes,
+            sealed,
+        ),
     }
     .map_err(NodeError::from)
 }
@@ -11659,6 +11668,45 @@ fn blob_claim_fits_network_bound(claim: &AuthenticatedBlobRouteClaim) -> bool {
         && claim.chunk_count <= MAX_NETWORK_BLOB_CHUNKS
 }
 
+fn blob_projection_fits_contact_bound(
+    store: &Store,
+    projection: &BlobSourceProjection,
+    mode: BlobContactMode,
+) -> bool {
+    if !mode.stream_v1_enabled() {
+        return blob_projection_fits_network_bound(projection);
+    }
+    let limits = store.blob_depot_limits();
+    mutable_source_fits_transfer_bound(projection.sealed_len)
+        && projection.sealed_len
+            <= u64::try_from(MAX_BLOB_NETWORK_SOURCE_BYTES).expect("Blob source bound fits u64")
+        && projection.total_len != 0
+        && projection.total_len <= limits.max_bytes()
+        && projection.chunk_size == aster_mesh::SELECTED_BLOB_CHUNK_SIZE
+        && projection.chunk_count <= limits.max_chunks()
+        && projection.chunk_count
+            == projection
+                .total_len
+                .div_ceil(u64::from(projection.chunk_size))
+}
+
+fn blob_claim_fits_contact_bound(
+    store: &Store,
+    claim: &AuthenticatedBlobRouteClaim,
+    mode: BlobContactMode,
+) -> bool {
+    if !mode.stream_v1_enabled() {
+        return blob_claim_fits_network_bound(claim);
+    }
+    let limits = store.blob_depot_limits();
+    mutable_source_fits_transfer_bound(claim.exact_len)
+        && claim.exact_len
+            <= u64::try_from(MAX_BLOB_NETWORK_SOURCE_BYTES).expect("Blob source bound fits u64")
+        && claim.has_canonical_manifest_shape()
+        && claim.total_len <= limits.max_bytes()
+        && claim.chunk_count <= limits.max_chunks()
+}
+
 fn repair_blob_sender_cache_miss(
     store: &Store,
     verifier: &mut ReferenceEnvelopeSealer,
@@ -11666,7 +11714,7 @@ fn repair_blob_sender_cache_miss(
     expected: &BlobSourceProjection,
     blob_contact_mode: BlobContactMode,
 ) -> Result<Option<AuthenticatedBlobRouteClaim>, NodeError> {
-    if !blob_projection_fits_network_bound(expected) {
+    if !blob_projection_fits_contact_bound(store, expected, blob_contact_mode) {
         return Ok(None);
     }
     (|| -> Result<Option<AuthenticatedBlobRouteClaim>, NodeError> {
@@ -11880,6 +11928,11 @@ fn cached_mutable_sender_snapshot_with_blob_mode(
                             retained.push(item.clone());
                         })?
                     }
+                    BlobContactMode::StreamV1 => {
+                        store.visit_custody_v2_retained_blob_sources(Some(policy), |item| {
+                            retained.push(item.clone());
+                        })?
+                    }
                 }
                 for item in retained {
                     let projection = item.source;
@@ -11903,7 +11956,7 @@ fn cached_mutable_sender_snapshot_with_blob_mode(
                         // capability/final-comparison boundary.
                         continue;
                     }
-                    if !blob_projection_fits_network_bound(&projection) {
+                    if !blob_projection_fits_contact_bound(store, &projection, blob_contact_mode) {
                         // Projection-only bounds are checked before any exact
                         // source-row load, byte clone, cryptographic open, or
                         // depot capability acquisition. Local-only oversized
@@ -11937,7 +11990,7 @@ fn cached_mutable_sender_snapshot_with_blob_mode(
                             "injected outbound Blob projection/cache mismatch".into(),
                         ));
                     }
-                    if !blob_claim_fits_network_bound(&claim)
+                    if !blob_claim_fits_contact_bound(store, &claim, blob_contact_mode)
                         || !verifier.is_current_source_route_lineage(
                             &claim.scope,
                             claim.key_epoch,
@@ -12123,7 +12176,7 @@ fn load_verified_mutable_for_peer(
                 "outbound completed Blob inventory retained a pending cache claim".into(),
             ));
         }
-        if !blob_claim_fits_network_bound(claim) {
+        if !blob_claim_fits_contact_bound(store, claim, blob_contact_mode) {
             return Err(NodeError::Protocol(
                 "outbound Blob is local-only outside selected network bounds".into(),
             ));
@@ -12923,6 +12976,7 @@ fn cache_staged_blob_after_transition(
         };
         let projection = match blob_contact_mode {
             BlobContactMode::CustodyV1 => store.custody_v1_blob_source_projection(expected)?,
+            BlobContactMode::StreamV1 => store.custody_v2_blob_source_projection(expected)?,
             BlobContactMode::DurableOnly => store.blob_source_projection(expected)?,
         }
         .ok_or_else(|| {
@@ -21741,11 +21795,16 @@ struct MutableClassContact<'a> {
 enum BlobContactMode {
     DurableOnly,
     CustodyV1,
+    StreamV1,
 }
 
 impl BlobContactMode {
     const fn finite_transfer_enabled(self) -> bool {
-        matches!(self, Self::CustodyV1)
+        matches!(self, Self::CustodyV1 | Self::StreamV1)
+    }
+
+    const fn stream_v1_enabled(self) -> bool {
+        matches!(self, Self::StreamV1)
     }
 
     fn from_authenticated_profiles(
@@ -21766,6 +21825,9 @@ impl BlobContactMode {
         match (semantic_version, profile) {
             (SEMANTIC_PROTOCOL_V7, TransferProfileId::BlobRangesStreamV1) => Ok(Self::DurableOnly),
             (SEMANTIC_PROTOCOL_V8, TransferProfileId::BlobRangesStreamV1) => Ok(Self::CustodyV1),
+            (crate::event_pages::SEMANTIC_PROTOCOL_V9, TransferProfileId::BlobStreamV1) => {
+                Ok(Self::StreamV1)
+            }
             _ => Err(NodeError::Protocol(
                 "Blob lane selected an incompatible semantic/profile pair".into(),
             )),
@@ -23019,6 +23081,7 @@ fn blob_source_projection_for_contact(
     match mode {
         BlobContactMode::DurableOnly => store.durable_contact_blob_source_projection(source),
         BlobContactMode::CustodyV1 => store.custody_v1_blob_source_projection(source),
+        BlobContactMode::StreamV1 => store.custody_v2_blob_source_projection(source),
     }
 }
 
@@ -23030,6 +23093,7 @@ fn pending_blob_source_for_contact(
     match mode {
         BlobContactMode::DurableOnly => store.durable_contact_pending_blob_source(source),
         BlobContactMode::CustodyV1 => store.custody_v1_pending_blob_source(source),
+        BlobContactMode::StreamV1 => store.custody_v2_pending_blob_source(source),
     }
 }
 
@@ -23047,6 +23111,8 @@ fn retained_blob_source_matches_verified_for_contact(
         }
         BlobContactMode::CustodyV1 => store
             .custody_v1_retained_blob_source_matches_verified(projection, retention, blob, sealed),
+        BlobContactMode::StreamV1 => store
+            .custody_v2_retained_blob_source_matches_verified(projection, retention, blob, sealed),
     }
 }
 
@@ -23061,6 +23127,9 @@ fn next_pending_blob_source_for_contact(
             store.next_durable_pending_blob_source_with_policy(policy, after)
         }
         BlobContactMode::CustodyV1 => store.next_pending_blob_source_with_policy(policy, after),
+        BlobContactMode::StreamV1 => {
+            store.next_blob_stream_v9_pending_source_with_policy(policy, after)
+        }
     }
 }
 
@@ -23077,6 +23146,9 @@ fn pending_blob_carrier_work_for_contact(
         }
         BlobContactMode::CustodyV1 => {
             store.pending_blob_carrier_work_with_policy(policy, source, plan)
+        }
+        BlobContactMode::StreamV1 => {
+            store.pending_blob_stream_v9_carrier_work_with_policy(policy, source, plan)
         }
     }
 }
@@ -23099,6 +23171,7 @@ fn append_blob_carrier_prefix_for_contact(
         BlobContactMode::CustodyV1 => store.append_blob_carrier_prefix_with_policy(
             policy, source, object, total_len, offset, bytes,
         ),
+        BlobContactMode::StreamV1 => Err(StoreError::Blob(BlobStoreError::ReadPlanChanged)),
     }
 }
 
@@ -23117,6 +23190,7 @@ fn commit_complete_blob_carrier_for_contact(
         BlobContactMode::CustodyV1 => {
             store.commit_complete_blob_carrier_with_policy(policy, source, object, plan)
         }
+        BlobContactMode::StreamV1 => Err(StoreError::Blob(BlobStoreError::ReadPlanChanged)),
     }
 }
 
@@ -23140,6 +23214,13 @@ fn completed_pending_blob_for_contact(
         BlobContactMode::CustodyV1 => {
             store.completed_pending_blob_with_policy(policy, source, blob, manifest_bytes, plan)
         }
+        BlobContactMode::StreamV1 => store.completed_pending_blob_stream_v9_with_policy(
+            policy,
+            source,
+            blob,
+            manifest_bytes,
+            plan,
+        ),
     }
 }
 
@@ -23161,6 +23242,13 @@ fn apply_verified_blob_for_contact(
             content_completion,
         ),
         BlobContactMode::CustodyV1 => store.apply_verified_blob_with_policy(
+            policy,
+            plan,
+            lineage,
+            depot_completion,
+            content_completion,
+        ),
+        BlobContactMode::StreamV1 => store.apply_verified_blob_stream_v9_with_policy(
             policy,
             plan,
             lineage,
@@ -23670,6 +23758,7 @@ enum BlobCapacityRecoveryVisibility {
     LocalAllVisible,
     DurableOnly,
     CustodyV1,
+    CustodyV2,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -23717,6 +23806,7 @@ fn recover_contact_blob_capacity_after_cleanup(
     let visibility = match blob_contact_mode {
         BlobContactMode::DurableOnly => BlobCapacityRecoveryVisibility::DurableOnly,
         BlobContactMode::CustodyV1 => BlobCapacityRecoveryVisibility::CustodyV1,
+        BlobContactMode::StreamV1 => BlobCapacityRecoveryVisibility::CustodyV2,
     };
     recover_blob_capacity_after_cleanup_with_visibility(
         store,
@@ -23765,7 +23855,9 @@ fn recover_blob_capacity_after_cleanup_with_visibility(
         BlobCapacityRecoveryVisibility::LocalAllVisible => {
             store.run_blob_capacity_gc_for(target, budget, custody_sample)?;
         }
-        BlobCapacityRecoveryVisibility::DurableOnly | BlobCapacityRecoveryVisibility::CustodyV1 => {
+        BlobCapacityRecoveryVisibility::DurableOnly
+        | BlobCapacityRecoveryVisibility::CustodyV1
+        | BlobCapacityRecoveryVisibility::CustodyV2 => {
             store.run_durable_blob_capacity_gc_for(target, budget, custody_sample)?;
         }
     }
@@ -23783,6 +23875,15 @@ fn recover_blob_capacity_after_cleanup_with_visibility(
             )?,
         BlobCapacityRecoveryVisibility::CustodyV1 => store
             .run_custody_blob_pressure_recovery_after_cleanup(
+                error,
+                incoming_priority,
+                content,
+                (incoming_depot_chunks, incoming_depot_variants),
+                budget,
+                custody_sample,
+            )?,
+        BlobCapacityRecoveryVisibility::CustodyV2 => store
+            .run_custody_v2_blob_pressure_recovery_after_cleanup(
                 error,
                 incoming_priority,
                 content,
@@ -23858,7 +23959,7 @@ fn settle_pending_blob_lifetime_unavailability_for_contact(
     source: BlobTransferId,
     blob_contact_mode: BlobContactMode,
 ) -> Result<PendingBlobLifetimeTransition, NodeError> {
-    if blob_contact_mode != BlobContactMode::CustodyV1 {
+    if !blob_contact_mode.finite_transfer_enabled() {
         return Err(NodeError::Protocol(
             "durable-only Blob contact became lifetime-unavailable".into(),
         ));
@@ -23871,7 +23972,15 @@ fn settle_pending_blob_lifetime_unavailability_for_contact(
     let claim = cache
         .get_blob(verifier, source)
         .map_err(|error| fatal_blob_coherence("pending Blob lifetime cache lookup", error))?;
-    let transition = store.settle_custody_v1_pending_blob_lifetime_unavailability(source)?;
+    let transition = match blob_contact_mode {
+        BlobContactMode::CustodyV1 => {
+            store.settle_custody_v1_pending_blob_lifetime_unavailability(source)?
+        }
+        BlobContactMode::StreamV1 => {
+            store.settle_custody_v2_pending_blob_lifetime_unavailability(source)?
+        }
+        BlobContactMode::DurableOnly => unreachable!("checked finite transfer mode"),
+    };
     if matches!(
         transition,
         PendingBlobLifetimeTransition::Missing | PendingBlobLifetimeTransition::ExpiredRetired
@@ -24923,6 +25032,7 @@ fn serve_verified_blob_range_in_schedule(
                 usize::try_from(requested_len).expect("u32 fits usize"),
                 plan,
             ),
+            BlobContactMode::StreamV1 => Err(StoreError::Blob(BlobStoreError::ReadPlanChanged)),
         }
     };
     #[cfg(not(test))]
@@ -24948,6 +25058,7 @@ fn serve_verified_blob_range_in_schedule(
             usize::try_from(requested_len).expect("u32 fits usize"),
             plan,
         ),
+        BlobContactMode::StreamV1 => Err(StoreError::Blob(BlobStoreError::ReadPlanChanged)),
     };
     #[cfg(test)]
     if result.is_ok() && cache.fire_test_blob_contact_fault(TestBlobContactFault::RangePostcheck) {
@@ -49821,6 +49932,18 @@ mod tests {
                 .expect("v8 custody-capable stream mode");
         assert_eq!(custody_mode, BlobContactMode::CustodyV1);
         assert!(custody_mode.finite_transfer_enabled());
+        assert!(!custody_mode.stream_v1_enabled());
+        let v9_stream = negotiated(
+            SEMANTIC_PROTOCOL_V9,
+            TransferProfileOfferV1::for_semantic_version(SEMANTIC_PROTOCOL_V9)
+                .expect("v9 transfer offer"),
+        );
+        let stream_mode =
+            BlobContactMode::from_authenticated_profiles(SEMANTIC_PROTOCOL_V9, Some(&v9_stream))
+                .expect("v9 Blob stream mode");
+        assert_eq!(stream_mode, BlobContactMode::StreamV1);
+        assert!(stream_mode.finite_transfer_enabled());
+        assert!(stream_mode.stream_v1_enabled());
         assert!(matches!(
             BlobContactMode::from_authenticated_profiles(
                 SEMANTIC_PROTOCOL_V9 + 1,

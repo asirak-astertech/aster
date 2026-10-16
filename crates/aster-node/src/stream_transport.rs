@@ -307,6 +307,12 @@ pub(crate) trait StreamAttempt: Send + Sync {
     fn finish_data(&self) -> AdapterFuture<'_, ()>;
 }
 
+pub(crate) trait StreamReceiveAttempt: Send + Sync {
+    fn receive_data(&self) -> AdapterFuture<'_, Option<Vec<u8>>>;
+    fn send_control<'a>(&'a self, frame: &'a [u8]) -> AdapterFuture<'a, ()>;
+    fn finish_control(&self) -> AdapterFuture<'_, ()>;
+}
+
 pub(crate) trait StreamTransportAdapter: Send + Sync {
     fn id(&self) -> StreamTransportId;
     fn eligibility(&self, requirements: TransferRequirements) -> bool;
@@ -315,6 +321,10 @@ pub(crate) trait StreamTransportAdapter: Send + Sync {
         &'a self,
         request: AttemptOpenRequest,
     ) -> AdapterFuture<'a, Arc<dyn StreamAttempt>>;
+    fn accept_attempt<'a>(
+        &'a self,
+        request: AttemptOpenRequest,
+    ) -> AdapterFuture<'a, Arc<dyn StreamReceiveAttempt>>;
 }
 
 pub(crate) struct IrohQuicV1Adapter {
@@ -329,6 +339,46 @@ impl IrohQuicV1Adapter {
 struct IrohSenderAttempt {
     data: Mutex<BoundedSendStream>,
     control: Mutex<BoundedReceiveStream>,
+}
+
+struct IrohReceiverAttempt {
+    data: Mutex<BoundedReceiveStream>,
+    control: Mutex<BoundedSendStream>,
+}
+
+impl StreamReceiveAttempt for IrohReceiverAttempt {
+    fn receive_data(&self) -> AdapterFuture<'_, Option<Vec<u8>>> {
+        Box::pin(async move {
+            self.data
+                .lock()
+                .await
+                .read_frame()
+                .await
+                .map_err(map_iroh_error)
+        })
+    }
+
+    fn send_control<'a>(&'a self, frame: &'a [u8]) -> AdapterFuture<'a, ()> {
+        Box::pin(async move {
+            self.control
+                .lock()
+                .await
+                .write_frame(frame)
+                .await
+                .map_err(map_iroh_error)
+        })
+    }
+
+    fn finish_control(&self) -> AdapterFuture<'_, ()> {
+        Box::pin(async move {
+            self.control
+                .lock()
+                .await
+                .finish()
+                .await
+                .map_err(map_iroh_error)
+        })
+    }
 }
 impl StreamAttempt for IrohSenderAttempt {
     fn send_data<'a>(&'a self, frame: &'a [u8]) -> AdapterFuture<'a, ()> {
@@ -394,6 +444,27 @@ impl StreamTransportAdapter for IrohQuicV1Adapter {
                 data: Mutex::new(pair.data),
                 control: Mutex::new(pair.control),
             }) as Arc<dyn StreamAttempt>)
+        })
+    }
+
+    fn accept_attempt<'a>(
+        &'a self,
+        request: AttemptOpenRequest,
+    ) -> AdapterFuture<'a, Arc<dyn StreamReceiveAttempt>> {
+        Box::pin(async move {
+            let pair = self
+                .connection
+                .accept_stream_pair(
+                    request.deadline,
+                    request.max_data_bytes,
+                    request.max_control_bytes,
+                )
+                .await
+                .map_err(map_iroh_error)?;
+            Ok(Arc::new(IrohReceiverAttempt {
+                data: Mutex::new(pair.data),
+                control: Mutex::new(pair.control),
+            }) as Arc<dyn StreamReceiveAttempt>)
         })
     }
 }
@@ -555,18 +626,23 @@ mod tests {
             let server = server.clone();
             async move {
                 let connection = server.accept(&allowed).await.unwrap();
+                let adapter = IrohQuicV1Adapter::new(connection);
                 for expected in [b"first".as_slice(), b"resume".as_slice()] {
-                    let mut pair = connection
-                        .accept_stream_pair(Instant::now() + Duration::from_secs(2), 64, 64)
+                    let attempt = adapter
+                        .accept_attempt(AttemptOpenRequest {
+                            deadline: Instant::now() + Duration::from_secs(2),
+                            max_data_bytes: 64,
+                            max_control_bytes: 64,
+                        })
                         .await
                         .unwrap();
                     assert_eq!(
-                        pair.data.read_frame().await.unwrap().as_deref(),
+                        attempt.receive_data().await.unwrap().as_deref(),
                         Some(expected)
                     );
-                    pair.control.write_frame(b"checkpoint").await.unwrap();
-                    pair.control.finish().await.unwrap();
-                    assert_eq!(pair.data.read_frame().await.unwrap(), None);
+                    attempt.send_control(b"checkpoint").await.unwrap();
+                    attempt.finish_control().await.unwrap();
+                    assert_eq!(attempt.receive_data().await.unwrap(), None);
                 }
             }
         });

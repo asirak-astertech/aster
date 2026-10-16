@@ -3107,6 +3107,28 @@ impl Store {
         )
     }
 
+    /// Mints an exact completion capability for a semantic-v9/profile-5
+    /// contact while enforcing custody-v2 provenance and lifetime visibility.
+    #[doc(hidden)]
+    pub fn custody_v2_completed_retained_blob(
+        &self,
+        projection: &BlobSourceProjection,
+        retention: BlobSourceRetention,
+        blob: &ContentVerifiedBlobEnvelope,
+        manifest_bytes: &[u8],
+        sealed: &[u8],
+    ) -> Result<BlobDepotCompletion, StoreError> {
+        self.completed_retained_blob_with_eligibility(
+            projection,
+            retention,
+            blob,
+            manifest_bytes,
+            sealed,
+            BlobContactEligibility::CustodyV2,
+            true,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn completed_retained_blob_with_eligibility(
         &self,
@@ -4457,6 +4479,15 @@ impl Store {
         self.pending_blob_source_with_eligibility(source, BlobContactEligibility::CustodyV1, true)
     }
 
+    /// Loads one exact pending source for a semantic-v9/profile-5 contact.
+    #[doc(hidden)]
+    pub fn custody_v2_pending_blob_source(
+        &self,
+        source: BlobTransferId,
+    ) -> Result<Option<PendingBlobSource>, StoreError> {
+        self.pending_blob_source_with_eligibility(source, BlobContactEligibility::CustodyV2, true)
+    }
+
     fn pending_blob_source_with_eligibility(
         &self,
         source: BlobTransferId,
@@ -4519,6 +4550,19 @@ impl Store {
         )
     }
 
+    /// Loads one exact source eligible for semantic-v9/profile-5 custody.
+    #[doc(hidden)]
+    pub fn custody_v2_blob_source_projection(
+        &self,
+        source: BlobTransferId,
+    ) -> Result<Option<RetainedBlobSource>, StoreError> {
+        self.blob_source_projection_with_eligibility(
+            source,
+            BlobContactEligibility::CustodyV2,
+            true,
+        )
+    }
+
     /// Revalidates one retained projection against both its exact Store row
     /// and one content-verified envelope. The retained lifetime (including
     /// finite age and provenance) remains private, but participates in the
@@ -4559,6 +4603,25 @@ impl Store {
             blob,
             sealed,
             BlobContactEligibility::CustodyV1,
+            true,
+        )
+    }
+
+    /// Revalidates one retained projection for semantic-v9/profile-5 custody.
+    #[doc(hidden)]
+    pub fn custody_v2_retained_blob_source_matches_verified(
+        &self,
+        projection: &BlobSourceProjection,
+        retention: BlobSourceRetention,
+        blob: &ContentVerifiedBlobEnvelope,
+        sealed: &[u8],
+    ) -> Result<bool, StoreError> {
+        self.retained_blob_source_matches_verified_with_eligibility(
+            projection,
+            retention,
+            blob,
+            sealed,
+            BlobContactEligibility::CustodyV2,
             true,
         )
     }
@@ -5210,6 +5273,20 @@ impl Store {
         )
     }
 
+    /// Visits only sources eligible for semantic-v9/profile-5 custody.
+    #[doc(hidden)]
+    pub fn visit_custody_v2_retained_blob_sources(
+        &self,
+        policy: Option<&ControlPolicySnapshot>,
+        visitor: impl FnMut(&RetainedBlobSource),
+    ) -> Result<(), StoreError> {
+        self.visit_retained_blob_sources_with_eligibility(
+            policy,
+            BlobContactEligibility::CustodyV2,
+            visitor,
+        )
+    }
+
     fn visit_retained_blob_sources_with_eligibility(
         &self,
         policy: Option<&ControlPolicySnapshot>,
@@ -5537,6 +5614,20 @@ impl Store {
             policy,
             after,
             BlobContactEligibility::CustodyV1,
+        )
+    }
+
+    /// Selects the next semantic-v9/profile-5 eligible pending source.
+    #[doc(hidden)]
+    pub fn next_blob_stream_v9_pending_source_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        after: Option<BlobTransferId>,
+    ) -> Result<Option<BlobSourceProjection>, StoreError> {
+        self.next_pending_blob_source_with_eligibility(
+            policy,
+            after,
+            BlobContactEligibility::CustodyV2,
         )
     }
 
@@ -6393,6 +6484,22 @@ impl Store {
             source,
             plan,
             BlobContactEligibility::CustodyV1,
+        )
+    }
+
+    /// Exact uncommitted work under semantic-v9/profile-5 eligibility.
+    #[doc(hidden)]
+    pub fn pending_blob_stream_v9_carrier_work_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        source: BlobTransferId,
+        plan: &VerifiedBlobTransferPlan,
+    ) -> Result<Vec<BlobCarrierPrefixStatus>, StoreError> {
+        self.pending_blob_carrier_work_with_eligibility(
+            policy,
+            source,
+            plan,
+            BlobContactEligibility::CustodyV2,
         )
     }
 
@@ -10659,6 +10766,28 @@ impl Store {
             budget,
             custody_sample,
             BlobContactEligibility::CustodyV1,
+        )
+    }
+
+    /// Custody-v2 pressure recovery for semantic-v9/profile-5 contacts.
+    #[doc(hidden)]
+    pub fn run_custody_v2_blob_pressure_recovery_after_cleanup(
+        &self,
+        error: &StoreError,
+        incoming_priority: Priority,
+        content: Option<(&Topic, &Scope, BlobId)>,
+        incoming_depot_units: (u64, u64),
+        budget: BlobMaintenanceBudget,
+        custody_sample: Option<aster_mesh::CustodySample>,
+    ) -> Result<Option<BlobCapacityRecoveryResult>, StoreError> {
+        self.run_blob_pressure_recovery_after_cleanup_with_eligibility(
+            error,
+            incoming_priority,
+            content,
+            incoming_depot_units,
+            budget,
+            custody_sample,
+            BlobContactEligibility::CustodyV2,
         )
     }
 

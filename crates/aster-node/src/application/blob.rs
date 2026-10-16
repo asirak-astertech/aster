@@ -635,6 +635,40 @@ pub enum BlobTransferPhase {
     ReadyToFinalize,
 }
 
+/// Bounded phase of one active semantic-v9/profile-5 stream attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlobStreamTransferPhase {
+    Negotiating,
+    Receiving,
+    Finalizing,
+    Settling,
+    Complete,
+    Terminal,
+}
+
+/// Sanitized terminal category. Peer errors, transport details, paths, and
+/// authenticated identifiers are intentionally not exposed here.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlobStreamTerminalCategory {
+    Protocol,
+    Integrity,
+    Lifecycle,
+    Policy,
+    Transport,
+    Cancelled,
+}
+
+/// High-level public progress for one active Blob stream.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlobStreamTransferStatus {
+    pub phase: BlobStreamTransferPhase,
+    pub total_bytes: u64,
+    pub durable_bytes: u64,
+    /// Rolling durable throughput in bytes per second.
+    pub throughput_bytes_per_second: u64,
+    pub terminal: Option<BlobStreamTerminalCategory>,
+}
+
 /// Audited local Blob storage and authenticated pending-transfer snapshot.
 ///
 /// This is not peer convergence or global delivery status. Retained counters
