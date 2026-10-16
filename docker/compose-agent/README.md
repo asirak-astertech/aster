@@ -94,6 +94,20 @@ docker compose -f docker/compose-agent/compose.yaml run --rm verify
 docker compose -f docker/compose-agent/compose.yaml run --rm asterctl --json status
 ```
 
+The default file publishes no host port. To accept mesh traffic from another
+device, set `ASTER_MESH_BIND_ADDRESS` to an explicit host IPv4 address and
+optionally set `ASTER_MESH_PUBLISHED_PORT` (default `8183`), then add the
+shipped override to every Compose command:
+
+```sh
+docker compose -f docker/compose-agent/compose.yaml \
+  -f docker/compose-agent/compose.remote-mesh.yaml config --format json
+```
+
+Configure the remote peer with that host address and published UDP port, and
+permit the port in applicable host firewall policy. Omitting the override
+keeps the default deployment closed to inbound host traffic.
+
 Credential rotation always uses `up -d --force-recreate`. `docker compose
 restart` is not a supported rotation operation because it does not apply a new
 Compose configuration. Preflight has no network and no state mount. Verification

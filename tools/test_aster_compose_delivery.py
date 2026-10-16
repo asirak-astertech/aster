@@ -28,6 +28,7 @@ SPEC.loader.exec_module(MODULE)
 
 REPOSITORY = MODULE_PATH.parents[1]
 COMPOSE = REPOSITORY / "docker/compose-agent/compose.yaml"
+REMOTE_MESH = REPOSITORY / "docker/compose-agent/compose.remote-mesh.yaml"
 MISE = REPOSITORY / "mise.toml"
 TOKEN_CANARY = "task6-token-canary-do-not-print"
 GENERATION = "generation-" + "a" * 64
@@ -123,6 +124,19 @@ def canonical_model():
 
 def canonical_json(model) -> str:
     return json.dumps(model, indent=2) + "\n"
+
+
+def canonical_remote_mesh_model():
+    return {
+        "services": {
+            "aster-agent": {
+                "ports": [
+                    "${ASTER_MESH_BIND_ADDRESS:?required}:"
+                    "${ASTER_MESH_PUBLISHED_PORT:-8183}:8183/udp"
+                ]
+            }
+        }
+    }
 
 
 class Fixture:
@@ -344,6 +358,29 @@ class GenerationBoundaryTests(DeliveryTestCase):
         self.assert_rejected("generation-directory-immutable", env)
 
 class StaticComposePolicyTests(DeliveryTestCase):
+    def test_remote_mesh_override_is_exact_and_default_stays_closed(self):
+        self.assertNotIn("ports", self.fixture.model["services"]["aster-agent"])
+        self.assertEqual(
+            REMOTE_MESH.read_text(),
+            canonical_json(canonical_remote_mesh_model()),
+        )
+        with self.assertRaises(MODULE.ValidationError) as raised:
+            MODULE.validate_remote_mesh_override(REMOTE_MESH, {})
+        self.assertEqual(raised.exception.code, "mesh-bind-address-required")
+        MODULE.validate_remote_mesh_override(
+            REMOTE_MESH,
+            {"ASTER_MESH_BIND_ADDRESS": "10.244.151.17"},
+        )
+        with self.assertRaises(MODULE.ValidationError) as raised:
+            MODULE.validate_remote_mesh_override(
+                REMOTE_MESH,
+                {
+                    "ASTER_MESH_BIND_ADDRESS": "10.244.151.17",
+                    "ASTER_MESH_PUBLISHED_PORT": "0",
+                },
+            )
+        self.assertEqual(raised.exception.code, "mesh-published-port-invalid")
+
     def test_requires_an_absolute_user_owned_private_state_directory(self):
         # Break caught: accepting a missing, indirect, or broadly accessible
         # state path would reintroduce privileged initialization or expose data.
@@ -638,6 +675,28 @@ class ScopeReductionTests(DeliveryTestCase):
 
 
 class RepositoryPolicyTests(unittest.TestCase):
+    def test_release_artifact_records_remote_mesh_override_digest(self):
+        workflow = (REPOSITORY / ".github/workflows/build-compose-images.yml").read_text()
+        self.assertIn(
+            "cp docker/compose-agent/compose.remote-mesh.yaml "
+            "target/compose-release/compose.remote-mesh.yaml",
+            workflow,
+        )
+        self.assertIn(
+            "remote_mesh_digest=$(sha256sum "
+            "docker/compose-agent/compose.remote-mesh.yaml",
+            workflow,
+        )
+        self.assertIn(
+            'remote_mesh_override:{file:"compose.remote-mesh.yaml",'
+            "sha256:$remote_mesh_sha256}",
+            workflow,
+        )
+        self.assertIn(
+            "target/compose-release/compose.remote-mesh.yaml",
+            workflow,
+        )
+
     def test_admin_artifact_ships_asterctl_with_admin_bound_sbom(self):
         dockerfile = (REPOSITORY / "docker/compose-agent/Dockerfile.admin").read_text()
         workflow = (REPOSITORY / ".github/workflows/build-compose-images.yml").read_text()
@@ -779,6 +838,8 @@ class RepositoryPolicyTests(unittest.TestCase):
         self.assertEqual(workflow.count("--architecture \"${{ matrix.arch }}\""), 4)
         self.assertEqual(workflow.count("--expected-config-digest"), 4)
         self.assertEqual(workflow.count("--result-file"), 2)
+        self.assertEqual(workflow.count("compose.remote-mesh.yaml"), 6)
+        self.assertEqual(workflow.count("remote_mesh_sha256"), 3)
         self.assertIn("aster-compose-image-release/v2", workflow)
         self.assertIn("docker_image_id", workflow)
         self.assertLess(
