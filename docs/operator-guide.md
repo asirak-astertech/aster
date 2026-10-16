@@ -62,7 +62,8 @@ Obtain the following before changing a node:
 1. A reviewed Aster package or Compose release bundle for the host
    architecture.
 2. One authorized mission provisioning bundle for this node, delivered by the
-   site's protected channel.
+   site's protected channel, or a disposable evaluation bundle created as
+   described below.
 3. The retained install and load operation IDs that belong to that bundle.
 4. The topic and scope the node may publish or receive, for example
    `chat.events` and `mission/team/alpha`.
@@ -75,6 +76,98 @@ Obtain the following before changing a node:
 
 Do not invent peer identities or copy another node's state, configuration,
 credentials, or operation IDs. Every node needs independent custody.
+
+## Choose how the mission bundle is supplied
+
+Aster separates **issuance** from **installation**. The
+`aster-credential-admin install` command and the
+`aster-compose-credential-admin create` command consume an existing canonical
+`ASTRPB03` mission bundle and place it into their deployment's credential
+custody. Despite the Compose command's name, neither command creates a mission,
+acts as a mission authority, or grants new access.
+
+| Deployment | Operational bundle source | Repository evaluation option | How the node consumes it |
+| --- | --- | --- | --- |
+| Ubuntu `.deb` with systemd | The mission authority supplies one node-specific `ASTRPB03` bundle over a protected channel | The packaged `aster playground-init` command creates a disposable 2–32-node mission | Import the selected node's bundle with `aster-credential-admin install`, then install its matching carrier identity |
+| Docker Compose | The mission authority supplies one node-specific `ASTRPB03` bundle and the site creates a separate application token | A bundle from a disposable `playground-init` run can be used as the protected input to exercise generation creation | `aster-compose-credential-admin create` produces one immutable credential generation from the bundle and token |
+| Source checkout | The mission authority supplies a bundle only when an explicitly approved development integration requires it | Run `playground-init`, or use the checked-in public binding-test fixture for its narrowly documented tests | Development commands may read an owner-only file through `--mission-bundle-unprotected-reference`; this makes no protected-custody claim |
+
+There is currently no supported repository command for production authority-side
+bundle issuance. An operational authority must create, retain, recover, and
+destroy its issuer state outside these node installation tools. Do not use an
+evaluation generator, public fixture, copied node bundle, or node-side
+credential administrator as a substitute.
+
+### Create bundles for a Debian evaluation
+
+Create every member of one evaluation mission in a single run on a controlled
+host. Running the command independently on two hosts creates unrelated mission
+authorities that cannot authenticate each other:
+
+```sh
+umask 077
+aster playground-init --nodes 2 --root /tmp/aster-evaluation-mission
+```
+
+The root must not already exist. The command accepts 2 through 32 nodes and
+prints each node's public carrier and mission identifiers. Each `node-N`
+directory contains two sensitive files:
+
+| File | Purpose |
+| --- | --- |
+| `identity.key` | That node's carrier identity |
+| `mission.unprotected-reference.bundle` | That node's plaintext canonical `ASTRPB03` mission bundle |
+
+Assign exactly one complete `node-N` directory to each host and transfer it
+through an approved protected channel. The generated mission has fixed scope
+`demo/playground`, fixed topic `mesh.messages`, epoch 1, and all-member grants.
+It is suitable only for disposable interoperability evaluation; it cannot
+create an operational role model or authorize the `imagery.maps` Blob examples
+later in this guide.
+
+For a complete package example that imports each bundle into systemd protected
+credentials, installs the matching carrier identity, configures reciprocal
+peers, and removes the plaintext staging material, follow the
+[two-Raspberry-Pi package lab](quickstart/two-raspberry-pi-ci-package-lab.md).
+Generate and retain distinct install and load operation IDs for every node as
+that procedure specifies.
+
+### Supply a bundle to a Compose deployment
+
+Place an authority-issued bundle, or one selected node bundle from the
+disposable evaluation above, at the protected input path used by the Compose
+procedure:
+
+```sh
+export ASTER_BUNDLE_INPUT="$ASTER_DEPLOYMENT_ROOT/input/mission.astpb03"
+install -m 0600 \
+  /protected/inbox/node.astpb03 "$ASTER_BUNDLE_INPUT"
+```
+
+Then follow [Create an immutable generation](release/docker-compose.md#create-an-immutable-generation).
+That command reads the bundle on standard input and combines it with a separate
+application token. Its output is a deployable credential generation, not a new
+mission bundle. Remove the input bundle under site policy after the generation
+and deployment have been verified.
+
+### Create or select a source-development bundle
+
+From a source checkout, the same evaluation generator is available through
+Cargo:
+
+```sh
+umask 077
+cargo run --locked -p aster-node --bin aster -- \
+  playground-init --nodes 2 --root /tmp/aster-source-mission
+```
+
+Use each generated node bundle with the matching generated carrier identity.
+For binding tests only, the repository also contains
+`bindings/testdata/non-production-provisioning.bundle`; it has public,
+disposable credentials and narrowly fixed test grants. The
+[development agent example](quickstart/connect-agent.md#exercise-the-repository-development-path)
+shows the plaintext compatibility flag. Neither file-based source path
+exercises systemd or Compose protected credential custody.
 
 ## Install the Ubuntu package
 
@@ -306,6 +399,11 @@ The selector is receive policy, not authorization. Mission authorization and
 the current epoch and revocation state still decide whether transfer is
 allowed. An authenticated peer can observe the exact topic and scope interest
 metadata, so enable only reviewed interests.
+
+The `imagery.maps@mission/team/alpha` examples require bundles issued with
+that exact Blob authorization. Bundles from `playground-init` authorize only
+`mesh.messages@demo/playground`; changing the JSON selector or CLI arguments
+does not add authority grants.
 
 `receive_only` is not a way to receive Blobs in the current profile: while
 that mode is active, the configured selectors remain stored for a later
