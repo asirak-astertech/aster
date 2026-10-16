@@ -98,6 +98,16 @@ fn fixture_bytes(offset: u64, len: usize) -> Vec<u8> {
         .collect()
 }
 
+fn retryable_probe_error(kind: ApplicationErrorKind) -> bool {
+    matches!(
+        kind,
+        ApplicationErrorKind::NotFound
+            | ApplicationErrorKind::RequestRejected
+            | ApplicationErrorKind::UnauthorizedOrRevoked
+            | ApplicationErrorKind::PolicyUnsettled
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,6 +127,13 @@ mod tests {
             fixture_bytes(0, 65536) != fixture_bytes(251 * 65536, 65536),
             "large-size fixture must not repeat chunks"
         );
+    }
+
+    #[test]
+    fn pre_admission_not_found_is_a_retryable_benchmark_probe() {
+        assert!(retryable_probe_error(ApplicationErrorKind::NotFound));
+        assert!(retryable_probe_error(ApplicationErrorKind::RequestRejected));
+        assert!(!retryable_probe_error(ApplicationErrorKind::Integrity));
     }
 }
 
@@ -235,7 +252,7 @@ async fn main() -> Result<(), E> {
     let completed=timeout(Duration::from_secs(deadline),async {
   loop {match h.read_page(BlobReadPageRequest{blob:request.clone(),offset:0,max_bytes:1}).await {
    Ok(page)=>{assert_eq!(page.total_len,len);assert_eq!(page.id,published.id);break Ok::<(),E>(());},
-   Err(e) if matches!(e.kind(),ApplicationErrorKind::RequestRejected|ApplicationErrorKind::UnauthorizedOrRevoked|ApplicationErrorKind::PolicyUnsettled)=>{},
+   Err(e) if retryable_probe_error(e.kind())=>{},
    Err(e)=>break Err(Box::new(e) as E),
   }
   if last.elapsed()>=Duration::from_secs(10){let s=r.selected_events().status().await?;println!("BENCH_PROGRESS {{\"elapsed_ns\":{},\"authenticated_contacts\":{},\"failed_contacts\":{}}}",transfer.elapsed().as_nanos(),s.authenticated_contacts,s.failed_contact_attempts);last=Instant::now();}
