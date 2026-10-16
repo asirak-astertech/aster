@@ -1079,6 +1079,19 @@ nonce and resumes only from the receiver's durable offset. Duplicate terminal
 records replay the same digest-bound result or acknowledgement and never repeat
 promotion.
 
+Finite profile-5 work uses `BlobCustodyClaimV2[208]`. Its field widths and age
+semantics are identical to `BlobCustodyClaimV1`, but its fixed header is
+`"ASTRBL09" || format_version u16 = 2 || semantic_version u16 = 9 ||
+profile_id u16 = 5`. Lane ID 4 is bound by the record context rather than
+duplicated in the fixed claim body. Each protected stream record authenticates
+`"ASTER/v9-lane-record/v1\0" || semantic_version u16 ||
+transfer_profile_digest[32] || lane u16 || profile u16 || direction u8 ||
+attempt_nonce[32] || record_sequence u64`. A custody contact capability also
+binds the session transcript and exact claim digest under
+`"ASTER/v9-blob-custody-contact/v2\0"`. These send/contact capabilities are
+non-clone, exact-context values; decoding raw claim bytes grants no Store
+authority. Semantic-v8 claim bytes and domains remain unchanged.
+
 For each admitted Blob direction, profile 4 sends one protected `ABRS || 0x01`
 schedule containing at most 64 canonical `BlobRangeFetchV5` tuples and receives
 the exact domain-separated schedule hash as acceptance. The role-ordered
@@ -2135,6 +2148,7 @@ outbound, and replay limits:
 | combined pending logical bytes | 16 MiB | checked before every retry insert/refresh, outbox insert, and handshake replacement |
 | selected mutable object | 1 MiB | oversized State/Record bytes fail before durable admission; malformed or unauthorized bytes remain fatal |
 | semantic-v8 Blob custody claim | exactly 208 bytes; source field at most 211 bytes and result/ack field at most 33 bytes | wrong presence, length, context, digest, duplicate, truncation, trailing bytes, or age overflow fail closed; a verified exact-context capability is required for finite admission and every lifecycle boundary |
+| semantic-v9 Blob custody claim | exactly 208 bytes plus fixed-size attempt/record AAD | v8/v9 domain substitution, zero nonce, wrong sequence/profile/lane/direction/digest, replay, or younger age fails closed before finite admission |
 | selected mutable class | 4,096 rows and 16 MiB encoded source bytes, independently for State and Record | an otherwise valid new object receives `DeferredCapacity`; no existing mutable row is pruned |
 | mutable fairness cursor | 256 configured mission peers, 4 peer/class/local-mode rows each, 1,024 rows total | startup rejects an overbound configured set and prunes rows for peers no longer configured; ordinary data quota cannot consume the reserve |
 | live application command lane | 32 commands shared by Event, State, Record, and Blob; one queued command for the joined Blob worker | a full Blob worker queue returns explicit `ResourceLimit`; shutdown and zeroization close both admissions and join the worker |

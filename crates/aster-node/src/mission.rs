@@ -18,8 +18,9 @@ use aster_iroh::{
     Connection, EndpointId, SecretKey,
 };
 use aster_mesh::{
-    ApplicationProtection, AuthenticatedBlobCustodySendContextV1, AuthenticatedChannelBinding,
-    BlobCustodyClaimV1, BlobCustodyDirectionV1, ClassicalAuthenticatedSession,
+    ApplicationProtection, AuthenticatedBlobCustodySendContextV1,
+    AuthenticatedBlobCustodySendContextV2, AuthenticatedChannelBinding, BlobCustodyClaimV1,
+    BlobCustodyClaimV2, BlobCustodyDirectionV1, ClassicalAuthenticatedSession,
     ClassicalProvisioningBundle, ClassicalSessionInitiator, ClassicalSessionResponder,
     CustodyClaims, CustodyExpectation, MAX_PROTECTED_PROVISIONING_BYTES,
     MAX_UNPROTECTED_PROVISIONING_BYTES, NodeId, OpenedBlobSourceFrameV1, ProvisioningBundle,
@@ -2389,6 +2390,17 @@ pub struct MissionSession {
 }
 
 impl MissionSession {
+    fn blob_direction(direction: crate::frame::EventDirection) -> BlobCustodyDirectionV1 {
+        match direction {
+            crate::frame::EventDirection::ToSessionInitiator => {
+                BlobCustodyDirectionV1::ToSessionInitiator
+            }
+            crate::frame::EventDirection::ToSessionResponder => {
+                BlobCustodyDirectionV1::ToSessionResponder
+            }
+        }
+    }
+
     /// Carrier and mission identities authenticated independently for this session.
     ///
     /// Exact-roster sessions additionally checked the pair against
@@ -2417,6 +2429,24 @@ impl MissionSession {
     ) -> Result<AuthenticatedBlobCustodySendContextV1, MissionSessionError> {
         self.inner
             .mint_blob_custody_send_context(direction, exchange_id, finalization_charge_ms)
+            .map_err(Into::into)
+    }
+
+    #[allow(dead_code)] // Consumed by the profile-5 runtime driver in Task 7.
+    pub(crate) fn mint_blob_custody_send_context_v2(
+        &self,
+        direction: crate::frame::EventDirection,
+        exchange_id: u64,
+        attempt_nonce: [u8; 32],
+        finalization_charge_ms: u64,
+    ) -> Result<AuthenticatedBlobCustodySendContextV2, MissionSessionError> {
+        self.inner
+            .mint_blob_custody_send_context_v2(
+                Self::blob_direction(direction),
+                exchange_id,
+                attempt_nonce,
+                finalization_charge_ms,
+            )
             .map_err(Into::into)
     }
 
@@ -2527,6 +2557,113 @@ impl MissionSession {
         )?;
         self.inner
             .open_frame_with_context(frame, &context)
+            .map_err(Into::into)
+    }
+
+    #[allow(dead_code)] // Consumed by the profile-5 runtime driver in Task 7.
+    pub(crate) fn seal_v9_blob_application_frame(
+        &mut self,
+        transfer_profile_digest: [u8; 32],
+        direction: crate::frame::EventDirection,
+        attempt_nonce: [u8; 32],
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, MissionSessionError> {
+        let decoded = crate::stream_transfer::StreamFrame::decode_for_context(9, 5, plaintext)
+            .map_err(|_| {
+                MissionSessionError::Authentication(EnvelopeError(
+                    "invalid v9 Blob stream record".into(),
+                ))
+            })?;
+        let (bound_nonce, record_sequence) = decoded.attempt_binding();
+        if bound_nonce != attempt_nonce {
+            return Err(MissionSessionError::Authentication(EnvelopeError(
+                "v9 Blob stream attempt differs".into(),
+            )));
+        }
+        self.inner
+            .seal_v9_blob_application_frame(
+                transfer_profile_digest,
+                Self::blob_direction(direction),
+                attempt_nonce,
+                record_sequence,
+                plaintext,
+            )
+            .map_err(Into::into)
+    }
+
+    #[allow(dead_code)] // Consumed by the profile-5 runtime driver in Task 7.
+    pub(crate) fn open_v9_blob_application_frame(
+        &mut self,
+        transfer_profile_digest: [u8; 32],
+        direction: crate::frame::EventDirection,
+        attempt_nonce: [u8; 32],
+        frame: &[u8],
+    ) -> Result<Vec<u8>, MissionSessionError> {
+        let (plaintext, outer_sequence) = self
+            .inner
+            .open_v9_blob_application_frame(
+                transfer_profile_digest,
+                Self::blob_direction(direction),
+                attempt_nonce,
+                frame,
+            )
+            .map_err(MissionSessionError::from)?;
+        let decoded = crate::stream_transfer::StreamFrame::decode_for_context(9, 5, &plaintext)
+            .map_err(|_| {
+                MissionSessionError::Authentication(EnvelopeError(
+                    "invalid v9 Blob stream record".into(),
+                ))
+            })?;
+        let (bound_nonce, record_sequence) = decoded.attempt_binding();
+        if bound_nonce != attempt_nonce
+            || record_sequence.is_some_and(|sequence| sequence != outer_sequence)
+        {
+            return Err(MissionSessionError::Authentication(EnvelopeError(
+                "v9 Blob stream record binding differs".into(),
+            )));
+        }
+        Ok(plaintext)
+    }
+
+    #[allow(dead_code)] // Consumed by the profile-5 runtime driver in Task 7.
+    pub(crate) fn seal_blob_custody_frame_v2(
+        &mut self,
+        transfer_profile_digest: [u8; 32],
+        direction: crate::frame::EventDirection,
+        attempt_nonce: [u8; 32],
+        claim: &BlobCustodyClaimV2,
+    ) -> Result<Vec<u8>, MissionSessionError> {
+        self.inner
+            .seal_blob_custody_frame_v2(
+                transfer_profile_digest,
+                Self::blob_direction(direction),
+                attempt_nonce,
+                claim,
+            )
+            .map_err(Into::into)
+    }
+
+    #[allow(dead_code)] // Consumed by the profile-5 runtime driver in Task 7.
+    pub(crate) fn open_blob_custody_frame_v2(
+        &mut self,
+        transfer_profile_digest: [u8; 32],
+        direction: crate::frame::EventDirection,
+        attempt_nonce: [u8; 32],
+        frame: &[u8],
+    ) -> Result<
+        (
+            BlobCustodyClaimV2,
+            aster_mesh::AuthenticatedBlobCustodyContactV2,
+        ),
+        MissionSessionError,
+    > {
+        self.inner
+            .open_blob_custody_frame_v2(
+                transfer_profile_digest,
+                Self::blob_direction(direction),
+                attempt_nonce,
+                frame,
+            )
             .map_err(Into::into)
     }
 
@@ -3628,6 +3765,113 @@ mod tests {
                 .open_profiled_application_frame(digest, lane, profile, direction, &substituted)
                 .is_err(),
             "semantic-v8 lane record protection must reject the v7 AAD domain"
+        );
+    }
+
+    #[test]
+    fn contextual_application_frame_v9_binds_attempt_and_record_sequence() {
+        const RECORD_SEQUENCE_OFFSET: usize = 8 + 2 + 2;
+        let mut provisioner = ReferenceProvisioner::from_seed([0x45; 32]).expect("provisioner");
+        let initiator = issue(&mut provisioner, 1);
+        let responder = issue(&mut provisioner, 2);
+        let (mut sender, mut receiver) = establish_with_semantic_version(
+            &initiator,
+            &responder,
+            crate::event_pages::SEMANTIC_PROTOCOL_V9,
+        )
+        .expect("establish semantic-v9 session");
+        let offer = crate::event_pages::TransferProfileOfferV1::for_semantic_version(
+            crate::event_pages::SEMANTIC_PROTOCOL_V9,
+        )
+        .expect("v9 transfer profiles");
+        let sender_offer = sender
+            .seal_transfer_profile_offer(&offer)
+            .expect("seal sender profile offer");
+        receiver
+            .open_transfer_profile_offer(&sender_offer)
+            .expect("open sender profile offer");
+        let receiver_offer = receiver
+            .seal_transfer_profile_offer(&offer)
+            .expect("seal receiver profile offer");
+        sender
+            .open_transfer_profile_offer(&receiver_offer)
+            .expect("open receiver profile offer");
+        let negotiated = crate::event_pages::negotiate_transfer_profiles(&offer, &offer)
+            .expect("negotiate v9 profiles");
+        let digest = crate::event_pages::transfer_profile_digest(&offer, &offer, &negotiated);
+        let nonce = [0x73; 32];
+        let stream_open =
+            crate::stream_transfer::StreamFrame::Open(crate::stream_transfer::StreamOpenV1 {
+                class: crate::stream_transfer::StreamClass::Blob,
+                direction: crate::stream_transfer::StreamDirection::ToSessionResponder,
+                session_transcript: sender.session_id(),
+                exchange_id: 3,
+                transfer_id: [0x31; 32],
+                source_transfer_id: [0x32; 32],
+                publication_id: [0x33; 32],
+                variant_id: [0x34; 32],
+                total_len: 1024,
+                attempt_nonce: nonce,
+                checkpoint_generation: 0,
+                custody_digest: None,
+            })
+            .encode_for_context(9, 5)
+            .expect("encode stream open");
+        let protected = sender
+            .seal_v9_blob_application_frame(
+                digest,
+                EventDirection::ToSessionResponder,
+                nonce,
+                &stream_open,
+            )
+            .expect("seal v9 Blob record");
+
+        let mut wrong_nonce = nonce;
+        wrong_nonce[0] ^= 1;
+        assert!(
+            receiver
+                .open_v9_blob_application_frame(
+                    digest,
+                    EventDirection::ToSessionResponder,
+                    wrong_nonce,
+                    &protected,
+                )
+                .is_err()
+        );
+
+        let mut forged_sequence = protected.clone();
+        forged_sequence[RECORD_SEQUENCE_OFFSET..RECORD_SEQUENCE_OFFSET + 8]
+            .copy_from_slice(&9u64.to_be_bytes());
+        assert!(
+            receiver
+                .open_v9_blob_application_frame(
+                    digest,
+                    EventDirection::ToSessionResponder,
+                    nonce,
+                    &forged_sequence,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            receiver
+                .open_v9_blob_application_frame(
+                    digest,
+                    EventDirection::ToSessionResponder,
+                    nonce,
+                    &protected,
+                )
+                .expect("exact v9 context remains replay-valid"),
+            stream_open
+        );
+        assert!(
+            receiver
+                .open_v9_blob_application_frame(
+                    digest,
+                    EventDirection::ToSessionResponder,
+                    nonce,
+                    &protected,
+                )
+                .is_err()
         );
     }
 

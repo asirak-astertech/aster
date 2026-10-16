@@ -1931,6 +1931,14 @@ pub(crate) struct SendSequence {
 }
 
 impl SendSequence {
+    pub(crate) const fn next_value(&self) -> Option<u64> {
+        if self.exhausted {
+            None
+        } else {
+            Some(self.next)
+        }
+    }
+
     fn reserve(&mut self) -> Result<u64, CryptoError> {
         if self.exhausted {
             return Err(CryptoError::SequenceExhausted);
@@ -2015,6 +2023,10 @@ impl fmt::Debug for SecureChannel {
 }
 
 impl SecureChannel {
+    pub(crate) const fn next_send_sequence(&self) -> Option<u64> {
+        self.send_sequence.next_value()
+    }
+
     pub(crate) fn seal<P: CryptoProvider>(
         &mut self,
         provider: &mut P,

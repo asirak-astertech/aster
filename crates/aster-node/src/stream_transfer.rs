@@ -190,6 +190,18 @@ fn put_attempt(o: &mut Vec<u8>, id: &[u8; 32], n: &[u8; 32], s: u64) {
 }
 
 impl StreamFrame {
+    pub(crate) fn attempt_binding(&self) -> ([u8; 32], Option<u64>) {
+        match self {
+            Self::Open(value) => (value.attempt_nonce, None),
+            Self::Accept(value) => (value.attempt_nonce, Some(value.sequence)),
+            Self::Data(value) => (value.attempt_nonce, Some(value.sequence)),
+            Self::Checkpoint(value) => (value.attempt_nonce, Some(value.sequence)),
+            Self::Finish(value) => (value.attempt_nonce, Some(value.sequence)),
+            Self::Result(value) => (value.attempt_nonce, Some(value.sequence)),
+            Self::ResultAck(value) => (value.attempt_nonce, Some(value.sequence)),
+        }
+    }
+
     pub(crate) fn encode_for_context(&self, v: u16, p: u16) -> Result<Vec<u8>, StreamError> {
         context(v, p)?;
         let mut o = MAGIC.to_vec();

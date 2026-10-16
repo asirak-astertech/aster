@@ -23,6 +23,10 @@ use crate::blob_custody::{
     AuthenticatedBlobCustodyContactV1, BlobCustodyClaimV1, BlobCustodyDirectionV1,
     blob_custody_lane_record_context,
 };
+use crate::blob_custody_v2::{
+    ApplicationRecordContext, AuthenticatedBlobCustodyContactV2,
+    AuthenticatedBlobCustodySendContextV2, BlobCustodyClaimV2,
+};
 use crate::bridge::{
     self, AuthorizationEnvelope, BridgeAuthorization, BridgeOuterKind, BridgeRoute,
 };
@@ -103,7 +107,6 @@ const SEMANTIC_PROTOCOL_V5: u16 = super::SEMANTIC_PROTOCOL_V5;
 const SEMANTIC_PROTOCOL_V6: u16 = super::SEMANTIC_PROTOCOL_V6;
 const SEMANTIC_PROTOCOL_V7: u16 = super::SEMANTIC_PROTOCOL_V7;
 const SEMANTIC_PROTOCOL_V8: u16 = super::SEMANTIC_PROTOCOL_V8;
-#[cfg(test)]
 const SEMANTIC_PROTOCOL_V9: u16 = super::SEMANTIC_PROTOCOL_V9;
 const TRANSFER_PROFILE_OFFER_FRAME_PREFIX: &[u8; 5] = b"ASM\x01\xd1";
 const SUITE_ID: u16 = super::HYBRID_SUITE_ID;
@@ -5009,6 +5012,198 @@ impl ReferenceAuthenticatedSession {
                 finalization_charge_ms,
             ),
         )
+    }
+
+    /// Returns the authenticated semantic-v9 Blob record context for the next
+    /// outbound contextual record. The linear send authority is tied to that
+    /// exact sequence and cannot be cloned.
+    pub fn mint_blob_custody_send_context_v2(
+        &self,
+        direction: BlobCustodyDirectionV1,
+        exchange_id: u64,
+        attempt_nonce: [u8; 32],
+        finalization_charge_ms: u64,
+    ) -> Result<AuthenticatedBlobCustodySendContextV2, EnvelopeError> {
+        let expected_direction = match self.role {
+            SessionRole::Initiator => BlobCustodyDirectionV1::ToSessionResponder,
+            SessionRole::Responder => BlobCustodyDirectionV1::ToSessionInitiator,
+        };
+        let profiles = self
+            .transfer_profiles
+            .authenticated
+            .as_ref()
+            .ok_or_else(blob_custody_contact_unavailable)?;
+        if self.semantic_version != SEMANTIC_PROTOCOL_V9
+            || direction != expected_direction
+            || finalization_charge_ms == 0
+            || profiles.negotiated.profile(TransferLaneId::Blob)
+                != Some(TransferProfileId::BlobStreamV1)
+        {
+            return Err(blob_custody_contact_unavailable());
+        }
+        let sequence = self
+            .channel
+            .next_send_sequence()
+            .ok_or_else(blob_custody_contact_unavailable)?;
+        let context = ApplicationRecordContext::new_v9_blob(
+            profiles.digest,
+            direction,
+            attempt_nonce,
+            sequence,
+        )
+        .map_err(|_| blob_custody_contact_unavailable())?;
+        Ok(
+            AuthenticatedBlobCustodySendContextV2::from_authenticated_record(
+                self.session_id,
+                exchange_id,
+                context,
+                finalization_charge_ms,
+            ),
+        )
+    }
+
+    fn v9_blob_record_context(
+        &self,
+        transfer_profile_digest: [u8; 32],
+        direction: BlobCustodyDirectionV1,
+        attempt_nonce: [u8; 32],
+        record_sequence: u64,
+        outbound: bool,
+    ) -> Result<ApplicationRecordContext, EnvelopeError> {
+        let expected_direction = match (self.role, outbound) {
+            (SessionRole::Initiator, true) | (SessionRole::Responder, false) => {
+                BlobCustodyDirectionV1::ToSessionResponder
+            }
+            (SessionRole::Responder, true) | (SessionRole::Initiator, false) => {
+                BlobCustodyDirectionV1::ToSessionInitiator
+            }
+        };
+        let profiles = self
+            .transfer_profiles
+            .authenticated
+            .as_ref()
+            .ok_or_else(blob_custody_contact_unavailable)?;
+        if self.semantic_version != SEMANTIC_PROTOCOL_V9
+            || transfer_profile_digest != profiles.digest
+            || direction != expected_direction
+            || profiles.negotiated.profile(TransferLaneId::Blob)
+                != Some(TransferProfileId::BlobStreamV1)
+        {
+            return Err(blob_custody_contact_unavailable());
+        }
+        ApplicationRecordContext::new_v9_blob(
+            profiles.digest,
+            direction,
+            attempt_nonce,
+            record_sequence,
+        )
+        .map_err(|_| blob_custody_contact_unavailable())
+    }
+
+    /// Seals one bounded record in the v9/profile-5 attempt and sequence domain.
+    pub fn seal_v9_blob_application_frame(
+        &mut self,
+        transfer_profile_digest: [u8; 32],
+        direction: BlobCustodyDirectionV1,
+        attempt_nonce: [u8; 32],
+        expected_record_sequence: Option<u64>,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, EnvelopeError> {
+        let sequence = self
+            .channel
+            .next_send_sequence()
+            .ok_or_else(blob_custody_contact_unavailable)?;
+        if expected_record_sequence.is_some_and(|expected| expected != sequence) {
+            return Err(blob_custody_contact_unavailable());
+        }
+        let context = self.v9_blob_record_context(
+            transfer_profile_digest,
+            direction,
+            attempt_nonce,
+            sequence,
+            true,
+        )?;
+        self.seal_frame_with_context(plaintext, &context.aad())
+    }
+
+    /// Opens one bounded record only in its exact v9/profile-5 attempt and
+    /// authenticated record-sequence domain.
+    pub fn open_v9_blob_application_frame(
+        &mut self,
+        transfer_profile_digest: [u8; 32],
+        direction: BlobCustodyDirectionV1,
+        attempt_nonce: [u8; 32],
+        frame: &[u8],
+    ) -> Result<(Vec<u8>, u64), EnvelopeError> {
+        let record = decode_transport_frame(frame)?;
+        let context = self.v9_blob_record_context(
+            transfer_profile_digest,
+            direction,
+            attempt_nonce,
+            record.sequence,
+            false,
+        )?;
+        let aad = transport_frame_context_aad(&context.aad())?;
+        let plaintext = self
+            .channel
+            .open_contextual(&self.provider, &record, &aad)
+            .map_err(handshake_error)?;
+        Ok((plaintext, record.sequence))
+    }
+
+    /// Seals one exact v2 custody claim at the sequence captured by its
+    /// authenticated send authority.
+    pub fn seal_blob_custody_frame_v2(
+        &mut self,
+        transfer_profile_digest: [u8; 32],
+        direction: BlobCustodyDirectionV1,
+        attempt_nonce: [u8; 32],
+        claim: &BlobCustodyClaimV2,
+    ) -> Result<Vec<u8>, EnvelopeError> {
+        if claim.session_transcript() != self.session_id || claim.direction() != direction {
+            return Err(blob_custody_contact_unavailable());
+        }
+        self.seal_v9_blob_application_frame(
+            transfer_profile_digest,
+            direction,
+            attempt_nonce,
+            None,
+            &claim.encode(),
+        )
+    }
+
+    /// Opens one exact v2 claim and returns its non-clone authenticated contact.
+    pub fn open_blob_custody_frame_v2(
+        &mut self,
+        transfer_profile_digest: [u8; 32],
+        direction: BlobCustodyDirectionV1,
+        attempt_nonce: [u8; 32],
+        frame: &[u8],
+    ) -> Result<(BlobCustodyClaimV2, AuthenticatedBlobCustodyContactV2), EnvelopeError> {
+        let record = decode_transport_frame(frame)?;
+        let context = self.v9_blob_record_context(
+            transfer_profile_digest,
+            direction,
+            attempt_nonce,
+            record.sequence,
+            false,
+        )?;
+        let aad = transport_frame_context_aad(&context.aad())?;
+        let plaintext = self
+            .channel
+            .open_contextual(&self.provider, &record, &aad)
+            .map_err(handshake_error)?;
+        let claim = BlobCustodyClaimV2::decode(&plaintext)
+            .map_err(|_| blob_custody_contact_unavailable())?;
+        if claim.session_transcript() != self.session_id || claim.direction() != direction {
+            return Err(blob_custody_contact_unavailable());
+        }
+        let contact = AuthenticatedBlobCustodyContactV2::from_opened_record(
+            self.session_id,
+            context,
+            claim.digest(),
+        );
+        Ok((claim, contact))
     }
 
     /// Opaque, authority-signed route-grant commitments from the peer credential.
@@ -10904,6 +11099,83 @@ mod tests {
                 .is_err(),
             "the authenticated sender role fixes the outbound direction"
         );
+    }
+
+    #[test]
+    fn blob_custody_v2_requires_v9_profile_five_attempt_context() {
+        let mut provisioner = ReferenceProvisioner::from_seed([0x85; 32]).unwrap();
+        let initiator = provisioner
+            .issue_node(1, &[member_access(vec![0])])
+            .unwrap();
+        let responder = provisioner
+            .issue_node(2, &[member_access(vec![0])])
+            .unwrap();
+        let (mut sender, mut receiver) =
+            complete_sessions_with_versions(initiator, responder, vec![SEMANTIC_PROTOCOL_V9]);
+        let offer =
+            crate::TransferProfileOfferV1::for_semantic_version(SEMANTIC_PROTOCOL_V9).unwrap();
+        let request = sender.seal_transfer_profile_offer(&offer).unwrap();
+        receiver.open_transfer_profile_offer(&request).unwrap();
+        let response = receiver.seal_transfer_profile_offer(&offer).unwrap();
+        sender.open_transfer_profile_offer(&response).unwrap();
+        let negotiated =
+            negotiate_transfer_profiles_for_semantic_version(SEMANTIC_PROTOCOL_V9, &offer, &offer)
+                .unwrap();
+        let digest = transfer_profile_digest(&offer, &offer, &negotiated);
+        let direction = BlobCustodyDirectionV1::ToSessionResponder;
+        let nonce = [0x91; 32];
+        let outbound = sender
+            .mint_blob_custody_send_context_v2(direction, 73, nonce, 41)
+            .expect("mint v2 send capability");
+        assert_eq!(outbound.session_transcript(), sender.session_id());
+        assert_eq!(outbound.context().semantic_version(), 9);
+        assert_eq!(outbound.context().profile(), 5);
+        assert_eq!(outbound.context().lane(), 4);
+        assert_eq!(outbound.context().attempt_nonce(), nonce);
+        assert_eq!(outbound.context().transfer_profile_digest(), digest);
+
+        let mut bytes = literal_blob_custody_claim_v2();
+        bytes[14..46].copy_from_slice(&sender.session_id);
+        bytes[54] = direction as u8;
+        let claim = crate::BlobCustodyClaimV2::decode(&bytes).unwrap();
+        let frame = sender
+            .seal_blob_custody_frame_v2(digest, direction, nonce, &claim)
+            .expect("seal v2 claim");
+
+        let mut wrong_digest = digest;
+        wrong_digest[0] ^= 1;
+        assert!(
+            receiver
+                .open_blob_custody_frame_v2(wrong_digest, direction, nonce, &frame,)
+                .is_err()
+        );
+        let mut wrong_nonce = nonce;
+        wrong_nonce[0] ^= 1;
+        assert!(
+            receiver
+                .open_blob_custody_frame_v2(digest, direction, wrong_nonce, &frame,)
+                .is_err()
+        );
+        let (opened, contact) = receiver
+            .open_blob_custody_frame_v2(digest, direction, nonce, &frame)
+            .expect("open exact v2 claim");
+        assert_eq!(opened, claim);
+        assert_eq!(contact.claim_digest(), claim.digest());
+        assert_eq!(contact.context().attempt_nonce(), nonce);
+        assert!(
+            receiver
+                .open_blob_custody_frame_v2(digest, direction, nonce, &frame,)
+                .is_err()
+        );
+    }
+
+    fn literal_blob_custody_claim_v2() -> [u8; crate::BLOB_CUSTODY_CLAIM_V2_BYTES] {
+        const HEX: &str = "41535452424c30390002000900051111111111111111111111111111111111111111111111111111111111111111000000000000000001222222222222222222222222222222222222222222222222222222222222222200000000000000013333333333333333333333333333333333333333333333333333333333333333444444444444444444444444444444444444444444444444444444444444444400000000000000000100000000000000005555555555555555555555555555555500000000000000000000000000000000";
+        let mut output = [0u8; crate::BLOB_CUSTODY_CLAIM_V2_BYTES];
+        for (index, byte) in output.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&HEX[index * 2..index * 2 + 2], 16).unwrap();
+        }
+        output
     }
 
     fn literal_blob_custody_claim() -> [u8; crate::BLOB_CUSTODY_CLAIM_V1_BYTES] {
