@@ -13,17 +13,31 @@ use crate::{
         StreamDirection, StreamFrame, StreamOpenV1, StreamReceiverState, StreamResultCode,
         StreamSenderState,
     },
-    stream_transport::{StreamAttempt, StreamReceiveAttempt, StreamTransportError},
+    stream_transport::{
+        AttemptOpenRequest, AuthenticatedPeerSupport, AuthenticatedSupportSource,
+        IrohQuicV1Adapter, StreamAttempt, StreamReceiveAttempt, StreamTransportAdapter,
+        StreamTransportError, StreamTransportId, TransferRequirements, TransportCandidate,
+        TransportSelector,
+    },
 };
-use aster_mesh::VerifiedBlobTransferPlan;
+use aster_mesh::{BlobStreamLayout, VerifiedBlobTransferPlan};
 use aster_redb_store::{
-    BlobStreamCheckpoint, BlobStreamCommitOutcome, BlobTransferId, ControlPolicySnapshot, Store,
-    VerifiedBlobStreamCheckpointBatch,
+    BlobStreamCheckpoint, BlobStreamCommitOutcome, BlobTransferId, BlobVariantId,
+    ControlPolicySnapshot, Store, VerifiedBlobStreamCheckpointBatch,
 };
 use sha2::{Digest as _, Sha256};
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
-use super::{EventDirection, NodeError};
+use super::{
+    BlobContactMode, CompletedBlobStreamSource, EventDirection, EventLaneGuard,
+    MutableApplyDisposition, NodeError, PendingBlobRecoveryDisposition, ReferenceEnvelopeSealer,
+    load_completed_blob_stream_source, load_pending_blob_plan, recover_and_finalize_pending_blob,
+};
+
+const STREAM_ATTEMPT_DEADLINE: Duration = Duration::from_secs(30 * 60);
+const STREAM_RECEIVE_WINDOW_BYTES: u64 = 8 * 1_048_576;
+const STREAM_CHECKPOINT_BATCH_BYTES: u32 = 4 * 1_048_576;
+const STREAM_RECORD_BUDGET_BYTES: usize = 256;
 
 fn protocol(error: impl std::fmt::Display) -> NodeError {
     NodeError::Protocol(format!("Blob stream: {error}"))
@@ -37,6 +51,86 @@ fn transport(error: StreamTransportError) -> NodeError {
         StreamTransportError::Bounds => "bounds",
     };
     protocol(format_args!("transport {category}"))
+}
+
+fn result_digest(
+    source: BlobTransferId,
+    manifest_digest: [u8; 32],
+    code: StreamResultCode,
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"ASTER/blob-stream/result/v1\0");
+    digest.update(source.as_bytes());
+    digest.update(manifest_digest);
+    digest.update([code as u8]);
+    digest.finalize().into()
+}
+
+fn exchange_id(session: [u8; 32], direction: EventDirection, source: BlobTransferId) -> u64 {
+    let mut digest = Sha256::new();
+    digest.update(b"ASTER/blob-stream/exchange/v1\0");
+    digest.update(session);
+    digest.update([match direction {
+        EventDirection::ToSessionInitiator => 1,
+        EventDirection::ToSessionResponder => 2,
+    }]);
+    digest.update(source.as_bytes());
+    u64::from_be_bytes(digest.finalize()[..8].try_into().expect("SHA-256 prefix"))
+}
+
+fn selected_iroh_adapter(
+    connection: &aster_iroh::Connection,
+) -> Result<IrohQuicV1Adapter, NodeError> {
+    let adapter = IrohQuicV1Adapter::new(connection.clone());
+    let requirements = TransferRequirements::default();
+    let candidates = [TransportCandidate {
+        id: adapter.id(),
+        locally_enabled: true,
+        policy_allowed: true,
+        peer_support: Some(AuthenticatedPeerSupport::new(
+            AuthenticatedSupportSource::ProvisionedPeer,
+            true,
+        )),
+        reliable_ordered: true,
+        full_duplex: true,
+        health: adapter.health(),
+        configured_priority: 0,
+    }];
+    let selected = TransportSelector::rank(requirements, &candidates)
+        .into_iter()
+        .next()
+        .ok_or_else(|| protocol("no authenticated eligible transport"))?;
+    if selected.id != StreamTransportId::IrohQuicV1 || !adapter.eligibility(requirements) {
+        return Err(protocol("selected transport adapter is unavailable"));
+    }
+    Ok(adapter)
+}
+
+fn stream_budgets(total_len: u64, carrier_count: u64) -> Result<(usize, usize), NodeError> {
+    let records = carrier_count
+        .checked_add(4)
+        .ok_or_else(|| protocol("stream record count overflow"))?;
+    let overhead = records
+        .checked_mul(STREAM_RECORD_BUDGET_BYTES as u64)
+        .ok_or_else(|| protocol("stream framing budget overflow"))?;
+    let data = total_len
+        .checked_add(overhead)
+        .and_then(|bytes| usize::try_from(bytes).ok())
+        .ok_or_else(|| protocol("stream data budget exceeds this platform"))?;
+    let control = overhead
+        .checked_add(64 * 1024)
+        .and_then(|bytes| usize::try_from(bytes).ok())
+        .ok_or_else(|| protocol("stream control budget exceeds this platform"))?;
+    Ok((data, control))
+}
+
+fn open_request(total_len: u64, carrier_count: u64) -> Result<AttemptOpenRequest, NodeError> {
+    let (max_data_bytes, max_control_bytes) = stream_budgets(total_len, carrier_count)?;
+    Ok(AttemptOpenRequest {
+        deadline: tokio::time::Instant::now() + STREAM_ATTEMPT_DEADLINE,
+        max_data_bytes,
+        max_control_bytes,
+    })
 }
 
 /// Derives a fresh attempt nonce from the authenticated mission session and
@@ -166,6 +260,14 @@ where
                 let protected = protect(mission, profile_digest, direction, nonce, ack)?;
                 attempt.send_data(&protected).await.map_err(transport)?;
                 attempt.finish_data().await.map_err(transport)?;
+                if attempt
+                    .receive_control()
+                    .await
+                    .map_err(transport)?
+                    .is_some()
+                {
+                    return Err(protocol("control record followed terminal settlement"));
+                }
                 return Ok(code);
             }
             _ => return Err(protocol("unexpected control record")),
@@ -178,6 +280,228 @@ fn expected_direction(direction: EventDirection) -> StreamDirection {
         EventDirection::ToSessionInitiator => StreamDirection::ToSessionInitiator,
         EventDirection::ToSessionResponder => StreamDirection::ToSessionResponder,
     }
+}
+
+fn stream_open(
+    mission: &MissionSession,
+    direction: EventDirection,
+    source: BlobTransferId,
+    loaded: &CompletedBlobStreamSource,
+    layout: &BlobStreamLayout,
+    checkpoint_generation: u64,
+) -> StreamOpenV1 {
+    let transfer = *source.as_bytes();
+    let nonce = attempt_nonce(
+        mission.session_id(),
+        direction,
+        transfer,
+        checkpoint_generation,
+    );
+    StreamOpenV1 {
+        class: crate::stream_transfer::StreamClass::Blob,
+        direction: expected_direction(direction),
+        session_transcript: mission.session_id(),
+        exchange_id: exchange_id(mission.session_id(), direction, source),
+        transfer_id: transfer,
+        source_transfer_id: transfer,
+        publication_id: *loaded.blob.blob_id().as_bytes(),
+        variant_id: *BlobVariantId::for_content(
+            loaded.blob.blob_id(),
+            loaded.plan.manifest().content_group(),
+            loaded.plan.manifest().content_epoch(),
+        )
+        .as_bytes(),
+        total_len: layout.total_encoded_len(),
+        attempt_nonce: nonce,
+        checkpoint_generation,
+        custody_digest: None,
+    }
+}
+
+/// Sends one exact durable source selected by the authenticated metadata lane.
+/// The first runtime milestone intentionally permits only the initial
+/// generation; resumable source selection is added with the authenticated
+/// pre-open recovery exchange rather than guessing receiver state.
+pub(super) async fn send(
+    store: &Store,
+    connection: &aster_iroh::Connection,
+    mission: &mut MissionSession,
+    verifier: &mut ReferenceEnvelopeSealer,
+    guard: &EventLaneGuard,
+    direction: EventDirection,
+    source: BlobTransferId,
+    profile_digest: [u8; 32],
+) -> Result<StreamResultCode, NodeError> {
+    guard.check(store)?;
+    let loaded = load_completed_blob_stream_source(store, verifier, source)?
+        .ok_or_else(|| protocol("selected completed source is unavailable"))?;
+    if loaded.blob.ttl_ms().is_some() {
+        return Err(protocol(
+            "finite source requires authenticated custody-v2 stream authority",
+        ));
+    }
+    let layout = BlobStreamLayout::from_plan(&loaded.plan).map_err(protocol)?;
+    let open = stream_open(mission, direction, source, &loaded, &layout, 1);
+    let adapter = selected_iroh_adapter(connection)?;
+    let attempt = adapter
+        .open_attempt(open_request(
+            layout.total_encoded_len(),
+            layout.carrier_count(),
+        )?)
+        .await
+        .map_err(transport)?;
+    let policy = guard.policy().clone();
+    let completion = loaded.completion.clone();
+    let plan = &loaded.plan;
+    drive_sender_attempt(
+        attempt,
+        mission,
+        profile_digest,
+        direction,
+        open,
+        move |offset, maximum| {
+            let layout = BlobStreamLayout::from_plan(plan).map_err(protocol)?;
+            let next_carrier_index = layout
+                .carrier_index_at_offset(offset)
+                .ok_or_else(|| protocol("sender offset is not a carrier boundary"))?;
+            let checkpoint = BlobStreamCheckpoint {
+                next_carrier_index,
+                durable_encoded_offset: offset,
+                generation: 1,
+            };
+            let extent = store
+                .read_completed_blob_stream_extent_with_policy(
+                    &policy,
+                    &completion,
+                    plan,
+                    checkpoint,
+                    maximum,
+                )?
+                .ok_or_else(|| protocol("completed source ended before declared length"))?;
+            Ok(extent.encoded_bytes())
+        },
+    )
+    .await
+}
+
+/// Receives one exact durable source selected by the authenticated metadata
+/// lane, commits bounded whole-carrier batches, and promotes only after the
+/// final durable checkpoint.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn receive(
+    store: &Store,
+    connection: &aster_iroh::Connection,
+    mission: &mut MissionSession,
+    verifier: &mut ReferenceEnvelopeSealer,
+    guard: &EventLaneGuard,
+    direction: EventDirection,
+    source: BlobTransferId,
+    profile_digest: [u8; 32],
+) -> Result<StreamResultCode, NodeError> {
+    guard.check(store)?;
+    let (blob, manifest_bytes, plan) =
+        load_pending_blob_plan(store, verifier, source, BlobContactMode::StreamV1)?
+            .ok_or_else(|| protocol("selected pending source is unavailable"))?;
+    if blob.ttl_ms().is_some() {
+        return Err(protocol(
+            "finite pending source requires authenticated custody-v2 stream authority",
+        ));
+    }
+    let layout = BlobStreamLayout::from_plan(&plan).map_err(protocol)?;
+    let checkpoint = store.blob_stream_checkpoint_with_policy(guard.policy(), source, &plan)?;
+    let nonce = attempt_nonce(
+        mission.session_id(),
+        direction,
+        *source.as_bytes(),
+        checkpoint.generation,
+    );
+    let (_, receive_limit) = layout.carrier_boundary_at_or_before(
+        checkpoint
+            .durable_encoded_offset
+            .checked_add(STREAM_RECEIVE_WINDOW_BYTES)
+            .unwrap_or(u64::MAX)
+            .min(layout.total_encoded_len()),
+    );
+    let adapter = selected_iroh_adapter(connection)?;
+    let attempt = adapter
+        .accept_attempt(open_request(
+            layout.total_encoded_len(),
+            layout.carrier_count(),
+        )?)
+        .await
+        .map_err(transport)?;
+    let policy = guard.policy().clone();
+    let commit_plan = &plan;
+    let promote_plan = &plan;
+    let promote_blob = blob.clone();
+    let promote_manifest = manifest_bytes.clone();
+    let manifest_digest = *plan.manifest_digest();
+    let mut expected_checkpoint = checkpoint;
+    drive_receiver_attempt(
+        attempt,
+        mission,
+        profile_digest,
+        direction,
+        nonce,
+        *source.as_bytes(),
+        checkpoint.durable_encoded_offset,
+        checkpoint.generation,
+        receive_limit,
+        MAX_STREAM_EXTENT_BYTES as u32,
+        STREAM_CHECKPOINT_BATCH_BYTES,
+        |_, frames| {
+            guard.check(store)?;
+            let next = commit_received_batch(
+                store,
+                &policy,
+                source,
+                commit_plan,
+                expected_checkpoint,
+                frames,
+                STREAM_CHECKPOINT_BATCH_BYTES as usize,
+            )?;
+            expected_checkpoint = next;
+            let (_, new_limit) = layout.carrier_boundary_at_or_before(
+                next.durable_encoded_offset
+                    .checked_add(STREAM_RECEIVE_WINDOW_BYTES)
+                    .unwrap_or(u64::MAX)
+                    .min(layout.total_encoded_len()),
+            );
+            Ok((next.durable_encoded_offset, next.generation, new_limit))
+        },
+        |_| {
+            guard.check(store)?;
+            let mut work = Vec::new();
+            let disposition = recover_and_finalize_pending_blob(
+                store,
+                guard,
+                verifier,
+                source,
+                &promote_blob,
+                &promote_manifest,
+                promote_plan,
+                &mut work,
+                BlobContactMode::StreamV1,
+            )?
+            .ok_or_else(|| protocol("complete stream did not reach promotion"))?;
+            let code = match disposition {
+                PendingBlobRecoveryDisposition::Apply(MutableApplyDisposition::Inserted) => {
+                    StreamResultCode::Promoted
+                }
+                PendingBlobRecoveryDisposition::Apply(MutableApplyDisposition::Duplicate) => {
+                    StreamResultCode::AlreadyPresent
+                }
+                PendingBlobRecoveryDisposition::Apply(
+                    MutableApplyDisposition::DeferredCapacity,
+                )
+                | PendingBlobRecoveryDisposition::DeferredLease => {
+                    StreamResultCode::DeferredCapacity
+                }
+            };
+            Ok((code, result_digest(source, manifest_digest, code)))
+        },
+    )
+    .await
 }
 
 /// Verifies every received separator-free extent against the exact plan and
@@ -310,8 +634,37 @@ where
                 else {
                     return Err(protocol("receiver produced an invalid data transition"));
                 };
+                let data_bytes = data.bytes.len() as u64;
+                let combined = pending_bytes
+                    .checked_add(data_bytes)
+                    .ok_or_else(|| protocol("receiver batch byte overflow"))?;
+                if !pending.is_empty() && combined > u64::from(checkpoint_batch_bytes) {
+                    let prior_through = data.offset;
+                    let (durable, generation, new_limit) = persist_batch(&open, &pending)?;
+                    if durable != prior_through {
+                        return Err(protocol("Store checkpoint differs from received batch"));
+                    }
+                    let StreamAction::Send(checkpoint) = state
+                        .persisted(durable, generation, new_limit)
+                        .map_err(protocol)?
+                    else {
+                        return Err(protocol(
+                            "receiver produced an invalid checkpoint transition",
+                        ));
+                    };
+                    pending.clear();
+                    pending_bytes = 0;
+                    let protected = protect(
+                        mission,
+                        profile_digest,
+                        direction,
+                        expected_nonce,
+                        checkpoint,
+                    )?;
+                    attempt.send_control(&protected).await.map_err(transport)?;
+                }
                 pending_bytes = pending_bytes
-                    .checked_add(data.bytes.len() as u64)
+                    .checked_add(data_bytes)
                     .ok_or_else(|| protocol("receiver batch byte overflow"))?;
                 pending.push(data);
                 if pending_bytes >= u64::from(checkpoint_batch_bytes) || through == open.total_len {
@@ -374,6 +727,9 @@ where
                         "receiver produced an invalid acknowledgement transition",
                     ));
                 };
+                if attempt.receive_data().await.map_err(transport)?.is_some() {
+                    return Err(protocol("data record followed terminal settlement"));
+                }
                 attempt.finish_control().await.map_err(transport)?;
                 return Ok(code);
             }

@@ -682,6 +682,18 @@ impl BlobStreamLayout {
             .and_then(|index| u64::try_from(index).ok())
     }
 
+    /// Returns the greatest canonical carrier boundary not exceeding `offset`.
+    pub fn carrier_boundary_at_or_before(&self, offset: u64) -> (u64, u64) {
+        let index = match self.boundaries.binary_search(&offset) {
+            Ok(index) => index,
+            Err(index) => index.saturating_sub(1),
+        };
+        (
+            u64::try_from(index).unwrap_or(u64::MAX),
+            self.boundaries.get(index).copied().unwrap_or(0),
+        )
+    }
+
     /// Whether the index and offset identify the same canonical boundary.
     pub fn contains_checkpoint(&self, carrier_index: u64, encoded_offset: u64) -> bool {
         self.carrier_offset(carrier_index) == Some(encoded_offset)
@@ -5986,6 +5998,10 @@ mod tests {
         assert_eq!(layout.carrier_offset(3), Some(31));
         assert_eq!(layout.carrier_index_at_offset(18), Some(2));
         assert_eq!(layout.carrier_index_at_offset(17), None);
+        assert_eq!(layout.carrier_boundary_at_or_before(0), (0, 0));
+        assert_eq!(layout.carrier_boundary_at_or_before(17), (1, 7));
+        assert_eq!(layout.carrier_boundary_at_or_before(18), (2, 18));
+        assert_eq!(layout.carrier_boundary_at_or_before(u64::MAX), (3, 31));
         assert!(!layout.contains_checkpoint(2, 17));
 
         for total in [64_u64 << 20, 1_u64 << 30, 2_u64 << 30] {

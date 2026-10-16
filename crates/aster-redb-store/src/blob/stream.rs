@@ -2,8 +2,8 @@
 
 use super::*;
 use aster_mesh::{
-    BlobStore as CoreBlobStore, BlobStreamLayout, OwnedBlobStreamExtent,
-    VerifiedBlobContentCompletion, VerifiedBlobStreamExtent, VerifiedBlobTransferObject,
+    BlobStore as CoreBlobStore, BlobStreamLayout, OwnedBlobStreamExtent, VerifiedBlobStreamExtent,
+    VerifiedBlobTransferObject,
 };
 use std::time::Duration;
 
@@ -551,7 +551,7 @@ impl Store {
     pub fn read_completed_blob_stream_extent_with_policy(
         &self,
         policy: &ControlPolicySnapshot,
-        completion: &VerifiedBlobContentCompletion,
+        completion: &BlobDepotCompletion,
         plan: &VerifiedBlobTransferPlan,
         checkpoint: BlobStreamCheckpoint,
         max_bytes: usize,
@@ -560,13 +560,17 @@ impl Store {
         let authority = self.require_bound_mission()?;
         let layout = BlobStreamLayout::from_plan(plan)
             .map_err(|error| blob_error(BlobStoreError::Verification(error.to_string())))?;
-        if completion.mission_authority_id() != authority
-            || completion.source_envelope() != plan.source_envelope()
-            || completion.blob_id() != plan.manifest().id()
+        if completion.blob_id() != plan.manifest().id()
             || completion.manifest_digest() != plan.manifest_digest()
-            || completion.physical_lineage() != plan.physical_lineage()
+            || completion.physical_lineage() != plan.physical_lineage().binding()
             || completion.chunk_count() != plan.manifest().chunk_count()
-            || completion.plaintext_bytes() != plan.manifest().total_len()
+            || completion.total_len() != plan.manifest().total_len()
+            || completion.variant_id()
+                != BlobVariantId::for_content(
+                    plan.manifest().id(),
+                    plan.manifest().content_group(),
+                    plan.manifest().content_epoch(),
+                )
             || !layout.contains_checkpoint(
                 checkpoint.next_carrier_index,
                 checkpoint.durable_encoded_offset,

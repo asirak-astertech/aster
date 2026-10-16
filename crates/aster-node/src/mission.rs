@@ -2516,7 +2516,7 @@ impl MissionSession {
             .map_err(Into::into)
     }
 
-    /// Protects one semantic-v7-or-v8 record with exact negotiated profile, lane,
+    /// Protects one semantic-v7-or-newer profiled record with exact negotiated profile, lane,
     /// and direction context as authenticated associated data.
     pub(crate) fn seal_profiled_application_frame(
         &mut self,
@@ -2538,7 +2538,7 @@ impl MissionSession {
             .map_err(Into::into)
     }
 
-    /// Opens one semantic-v7-or-v8 record only under the exact negotiated profile,
+    /// Opens one semantic-v7-or-newer profiled record only under the exact negotiated profile,
     /// lane, and direction context supplied by the local state machine.
     pub(crate) fn open_profiled_application_frame(
         &mut self,
@@ -2574,7 +2574,7 @@ impl MissionSession {
                     "invalid v9 Blob stream record".into(),
                 ))
             })?;
-        let (bound_nonce, record_sequence) = decoded.attempt_binding();
+        let (bound_nonce, _attempt_sequence) = decoded.attempt_binding();
         if bound_nonce != attempt_nonce {
             return Err(MissionSessionError::Authentication(EnvelopeError(
                 "v9 Blob stream attempt differs".into(),
@@ -2585,7 +2585,7 @@ impl MissionSession {
                 transfer_profile_digest,
                 Self::blob_direction(direction),
                 attempt_nonce,
-                record_sequence,
+                None,
                 plaintext,
             )
             .map_err(Into::into)
@@ -2599,7 +2599,7 @@ impl MissionSession {
         attempt_nonce: [u8; 32],
         frame: &[u8],
     ) -> Result<Vec<u8>, MissionSessionError> {
-        let (plaintext, outer_sequence) = self
+        let (plaintext, _outer_sequence) = self
             .inner
             .open_v9_blob_application_frame(
                 transfer_profile_digest,
@@ -2614,10 +2614,8 @@ impl MissionSession {
                     "invalid v9 Blob stream record".into(),
                 ))
             })?;
-        let (bound_nonce, record_sequence) = decoded.attempt_binding();
-        if bound_nonce != attempt_nonce
-            || record_sequence.is_some_and(|sequence| sequence != outer_sequence)
-        {
+        let (bound_nonce, _attempt_sequence) = decoded.attempt_binding();
+        if bound_nonce != attempt_nonce {
             return Err(MissionSessionError::Authentication(EnvelopeError(
                 "v9 Blob stream record binding differs".into(),
             )));
@@ -2713,6 +2711,7 @@ impl MissionSession {
         let domain = match semantic_version {
             crate::event_pages::SEMANTIC_PROTOCOL_V7 => b"ASTER/v7-lane-record/v1\0".as_slice(),
             crate::event_pages::SEMANTIC_PROTOCOL_V8 => b"ASTER/v8-lane-record/v1\0".as_slice(),
+            crate::event_pages::SEMANTIC_PROTOCOL_V9 => b"ASTER/v9-lane-record/v1\0".as_slice(),
             _ => {
                 return Err(MissionSessionError::Authentication(EnvelopeError(
                     "profiled record context is unavailable for this session".into(),

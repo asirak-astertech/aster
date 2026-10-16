@@ -5005,28 +5005,29 @@ impl ReferenceAuthenticatedSession {
         direction: BlobCustodyDirectionV1,
         attempt_nonce: [u8; 32],
         record_sequence: u64,
-        outbound: bool,
+        _outbound: bool,
     ) -> Result<ApplicationRecordContext, EnvelopeError> {
-        let expected_direction = match (self.role, outbound) {
-            (SessionRole::Initiator, true) | (SessionRole::Responder, false) => {
-                BlobCustodyDirectionV1::ToSessionResponder
-            }
-            (SessionRole::Responder, true) | (SessionRole::Initiator, false) => {
-                BlobCustodyDirectionV1::ToSessionInitiator
-            }
-        };
         let profiles = self
             .transfer_profiles
             .authenticated
             .as_ref()
             .ok_or_else(blob_custody_contact_unavailable)?;
-        if self.semantic_version != SEMANTIC_PROTOCOL_V9
-            || transfer_profile_digest != profiles.digest
-            || direction != expected_direction
-            || profiles.negotiated.profile(TransferLaneId::Blob)
-                != Some(TransferProfileId::BlobStreamV1)
+        if self.semantic_version != SEMANTIC_PROTOCOL_V9 {
+            return Err(EnvelopeError(
+                "semantic-v9 Blob stream is unavailable for this session".into(),
+            ));
+        }
+        if transfer_profile_digest != profiles.digest {
+            return Err(EnvelopeError(
+                "semantic-v9 Blob stream profile binding differs".into(),
+            ));
+        }
+        if profiles.negotiated.profile(TransferLaneId::Blob)
+            != Some(TransferProfileId::BlobStreamV1)
         {
-            return Err(blob_custody_contact_unavailable());
+            return Err(EnvelopeError(
+                "semantic-v9 Blob stream profile is unavailable".into(),
+            ));
         }
         ApplicationRecordContext::new_v9_blob(
             profiles.digest,
