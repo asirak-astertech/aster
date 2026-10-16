@@ -25,9 +25,9 @@ pub use lifecycle::{
 #[doc(hidden)]
 pub use pressure::BlobCapacityRecoveryResult;
 pub use stream::{
-    BlobStreamCheckpoint, BlobStreamCommitOutcome, DEFAULT_BLOB_STREAM_CHECKPOINT_BATCH_BYTES,
-    DEFAULT_BLOB_STREAM_CHECKPOINT_INTERVAL, MAX_BLOB_STREAM_CHECKPOINT_BATCH_BYTES,
-    VerifiedBlobStreamCheckpointBatch,
+    BlobStreamCheckpoint, BlobStreamCommitOutcome, BlobStreamProvenanceUpgrade,
+    DEFAULT_BLOB_STREAM_CHECKPOINT_BATCH_BYTES, DEFAULT_BLOB_STREAM_CHECKPOINT_INTERVAL,
+    MAX_BLOB_STREAM_CHECKPOINT_BATCH_BYTES, VerifiedBlobStreamCheckpointBatch,
 };
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -35,12 +35,13 @@ use std::error::Error;
 use std::fmt;
 
 use aster_mesh::{
-    AuthenticatedBlobCustodySendContextV1, BlobCustodyClaimV1, BlobCustodyDirectionV1,
-    BlobCustodyError, BlobCustodyTransferId, BlobId, BlobRouteCommitment,
-    BlobStore as CoreBlobStore, ContentVerifiedBlobEnvelope, CurrentBlobLineage,
-    MAX_BLOB_CHUNK_SIZE, MAX_BLOB_CHUNKS, MAX_BLOB_MANIFEST_BYTES, MAX_BLOB_MEDIA_TYPE_BYTES,
-    MAX_BLOB_SCHEMA_ID_BYTES, SELECTED_BLOB_CHUNK_SIZE as CORE_SELECTED_BLOB_CHUNK_SIZE,
-    VerifiedBlobContentCompletion, VerifiedBlobCustodyClaimV1, VerifiedBlobTransferPlan,
+    AuthenticatedBlobCustodyContactV2, AuthenticatedBlobCustodySendContextV1, BlobCustodyClaimV1,
+    BlobCustodyClaimV2, BlobCustodyDirectionV1, BlobCustodyError, BlobCustodyTransferId, BlobId,
+    BlobRouteCommitment, BlobStore as CoreBlobStore, ContentVerifiedBlobEnvelope,
+    CurrentBlobLineage, MAX_BLOB_CHUNK_SIZE, MAX_BLOB_CHUNKS, MAX_BLOB_MANIFEST_BYTES,
+    MAX_BLOB_MEDIA_TYPE_BYTES, MAX_BLOB_SCHEMA_ID_BYTES,
+    SELECTED_BLOB_CHUNK_SIZE as CORE_SELECTED_BLOB_CHUNK_SIZE, VerifiedBlobContentCompletion,
+    VerifiedBlobCustodyClaimV1, VerifiedBlobTransferPlan,
 };
 use redb::{ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle};
 
@@ -128,7 +129,7 @@ const BLOB_SOURCE_PROJECTION_DOMAIN: &[u8] = b"aster/blob-source-projection/v1";
 
 /// Selected interoperable Blob chunk size (64 KiB).
 pub const SELECTED_BLOB_CHUNK_SIZE: u32 = CORE_SELECTED_BLOB_CHUNK_SIZE;
-/// Maximum chunks representable by the selected one-MiB manifest bound.
+/// Maximum chunks representable by the selected four-MiB manifest bound.
 pub const MAX_SELECTED_BLOB_CHUNKS: u64 = MAX_BLOB_CHUNKS;
 /// Maximum byte length of one durable Blob operation key.
 pub const MAX_BLOB_OPERATION_KEY_BYTES: usize = 256;
@@ -1587,13 +1588,35 @@ enum BlobContactEligibility {
     AllVisible,
     DurableOnly,
     CustodyV1,
+    CustodyV2,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BlobNetworkAdmissionProfile {
+    RangesV1,
+    StreamV1,
+}
+
+fn blob_network_admission_limits(
+    profile: BlobNetworkAdmissionProfile,
+    depot: BlobDepotLimits,
+) -> (u64, u64) {
+    match profile {
+        BlobNetworkAdmissionProfile::RangesV1 => (MAX_NETWORK_BLOB_BYTES, MAX_NETWORK_BLOB_CHUNKS),
+        BlobNetworkAdmissionProfile::StreamV1 => (
+            depot.max_bytes(),
+            depot.max_chunks().min(MAX_SELECTED_BLOB_CHUNKS),
+        ),
+    }
 }
 
 impl BlobContactEligibility {
     const fn admits(self, lifetime: BlobLifetime) -> bool {
         match (self, lifetime) {
             (Self::AllVisible, _)
-            | (Self::DurableOnly | Self::CustodyV1, BlobLifetime::Durable) => true,
+            | (Self::DurableOnly | Self::CustodyV1 | Self::CustodyV2, BlobLifetime::Durable) => {
+                true
+            }
             (Self::DurableOnly, BlobLifetime::Finite { .. }) => false,
             (
                 Self::CustodyV1,
@@ -1614,6 +1637,18 @@ impl BlobContactEligibility {
                 },
             ) => profile_id == aster_mesh::TransferProfileId::BlobRangesStreamV1 as u16,
             (Self::CustodyV1, BlobLifetime::Finite { .. }) => false,
+            (
+                Self::CustodyV2,
+                BlobLifetime::Finite {
+                    provenance:
+                        BlobFiniteProvenance::NetworkV1 {
+                            semantic_version: 9,
+                            profile_id,
+                        },
+                    ..
+                },
+            ) => profile_id == aster_mesh::TransferProfileId::BlobStreamV1 as u16,
+            (Self::CustodyV2, BlobLifetime::Finite { .. }) => false,
         }
     }
 }
@@ -2941,6 +2976,25 @@ impl Store {
         )
     }
 
+    /// Profile-5 completion capability with custody-v2 lifecycle eligibility.
+    pub fn completed_pending_blob_stream_v9_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        source: BlobTransferId,
+        blob: &ContentVerifiedBlobEnvelope,
+        manifest_bytes: &[u8],
+        plan: &VerifiedBlobTransferPlan,
+    ) -> Result<BlobDepotCompletion, StoreError> {
+        self.completed_pending_blob_with_eligibility(
+            policy,
+            source,
+            blob,
+            manifest_bytes,
+            plan,
+            BlobContactEligibility::CustodyV2,
+        )
+    }
+
     #[doc(hidden)]
     pub fn completed_durable_pending_blob_with_policy(
         &self,
@@ -3791,6 +3845,25 @@ impl Store {
         plan: &VerifiedBlobTransferPlan,
         finite: Option<VerifiedFiniteBlobAdmission>,
     ) -> Result<BlobSourceStageOutcome, StoreError> {
+        self.stage_verified_blob_source_with_lifetime_and_profile(
+            policy,
+            blob,
+            sealed,
+            plan,
+            finite,
+            BlobNetworkAdmissionProfile::RangesV1,
+        )
+    }
+
+    fn stage_verified_blob_source_with_lifetime_and_profile(
+        &self,
+        policy: &ControlPolicySnapshot,
+        blob: &ContentVerifiedBlobEnvelope,
+        sealed: &[u8],
+        plan: &VerifiedBlobTransferPlan,
+        finite: Option<VerifiedFiniteBlobAdmission>,
+        profile: BlobNetworkAdmissionProfile,
+    ) -> Result<BlobSourceStageOutcome, StoreError> {
         self.require_live()?;
         let authority = self.require_bound_mission()?;
         if sealed.len() > MAX_BLOB_NETWORK_SOURCE_BYTES {
@@ -3812,9 +3885,9 @@ impl Store {
             return Err(blob_error(BlobStoreError::PendingSourceConflict));
         }
         let manifest = plan.manifest();
-        if manifest.total_len() > MAX_NETWORK_BLOB_BYTES
-            || manifest.chunk_count() > MAX_NETWORK_BLOB_CHUNKS
-        {
+        let (max_bytes, max_chunks) =
+            blob_network_admission_limits(profile, self.blob_depot_limits);
+        if manifest.total_len() > max_bytes || manifest.chunk_count() > max_chunks {
             return Err(blob_error(BlobStoreError::NetworkBlobTooLarge {
                 total_len: manifest.total_len(),
                 chunk_count: manifest.chunk_count(),
@@ -4175,7 +4248,12 @@ impl Store {
         };
         require_blob_network_staging_capacity(staging, incoming_rows, incoming_bytes)?;
 
-        depot::stage_verified_plan_write(&write, self.blob_depot_limits, plan)?;
+        depot::stage_verified_plan_write(
+            &write,
+            self.blob_depot_limits,
+            plan,
+            profile == BlobNetworkAdmissionProfile::StreamV1,
+        )?;
         if existing.is_none() {
             let pending_acceptance_order =
                 pressure::allocate_pending_acceptance_order_write(&write)?;
@@ -4249,6 +4327,27 @@ impl Store {
                 None,
             )?;
         }
+        if profile == BlobNetworkAdmissionProfile::StreamV1
+            && write
+                .open_table(BLOB_PENDING_SOURCES)?
+                .get(transfer_id.as_bytes().as_slice())?
+                .is_some()
+        {
+            let checkpoint = write
+                .open_table(BLOB_STREAM_CHECKPOINTS)?
+                .get(transfer_id.as_bytes().as_slice())?
+                .map(|row| BlobStreamCheckpoint::decode(row.value()))
+                .transpose()?
+                .unwrap_or(BlobStreamCheckpoint {
+                    next_carrier_index: 0,
+                    durable_encoded_offset: 0,
+                    generation: 1,
+                });
+            let encoded = checkpoint.encode();
+            write
+                .open_table(BLOB_STREAM_CHECKPOINTS)?
+                .insert(transfer_id.as_bytes().as_slice(), encoded.as_slice())?;
+        }
         write.commit()?;
         Ok(if existing.is_some() {
             BlobSourceStageOutcome::Duplicate
@@ -4274,6 +4373,23 @@ impl Store {
         &self,
         source: BlobTransferId,
     ) -> Result<PendingBlobLifetimeTransition, StoreError> {
+        self.settle_pending_blob_lifetime_unavailability(source, BlobContactEligibility::CustodyV1)
+    }
+
+    /// Profile-5 counterpart using the same finite-TTL retirement authority.
+    #[doc(hidden)]
+    pub fn settle_custody_v2_pending_blob_lifetime_unavailability(
+        &self,
+        source: BlobTransferId,
+    ) -> Result<PendingBlobLifetimeTransition, StoreError> {
+        self.settle_pending_blob_lifetime_unavailability(source, BlobContactEligibility::CustodyV2)
+    }
+
+    fn settle_pending_blob_lifetime_unavailability(
+        &self,
+        source: BlobTransferId,
+        eligibility: BlobContactEligibility,
+    ) -> Result<PendingBlobLifetimeTransition, StoreError> {
         self.require_live()?;
         let authority = self.require_bound_mission()?;
         let write = self.database.begin_write()?;
@@ -4286,10 +4402,7 @@ impl Store {
         let Some(pending) = pending else {
             return Ok(PendingBlobLifetimeTransition::Missing);
         };
-        require_blob_contact_eligibility(
-            pending.metadata.lifetime,
-            BlobContactEligibility::CustodyV1,
-        )?;
+        require_blob_contact_eligibility(pending.metadata.lifetime, eligibility)?;
         let pending = normalize_pending_blob_policy_write(
             &write,
             source,
@@ -6570,6 +6683,25 @@ impl Store {
         )
     }
 
+    /// Profile-5 promotion through the same PR-47 lifecycle authority.
+    pub fn apply_verified_blob_stream_v9_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        plan: &VerifiedBlobTransferPlan,
+        lineage: &CurrentBlobLineage,
+        depot_completion: &BlobDepotCompletion,
+        content_completion: &VerifiedBlobContentCompletion,
+    ) -> Result<ApplyOutcome, StoreError> {
+        self.apply_verified_blob_with_eligibility(
+            policy,
+            plan,
+            lineage,
+            depot_completion,
+            content_completion,
+            BlobContactEligibility::CustodyV2,
+        )
+    }
+
     #[doc(hidden)]
     pub fn apply_verified_durable_blob_with_policy(
         &self,
@@ -6602,6 +6734,11 @@ impl Store {
         self.require_live()?;
         let authority = self.require_bound_mission()?;
         let source = BlobTransferId::new(plan.source_envelope().into_bytes());
+        let max_content_bytes = if eligibility == BlobContactEligibility::CustodyV2 {
+            self.blob_depot_limits.max_bytes()
+        } else {
+            MAX_NETWORK_BLOB_BYTES
+        };
         if lineage.mission_authority_id() != authority
             || lineage.source_envelope().into_bytes() != *source.as_bytes()
             || lineage.blob_id() != plan.manifest().id()
@@ -6614,7 +6751,7 @@ impl Store {
             || content_completion.physical_lineage() != plan.physical_lineage()
             || content_completion.chunk_count() != plan.manifest().chunk_count()
             || content_completion.plaintext_bytes() != plan.manifest().total_len()
-            || content_completion.plaintext_bytes() > MAX_NETWORK_BLOB_BYTES
+            || content_completion.plaintext_bytes() > max_content_bytes
             || depot_completion.blob_id != plan.manifest().id()
             || depot_completion.manifest_digest != *plan.manifest_digest()
             || depot_completion.physical_lineage != *plan.physical_lineage().binding()
@@ -10074,9 +10211,9 @@ impl Store {
         // Durable eviction does not need a custody sample, so suppress it for
         // the complete contact recovery transaction.
         let custody_sample = match eligibility {
-            BlobContactEligibility::AllVisible | BlobContactEligibility::CustodyV1 => {
-                custody_sample
-            }
+            BlobContactEligibility::AllVisible
+            | BlobContactEligibility::CustodyV1
+            | BlobContactEligibility::CustodyV2 => custody_sample,
             BlobContactEligibility::DurableOnly => None,
         };
         let _depot_guard = self
@@ -10117,7 +10254,9 @@ impl Store {
 
         let read = self.database.begin_read()?;
         let selection = match eligibility {
-            BlobContactEligibility::AllVisible | BlobContactEligibility::CustodyV1 => {
+            BlobContactEligibility::AllVisible
+            | BlobContactEligibility::CustodyV1
+            | BlobContactEligibility::CustodyV2 => {
                 pressure::select_pressure_candidate_read(&read, demand, budget)?
             }
             BlobContactEligibility::DurableOnly => {
@@ -10597,7 +10736,9 @@ impl Store {
             BlobContactEligibility::AllVisible => {
                 self.run_blob_pressure_recovery(demand, pressure_budget, custody_sample)?
             }
-            BlobContactEligibility::DurableOnly | BlobContactEligibility::CustodyV1 => self
+            BlobContactEligibility::DurableOnly
+            | BlobContactEligibility::CustodyV1
+            | BlobContactEligibility::CustodyV2 => self
                 .run_blob_pressure_recovery_with_eligibility(
                     demand,
                     pressure_budget,
@@ -16112,6 +16253,7 @@ fn audit_blob_network_rows(
     carriers: &impl ReadableTable<&'static [u8], &'static [u8]>,
     metadata: &impl ReadableTable<&'static str, u64>,
     cursors: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    checkpoints: &impl ReadableTable<&'static [u8], &'static [u8]>,
     publications: &impl ReadableTable<&'static [u8], &'static [u8]>,
     imports: &impl ReadableTable<&'static [u8], &'static [u8]>,
     chunks: &impl ReadableTable<&'static [u8], &'static [u8]>,
@@ -16143,7 +16285,7 @@ fn audit_blob_network_rows(
         };
         if record.metadata.transfer_id != source
             || route.chunk_count() == 0
-            || route.chunk_count() > MAX_NETWORK_BLOB_CHUNKS
+            || route.chunk_count() > MAX_SELECTED_BLOB_CHUNKS
         {
             return Err(blob_error(BlobStoreError::SchemaInvariant(
                 "pending Blob source key or network profile is inconsistent",
@@ -16195,6 +16337,63 @@ fn audit_blob_network_rows(
         bytes = bytes
             .checked_add(staging_entry_bytes(key.value().len(), value.value().len())?)
             .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+    }
+    if checkpoints.len()? > pending_sources {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "Blob stream checkpoint count exceeds pending sources",
+        )));
+    }
+    for row in checkpoints.iter()? {
+        let (key, value) = row?;
+        let source = parse_blob_transfer_id("Blob stream checkpoint table", key.value())?;
+        let checkpoint = BlobStreamCheckpoint::decode(value.value())?;
+        let pending = sources.get(&source).ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "Blob stream checkpoint is orphaned from its pending source",
+            ))
+        })?;
+        if checkpoint.generation == 0
+            || checkpoint.next_carrier_index
+                > u64::try_from(pending.carriers.len())
+                    .map_err(|_| StoreError::ItemCountAccountingOverflow)?
+        {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "Blob stream checkpoint has an invalid generation or carrier index",
+            )));
+        }
+        let mut offset = 0_u64;
+        for index in 0..checkpoint.next_carrier_index {
+            let carrier = pending
+                .carriers
+                .iter()
+                .find(|carrier| carrier.index == index)
+                .ok_or_else(|| {
+                    blob_error(BlobStoreError::SchemaInvariant(
+                        "Blob stream checkpoint crosses a missing carrier",
+                    ))
+                })?;
+            offset = offset
+                .checked_add(carrier.total_len)
+                .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+        }
+        if offset != checkpoint.durable_encoded_offset {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "Blob stream checkpoint is not a canonical carrier boundary",
+            )));
+        }
+        if let BlobLifetime::Finite { provenance, .. } = pending.metadata.lifetime
+            && !matches!(
+                provenance,
+                BlobFiniteProvenance::NetworkV1 {
+                    semantic_version: 9,
+                    profile_id
+                } if profile_id == aster_mesh::TransferProfileId::BlobStreamV1 as u16
+            )
+        {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "finite Blob stream checkpoint lacks v9 provenance",
+            )));
+        }
     }
     if bytes > MAX_BLOB_NETWORK_STAGING_BYTES {
         return Err(blob_error(BlobStoreError::SchemaInvariant(
@@ -16279,6 +16478,7 @@ fn audit_blob_network_tables_write_with_publications(
     let carriers = write.open_table(BLOB_CARRIER_PREFIXES)?;
     let metadata = write.open_table(BLOB_NETWORK_METADATA)?;
     let cursors = write.open_table(BLOB_CARRIER_FETCH_CURSORS)?;
+    let checkpoints = write.open_table(BLOB_STREAM_CHECKPOINTS)?;
     let imports = write.open_table(BLOB_IMPORTS)?;
     let chunks = write.open_table(BLOB_CHUNKS)?;
     audit_blob_network_rows(
@@ -16286,6 +16486,7 @@ fn audit_blob_network_tables_write_with_publications(
         &carriers,
         &metadata,
         &cursors,
+        &checkpoints,
         publications,
         &imports,
         &chunks,
@@ -16303,6 +16504,7 @@ fn inspect_blob_network_tables_read_with_publications(
     let carriers = read.open_table(BLOB_CARRIER_PREFIXES)?;
     let metadata = read.open_table(BLOB_NETWORK_METADATA)?;
     let cursors = read.open_table(BLOB_CARRIER_FETCH_CURSORS)?;
+    let checkpoints = read.open_table(BLOB_STREAM_CHECKPOINTS)?;
     let imports = read.open_table(BLOB_IMPORTS)?;
     let chunks = read.open_table(BLOB_CHUNKS)?;
     audit_blob_network_rows(
@@ -16310,6 +16512,7 @@ fn inspect_blob_network_tables_read_with_publications(
         &carriers,
         &metadata,
         &cursors,
+        &checkpoints,
         publications,
         &imports,
         &chunks,
@@ -16954,7 +17157,7 @@ fn decode_pending_blob_source_for_encoding(
         ))
     })?;
     if carrier_count == 0
-        || carrier_count > usize::try_from(MAX_NETWORK_BLOB_CHUNKS).unwrap_or(usize::MAX)
+        || carrier_count > usize::try_from(MAX_SELECTED_BLOB_CHUNKS).unwrap_or(usize::MAX)
         || u64::try_from(carrier_count).ok()
             != metadata.header.blob_route.map(|route| route.chunk_count())
     {
@@ -17413,6 +17616,9 @@ fn remove_pending_source_rows_write_inner(
     }
     write
         .open_table(BLOB_PENDING_SOURCES)?
+        .remove(source.as_bytes().as_slice())?;
+    write
+        .open_table(BLOB_STREAM_CHECKPOINTS)?
         .remove(source.as_bytes().as_slice())?;
     {
         let mut prefixes = write.open_table(BLOB_CARRIER_PREFIXES)?;
@@ -21482,13 +21688,23 @@ mod tests {
         let policy = target.control_policy_snapshot().expect("stream policy");
         let transfer = BlobTransferId::new(proof.blob.envelope_id());
         target
-            .stage_verified_blob_source_with_policy(&policy, &proof.blob, &proof.sealed, &plan)
+            .stage_verified_durable_blob_stream_v9_with_policy(
+                &policy,
+                &proof.blob,
+                &proof.sealed,
+                &plan,
+            )
             .expect("stage stream source");
+        let initial = BlobStreamCheckpoint {
+            next_carrier_index: 0,
+            durable_encoded_offset: 0,
+            generation: 1,
+        };
         assert_eq!(
             target
                 .blob_stream_checkpoint_with_policy(&policy, transfer, &plan)
                 .expect("initial checkpoint"),
-            BlobStreamCheckpoint::default()
+            initial
         );
 
         let owned = {
@@ -21512,19 +21728,13 @@ mod tests {
         )
         .expect("checkpoint batch");
         let outcome = target
-            .commit_blob_stream_batch_with_policy(
-                &policy,
-                transfer,
-                &plan,
-                BlobStreamCheckpoint::default(),
-                batch,
-            )
+            .commit_blob_stream_batch_with_policy(&policy, transfer, &plan, initial, batch)
             .expect("commit stream batch");
         let BlobStreamCommitOutcome::Complete(checkpoint) = outcome else {
             panic!("all carriers must complete the stream")
         };
         assert_eq!(checkpoint.next_carrier_index, plan.manifest().chunk_count());
-        assert_eq!(checkpoint.generation, 1);
+        assert_eq!(checkpoint.generation, 2);
         assert_eq!(
             target
                 .blob_stream_checkpoint_with_policy(&policy, transfer, &plan)
@@ -21555,8 +21765,18 @@ mod tests {
         let policy = target.control_policy_snapshot().expect("fault policy");
         let transfer = BlobTransferId::new(proof.blob.envelope_id());
         target
-            .stage_verified_blob_source_with_policy(&policy, &proof.blob, &proof.sealed, &plan)
+            .stage_verified_durable_blob_stream_v9_with_policy(
+                &policy,
+                &proof.blob,
+                &proof.sealed,
+                &plan,
+            )
             .expect("stage fault source");
+        let initial = BlobStreamCheckpoint {
+            next_carrier_index: 0,
+            durable_encoded_offset: 0,
+            generation: 1,
+        };
         let batch = {
             let mut source_depot = source.blob_depot().expect("fault source depot");
             CoreBlobStore::begin_blob_with_lineage(
@@ -21581,19 +21801,13 @@ mod tests {
 
         depot::inject_test_fault(&target_root.path, depot::DepotFaultPoint::Renamed);
         target
-            .commit_blob_stream_batch_with_policy(
-                &policy,
-                transfer,
-                &plan,
-                BlobStreamCheckpoint::default(),
-                batch.clone(),
-            )
+            .commit_blob_stream_batch_with_policy(&policy, transfer, &plan, initial, batch.clone())
             .expect_err("rename fault interrupts before checkpoint");
         assert_eq!(
             target
                 .blob_stream_checkpoint_with_policy(&policy, transfer, &plan)
                 .expect("checkpoint after fault"),
-            BlobStreamCheckpoint::default()
+            initial
         );
         assert_eq!(
             target.blob_stats().expect("fault stats").committed_chunks,
@@ -21606,16 +21820,141 @@ mod tests {
         let policy = reopened.control_policy_snapshot().expect("reopen policy");
         assert!(matches!(
             reopened
-                .commit_blob_stream_batch_with_policy(
-                    &policy,
-                    transfer,
-                    &plan,
-                    BlobStreamCheckpoint::default(),
-                    batch,
-                )
+                .commit_blob_stream_batch_with_policy(&policy, transfer, &plan, initial, batch,)
                 .expect("retry exact stream batch"),
             BlobStreamCommitOutcome::Complete(_)
         ));
+    }
+
+    #[test]
+    fn blob_stream_lifecycle_durable_upgrade_is_atomic_and_one_way() {
+        let source_root = BlobTestRoot::new("stream-upgrade-source");
+        let target_root = BlobTestRoot::new("stream-upgrade-target");
+        let mut services = blob_services(0xa9);
+        let source = Store::open_for_mission(&source_root.database, services.authority)
+            .expect("upgrade source store");
+        let target = Store::open_for_mission(&target_root.database, services.authority)
+            .expect("upgrade target store");
+        let plaintext = vec![0x7c; 16_385];
+        let prepared = prepared_blob(&plaintext);
+        let proof = prepare_blob_proof(&source, &mut services, &prepared, &plaintext, 1);
+        let plan = proof
+            .blob
+            .transfer_plan(&proof.manifest_bytes)
+            .expect("upgrade transfer plan");
+        let policy = target.control_policy_snapshot().expect("upgrade policy");
+        let transfer = BlobTransferId::new(proof.blob.envelope_id());
+        target
+            .stage_verified_blob_source_with_policy(&policy, &proof.blob, &proof.sealed, &plan)
+            .expect("stage upgrade source");
+
+        let BlobStreamProvenanceUpgrade::Upgraded(checkpoint) = target
+            .upgrade_pending_blob_to_stream_v9(
+                &policy,
+                transfer,
+                &proof.blob,
+                &proof.sealed,
+                &plan,
+                None,
+            )
+            .expect("upgrade durable source")
+        else {
+            panic!("first upgrade must change provenance")
+        };
+        assert_eq!(checkpoint.generation, 1);
+        assert_eq!(checkpoint.next_carrier_index, 0);
+        assert_eq!(checkpoint.durable_encoded_offset, 0);
+        assert_eq!(
+            target
+                .upgrade_pending_blob_to_stream_v9(
+                    &policy,
+                    transfer,
+                    &proof.blob,
+                    &proof.sealed,
+                    &plan,
+                    None,
+                )
+                .expect("idempotent upgrade"),
+            BlobStreamProvenanceUpgrade::AlreadyV9(checkpoint)
+        );
+    }
+
+    #[test]
+    fn blob_stream_lifecycle_large_object_limits_are_profile_scoped_and_checked() {
+        let two_gib = 2_u64 * 1024 * 1024 * 1024;
+        let chunks = two_gib / u64::from(SELECTED_BLOB_CHUNK_SIZE);
+        let depot = BlobDepotLimits::new(two_gib + chunks * 256, chunks, 2)
+            .expect("explicit 2-GiB depot limits");
+        assert_eq!(
+            blob_network_admission_limits(BlobNetworkAdmissionProfile::RangesV1, depot),
+            (MAX_NETWORK_BLOB_BYTES, MAX_NETWORK_BLOB_CHUNKS)
+        );
+        let (stream_bytes, stream_chunks) =
+            blob_network_admission_limits(BlobNetworkAdmissionProfile::StreamV1, depot);
+        assert!(stream_bytes >= two_gib);
+        assert!(stream_chunks >= chunks);
+        assert!(MAX_SELECTED_BLOB_CHUNKS >= chunks);
+    }
+
+    #[test]
+    fn blob_stream_lifecycle_new_v9_stage_creates_checkpoint_atomically() {
+        let source_root = BlobTestRoot::new("stream-v9-stage-source");
+        let target_root = BlobTestRoot::new("stream-v9-stage-target");
+        let mut services = blob_services(0xaa);
+        let source = Store::open_for_mission(&source_root.database, services.authority)
+            .expect("v9 stage source store");
+        let target = Store::open_for_mission(&target_root.database, services.authority)
+            .expect("v9 stage target store");
+        let plaintext = vec![0x2d; 32_769];
+        let prepared = prepared_blob(&plaintext);
+        let proof = prepare_blob_proof(&source, &mut services, &prepared, &plaintext, 1);
+        let plan = proof
+            .blob
+            .transfer_plan(&proof.manifest_bytes)
+            .expect("v9 stage plan");
+        let policy = target.control_policy_snapshot().expect("v9 stage policy");
+        let transfer = BlobTransferId::new(proof.blob.envelope_id());
+        assert_eq!(
+            target
+                .stage_verified_durable_blob_stream_v9_with_policy(
+                    &policy,
+                    &proof.blob,
+                    &proof.sealed,
+                    &plan,
+                )
+                .expect("stage v9 source"),
+            BlobSourceStageOutcome::Inserted
+        );
+        assert_eq!(
+            target
+                .blob_stream_checkpoint_with_policy(&policy, transfer, &plan)
+                .expect("initial v9 checkpoint"),
+            BlobStreamCheckpoint {
+                next_carrier_index: 0,
+                durable_encoded_offset: 0,
+                generation: 1,
+            }
+        );
+        drop(target);
+        let reopened = Store::open_for_mission(&target_root.database, services.authority)
+            .expect("v9 checkpoint survives audited reopen");
+        assert!(
+            reopened
+                .abort_pending_blob_source(transfer)
+                .expect("abort v9 pending source")
+        );
+        let read = reopened
+            .database
+            .begin_read()
+            .expect("checkpoint cleanup read");
+        assert!(
+            read.open_table(BLOB_STREAM_CHECKPOINTS)
+                .expect("checkpoint table")
+                .get(transfer.as_bytes().as_slice())
+                .expect("checkpoint lookup")
+                .is_none(),
+            "pending-source cleanup must remove its stream checkpoint"
+        );
     }
 
     fn assert_durable_contact_rejects_without_mutation<T>(

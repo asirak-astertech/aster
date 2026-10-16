@@ -38,7 +38,7 @@ use aster_redb_store::{
     BlobTransferStatusSnapshot as StoreBlobTransferStatusSnapshot, BlobVariantId,
     ControlPolicySnapshot, ControlTransferId, MAX_BLOB_OPERATION_KEY_BYTES,
     MAX_BLOB_POLL_DELIVERIES, MAX_BLOB_SUBSCRIPTION_SCAN, MAX_NETWORK_BLOB_BYTES,
-    MAX_NETWORK_BLOB_CHUNKS, Store, StoreError, StoreLimits, StoredBlob,
+    MAX_NETWORK_BLOB_CHUNKS, MAX_SELECTED_BLOB_CHUNKS, Store, StoreError, StoreLimits, StoredBlob,
 };
 pub use aster_redb_store::{
     BlobDepotLimits, BlobGcFailureCategory, BlobGcRetryState, BlobGcStatus, BlobRetirementReason,
@@ -252,11 +252,22 @@ impl Seek for AdmittedFile<'_> {
     }
 }
 
-/// Maximum plaintext accepted by one live Blob publication.
+/// Legacy profile-4 live-publication byte ceiling.
+///
+/// Profile-5-capable local publication derives its checked ceiling from the
+/// configured physical depot limits without adding a transport option here.
 pub const MAX_SELECTED_LIVE_BLOB_BYTES: u64 = MAX_NETWORK_BLOB_BYTES;
 
-/// Maximum canonical 64 KiB chunks accepted by one live Blob publication.
+/// Legacy profile-4 live-publication chunk ceiling.
 pub const MAX_SELECTED_LIVE_BLOB_CHUNKS: u64 = MAX_NETWORK_BLOB_CHUNKS;
+
+fn configured_live_blob_limits(store: &Store) -> (u64, u64) {
+    let depot = store.blob_depot_limits();
+    (
+        depot.max_bytes(),
+        depot.max_chunks().min(MAX_SELECTED_BLOB_CHUNKS),
+    )
+}
 
 /// Maximum plaintext returned by one live Blob page read.
 pub const MAX_SELECTED_BLOB_PAGE_BYTES: usize = SELECTED_BLOB_CHUNK_SIZE as usize;
@@ -1770,7 +1781,8 @@ impl SelectedBlobNode {
                 "blob publish",
             ));
         }
-        if metadata.len() > MAX_SELECTED_LIVE_BLOB_BYTES {
+        let (max_live_bytes, _) = configured_live_blob_limits(&self.store);
+        if metadata.len() > max_live_bytes {
             return Err(ApplicationError::new(
                 ApplicationErrorKind::ResourceLimit,
                 "blob publish",
@@ -1789,7 +1801,7 @@ impl SelectedBlobNode {
         let mut source = AdmittedFile {
             file: &mut source,
             admission,
-            max_len: MAX_SELECTED_LIVE_BLOB_BYTES,
+            max_len: max_live_bytes,
             #[cfg(test)]
             pass_two_gate: self.live_publish_pass_two_gate.take(),
             #[cfg(test)]
@@ -1966,9 +1978,9 @@ impl SelectedBlobNode {
             )
             .into());
         }
+        let (max_live_bytes, max_live_chunks) = configured_live_blob_limits(&self.store);
         if live.is_some()
-            && (prepared.total_len() > MAX_SELECTED_LIVE_BLOB_BYTES
-                || prepared.chunk_count() > MAX_SELECTED_LIVE_BLOB_CHUNKS)
+            && (prepared.total_len() > max_live_bytes || prepared.chunk_count() > max_live_chunks)
         {
             return Err(
                 ApplicationError::new(ApplicationErrorKind::ResourceLimit, "blob publish").into(),
@@ -3441,8 +3453,9 @@ impl SelectedBlobNode {
             ));
         }
         Self::require_blob_plan_claims_for(plan, &stored, "blob read page")?;
-        if stored.blob.manifest().total_len() > MAX_SELECTED_LIVE_BLOB_BYTES
-            || stored.blob.manifest().chunk_count() > MAX_SELECTED_LIVE_BLOB_CHUNKS
+        let (max_live_bytes, max_live_chunks) = configured_live_blob_limits(&self.store);
+        if stored.blob.manifest().total_len() > max_live_bytes
+            || stored.blob.manifest().chunk_count() > max_live_chunks
         {
             return Err(ApplicationError::new(
                 ApplicationErrorKind::ResourceLimit,
@@ -3835,9 +3848,10 @@ impl SelectedBlobNode {
             || stored.blob_id != prepared.id()
             || prepared.total_len() == 0
             || prepared.chunk_count() == 0
-            || (live_bounded
-                && (prepared.chunk_count() > MAX_SELECTED_LIVE_BLOB_CHUNKS
-                    || prepared.total_len() > MAX_SELECTED_LIVE_BLOB_BYTES))
+            || (live_bounded && {
+                let (max_live_bytes, max_live_chunks) = configured_live_blob_limits(&self.store);
+                prepared.chunk_count() > max_live_chunks || prepared.total_len() > max_live_bytes
+            })
         {
             return Err(ApplicationError::new(
                 ApplicationErrorKind::Integrity,

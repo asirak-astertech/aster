@@ -1162,6 +1162,13 @@ impl<'a> BlobDepot<'a> {
         self.ensure_variant_lease(variant, super::lease::BlobLeaseKind::InternalChunkWork)
     }
 
+    pub(super) fn acquire_carrier_extent_lease(
+        &mut self,
+        variant: BlobVariantId,
+    ) -> Result<(), StoreError> {
+        self.ensure_variant_lease(variant, super::lease::BlobLeaseKind::CarrierExtent)
+    }
+
     pub(super) fn open(store: &'a Store) -> Result<Self, StoreError> {
         let guard = store
             .blob_depot_lock
@@ -1676,11 +1683,14 @@ impl<'a> BlobDepot<'a> {
         // so acquiring another worker lease here would turn a stopped whole-
         // Blob read into unbounded worker work. The write-transaction check
         // below remains the durable DeletePending fence for both cases.
-        if self._lease.is_some() {
-            self.ensure_variant_lease(
-                incoming.variant_id,
-                super::lease::BlobLeaseKind::LocalImport,
-            )?;
+        if let Some(lease) = &self._lease {
+            let held = lease.kind().map_err(super::lease::store_error)?;
+            let required = if held == super::lease::BlobLeaseKind::CarrierExtent {
+                held
+            } else {
+                super::lease::BlobLeaseKind::LocalImport
+            };
+            self.ensure_variant_lease(incoming.variant_id, required)?;
         }
         #[cfg(test)]
         self.store
@@ -4485,11 +4495,22 @@ pub(super) fn stage_verified_plan_write(
     write: &redb::WriteTransaction,
     limits: BlobDepotLimits,
     plan: &VerifiedBlobTransferPlan,
+    stream_v1: bool,
 ) -> Result<(), StoreError> {
     let manifest = plan.manifest();
     let incoming = ImportRecord::from_manifest(manifest, Some(plan.physical_lineage()))?;
-    if incoming.total_len > MAX_NETWORK_BLOB_BYTES
-        || incoming.chunk_count > MAX_NETWORK_BLOB_CHUNKS
+    let max_bytes = if stream_v1 {
+        limits.max_bytes()
+    } else {
+        MAX_NETWORK_BLOB_BYTES
+    };
+    let max_chunks = if stream_v1 {
+        limits.max_chunks().min(MAX_SELECTED_BLOB_CHUNKS)
+    } else {
+        MAX_NETWORK_BLOB_CHUNKS
+    };
+    if incoming.total_len > max_bytes
+        || incoming.chunk_count > max_chunks
         || usize::try_from(incoming.chunk_count).ok() != Some(plan.chunk_records().len())
     {
         return Err(blob_error(BlobStoreError::NetworkBlobTooLarge {

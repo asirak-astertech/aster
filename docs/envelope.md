@@ -151,7 +151,7 @@ that 32-byte value itself is the input to both signature algorithms.
 | Semantic-v8 Blob custody claim | `"ASTRBL08"` in a v8 Blob mutable source frame | exact 208-byte canonical claim; decoded bytes remain untrusted until exact-context verification |
 | Handshake flight | `"ASTRHS01"` | network, at most 64 KiB per flight |
 | Protected transport frame | `"ASTRFR01"` | network; plaintext at most 16 MiB |
-| Blob manifest | `"ASTRBM01"` | canonical source-authenticated object, at most 1 MiB |
+| Blob manifest | `"ASTRBM01"` | canonical source-authenticated object, at most 4 MiB; profile 4 retains its smaller network admission ceiling |
 | Blob ciphertext chunk carrier | `"ASTRBT01"` | network/stable-store object; exact bounds in §10 |
 
 Security-object kind registries are closed in this profile:

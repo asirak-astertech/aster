@@ -32,11 +32,15 @@ pub const MAX_BLOB_CHUNK_SIZE: u32 = 64 * 1024;
 /// Canonical chunk size required by the selected Blob application profile.
 pub const SELECTED_BLOB_CHUNK_SIZE: u32 = MAX_BLOB_CHUNK_SIZE;
 /// Maximum exact canonical manifest size, including every per-chunk integrity record.
-pub const MAX_BLOB_MANIFEST_BYTES: u64 = 1024 * 1024;
+///
+/// Four MiB covers more than 2 GiB of selected 64-KiB chunks. Older transfer
+/// profiles retain their smaller admission limits; this is an additive parser
+/// and source-format capacity extension, not a reinterpretation of their bytes.
+pub const MAX_BLOB_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 const MANIFEST_RECORD_LEN: u64 = 72;
 const MANIFEST_FIXED_LEN: u64 = 141;
 const MAX_ENCODED_METADATA_LEN: u64 = 2 + MAX_MEDIA_TYPE_LEN as u64 + MAX_SCHEMA_ID_LEN as u64;
-/// Maximum selected chunk count that keeps the exact canonical manifest within 1 MiB.
+/// Maximum selected chunk count that keeps the exact canonical manifest within 4 MiB.
 pub const MAX_BLOB_CHUNKS: u64 =
     (MAX_BLOB_MANIFEST_BYTES - MANIFEST_FIXED_LEN - MAX_ENCODED_METADATA_LEN) / MANIFEST_RECORD_LEN;
 const MAX_MEDIA_TYPE_LEN: usize = 255;
@@ -5867,7 +5871,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_cap_boundary_is_at_most_one_mibibyte() {
+    fn manifest_cap_boundary_covers_two_gibibytes_within_four_mibibytes() {
         let metadata = BlobMetadata::new(
             Some("a".repeat(MAX_MEDIA_TYPE_LEN)),
             vec![9; MAX_SCHEMA_ID_LEN],
@@ -5887,6 +5891,10 @@ mod tests {
             .unwrap_or_else(|error| panic!("manifest length failed: {error}"));
         assert!(encoded <= MAX_BLOB_MANIFEST_BYTES);
         assert!(MAX_BLOB_MANIFEST_BYTES - encoded < MANIFEST_RECORD_LEN);
+        assert!(
+            at_limit.total_len >= 2_u64 * 1024 * 1024 * 1024,
+            "selected manifest capacity must cover the profile-5 2-GiB shape"
+        );
         validate_manifest(&at_limit)
             .unwrap_or_else(|error| panic!("boundary manifest failed: {error}"));
 

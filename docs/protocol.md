@@ -514,7 +514,7 @@ A Blob manifest contains total length, media/schema metadata, chunk size, ordere
 SHA-256 chunk digests, and a full-content digest. Default chunk size is 16 KiB,
 configurable from 4–64 KiB. Chunks use independently derived keys/nonces and are
 verified and committed while streaming. A complete blob digest is verified before
-delivery. The canonical manifest is at most 1 MiB and is independently
+delivery. The canonical manifest is at most 4 MiB and is independently
 implementable from [envelope.md](envelope.md). The current durable Blob service
 can resume local chunk production and reading without whole-Blob RAM growth.
 
@@ -565,7 +565,10 @@ route root or chunk count.
 
 Empty manifests are canonical local objects, but envelope format 2 requires a
 nonzero route chunk count, so a zero-byte Blob is not publishable in this network
-profile. A manifest has at most 14,543 chunks and 1 MiB of bytes.
+profile. A manifest has at most 58,234 chunks and 4 MiB of bytes. Profile 4
+retains its separate 64-MiB/1,024-chunk network admission ceiling; profile 5
+uses checked configured depot byte/chunk limits and supports at least a 2-GiB
+shape when those limits reserve its complete physical representation.
 The composite per-contact inventory is capped at 100,000 ObjectIDs with source
 envelopes inserted before Blob carriers. A source-envelope selection that alone
 exceeds the cap is rejected rather than silently truncated. Content-authorized nodes retain both a
