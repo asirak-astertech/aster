@@ -2,8 +2,6 @@ name: "Build: Compose images"
 
 on:
   workflow_dispatch:
-  pull_request:
-    branches: [main]
 
 permissions:
   contents: read
@@ -18,7 +16,6 @@ defaults:
 
 jobs:
   package:
-    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.number == 95
     name: Package Compose images (${{ matrix.arch }})
     strategy:
       fail-fast: false
