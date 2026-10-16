@@ -17,7 +17,7 @@ profile `0x0002` remains an interoperability gate.
 
 The key words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY**
 are normative. This document defines the base fixed binary security objects
-emitted or accepted by the reference profile. The semantic-version-2/3/v4/v5/v6/v7/v8 batch
+emitted or accepted by the reference profile. The semantic-version-2/3/v4/v5/v6/v7/v8/v9 batch
 additions are defined normatively in [protocol.md](protocol.md) §6.1; together,
 these sections are the interoperability authority for the fixed bytes. Rust
 types and local database rows are not wire formats.
@@ -138,16 +138,16 @@ that 32-byte value itself is the input to both signature algorithms.
 | Provisioning bundle | `"ASTRPB03"` | unprotected local provisioning-inner format; not a network object |
 | Rekey recipient registry | `"ASTRRKR1"` | signed administrative artifact; at most 16 MiB; not a mesh replication object |
 | Authority credential body | none; embedded with `b32` | network security object; embedded bound 16 KiB |
-| Singleton source envelope | `"ASTRENV2"` | network/stable-store format-2 object; semantic versions 1 through 8 |
-| Compact batch source envelope | `"ASTRENV3"`, kind `1` | semantic-version-2/3/v4/v5/v6/v7/v8 network/stable-store format-3 object; exact bytes in [protocol.md](protocol.md) §6.1 |
-| Source-batch proof | `"ASTRENV3"`, kind `3` | semantic-version-2/3/v4/v5/v6/v7/v8 network/stable-store format-3 object; exact bytes in [protocol.md](protocol.md) §6.1 |
+| Singleton source envelope | `"ASTRENV2"` | network/stable-store format-2 object; semantic versions 1 through 9 |
+| Compact batch source envelope | `"ASTRENV3"`, kind `1` | semantic-version-2/3/v4/v5/v6/v7/v8/v9 network/stable-store format-3 object; exact bytes in [protocol.md](protocol.md) §6.1 |
+| Source-batch proof | `"ASTRENV3"`, kind `3` | semantic-version-2/3/v4/v5/v6/v7/v8/v9 network/stable-store format-3 object; exact bytes in [protocol.md](protocol.md) §6.1 |
 | Revocation control | source-envelope kind `2`, protected `"ASTRCA02"` | delegated-control format 2 inside `ASTRENV2` |
 | Scope-epoch control | source-envelope kind `3`, protected `"ASTRCA02"` | delegated-control format 2 inside `ASTRENV2` |
-| Bridge authorization | `"ASTRBA01"`, protected ObjectKind `4` | semantic-version-2/3/v4/v5/v6/v7/v8 authorization format 2; at most 65,536 bytes total |
-| Bridge route wrapper | `"ASTRBW01"`, protected ObjectKind `5` | semantic-version-2/3/v4/v5/v6/v7/v8 wrapper format 1; at most 524,322 bytes total |
+| Bridge authorization | `"ASTRBA01"`, protected ObjectKind `4` | semantic-version-2/3/v4/v5/v6/v7/v8/v9 authorization format 2; at most 65,536 bytes total |
+| Bridge route wrapper | `"ASTRBW01"`, protected ObjectKind `5` | semantic-version-2/3/v4/v5/v6/v7/v8/v9 wrapper format 1; at most 524,322 bytes total |
 | Bridge edge enrollment | `"ASTRBE01"` | provider-authenticated administrative capability; at most 32 KiB; not a mesh replication object |
 | Legacy per-hop forwarding wrapper | `"ASTRFWD1"` | provider-owned network object; protected body at most 64 KiB including tag |
-| Semantic-v3-format custody claim, used by v3/v4/v5/v6/v7/v8 | `"ASTRCU03"` inside `"ASTRFR01"` | exact 150-byte plaintext; exact current outer record 202 bytes, hard bound 256 bytes |
+| Semantic-v3-format custody claim, used by v3/v4/v5/v6/v7/v8/v9 | `"ASTRCU03"` inside `"ASTRFR01"` | exact 150-byte plaintext; exact current outer record 202 bytes, hard bound 256 bytes |
 | Semantic-v8 Blob custody claim | `"ASTRBL08"` in a v8 Blob mutable source frame | exact 208-byte canonical claim; decoded bytes remain untrusted until exact-context verification |
 | Handshake flight | `"ASTRHS01"` | network, at most 64 KiB per flight |
 | Protected transport frame | `"ASTRFR01"` | network; plaintext at most 16 MiB |
@@ -511,7 +511,7 @@ and semantic-version-8 sessions also support the separate `ASTRENV3` format-3
 source-batch proof and compact item representations defined in
 [protocol.md](protocol.md) §6.1. Those bytes MUST NOT
 be inserted into or reinterpreted as an `ASTRENV2` object; format 2 remains the
-singleton fallback for semantic-version-2/3/v4/v5/v6/v7/v8 peers and the only source-envelope
+singleton fallback for semantic-version-2/3/v4/v5/v6/v7/v8/v9 peers and the only source-envelope
 format accepted by semantic version 1.
 
 ## 6. Authority control objects
@@ -791,7 +791,7 @@ generation in independent durable state and supply it as the minimum generation
 on import; using the zero-minimum convenience import after losing that state
 does not provide rollback detection.
 
-### 6.2 Semantic-v2/v3/v4/v5/v6/v7/v8 bridge delegated control authentication
+### 6.2 Semantic-v2/v3/v4/v5/v6/v7/v8/v9 bridge delegated control authentication
 
 A semantic-version-2, semantic-version-3, semantic-version-4,
 semantic-version-5, semantic-version-6, or semantic-version-7 ObjectKind `4` bridge authorization
@@ -1393,7 +1393,7 @@ direction, shared by the ordinary and semantic-v7/v8 contextual AAD domains. It
 starts at zero, increments by one for each encryption attempt in either domain,
 never repeats, and fails closed after using `u64::MAX`.
 
-For semantic versions 1 through 8, the application AAD for normal transport
+For semantic versions 1 through 9, the application AAD for normal transport
 frames is the exact ASCII string `"aster/transport-frame/v1"`. Record AEAD
 associated data is:
 
@@ -1919,7 +1919,7 @@ cross-field length, hash, AEAD tag, required signature, or trailing-byte rule
 above fails. Authentication errors exposed to an unauthenticated peer SHOULD be
 indistinguishable.
 
-Semantic-version-2/3/v4/v5/v6/v7/v8 multi-item source authentication and inclusion proofs are
+Semantic-version-2/3/v4/v5/v6/v7/v8/v9 multi-item source authentication and inclusion proofs are
 implemented as the separate `ASTRENV3` format-3 objects defined normatively in
 [protocol.md](protocol.md) §6.1. They are not unresolved extensions to
 `ASTRENV2` and MUST be rejected by semantic-version-1 sessions.

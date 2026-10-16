@@ -110,6 +110,8 @@ mod blob_ranges_stream_test;
 mod convergence_test;
 
 #[cfg(test)]
+use crate::event_pages::SEMANTIC_PROTOCOL_V9;
+#[cfg(test)]
 use crate::event_pages::empty_set_commitment;
 #[cfg(test)]
 use crate::mission::initiate_over_iroh_metered_for_semantic_version;
@@ -36322,7 +36324,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v7_profile_offer_is_first_protected_exchange_after_four_flight_handshake() {
+    async fn v9_profile_offer_is_first_protected_exchange_after_four_flight_handshake() {
         let mut issued = issue_missions(2);
         let client_mission = issued.remove(0);
         let server_mission = issued.remove(0);
@@ -36362,23 +36364,8 @@ mod tests {
                 let profiles = serve_transfer_profiles(&connection, &mut mission, &mut receipt)
                     .await
                     .expect("serve profiles")
-                    .expect("semantic v7 profiles");
-                let response_plan = EventTurnPlanV1::Empty {
-                    direction: EventDirection::ToSessionInitiator,
-                    transfer_profile_digest: profiles.digest,
-                    selected_profile: TransferProfileId::EventPagesV1,
-                    set_commitment: empty_set_commitment(),
-                };
-                let request_plan = serve_event_turn_plans(
-                    &connection,
-                    &mut mission,
-                    &profiles,
-                    response_plan.clone(),
-                    &mut receipt,
-                )
-                .await
-                .expect("serve plans");
-                (profiles, receipt, request_plan, response_plan)
+                    .expect("semantic v9 profiles");
+                (profiles, receipt)
             }
         });
 
@@ -36405,31 +36392,17 @@ mod tests {
         let client_profiles = sync_transfer_profiles(&connection, &mut mission, &mut receipt)
             .await
             .expect("sync profiles")
-            .expect("semantic v7 profiles");
-        let request_plan = EventTurnPlanV1::Empty {
-            direction: EventDirection::ToSessionResponder,
-            transfer_profile_digest: client_profiles.digest,
-            selected_profile: TransferProfileId::EventPagesV1,
-            set_commitment: empty_set_commitment(),
-        };
-        let response_plan = sync_event_turn_plans(
-            &connection,
-            &mut mission,
-            &client_profiles,
-            request_plan.clone(),
-            &mut receipt,
-        )
-        .await
-        .expect("sync plans");
-        let (server_profiles, server_receipt, server_request_plan, server_response_plan) =
-            server_task.await.expect("server task");
+            .expect("semantic v9 profiles");
+        let (server_profiles, server_receipt) = server_task.await.expect("server task");
 
         assert_eq!(client_profiles, server_profiles);
-        assert_eq!(server_request_plan, request_plan);
-        assert_eq!(response_plan, server_response_plan);
-        assert_eq!(receipt.protected_frames, 4);
-        assert_eq!(server_receipt.protected_frames, 4);
-        assert_eq!(mission.semantic_version(), SEMANTIC_PROTOCOL_V8);
+        assert_eq!(
+            client_profiles.negotiated.profile(LaneId::Blob),
+            Some(TransferProfileId::BlobStreamV1)
+        );
+        assert_eq!(receipt.protected_frames, 2);
+        assert_eq!(server_receipt.protected_frames, 2);
+        assert_eq!(mission.semantic_version(), SEMANTIC_PROTOCOL_V9);
         client.close().await;
         server.close().await;
     }
@@ -49439,8 +49412,14 @@ mod tests {
             }
         });
         let snapshot = client_policy.snapshot().expect("client policy snapshot");
-        let client_receipt = TEST_BLOB_SETTLEMENT_HARNESS
-            .scope(
+        let semantic_version = TEST_SEMANTIC_VERSION
+            .try_with(std::cell::Cell::get)
+            .ok()
+            .flatten()
+            .unwrap_or(SEMANTIC_PROTOCOL_V8);
+        let client_receipt = with_test_semantic_version(
+            semantic_version,
+            TEST_BLOB_SETTLEMENT_HARNESS.scope(
                 client_settlement_harness.unwrap_or_default(),
                 TEST_BLOB_RECEIVE_FAULT.scope(
                     std::cell::Cell::new(client_receive_fault),
@@ -49484,8 +49463,9 @@ mod tests {
                         ),
                     ),
                 ),
-            )
-            .await;
+            ),
+        )
+        .await;
         if client_receipt.is_err() {
             client.close().await;
         }
@@ -49843,7 +49823,7 @@ mod tests {
         assert!(custody_mode.finite_transfer_enabled());
         assert!(matches!(
             BlobContactMode::from_authenticated_profiles(
-                SEMANTIC_PROTOCOL_V8 + 1,
+                SEMANTIC_PROTOCOL_V9 + 1,
                 Some(&v8_custody),
             ),
             Err(NodeError::Protocol(_))
@@ -49914,7 +49894,7 @@ mod tests {
                     clock_id: BLOB_CONTACT_TEST_CLIENT_CLOCK_ID,
                     tick_ms: 0,
                 },
-                SEMANTIC_PROTOCOL_V8 + 1,
+                SEMANTIC_PROTOCOL_V9 + 1,
                 TransferProfileId::BlobRangesStreamV1 as u16,
             )
             .expect("stage unsupported received provenance");

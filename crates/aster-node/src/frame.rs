@@ -2253,7 +2253,7 @@ const fn is_v7_only_tag(tag: u8) -> bool {
 }
 
 fn validate_semantic_version(semantic_version: u16) -> Result<(), NodeError> {
-    if !(1..=crate::event_pages::SEMANTIC_PROTOCOL_V8).contains(&semantic_version) {
+    if !(1..=crate::event_pages::SEMANTIC_PROTOCOL_V9).contains(&semantic_version) {
         return Err(NodeError::Protocol(format!(
             "unsupported semantic protocol version {semantic_version}"
         )));
@@ -4833,7 +4833,7 @@ mod tests {
             direction: EventDirection::ToSessionInitiator,
         };
         let raw = frame.encode().unwrap();
-        for semantic_version in 1..=8 {
+        for semantic_version in 1..=9 {
             assert_eq!(
                 frame.encode_for_semantic_version(semantic_version).unwrap(),
                 raw
@@ -4843,6 +4843,6 @@ mod tests {
                 frame
             );
         }
-        assert!(Frame::decode_for_semantic_version(&raw, 9).is_err());
+        assert!(Frame::decode_for_semantic_version(&raw, 10).is_err());
     }
 }

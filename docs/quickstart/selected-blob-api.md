@@ -24,8 +24,10 @@ content-capable peers. V7 admits durable work only; v8 also admits finite work
 with exact authenticated custody provenance. Both endpoints must support
 `BlobRangesStreamV1`; old Blob transfer has no fallback. Incompatible profile
 offers and v5/v6 carrier attempts fail before carrier IO. `EventPagesV1` is
-Event-only. The default semantic offer is `[8, 7, 6, 5, 4, 3, 2, 1]`; stable
-wire/ABI, source, manifest, and `ASTRBT01` formats remain version 1.
+Event-only. The default semantic offer is `[9, 8, 7, 6, 5, 4, 3, 2, 1]`;
+semantic v9 allocates Blob profile 5 `BlobStreamV1`, whose runtime remains
+fail-closed until the streaming driver is enabled. Stable wire/ABI, source,
+manifest, and `ASTRBT01` formats remain version 1.
 
 ## Use the live actor API
 

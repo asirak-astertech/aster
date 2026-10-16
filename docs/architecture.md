@@ -120,10 +120,13 @@ or key-bearing state is released, so retained clones return sanitized
 `StateUnavailable`. A stopped facade can acquire the writer only after the live
 actor has exited and must close before a new actor starts.
 
-For a semantic-v7 contact, the first protected exchange negotiates a transfer
+For a semantic-v7/v8/v9 contact, the first protected exchange negotiates a transfer
 profile independently for Event, State, Record, Blob, and EventBridge. Every
 non-Blob lane offers `LegacyV6`; Event may additionally select
-`EventPagesV1`. Blob requires `BlobRangesStreamV1`, with no legacy fallback. Exact Event differences and bounded blind traffic into a
+`EventPagesV1`. Blob requires `BlobRangesStreamV1` under v7/v8 and the distinct
+`BlobStreamV1` allocation under v9, with no legacy fallback and no profile-5 to
+profile-4 downgrade inside an attempt. The v9 allocation is fail-closed until
+its bounded stream runtime is active. Exact Event differences and bounded blind traffic into a
 ReceiveOnly peer can then move in one ordered bounded unidirectional turn.
 Finite entries carry session-authenticated cumulative age, while durable and
 tombstone entries carry no age wrapper. The receiver commits each complete page

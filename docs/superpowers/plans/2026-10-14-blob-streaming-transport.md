@@ -51,6 +51,7 @@
 ### Task 1: Establish the reviewed baseline and allocate semantic v9/profile 5
 
 **Files:**
+- Modify: `crates/aster-core/src/lib.rs`
 - Modify: `crates/aster-core/src/wire.rs`
 - Modify: `crates/aster-core/src/crypto.rs`
 - Modify: `crates/aster-core/src/crypto/reference.rs`
@@ -62,6 +63,10 @@
 - Modify: `crates/aster-node/src/event_pages.rs`
 - Modify: `crates/aster-node/src/frame.rs`
 - Modify: `crates/aster-node/src/lib.rs`
+- Modify: `bindings/c/aster_mesh.h`
+- Modify: `bindings/c/header_smoke.c`
+- Modify: `bindings/c/header_smoke.cpp`
+- Modify: `bindings/python/tests/test_binding.py`
 - Modify: `docs/protocol.md`
 - Modify: `docs/transports.md`
 - Modify: `docs/architecture.md`

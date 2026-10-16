@@ -281,7 +281,7 @@ are recorded separately in the
 - Canonical ordered semantic-version and complete-suite offers, with selection
   bound into the transcript, KDF, key confirmations, and hybrid authentication;
   there is no algorithm-by-algorithm mixing. The stable framing/profile remains
-  `1`, the default semantic offer is `[8, 7, 6, 5, 4, 3, 2, 1]`, and profile 1
+  `1`, the default semantic offer is `[9, 8, 7, 6, 5, 4, 3, 2, 1]`, and profile 1
   has one registered complete suite.
 - Semantic-v7 profile, plan, header, page, and terminal records bind semantic
   version, the canonical transfer-profile digest, lane, selected profile, and
@@ -295,11 +295,11 @@ are recorded separately in the
   only a send attempt, and later authenticated reconciliation determines the
   remaining difference.
 - Both classical and PQ signatures verify; failure is indistinguishable on wire.
-- A compact semantic-version-2/3/v4/v5/v6/v7/v8 batch item is never authenticated by its P-256
+- A compact semantic-version-2/3/v4/v5/v6/v7/v8/v9 batch item is never authenticated by its P-256
   suffix alone: the exact proof credential, authority hybrid signature, source
   hybrid root signature, ciphertext commitment, Merkle path, and item signature
   must all verify. Missing proof means bounded pending state, never delivery.
-- Selected Event/RouteEvent semantic-v3-format custody claims, used by v3 through v8 sessions, use a distinct
+- Selected Event/RouteEvent semantic-v3-format custody claims, used by v3 through v9 sessions, use a distinct
   session-record AAD, bind the exact transfer/source fields, exchange, nonzero
   policy revision, session ID, and checked cumulative age, and are
   replay-checked before store admission.

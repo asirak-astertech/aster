@@ -468,12 +468,17 @@ reconciliation, authentication, or scheduling authority. Use the
 ## Semantic protocol versions you may see
 
 Aster separates stable bytes from negotiated behavior. The current selected
-implementation offers semantic versions `[8, 7, 6, 5, 4, 3, 2, 1]` in that
+implementation offers semantic versions `[9, 8, 7, 6, 5, 4, 3, 2, 1]` in that
 descending order:
 
 - **Replication wire/profile version 1** identifies the current encoding and
   fixed security-object family.
-- **Semantic version 8** is offered first. It inherits semantic-v7 profile
+- **Semantic version 9** is offered first. It preserves v1-v8 stable bytes and
+  selects Blob profile 5 `BlobStreamV1`. Profile 5 is a distinct allocation,
+  never a reinterpretation or in-attempt downgrade of profile 4. Its
+  `0xd6..0xdc` records remain fail-closed until the bounded concurrent stream
+  driver is active.
+- **Semantic version 8** inherits semantic-v7 profile
   negotiation and receipt-free Event pages, while profile 4 adds authenticated
   finite-TTL Blob custody and bounded lower-priority pressure recovery.
 - **Semantic version 7** remains a compatibility option. After the four-flight mission
