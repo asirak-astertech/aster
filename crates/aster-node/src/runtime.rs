@@ -12467,7 +12467,7 @@ fn load_verified_mutable_for_contact_peer(
         blob_contact_mode,
     )?;
     let finite_blob = if let MutableTransferId::Blob(_) = id
-        && blob_contact_mode.finite_transfer_enabled()
+        && blob_contact_mode.source_custody_v1_enabled()
     {
         let route = verifier.verify_blob(&bytes)?;
         let BlobContentVerification::ContentVerified { blob, .. } =
@@ -13113,6 +13113,7 @@ fn accept_received_mutable(
     id: MutableTransferId,
     sealed: &[u8],
     blob_custody: Option<ReceivedBlobCustody>,
+    blob_contact_mode: Option<BlobContactMode>,
 ) -> Result<(MutableApplyDisposition, Option<[u8; 32]>), NodeError> {
     guard.check(store)?;
     if sealed.len() > MAX_OBJECT_BYTES {
@@ -13357,6 +13358,13 @@ fn accept_received_mutable(
                     verified,
                     receiver_sample,
                 )
+            } else if blob_contact_mode == Some(BlobContactMode::StreamV1) {
+                store.stage_verified_durable_blob_stream_v9_with_policy(
+                    guard.policy(),
+                    &blob,
+                    sealed,
+                    &plan,
+                )
             } else {
                 store.stage_verified_blob_source_with_policy(guard.policy(), &blob, sealed, &plan)
             };
@@ -13369,6 +13377,13 @@ fn accept_received_mutable(
                     &plan,
                     verified,
                     receiver_sample,
+                )
+            } else if blob_contact_mode == Some(BlobContactMode::StreamV1) {
+                store.stage_verified_durable_blob_stream_v9_with_policy(
+                    guard.policy(),
+                    &blob,
+                    sealed,
+                    &plan,
                 )
             } else {
                 store.stage_verified_blob_source_with_policy(guard.policy(), &blob, sealed, &plan)
@@ -13405,6 +13420,31 @@ fn accept_received_mutable(
                                 "injected Blob staging retry coherence failure",
                             )))
                         } else {
+                            if blob_contact_mode == Some(BlobContactMode::StreamV1) {
+                                store.stage_verified_durable_blob_stream_v9_with_policy(
+                                    guard.policy(),
+                                    &blob,
+                                    sealed,
+                                    &plan,
+                                )
+                            } else {
+                                store.stage_verified_blob_source_with_policy(
+                                    guard.policy(),
+                                    &blob,
+                                    sealed,
+                                    &plan,
+                                )
+                            }
+                        };
+                        #[cfg(not(test))]
+                        let retry = if blob_contact_mode == Some(BlobContactMode::StreamV1) {
+                            store.stage_verified_durable_blob_stream_v9_with_policy(
+                                guard.policy(),
+                                &blob,
+                                sealed,
+                                &plan,
+                            )
+                        } else {
                             store.stage_verified_blob_source_with_policy(
                                 guard.policy(),
                                 &blob,
@@ -13412,13 +13452,6 @@ fn accept_received_mutable(
                                 &plan,
                             )
                         };
-                        #[cfg(not(test))]
-                        let retry = store.stage_verified_blob_source_with_policy(
-                            guard.policy(),
-                            &blob,
-                            sealed,
-                            &plan,
-                        );
                         match retry {
                             Ok(outcome) => Ok(outcome),
                             Err(retry) if equivalent_blob_capacity_error(&original, &retry) => {
@@ -13493,12 +13526,21 @@ fn accept_received_mutable_for_contact(
     custody: Option<ReceivedBlobCustody>,
     blob_contact_mode: BlobContactMode,
 ) -> Result<(MutableApplyDisposition, Option<[u8; 32]>), NodeError> {
-    if custody.is_some() && !blob_contact_mode.finite_transfer_enabled() {
+    if custody.is_some() && !blob_contact_mode.source_custody_v1_enabled() {
         return Err(NodeError::Protocol(
             "Blob custody authority arrived outside negotiated profile 4".into(),
         ));
     }
-    accept_received_mutable(store, guard, verifier, admission, id, bytes, custody)
+    accept_received_mutable(
+        store,
+        guard,
+        verifier,
+        admission,
+        id,
+        bytes,
+        custody,
+        Some(blob_contact_mode),
+    )
 }
 
 fn require_blob_claim_presence(
@@ -21799,8 +21841,12 @@ enum BlobContactMode {
 }
 
 impl BlobContactMode {
-    const fn finite_transfer_enabled(self) -> bool {
+    const fn finite_lifecycle_enabled(self) -> bool {
         matches!(self, Self::CustodyV1 | Self::StreamV1)
+    }
+
+    const fn source_custody_v1_enabled(self) -> bool {
+        matches!(self, Self::CustodyV1)
     }
 
     const fn stream_v1_enabled(self) -> bool {
@@ -23959,7 +24005,7 @@ fn settle_pending_blob_lifetime_unavailability_for_contact(
     source: BlobTransferId,
     blob_contact_mode: BlobContactMode,
 ) -> Result<PendingBlobLifetimeTransition, NodeError> {
-    if !blob_contact_mode.finite_transfer_enabled() {
+    if !blob_contact_mode.finite_lifecycle_enabled() {
         return Err(NodeError::Protocol(
             "durable-only Blob contact became lifetime-unavailable".into(),
         ));
@@ -25144,55 +25190,56 @@ async fn sync_mutable_transfer_lane(
                     receiver_interest,
                     blob_contact_mode,
                 )?;
-                let (response, verified_digest) =
-                    if class == MutableClass::Blob && blob_contact_mode.finite_transfer_enabled() {
-                        request_blob_source_offer_frame(
-                            store,
-                            guard,
-                            connection,
-                            mission,
-                            direction,
-                            receipt,
-                            |mission| {
-                                let prepared = authorize_outbound_blob_claim(
-                                    store,
-                                    guard,
-                                    mission,
-                                    source_snapshot,
-                                    id,
-                                    direction,
-                                    &loaded,
-                                )?;
-                                let claim = prepared.as_ref().map(|prepared| prepared.claim);
-                                Ok((
-                                    Frame::MutableOffer {
-                                        direction,
-                                        id,
-                                        bytes: loaded.bytes,
-                                        claim,
-                                    },
-                                    prepared,
-                                ))
-                            },
-                        )
-                        .await?
-                    } else {
-                        (
-                            request_mission_frame(
-                                connection,
+                let (response, verified_digest) = if class == MutableClass::Blob
+                    && blob_contact_mode.source_custody_v1_enabled()
+                {
+                    request_blob_source_offer_frame(
+                        store,
+                        guard,
+                        connection,
+                        mission,
+                        direction,
+                        receipt,
+                        |mission| {
+                            let prepared = authorize_outbound_blob_claim(
+                                store,
+                                guard,
                                 mission,
+                                source_snapshot,
+                                id,
+                                direction,
+                                &loaded,
+                            )?;
+                            let claim = prepared.as_ref().map(|prepared| prepared.claim);
+                            Ok((
                                 Frame::MutableOffer {
                                     direction,
                                     id,
                                     bytes: loaded.bytes,
-                                    claim: None,
+                                    claim,
                                 },
-                                receipt,
-                            )
-                            .await?,
-                            None,
+                                prepared,
+                            ))
+                        },
+                    )
+                    .await?
+                } else {
+                    (
+                        request_mission_frame(
+                            connection,
+                            mission,
+                            Frame::MutableOffer {
+                                direction,
+                                id,
+                                bytes: loaded.bytes,
+                                claim: None,
+                            },
+                            receipt,
                         )
-                    };
+                        .await?,
+                        None,
+                    )
+                };
                 let disposition = settle_mutable_apply_result(
                     store,
                     peer,
@@ -25230,28 +25277,29 @@ async fn sync_mutable_transfer_lane(
                     ));
                 }
                 guard.check(store)?;
-                let (response, opened_custody) =
-                    if class == MutableClass::Blob && blob_contact_mode.finite_transfer_enabled() {
-                        request_blob_source_fetch_frame(
+                let (response, opened_custody) = if class == MutableClass::Blob
+                    && blob_contact_mode.source_custody_v1_enabled()
+                {
+                    request_blob_source_fetch_frame(
+                        connection,
+                        mission,
+                        direction,
+                        Frame::MutableFetch { direction, id },
+                        receipt,
+                    )
+                    .await?
+                } else {
+                    (
+                        request_mission_frame(
                             connection,
                             mission,
-                            direction,
                             Frame::MutableFetch { direction, id },
                             receipt,
                         )
-                        .await?
-                    } else {
-                        (
-                            request_mission_frame(
-                                connection,
-                                mission,
-                                Frame::MutableFetch { direction, id },
-                                receipt,
-                            )
-                            .await?,
-                            None,
-                        )
-                    };
+                        .await?,
+                        None,
+                    )
+                };
                 let Frame::MutableObject {
                     direction: response_direction,
                     id: received,
@@ -28188,7 +28236,7 @@ async fn serve_mutable_transfer_lane(
         guard.check(store)?;
         let wire_budget = exchange_wire_budget(receipt)?;
         let protect_blob_sources =
-            class == MutableClass::Blob && blob_contact_mode.finite_transfer_enabled();
+            class == MutableClass::Blob && blob_contact_mode.source_custody_v1_enabled();
         let source_request = protect_blob_sources
             && direction == EventDirection::ToSessionResponder
             && !authorization.is_consumed();
@@ -34802,6 +34850,7 @@ mod tests {
                         MutableTransferId::State(historical_state),
                         &historical_state_source.sealed,
                         None,
+                        None,
                     )
                     .expect("accept post-startup historical State")
                     .0,
@@ -34823,6 +34872,7 @@ mod tests {
                         MutableTransferId::State(historical_state),
                         &historical_state_source.sealed,
                         None,
+                        None,
                     )
                     .expect("accept duplicate historical State")
                     .0,
@@ -34841,6 +34891,7 @@ mod tests {
                         },
                         MutableTransferId::Record(historical_record),
                         &historical_record_source.sealed,
+                        None,
                         None,
                     )
                     .expect("accept post-startup historical Record")
@@ -49900,7 +49951,7 @@ mod tests {
             let mode = BlobContactMode::from_authenticated_profiles(semantic_version, None)
                 .expect("v5-v6 durable-only Blob mode");
             assert_eq!(mode, BlobContactMode::DurableOnly);
-            assert!(!mode.finite_transfer_enabled());
+            assert!(!mode.finite_lifecycle_enabled());
         }
         let v7 = negotiated(
             SEMANTIC_PROTOCOL_V7,
@@ -49931,7 +49982,8 @@ mod tests {
             BlobContactMode::from_authenticated_profiles(SEMANTIC_PROTOCOL_V8, Some(&v8_custody))
                 .expect("v8 custody-capable stream mode");
         assert_eq!(custody_mode, BlobContactMode::CustodyV1);
-        assert!(custody_mode.finite_transfer_enabled());
+        assert!(custody_mode.finite_lifecycle_enabled());
+        assert!(custody_mode.source_custody_v1_enabled());
         assert!(!custody_mode.stream_v1_enabled());
         let v9_stream = negotiated(
             SEMANTIC_PROTOCOL_V9,
@@ -49942,7 +49994,8 @@ mod tests {
             BlobContactMode::from_authenticated_profiles(SEMANTIC_PROTOCOL_V9, Some(&v9_stream))
                 .expect("v9 Blob stream mode");
         assert_eq!(stream_mode, BlobContactMode::StreamV1);
-        assert!(stream_mode.finite_transfer_enabled());
+        assert!(stream_mode.finite_lifecycle_enabled());
+        assert!(!stream_mode.source_custody_v1_enabled());
         assert!(stream_mode.stream_v1_enabled());
         assert!(matches!(
             BlobContactMode::from_authenticated_profiles(
