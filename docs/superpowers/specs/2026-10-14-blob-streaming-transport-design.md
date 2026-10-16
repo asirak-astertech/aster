@@ -572,6 +572,37 @@ Defaults sized around 64 MiB or 1,024 chunks must be revised or made
 proportional. A conforming 2-GiB transfer cannot fail merely because an
 unrelated legacy default retained the old ceiling.
 
+### Operator workflow composition
+
+PR 95 adds the first shipped operator workflow for known-ID Blob receipt and
+readout. It does not allocate a protocol version, transfer profile, or mechanics
+tag, and it explicitly leaves large-object streaming and deadline work to this
+design. Profile 5 therefore composes with, rather than replaces, these PR 95
+boundaries:
+
+- restart-only exact `TOPIC@SCOPE` Blob receive interests remain local policy
+  and never grant mission authority;
+- nonempty receive interests continue to require explicit nonzero Blob depot
+  limits, while the checked configuration path must admit the profile-5
+  2-GiB conformance shape when the configured quota permits;
+- `receive_only` continues to suppress all Blob network work;
+- `asterctl blob-read` remains transport-blind and incrementally writes the
+  application response into its owner-only mode-0600 sibling before atomic
+  no-replace publication and directory synchronization; profile 5 must not
+  introduce whole-Blob buffering in the agent, application server, or CLI; and
+- Compose mesh exposure remains an explicit deployment choice and is not a
+  transport candidate or ranking signal.
+
+PR 95's retained device evidence at head
+`7c2f5f92b3fe4cf78c42b216b4de125a6862863a` measured a 1-MiB transfer at
+0.03 MiB/s and recorded an unresolved 16-MiB attempt that caused one runtime
+fatal transition after about 7 MiB had staged. That observation is not a
+performance qualification, but it is a mandatory regression input: the
+profile-4 failure must be reproduced or bounded to a known cause, and the v9
+runtime must demonstrate that the same 16-MiB shape neither terminates the
+actor nor loses durable checkpoint authority. Streaming performance evidence
+cannot by itself close this correctness gate.
+
 ## Security invariants
 
 - The signed source and exact physical lineage remain authoritative.

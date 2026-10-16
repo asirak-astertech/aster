@@ -22,6 +22,8 @@
 - Allocate semantic protocol version `9`, transfer-profile ID `5` (`BlobStreamV1`), and mechanics tags `0xd6..0xdc`. Keep profile `3` reserved and profile `4` as `BlobRangesStreamV1` for semantic v7/v8.
 - Preserve semantic-v1 through semantic-v8 bytes and behavior exactly. Semantic v9's Blob offer is `[5]`; mixed-version contacts select v8/profile 4 or v7/profile 4 through semantic negotiation, never by downgrading an active profile-5 attempt.
 - Reuse PR 47 lifetime, age, lease, pressure, retirement, deletion-fence, reclamation, and public Rust API authority. Do not create a parallel lifecycle model.
+- Compose with PR 95's operator workflow after its final reviewed merge: preserve restart-only exact Blob receive interests, the explicit-depot requirement, `receive_only` suppression, hardened incremental `asterctl blob-read` publication, and opt-in Compose mesh exposure. None of those surfaces selects a transport or grants mission authority.
+- Treat PR 95's retained 16-MiB device failure (one runtime fatal transition after about 7 MiB staged) as an open correctness regression. Reproduce or identify its bounded cause before claiming the v9 runtime closes large-Blob delivery; a faster benchmark alone does not close it.
 - Define `BlobCustodyClaimV2` for semantic v9/profile 5. Do not reinterpret PR 47's v8/profile-4 `BlobCustodyClaimV1` bytes or contextual domain.
 - Keep the application Blob API transport-blind. Configuration may set adapter enablement and resource limits; callers cannot choose transport, extent, checkpoint cadence, offset, or failover.
 - Carry data over exactly one selected transport adapter per logical attempt. No striping, speculative duplication, multipath scheduling, or multi-peer parallel download.
@@ -355,6 +357,8 @@
 - Modify: `crates/aster-redb-store/src/blob/pressure.rs`
 - Modify: `crates/aster-redb-store/src/blob.rs`
 - Modify: `crates/aster-node/src/application/blob.rs`
+- Modify after PR 95 merge: `crates/aster-agent/src/config.rs`
+- Modify after PR 95 merge: `crates/aster-agent/src/main.rs`
 - Test: colocated lifecycle, pressure, Store, and application tests
 
 **Interfaces:**
@@ -364,6 +368,7 @@
 - Produces: atomic `Store::upgrade_pending_blob_to_stream_v9(&self, policy: &ControlPolicySnapshot, source: BlobTransferId, blob: &ContentVerifiedBlobEnvelope, sealed: &[u8], plan: &VerifiedBlobTransferPlan, finite: Option<(BlobCustodyClaimV2, AuthenticatedBlobCustodyContactV2)>) -> Result<BlobStreamProvenanceUpgrade, StoreError>`, requiring exact source/publication/variant/layout/lineage and a non-younger authenticated v2 capability for finite work.
 - Produces: checked configurable large-object limits and exact reservation for physical bytes, chunk rows, pending/checkpoint rows, lifecycle/replay capacity, and at least 2-GiB admission.
 - Produces: typed lifecycle-to-stream terminal mapping without free-form peer text.
+- Preserves: PR 95's empty receive-none default, maximum 256 unique exact selectors, explicit nonzero depot requirement, authority-neutral interests, and `receive_only` network suppression.
 
 - [ ] **Step 1: Write failing lifecycle and provenance-upgrade tests**
 
@@ -385,7 +390,7 @@
 
 - [ ] **Step 5: Implement checked large-object policy and reservation**
 
-  Replace profile-5 use of 64-MiB/1,024-chunk limits with configurable checked limits while leaving profile 4 unchanged. Extend the existing file-based publish implementation without adding transport controls to `BlobPublishOptions`.
+  Replace profile-5 use of 64-MiB/1,024-chunk limits with configurable checked limits while leaving profile 4 unchanged. Extend the existing file-based publish implementation without adding transport controls to `BlobPublishOptions`. After PR 95 merges, prove its agent configuration accepts an explicitly sized 2-GiB profile while preserving all receive-interest validation and failing deterministically when configured depot capacity is insufficient.
 
 - [ ] **Step 6: Route lifecycle outcomes through PR 47 authority**
 
@@ -413,6 +418,7 @@
 - Modify: `crates/aster-node/src/lib.rs`
 - Modify: `crates/aster-node/src/application/blob.rs`
 - Modify: `crates/aster-redb-store/src/blob.rs`
+- Test after PR 95 merge: `crates/asterctl/tests/blob.rs`
 - Test: colocated runtime/application tests
 
 **Interfaces:**
@@ -425,7 +431,7 @@
 
 - [ ] **Step 1: Write failing small end-to-end runtime tests**
 
-  Cover v9/profile-5 negotiation, one/multiple carriers, multiple extents and multiple replenishment cycles on one concurrent data/control pair, smaller receiver extents, zero/unchanged credit beyond the data-stall deadline without false failover, final checkpoint, exact promotion, result/ack replay, finite v2 custody, and transport-blind application behavior.
+  Cover v9/profile-5 negotiation, one/multiple carriers, multiple extents and multiple replenishment cycles on one concurrent data/control pair, smaller receiver extents, zero/unchanged credit beyond the data-stall deadline without false failover, final checkpoint, exact promotion, result/ack replay, finite v2 custody, and transport-blind application behavior. Add a focused 16-MiB regression matching PR 95's failed device shape; it must not terminate the actor and must retain exact durable checkpoint authority across interruption.
 
 - [ ] **Step 2: Run focused runtime tests and verify RED**
 
@@ -452,6 +458,8 @@
 - [ ] **Step 7: Add bounded status and contact metrics**
 
   Add stable numeric fields/fixed enums and aggregate attempt history. Keep only high-level transfer progress in the application status; put transport/checkpoint/commit/failover internals behind privileged diagnostics. Preserve PR 71 range counters with their existing meaning; add distinct profile-5 metrics and never log raw peer errors or paths.
+
+  After PR 95 merges, exercise the public `asterctl blob-read` workflow against a completed profile-5 object and retain its incremental owner-only staging, atomic no-replace publication, directory synchronization, and bounded-memory behavior. Do not expose transport selection through the CLI.
 
 - [ ] **Step 8: Run focused runtime regressions and verify GREEN**
 
@@ -582,6 +590,10 @@
 - Modify: `docs/validation/capability-roadmap.md`
 - Modify: `docs/validation/requirements-status.md`
 - Modify: `docs/validation/requirements-implementation.csv`
+- Modify after PR 95 merge: `docs/operator-guide.md`
+- Modify after PR 95 merge: `docs/quickstart/selected-blob-api.md`
+- Modify after PR 95 merge: `docs/reference/aster-agent-config-v1.md`
+- Modify after PR 95 merge: `docs/reference/aster-agent-config-v2.md`
 - Create: `docs/validation/blob-streaming-cm4-procedure.md`
 - Create: `docs/validation/evidence/2026-10-15-cm4-blob-streaming-inventory-amendment.md`
 - Create: `docs/validation/evidence/blob-streaming-cm4-receipt.schema.json`
@@ -604,7 +616,7 @@
 
 - [ ] **Step 3: Amend inventory and freeze the CM4 procedure**
 
-  Preserve existing observed platform facts, name all aliases, bind commit/config/artifact digests, define warm-ups/samples/fault injection, and require source-read/destination-write/crypto/network baselines before the 70% calculation.
+  Preserve existing observed platform facts, including PR 95's bounded 1-MiB observation and unresolved 16-MiB fatal transition, name all aliases, bind commit/config/artifact digests, define warm-ups/samples/fault injection, and require source-read/destination-write/crypto/network baselines before the 70% calculation. Include the shipped Compose/agent receive-interest and explicit-depot configuration in retained receipts without recording sensitive selectors.
 
 - [ ] **Step 4: Validate a clearly non-evidence receipt example**
 
