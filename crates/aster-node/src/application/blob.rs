@@ -929,6 +929,7 @@ pub struct SelectedBlobHandle {
     admission: Arc<AtomicBool>,
     identity: NodeId,
     mission_authority: NodeId,
+    max_publish_bytes: u64,
 }
 
 impl SelectedBlobHandle {
@@ -937,12 +938,15 @@ impl SelectedBlobHandle {
         admission: Arc<AtomicBool>,
         identity: NodeId,
         mission_authority: NodeId,
+        max_publish_bytes: u64,
     ) -> Self {
+        debug_assert!(max_publish_bytes > 0);
         Self {
             commands,
             admission,
             identity,
             mission_authority,
+            max_publish_bytes,
         }
     }
 
@@ -954,6 +958,15 @@ impl SelectedBlobHandle {
     /// Stable mission authority bound to the live store and depot.
     pub const fn mission_authority(&self) -> NodeId {
         self.mission_authority
+    }
+
+    /// Maximum plaintext length accepted by one live publication.
+    ///
+    /// This is derived from both configured depot bytes and selected-profile
+    /// chunk capacity, so colocated protocol adapters can reject impossible
+    /// streams before staging their bodies.
+    pub const fn max_publish_bytes(&self) -> u64 {
+        self.max_publish_bytes
     }
 
     /// Durably publishes one already-open regular file through the live worker.
@@ -5504,7 +5517,13 @@ mod tests {
         let admission = Arc::new(AtomicBool::new(true));
         let worker_admission = Arc::clone(&admission);
         let (commands, mut received) = mpsc::channel(2);
-        let handle = SelectedBlobHandle::new(commands, admission, identity, mission_authority);
+        let handle = SelectedBlobHandle::new(
+            commands,
+            admission,
+            identity,
+            mission_authority,
+            MAX_SELECTED_LIVE_BLOB_BYTES,
+        );
         let worker = tokio::task::spawn_blocking(move || {
             while let Some(command) = received.blocking_recv() {
                 let SelectedApplicationCommand::Blob(command) = command else {
@@ -5584,7 +5603,13 @@ mod tests {
         let admission = Arc::new(AtomicBool::new(true));
         let worker_admission = Arc::clone(&admission);
         let (commands, mut received) = mpsc::channel(2);
-        let handle = SelectedBlobHandle::new(commands, admission, identity, mission_authority);
+        let handle = SelectedBlobHandle::new(
+            commands,
+            admission,
+            identity,
+            mission_authority,
+            MAX_SELECTED_LIVE_BLOB_BYTES,
+        );
         let worker = tokio::task::spawn_blocking(move || {
             while let Some(command) = received.blocking_recv() {
                 let SelectedApplicationCommand::Blob(command) = command else {
@@ -5905,6 +5930,7 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
             identity,
             mission_authority,
+            MAX_SELECTED_LIVE_BLOB_BYTES,
         );
 
         let mut oversized_operation = request(b"blob/handle-operation");

@@ -76,14 +76,14 @@ use aster_redb_store::{
     MAX_BLOB_NETWORK_SOURCE_BYTES, MAX_BLOB_NETWORK_STAGING_ROWS, MAX_CUSTODY_PAGE,
     MAX_CUSTODY_RETIREMENTS, MAX_EVENT_PAGE, MAX_MUTABLE_TRANSFER_CURSOR_PEERS,
     MAX_NETWORK_BLOB_BYTES, MAX_NETWORK_BLOB_CHUNKS, MAX_ROUTE_CACHE_ITEMS,
-    MutableTransferCursorClass, MutableTransferCursorMode, NumberedEventOperationRequest,
-    NumberedEventPublishOutcome, PendingBlobLifetimeTransition, PendingBlobSource,
-    PreparedBlobCustodySend, RecordSenderProjection, RecordTransferId, RejectedControl,
-    ReservedEventOnceCommit, RetainedBlobSource, RouteCacheOutcome, ScopeRekeyPublicationIntent,
-    StateSenderProjection, StateTransferId, Store, StoreBackingIdentity, StoreError,
-    StoreInspection, StoreLimits, StoreZeroizationState, StoredControl, StoredControlEffect,
-    StoredEvent, StoredEventTransfer, StoredRecord, StoredState, TransferLease,
-    ZeroizationArtifact, ZeroizationIntent, ZeroizationStore,
+    MAX_SELECTED_BLOB_CHUNKS, MutableTransferCursorClass, MutableTransferCursorMode,
+    NumberedEventOperationRequest, NumberedEventPublishOutcome, PendingBlobLifetimeTransition,
+    PendingBlobSource, PreparedBlobCustodySend, RecordSenderProjection, RecordTransferId,
+    RejectedControl, ReservedEventOnceCommit, RetainedBlobSource, RouteCacheOutcome,
+    ScopeRekeyPublicationIntent, StateSenderProjection, StateTransferId, Store,
+    StoreBackingIdentity, StoreError, StoreInspection, StoreLimits, StoreZeroizationState,
+    StoredControl, StoredControlEffect, StoredEvent, StoredEventTransfer, StoredRecord,
+    StoredState, TransferLease, ZeroizationArtifact, ZeroizationIntent, ZeroizationStore,
 };
 use sha2::{Digest as _, Sha256};
 #[cfg(unix)]
@@ -15598,11 +15598,19 @@ async fn start_node_with_shutdown_ownership(
         identity,
         mission_authority,
     );
+    let blob_depot_limits = forwarding.blob_depot_limits();
+    let max_publish_bytes = blob_depot_limits.max_bytes().min(
+        blob_depot_limits
+            .max_chunks()
+            .min(MAX_SELECTED_BLOB_CHUNKS)
+            .saturating_mul(u64::from(aster_mesh::SELECTED_BLOB_CHUNK_SIZE)),
+    );
     let selected_blobs = SelectedBlobHandle::new(
         application_sender,
         application_admission.clone(),
         identity,
         mission_authority,
+        max_publish_bytes,
     );
     let (control_sender, control_receiver) = mpsc::channel(CONTROL_COMMAND_CAPACITY);
     let selected_controls = SelectedControlHandle::new(control_sender, identity, mission_authority);
@@ -32239,6 +32247,7 @@ mod tests {
             application_admission.clone(),
             services.member.identity(),
             services.member.mission_authority_id(),
+            MAX_NETWORK_BLOB_BYTES,
         );
         let (_control_sender, control_receiver) = mpsc::channel(CONTROL_COMMAND_CAPACITY);
         let (shutdown_sender, shutdown_receiver) = mpsc::channel(1);
@@ -32542,6 +32551,7 @@ mod tests {
             application_admission.clone(),
             identity,
             mission_authority,
+            MAX_NETWORK_BLOB_BYTES,
         );
         let (_control_sender, control_receiver) = mpsc::channel(CONTROL_COMMAND_CAPACITY);
         let (shutdown_sender, shutdown_receiver) = mpsc::channel(1);
@@ -40138,6 +40148,7 @@ mod tests {
             application_admission.clone(),
             identity,
             mission_authority,
+            MAX_NETWORK_BLOB_BYTES,
         );
         let (control_sender, control_receiver) = mpsc::channel(CONTROL_COMMAND_CAPACITY);
         let controls = SelectedControlHandle::new(control_sender, identity, mission_authority);
@@ -41538,6 +41549,7 @@ mod tests {
             application_admission.clone(),
             identity,
             mission_authority,
+            MAX_NETWORK_BLOB_BYTES,
         );
         let responses = prefill_mixed_application_commands(&application_sender);
 

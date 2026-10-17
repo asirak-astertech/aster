@@ -8,8 +8,8 @@ use std::{
 use aster_mesh::{MAX_BLOB_MEDIA_TYPE_BYTES, MAX_BLOB_SCHEMA_ID_BYTES};
 use aster_node::application::{
     BlobId, BlobPublishOptions, BlobPublishRequest as NodeBlobPublishRequest, BlobPublishResult,
-    BlobReadPage, BlobReadPageRequest, BlobReadRequest as NodeBlobReadRequest,
-    MAX_SELECTED_LIVE_BLOB_BYTES, Priority, Scope, SelectedBlobHandle, Topic,
+    BlobReadPage, BlobReadPageRequest, BlobReadRequest as NodeBlobReadRequest, Priority, Scope,
+    SelectedBlobHandle, Topic,
 };
 use aster_redb_store::MAX_BLOB_OPERATION_KEY_BYTES;
 use connectrpc::{ConnectError, ErrorCode, RequestContext, Response, ServiceResult, ServiceStream};
@@ -27,6 +27,7 @@ const UPLOAD_PERMITS: usize = 1;
 #[derive(Clone)]
 pub(crate) struct BlobConnectService {
     blobs: SelectedBlobHandle,
+    max_publish_bytes: u64,
     staging: Option<Arc<PinnedStagingDirectory>>,
     uploads: Arc<tokio::sync::Semaphore>,
 }
@@ -34,8 +35,10 @@ pub(crate) struct BlobConnectService {
 impl BlobConnectService {
     pub(crate) fn new(blobs: SelectedBlobHandle, state_root: &Path) -> std::io::Result<Self> {
         let staging = open_optional_staging(state_root)?.map(Arc::new);
+        let max_publish_bytes = blobs.max_publish_bytes();
         Ok(Self {
             blobs,
+            max_publish_bytes,
             staging,
             uploads: Arc::new(tokio::sync::Semaphore::new(UPLOAD_PERMITS)),
         })
@@ -61,7 +64,7 @@ impl BlobConnectService {
             .ok_or_else(|| malformed(operation))?
             .map_err(|_| malformed(operation))?
             .to_owned_message();
-        let (parsed, mut grammar) = UploadGrammar::start(first)?;
+        let (parsed, mut grammar) = UploadGrammar::start(first, self.max_publish_bytes)?;
         let permit = Arc::clone(&self.uploads)
             .try_acquire_owned()
             .map_err(|_| resource_exhausted(operation))?;
@@ -367,7 +370,10 @@ struct UploadGrammar {
 }
 
 impl UploadGrammar {
-    fn start(first: api::PublishBlobRequest) -> Result<(ParsedPublish, Self), ConnectError> {
+    fn start(
+        first: api::PublishBlobRequest,
+        max_publish_bytes: u64,
+    ) -> Result<(ParsedPublish, Self), ConnectError> {
         let operation = PublicOperation::PublishBlob;
         let api::publish_blob_request::Frame::Metadata(metadata) =
             first.frame.ok_or_else(|| malformed(operation))?
@@ -377,7 +383,7 @@ impl UploadGrammar {
         if metadata.total_len == 0 {
             return Err(malformed(operation));
         }
-        if metadata.total_len > MAX_SELECTED_LIVE_BLOB_BYTES {
+        if metadata.total_len > max_publish_bytes {
             return Err(resource_exhausted(operation));
         }
         if metadata.operation_key.is_empty()
@@ -832,6 +838,12 @@ mod tests {
         }
     }
 
+    fn start_upload(
+        first: api::PublishBlobRequest,
+    ) -> Result<(ParsedPublish, UploadGrammar), ConnectError> {
+        UploadGrammar::start(first, MAX_SELECTED_LIVE_BLOB_BYTES)
+    }
+
     fn chunk(bytes: Vec<u8>) -> api::PublishBlobRequest {
         api::PublishBlobRequest {
             frame: Some(api::publish_blob_request::Frame::Chunk(bytes)),
@@ -843,32 +855,32 @@ mod tests {
     fn blob_ttl_wire_presence_round_trips_and_zero_is_rejected() {
         let durable = metadata_frame(1, None);
         let durable = api::PublishBlobRequest::decode_from_slice(&durable.encode_to_vec()).unwrap();
-        let (durable, _) = UploadGrammar::start(durable).unwrap();
+        let (durable, _) = start_upload(durable).unwrap();
         assert_eq!(durable.options.ttl_ms(), None);
 
         let finite = metadata_frame(1, Some(u64::MAX));
         let finite = api::PublishBlobRequest::decode_from_slice(&finite.encode_to_vec()).unwrap();
-        let (finite, _) = UploadGrammar::start(finite).unwrap();
+        let (finite, _) = start_upload(finite).unwrap();
         assert_eq!(finite.options.ttl_ms(), Some(u64::MAX));
 
-        let error = UploadGrammar::start(metadata_frame(1, Some(0))).unwrap_err();
+        let error = start_upload(metadata_frame(1, Some(0))).unwrap_err();
         assert_eq!(error.code, ErrorCode::InvalidArgument);
     }
 
     #[test]
     fn blob_upload_requires_one_metadata_frame_before_chunks() {
         assert_eq!(
-            UploadGrammar::start(api::PublishBlobRequest::default())
+            start_upload(api::PublishBlobRequest::default())
                 .unwrap_err()
                 .code,
             ErrorCode::InvalidArgument
         );
         assert_eq!(
-            UploadGrammar::start(chunk(vec![1])).unwrap_err().code,
+            start_upload(chunk(vec![1])).unwrap_err().code,
             ErrorCode::InvalidArgument
         );
 
-        let (_, mut grammar) = UploadGrammar::start(metadata_frame(1, None)).unwrap();
+        let (_, mut grammar) = start_upload(metadata_frame(1, None)).unwrap();
         assert_eq!(
             grammar.accept(metadata_frame(1, None)).unwrap_err().code,
             ErrorCode::InvalidArgument
@@ -878,25 +890,23 @@ mod tests {
     #[test]
     fn blob_upload_rejects_empty_oversized_and_length_mismatched_streams() {
         assert_eq!(
-            UploadGrammar::start(metadata_frame(0, None))
-                .unwrap_err()
-                .code,
+            start_upload(metadata_frame(0, None)).unwrap_err().code,
             ErrorCode::InvalidArgument
         );
         assert_eq!(
-            UploadGrammar::start(metadata_frame(MAX_SELECTED_LIVE_BLOB_BYTES + 1, None))
+            start_upload(metadata_frame(MAX_SELECTED_LIVE_BLOB_BYTES + 1, None))
                 .unwrap_err()
                 .code,
             ErrorCode::ResourceExhausted
         );
 
-        let (_, mut empty_chunk) = UploadGrammar::start(metadata_frame(1, None)).unwrap();
+        let (_, mut empty_chunk) = start_upload(metadata_frame(1, None)).unwrap();
         assert_eq!(
             empty_chunk.accept(chunk(Vec::new())).unwrap_err().code,
             ErrorCode::InvalidArgument
         );
 
-        let (_, mut oversized_chunk) = UploadGrammar::start(metadata_frame(
+        let (_, mut oversized_chunk) = start_upload(metadata_frame(
             (MAX_SELECTED_BLOB_PAGE_BYTES + 1) as u64,
             None,
         ))
@@ -909,13 +919,28 @@ mod tests {
             ErrorCode::InvalidArgument
         );
 
-        let (_, short) = UploadGrammar::start(metadata_frame(2, None)).unwrap();
+        let (_, short) = start_upload(metadata_frame(2, None)).unwrap();
         assert_eq!(short.finish().unwrap_err().code, ErrorCode::InvalidArgument);
 
-        let (_, mut long) = UploadGrammar::start(metadata_frame(1, None)).unwrap();
+        let (_, mut long) = start_upload(metadata_frame(1, None)).unwrap();
         assert_eq!(
             long.accept(chunk(vec![1, 2])).unwrap_err().code,
             ErrorCode::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn blob_upload_admission_uses_the_live_profile_capacity() {
+        let configured_max = 2 * 1024 * 1024 * 1024;
+        let declared = 800 * 1024 * 1024;
+
+        UploadGrammar::start(metadata_frame(declared, None), configured_max)
+            .expect("profile-5 upload below the configured live capacity");
+        assert_eq!(
+            UploadGrammar::start(metadata_frame(configured_max + 1, None), configured_max)
+                .unwrap_err()
+                .code,
+            ErrorCode::ResourceExhausted
         );
     }
 
