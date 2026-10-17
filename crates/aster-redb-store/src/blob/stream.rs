@@ -278,14 +278,72 @@ impl Store {
             }
         };
         if already_v9 {
-            if finite.is_some() && matches!(pending.metadata.lifetime, BlobLifetime::Durable) {
-                return Err(blob_error(BlobStoreError::PendingSourceConflict));
+            match pending.metadata.lifetime {
+                BlobLifetime::Durable => {
+                    if finite.is_some() {
+                        return Err(blob_error(BlobStoreError::PendingSourceConflict));
+                    }
+                }
+                BlobLifetime::Finite {
+                    ttl_ms,
+                    mut age,
+                    provenance,
+                } => {
+                    let old_lifetime = pending.metadata.lifetime;
+                    let (claim, contact) =
+                        finite.ok_or_else(|| blob_error(BlobStoreError::PendingSourceConflict))?;
+                    let verified = claim
+                        .verify_authenticated_source(
+                            contact,
+                            claim.exchange_id(),
+                            BlobCustodyTransferId::from_exact_hash(*source.as_bytes()),
+                            blob,
+                            sealed,
+                            age.cumulative_age_ms,
+                        )
+                        .map_err(|error| {
+                            blob_error(BlobStoreError::Verification(error.to_string()))
+                        })?;
+                    if verified.ttl_ms() != ttl_ms {
+                        return Err(blob_error(BlobStoreError::PendingSourceConflict));
+                    }
+                    age.cumulative_age_ms = age.cumulative_age_ms.max(verified.forwarding_age_ms());
+                    pending.metadata.lifetime = BlobLifetime::Finite {
+                        ttl_ms,
+                        age,
+                        provenance,
+                    };
+                    pending.metadata.lifetime = lifecycle::project_lifetime_for_policy_write(
+                        &write,
+                        pending.metadata.lifetime,
+                    )?;
+                    lifecycle::replace_policy_ttl_deadline_write(
+                        &write,
+                        source,
+                        lifecycle::TtlDeadlineKind::PendingSource,
+                        Some(old_lifetime),
+                        Some(pending.metadata.lifetime),
+                        self.blob_lifecycle_limits,
+                    )?;
+                    pending.authenticated_source_binding =
+                        pending_blob_authenticated_source_binding(
+                            &pending.metadata,
+                            &pending.sealed,
+                        )?;
+                    let replacement = encode_pending_blob_source(&pending)?;
+                    write
+                        .open_table(BLOB_PENDING_SOURCES)?
+                        .insert(source.as_bytes().as_slice(), replacement.as_slice())?;
+                    pressure::rekey_pending_source_lifetime_write(&write, source, &pending)?;
+                    write.commit()?;
+                }
             }
             return Ok(BlobStreamProvenanceUpgrade::AlreadyV9(
                 existing_checkpoint.unwrap_or_default(),
             ));
         }
 
+        let old_lifetime = pending.metadata.lifetime;
         match pending.metadata.lifetime {
             BlobLifetime::Durable => {
                 if finite.is_some() {
@@ -336,6 +394,14 @@ impl Store {
         }
         pending.metadata.lifetime =
             lifecycle::project_lifetime_for_policy_write(&write, pending.metadata.lifetime)?;
+        lifecycle::replace_policy_ttl_deadline_write(
+            &write,
+            source,
+            lifecycle::TtlDeadlineKind::PendingSource,
+            Some(old_lifetime),
+            Some(pending.metadata.lifetime),
+            self.blob_lifecycle_limits,
+        )?;
         pending.authenticated_source_binding =
             pending_blob_authenticated_source_binding(&pending.metadata, &pending.sealed)?;
         let replacement = encode_pending_blob_source(&pending)?;

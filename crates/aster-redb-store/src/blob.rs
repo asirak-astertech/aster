@@ -20065,11 +20065,14 @@ mod tests {
     fn finite_stream_v9_send_authority_constructs_exact_claim_and_rechecks_age() {
         let source_root = BlobTestRoot::new("finite-stream-v9-send-source");
         let target_root = BlobTestRoot::new("finite-stream-v9-send-target");
+        let receiver_root = BlobTestRoot::new("finite-stream-v9-send-receiver");
         let mut services = blob_services(0x69);
         let source = Store::open_for_mission(&source_root.database, services.authority)
             .expect("finite stream v9 source store");
         let target = Store::open_for_mission(&target_root.database, services.authority)
             .expect("finite stream v9 target store");
+        let receiver = Store::open_for_mission(&receiver_root.database, services.authority)
+            .expect("finite stream v9 receiver store");
         let plaintext = b"finite stream v9 send authorization preserves exact age".to_vec();
         let prepared = prepared_blob(&plaintext);
         let proof = prepare_blob_proof_with_lifetime(
@@ -20149,6 +20152,10 @@ mod tests {
         initiator
             .open_transfer_profile_offer(&responder_offer)
             .expect("open responder v9 offer");
+        let negotiated =
+            aster_mesh::negotiate_transfer_profiles_for_semantic_version(9, &offer, &offer)
+                .expect("negotiate v9 profiles");
+        let profile_digest = aster_mesh::transfer_profile_digest(&offer, &offer, &negotiated);
         let attempt_nonce = [0x6b; 32];
         let context = initiator
             .mint_blob_custody_send_context_v2(
@@ -20190,6 +20197,14 @@ mod tests {
         assert_eq!(claim.prior_cumulative_age_ms(), 1_025);
         assert_eq!(claim.hop_delta_ms(), 40);
         assert_eq!(claim.forwarding_age_ms(), 1_065);
+        let protected_claim = initiator
+            .seal_blob_custody_frame_v2(
+                profile_digest,
+                BlobCustodyDirectionV1::ToSessionResponder,
+                attempt_nonce,
+                &claim,
+            )
+            .expect("seal finite stream v9 claim");
         assert!(
             target
                 .finalize_finite_blob_send_with_policy(
@@ -20203,6 +20218,158 @@ mod tests {
                     },
                 )
                 .expect("finalize finite stream v9 send")
+        );
+        let (received_claim, contact) = responder
+            .open_blob_custody_frame_v2(
+                profile_digest,
+                BlobCustodyDirectionV1::ToSessionResponder,
+                attempt_nonce,
+                &protected_claim,
+            )
+            .expect("open finite stream v9 claim");
+        let receiver_policy = receiver
+            .control_policy_snapshot()
+            .expect("finite stream v9 receiver policy");
+        receiver
+            .stage_verified_finite_blob_stream_v9_with_policy(
+                &receiver_policy,
+                &proof.blob,
+                &proof.sealed,
+                &plan,
+                received_claim,
+                contact,
+                CustodySample {
+                    clock_id: [0x6c; 16],
+                    tick_ms: 30_000,
+                },
+            )
+            .expect("stage authenticated finite stream v9 source");
+        assert!(
+            receiver
+                .upgrade_pending_blob_to_stream_v9(
+                    &receiver_policy,
+                    transfer,
+                    &proof.blob,
+                    &proof.sealed,
+                    &plan,
+                    None,
+                )
+                .is_err(),
+            "already-v9 finite recovery must still require fresh custody authority"
+        );
+
+        let refreshed = target
+            .custody_v2_blob_source_projection(transfer)
+            .expect("refreshed finite stream v9 projection")
+            .expect("refreshed finite stream v9 source");
+        let retry_nonce = [0x6d; 32];
+        let retry_context = initiator
+            .mint_blob_custody_send_context_v2(
+                BlobCustodyDirectionV1::ToSessionResponder,
+                18,
+                retry_nonce,
+                40,
+            )
+            .expect("mint retry finite stream v9 context");
+        let retry = target
+            .authorize_finite_blob_stream_v9_send_with_policy(
+                &policy,
+                &refreshed.source,
+                refreshed.retention,
+                &proof.blob,
+                &proof.sealed,
+                retry_context,
+                CustodySample {
+                    clock_id: admitted.clock_id,
+                    tick_ms: 20_200,
+                },
+            )
+            .expect("authorize retry finite stream v9 send")
+            .expect("live retry finite stream v9 authority");
+        let (retry_claim, retry_prepared) = retry
+            .into_claim_v2(&proof.blob, &proof.sealed)
+            .expect("construct retry finite stream v9 claim");
+        assert!(retry_claim.forwarding_age_ms() >= claim.forwarding_age_ms());
+        let protected_retry = initiator
+            .seal_blob_custody_frame_v2(
+                profile_digest,
+                BlobCustodyDirectionV1::ToSessionResponder,
+                retry_nonce,
+                &retry_claim,
+            )
+            .expect("seal retry finite stream v9 claim");
+        assert!(
+            target
+                .finalize_finite_blob_send_with_policy(
+                    &policy,
+                    retry_prepared,
+                    &proof.blob,
+                    &proof.sealed,
+                    CustodySample {
+                        clock_id: admitted.clock_id,
+                        tick_ms: 20_220,
+                    },
+                )
+                .expect("finalize retry finite stream v9 send")
+        );
+        let (received_retry, retry_contact) = responder
+            .open_blob_custody_frame_v2(
+                profile_digest,
+                BlobCustodyDirectionV1::ToSessionResponder,
+                retry_nonce,
+                &protected_retry,
+            )
+            .expect("open retry finite stream v9 claim");
+        let checkpoint = receiver
+            .blob_stream_checkpoint_with_policy(&receiver_policy, transfer, &plan)
+            .expect("finite stream v9 checkpoint before retry");
+        assert_eq!(
+            receiver
+                .upgrade_pending_blob_to_stream_v9(
+                    &receiver_policy,
+                    transfer,
+                    &proof.blob,
+                    &proof.sealed,
+                    &plan,
+                    Some((received_retry, retry_contact)),
+                )
+                .expect("merge fresh finite stream v9 authority"),
+            BlobStreamProvenanceUpgrade::AlreadyV9(checkpoint)
+        );
+
+        let receiver_projection = receiver
+            .custody_v2_blob_source_projection(transfer)
+            .expect("receiver projection after age merge")
+            .expect("receiver source after age merge");
+        let inspect_context = initiator
+            .mint_blob_custody_send_context_v2(
+                BlobCustodyDirectionV1::ToSessionResponder,
+                19,
+                [0x6e; 32],
+                40,
+            )
+            .expect("mint finite age inspection context");
+        let inspect = receiver
+            .authorize_finite_blob_stream_v9_send_with_policy(
+                &receiver_policy,
+                &receiver_projection.source,
+                receiver_projection.retention,
+                &proof.blob,
+                &proof.sealed,
+                inspect_context,
+                CustodySample {
+                    clock_id: [0x6c; 16],
+                    tick_ms: 30_000,
+                },
+            )
+            .expect("authorize merged finite age")
+            .expect("merged finite source remains live");
+        let (inspect_claim, _) = inspect
+            .into_claim_v2(&proof.blob, &proof.sealed)
+            .expect("construct merged finite age claim");
+        assert!(
+            inspect_claim.prior_cumulative_age_ms() >= retry_claim.forwarding_age_ms(),
+            "fresh profile-5 custody must merge age without rejuvenation"
         );
     }
 
