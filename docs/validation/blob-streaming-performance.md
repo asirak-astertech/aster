@@ -90,3 +90,58 @@ throughput regression in this fixture.
 ```text
 ASTER_TEST_BLOB_STREAM_MIB=256 cargo test --release --locked -p aster-node live_blob_stream_v9_completes_retained_sixteen_mib_shape_in_one_contact --lib -- --nocapture
 ```
+
+## 2026-10-17 two-CM4 development validation
+
+This is local development evidence, not the required three-device qualification
+receipt. The existing protected mission on `rpi4-2` published to `rpi4-1` over
+their ZeroTier addresses. Both devices are Raspberry Pi CM4 Rev 1.1 systems
+running aarch64 Debian 13 and kernel 6.18.39. Their isolated validation depots
+were configured for 3 GiB, 65,536 chunks, and 16 variants.
+
+The first 800-MiB attempt exposed two application-protocol limits outside the
+profile-5 carrier driver: Blob RPCs inherited the ordinary 30-second total
+deadline, and upload metadata still used the legacy 64-MiB profile-4 ceiling.
+Focused regressions now give Blob RPC streams a bounded 30-minute total deadline
+and derive upload admission from the running node's configured depot byte and
+selected-profile chunk capacity.
+
+The corrected publisher admitted and durably committed a fresh 800-MiB Blob:
+
+| Leg | Device | Bytes | Elapsed | Rate | Sampled agent RSS |
+| --- | --- | ---: | ---: | ---: | ---: |
+| local RPC publish and durable commit | `rpi4-2` | 838,860,800 | 515 s | 1.55 MiB/s | at most 49,940 KiB |
+| authenticated receiver RPC read and atomic output publication | `rpi4-1` | 838,860,800 | 433 s | 1.85 MiB/s | at most 46,476 KiB |
+
+The initial receiver read used 64-KiB application pages and progressed at only
+about 10 MiB/min while replication was active. The selected live read boundary
+now returns a bounded 1-MiB authenticated window, spanning at most 17 canonical
+chunks when unaligned, and rechecks authorization between windows. Upload frames
+remain 64 KiB. The final uncontended read was roughly ten times faster than the
+initial observation and retained bounded process memory.
+
+The source and receiver output both had SHA-256
+`0b369a7ba0bd446b5d687657a9faadc5702abc387a88fdd26b798fcc80d93420`.
+The committed Blob ID was
+`EVy5o+y8B30+1D0XP90kfhbVBaWkKNS9vjpcToEjfRM=` and operation key was
+`cm4-v9-800m-a61d22d5`. Exact receiver reconstruction proves inter-node
+replication completed, but this run did not retain a precise convergence
+timestamp: `rpi4-1` had intermittent overlay reachability during transfer and
+the read probe was intentionally stopped while diagnosing contention. The
+publish-plus-read sum is 948 seconds (15m48s), but it excludes asynchronous
+peer convergence and therefore is not an end-to-end delivery latency claim.
+
+The candidate binaries used for the final read were built from local commit
+`fa5a4791cc81` and had SHA-256
+`44623ac637fdc910b6fd0ae4f607bfc04a74d932c7533984da14e505e747fbf9`
+(`aster-agent`) and
+`f7d40acf51b8a6f211de478313bc71e4656f2b91093c09f19037d2ec0c4ee39f`
+(`asterctl`). Both services remained active after validation.
+
+The third prior CM4 was reachable and its hardware/platform preflight was
+recorded, but it had no installed mission credentials. Fresh credential
+provisioning was not authorized, so alternate-peer/failover, exact convergence
+latency, a 1-GiB run, interruption/resume, and three-device qualification remain
+open. This evidence supports feasibility and catches size-dependent application
+limits; it does not establish UAS radio, Jetson, mixed-implementation, relay, or
+release acceptance.
