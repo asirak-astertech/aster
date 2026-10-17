@@ -7,7 +7,16 @@ Date: 2026-10-14
 Amended: 2026-10-15 after review of PR 71 at `c17213a50a59` and PR 47 at
 `04de641bfb3d`
 
-Status: approved amended specification; ready for implementation handoff
+Status: superseded on 2026-10-17 by
+`2026-10-17-end-to-end-blob-streaming-design.md`
+
+The production-driver and CM4 measurements showed that this design removed
+network stop-and-wait behavior but retained carrier-per-file persistence,
+per-window database work, and a staged two-pass application path. Those costs
+limited an 800-MiB CM4 publish/read to 1.55/1.85 MiB/s even though the raw
+stream transport was substantially faster. The replacement specification
+removes those retained assumptions instead of treating them as compatibility
+requirements.
 
 ## Purpose
 

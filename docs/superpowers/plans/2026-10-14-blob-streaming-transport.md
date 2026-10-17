@@ -12,7 +12,12 @@
 
 **Spec:** `docs/superpowers/specs/2026-10-14-blob-streaming-transport-design.md`
 
-**Status:** Approved for implementation handoff on 2026-10-15.
+**Status:** Superseded on 2026-10-17. CM4 validation showed that the
+carrier-per-file and staged two-pass architecture did not meet the performance
+requirement. Do not execute the remaining tasks in this plan. Its replacement
+will be written from
+`docs/superpowers/specs/2026-10-17-end-to-end-blob-streaming-design.md` after
+that specification is reviewed.
 
 ## Global Constraints
 
