@@ -162,11 +162,13 @@ Unsigned integer fields use their JSON integer representation.
 
 The server also retains compiled, non-configurable bounds: 1 MiB encoded
 request/message, 4 MiB protobuf element memory, 2 MiB encoded protobuf
-response, RPC deadlines of 10 ms through 30 seconds (10-second default), 32
+response, ordinary RPC deadlines of 10 ms through 30 seconds (10-second
+default), Blob RPC deadlines through 1,800 seconds, 32
 HTTP/2 streams per connection, and streaming poll backoff of 100 through
 60,000 ms. Event query, delivery, and scan pages are each `1..=1024`.
 
-RPC deadlines also bound established response streams. An authenticated
+RPC deadlines also bound established response streams. Blob response streams
+add a 30-second maximum gap between pages. An authenticated
 connection with no active response closes after 60 seconds idle. At 30 minutes
 of connection age, new requests receive `Unavailable`; existing responses have
 at most 30 seconds of additional grace before closure. HTTP/2 keepalive runs

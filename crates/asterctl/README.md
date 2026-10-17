@@ -84,8 +84,10 @@ listeners; `--host` does not change that server restriction. There is no TLS.
 Each RPC has a configurable timeout (10 seconds by default), a 4-MiB response
 limit and a 4-MiB decoded-element budget.
 Use `--timeout 30` or `--timeout=30` before or after the command to change the
-client deadline. The agent may enforce a shorter deadline: the current
-`aster-agent` caps each RPC at 30 seconds, even when the client requests more.
+client deadline. The agent may enforce a shorter deadline. Ordinary RPCs cap
+at 30 seconds; progressing `PublishBlob` and `ReadBlob` streams may request up
+to 1,800 seconds and are still bounded by the connection lifetime and stream
+progress checks.
 Query applies a fresh deadline to each page request, not to the whole query.
 The RPC timeout does not limit time spent entering a payload on stdin.
 

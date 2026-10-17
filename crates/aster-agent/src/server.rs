@@ -262,21 +262,40 @@ pub struct PreBodyGate<S> {
     max_header_bytes: usize,
 }
 
-impl PreBodyGate<ConnectRpcService<Router>> {
+pub trait GateService: Clone {
+    fn rejection_service() -> Self;
+}
+
+impl GateService for ConnectRpcService<Router> {
+    fn rejection_service() -> Self {
+        crate::event_service::configured_service(crate::event_service::rejection_router())
+            .with_interceptor(RejectionInterceptor)
+    }
+}
+
+impl GateService for crate::event_service::ApplicationService {
+    fn rejection_service() -> Self {
+        crate::event_service::ApplicationService::new(
+            crate::event_service::configured_service(crate::event_service::rejection_router())
+                .with_interceptor(RejectionInterceptor),
+            crate::event_service::configured_blob_service(crate::event_service::rejection_router())
+                .with_interceptor(RejectionInterceptor),
+        )
+    }
+}
+
+impl<S: GateService> PreBodyGate<S> {
     fn new(
-        accepted: ConnectRpcService<Router>,
+        accepted: S,
         token: ReloadableClientToken,
         status: ServiceStatus,
         in_flight: Arc<Semaphore>,
         connection_auth: ConnectionAuthState,
         max_header_bytes: usize,
     ) -> Self {
-        let rejected =
-            crate::event_service::configured_service(crate::event_service::rejection_router())
-                .with_interceptor(RejectionInterceptor);
         Self {
             accepted,
-            rejected,
+            rejected: S::rejection_service(),
             token,
             status,
             in_flight,
@@ -553,14 +572,26 @@ impl BoundAgent {
     }
 
     /// Serves the supplied Event router with node-global admission limits.
-    pub async fn serve(
+    pub async fn serve<S>(
         self,
-        service: ConnectRpcService<Router>,
+        service: S,
         token: ReloadableClientToken,
         status: ServiceStatus,
         limits: AgentLimits,
         mut stop: watch::Receiver<ServerStop>,
-    ) -> Result<(), ServerError> {
+    ) -> Result<(), ServerError>
+    where
+        S: GateService
+            + Service<
+                Request<hyper::body::Incoming>,
+                Response = Response<ConnectRpcBody>,
+                Error = Infallible,
+            > + Service<Request<Empty<Bytes>>, Response = Response<ConnectRpcBody>, Error = Infallible>
+            + Send
+            + 'static,
+        <S as Service<Request<hyper::body::Incoming>>>::Future: Send + 'static,
+        <S as Service<Request<Empty<Bytes>>>>::Future: Send + 'static,
+    {
         let total = Arc::new(Semaphore::new(limits.max_connections()));
         let unauthenticated = Arc::new(Semaphore::new(limits.max_unauthenticated_connections()));
         let in_flight = Arc::new(Semaphore::new(limits.max_in_flight_requests()));
@@ -1206,6 +1237,54 @@ mod tests {
         );
         drop(stream);
         assert_eq!(permits.available_permits(), 1);
+    }
+
+    #[cfg(feature = "client")]
+    #[tokio::test(start_paused = true)]
+    async fn blob_upload_may_make_progress_beyond_the_ordinary_rpc_deadline() {
+        // Break caught: applying the ordinary 30-second absolute RPC deadline
+        // to a progressing Blob upload makes operationally large sources
+        // impossible to ingest through the public streaming API.
+        let router = Router::new().route_client_stream(
+            api::ASTER_APPLICATION_SERVICE_SERVICE_NAME,
+            "PublishBlob",
+            connectrpc::client_streaming_handler_fn(
+                |_ctx, mut requests: connectrpc::ServiceStream<api::PublishBlobRequest>| async move {
+                    let _ = futures::StreamExt::next(&mut requests).await;
+                    tokio::time::sleep(Duration::from_secs(31)).await;
+                    Ok::<_, ConnectError>(connectrpc::Response::new(
+                        api::PublishBlobResponse::default(),
+                    ))
+                },
+            ),
+        );
+        let client = api::AsterApplicationServiceClient::new(
+            ServiceTransport::new(PreBodyGate::new(
+                crate::event_service::ApplicationService::new(
+                    crate::event_service::configured_service(Router::new()),
+                    crate::event_service::configured_blob_service(router),
+                ),
+                token(),
+                ready(),
+                Arc::new(Semaphore::new(1)),
+                ConnectionAuthState::detached(),
+                16 * 1024,
+            )),
+            ClientConfig::new("http://localhost".parse().unwrap())
+                .with_protocol(Protocol::Grpc)
+                .with_default_timeout(Duration::from_secs(120))
+                .with_default_header(
+                    http::header::AUTHORIZATION,
+                    format!("Bearer {}", String::from_utf8_lossy(TEST_TOKEN)),
+                ),
+        );
+        let response = client
+            .publish_blob(futures::stream::iter([api::PublishBlobRequest::default()]))
+            .await;
+        assert!(
+            response.is_ok(),
+            "progressing Blob upload was cut off by the ordinary deadline: {response:?}"
+        );
     }
 
     #[cfg(feature = "client")]

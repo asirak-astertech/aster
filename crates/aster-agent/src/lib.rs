@@ -122,7 +122,7 @@ impl BoundAgent {
 
     async fn serve_service(
         self,
-        service: connectrpc::ConnectRpcService<connectrpc::Router>,
+        service: event_service::ApplicationService,
         token: ClientToken,
         mut shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

@@ -41,6 +41,66 @@ const PROFILE_EVENT_OPERATION_WARNING: u64 = 512;
 const PROFILE_EVENT_OPERATION_BOUNDARY: u64 = 1_024;
 const PROFILE_EVENT_PENDING_DELIVERY_BOUNDARY: u64 = 256;
 const PUBLISH_EVENTS_WINDOW: usize = 8;
+const BLOB_RPC_MAX_DURATION: Duration = Duration::from_secs(30 * 60);
+const BLOB_RPC_MAX_IDLE: Duration = Duration::from_secs(30);
+
+#[derive(Clone)]
+pub(crate) struct ApplicationService {
+    ordinary: connectrpc::ConnectRpcService<connectrpc::Router>,
+    blob: connectrpc::ConnectRpcService<connectrpc::Router>,
+}
+
+impl ApplicationService {
+    pub(crate) const fn new(
+        ordinary: connectrpc::ConnectRpcService<connectrpc::Router>,
+        blob: connectrpc::ConnectRpcService<connectrpc::Router>,
+    ) -> Self {
+        Self { ordinary, blob }
+    }
+}
+
+impl<B> tower_service::Service<http::Request<B>> for ApplicationService
+where
+    connectrpc::ConnectRpcService<connectrpc::Router>: tower_service::Service<http::Request<B>>,
+{
+    type Response = <connectrpc::ConnectRpcService<connectrpc::Router> as tower_service::Service<
+        http::Request<B>,
+    >>::Response;
+    type Error = <connectrpc::ConnectRpcService<connectrpc::Router> as tower_service::Service<
+        http::Request<B>,
+    >>::Error;
+    type Future = <connectrpc::ConnectRpcService<connectrpc::Router> as tower_service::Service<
+        http::Request<B>,
+    >>::Future;
+
+    fn poll_ready(
+        &mut self,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        match tower_service::Service::poll_ready(&mut self.ordinary, context) {
+            std::task::Poll::Ready(Ok(())) => {
+                tower_service::Service::poll_ready(&mut self.blob, context)
+            }
+            other => other,
+        }
+    }
+
+    fn call(&mut self, request: http::Request<B>) -> Self::Future {
+        if is_blob_rpc_path(request.uri().path()) {
+            tower_service::Service::call(&mut self.blob, request)
+        } else {
+            tower_service::Service::call(&mut self.ordinary, request)
+        }
+    }
+}
+
+fn is_blob_rpc_path(path: &str) -> bool {
+    let Some((service, method)) = path.strip_prefix('/').and_then(|path| path.split_once('/'))
+    else {
+        return false;
+    };
+    service == APPLICATION_SERVICE_NAME && matches!(method, "PublishBlob" | "ReadBlob")
+}
 
 /// High-level ConnectRPC service backed by the running node's sole authority.
 #[derive(Clone)]
@@ -92,16 +152,17 @@ pub(crate) fn application_service_with_blobs(
     configured_emission_policy: EventEmissionPolicy,
     credential_generation: Option<CredentialGeneration>,
     shutdown: tokio::sync::watch::Receiver<bool>,
-) -> std::io::Result<connectrpc::ConnectRpcService<connectrpc::Router>> {
-    Ok(configured_service(
-        AsterConnectService::new(
-            events,
-            configured_emission_policy,
-            credential_generation,
-            shutdown,
-        )
-        .with_blobs(blobs, &state_root)?
-        .router(),
+) -> std::io::Result<ApplicationService> {
+    let service = AsterConnectService::new(
+        events,
+        configured_emission_policy,
+        credential_generation,
+        shutdown,
+    )
+    .with_blobs(blobs, &state_root)?;
+    Ok(ApplicationService::new(
+        configured_service(service.clone().router()),
+        configured_blob_service(service.router()),
     ))
 }
 
@@ -110,15 +171,16 @@ pub(crate) fn application_service(
     configured_emission_policy: EventEmissionPolicy,
     credential_generation: Option<CredentialGeneration>,
     shutdown: tokio::sync::watch::Receiver<bool>,
-) -> connectrpc::ConnectRpcService<connectrpc::Router> {
-    configured_service(
-        AsterConnectService::new(
-            events,
-            configured_emission_policy,
-            credential_generation,
-            shutdown,
-        )
-        .router(),
+) -> ApplicationService {
+    let service = AsterConnectService::new(
+        events,
+        configured_emission_policy,
+        credential_generation,
+        shutdown,
+    );
+    ApplicationService::new(
+        configured_service(service.clone().router()),
+        configured_blob_service(service.router()),
     )
 }
 
@@ -129,14 +191,32 @@ pub(crate) fn configured_service(
         .with_max_request_body_size(crate::MAX_AGENT_MESSAGE_BYTES)
         .with_max_message_size(crate::MAX_AGENT_MESSAGE_BYTES)
         .with_element_memory_limit(crate::MAX_AGENT_ELEMENT_MEMORY_BYTES);
-    let deadline = connectrpc::DeadlinePolicy::new()
+    let ordinary_deadline = connectrpc::DeadlinePolicy::new()
         .with_min(Duration::from_millis(10))
         .with_max(Duration::from_secs(30))
         .with_default_timeout(Duration::from_secs(10))
         .with_enforce_on_streams(true);
     connectrpc::ConnectRpcService::new(router)
         .with_limits(limits)
-        .with_deadline_policy(deadline)
+        .with_deadline_policy(ordinary_deadline)
+}
+
+pub(crate) fn configured_blob_service(
+    router: connectrpc::Router,
+) -> connectrpc::ConnectRpcService<connectrpc::Router> {
+    let limits = connectrpc::Limits::default()
+        .with_max_request_body_size(crate::MAX_AGENT_MESSAGE_BYTES)
+        .with_max_message_size(crate::MAX_AGENT_MESSAGE_BYTES)
+        .with_element_memory_limit(crate::MAX_AGENT_ELEMENT_MEMORY_BYTES);
+    let blob_deadline = connectrpc::DeadlinePolicy::new()
+        .with_min(Duration::from_millis(10))
+        .with_max(BLOB_RPC_MAX_DURATION)
+        .with_default_timeout(Duration::from_secs(10))
+        .with_enforce_on_streams(true)
+        .with_inter_message_timeout(BLOB_RPC_MAX_IDLE);
+    connectrpc::ConnectRpcService::new(router)
+        .with_limits(limits)
+        .with_deadline_policy(blob_deadline)
 }
 
 fn rejection_handler<Req, Res>() -> impl connectrpc::BidiStreamingHandler<Req, Res, Item = Res>

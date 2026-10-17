@@ -129,10 +129,12 @@ Text output renders the original signed TTL as exactly `TTL: durable` or
 omits `ttlMs`. These values are the original lifetime, not remaining time.
 
 The CLI and wire fields use checked `u64` lengths and do not define a 64-MiB
-protocol maximum. The current selected backend nevertheless admits at most
-64 MiB, and the shared agent deadline policy currently defaults to 10 seconds
-and caps each stream at 30 seconds. Those are current implementation limits,
-not RPC compatibility guarantees or large-file performance claims.
+protocol maximum. Configured profile-5 depot bounds determine large-object
+admission. The agent retains a 10-second default and 30-second maximum for
+ordinary RPCs; progressing `PublishBlob` and `ReadBlob` streams may explicitly
+request up to 1,800 seconds and remain bounded by connection lifetime and
+stream progress checks. These are implementation limits, not RPC compatibility
+guarantees or performance claims.
 
 `blob-read` currently requires Linux, an owner-controlled destination directory
 (owned by the current user and not writable by group or other users), and a

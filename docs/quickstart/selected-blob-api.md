@@ -162,11 +162,12 @@ original authenticated lifetime, never a countdown or deletion time. Blob
 plaintext is written only to the requested output and is never printed.
 
 The RPC and CLI use checked `u64` lengths and bounded 64-KiB frames/pages; they
-do not promise a fixed total-size ceiling. The current selected backend rejects
-objects above 64 MiB. The shared agent deadline policy currently defaults to
-10 seconds and caps a stream at 30 seconds, even if `asterctl --timeout` asks
-for longer. These values describe this implementation, not durable RPC
-semantics, supported large-file behavior, or performance qualification.
+do not promise a fixed total-size ceiling. Configured profile-5 depot bounds
+determine large-object admission. Ordinary RPCs retain a 10-second default and
+30-second maximum. Progressing `PublishBlob` and `ReadBlob` streams may request
+up to 1,800 seconds and remain bounded by connection lifetime and progress
+checks. These values describe this implementation, not durable RPC semantics
+or performance qualification.
 
 `blob-read` currently requires Linux, a destination directory owned by the
 current user and not writable by group or other users, and a filesystem that
