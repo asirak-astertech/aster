@@ -22256,6 +22256,42 @@ fn settle_mutable_transfer_cursor(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DeferredBlobCursorSettlement {
+    peer: NodeId,
+    direction: EventDirection,
+    expected: Option<[u8; 32]>,
+    source: BlobTransferId,
+}
+
+impl DeferredBlobCursorSettlement {
+    const fn new(
+        peer: NodeId,
+        direction: EventDirection,
+        expected: Option<[u8; 32]>,
+        source: BlobTransferId,
+    ) -> Self {
+        Self {
+            peer,
+            direction,
+            expected,
+            source,
+        }
+    }
+
+    fn settle(self, store: &Store) -> Result<(), NodeError> {
+        let mut expected = self.expected;
+        settle_mutable_transfer_cursor(
+            store,
+            self.peer,
+            MutableClass::Blob,
+            self.direction,
+            &mut expected,
+            MutableTransferId::Blob(self.source),
+        )
+    }
+}
+
 const fn mutable_lane_fetch_result_exchanges(direction: EventDirection) -> usize {
     match direction {
         EventDirection::ToSessionResponder => 0,
@@ -25405,7 +25441,7 @@ async fn sync_mutable_transfer_lane(
     lane: DirectedMutableLane<'_>,
     difference: &MutableDifference,
     receipt: &mut PeerReceipt,
-) -> Result<Option<BlobTransferId>, NodeError> {
+) -> Result<Option<DeferredBlobCursorSettlement>, NodeError> {
     let DirectedMutableLane {
         guard,
         source_snapshot,
@@ -25426,7 +25462,7 @@ async fn sync_mutable_transfer_lane(
     )?;
     let mut transferred = 0usize;
     let mut deferred_capacity = 0usize;
-    let mut stream_source = None;
+    let mut stream_settlement = None;
     match direction {
         EventDirection::ToSessionResponder => {
             let limit = difference.local_only.len().min(capacity);
@@ -25499,16 +25535,22 @@ async fn sync_mutable_transfer_lane(
                         None,
                     )
                 };
-                let disposition = settle_mutable_apply_result(
-                    store,
-                    peer,
-                    class,
-                    direction,
-                    &mut cursor,
-                    id,
-                    response,
-                    verified_digest,
-                )?;
+                let defer_stream_cursor =
+                    class == MutableClass::Blob && blob_contact_mode.stream_v1_enabled();
+                let disposition = if defer_stream_cursor {
+                    require_mutable_apply_result(response, class, direction, id, verified_digest)?
+                } else {
+                    settle_mutable_apply_result(
+                        store,
+                        peer,
+                        class,
+                        direction,
+                        &mut cursor,
+                        id,
+                        response,
+                        verified_digest,
+                    )?
+                };
                 receipt.offered += 1;
                 match disposition {
                     MutableApplyDisposition::Inserted => {}
@@ -25524,12 +25566,16 @@ async fn sync_mutable_transfer_lane(
                 }
                 if class == MutableClass::Blob
                     && disposition != MutableApplyDisposition::DeferredCapacity
-                    && stream_source.is_none()
+                    && stream_settlement.is_none()
                 {
                     let MutableTransferId::Blob(source) = id else {
                         unreachable!("Blob lane contains only Blob transfer identifiers")
                     };
-                    stream_source = Some(source);
+                    if defer_stream_cursor {
+                        stream_settlement = Some(DeferredBlobCursorSettlement::new(
+                            peer, direction, cursor, source,
+                        ));
+                    }
                 }
                 transferred += 1;
             }
@@ -25640,17 +25686,29 @@ async fn sync_mutable_transfer_lane(
                 let result = observe_and_fault_test_blob_settlement(store, result, verified_digest);
                 let acknowledgement =
                     request_mission_frame(connection, mission, result, receipt).await?;
-                settle_mutable_fetch_result_ack(
-                    store,
-                    peer,
-                    class,
-                    direction,
-                    &mut cursor,
-                    received,
-                    disposition,
-                    acknowledgement,
-                    verified_digest,
-                )?;
+                let defer_stream_cursor =
+                    class == MutableClass::Blob && blob_contact_mode.stream_v1_enabled();
+                if defer_stream_cursor {
+                    require_mutable_fetch_result_ack(
+                        acknowledgement,
+                        direction,
+                        received,
+                        disposition,
+                        verified_digest,
+                    )?;
+                } else {
+                    settle_mutable_fetch_result_ack(
+                        store,
+                        peer,
+                        class,
+                        direction,
+                        &mut cursor,
+                        received,
+                        disposition,
+                        acknowledgement,
+                        verified_digest,
+                    )?;
+                }
                 match disposition {
                     MutableApplyDisposition::Inserted => receipt.inserted += 1,
                     MutableApplyDisposition::Duplicate => receipt.duplicates += 1,
@@ -25665,12 +25723,16 @@ async fn sync_mutable_transfer_lane(
                 }
                 if class == MutableClass::Blob
                     && disposition != MutableApplyDisposition::DeferredCapacity
-                    && stream_source.is_none()
+                    && stream_settlement.is_none()
                 {
                     let MutableTransferId::Blob(source) = received else {
                         unreachable!("Blob lane contains only Blob transfer identifiers")
                     };
-                    stream_source = Some(source);
+                    if defer_stream_cursor {
+                        stream_settlement = Some(DeferredBlobCursorSettlement::new(
+                            peer, direction, cursor, source,
+                        ));
+                    }
                 }
                 receipt.fetched += 1;
                 transferred += 1;
@@ -25710,15 +25772,15 @@ async fn sync_mutable_transfer_lane(
         ));
     }
     add_unscheduled_mutable(receipt, remaining)?;
-    Ok(stream_source)
+    Ok(stream_settlement)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct BlobClassExchange {
     local_interest: BlobInterest,
     peer_interest: BlobInterest,
-    to_responder: Option<BlobTransferId>,
-    to_initiator: Option<BlobTransferId>,
+    to_responder: Option<DeferredBlobCursorSettlement>,
+    to_initiator: Option<DeferredBlobCursorSettlement>,
 }
 
 async fn sync_mutable_class(
@@ -25939,6 +26001,9 @@ async fn sync_mutable_classes(
                 .await?;
                 receipt.account_blob_stream_attempt(outcome)?;
             }
+            if let Some(settlement) = exchange.to_responder {
+                settlement.settle(store)?;
+            }
             let to_initiator = blob_stream::select_receive_plan(
                 store,
                 verifier,
@@ -25971,6 +26036,9 @@ async fn sync_mutable_classes(
                 )
                 .await?;
                 receipt.account_blob_stream_attempt(outcome)?;
+            }
+            if let Some(settlement) = exchange.to_initiator {
+                settlement.settle(store)?;
             }
             return Ok(());
         }
@@ -28908,7 +28976,7 @@ async fn serve_mutable_class(
         receipt,
     )
     .await?;
-    let to_responder_source = if let MutableReconciliationOutcome::Complete(difference) = outcome {
+    let _to_responder_source = if let MutableReconciliationOutcome::Complete(difference) = outcome {
         serve_mutable_transfer_lane(
             store,
             connection,
@@ -28941,7 +29009,7 @@ async fn serve_mutable_class(
         receipt,
     )
     .await?;
-    let to_initiator_source = if let MutableReconciliationOutcome::Complete(difference) = outcome {
+    let _to_initiator_source = if let MutableReconciliationOutcome::Complete(difference) = outcome {
         serve_mutable_transfer_lane(
             store,
             connection,
@@ -28960,8 +29028,8 @@ async fn serve_mutable_class(
             Some(BlobClassExchange {
                 local_interest: local,
                 peer_interest: peer,
-                to_responder: to_responder_source,
-                to_initiator: to_initiator_source,
+                to_responder: None,
+                to_initiator: None,
             })
         }
         _ => None,
@@ -32871,6 +32939,51 @@ mod tests {
 
         assert!(receipt.account_blob_stream_attempt(attempt).is_err());
         assert_eq!(receipt, before);
+    }
+
+    #[test]
+    fn blob_stream_cursor_settlement_is_deferred_until_terminal_ack() {
+        let state = root("blob-stream-deferred-cursor");
+        fs::create_dir_all(&state).unwrap();
+        let services = control_test_services([0x91; 32]);
+        let store = Store::open_for_mission(
+            state.join(STORE_FILE),
+            services.member.mission_authority_id(),
+        )
+        .unwrap();
+        let peer = services.other.identity();
+        let source = BlobTransferId::new([0x37; 32]);
+        let settlement = DeferredBlobCursorSettlement::new(
+            peer,
+            EventDirection::ToSessionResponder,
+            None,
+            source,
+        );
+
+        assert_eq!(
+            store
+                .mutable_transfer_cursor(
+                    peer,
+                    MutableTransferCursorClass::Blob,
+                    MutableTransferCursorMode::OfferToPeer,
+                )
+                .unwrap(),
+            None
+        );
+        settlement.settle(&store).unwrap();
+        assert_eq!(
+            store
+                .mutable_transfer_cursor(
+                    peer,
+                    MutableTransferCursorClass::Blob,
+                    MutableTransferCursorMode::OfferToPeer,
+                )
+                .unwrap(),
+            Some(*source.as_bytes())
+        );
+
+        drop(store);
+        fs::remove_dir_all(state).unwrap();
     }
 
     #[test]
@@ -49795,6 +49908,17 @@ mod tests {
         assert!(received.blob_stream_receive_limit_bytes >= plaintext.len() as u64);
         assert!(received.blob_stream_writer_commits > 0);
         assert_eq!(sent.blob_stream_received_bytes, 0);
+        assert_eq!(
+            receiver_store
+                .mutable_transfer_cursor(
+                    source_mission.identity,
+                    MutableTransferCursorClass::Blob,
+                    MutableTransferCursorMode::FetchFromPeer,
+                )
+                .unwrap(),
+            Some(*source.as_bytes()),
+            "profile-5 metadata cursor advances only after settled stream completion"
+        );
         eprintln!(
             "live_blob_stream_v9 bytes={} elapsed_ms={}",
             plaintext.len(),

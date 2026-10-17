@@ -1095,7 +1095,11 @@ Credit is an absolute offset and never decreases within an attempt. Durable
 offsets and checkpoint generations never move backward. Reopen uses a fresh
 nonce and resumes only from the receiver's durable offset. Duplicate terminal
 records replay the same digest-bound result or acknowledgement and never repeat
-promotion.
+promotion. The selected runtime likewise defers the existing per-peer Blob
+metadata cursor CAS for profile 5: a validated mutable source result records a
+contact-local settlement capability, and only successful completion of the
+bound stream result/ack exchange consumes it. Any error before that boundary
+leaves the durable cursor unchanged. Profile-4 cursor timing is unchanged.
 
 Finite profile-5 work uses `BlobCustodyClaimV2[208]`. Its field widths and age
 semantics are identical to `BlobCustodyClaimV1`, but its fixed header is

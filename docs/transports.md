@@ -496,7 +496,9 @@ descending order:
   contact metrics are implemented. The metrics use a stable transport ID and
   numeric attempt, received/retransmitted byte, receive-limit, checkpoint,
   checkpoint-latency, writer-commit, and failover-recovery fields. They never
-  contain raw paths or peer error text. Finite-TTL custody-v2 runtime
+  contain raw paths or peer error text. Profile-5 metadata cursor advancement
+  is deferred until the authenticated stream result acknowledgement; a failed
+  attempt leaves that cursor unchanged. Finite-TTL custody-v2 runtime
   composition and cross-transport failover remain fail-closed.
 - **Semantic version 8** inherits semantic-v7 profile
   negotiation and receipt-free Event pages, while profile 4 adds authenticated
