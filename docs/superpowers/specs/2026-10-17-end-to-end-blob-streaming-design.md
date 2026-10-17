@@ -4,7 +4,7 @@
 
 Date: 2026-10-17
 
-Status: approved conversational design; written specification awaiting review
+Status: approved written specification; implementation planning complete
 
 Supersedes: `2026-10-14-blob-streaming-transport-design.md`
 
@@ -180,8 +180,9 @@ be finalized by the same signed commitment.
 The final `BlobId` cannot be honestly known at stream open. Profile 5 therefore
 uses two identities:
 
-- `publication_stream_id`: a fresh random 256-bit identifier scoped by the
-  publisher, operation key, mission, and authenticated session; and
+- `publication_stream_id`: a fresh random 256-bit identifier bound by the
+  publisher to the operation key and mission; each network attempt separately
+  binds that logical stream to its authenticated session and attempt nonce; and
 - `BlobId`: the immutable final content identity derived at finish.
 
 `PublishStreamOpenV1` is signed by the source publisher and is additionally
@@ -194,7 +195,8 @@ open binds:
 - topic, scope, priority, media type, schema ID, and optional TTL;
 - declared total plaintext length;
 - segment and pack-format versions;
-- publication stream ID and fresh attempt nonce;
+- publication stream ID; the transport-attempt `StreamOpen` separately binds a
+  fresh attempt nonce so a retry can preserve the publisher-signed intent;
 - content-encryption epoch and provisional encryption parameters;
 - policy revision and required authorization context; and
 - a digest of all canonical open fields.
