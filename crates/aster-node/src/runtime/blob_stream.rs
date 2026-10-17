@@ -29,6 +29,8 @@ use aster_redb_store::{
 use sha2::{Digest as _, Sha256};
 use std::{sync::Arc, time::Duration};
 
+#[cfg(test)]
+use super::TestBlobContactFault;
 use super::{
     AuthenticatedBlobRouteClaim, BlobContactMode, BlobStreamTransport, CompletedBlobStreamSource,
     DeferredFiniteBlobStreamAdmission, EventDirection, EventLaneGuard, MutableApplyDisposition,
@@ -823,6 +825,8 @@ pub(super) async fn receive(
     let mut greatest_receive_limit = receive_limit;
     let mut greatest_checkpoint_latency_ms = 0_u64;
     let mut writer_commits = 0_u32;
+    #[cfg(test)]
+    let checkpoint_fault_cache = contact_mutable_route_cache(verifier)?;
     let code = drive_receiver_attempt(
         attempt,
         mission,
@@ -848,6 +852,12 @@ pub(super) async fn receive(
                 frames,
                 STREAM_CHECKPOINT_BATCH_BYTES as usize,
             )?;
+            #[cfg(test)]
+            if checkpoint_fault_cache
+                .fire_test_blob_contact_fault(TestBlobContactFault::StreamAfterCheckpoint)
+            {
+                return Err(protocol("injected failure after durable checkpoint"));
+            }
             greatest_checkpoint_latency_ms = greatest_checkpoint_latency_ms
                 .max(u64::try_from(commit_started.elapsed().as_millis()).unwrap_or(u64::MAX));
             writer_commits = writer_commits

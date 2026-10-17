@@ -7878,6 +7878,7 @@ enum TestBlobContactFault {
     CompletedCacheRepairCapabilityLifetimeDiscontinuity = 45,
     CompletedCacheRepairFinalComparisonLifetimeExpiry = 46,
     CompletedCacheRepairFinalComparisonLifetimeDiscontinuity = 47,
+    StreamAfterCheckpoint = 48,
 }
 
 #[cfg(test)]
@@ -22334,6 +22335,31 @@ impl DeferredBlobCursorSettlement {
     }
 }
 
+fn blob_stream_cursor_settlement(
+    store: &Store,
+    peer: NodeId,
+    direction: EventDirection,
+    source: BlobTransferId,
+    deferred: Option<DeferredBlobCursorSettlement>,
+) -> Result<DeferredBlobCursorSettlement, NodeError> {
+    if let Some(deferred) = deferred {
+        if deferred.peer != peer || deferred.direction != direction || deferred.source != source {
+            return Err(NodeError::Protocol(
+                "deferred Blob cursor settlement differs from stream selection".into(),
+            ));
+        }
+        return Ok(deferred);
+    }
+    let expected = store.mutable_transfer_cursor(
+        peer,
+        MutableTransferCursorClass::Blob,
+        mutable_transfer_cursor_mode(direction),
+    )?;
+    Ok(DeferredBlobCursorSettlement::new(
+        peer, direction, expected, source,
+    ))
+}
+
 const fn mutable_lane_fetch_result_exchanges(direction: EventDirection) -> usize {
     match direction {
         EventDirection::ToSessionResponder => 0,
@@ -26057,6 +26083,13 @@ async fn sync_mutable_classes(
                 ));
             }
             if let Some(selection) = to_responder.selection {
+                let settlement = blob_stream_cursor_settlement(
+                    store,
+                    mission.peer().mission_id(),
+                    EventDirection::ToSessionResponder,
+                    selection.source_id,
+                    exchange.to_responder.take(),
+                )?;
                 let outcome = blob_stream::send(
                     store,
                     connection,
@@ -26070,8 +26103,8 @@ async fn sync_mutable_classes(
                 )
                 .await?;
                 receipt.account_blob_stream_attempt(outcome)?;
-            }
-            if let Some(settlement) = exchange.to_responder {
+                settlement.settle(store)?;
+            } else if let Some(settlement) = exchange.to_responder.take() {
                 settlement.settle(store)?;
             }
             let to_initiator = blob_stream::select_receive_plan(
@@ -26095,6 +26128,13 @@ async fn sync_mutable_classes(
                 ));
             }
             if let Some(selection) = to_initiator.selection {
+                let settlement = blob_stream_cursor_settlement(
+                    store,
+                    mission.peer().mission_id(),
+                    EventDirection::ToSessionInitiator,
+                    selection.source_id,
+                    exchange.to_initiator.take(),
+                )?;
                 let outcome = blob_stream::receive(
                     store,
                     connection,
@@ -26108,8 +26148,8 @@ async fn sync_mutable_classes(
                 )
                 .await?;
                 receipt.account_blob_stream_attempt(outcome)?;
-            }
-            if let Some(settlement) = exchange.to_initiator {
+                settlement.settle(store)?;
+            } else if let Some(settlement) = exchange.to_initiator.take() {
                 settlement.settle(store)?;
             }
             return Ok(());
@@ -50416,6 +50456,158 @@ mod tests {
                 .pending_blob_source(source)
                 .unwrap()
                 .is_none()
+        );
+
+        drop(source_store);
+        drop(receiver_store);
+        fs::remove_dir_all(source_root).unwrap();
+        fs::remove_dir_all(receiver_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_blob_stream_v9_reconnects_from_first_durable_checkpoint() {
+        let mut missions = issue_missions(2);
+        let source_mission = missions.pop().unwrap();
+        let receiver_mission = missions.pop().unwrap();
+        let authority = source_mission.credentials.mission_authority_id();
+        let topic = Topic::new("opaque").unwrap();
+        let scope = Scope::new("test/runtime-contact").unwrap();
+        let interests = || {
+            MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
+                topic.clone(),
+                scope.clone(),
+                false,
+            )])
+        };
+        let source_root = root("blob-stream-v9-checkpoint-source");
+        let receiver_root = root("blob-stream-v9-checkpoint-receiver");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::create_dir_all(&receiver_root).unwrap();
+        let source_store =
+            Arc::new(Store::open_for_mission(source_root.join(STORE_FILE), authority).unwrap());
+        let receiver_store =
+            Arc::new(Store::open_for_mission(receiver_root.join(STORE_FILE), authority).unwrap());
+        let source = publish_test_blob(
+            &source_store,
+            &mut open_test_sealer(&source_mission.credentials),
+            &topic,
+            &scope,
+            1,
+            &vec![0x9f; 6 * 1_048_576],
+        );
+        let sealed = source_store
+            .get_blob(source)
+            .unwrap()
+            .expect("checkpoint source")
+            .sealed;
+        let mut source_verifier = open_test_sealer(&source_mission.credentials);
+        let route = source_verifier.verify_blob(&sealed).unwrap();
+        let BlobContentVerification::ContentVerified {
+            blob,
+            manifest_bytes,
+        } = source_verifier.verify_blob_content(route, &sealed).unwrap()
+        else {
+            panic!("checkpoint source lost content access");
+        };
+        let plan = blob.transfer_plan(&manifest_bytes).unwrap();
+        let receiver_policy = receiver_store.control_policy_snapshot().unwrap();
+        let fault = install_test_blob_contact_fault(
+            receiver_mission.credentials.identity(),
+            TestBlobContactFault::StreamAfterCheckpoint,
+        );
+        let source_cache = test_event_route_cache(&source_store, &source_mission.credentials);
+        let receiver_cache = test_event_route_cache(&receiver_store, &receiver_mission.credentials);
+
+        let (first_client, first_server) = TEST_SEMANTIC_VERSION
+            .scope(
+                std::cell::Cell::new(Some(SEMANTIC_PROTOCOL_V9)),
+                blob_contact_test_pair_with_caches_results(
+                    source_store.clone(),
+                    source_mission.credentials.clone(),
+                    interests(),
+                    Arc::clone(&source_cache),
+                    receiver_store.clone(),
+                    receiver_mission.credentials.clone(),
+                    interests(),
+                    Arc::clone(&receiver_cache),
+                    None,
+                    None,
+                    None,
+                    None,
+                    0,
+                ),
+            )
+            .await;
+        assert!(fault.fired.load(Ordering::Acquire));
+        assert!(
+            first_client.is_err() && first_server.is_err(),
+            "checkpoint fault did not terminate both contact halves: client={first_client:?} server={first_server:?}"
+        );
+        assert!(receiver_store.get_blob(source).unwrap().is_none());
+        assert!(
+            receiver_store
+                .pending_blob_source(source)
+                .unwrap()
+                .is_some()
+        );
+        let checkpoint = receiver_store
+            .blob_stream_checkpoint_with_policy(&receiver_policy, source, &plan)
+            .unwrap();
+        assert!(checkpoint.durable_encoded_offset > 0);
+        assert!(checkpoint.durable_encoded_offset < plan.manifest().total_len());
+        assert_eq!(checkpoint.generation, 2);
+        assert_eq!(
+            receiver_store
+                .mutable_transfer_cursor(
+                    source_mission.identity,
+                    MutableTransferCursorClass::Blob,
+                    MutableTransferCursorMode::FetchFromPeer,
+                )
+                .unwrap(),
+            None,
+            "failed stream must not settle its metadata cursor"
+        );
+
+        let (second_client, second_server) = TEST_SEMANTIC_VERSION
+            .scope(
+                std::cell::Cell::new(Some(SEMANTIC_PROTOCOL_V9)),
+                blob_contact_test_pair_with_caches_results(
+                    source_store.clone(),
+                    source_mission.credentials,
+                    interests(),
+                    source_cache,
+                    receiver_store.clone(),
+                    receiver_mission.credentials,
+                    interests(),
+                    receiver_cache,
+                    None,
+                    None,
+                    None,
+                    None,
+                    0,
+                ),
+            )
+            .await;
+        assert!(
+            second_client.is_ok() && second_server.is_ok(),
+            "checkpoint reconnect failed: client={second_client:?} server={second_server:?}"
+        );
+        assert!(receiver_store.get_blob(source).unwrap().is_some());
+        assert!(
+            receiver_store
+                .pending_blob_source(source)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            receiver_store
+                .mutable_transfer_cursor(
+                    source_mission.identity,
+                    MutableTransferCursorClass::Blob,
+                    MutableTransferCursorMode::FetchFromPeer,
+                )
+                .unwrap(),
+            Some(*source.as_bytes())
         );
 
         drop(source_store);

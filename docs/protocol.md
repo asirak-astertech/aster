@@ -1102,8 +1102,12 @@ records replay the same digest-bound result or acknowledgement and never repeat
 promotion. The selected runtime likewise defers the existing per-peer Blob
 metadata cursor CAS for profile 5: a validated mutable source result records a
 contact-local settlement capability, and only successful completion of the
-bound stream result/ack exchange consumes it. Any error before that boundary
-leaves the durable cursor unchanged. Profile-4 cursor timing is unchanged.
+bound stream result/ack exchange consumes it. If a failed attempt leaves the
+metadata inventories equal, the next receiver-authored plan reconstructs the
+same settlement from the current durable cursor and exact selected source; it
+still cannot be consumed before that reconnect's result acknowledgement. Any
+error before that boundary leaves the durable cursor unchanged. Profile-4
+cursor timing is unchanged.
 
 Finite profile-5 work uses `BlobCustodyClaimV2[208]`. Its field widths and age
 semantics are identical to `BlobCustodyClaimV1`, but its fixed header is

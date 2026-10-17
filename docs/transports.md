@@ -498,7 +498,9 @@ descending order:
   checkpoint-latency, writer-commit, and failover-recovery fields. They never
   contain raw paths or peer error text. Profile-5 metadata cursor advancement
   is deferred until the authenticated stream result acknowledgement; a failed
-  attempt leaves that cursor unchanged. Reopen of an already-staged finite
+  attempt leaves that cursor unchanged, and an authenticated metadata-equal
+  reconnect reconstructs the exact deferred settlement from the selected
+  source and current cursor. Reopen of an already-staged finite
   profile-5 source now consumes a fresh custody-v2 prelude, durably merges age,
   binds its digest into `StreamOpen`, and withholds credit until authentication
   succeeds. Initial finite profile-5 metadata is retained only for the current
