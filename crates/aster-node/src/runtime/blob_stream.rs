@@ -575,6 +575,19 @@ pub(super) async fn send(
             open.attempt_nonce,
             &claim,
         )?;
+        #[cfg(test)]
+        let protected_claim = {
+            let mut protected_claim = protected_claim;
+            let cache = contact_mutable_route_cache(verifier)?;
+            if cache.fire_test_blob_contact_fault(TestBlobContactFault::StreamCustodyPreludeTamper)
+            {
+                let last = protected_claim
+                    .last_mut()
+                    .ok_or_else(|| protocol("custody prelude is empty"))?;
+                *last ^= 1;
+            }
+            protected_claim
+        };
         guard.check(store)?;
         let final_sample = contact_custody_sample()?
             .ok_or_else(|| protocol("finite stream finalization lacks a local custody sample"))?;

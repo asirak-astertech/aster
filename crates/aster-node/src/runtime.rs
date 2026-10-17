@@ -7879,6 +7879,7 @@ enum TestBlobContactFault {
     CompletedCacheRepairFinalComparisonLifetimeExpiry = 46,
     CompletedCacheRepairFinalComparisonLifetimeDiscontinuity = 47,
     StreamAfterCheckpoint = 48,
+    StreamCustodyPreludeTamper = 49,
 }
 
 #[cfg(test)]
@@ -50456,6 +50457,99 @@ mod tests {
                 .pending_blob_source(source)
                 .unwrap()
                 .is_none()
+        );
+
+        drop(source_store);
+        drop(receiver_store);
+        fs::remove_dir_all(source_root).unwrap();
+        fs::remove_dir_all(receiver_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_blob_stream_v9_rejects_initial_finite_custody_before_admission() {
+        let mut missions = issue_missions(2);
+        let source_mission = missions.pop().unwrap();
+        let receiver_mission = missions.pop().unwrap();
+        let authority = source_mission.credentials.mission_authority_id();
+        let topic = Topic::new("opaque").unwrap();
+        let scope = Scope::new("test/runtime-contact").unwrap();
+        let interests = || {
+            MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
+                topic.clone(),
+                scope.clone(),
+                false,
+            )])
+        };
+        let source_root = root("blob-stream-v9-finite-reject-source");
+        let receiver_root = root("blob-stream-v9-finite-reject-receiver");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::create_dir_all(&receiver_root).unwrap();
+        let source_store =
+            Arc::new(Store::open_for_mission(source_root.join(STORE_FILE), authority).unwrap());
+        let receiver_store =
+            Arc::new(Store::open_for_mission(receiver_root.join(STORE_FILE), authority).unwrap());
+        let source = publish_test_finite_blob_stream_v9(
+            &source_store,
+            &mut open_test_sealer(&source_mission.credentials),
+            &topic,
+            &scope,
+            1,
+            &vec![0xa7; 2 * 1_048_576],
+            10 * 60 * 1_000,
+            100,
+            CustodySample {
+                clock_id: [0xb1; 16],
+                tick_ms: 0,
+            },
+        );
+        let fault = install_test_blob_contact_fault(
+            source_mission.credentials.identity(),
+            TestBlobContactFault::StreamCustodyPreludeTamper,
+        );
+        let source_cache = test_event_route_cache(&source_store, &source_mission.credentials);
+        let receiver_cache = test_event_route_cache(&receiver_store, &receiver_mission.credentials);
+
+        let (client, server) = TEST_SEMANTIC_VERSION
+            .scope(
+                std::cell::Cell::new(Some(SEMANTIC_PROTOCOL_V9)),
+                blob_contact_test_pair_with_caches_results(
+                    source_store.clone(),
+                    source_mission.credentials,
+                    interests(),
+                    source_cache,
+                    receiver_store.clone(),
+                    receiver_mission.credentials,
+                    interests(),
+                    receiver_cache,
+                    None,
+                    None,
+                    None,
+                    None,
+                    0,
+                ),
+            )
+            .await;
+        assert!(fault.fired.load(Ordering::Acquire));
+        assert!(
+            client.is_err() && server.is_err(),
+            "tampered custody prelude did not terminate both halves: client={client:?} server={server:?}"
+        );
+        assert!(receiver_store.get_blob(source).unwrap().is_none());
+        assert!(
+            receiver_store
+                .pending_blob_source(source)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            receiver_store
+                .mutable_transfer_cursor(
+                    source_mission.identity,
+                    MutableTransferCursorClass::Blob,
+                    MutableTransferCursorMode::FetchFromPeer,
+                )
+                .unwrap(),
+            None
         );
 
         drop(source_store);
