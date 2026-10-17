@@ -35,13 +35,13 @@ use std::error::Error;
 use std::fmt;
 
 use aster_mesh::{
-    AuthenticatedBlobCustodyContactV2, AuthenticatedBlobCustodySendContextV1, BlobCustodyClaimV1,
-    BlobCustodyClaimV2, BlobCustodyDirectionV1, BlobCustodyError, BlobCustodyTransferId, BlobId,
-    BlobRouteCommitment, BlobStore as CoreBlobStore, ContentVerifiedBlobEnvelope,
-    CurrentBlobLineage, MAX_BLOB_CHUNK_SIZE, MAX_BLOB_CHUNKS, MAX_BLOB_MANIFEST_BYTES,
-    MAX_BLOB_MEDIA_TYPE_BYTES, MAX_BLOB_SCHEMA_ID_BYTES,
-    SELECTED_BLOB_CHUNK_SIZE as CORE_SELECTED_BLOB_CHUNK_SIZE, VerifiedBlobContentCompletion,
-    VerifiedBlobCustodyClaimV1, VerifiedBlobTransferPlan,
+    AuthenticatedBlobCustodyContactV2, AuthenticatedBlobCustodySendContextV1,
+    AuthenticatedBlobCustodySendContextV2, BlobCustodyClaimV1, BlobCustodyClaimV2,
+    BlobCustodyDirectionV1, BlobCustodyError, BlobCustodyTransferId, BlobId, BlobRouteCommitment,
+    BlobStore as CoreBlobStore, ContentVerifiedBlobEnvelope, CurrentBlobLineage,
+    MAX_BLOB_CHUNK_SIZE, MAX_BLOB_CHUNKS, MAX_BLOB_MANIFEST_BYTES, MAX_BLOB_MEDIA_TYPE_BYTES,
+    MAX_BLOB_SCHEMA_ID_BYTES, SELECTED_BLOB_CHUNK_SIZE as CORE_SELECTED_BLOB_CHUNK_SIZE,
+    VerifiedBlobContentCompletion, VerifiedBlobCustodyClaimV1, VerifiedBlobTransferPlan,
 };
 use redb::{ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle};
 
@@ -1677,6 +1677,7 @@ struct VerifiedFiniteBlobAdmission {
 #[derive(Debug)]
 pub struct VerifiedBlobCustodySend {
     context: BlobCustodySendContextFields,
+    v2_authority: Option<AuthenticatedBlobCustodySendContextV2>,
     source_transfer_id: BlobCustodyTransferId,
     source_len: u64,
     publication_id: [u8; 32],
@@ -1713,6 +1714,20 @@ impl From<AuthenticatedBlobCustodySendContextV1> for BlobCustodySendContextField
     }
 }
 
+impl From<&AuthenticatedBlobCustodySendContextV2> for BlobCustodySendContextFields {
+    fn from(context: &AuthenticatedBlobCustodySendContextV2) -> Self {
+        let record = context.context();
+        Self {
+            semantic_version: record.semantic_version(),
+            profile_id: record.profile(),
+            session_transcript: context.session_transcript(),
+            exchange_id: context.exchange_id(),
+            direction: record.direction(),
+            finalization_charge_ms: context.finalization_charge_ms(),
+        }
+    }
+}
+
 /// One-use final carrier check for an already sealed finite Blob source frame.
 ///
 /// This retains the exact Store checkpoint and authenticated conservative age
@@ -1737,6 +1752,7 @@ impl VerifiedBlobCustodySend {
     ) -> Result<(BlobCustodyClaimV1, PreparedBlobCustodySend), BlobCustodyError> {
         let Self {
             context,
+            v2_authority,
             source_transfer_id,
             source_len,
             publication_id,
@@ -1749,6 +1765,9 @@ impl VerifiedBlobCustodySend {
             projection,
             retention,
         } = self;
+        if v2_authority.is_some() {
+            return Err(BlobCustodyError::ContextMismatch);
+        }
         let claim = BlobCustodyClaimV1::from_authenticated_source(
             context.session_transcript,
             context.exchange_id,
@@ -1759,6 +1778,58 @@ impl VerifiedBlobCustodySend {
             prior_cumulative_age_ms,
             sender_sample,
             context.finalization_charge_ms,
+        )?;
+        if claim.source_len() != source_len
+            || claim.publication_id() != publication_id
+            || claim.blob_id() != blob_id
+            || claim.priority() != priority
+            || claim.ttl_ms() != ttl_ms
+            || claim.forwarding_age_ms() != authenticated_age_ms
+        {
+            return Err(BlobCustodyError::ContextMismatch);
+        }
+        Ok((
+            claim,
+            PreparedBlobCustodySend {
+                context,
+                checkpoint_sample: sender_sample,
+                authenticated_age_ms,
+                projection,
+                retention,
+            },
+        ))
+    }
+
+    /// Consumes one semantic-v9/profile-5 Store authorization to construct
+    /// the exact custody-v2 claim bound to its authenticated record context.
+    pub fn into_claim_v2(
+        self,
+        source: &ContentVerifiedBlobEnvelope,
+        exact_source_bytes: &[u8],
+    ) -> Result<(BlobCustodyClaimV2, PreparedBlobCustodySend), BlobCustodyError> {
+        let Self {
+            context,
+            v2_authority,
+            source_transfer_id,
+            source_len,
+            publication_id,
+            blob_id,
+            priority,
+            ttl_ms,
+            prior_cumulative_age_ms,
+            sender_sample,
+            authenticated_age_ms,
+            projection,
+            retention,
+        } = self;
+        let authority = v2_authority.ok_or(BlobCustodyError::ContextMismatch)?;
+        let claim = BlobCustodyClaimV2::from_authenticated_source(
+            authority,
+            source_transfer_id,
+            source,
+            exact_source_bytes,
+            prior_cumulative_age_ms,
+            sender_sample,
         )?;
         if claim.source_len() != source_len
             || claim.publication_id() != publication_id
@@ -4742,6 +4813,38 @@ impl Store {
         )
     }
 
+    /// Transactionally authorizes one finite semantic-v9/profile-5 source
+    /// emission. The returned capability owns the exact non-clone custody-v2
+    /// record authority and can therefore construct at most one claim.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn authorize_finite_blob_stream_v9_send_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        projection: &BlobSourceProjection,
+        retention: BlobSourceRetention,
+        blob: &ContentVerifiedBlobEnvelope,
+        sealed: &[u8],
+        context: AuthenticatedBlobCustodySendContextV2,
+        sender_sample: aster_mesh::CustodySample,
+    ) -> Result<Option<VerifiedBlobCustodySend>, StoreError> {
+        let fields = BlobCustodySendContextFields::from(&context);
+        let Some(mut authorized) = self.authorize_finite_blob_send_fields(
+            policy,
+            projection,
+            retention,
+            blob,
+            sealed,
+            fields,
+            sender_sample,
+        )?
+        else {
+            return Ok(None);
+        };
+        authorized.v2_authority = Some(context);
+        Ok(Some(authorized))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn authorize_finite_blob_send_fields(
         &self,
@@ -4755,10 +4858,16 @@ impl Store {
     ) -> Result<Option<VerifiedBlobCustodySend>, StoreError> {
         self.require_live()?;
         let authority = self.require_bound_mission()?;
-        if context.semantic_version != 8
-            || context.profile_id != aster_mesh::TransferProfileId::BlobRangesStreamV1 as u16
-            || context.finalization_charge_ms == 0
-        {
+        let eligibility = match (context.semantic_version, context.profile_id) {
+            (8, profile) if profile == aster_mesh::TransferProfileId::BlobRangesStreamV1 as u16 => {
+                BlobContactEligibility::CustodyV1
+            }
+            (9, profile) if profile == aster_mesh::TransferProfileId::BlobStreamV1 as u16 => {
+                BlobContactEligibility::CustodyV2
+            }
+            _ => return Err(blob_error(BlobStoreError::PendingSourceConflict)),
+        };
+        if context.finalization_charge_ms == 0 {
             return Err(blob_error(BlobStoreError::PendingSourceConflict));
         }
         blob.verify_exact_sealed(sealed)
@@ -4829,23 +4938,13 @@ impl Store {
             return Ok(None);
         }
         enforce_blob_policy_write(&write, authority, policy, &metadata.header)?;
-        let BlobLifetime::Finite {
-            ttl_ms, provenance, ..
-        } = metadata.lifetime
-        else {
+        let BlobLifetime::Finite { ttl_ms, .. } = metadata.lifetime else {
             return Err(blob_error(BlobStoreError::InvalidPublication(
                 "durable Blob cannot mint finite custody authority",
             )));
         };
-        match provenance {
-            BlobFiniteProvenance::Local => {}
-            BlobFiniteProvenance::NetworkV1 {
-                semantic_version: 8,
-                profile_id,
-            } if profile_id == aster_mesh::TransferProfileId::BlobRangesStreamV1 as u16 => {}
-            BlobFiniteProvenance::NetworkV1 { .. } => {
-                return Err(blob_error(BlobStoreError::PendingSourceConflict));
-            }
+        if !eligibility.admits(metadata.lifetime) {
+            return Err(blob_error(BlobStoreError::PendingSourceConflict));
         }
         let physical_lineage = metadata
             .physical_lineage
@@ -4948,6 +5047,7 @@ impl Store {
         }
         let send = VerifiedBlobCustodySend {
             context,
+            v2_authority: None,
             source_transfer_id: BlobCustodyTransferId::from_exact_hash(blob.envelope_id()),
             source_len: sealed_len,
             publication_id: blob.item_id(),
@@ -18852,7 +18952,8 @@ mod tests {
     use aster_mesh::{
         BlobContentVerification, BlobMetadata as CoreBlobMetadata, BlobStore as CoreBlobStore,
         CustodySample, EventContentVerification, FinishedBlob, ProvisioningAccess,
-        ReferenceEnvelopeSealer, ReferenceProvisioner, ScopeRekeyRecipient, prepare_blob,
+        ReferenceEnvelopeSealer, ReferenceProvisioner, ReferenceSessionInitiator,
+        ReferenceSessionResponder, ScopeRekeyRecipient, TransferProfileOfferV1, prepare_blob,
     };
 
     use super::*;
@@ -19957,6 +20058,151 @@ mod tests {
                 .expect("reject discontinuous finite send")
                 .is_none(),
             "continuity loss must suppress finite emission"
+        );
+    }
+
+    #[test]
+    fn finite_stream_v9_send_authority_constructs_exact_claim_and_rechecks_age() {
+        let source_root = BlobTestRoot::new("finite-stream-v9-send-source");
+        let target_root = BlobTestRoot::new("finite-stream-v9-send-target");
+        let mut services = blob_services(0x69);
+        let source = Store::open_for_mission(&source_root.database, services.authority)
+            .expect("finite stream v9 source store");
+        let target = Store::open_for_mission(&target_root.database, services.authority)
+            .expect("finite stream v9 target store");
+        let plaintext = b"finite stream v9 send authorization preserves exact age".to_vec();
+        let prepared = prepared_blob(&plaintext);
+        let proof = prepare_blob_proof_with_lifetime(
+            &source,
+            &mut services,
+            &prepared,
+            &plaintext,
+            1,
+            Priority::Immediate,
+            Some(5_000),
+        );
+        let plan = proof
+            .blob
+            .transfer_plan(&proof.manifest_bytes)
+            .expect("finite stream v9 plan");
+        let transfer = BlobTransferId::new(proof.blob.envelope_id());
+        let policy = target
+            .control_policy_snapshot()
+            .expect("finite stream v9 target policy");
+        let admitted = CustodySample {
+            clock_id: [0x6a; 16],
+            tick_ms: 20_000,
+        };
+        target
+            .test_stage_finite_blob_source_with_network_provenance_for_policy(
+                &policy,
+                &proof.blob,
+                &proof.sealed,
+                &plan,
+                900,
+                admitted,
+                9,
+                aster_mesh::TransferProfileId::BlobStreamV1 as u16,
+            )
+            .expect("stage finite stream v9 source");
+        let retained = target
+            .custody_v2_blob_source_projection(transfer)
+            .expect("finite stream v9 projection")
+            .expect("finite stream v9 retained source");
+
+        let access = ProvisioningAccess::member(blob_scope(), vec![1, 2, 3], vec![blob_topic()])
+            .expect("finite stream v9 session access");
+        let initiator_bundle = services
+            .provisioner
+            .issue_node(71, std::slice::from_ref(&access))
+            .expect("finite stream v9 initiator bundle");
+        let responder_bundle = services
+            .provisioner
+            .issue_node(72, &[access])
+            .expect("finite stream v9 responder bundle");
+        let (initiator, first) =
+            ReferenceSessionInitiator::start(initiator_bundle).expect("start v9 session");
+        let responder =
+            ReferenceSessionResponder::open(responder_bundle).expect("open v9 responder");
+        let (responder, second) = responder
+            .receive_client(&first)
+            .expect("receive v9 client flight");
+        let (initiator, third) = initiator
+            .receive_server(&second)
+            .expect("receive v9 server flight");
+        let (mut responder, fourth) = responder
+            .receive_client_auth(&third)
+            .expect("receive v9 client authentication");
+        let mut initiator = initiator
+            .receive_finished(&fourth)
+            .expect("receive v9 server finished");
+        let offer = TransferProfileOfferV1::for_semantic_version(9).expect("v9 profile offer");
+        let initiator_offer = initiator
+            .seal_transfer_profile_offer(&offer)
+            .expect("seal initiator v9 offer");
+        responder
+            .open_transfer_profile_offer(&initiator_offer)
+            .expect("open initiator v9 offer");
+        let responder_offer = responder
+            .seal_transfer_profile_offer(&offer)
+            .expect("seal responder v9 offer");
+        initiator
+            .open_transfer_profile_offer(&responder_offer)
+            .expect("open responder v9 offer");
+        let attempt_nonce = [0x6b; 32];
+        let context = initiator
+            .mint_blob_custody_send_context_v2(
+                BlobCustodyDirectionV1::ToSessionResponder,
+                17,
+                attempt_nonce,
+                40,
+            )
+            .expect("mint finite stream v9 send context");
+
+        let authorized = target
+            .authorize_finite_blob_stream_v9_send_with_policy(
+                &policy,
+                &retained.source,
+                retained.retention,
+                &proof.blob,
+                &proof.sealed,
+                context,
+                CustodySample {
+                    clock_id: admitted.clock_id,
+                    tick_ms: 20_125,
+                },
+            )
+            .expect("authorize finite stream v9 send")
+            .expect("live finite stream v9 authority");
+        let (claim, prepared_send) = authorized
+            .into_claim_v2(&proof.blob, &proof.sealed)
+            .expect("construct finite stream v9 claim");
+        assert_eq!(claim.session_transcript(), initiator.session_id());
+        assert_eq!(claim.exchange_id(), 17);
+        assert_eq!(
+            claim.direction(),
+            BlobCustodyDirectionV1::ToSessionResponder
+        );
+        assert_eq!(
+            claim.source_transfer_id().as_bytes(),
+            &proof.blob.envelope_id()
+        );
+        assert_eq!(claim.prior_cumulative_age_ms(), 1_025);
+        assert_eq!(claim.hop_delta_ms(), 40);
+        assert_eq!(claim.forwarding_age_ms(), 1_065);
+        assert!(
+            target
+                .finalize_finite_blob_send_with_policy(
+                    &policy,
+                    prepared_send,
+                    &proof.blob,
+                    &proof.sealed,
+                    CustodySample {
+                        clock_id: admitted.clock_id,
+                        tick_ms: 20_150,
+                    },
+                )
+                .expect("finalize finite stream v9 send")
         );
     }
 
