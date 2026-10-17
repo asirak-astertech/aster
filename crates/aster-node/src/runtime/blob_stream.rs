@@ -30,12 +30,13 @@ use sha2::{Digest as _, Sha256};
 use std::{sync::Arc, time::Duration};
 
 use super::{
-    BlobContactMode, BlobStreamTransport, CompletedBlobStreamSource, EventDirection,
-    EventLaneGuard, MutableApplyDisposition, NodeError, PendingBlobRecoveryDisposition,
-    ReferenceEnvelopeSealer, abort_pending_blob_with_cached_claim,
+    AuthenticatedBlobRouteClaim, BlobContactMode, BlobStreamTransport, CompletedBlobStreamSource,
+    EventDirection, EventLaneGuard, MutableApplyDisposition, NodeError,
+    PendingBlobRecoveryDisposition, ReferenceEnvelopeSealer, abort_pending_blob_with_cached_claim,
+    contact_custody_sample, contact_mutable_route_cache, custody_finalization_charge_ms,
     load_completed_blob_stream_source, load_pending_blob_plan,
     next_pending_blob_source_for_contact, pending_blob_claim_is_current,
-    recover_and_finalize_pending_blob,
+    recover_and_finalize_pending_blob, require_contact_policy_current,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -90,6 +91,19 @@ fn result_digest(
     digest.update(manifest_digest);
     digest.update([code as u8]);
     digest.finalize().into()
+}
+
+fn require_stream_open_custody_digest(
+    expected: Option<[u8; 32]>,
+    received: Option<[u8; 32]>,
+) -> Result<(), NodeError> {
+    if expected == received {
+        Ok(())
+    } else {
+        Err(protocol(
+            "stream open custody digest differs from authenticated prelude",
+        ))
+    }
 }
 
 fn exchange_id(session: [u8; 32], direction: EventDirection, source: BlobTransferId) -> u64 {
@@ -386,16 +400,11 @@ pub(super) fn select_receive_plan(
             selection: None,
         });
     }
-    let Some((blob, _, plan)) =
+    let Some((_blob, _, plan)) =
         load_pending_blob_plan(store, verifier, source, BlobContactMode::StreamV1)?
     else {
         return Err(protocol("selected pending source became unavailable"));
     };
-    if blob.ttl_ms().is_some() {
-        return Err(protocol(
-            "finite pending source requires authenticated custody-v2 stream authority",
-        ));
-    }
     let layout = BlobStreamLayout::from_plan(&plan).map_err(protocol)?;
     let checkpoint = store.blob_stream_checkpoint_with_policy(guard.policy(), source, &plan)?;
     if !layout.contains_checkpoint(
@@ -428,11 +437,6 @@ fn load_authorized_send_source(
     guard.check(store)?;
     let loaded = load_completed_blob_stream_source(store, verifier, selection.source_id)?
         .ok_or_else(|| protocol("selected completed source is unavailable"))?;
-    if loaded.blob.ttl_ms().is_some() {
-        return Err(protocol(
-            "finite source requires authenticated custody-v2 stream authority",
-        ));
-    }
     let layout = BlobStreamLayout::from_plan(&loaded.plan).map_err(protocol)?;
     if !layout.contains_checkpoint(selection.next_carrier_index, selection.durable_offset) {
         return Err(protocol(
@@ -491,7 +495,7 @@ pub(super) async fn send(
     let source = selection.source_id;
     let (loaded, layout) =
         load_authorized_send_source(store, mission, verifier, guard, selection, peer_interest)?;
-    let open = stream_open(
+    let mut open = stream_open(
         mission,
         direction,
         source,
@@ -507,6 +511,60 @@ pub(super) async fn send(
         )?)
         .await
         .map_err(transport)?;
+    if loaded.blob.ttl_ms().is_some() {
+        let sample = contact_custody_sample()?
+            .ok_or_else(|| protocol("finite stream send lacks a local custody sample"))?;
+        let exact_len = u64::try_from(loaded.sealed.len())
+            .map_err(|_| protocol("finite stream source length exceeds u64"))?;
+        let finalization_charge_ms = custody_finalization_charge_ms(exact_len)?;
+        let context = mission.mint_blob_custody_send_context_v2(
+            direction,
+            open.exchange_id,
+            open.attempt_nonce,
+            finalization_charge_ms,
+        )?;
+        let Some(authorized) = store.authorize_finite_blob_stream_v9_send_with_policy(
+            guard.policy(),
+            &loaded.projection,
+            loaded.retention,
+            &loaded.blob,
+            &loaded.sealed,
+            context,
+            sample,
+        )?
+        else {
+            return Err(NodeError::CustodySendSkipped);
+        };
+        let (claim, prepared) = authorized
+            .into_claim_v2(&loaded.blob, &loaded.sealed)
+            .map_err(|error| {
+                protocol(format_args!("invalid outbound custody-v2 claim: {error}"))
+            })?;
+        open.custody_digest = Some(claim.digest());
+        let protected_claim = mission.seal_blob_custody_frame_v2(
+            profile_digest,
+            direction,
+            open.attempt_nonce,
+            &claim,
+        )?;
+        guard.check(store)?;
+        let final_sample = contact_custody_sample()?
+            .ok_or_else(|| protocol("finite stream finalization lacks a local custody sample"))?;
+        if !store.finalize_finite_blob_send_with_policy(
+            guard.policy(),
+            prepared,
+            &loaded.blob,
+            &loaded.sealed,
+            final_sample,
+        )? {
+            return Err(NodeError::CustodySendSkipped);
+        }
+        require_contact_policy_current()?;
+        attempt
+            .send_data(&protected_claim)
+            .await
+            .map_err(transport)?;
+    }
     let policy = guard.policy().clone();
     let completion = loaded.completion.clone();
     let plan = &loaded.plan;
@@ -574,11 +632,7 @@ pub(super) async fn receive(
     let (blob, manifest_bytes, plan) =
         load_pending_blob_plan(store, verifier, source, BlobContactMode::StreamV1)?
             .ok_or_else(|| protocol("selected pending source is unavailable"))?;
-    if blob.ttl_ms().is_some() {
-        return Err(protocol(
-            "finite pending source requires authenticated custody-v2 stream authority",
-        ));
-    }
+    let finite = blob.ttl_ms().is_some();
     let layout = BlobStreamLayout::from_plan(&plan).map_err(protocol)?;
     let checkpoint = store.blob_stream_checkpoint_with_policy(guard.policy(), source, &plan)?;
     if checkpoint.next_carrier_index != selection.next_carrier_index
@@ -610,6 +664,63 @@ pub(super) async fn receive(
         )?)
         .await
         .map_err(transport)?;
+    let expected_custody_digest = if finite {
+        let sealed = store
+            .custody_v2_pending_blob_source(source)?
+            .ok_or_else(|| protocol("finite pending source became unavailable before custody"))?
+            .sealed;
+        let protected_claim = attempt
+            .receive_data()
+            .await
+            .map_err(transport)?
+            .ok_or_else(|| protocol("data stream closed before finite custody prelude"))?;
+        let (claim, contact) = mission.open_blob_custody_frame_v2(
+            profile_digest,
+            direction,
+            nonce,
+            &protected_claim,
+        )?;
+        if claim.session_transcript() != mission.session_id()
+            || claim.exchange_id() != exchange_id(mission.session_id(), direction, source)
+            || claim.source_transfer_id().as_bytes() != source.as_bytes()
+        {
+            return Err(protocol(
+                "finite custody prelude differs from planned transfer",
+            ));
+        }
+        let digest = claim.digest();
+        let cache = contact_mutable_route_cache(verifier)?;
+        let _lifecycle = cache.lock_blob_lifecycle()?;
+        store.upgrade_pending_blob_to_stream_v9(
+            guard.policy(),
+            source,
+            &blob,
+            &sealed,
+            &plan,
+            Some((claim, contact)),
+        )?;
+        let retained = store
+            .custody_v2_blob_source_projection(source)?
+            .ok_or_else(|| protocol("finite source disappeared after custody age merge"))?;
+        if retained.retention != aster_redb_store::BlobSourceRetention::Pending {
+            return Err(protocol(
+                "finite custody age merge changed source retention",
+            ));
+        }
+        let refreshed = AuthenticatedBlobRouteClaim::from_verified_for_contact(
+            store,
+            &blob,
+            &sealed,
+            &retained.source,
+            retained.retention,
+            None,
+            BlobContactMode::StreamV1,
+        )?;
+        cache.insert_blob(verifier, refreshed)?;
+        Some(digest)
+    } else {
+        None
+    };
     let policy = guard.policy().clone();
     let commit_plan = &plan;
     let promote_plan = &plan;
@@ -630,6 +741,7 @@ pub(super) async fn receive(
         *source.as_bytes(),
         checkpoint.durable_encoded_offset,
         checkpoint.generation,
+        expected_custody_digest,
         receive_limit,
         MAX_STREAM_EXTENT_BYTES as u32,
         STREAM_CHECKPOINT_BATCH_BYTES,
@@ -769,6 +881,7 @@ pub(super) async fn drive_receiver_attempt<P, M>(
     expected_transfer: [u8; 32],
     durable_offset: u64,
     checkpoint_generation: u64,
+    expected_custody_digest: Option<[u8; 32]>,
     absolute_receive_limit: u64,
     max_extent_bytes: u32,
     checkpoint_batch_bytes: u32,
@@ -809,6 +922,7 @@ where
     {
         return Err(protocol("open authority differs from expected transfer"));
     }
+    require_stream_open_custody_digest(expected_custody_digest, open.custody_digest)?;
     let mut state = StreamReceiverState::new(
         &open,
         durable_offset,
@@ -1057,6 +1171,16 @@ impl BlobStreamProgress {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_blob_stream_v9_open_requires_exact_finite_custody_digest() {
+        let exact = [0x61; 32];
+        assert!(require_stream_open_custody_digest(None, None).is_ok());
+        assert!(require_stream_open_custody_digest(Some(exact), Some(exact)).is_ok());
+        assert!(require_stream_open_custody_digest(Some(exact), None).is_err());
+        assert!(require_stream_open_custody_digest(None, Some(exact)).is_err());
+        assert!(require_stream_open_custody_digest(Some(exact), Some([0x62; 32])).is_err());
+    }
 
     #[test]
     fn live_blob_stream_v9_attempt_nonce_binds_session_direction_transfer_and_checkpoint() {

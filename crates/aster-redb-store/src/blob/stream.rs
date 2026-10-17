@@ -215,6 +215,48 @@ impl Store {
         )
     }
 
+    /// Test-only semantic-v9 finite staging seam. Runtime callers must use
+    /// [`Self::stage_verified_finite_blob_stream_v9_with_policy`] with an
+    /// authenticated custody-v2 contact.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn test_stage_verified_finite_blob_stream_v9_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        blob: &ContentVerifiedBlobEnvelope,
+        sealed: &[u8],
+        plan: &VerifiedBlobTransferPlan,
+        forwarding_age_ms: u64,
+        receiver_sample: aster_mesh::CustodySample,
+    ) -> Result<BlobSourceStageOutcome, StoreError> {
+        let ttl_ms = blob.ttl_ms().ok_or_else(|| {
+            blob_error(BlobStoreError::InvalidPublication(
+                "finite Blob stream fixture is missing its signed TTL",
+            ))
+        })?;
+        let admission = VerifiedFiniteBlobAdmission::for_test_with_network_provenance(
+            blob.envelope_id(),
+            u64::try_from(sealed.len()).map_err(|_| StoreError::PayloadByteAccountingOverflow)?,
+            blob.item_id(),
+            blob.blob_id(),
+            blob.priority(),
+            ttl_ms,
+            forwarding_age_ms,
+            receiver_sample,
+            9,
+            aster_mesh::TransferProfileId::BlobStreamV1 as u16,
+        );
+        self.stage_verified_blob_source_with_lifetime_and_profile(
+            policy,
+            blob,
+            sealed,
+            plan,
+            Some(admission),
+            BlobNetworkAdmissionProfile::StreamV1,
+        )
+    }
+
     /// Atomically upgrades an exact profile-4 pending source to semantic-v9
     /// profile-5 authority. Finite work must carry a freshly authenticated,
     /// non-younger v2 claim; durable work carries no synthetic TTL authority.

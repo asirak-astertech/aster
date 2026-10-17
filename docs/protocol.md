@@ -1114,6 +1114,16 @@ binds the session transcript and exact claim digest under
 non-clone, exact-context values; decoding raw claim bytes grants no Store
 authority. Semantic-v8 claim bytes and domains remain unchanged.
 
+A finite profile-5 attempt carries exactly one custody-v2 protected record as
+the first record on the attempt data half, immediately before `StreamOpenV1`.
+The receiver authenticates that record in the same v9 Blob context and attempt
+nonce, requires its session, direction, exchange, and source transfer to match
+the receiver-authored plan, and durably merges its non-younger age before
+opening the stream. The following `StreamOpenV1.custody_digest` MUST equal the
+authenticated claim digest. Durable attempts carry no custody prelude and MUST
+set no custody digest. The receiver MUST NOT emit `StreamAcceptV1`, credit, or
+any other control record before these checks and the age merge succeed.
+
 For each admitted Blob direction, profile 4 sends one protected `ABRS || 0x01`
 schedule containing at most 64 canonical `BlobRangeFetchV5` tuples and receives
 the exact domain-separated schedule hash as acceptance. The role-ordered

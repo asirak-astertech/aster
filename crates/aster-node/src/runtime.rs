@@ -8552,7 +8552,12 @@ impl AuthenticatedEventRouteCache {
                         // exact retained bytes and immutable projection, so
                         // advance this cache proof without treating a normal
                         // custody checkpoint as source corruption.
+                        let projection_changed =
+                            existing.metadata_fingerprint != claim.metadata_fingerprint;
                         existing.metadata_fingerprint = claim.metadata_fingerprint;
+                        if projection_changed {
+                            inner.pending_blob_completions.remove(&claim.transfer_id);
+                        }
                         Ok(())
                     }
                 }
@@ -23640,6 +23645,9 @@ struct CompletedBlobStreamSource {
     blob: ContentVerifiedBlobEnvelope,
     plan: VerifiedBlobTransferPlan,
     completion: BlobDepotCompletion,
+    projection: BlobSourceProjection,
+    retention: BlobSourceRetention,
+    sealed: Vec<u8>,
 }
 
 fn load_completed_blob_stream_source(
@@ -23725,6 +23733,9 @@ fn load_completed_blob_stream_source(
         blob,
         plan,
         completion,
+        projection: retained.source,
+        retention,
+        sealed,
     }))
 }
 
@@ -47222,6 +47233,65 @@ mod tests {
         forwarding_age_ms: u64,
         sample: CustodySample,
     ) -> BlobTransferId {
+        publish_test_finite_blob_with_profile(
+            store,
+            sealer,
+            topic,
+            scope,
+            epoch,
+            plaintext,
+            ttl_ms,
+            forwarding_age_ms,
+            sample,
+            false,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "finite Blob fixture keeps authenticated lifetime inputs explicit"
+    )]
+    fn publish_test_finite_blob_stream_v9(
+        store: &Store,
+        sealer: &mut ReferenceEnvelopeSealer,
+        topic: &Topic,
+        scope: &Scope,
+        epoch: u64,
+        plaintext: &[u8],
+        ttl_ms: u64,
+        forwarding_age_ms: u64,
+        sample: CustodySample,
+    ) -> BlobTransferId {
+        publish_test_finite_blob_with_profile(
+            store,
+            sealer,
+            topic,
+            scope,
+            epoch,
+            plaintext,
+            ttl_ms,
+            forwarding_age_ms,
+            sample,
+            true,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "finite Blob fixture keeps authenticated lifetime inputs explicit"
+    )]
+    fn publish_test_finite_blob_with_profile(
+        store: &Store,
+        sealer: &mut ReferenceEnvelopeSealer,
+        topic: &Topic,
+        scope: &Scope,
+        epoch: u64,
+        plaintext: &[u8],
+        ttl_ms: u64,
+        forwarding_age_ms: u64,
+        sample: CustodySample,
+        stream_v9: bool,
+    ) -> BlobTransferId {
         let prepared = aster_mesh::prepare_blob(
             &mut std::io::Cursor::new(plaintext),
             aster_mesh::SELECTED_BLOB_CHUNK_SIZE,
@@ -47280,28 +47350,47 @@ mod tests {
         let plan = blob
             .transfer_plan(&manifest_bytes)
             .expect("finite Blob transfer plan");
+        let stage = if stream_v9 {
+            store.test_stage_verified_finite_blob_stream_v9_with_policy(
+                &policy,
+                &blob,
+                &sealed.bytes,
+                &plan,
+                forwarding_age_ms,
+                sample,
+            )
+        } else {
+            store.test_stage_verified_finite_blob_source_with_policy(
+                &policy,
+                &blob,
+                &sealed.bytes,
+                &plan,
+                forwarding_age_ms,
+                sample,
+            )
+        };
         assert_eq!(
-            store
-                .test_stage_verified_finite_blob_source_with_policy(
-                    &policy,
-                    &blob,
-                    &sealed.bytes,
-                    &plan,
-                    forwarding_age_ms,
-                    sample,
-                )
-                .expect("stage finite Blob source"),
+            stage.expect("stage finite Blob source"),
             BlobSourceStageOutcome::Inserted
         );
-        let completion = store
-            .completed_pending_blob_with_policy(
+        let completion = if stream_v9 {
+            store.completed_pending_blob_stream_v9_with_policy(
                 &policy,
                 BlobTransferId::new(blob.envelope_id()),
                 &blob,
                 &manifest_bytes,
                 &plan,
             )
-            .expect("complete finite Blob source");
+        } else {
+            store.completed_pending_blob_with_policy(
+                &policy,
+                BlobTransferId::new(blob.envelope_id()),
+                &blob,
+                &manifest_bytes,
+                &plan,
+            )
+        }
+        .expect("complete finite Blob source");
         let content = {
             let depot = store
                 .blob_depot_for_authenticated_read(&completion)
@@ -47316,9 +47405,18 @@ mod tests {
         let lineage = sealer
             .verify_current_blob_lineage(&blob)
             .expect("finite Blob current lineage");
-        store
-            .apply_verified_blob_with_policy(&policy, &plan, &lineage, &completion, &content)
-            .expect("promote finite Blob source");
+        if stream_v9 {
+            store.apply_verified_blob_stream_v9_with_policy(
+                &policy,
+                &plan,
+                &lineage,
+                &completion,
+                &content,
+            )
+        } else {
+            store.apply_verified_blob_with_policy(&policy, &plan, &lineage, &completion, &content)
+        }
+        .expect("promote finite Blob source");
         BlobTransferId::new(blob.envelope_id())
     }
 
@@ -48765,10 +48863,19 @@ mod tests {
         let _lifecycle = cache
             .lock_blob_lifecycle()
             .expect("pending v9 test Blob lifecycle lock");
+        let stage = if blob.ttl_ms().is_some() {
+            let sample = CustodySample {
+                clock_id: BLOB_CONTACT_TEST_CLIENT_CLOCK_ID,
+                tick_ms: 0,
+            };
+            store.test_stage_verified_finite_blob_stream_v9_with_policy(
+                &policy, &blob, sealed, &plan, 100, sample,
+            )
+        } else {
+            store.stage_verified_durable_blob_stream_v9_with_policy(&policy, &blob, sealed, &plan)
+        };
         assert!(matches!(
-            store
-                .stage_verified_durable_blob_stream_v9_with_policy(&policy, &blob, sealed, &plan,)
-                .expect("stage pending v9 test Blob"),
+            stage.expect("stage pending v9 test Blob"),
             BlobSourceStageOutcome::Inserted | BlobSourceStageOutcome::Duplicate
         ));
         let projection = store
@@ -50046,6 +50153,99 @@ mod tests {
         assert!(
             receiver_store.get_blob(source).unwrap().is_some(),
             "pre-existing pending source was not selected and promoted"
+        );
+        assert!(
+            receiver_store
+                .pending_blob_source(source)
+                .unwrap()
+                .is_none()
+        );
+
+        drop(source_store);
+        drop(receiver_store);
+        fs::remove_dir_all(source_root).unwrap();
+        fs::remove_dir_all(receiver_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_blob_stream_v9_reauthenticates_finite_pending_source_before_credit() {
+        let mut missions = issue_missions(2);
+        let source_mission = missions.pop().unwrap();
+        let receiver_mission = missions.pop().unwrap();
+        let authority = source_mission.credentials.mission_authority_id();
+        let topic = Topic::new("opaque").unwrap();
+        let scope = Scope::new("test/runtime-contact").unwrap();
+        let interests = || {
+            MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
+                topic.clone(),
+                scope.clone(),
+                false,
+            )])
+        };
+        let source_root = root("blob-stream-v9-finite-source");
+        let receiver_root = root("blob-stream-v9-finite-receiver");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::create_dir_all(&receiver_root).unwrap();
+        let source_store =
+            Arc::new(Store::open_for_mission(source_root.join(STORE_FILE), authority).unwrap());
+        let receiver_store =
+            Arc::new(Store::open_for_mission(receiver_root.join(STORE_FILE), authority).unwrap());
+        let source = publish_test_finite_blob_stream_v9(
+            &source_store,
+            &mut open_test_sealer(&source_mission.credentials),
+            &topic,
+            &scope,
+            1,
+            &vec![0x7d; 2 * 1_048_576],
+            10 * 60 * 1_000,
+            100,
+            CustodySample {
+                clock_id: [0xb1; 16],
+                tick_ms: 0,
+            },
+        );
+        let sealed = source_store
+            .get_blob(source)
+            .unwrap()
+            .expect("completed finite profile-5 source")
+            .sealed;
+        let source_cache = test_event_route_cache(&source_store, &source_mission.credentials);
+        let receiver_cache = test_event_route_cache(&receiver_store, &receiver_mission.credentials);
+        stage_test_pending_blob_stream_v9(
+            &receiver_store,
+            &receiver_cache,
+            &receiver_mission.credentials,
+            source,
+            &sealed,
+        );
+
+        let (client, server) = TEST_SEMANTIC_VERSION
+            .scope(
+                std::cell::Cell::new(Some(SEMANTIC_PROTOCOL_V9)),
+                blob_contact_test_pair_with_caches_results(
+                    source_store.clone(),
+                    source_mission.credentials,
+                    interests(),
+                    source_cache,
+                    receiver_store.clone(),
+                    receiver_mission.credentials,
+                    interests(),
+                    receiver_cache,
+                    None,
+                    None,
+                    None,
+                    None,
+                    0,
+                ),
+            )
+            .await;
+        assert!(
+            client.is_ok() && server.is_ok(),
+            "finite profile-5 contact failed: client={client:?} server={server:?}"
+        );
+        assert!(
+            receiver_store.get_blob(source).unwrap().is_some(),
+            "finite profile-5 source was not promoted after custody-v2 prelude"
         );
         assert!(
             receiver_store

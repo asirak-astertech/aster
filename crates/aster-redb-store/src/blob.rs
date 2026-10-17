@@ -1640,6 +1640,13 @@ impl BlobContactEligibility {
             (
                 Self::CustodyV2,
                 BlobLifetime::Finite {
+                    provenance: BlobFiniteProvenance::Local,
+                    ..
+                },
+            ) => true,
+            (
+                Self::CustodyV2,
+                BlobLifetime::Finite {
                     provenance:
                         BlobFiniteProvenance::NetworkV1 {
                             semantic_version: 9,
@@ -39313,11 +39320,12 @@ mod tests {
             provenance,
         };
         let cases = [
-            ("durable", BlobLifetime::Durable, true, true),
+            ("durable", BlobLifetime::Durable, true, true, true),
             (
                 "local-finite",
                 finite(BlobFiniteProvenance::Local),
                 false,
+                true,
                 true,
             ),
             (
@@ -39328,6 +39336,7 @@ mod tests {
                 }),
                 false,
                 true,
+                false,
             ),
             (
                 "v8-legacy",
@@ -39335,6 +39344,7 @@ mod tests {
                     semantic_version: 8,
                     profile_id: aster_mesh::TransferProfileId::LegacyV6 as u16,
                 }),
+                false,
                 false,
                 false,
             ),
@@ -39346,6 +39356,7 @@ mod tests {
                 }),
                 false,
                 false,
+                false,
             ),
             (
                 "future-version-custody-profile-number",
@@ -39355,10 +39366,21 @@ mod tests {
                 }),
                 false,
                 false,
+                false,
+            ),
+            (
+                "v9-stream",
+                finite(BlobFiniteProvenance::NetworkV1 {
+                    semantic_version: 9,
+                    profile_id: aster_mesh::TransferProfileId::BlobStreamV1 as u16,
+                }),
+                false,
+                false,
+                true,
             ),
         ];
 
-        for (label, lifetime, durable, custody_v1) in cases {
+        for (label, lifetime, durable, custody_v1, custody_v2) in cases {
             assert_eq!(
                 BlobContactEligibility::DurableOnly.admits(lifetime),
                 durable,
@@ -39368,6 +39390,11 @@ mod tests {
                 BlobContactEligibility::CustodyV1.admits(lifetime),
                 custody_v1,
                 "{label}: custody contact eligibility"
+            );
+            assert_eq!(
+                BlobContactEligibility::CustodyV2.admits(lifetime),
+                custody_v2,
+                "{label}: stream custody contact eligibility"
             );
         }
     }
