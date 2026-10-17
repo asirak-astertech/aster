@@ -13124,6 +13124,7 @@ fn cache_staged_blob_after_transition(
     blob: &ContentVerifiedBlobEnvelope,
     manifest_bytes: &[u8],
     sealed: &[u8],
+    blob_contact_mode: BlobContactMode,
 ) -> Result<(), NodeError> {
     #[cfg(test)]
     if cache.fire_test_blob_contact_fault(TestBlobContactFault::PostStage) {
@@ -13139,11 +13140,6 @@ fn cache_staged_blob_after_transition(
         TestBlobContactFault::PostStageLifetimeDiscontinuity,
     )?;
     let transition = (|| -> Result<(), NodeError> {
-        let blob_contact_mode = if blob.ttl_ms().is_some() {
-            BlobContactMode::CustodyV1
-        } else {
-            BlobContactMode::DurableOnly
-        };
         let projection = match blob_contact_mode {
             BlobContactMode::CustodyV1 => store.custody_v1_blob_source_projection(expected)?,
             BlobContactMode::StreamV1 => store.custody_v2_blob_source_projection(expected)?,
@@ -13221,6 +13217,14 @@ struct ReceivedBlobCustody {
     expected_exchange_id: u64,
 }
 
+struct DeferredFiniteBlobStreamAdmission {
+    source: BlobTransferId,
+    blob: ContentVerifiedBlobEnvelope,
+    manifest_bytes: Vec<u8>,
+    plan: VerifiedBlobTransferPlan,
+    sealed: Vec<u8>,
+}
+
 #[cfg(test)]
 fn take_test_blob_receive_replay() -> bool {
     TEST_BLOB_RECEIVE_FAULT
@@ -13284,6 +13288,7 @@ fn accept_received_mutable(
     sealed: &[u8],
     blob_custody: Option<ReceivedBlobCustody>,
     blob_contact_mode: Option<BlobContactMode>,
+    mut deferred_finite_stream: Option<&mut Option<DeferredFiniteBlobStreamAdmission>>,
 ) -> Result<(MutableApplyDisposition, Option<[u8; 32]>), NodeError> {
     guard.check(store)?;
     if sealed.len() > MAX_OBJECT_BYTES {
@@ -13449,7 +13454,6 @@ fn accept_received_mutable(
                     "Blob receive interest lacks the exact current content grant".into(),
                 ));
             };
-            require_blob_claim_presence(blob.ttl_ms(), blob_custody.is_some())?;
             verifier.verify_current_blob_lineage(&blob)?;
             let plan = blob.transfer_plan(&manifest_bytes).map_err(|error| {
                 NodeError::Protocol(format!("received Blob transfer plan is invalid: {error}"))
@@ -13459,6 +13463,30 @@ fn accept_received_mutable(
                     "received Blob manifest exceeds selected network bounds".into(),
                 ));
             }
+            if blob_contact_mode == Some(BlobContactMode::StreamV1)
+                && blob.ttl_ms().is_some()
+                && blob_custody.is_none()
+            {
+                let admission = deferred_finite_stream.as_deref_mut().ok_or_else(|| {
+                    NodeError::Protocol(
+                        "finite Blob stream metadata lacks a contact-local admission slot".into(),
+                    )
+                })?;
+                if admission.is_some() {
+                    return Err(NodeError::Protocol(
+                        "finite Blob stream lane selected more than one initial source".into(),
+                    ));
+                }
+                *admission = Some(DeferredFiniteBlobStreamAdmission {
+                    source: expected,
+                    blob,
+                    manifest_bytes,
+                    plan,
+                    sealed: sealed.to_vec(),
+                });
+                return Ok((MutableApplyDisposition::Inserted, None));
+            }
+            require_blob_claim_presence(blob.ttl_ms(), blob_custody.is_some())?;
             let cache = contact_mutable_route_cache(verifier)?;
             let lifecycle = cache.lock_blob_lifecycle()?;
             guard.check(store)?;
@@ -13658,6 +13686,13 @@ fn accept_received_mutable(
                     &blob,
                     &manifest_bytes,
                     sealed,
+                    blob_contact_mode.unwrap_or_else(|| {
+                        if blob.ttl_ms().is_some() {
+                            BlobContactMode::CustodyV1
+                        } else {
+                            BlobContactMode::DurableOnly
+                        }
+                    }),
                 )?;
             }
             #[cfg(test)]
@@ -13693,6 +13728,7 @@ fn accept_received_mutable_for_contact(
     bytes: &[u8],
     custody: Option<ReceivedBlobCustody>,
     blob_contact_mode: BlobContactMode,
+    deferred_finite_stream: &mut Option<DeferredFiniteBlobStreamAdmission>,
 ) -> Result<(MutableApplyDisposition, Option<[u8; 32]>), NodeError> {
     if custody.is_some() && !blob_contact_mode.source_custody_v1_enabled() {
         return Err(NodeError::Protocol(
@@ -13708,6 +13744,7 @@ fn accept_received_mutable_for_contact(
         bytes,
         custody,
         Some(blob_contact_mode),
+        Some(deferred_finite_stream),
     )
 }
 
@@ -25452,7 +25489,7 @@ async fn sync_mutable_transfer_lane(
     lane: DirectedMutableLane<'_>,
     difference: &MutableDifference,
     receipt: &mut PeerReceipt,
-) -> Result<Option<DeferredBlobCursorSettlement>, NodeError> {
+) -> Result<BlobSyncLaneOutcome, NodeError> {
     let DirectedMutableLane {
         guard,
         source_snapshot,
@@ -25474,6 +25511,7 @@ async fn sync_mutable_transfer_lane(
     let mut transferred = 0usize;
     let mut deferred_capacity = 0usize;
     let mut stream_settlement = None;
+    let mut finite_stream_admission = None;
     match direction {
         EventDirection::ToSessionResponder => {
             let limit = difference.local_only.len().min(capacity);
@@ -25682,6 +25720,7 @@ async fn sync_mutable_transfer_lane(
                     &bytes,
                     custody,
                     blob_contact_mode,
+                    &mut finite_stream_admission,
                 )?;
                 #[cfg(test)]
                 if class == MutableClass::Blob {
@@ -25783,15 +25822,31 @@ async fn sync_mutable_transfer_lane(
         ));
     }
     add_unscheduled_mutable(receipt, remaining)?;
-    Ok(stream_settlement)
+    Ok(BlobSyncLaneOutcome {
+        settlement: stream_settlement,
+        finite_admission: finite_stream_admission,
+    })
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Default)]
+struct BlobSyncLaneOutcome {
+    settlement: Option<DeferredBlobCursorSettlement>,
+    finite_admission: Option<DeferredFiniteBlobStreamAdmission>,
+}
+
+#[derive(Default)]
+struct BlobServeLaneOutcome {
+    source: Option<BlobTransferId>,
+    finite_admission: Option<DeferredFiniteBlobStreamAdmission>,
+}
+
 struct BlobClassExchange {
     local_interest: BlobInterest,
     peer_interest: BlobInterest,
     to_responder: Option<DeferredBlobCursorSettlement>,
     to_initiator: Option<DeferredBlobCursorSettlement>,
+    to_responder_admission: Option<DeferredFiniteBlobStreamAdmission>,
+    to_initiator_admission: Option<DeferredFiniteBlobStreamAdmission>,
 }
 
 async fn sync_mutable_class(
@@ -25847,6 +25902,8 @@ async fn sync_mutable_class(
                     peer_interest: peer,
                     to_responder: None,
                     to_initiator: None,
+                    to_responder_admission: None,
+                    to_initiator_admission: None,
                 })
             }
             _ => None,
@@ -25877,7 +25934,7 @@ async fn sync_mutable_class(
         receipt,
     )
     .await?;
-    let to_responder_source = if let MutableReconciliationOutcome::Complete(difference) = outcome {
+    let to_responder_outcome = if let MutableReconciliationOutcome::Complete(difference) = outcome {
         sync_mutable_transfer_lane(
             store,
             connection,
@@ -25889,7 +25946,7 @@ async fn sync_mutable_class(
         )
         .await?
     } else {
-        None
+        BlobSyncLaneOutcome::default()
     };
 
     let to_initiator = DirectedMutableLane {
@@ -25910,7 +25967,7 @@ async fn sync_mutable_class(
         receipt,
     )
     .await?;
-    let to_initiator_source = if let MutableReconciliationOutcome::Complete(difference) = outcome {
+    let to_initiator_outcome = if let MutableReconciliationOutcome::Complete(difference) = outcome {
         sync_mutable_transfer_lane(
             store,
             connection,
@@ -25922,15 +25979,17 @@ async fn sync_mutable_class(
         )
         .await?
     } else {
-        None
+        BlobSyncLaneOutcome::default()
     };
     Ok(match (local_interest, peer_interest) {
         (OwnedMutableReceiveInterest::Blob(local), OwnedMutableReceiveInterest::Blob(peer)) => {
             Some(BlobClassExchange {
                 local_interest: local,
                 peer_interest: peer,
-                to_responder: to_responder_source,
-                to_initiator: to_initiator_source,
+                to_responder: to_responder_outcome.settlement,
+                to_initiator: to_initiator_outcome.settlement,
+                to_responder_admission: to_responder_outcome.finite_admission,
+                to_initiator_admission: to_initiator_outcome.finite_admission,
             })
         }
         _ => None,
@@ -25975,7 +26034,7 @@ async fn sync_mutable_classes(
             blob_interests = exchanged;
         }
     }
-    if let Some(exchange) = blob_interests {
+    if let Some(mut exchange) = blob_interests {
         if blob_contact_mode == BlobContactMode::StreamV1 {
             let profile_digest = receipt.transfer_profile_digest.ok_or_else(|| {
                 NodeError::Protocol("Blob stream profile digest is missing".into())
@@ -26021,6 +26080,7 @@ async fn sync_mutable_classes(
                 guard,
                 EventDirection::ToSessionInitiator,
                 &exchange.local_interest,
+                exchange.to_initiator_admission.as_ref(),
             )?;
             let response = request_mission_frame(
                 connection,
@@ -26044,6 +26104,7 @@ async fn sync_mutable_classes(
                     EventDirection::ToSessionInitiator,
                     selection,
                     profile_digest,
+                    exchange.to_initiator_admission.take(),
                 )
                 .await?;
                 receipt.account_blob_stream_attempt(outcome)?;
@@ -28668,7 +28729,7 @@ async fn serve_mutable_transfer_lane(
     lane: DirectedMutableLane<'_>,
     difference: &MutableDifference,
     receipt: &mut PeerReceipt,
-) -> Result<Option<BlobTransferId>, NodeError> {
+) -> Result<BlobServeLaneOutcome, NodeError> {
     let DirectedMutableLane {
         guard,
         source_snapshot,
@@ -28687,6 +28748,7 @@ async fn serve_mutable_transfer_lane(
     let peer = mission.peer().mission_id();
     let commitments = mission.peer_route_grant_commitments().to_vec();
     let mut stream_source = None;
+    let mut finite_stream_admission = None;
     loop {
         guard.check(store)?;
         let wire_budget = exchange_wire_budget(receipt)?;
@@ -28766,6 +28828,7 @@ async fn serve_mutable_transfer_lane(
                         &bytes,
                         custody,
                         blob_contact_mode,
+                        &mut finite_stream_admission,
                     )?;
                     match disposition {
                         MutableApplyDisposition::Inserted => receipt.inserted += 1,
@@ -28923,7 +28986,10 @@ async fn serve_mutable_transfer_lane(
         .await?;
         account(receipt, request_bytes, response_bytes)?;
         if complete {
-            return Ok(stream_source);
+            return Ok(BlobServeLaneOutcome {
+                source: stream_source,
+                finite_admission: finite_stream_admission,
+            });
         }
     }
 }
@@ -28987,7 +29053,7 @@ async fn serve_mutable_class(
         receipt,
     )
     .await?;
-    let _to_responder_source = if let MutableReconciliationOutcome::Complete(difference) = outcome {
+    let to_responder_outcome = if let MutableReconciliationOutcome::Complete(difference) = outcome {
         serve_mutable_transfer_lane(
             store,
             connection,
@@ -28999,7 +29065,7 @@ async fn serve_mutable_class(
         )
         .await?
     } else {
-        None
+        BlobServeLaneOutcome::default()
     };
 
     let to_initiator = DirectedMutableLane {
@@ -29020,7 +29086,7 @@ async fn serve_mutable_class(
         receipt,
     )
     .await?;
-    let _to_initiator_source = if let MutableReconciliationOutcome::Complete(difference) = outcome {
+    let to_initiator_outcome = if let MutableReconciliationOutcome::Complete(difference) = outcome {
         serve_mutable_transfer_lane(
             store,
             connection,
@@ -29032,8 +29098,10 @@ async fn serve_mutable_class(
         )
         .await?
     } else {
-        None
+        BlobServeLaneOutcome::default()
     };
+    let _to_responder_source = to_responder_outcome.source;
+    let _to_initiator_source = to_initiator_outcome.source;
     Ok(match (local_interest, peer_interest) {
         (OwnedMutableReceiveInterest::Blob(local), OwnedMutableReceiveInterest::Blob(peer)) => {
             Some(BlobClassExchange {
@@ -29041,6 +29109,8 @@ async fn serve_mutable_class(
                 peer_interest: peer,
                 to_responder: None,
                 to_initiator: None,
+                to_responder_admission: to_responder_outcome.finite_admission,
+                to_initiator_admission: to_initiator_outcome.finite_admission,
             })
         }
         _ => None,
@@ -29085,7 +29155,7 @@ async fn serve_mutable_classes(
             blob_interests = exchanged;
         }
     }
-    if let Some(exchange) = blob_interests {
+    if let Some(mut exchange) = blob_interests {
         if blob_contact_mode == BlobContactMode::StreamV1 {
             let profile_digest = receipt.transfer_profile_digest.ok_or_else(|| {
                 NodeError::Protocol("Blob stream profile digest is missing".into())
@@ -29115,6 +29185,7 @@ async fn serve_mutable_classes(
                         guard,
                         EventDirection::ToSessionResponder,
                         &exchange.local_interest,
+                        exchange.to_responder_admission.as_ref(),
                     )?;
                     to_responder = plan.selection;
                     Ok((Frame::BlobStreamPlanReply(plan), true))
@@ -29136,6 +29207,7 @@ async fn serve_mutable_classes(
                     EventDirection::ToSessionResponder,
                     selection,
                     profile_digest,
+                    exchange.to_responder_admission.take(),
                 )
                 .await?;
                 receipt.account_blob_stream_attempt(outcome)?;
@@ -35536,6 +35608,7 @@ mod tests {
                         &historical_state_source.sealed,
                         None,
                         None,
+                        None,
                     )
                     .expect("accept post-startup historical State")
                     .0,
@@ -35558,6 +35631,7 @@ mod tests {
                         &historical_state_source.sealed,
                         None,
                         None,
+                        None,
                     )
                     .expect("accept duplicate historical State")
                     .0,
@@ -35576,6 +35650,7 @@ mod tests {
                         },
                         MutableTransferId::Record(historical_record),
                         &historical_record_source.sealed,
+                        None,
                         None,
                         None,
                     )
@@ -49326,6 +49401,7 @@ mod tests {
             &blob,
             &manifest_bytes,
             &sealed,
+            BlobContactMode::DurableOnly,
         )
         .expect_err("post-stage cache failure must be fatal");
         assert!(matches!(stage_error, NodeError::FatalBlobCoherence(_)));
@@ -50246,6 +50322,94 @@ mod tests {
         assert!(
             receiver_store.get_blob(source).unwrap().is_some(),
             "finite profile-5 source was not promoted after custody-v2 prelude"
+        );
+        assert!(
+            receiver_store
+                .pending_blob_source(source)
+                .unwrap()
+                .is_none()
+        );
+
+        drop(source_store);
+        drop(receiver_store);
+        fs::remove_dir_all(source_root).unwrap();
+        fs::remove_dir_all(receiver_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_blob_stream_v9_authenticates_finite_source_before_initial_admission() {
+        let mut missions = issue_missions(2);
+        let source_mission = missions.pop().unwrap();
+        let receiver_mission = missions.pop().unwrap();
+        let authority = source_mission.credentials.mission_authority_id();
+        let topic = Topic::new("opaque").unwrap();
+        let scope = Scope::new("test/runtime-contact").unwrap();
+        let interests = || {
+            MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
+                topic.clone(),
+                scope.clone(),
+                false,
+            )])
+        };
+        let source_root = root("blob-stream-v9-finite-initial-source");
+        let receiver_root = root("blob-stream-v9-finite-initial-receiver");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::create_dir_all(&receiver_root).unwrap();
+        let source_store =
+            Arc::new(Store::open_for_mission(source_root.join(STORE_FILE), authority).unwrap());
+        let receiver_store =
+            Arc::new(Store::open_for_mission(receiver_root.join(STORE_FILE), authority).unwrap());
+        let source = publish_test_finite_blob_stream_v9(
+            &source_store,
+            &mut open_test_sealer(&source_mission.credentials),
+            &topic,
+            &scope,
+            1,
+            &vec![0x8e; 2 * 1_048_576],
+            10 * 60 * 1_000,
+            100,
+            CustodySample {
+                clock_id: [0xb1; 16],
+                tick_ms: 0,
+            },
+        );
+        assert!(receiver_store.get_blob(source).unwrap().is_none());
+        assert!(
+            receiver_store
+                .pending_blob_source(source)
+                .unwrap()
+                .is_none()
+        );
+        let source_cache = test_event_route_cache(&source_store, &source_mission.credentials);
+        let receiver_cache = test_event_route_cache(&receiver_store, &receiver_mission.credentials);
+
+        let (client, server) = TEST_SEMANTIC_VERSION
+            .scope(
+                std::cell::Cell::new(Some(SEMANTIC_PROTOCOL_V9)),
+                blob_contact_test_pair_with_caches_results(
+                    source_store.clone(),
+                    source_mission.credentials,
+                    interests(),
+                    source_cache,
+                    receiver_store.clone(),
+                    receiver_mission.credentials,
+                    interests(),
+                    receiver_cache,
+                    None,
+                    None,
+                    None,
+                    None,
+                    0,
+                ),
+            )
+            .await;
+        assert!(
+            client.is_ok() && server.is_ok(),
+            "initial finite profile-5 contact failed: client={client:?} server={server:?}"
+        );
+        assert!(
+            receiver_store.get_blob(source).unwrap().is_some(),
+            "finite profile-5 source was not admitted and promoted after custody-v2"
         );
         assert!(
             receiver_store

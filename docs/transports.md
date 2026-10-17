@@ -501,8 +501,10 @@ descending order:
   attempt leaves that cursor unchanged. Reopen of an already-staged finite
   profile-5 source now consumes a fresh custody-v2 prelude, durably merges age,
   binds its digest into `StreamOpen`, and withholds credit until authentication
-  succeeds. Initial finite profile-5 metadata admission and cross-transport
-  failover remain fail-closed.
+  succeeds. Initial finite profile-5 metadata is retained only for the current
+  contact; a custody-v2 prelude must authenticate before the receiver stages a
+  pending source, confirms the zero checkpoint, or emits stream credit.
+  Cross-transport failover remains fail-closed.
 - **Semantic version 8** inherits semantic-v7 profile
   negotiation and receipt-free Event pages, while profile 4 adds authenticated
   finite-TTL Blob custody and bounded lower-priority pressure recovery.

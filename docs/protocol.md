@@ -1054,8 +1054,12 @@ profile 5. Semantic v9 also reserves ordinary mission-protected mechanics tags
 `0xdd` `BlobStreamPlanV1` and `0xde` `BlobStreamPlanReplyV1`. Tags `0xd1..0xd5`
 and every semantic-v7/v8 byte retain their existing meanings.
 
-Before each profile-5 attempt, the receiver selects the exact durable resume
-point independently of metadata reconciliation. A plan body is `direction u8 ||
+Before each profile-5 attempt, the receiver selects the exact admission or
+durable resume point. An already-staged source uses its Store checkpoint. A
+new finite source may use only metadata authenticated during the current
+contact to author the initial `(carrier 0, offset 0, generation 1)` selection;
+that metadata remains contact-local and creates no pending Store row until the
+custody-v2 prelude authenticates. A plan body is `direction u8 ||
 selection_present u8`; when present it continues with `source_transfer_id[32]
 || next_carrier_index u64 || durable_offset u64 || checkpoint_generation u64`.
 The generation is nonzero, and carrier index and offset are either both zero or
@@ -1119,10 +1123,14 @@ the first record on the attempt data half, immediately before `StreamOpenV1`.
 The receiver authenticates that record in the same v9 Blob context and attempt
 nonce, requires its session, direction, exchange, and source transfer to match
 the receiver-authored plan, and durably merges its non-younger age before
-opening the stream. The following `StreamOpenV1.custody_digest` MUST equal the
-authenticated claim digest. Durable attempts carry no custody prelude and MUST
-set no custody digest. The receiver MUST NOT emit `StreamAcceptV1`, credit, or
-any other control record before these checks and the age merge succeed.
+opening the stream. For a first contact this same boundary atomically stages
+the finite source under semantic-v9/profile-5 provenance and establishes its
+zero checkpoint; for reopen it updates the existing finite pending source
+without rejuvenating its age. The following `StreamOpenV1.custody_digest` MUST
+equal the authenticated claim digest. Durable attempts carry no custody prelude
+and MUST set no custody digest. The receiver MUST NOT emit `StreamAcceptV1`,
+credit, or any other control record before these checks and the Store admission
+or age merge succeed.
 
 For each admitted Blob direction, profile 4 sends one protected `ABRS || 0x01`
 schedule containing at most 64 canonical `BlobRangeFetchV5` tuples and receives

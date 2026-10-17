@@ -31,8 +31,9 @@ use std::{sync::Arc, time::Duration};
 
 use super::{
     AuthenticatedBlobRouteClaim, BlobContactMode, BlobStreamTransport, CompletedBlobStreamSource,
-    EventDirection, EventLaneGuard, MutableApplyDisposition, NodeError,
-    PendingBlobRecoveryDisposition, ReferenceEnvelopeSealer, abort_pending_blob_with_cached_claim,
+    DeferredFiniteBlobStreamAdmission, EventDirection, EventLaneGuard, MutableApplyDisposition,
+    NodeError, PendingBlobRecoveryDisposition, ReferenceEnvelopeSealer,
+    abort_pending_blob_with_cached_claim, cache_staged_blob_after_transition,
     contact_custody_sample, contact_mutable_route_cache, custody_finalization_charge_ms,
     load_completed_blob_stream_source, load_pending_blob_plan,
     next_pending_blob_source_for_contact, pending_blob_claim_is_current,
@@ -372,8 +373,33 @@ pub(super) fn select_receive_plan(
     guard: &EventLaneGuard,
     direction: EventDirection,
     local_interest: &BlobInterest,
+    initial_finite: Option<&DeferredFiniteBlobStreamAdmission>,
 ) -> Result<BlobStreamPlanV1, NodeError> {
     guard.check(store)?;
+    if let Some(initial) = initial_finite {
+        if local_interest
+            .selector(initial.blob.topic(), initial.blob.scope())
+            .filter(|selector| selector.epoch() == initial.blob.key_epoch())
+            .is_none()
+        {
+            return Err(protocol(
+                "initial finite source is outside the authenticated local interest",
+            ));
+        }
+        let layout = BlobStreamLayout::from_plan(&initial.plan).map_err(protocol)?;
+        if !layout.contains_checkpoint(0, 0) {
+            return Err(protocol("initial finite source has no zero checkpoint"));
+        }
+        return Ok(BlobStreamPlanV1 {
+            direction,
+            selection: Some(BlobStreamPlanSelectionV1 {
+                source_id: initial.source,
+                next_carrier_index: 0,
+                durable_offset: 0,
+                checkpoint_generation: 1,
+            }),
+        });
+    }
     let Some(projection) = next_pending_blob_source_for_contact(
         store,
         guard.policy(),
@@ -626,15 +652,41 @@ pub(super) async fn receive(
     direction: EventDirection,
     selection: BlobStreamPlanSelectionV1,
     profile_digest: [u8; 32],
+    initial_finite: Option<DeferredFiniteBlobStreamAdmission>,
 ) -> Result<BlobStreamAttemptOutcome, NodeError> {
     guard.check(store)?;
     let source = selection.source_id;
-    let (blob, manifest_bytes, plan) =
-        load_pending_blob_plan(store, verifier, source, BlobContactMode::StreamV1)?
-            .ok_or_else(|| protocol("selected pending source is unavailable"))?;
+    let (blob, manifest_bytes, plan, initial_sealed) = match initial_finite {
+        Some(initial) if initial.source == source => (
+            initial.blob,
+            initial.manifest_bytes,
+            initial.plan,
+            Some(initial.sealed),
+        ),
+        Some(_) => {
+            return Err(protocol(
+                "initial finite admission differs from selected source",
+            ));
+        }
+        None => {
+            let (blob, manifest_bytes, plan) =
+                load_pending_blob_plan(store, verifier, source, BlobContactMode::StreamV1)?
+                    .ok_or_else(|| protocol("selected pending source is unavailable"))?;
+            (blob, manifest_bytes, plan, None)
+        }
+    };
+    let initial_admission = initial_sealed.is_some();
     let finite = blob.ttl_ms().is_some();
     let layout = BlobStreamLayout::from_plan(&plan).map_err(protocol)?;
-    let checkpoint = store.blob_stream_checkpoint_with_policy(guard.policy(), source, &plan)?;
+    let checkpoint = if initial_admission {
+        BlobStreamCheckpoint {
+            next_carrier_index: 0,
+            durable_encoded_offset: 0,
+            generation: 1,
+        }
+    } else {
+        store.blob_stream_checkpoint_with_policy(guard.policy(), source, &plan)?
+    };
     if checkpoint.next_carrier_index != selection.next_carrier_index
         || checkpoint.durable_encoded_offset != selection.durable_offset
         || checkpoint.generation != selection.checkpoint_generation
@@ -665,10 +717,17 @@ pub(super) async fn receive(
         .await
         .map_err(transport)?;
     let expected_custody_digest = if finite {
-        let sealed = store
-            .custody_v2_pending_blob_source(source)?
-            .ok_or_else(|| protocol("finite pending source became unavailable before custody"))?
-            .sealed;
+        let sealed = match initial_sealed {
+            Some(sealed) => sealed,
+            None => {
+                store
+                    .custody_v2_pending_blob_source(source)?
+                    .ok_or_else(|| {
+                        protocol("finite pending source became unavailable before custody")
+                    })?
+                    .sealed
+            }
+        };
         let protected_claim = attempt
             .receive_data()
             .await
@@ -691,14 +750,38 @@ pub(super) async fn receive(
         let digest = claim.digest();
         let cache = contact_mutable_route_cache(verifier)?;
         let _lifecycle = cache.lock_blob_lifecycle()?;
-        store.upgrade_pending_blob_to_stream_v9(
-            guard.policy(),
-            source,
-            &blob,
-            &sealed,
-            &plan,
-            Some((claim, contact)),
-        )?;
+        if initial_admission {
+            let receiver_sample = contact_custody_sample()?
+                .ok_or_else(|| protocol("finite stream admission lacks a local custody sample"))?;
+            store.stage_verified_finite_blob_stream_v9_with_policy(
+                guard.policy(),
+                &blob,
+                &sealed,
+                &plan,
+                claim,
+                contact,
+                receiver_sample,
+            )?;
+            cache_staged_blob_after_transition(
+                store,
+                verifier,
+                &cache,
+                source,
+                &blob,
+                &manifest_bytes,
+                &sealed,
+                BlobContactMode::StreamV1,
+            )?;
+        } else {
+            store.upgrade_pending_blob_to_stream_v9(
+                guard.policy(),
+                source,
+                &blob,
+                &sealed,
+                &plan,
+                Some((claim, contact)),
+            )?;
+        }
         let retained = store
             .custody_v2_blob_source_projection(source)?
             .ok_or_else(|| protocol("finite source disappeared after custody age merge"))?;
@@ -707,16 +790,24 @@ pub(super) async fn receive(
                 "finite custody age merge changed source retention",
             ));
         }
-        let refreshed = AuthenticatedBlobRouteClaim::from_verified_for_contact(
-            store,
-            &blob,
-            &sealed,
-            &retained.source,
-            retained.retention,
-            None,
-            BlobContactMode::StreamV1,
-        )?;
-        cache.insert_blob(verifier, refreshed)?;
+        if !initial_admission {
+            let refreshed = AuthenticatedBlobRouteClaim::from_verified_for_contact(
+                store,
+                &blob,
+                &sealed,
+                &retained.source,
+                retained.retention,
+                None,
+                BlobContactMode::StreamV1,
+            )?;
+            cache.insert_blob(verifier, refreshed)?;
+        }
+        let admitted = store.blob_stream_checkpoint_with_policy(guard.policy(), source, &plan)?;
+        if admitted != checkpoint {
+            return Err(protocol(
+                "finite custody admission changed the selected checkpoint",
+            ));
+        }
         Some(digest)
     } else {
         None
