@@ -281,8 +281,9 @@ Event, State, and Record. A running node exposes a cloneable
 `SelectedBlobHandle`; the exclusive `SelectedBlobNode` remains available for
 stopped-state streaming after the actor exits. Live publication accepts an
 owned, already-open regular file positioned at byte zero, rejects empty input,
-and is capped at 64 MiB/1,024 canonical 64-KiB chunks. A live read returns one
-freshly authenticated, zeroize-on-drop plaintext page of `1..=64 KiB`; the
+and derives its ceiling from configured depot bytes and selected-profile chunk
+capacity. A live read returns one freshly authenticated, zeroize-on-drop
+plaintext window of `1..=1 MiB`; the
 stopped facade retains its synchronous caller-owned streaming interface. The
 runtime separately uses semantic-v7/v8 profile-4 Blob source and range-stream
 frames; v5/v6 carrier attempts fail before IO. `BlobId` commits the exact
@@ -308,7 +309,7 @@ sequenceDiagram
     N->>C: freshly verify durable publication result
     N-->>A: sanitized BlobPublishResult
 
-    alt live read_page(≤64 KiB)
+    alt live read_page(≤1 MiB)
         N->>S: exact-load current selected projection
         N->>C: authenticate selected source; check inactive projections against cache capabilities
         N->>S: require current policy, lineage, and plan
@@ -350,8 +351,8 @@ The live path exact-loads and content-authenticates only the selected current
 source. Inactive candidates are projection-checked against
 startup-authenticated cache capabilities; their sealed bytes are not rehashed
 for every page. Current policy, lineage, lifecycle, and the exact completion
-capability are checked around range decryption before a zeroize-on-drop page of
-at most 64 KiB, spanning at most two canonical chunks, is disclosed. No
+capability are checked around range decryption before a zeroize-on-drop window
+of at most 1 MiB, spanning at most 17 canonical chunks when unaligned, is disclosed. No
 provider reader or copied epoch key escapes either surface. A late
 stopped-stream integrity failure can leave an already verified prefix in
 caller-owned output, so applications needing all-or-none replacement use their

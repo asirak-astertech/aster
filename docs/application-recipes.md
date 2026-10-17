@@ -84,8 +84,9 @@ delivery guides.
 ## Stream Blob content safely
 
 The broad bindings use `blob_writer`/`BlobWriter`-style streaming. The selected
-Rust runtime publishes an owned regular file and reads authenticated pages of
-at most 64 KiB. A live publication is nonempty and at most 64 MiB.
+Rust runtime publishes an owned regular file and reads authenticated windows of
+at most 1 MiB. A live publication is nonempty and bounded by the configured
+depot byte and selected-profile chunk limits.
 
 Each returned chunk or page is authenticated, but whole-content verification
 finishes only at end-of-file. Write to a temporary destination and rename it

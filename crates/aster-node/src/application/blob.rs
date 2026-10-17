@@ -2,7 +2,7 @@
 //!
 //! The stopped facade preserves caller-owned streaming readers and writers.
 //! The live facade accepts only an already-open regular [`fs::File`] and
-//! returns at most one zeroize-on-drop 64 KiB page. Encrypted chunks remain in
+//! returns at most one zeroize-on-drop 1 MiB read window. Encrypted chunks remain in
 //! the mission-bound depot; source-envelope bytes, manifest records, keys,
 //! nonces, and depot mechanics are never returned to applications. Both
 //! facades also expose a durable at-least-once metadata-notification queue.
@@ -270,7 +270,12 @@ fn configured_live_blob_limits(store: &Store) -> (u64, u64) {
 }
 
 /// Maximum plaintext returned by one live Blob page read.
-pub const MAX_SELECTED_BLOB_PAGE_BYTES: usize = SELECTED_BLOB_CHUNK_SIZE as usize;
+///
+/// The one-MiB window amortizes authenticated projection and depot setup while
+/// retaining bounded memory and reauthorization between successive windows.
+pub const MAX_SELECTED_BLOB_PAGE_BYTES: usize = 1024 * 1024;
+const MAX_SELECTED_BLOB_PAGE_CHUNKS: u64 =
+    MAX_SELECTED_BLOB_PAGE_BYTES as u64 / SELECTED_BLOB_CHUNK_SIZE as u64 + 1;
 
 /// Maximum number of immutable Blob publication notifications returned by one poll.
 pub const MAX_SELECTED_BLOB_DELIVERIES: usize = MAX_BLOB_POLL_DELIVERIES;
@@ -3191,7 +3196,7 @@ impl SelectedBlobNode {
         let range_chunk_count = last_chunk
             .checked_sub(first_chunk)
             .and_then(|span| span.checked_add(1))
-            .filter(|count| (1..=2).contains(count))
+            .filter(|count| (1..=MAX_SELECTED_BLOB_PAGE_CHUNKS).contains(count))
             .ok_or_else(|| {
                 ApplicationError::new(ApplicationErrorKind::Integrity, "blob read page")
             })?;
@@ -3223,7 +3228,7 @@ impl SelectedBlobNode {
                 .map_err(|error| blob_core_error("blob read page", error))?;
             if stats.plaintext_bytes != page_len as u64
                 || stats.verified_chunks != range_chunk_count
-                || !(1..=2).contains(&stats.verified_chunks)
+                || !(1..=MAX_SELECTED_BLOB_PAGE_CHUNKS).contains(&stats.verified_chunks)
             {
                 return Err(ApplicationError::new(
                     ApplicationErrorKind::Integrity,
@@ -5731,17 +5736,17 @@ mod tests {
             .read_page(BlobReadPageRequest {
                 blob: blob.clone(),
                 offset,
-                max_bytes: MAX_SELECTED_BLOB_PAGE_BYTES,
+                max_bytes: SELECTED_BLOB_CHUNK_SIZE as usize,
             })
             .expect("read cross-chunk live page");
-        assert_eq!(page.len(), MAX_SELECTED_BLOB_PAGE_BYTES);
+        assert_eq!(page.len(), SELECTED_BLOB_CHUNK_SIZE as usize);
         assert_eq!(
             page.as_bytes(),
             &bytes[offset as usize..page.next_offset() as usize]
         );
         assert_eq!(
             page.next_offset(),
-            offset + MAX_SELECTED_BLOB_PAGE_BYTES as u64
+            offset + u64::from(SELECTED_BLOB_CHUNK_SIZE)
         );
         assert!(!page.complete);
 
@@ -5750,7 +5755,7 @@ mod tests {
             .read_page(BlobReadPageRequest {
                 blob: blob.clone(),
                 offset: final_offset,
-                max_bytes: MAX_SELECTED_BLOB_PAGE_BYTES,
+                max_bytes: SELECTED_BLOB_CHUNK_SIZE as usize,
             })
             .expect("read final live page");
         assert_eq!(final_page.as_bytes(), &bytes[bytes.len() - 17..]);

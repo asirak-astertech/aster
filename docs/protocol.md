@@ -521,9 +521,10 @@ can resume local chunk production and reading without whole-Blob RAM growth.
 The selected node's application profile fixes canonical chunks at 64 KiB. A
 stopped `SelectedBlobNode` retains synchronous streaming, while
 `RunningNode::selected_blobs()` returns a cloneable live handle. Live publish
-takes ownership of a nonempty regular file positioned at byte zero and admits
-at most 64 MiB/1,024 chunks; live read returns one freshly authenticated,
-zeroize-on-drop page of `1..=64 KiB`. These application chunk/page bounds are
+takes ownership of a nonempty regular file positioned at byte zero and derives
+its admission ceiling from the configured depot byte and selected-profile chunk
+limits; live read returns one freshly authenticated, zeroize-on-drop window of
+`1..=1 MiB`. These application chunk/window bounds are
 separate from the historical semantic-v5 carrier range bound of 16 KiB in §9.2.
 Neither surface treats a redb projection as authorization: it freshly verifies
 the selected source and current policy/lineage and requires the exact
@@ -2199,8 +2200,8 @@ outbound, and replay limits:
 | selected mutable class | 4,096 rows and 16 MiB encoded source bytes, independently for State and Record | an otherwise valid new object receives `DeferredCapacity`; no existing mutable row is pruned |
 | mutable fairness cursor | 256 configured mission peers, 4 peer/class/local-mode rows each, 1,024 rows total | startup rejects an overbound configured set and prunes rows for peers no longer configured; ordinary data quota cannot consume the reserve |
 | live application command lane | 32 commands shared by Event, State, Record, and Blob; one queued command for the joined Blob worker | a full Blob worker queue returns explicit `ResourceLimit`; shutdown and zeroization close both admissions and join the worker |
-| live Blob publication | one owned nonempty regular file at byte-zero cursor, at most 64 MiB and 1,024 fixed 64-KiB chunks | invalid shape is rejected; overbound input returns `ResourceLimit`; a source changed across the two passes returns conflict and cannot silently rebind the operation |
-| live Blob plaintext page | `1..=64 KiB`, spanning at most two canonical chunks | zero or overbound requests are rejected; the returned allocation zeroizes on drop; durable/cache/depot coherence loss is actor-fatal |
+| live Blob publication | one owned nonempty regular file at byte-zero cursor, bounded by configured depot bytes and selected-profile 64-KiB chunk capacity | invalid shape is rejected; overbound input returns `ResourceLimit`; a source changed across the two passes returns conflict and cannot silently rebind the operation |
+| live Blob plaintext window | `1..=1 MiB`, spanning at most 17 canonical chunks when unaligned | zero or overbound requests are rejected; the returned allocation zeroizes on drop; durable/cache/depot coherence loss is actor-fatal |
 | logical sends per pump | 128 | remaining due work keeps its monotonic deadline |
 | UDP datagrams examined per adapter poll | 64 | yields `None`; a later poll may continue queued input |
 | discardable unauthenticated carrier failures per runtime pump | 64 | yields with the contact intact; subsequent valid input can progress |

@@ -56,8 +56,9 @@ freshly verified positive current versions and gives Record a separate durable
 whole-key active-head queue. Neither application selector mutates its separately
 configured network receive interest. The runtime also
 exposes a cloneable live Blob handle: publish accepts an already-open regular
-file at cursor zero, bounded to 64 MiB and 1,024 canonical 64-KiB chunks, and a
-live read returns at most 64 KiB of plaintext per zeroize-on-drop page. Under
+file at cursor zero, bounded by configured depot bytes and selected-profile
+64-KiB chunk capacity, and a live read returns at most 1 MiB of plaintext per
+zeroize-on-drop window. Under
 semantic v7/v8 profile 4, the same selected runtime automatically reconciles
 Blob sources and transfers peer-neutral contiguous carrier ranges of at most
 16 KiB directly between content-capable peers. V7 is durable-only. V8 also

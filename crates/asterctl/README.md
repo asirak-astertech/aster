@@ -103,6 +103,9 @@ asterctl --token-file ./client.token blob-read \
     --output ./downloaded-map.bin
 ```
 
+The agent returns freshly authorized read windows of at most 1 MiB; `asterctl`
+streams each window directly into its private no-replace output staging file.
+
 `blob-publish` requires a nonempty regular source file. The path remains local
 and is never sent to the agent. The client sends metadata first, then streams
 canonical chunks of at most 64 KiB without buffering the whole Blob or treating

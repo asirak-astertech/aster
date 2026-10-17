@@ -700,10 +700,11 @@ agreement and never repairs a partial or contradictory lifecycle image.
 The application boundary uses the same authority rather than a second Blob
 store. `RunningNode::selected_blobs()` returns a cloneable handle whose publish
 operation accepts ownership only of a nonempty regular file positioned at byte
-zero and caps it at 64 MiB/1,024 fixed 64-KiB chunks. The source length is
+zero and caps it by configured depot bytes and selected-profile 64-KiB chunk
+capacity. The source length is
 checked across both bounded passes so a concurrent change cannot silently
 change the authenticated intent. A read returns one freshly authenticated
-`1..=64 KiB` plaintext page in a zeroize-on-drop allocation and rechecks policy,
+`1..=1 MiB` plaintext window in a zeroize-on-drop allocation and rechecks policy,
 source selection, current lineage, and the exact depot completion capability
 around decryption. The shared application lane is capped at 32 commands and a
 single joined Blob worker accepts at most one queued Blob command; saturation

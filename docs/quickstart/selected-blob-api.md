@@ -8,7 +8,7 @@ application may publish a durable or finite-TTL owned regular file while the
 node has no peers, read one freshly authenticated plaintext page at a time,
 and consume tagged at-least-once content or retirement notifications for exact
 source-authenticated Blob publications.
-Each live page is at most 64 KiB and zeroizes its owned plaintext allocation on
+Each live page is at most 1 MiB and zeroizes its owned plaintext allocation on
 drop; each delivery is metadata only and carries no Blob plaintext.
 
 The live surface deliberately keeps application delivery separate from network
@@ -83,10 +83,11 @@ loop {
 }
 ```
 
-The live publisher accepts a nonempty regular file of at most 64 MiB, with its
-cursor at exactly zero, and fixes the selected chunk size at 64 KiB. The file is
+The live publisher accepts a nonempty regular file within the configured depot
+byte and selected-profile chunk limits, with its cursor at exactly zero, and
+fixes the selected chunk size at 64 KiB. The file is
 moved into a bounded, joined worker rather than cloned into the actor command.
-The 64-MiB ceiling is the current selected-backend policy, not a public RPC or
+The resulting ceiling is backend capacity policy, not a public RPC or
 wire-format guarantee.
 The returned publication is operation-key idempotent and echoes its original
 signed TTL (`None` means durable), never a remaining lifetime or deletion

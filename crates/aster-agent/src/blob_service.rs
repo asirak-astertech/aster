@@ -18,7 +18,7 @@ use tokio::sync::OwnedSemaphorePermit;
 use zeroize::Zeroizing;
 
 use crate::{
-    BLOB_RPC_FRAME_BYTES, api,
+    BLOB_RPC_FRAME_BYTES, BLOB_RPC_READ_FRAME_BYTES, api,
     error::{PublicOperation, connect_blob_application_error, public_error},
 };
 
@@ -113,7 +113,7 @@ impl BlobConnectService {
                 .read_page(BlobReadPageRequest {
                     blob: state.request.clone(),
                     offset: state.offset,
-                    max_bytes: BLOB_RPC_FRAME_BYTES,
+                    max_bytes: BLOB_RPC_READ_FRAME_BYTES,
                 })
                 .await
                 .map_err(|error| connect_blob_application_error(error, operation))?;
@@ -130,7 +130,7 @@ impl BlobConnectService {
             let complete = page.complete;
             let page_len = u64::try_from(page.len()).map_err(|_| internal(operation))?;
             if page.offset.checked_add(page_len) != Some(next_offset)
-                || page.len() > BLOB_RPC_FRAME_BYTES
+                || page.len() > BLOB_RPC_READ_FRAME_BYTES
                 || complete != (next_offset == observed.total_len)
             {
                 return Err(internal(operation));
@@ -946,7 +946,7 @@ mod tests {
 
     #[test]
     fn blob_upload_derives_frame_bound_from_declared_u64_length() {
-        let declared = MAX_SELECTED_BLOB_PAGE_BYTES as u64 * 1_025;
+        let declared = BLOB_RPC_FRAME_BYTES as u64 * 1_025;
         assert_eq!(maximum_chunk_frames_for_len(declared).unwrap(), 1_025);
     }
 
@@ -1169,6 +1169,7 @@ mod tests {
     #[test]
     fn rpc_blob_frame_size_is_a_stable_agent_contract() {
         assert_eq!(crate::BLOB_RPC_FRAME_BYTES, 64 * 1024);
+        assert_eq!(crate::BLOB_RPC_READ_FRAME_BYTES, 1024 * 1024);
     }
 
     #[cfg(target_os = "linux")]
