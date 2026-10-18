@@ -783,12 +783,9 @@ impl BlobStreamDecryptor {
                 .collect();
         }
 
-        let mut ciphertext_accumulator = self.ciphertext_accumulator.clone();
         let mut next_index = self.next_index;
         let mut next_offset = self.next_offset;
-        let mut checkpoints = Vec::with_capacity(segments.len());
         for segment in segments {
-            let expected_previous = checkpoint_commitment(&ciphertext_accumulator.checkpoint());
             let expected_nonce = segment_nonce(&self.base_nonce, next_index);
             if segment.stream_id != self.open.open.stream_id
                 || segment.open_digest != self.open.open.digest()
@@ -796,7 +793,6 @@ impl BlobStreamDecryptor {
                 || segment.offset != next_offset
                 || segment.total_len != self.open.open.total_len
                 || segment.content_epoch != self.open.open.content_epoch
-                || segment.previous_ciphertext_commitment != expected_previous
                 || segment.nonce != expected_nonce
                 || segment.ciphertext.len() != segment.plaintext_len as usize + GCM_TAG_BYTES
             {
@@ -812,31 +808,51 @@ impl BlobStreamDecryptor {
             {
                 return Err(BlobError::AuthenticationFailed);
             }
-            ciphertext_accumulator.push_segment(segment.index, &segment.ciphertext)?;
+            next_index = next_index.checked_add(1).ok_or(BlobError::LengthOverflow)?;
+            next_offset = end;
+        }
+
+        let authenticated = std::thread::scope(|scope| {
+            let handles = segments
+                .iter()
+                .map(|segment| {
+                    scope.spawn(|| {
+                        let plaintext = Zeroizing::new(self.decrypt_payload(segment)?);
+                        let ciphertext_leaf = accumulator_leaf(
+                            BlobStreamAccumulatorDomain::Ciphertext,
+                            segment.index,
+                            &segment.ciphertext,
+                        )?;
+                        Ok((plaintext, ciphertext_leaf))
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().map_err(|_| BlobError::AuthenticationFailed)?)
+                .collect::<Result<Vec<_>, BlobError>>()
+        })?;
+
+        let mut ciphertext_accumulator = self.ciphertext_accumulator.clone();
+        let mut plaintexts = Vec::with_capacity(segments.len());
+        let mut checkpoints = Vec::with_capacity(segments.len());
+        for (segment, (plaintext, ciphertext_leaf)) in segments.iter().zip(authenticated) {
+            let expected_previous = checkpoint_commitment(&ciphertext_accumulator.checkpoint());
+            if segment.previous_ciphertext_commitment != expected_previous {
+                return Err(BlobError::AuthenticationFailed);
+            }
+            ciphertext_accumulator.push_prehashed_segment(
+                segment.index,
+                segment.ciphertext.len(),
+                ciphertext_leaf,
+            )?;
+            plaintexts.push(plaintext);
             checkpoints.push(AuthenticatedBlobStreamSegmentCheckpoint {
                 segment_index: segment.index,
                 ciphertext_len: segment.ciphertext.len(),
                 checkpoint: ciphertext_accumulator.checkpoint(),
             });
-            next_index = next_index.checked_add(1).ok_or(BlobError::LengthOverflow)?;
-            next_offset = end;
         }
-
-        let plaintexts = std::thread::scope(|scope| {
-            let handles = segments
-                .iter()
-                .map(|segment| scope.spawn(|| self.decrypt_payload(segment)))
-                .collect::<Vec<_>>();
-            handles
-                .into_iter()
-                .map(|handle| {
-                    handle
-                        .join()
-                        .map_err(|_| BlobError::AuthenticationFailed)?
-                        .map(Zeroizing::new)
-                })
-                .collect::<Result<Vec<_>, BlobError>>()
-        })?;
 
         self.ciphertext_accumulator = ciphertext_accumulator;
         self.next_index = next_index;
@@ -1254,11 +1270,21 @@ impl BlobStreamAccumulator {
     }
 
     pub fn push_segment(&mut self, index: u64, bytes: &[u8]) -> Result<(), BlobError> {
+        let hash = accumulator_leaf(self.domain, index, bytes)?;
+        self.push_prehashed_segment(index, bytes.len(), hash)
+    }
+
+    fn push_prehashed_segment(
+        &mut self,
+        index: u64,
+        record_len: usize,
+        mut hash: [u8; 32],
+    ) -> Result<(), BlobError> {
         if index != self.next_index {
             return Err(BlobError::InvalidChunkIndex);
         }
         let maximum = self.domain.maximum_record_len();
-        if bytes.is_empty() || bytes.len() > maximum || self.saw_short_record {
+        if record_len == 0 || record_len > maximum || self.saw_short_record {
             return Err(BlobError::InvalidChunkSize);
         }
         let next_index = self
@@ -1267,10 +1293,9 @@ impl BlobStreamAccumulator {
             .ok_or(BlobError::LengthOverflow)?;
         let next_total = self
             .total_len
-            .checked_add(u64::try_from(bytes.len()).map_err(|_| BlobError::LengthOverflow)?)
+            .checked_add(u64::try_from(record_len).map_err(|_| BlobError::LengthOverflow)?)
             .ok_or(BlobError::LengthOverflow)?;
 
-        let mut hash = accumulator_leaf(self.domain, index, bytes)?;
         let mut level = 0_usize;
         while self.occupied & (1_u64 << level) != 0 {
             hash = accumulator_node(self.domain, &self.frontier[level], &hash);
@@ -1284,7 +1309,7 @@ impl BlobStreamAccumulator {
         self.next_index = next_index;
         self.total_len = next_total;
         self.occupied = next_index;
-        self.saw_short_record = bytes.len() < maximum;
+        self.saw_short_record = record_len < maximum;
         Ok(())
     }
 

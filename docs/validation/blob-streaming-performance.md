@@ -19,6 +19,7 @@ encoding without decrypt/re-encode, and compacts its receive buffer in batches.
 | 128 MiB, shared authenticated ciphertext checkpoint | 3.556 s | 36.0 MiB/s | 1.996 s | 5.552 s |
 | 128 MiB, zero-copy direct-data decode | 3.530 s | 36.3 MiB/s | 1.906 s | 5.437 s |
 | 128 MiB, bounded parallel segment authentication | 2.532 s | 50.6 MiB/s | 1.940 s | 4.473 s |
+| 128 MiB, parallel AEAD and ciphertext leaf hashing | 2.395 s | 53.4 MiB/s | 2.032 s | 4.428 s |
 
 The same 32-MiB path before direct data and batched compaction took 2.509 s in
 contact and 2.977 s total, so contact time fell by approximately 31%. A 16-MiB
@@ -44,10 +45,12 @@ and 128-MiB measurements indicates substantial fixed contact/authentication
 cost. Authenticating the independently sealed segments concurrently within the
 existing 4-MiB durability batch reduced the immediately preceding 128-MiB
 contact time by 28.3% and raised measured payload rate from 36.3 to 50.6 MiB/s.
-Ordered metadata validation, ciphertext-accumulator advancement, pack append,
-and durable commit remain serialized; accumulator state is advanced only after
-the entire AEAD batch succeeds. A tampered middle segment is therefore
-failure-atomic and the same decryptor can retry the valid batch.
+Moving each ciphertext identity-leaf hash into the same worker as its AEAD
+verification reduced contact time by a further 5.4% to 2.395 s. Ordered
+metadata validation, Merkle-frontier advancement, pack append, and durable
+commit remain serialized; accumulator state is advanced only after the entire
+AEAD batch succeeds. A tampered middle segment is therefore failure-atomic and
+the same decryptor can retry the valid batch.
 Direct-data decoding now retains the transport-owned allocation through the
 state machine and persistence batch, removing another payload-sized allocation
 and copy per extent. Its workstation elapsed-time improvement was small (0.7%
@@ -55,9 +58,12 @@ against the immediately preceding run), but it reduces bounded memory traffic
 that is more consequential on CM4-class devices.
 
 The current production path is still well below the 363.4-MiB/s raw Iroh
-loopback ceiling. Ordered content-identity hashing and pack writes now dominate
-the remaining receiver work, and physical CM4 measurements are required before
-choosing the next optimization or making a transport-limited claim.
+loopback ceiling. Plaintext content-identity hashing and pack writes remain in
+the ordered receiver path. An experiment that also passed a provider-minted
+plaintext checkpoint to persistence was rejected: its 2.479-s contact time was
+3.5% slower than the simpler ciphertext-prehash variant. Physical CM4
+measurements are required before choosing the next optimization or making a
+transport-limited claim.
 
 ## 2026-10-18 bidirectional application-RPC loopback
 
