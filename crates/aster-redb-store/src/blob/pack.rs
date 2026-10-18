@@ -16,7 +16,7 @@ use crate::{Store, StoreError};
 
 const PACK_MAGIC: &[u8; 8] = b"ASTRPK01";
 const PACK_VERSION: u16 = 1;
-const PACK_HEADER_LEN: u64 = 82;
+pub(super) const PACK_HEADER_LEN: u64 = 82;
 const PACK_FILE: &str = "segments.pack";
 const JOURNAL_ZERO: &str = "checkpoint.0";
 const JOURNAL_ONE: &str = "checkpoint.1";
@@ -316,6 +316,16 @@ impl BlobPackWriter {
         plaintext: &[u8],
         segment: &EncryptedBlobStreamSegment,
     ) -> Result<(), StoreError> {
+        let encoded = segment.encode();
+        self.append_encoded_segment(plaintext, segment, &encoded)
+    }
+
+    pub(crate) fn append_encoded_segment(
+        &mut self,
+        plaintext: &[u8],
+        segment: &EncryptedBlobStreamSegment,
+        encoded: &[u8],
+    ) -> Result<(), StoreError> {
         let expected_plaintext_next = segment
             .index()
             .checked_add(1)
@@ -333,12 +343,14 @@ impl BlobPackWriter {
         {
             return Err(integrity("Blob pack segment does not extend this stream"));
         }
-        let encoded = segment.encode();
         let encoded_len = u32::try_from(encoded.len())
             .map_err(|_| integrity("Blob pack segment length overflows"))?;
         if encoded.is_empty() || encoded.len() > MAX_SEGMENT_RECORD_LEN {
             return Err(integrity("Blob pack segment exceeds record bound"));
         }
+        segment
+            .validate_encoding(encoded)
+            .map_err(|_| integrity("Blob pack segment encoding differs"))?;
         let next_index = expected_plaintext_next;
         let next_offset = self
             .next_offset
@@ -359,7 +371,7 @@ impl BlobPackWriter {
         let append = self
             .data
             .write_all(&encoded_len.to_be_bytes())
-            .and_then(|()| self.data.write_all(&encoded));
+            .and_then(|()| self.data.write_all(encoded));
         if let Err(error) = append {
             let _ = self.data.set_len(self.pack_len);
             let _ = self.data.seek(SeekFrom::Start(self.pack_len));
@@ -375,6 +387,10 @@ impl BlobPackWriter {
 
     pub(super) fn ciphertext_checkpoint(&self) -> BlobStreamAccumulatorCheckpoint {
         self.ciphertext.checkpoint()
+    }
+
+    pub(super) fn plaintext_checkpoint(&self) -> BlobStreamAccumulatorCheckpoint {
+        self.plaintext.checkpoint()
     }
 
     pub(super) fn final_roots(&self) -> Result<([u8; 32], [u8; 32]), StoreError> {
@@ -909,6 +925,24 @@ mod tests {
         assert_eq!(
             checkpoint.plaintext_offset(),
             fixture.plaintexts[0].len() as u64
+        );
+    }
+
+    #[test]
+    fn blob_pack_appends_the_verified_original_encoding_without_reencoding() {
+        let fixture = stream_fixture(0x6a);
+        let mut writer = BlobPackWriter::create(&fixture.pack_root, &fixture.open).expect("writer");
+        let encoded = fixture.segments[0].encode();
+        writer
+            .append_encoded_segment(&fixture.plaintexts[0], &fixture.segments[0], &encoded)
+            .expect("append original encoding");
+
+        let mut mismatched = fixture.segments[1].encode();
+        mismatched[0] ^= 1;
+        assert!(
+            writer
+                .append_encoded_segment(&fixture.plaintexts[1], &fixture.segments[1], &mismatched,)
+                .is_err()
         );
     }
 

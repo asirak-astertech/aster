@@ -95,6 +95,7 @@ const CHANGE_PAGE_V7: u8 = 0xd4;
 const CHANGE_TURN_FINISHED_V1: u8 = 0xd5;
 const BLOB_PUBLICATION_OPEN_V1: u8 = 0xdd;
 const BLOB_PUBLICATION_COMMIT_V1: u8 = 0xde;
+const BLOB_PUBLICATION_ABSENT_V1: u8 = 0xdf;
 const MAX_SIGNED_BLOB_PUBLICATION_BYTES: usize = 1_048_576;
 pub(crate) const MAX_OBJECT_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_BLOB_RANGE_BYTES: usize = 16 * 1024;
@@ -142,6 +143,11 @@ pub(crate) struct BlobPublicationOpenV1 {
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct BlobPublicationCommitV1 {
     pub(crate) signed_commitment: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BlobPublicationAbsentV1 {
+    pub(crate) direction: EventDirection,
 }
 
 /// Bounded operator emission state disclosed only as a protected v3 response.
@@ -918,6 +924,7 @@ pub(crate) enum Frame {
     BlobStreamPlanReply(BlobStreamPlanV1),
     BlobPublicationOpen(BlobPublicationOpenV1),
     BlobPublicationCommit(BlobPublicationCommitV1),
+    BlobPublicationAbsent(BlobPublicationAbsentV1),
     #[allow(dead_code)] // Activated by the profile-5 runtime driver.
     Stream(StreamFrame),
 }
@@ -1565,6 +1572,12 @@ impl Frame {
                 output.push(BLOB_PUBLICATION_COMMIT_V1);
                 encode_blob_publication(&mut output, &commitment.signed_commitment)?;
             }
+            Self::BlobPublicationAbsent(absent) => {
+                output.push(BLOB_PUBLICATION_ABSENT_V1);
+                output.extend_from_slice(&9_u16.to_be_bytes());
+                output.extend_from_slice(&5_u16.to_be_bytes());
+                output.push(absent.direction.encode());
+            }
             Self::Stream(_) => {
                 return Err(NodeError::Protocol(
                     "stream frame requires an authenticated semantic/profile context".into(),
@@ -1740,6 +1753,7 @@ impl Frame {
                 | Self::BlobStreamPlanReply(_)
                 | Self::BlobPublicationOpen(_)
                 | Self::BlobPublicationCommit(_)
+                | Self::BlobPublicationAbsent(_)
         )
     }
 
@@ -2334,6 +2348,19 @@ impl Frame {
                     }))
                 }
             }
+            BLOB_PUBLICATION_ABSENT_V1 => {
+                if body.len() != 5
+                    || u16::from_be_bytes(body[..2].try_into().expect("fixed slice")) != 9
+                    || u16::from_be_bytes(body[2..4].try_into().expect("fixed slice")) != 5
+                {
+                    return Err(NodeError::Protocol(
+                        "absent Blob publication context differs".into(),
+                    ));
+                }
+                Ok(Self::BlobPublicationAbsent(BlobPublicationAbsentV1 {
+                    direction: EventDirection::decode(body[4])?,
+                }))
+            }
             _ => Err(NodeError::Protocol(
                 "unknown or malformed mechanics frame".into(),
             )),
@@ -2367,7 +2394,10 @@ const fn is_v7_only_tag(tag: u8) -> bool {
 }
 
 const fn is_v9_only_tag(tag: u8) -> bool {
-    matches!(tag, BLOB_PUBLICATION_OPEN_V1 | BLOB_PUBLICATION_COMMIT_V1)
+    matches!(
+        tag,
+        BLOB_PUBLICATION_OPEN_V1 | BLOB_PUBLICATION_COMMIT_V1 | BLOB_PUBLICATION_ABSENT_V1
+    )
 }
 
 fn encode_blob_publication(output: &mut Vec<u8>, signed: &[u8]) -> Result<(), NodeError> {
@@ -3886,6 +3916,27 @@ mod tests {
         let mut truncated = encoded;
         truncated.pop();
         assert!(Frame::decode(&truncated).is_err());
+    }
+
+    #[test]
+    fn blob_publication_absent_is_direction_bound_and_v9_only() {
+        let frame = Frame::BlobPublicationAbsent(BlobPublicationAbsentV1 {
+            direction: EventDirection::ToSessionResponder,
+        });
+        let encoded = frame
+            .encode_for_semantic_version(9)
+            .expect("encode absent Blob publication");
+        assert_eq!(encoded[4], BLOB_PUBLICATION_ABSENT_V1);
+        assert_eq!(
+            Frame::decode_for_semantic_version(&encoded, 9)
+                .expect("decode absent Blob publication"),
+            frame
+        );
+        assert!(frame.encode_for_semantic_version(8).is_err());
+        assert!(Frame::decode_for_semantic_version(&encoded, 8).is_err());
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert!(Frame::decode_for_semantic_version(&trailing, 9).is_err());
     }
 
     #[test]

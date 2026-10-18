@@ -21,13 +21,23 @@ use crate::{
         TransportSelector,
     },
 };
-use aster_mesh::{BlobStreamLayout, VerifiedBlobTransferPlan};
+use aster_mesh::{
+    BlobStreamDecryptor, BlobStreamLayout, EncryptedBlobStreamSegment,
+    VerifiedBlobStreamFinalCommitment, VerifiedBlobStreamOpen, VerifiedBlobTransferPlan,
+};
 use aster_redb_store::{
-    BlobStreamCheckpoint, BlobStreamCommitOutcome, BlobTransferId, BlobVariantId,
-    ControlPolicySnapshot, Store, VerifiedBlobStreamCheckpointBatch,
+    BlobOperationKey, BlobStreamCheckpoint, BlobStreamCommitOutcome, BlobStreamPackSession,
+    BlobStreamPublication, BlobStreamReservationRequest, BlobStreamSource, BlobTransferId,
+    BlobVariantId, ControlPolicySnapshot, Store, VerifiedBlobStreamCheckpointBatch,
 };
 use sha2::{Digest as _, Sha256};
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU32, AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 #[cfg(test)]
 use super::TestBlobContactFault;
@@ -64,10 +74,503 @@ const STREAM_ATTEMPT_DEADLINE: Duration = Duration::from_secs(30 * 60);
 const STREAM_RECEIVE_WINDOW_BYTES: u64 = 8 * 1_048_576;
 const STREAM_CHECKPOINT_BATCH_BYTES: u32 = 4 * 1_048_576;
 const STREAM_RECORD_BUDGET_BYTES: usize = 256;
+const PACK_STREAM_MAX_EXTENT_BYTES: u32 = MAX_STREAM_EXTENT_BYTES as u32;
 const _: () = assert!(
     STREAM_CHECKPOINT_BATCH_BYTES as u64 + MAX_STREAM_EXTENT_BYTES as u64
         <= STREAM_RECEIVE_WINDOW_BYTES
 );
+
+pub(super) struct CompletedPackStreamSource {
+    pub(super) publication: BlobStreamPublication,
+    pub(super) open: VerifiedBlobStreamOpen,
+    pub(super) commitment: VerifiedBlobStreamFinalCommitment,
+}
+
+pub(super) fn select_completed_pack_source(
+    store: &Store,
+    mission: &MissionSession,
+    verifier: &ReferenceEnvelopeSealer,
+    guard: &EventLaneGuard,
+    peer_interest: &BlobInterest,
+) -> Result<Option<CompletedPackStreamSource>, NodeError> {
+    guard.check(store)?;
+    let peer = mission.peer().mission_id();
+    let commitments = mission.peer_route_grant_commitments();
+    let publications = store.blob_stream_publications_with_policy(guard.policy())?;
+    for publication in publications.into_iter().rev() {
+        let open = verifier.verify_blob_stream_open(publication.authenticated_open())?;
+        let candidate = open.open();
+        let Some(selector) = peer_interest
+            .selector(candidate.topic(), candidate.scope())
+            .filter(|selector| selector.epoch() == candidate.content_epoch())
+        else {
+            continue;
+        };
+        if !verifier.peer_can_route(
+            peer,
+            commitments,
+            candidate.scope(),
+            candidate.content_epoch(),
+        ) || !verifier.peer_can_open_blob_content(
+            peer,
+            commitments,
+            candidate.scope(),
+            candidate.topic(),
+            candidate.content_epoch(),
+            selector.content_proof(),
+        ) {
+            continue;
+        }
+        let commitment = verifier
+            .verify_blob_stream_commitment(&open, publication.authenticated_commitment())?;
+        if open.open() != publication.open() || commitment.commitment() != publication.commitment()
+        {
+            return Err(protocol(
+                "completed pack publication differs from publisher authority",
+            ));
+        }
+        return Ok(Some(CompletedPackStreamSource {
+            publication,
+            open,
+            commitment,
+        }));
+    }
+    Ok(None)
+}
+
+pub(super) struct ReceivedPackStream {
+    pub(super) open: VerifiedBlobStreamOpen,
+    pub(super) commitment: VerifiedBlobStreamFinalCommitment,
+    pub(super) pack: BlobStreamPackSession,
+    pub(super) decryptor: BlobStreamDecryptor,
+}
+
+pub(super) fn admit_completed_pack_source(
+    store: &Store,
+    mission: &MissionSession,
+    verifier: &ReferenceEnvelopeSealer,
+    guard: &EventLaneGuard,
+    local_interest: &BlobInterest,
+    signed_open: &[u8],
+    signed_commitment: &[u8],
+) -> Result<ReceivedPackStream, NodeError> {
+    guard.check(store)?;
+    let open = verifier.verify_blob_stream_open(signed_open)?;
+    let intent = open.open();
+    local_interest
+        .selector(intent.topic(), intent.scope())
+        .filter(|selector| selector.epoch() == intent.content_epoch())
+        .ok_or_else(|| protocol("publisher-signed stream is outside local interest"))?;
+    let peer = mission.peer().mission_id();
+    let commitments = mission.peer_route_grant_commitments();
+    if !verifier.peer_can_route(peer, commitments, intent.scope(), intent.content_epoch()) {
+        return Err(protocol(
+            "forwarding peer lacks signed-stream route entitlement",
+        ));
+    }
+    let commitment = verifier.verify_blob_stream_commitment(&open, signed_commitment)?;
+    let operation = BlobOperationKey::new(intent.operation_key().to_vec())?;
+    let (reservation, _) = store.reserve_blob_stream_with_policy(
+        guard.policy(),
+        BlobStreamReservationRequest {
+            operation: &operation,
+            source: BlobStreamSource::AuthenticatedPeer(peer),
+        },
+        &open,
+    )?;
+    let pack = store.open_blob_stream_pack_session(guard.policy(), &reservation, &open)?;
+    let decryptor = verifier.begin_blob_stream_decrypt(&open)?;
+    Ok(ReceivedPackStream {
+        open,
+        commitment,
+        pack,
+        decryptor,
+    })
+}
+
+fn completed_pack_result_digest(
+    stream_id: [u8; 32],
+    blob_id: [u8; 32],
+    code: StreamResultCode,
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"ASTER/blob-pack-stream/result/v1\0");
+    digest.update(stream_id);
+    digest.update(blob_id);
+    digest.update([code as u8]);
+    digest.finalize().into()
+}
+
+fn pack_attempt_flow(total: u64) -> Result<(u32, u32, u64), NodeError> {
+    if total < 2 {
+        return Err(protocol("completed pack wire length is too short"));
+    }
+    let max_extent = total
+        .saturating_div(2)
+        .max(1)
+        .min(u64::from(PACK_STREAM_MAX_EXTENT_BYTES)) as u32;
+    let checkpoint_batch =
+        (total - u64::from(max_extent)).min(u64::from(STREAM_CHECKPOINT_BATCH_BYTES)) as u32;
+    let minimum_window = u64::from(max_extent) + u64::from(checkpoint_batch);
+    let window = STREAM_RECEIVE_WINDOW_BYTES.max(minimum_window).min(total);
+    Ok((max_extent, checkpoint_batch, window))
+}
+
+fn pack_frame_count(total: u64) -> u64 {
+    // Data-frame count plus bounded allowance for the signed terminal,
+    // protected open/result records, and post-quantum mission envelopes.
+    total
+        .div_ceil(u64::from(PACK_STREAM_MAX_EXTENT_BYTES))
+        .saturating_add(64)
+}
+
+pub(super) async fn send_completed_pack(
+    store: &Store,
+    connection: &aster_iroh::Connection,
+    mission: &mut MissionSession,
+    guard: &EventLaneGuard,
+    direction: EventDirection,
+    source: CompletedPackStreamSource,
+    profile_digest: [u8; 32],
+) -> Result<BlobStreamAttemptOutcome, NodeError> {
+    guard.check(store)?;
+    let total = source.publication.wire_len();
+    let segment_count = source.commitment.commitment().segment_count();
+    let computed =
+        EncryptedBlobStreamSegment::packed_wire_len(source.open.open().total_len(), segment_count)
+            .ok_or_else(|| protocol("completed pack wire length overflow"))?;
+    if computed != total {
+        return Err(protocol(
+            "completed pack length differs from canonical segment records",
+        ));
+    }
+    let mut reader = store.open_blob_stream_read_session_with_policy(
+        guard.policy(),
+        &source.publication,
+        &source.open,
+        &source.commitment,
+    )?;
+    let transfer = *source.publication.stream_id().as_bytes();
+    let source_id = BlobTransferId::new(transfer);
+    let generation = 0;
+    let nonce = attempt_nonce(mission.session_id(), direction, transfer, generation);
+    let open = StreamOpenV1 {
+        class: crate::stream_transfer::StreamClass::Blob,
+        direction: expected_direction(direction),
+        session_transcript: mission.session_id(),
+        exchange_id: exchange_id(mission.session_id(), direction, source_id),
+        transfer_id: transfer,
+        open_digest: source.open.open().digest(),
+        source_transfer_id: [0; 32],
+        publication_id: *source.publication.blob_id().as_bytes(),
+        variant_id: [0; 32],
+        total_len: total,
+        attempt_nonce: nonce,
+        checkpoint_generation: generation,
+        custody_digest: None,
+    };
+    let adapter = selected_iroh_adapter(connection)?;
+    let attempt = adapter
+        .open_attempt(open_request(total, pack_frame_count(total))?)
+        .await
+        .map_err(transport)?;
+    let selection = BlobStreamPlanSelectionV1 {
+        source_id,
+        next_carrier_index: 0,
+        durable_offset: 0,
+        checkpoint_generation: generation,
+    };
+    let mut buffered = Vec::new();
+    let mut buffered_offset = 0_usize;
+    let mut wire_offset = 0_u64;
+    let signed_commitment = source.publication.authenticated_commitment().to_vec();
+    let code = drive_sender_attempt(
+        attempt,
+        mission,
+        profile_digest,
+        direction,
+        open,
+        selection,
+        source.open.open().total_len(),
+        signed_commitment,
+        move |offset, maximum| {
+            if offset != wire_offset || maximum == 0 {
+                return Err(protocol("completed pack reader cursor differs"));
+            }
+            let mut output = Vec::with_capacity(maximum);
+            while output.len() < maximum {
+                if buffered_offset == buffered.len() {
+                    buffered.clear();
+                    buffered_offset = 0;
+                    let Some(segment) = reader.next_encrypted_segment()? else {
+                        break;
+                    };
+                    let len = u32::try_from(segment.len())
+                        .map_err(|_| protocol("encrypted segment length exceeds u32"))?;
+                    buffered.extend_from_slice(&len.to_be_bytes());
+                    buffered.extend_from_slice(&segment);
+                }
+                if output.is_empty() && buffered_offset == 0 && buffered.len() <= maximum {
+                    output.append(&mut buffered);
+                    buffered_offset = 0;
+                    break;
+                }
+                let take = (maximum - output.len()).min(buffered.len() - buffered_offset);
+                output.extend_from_slice(&buffered[buffered_offset..buffered_offset + take]);
+                buffered_offset += take;
+            }
+            if output.is_empty() {
+                return Err(protocol("completed pack ended before declared wire length"));
+            }
+            wire_offset = wire_offset
+                .checked_add(output.len() as u64)
+                .ok_or_else(|| protocol("completed pack reader offset overflow"))?;
+            Ok(output)
+        },
+    )
+    .await?;
+    Ok(BlobStreamAttemptOutcome {
+        code,
+        metrics: BlobStreamAttemptMetrics {
+            transport: BlobStreamTransport::IrohQuicV1,
+            received_bytes: 0,
+            retransmitted_bytes: 0,
+            receive_limit_bytes: 0,
+            checkpoint_bytes: total,
+            checkpoint_latency_ms: 0,
+            writer_commits: 0,
+            failover_recoveries: 0,
+        },
+    })
+}
+
+struct PackReceiveState {
+    stream: ReceivedPackStream,
+    buffered: Vec<u8>,
+    buffered_consumed: usize,
+    durable_wire_offset: u64,
+    appended_since_checkpoint: bool,
+}
+
+pub(super) async fn receive_completed_pack(
+    store: &Store,
+    connection: &aster_iroh::Connection,
+    mission: &mut MissionSession,
+    guard: &EventLaneGuard,
+    direction: EventDirection,
+    received: ReceivedPackStream,
+    profile_digest: [u8; 32],
+) -> Result<BlobStreamAttemptOutcome, NodeError> {
+    guard.check(store)?;
+    let intent_total_len = received.open.open().total_len();
+    let intent_digest = received.open.open().digest();
+    let transfer = *received.open.open().stream_id().as_bytes();
+    let segment_count = received.commitment.commitment().segment_count();
+    let total = EncryptedBlobStreamSegment::packed_wire_len(intent_total_len, segment_count)
+        .ok_or_else(|| protocol("received pack wire length overflow"))?;
+    let (max_extent, checkpoint_batch, initial_limit) = pack_attempt_flow(total)?;
+    if received.pack.progress().durable_pack_len() != 0
+        || received.pack.progress().generation() != 0
+    {
+        return Err(protocol(
+            "completed pack resume is not yet attached to receiver authority",
+        ));
+    }
+    let generation = 0;
+    let nonce = attempt_nonce(mission.session_id(), direction, transfer, generation);
+    let adapter = selected_iroh_adapter(connection)?;
+    let attempt = adapter
+        .accept_attempt(open_request(total, pack_frame_count(total))?)
+        .await
+        .map_err(transport)?;
+    let state = Mutex::new(Some(PackReceiveState {
+        stream: received,
+        buffered: Vec::new(),
+        buffered_consumed: 0,
+        durable_wire_offset: 0,
+        appended_since_checkpoint: false,
+    }));
+    let writer_commits = AtomicU32::new(0);
+    let received_bytes = AtomicU64::new(0);
+    let greatest_receive_limit = AtomicU64::new(initial_limit);
+    let code = drive_receiver_attempt(
+        attempt,
+        mission,
+        profile_digest,
+        direction,
+        nonce,
+        transfer,
+        intent_digest,
+        total,
+        0,
+        generation,
+        None,
+        initial_limit,
+        max_extent,
+        checkpoint_batch,
+        |_, frames| {
+            let mut slot = state
+                .lock()
+                .map_err(|_| protocol("pack receive state lock poisoned"))?;
+            let current = slot
+                .as_mut()
+                .ok_or_else(|| protocol("pack receive state already promoted"))?;
+            for frame in frames {
+                current.buffered.extend_from_slice(&frame.bytes);
+                received_bytes.store(
+                    received_bytes
+                        .load(Ordering::Relaxed)
+                        .checked_add(frame.bytes.len() as u64)
+                        .ok_or_else(|| protocol("received pack byte count overflow"))?,
+                    Ordering::Relaxed,
+                );
+                loop {
+                    let available = current
+                        .buffered
+                        .len()
+                        .saturating_sub(current.buffered_consumed);
+                    if available < 4 {
+                        break;
+                    }
+                    let record_start = current.buffered_consumed;
+                    let segment_len = u32::from_be_bytes(
+                        current.buffered[record_start..record_start + 4]
+                            .try_into()
+                            .expect("four-byte segment length"),
+                    ) as usize;
+                    let record_len = 4_usize
+                        .checked_add(segment_len)
+                        .ok_or_else(|| protocol("received segment length overflow"))?;
+                    if segment_len == 0 || segment_len > 2 * 1024 * 1024 {
+                        return Err(protocol("received encrypted segment length is invalid"));
+                    }
+                    if available < record_len {
+                        break;
+                    }
+                    let record_end = record_start
+                        .checked_add(record_len)
+                        .ok_or_else(|| protocol("received segment end overflow"))?;
+                    let segment = EncryptedBlobStreamSegment::decode(
+                        &current.buffered[record_start + 4..record_end],
+                    )
+                    .map_err(protocol)?;
+                    let plaintext = current
+                        .stream
+                        .decryptor
+                        .decrypt_segment(&segment)
+                        .map_err(protocol)?;
+                    current.stream.pack.append_encoded_segment(
+                        &plaintext,
+                        &segment,
+                        &current.buffered[record_start + 4..record_end],
+                    )?;
+                    current.buffered_consumed = record_end;
+                    current.durable_wire_offset = current
+                        .durable_wire_offset
+                        .checked_add(record_len as u64)
+                        .ok_or_else(|| protocol("received durable wire offset overflow"))?;
+                    current.appended_since_checkpoint = true;
+                }
+            }
+            if current.buffered_consumed == current.buffered.len() {
+                current.buffered.clear();
+                current.buffered_consumed = 0;
+            } else if current.buffered_consumed != 0 {
+                current.buffered.drain(..current.buffered_consumed);
+                current.buffered_consumed = 0;
+            }
+            if current.appended_since_checkpoint {
+                current.stream.pack.checkpoint(store, guard.policy())?;
+                current.appended_since_checkpoint = false;
+                writer_commits.store(
+                    writer_commits
+                        .load(Ordering::Relaxed)
+                        .checked_add(1)
+                        .ok_or_else(|| protocol("pack writer commit count overflow"))?,
+                    Ordering::Relaxed,
+                );
+            }
+            let resume = current.stream.pack.crypto_resume();
+            let progress = resume.progress();
+            let initial_authority = progress.generation() == 0
+                && progress.durable_plaintext_offset() == 0
+                && current.durable_wire_offset == 0;
+            let limit = current
+                .durable_wire_offset
+                .checked_add(STREAM_RECEIVE_WINDOW_BYTES)
+                .unwrap_or(u64::MAX)
+                .min(total)
+                .max(initial_limit);
+            greatest_receive_limit.fetch_max(limit, Ordering::Relaxed);
+            Ok(crate::stream_transfer::StreamCheckpointAuthorityV1 {
+                durable_plaintext_offset: progress.durable_plaintext_offset(),
+                durable_ciphertext_offset: current.durable_wire_offset,
+                next_segment_index: progress.next_segment_index(),
+                plaintext_commitment: if initial_authority {
+                    [1; 32]
+                } else {
+                    resume.plaintext_checkpoint().commitment()
+                },
+                ciphertext_commitment: if initial_authority {
+                    [1; 32]
+                } else {
+                    resume.ciphertext_checkpoint().commitment()
+                },
+                checkpoint_generation: progress.generation(),
+                absolute_receive_limit: limit,
+            })
+        },
+        |_, finish| {
+            let mut slot = state
+                .lock()
+                .map_err(|_| protocol("pack receive state lock poisoned"))?;
+            let current = slot
+                .take()
+                .ok_or_else(|| protocol("pack receive state already promoted"))?;
+            if !current.buffered.is_empty()
+                || current.buffered_consumed != 0
+                || current.durable_wire_offset != total
+                || finish.final_plaintext_offset != current.stream.open.open().total_len()
+                || finish.final_ciphertext_offset != total
+                || finish.signed_commitment != current.stream.commitment.authenticated_bytes()
+            {
+                return Err(protocol("completed pack finish authority differs"));
+            }
+            let final_sample = current.stream.commitment.commitment().final_custody();
+            let promotion = current.stream.pack.finish_and_promote(
+                store,
+                guard.policy(),
+                &current.stream.commitment,
+                final_sample,
+            )?;
+            let code = if promotion.duplicate() {
+                StreamResultCode::AlreadyPresent
+            } else {
+                StreamResultCode::Promoted
+            };
+            let blob_id = *promotion.blob_id().as_bytes();
+            Ok((
+                code,
+                blob_id,
+                completed_pack_result_digest(transfer, blob_id, code),
+            ))
+        },
+    )
+    .await?;
+    Ok(BlobStreamAttemptOutcome {
+        code,
+        metrics: BlobStreamAttemptMetrics {
+            transport: BlobStreamTransport::IrohQuicV1,
+            received_bytes: received_bytes.load(Ordering::Relaxed),
+            retransmitted_bytes: 0,
+            receive_limit_bytes: greatest_receive_limit.load(Ordering::Relaxed),
+            checkpoint_bytes: total,
+            checkpoint_latency_ms: 0,
+            writer_commits: writer_commits.load(Ordering::Relaxed),
+            failover_recoveries: 0,
+        },
+    })
+}
 
 fn protocol(error: impl std::fmt::Display) -> NodeError {
     NodeError::Protocol(format!("Blob stream: {error}"))
@@ -197,6 +700,34 @@ pub(super) fn attempt_nonce(
     digest.finalize().into()
 }
 
+const ATTEMPT_PROTECTED_RECORD: u8 = 0xa0;
+const ATTEMPT_DIRECT_DATA_RECORD: u8 = 0xa1;
+
+fn encode_direct_data_record(frame: StreamFrame) -> Result<Vec<u8>, NodeError> {
+    if !matches!(frame, StreamFrame::Data(_)) {
+        return Err(protocol("direct attempt record is not stream data"));
+    }
+    let encoded = frame.encode_for_context(9, 5).map_err(protocol)?;
+    let mut record = Vec::with_capacity(1 + encoded.len());
+    record.push(ATTEMPT_DIRECT_DATA_RECORD);
+    record.extend_from_slice(&encoded);
+    Ok(record)
+}
+
+fn decode_direct_data_record(record: &[u8]) -> Result<StreamFrame, NodeError> {
+    let Some((&kind, encoded)) = record.split_first() else {
+        return Err(protocol("empty attempt record"));
+    };
+    if kind != ATTEMPT_DIRECT_DATA_RECORD {
+        return Err(protocol("attempt record is not direct stream data"));
+    }
+    let frame = StreamFrame::decode_for_context(9, 5, encoded).map_err(protocol)?;
+    if !matches!(frame, StreamFrame::Data(_)) {
+        return Err(protocol("direct attempt record is not stream data"));
+    }
+    Ok(frame)
+}
+
 fn protect(
     mission: &mut MissionSession,
     profile_digest: [u8; 32],
@@ -204,10 +735,17 @@ fn protect(
     nonce: [u8; 32],
     frame: StreamFrame,
 ) -> Result<Vec<u8>, NodeError> {
+    if matches!(frame, StreamFrame::Data(_)) {
+        return encode_direct_data_record(frame);
+    }
     let plaintext = frame.encode_for_context(9, 5).map_err(protocol)?;
-    mission
+    let protected = mission
         .seal_v9_blob_application_frame(profile_digest, direction, nonce, &plaintext)
-        .map_err(Into::into)
+        .map_err(NodeError::from)?;
+    let mut record = Vec::with_capacity(1 + protected.len());
+    record.push(ATTEMPT_PROTECTED_RECORD);
+    record.extend_from_slice(&protected);
+    Ok(record)
 }
 
 fn open_control(
@@ -215,11 +753,24 @@ fn open_control(
     profile_digest: [u8; 32],
     direction: EventDirection,
     nonce: [u8; 32],
-    protected: &[u8],
+    record: &[u8],
 ) -> Result<StreamFrame, NodeError> {
+    let Some((&kind, encoded)) = record.split_first() else {
+        return Err(protocol("empty attempt record"));
+    };
+    if kind == ATTEMPT_DIRECT_DATA_RECORD {
+        return decode_direct_data_record(record);
+    }
+    if kind != ATTEMPT_PROTECTED_RECORD {
+        return Err(protocol("unknown attempt record kind"));
+    }
     let plaintext =
-        mission.open_v9_blob_application_frame(profile_digest, direction, nonce, protected)?;
-    StreamFrame::decode_for_context(9, 5, &plaintext).map_err(protocol)
+        mission.open_v9_blob_application_frame(profile_digest, direction, nonce, encoded)?;
+    let frame = StreamFrame::decode_for_context(9, 5, &plaintext).map_err(protocol)?;
+    if matches!(frame, StreamFrame::Data(_)) {
+        return Err(protocol("stream data used protected attempt record"));
+    }
+    Ok(frame)
 }
 
 /// Drives one sender attempt over the selected adapter. The supplied reader
@@ -232,6 +783,8 @@ pub(super) async fn drive_sender_attempt<R>(
     direction: EventDirection,
     open: StreamOpenV1,
     expected_checkpoint: BlobStreamPlanSelectionV1,
+    final_plaintext_offset: u64,
+    signed_commitment: Vec<u8>,
     mut read_extent: R,
 ) -> Result<StreamResultCode, NodeError>
 where
@@ -285,7 +838,10 @@ where
                 _ => return Err(protocol("sender produced an invalid data transition")),
             }
         } else if state.next_offset() == total && !finish_sent {
-            let StreamAction::Send(frame) = state.finish().map_err(protocol)? else {
+            let StreamAction::Send(frame) = state
+                .finish_bound(final_plaintext_offset, signed_commitment.clone())
+                .map_err(protocol)?
+            else {
                 return Err(protocol("sender produced an invalid finish transition"));
             };
             let protected = protect(mission, profile_digest, direction, nonce, frame)?;
@@ -617,6 +1173,8 @@ pub(super) async fn send(
         direction,
         open,
         selection,
+        layout.total_encoded_len(),
+        vec![1],
         move |offset, maximum| {
             let layout = BlobStreamLayout::from_plan(plan).map_err(protocol)?;
             let next_carrier_index = layout
@@ -848,6 +1406,8 @@ pub(super) async fn receive(
         direction,
         nonce,
         *source.as_bytes(),
+        *blob.blob_id().as_bytes(),
+        layout.total_encoded_len(),
         checkpoint.durable_encoded_offset,
         checkpoint.generation,
         expected_custody_digest,
@@ -890,9 +1450,17 @@ pub(super) async fn receive(
                     .min(layout.total_encoded_len()),
             );
             greatest_receive_limit = greatest_receive_limit.max(new_limit);
-            Ok((next.durable_encoded_offset, next.generation, new_limit))
+            Ok(crate::stream_transfer::StreamCheckpointAuthorityV1 {
+                durable_plaintext_offset: next.durable_encoded_offset,
+                durable_ciphertext_offset: next.durable_encoded_offset,
+                next_segment_index: next.next_carrier_index,
+                plaintext_commitment: [1; 32],
+                ciphertext_commitment: [1; 32],
+                checkpoint_generation: next.generation,
+                absolute_receive_limit: new_limit,
+            })
         },
-        |_| {
+        |_, _| {
             guard.check(store)?;
             let mut work = Vec::new();
             let disposition = recover_and_finalize_pending_blob(
@@ -921,7 +1489,8 @@ pub(super) async fn receive(
                     StreamResultCode::DeferredCapacity
                 }
             };
-            Ok((code, result_digest(source, manifest_digest, code)))
+            let digest = result_digest(source, manifest_digest, code);
+            Ok((code, digest, digest))
         },
     )
     .await?;
@@ -994,6 +1563,8 @@ pub(super) async fn drive_receiver_attempt<P, M>(
     direction: EventDirection,
     expected_nonce: [u8; 32],
     expected_transfer: [u8; 32],
+    expected_open_digest: [u8; 32],
+    expected_total_len: u64,
     durable_offset: u64,
     checkpoint_generation: u64,
     expected_custody_digest: Option<[u8; 32]>,
@@ -1004,8 +1575,14 @@ pub(super) async fn drive_receiver_attempt<P, M>(
     mut promote: M,
 ) -> Result<StreamResultCode, NodeError>
 where
-    P: FnMut(&StreamOpenV1, &[StreamDataV1]) -> Result<(u64, u64, u64), NodeError>,
-    M: FnMut(&StreamOpenV1) -> Result<(StreamResultCode, [u8; 32]), NodeError>,
+    P: FnMut(
+        &StreamOpenV1,
+        &[StreamDataV1],
+    ) -> Result<crate::stream_transfer::StreamCheckpointAuthorityV1, NodeError>,
+    M: FnMut(
+        &StreamOpenV1,
+        &crate::stream_transfer::StreamFinishV1,
+    ) -> Result<(StreamResultCode, [u8; 32], [u8; 32]), NodeError>,
 {
     if max_extent_bytes == 0
         || max_extent_bytes as usize > MAX_STREAM_EXTENT_BYTES
@@ -1019,7 +1596,7 @@ where
         .await
         .map_err(transport)?
         .ok_or_else(|| protocol("data stream closed before open"))?;
-    let StreamFrame::Open(open) = open_control(
+    let StreamFrame::Open(mut open) = open_control(
         mission,
         profile_digest,
         direction,
@@ -1031,12 +1608,14 @@ where
     };
     if open.attempt_nonce != expected_nonce
         || open.transfer_id != expected_transfer
+        || open.open_digest != expected_open_digest
         || open.session_transcript != mission.session_id()
         || open.direction != expected_direction(direction)
         || open.checkpoint_generation != checkpoint_generation
     {
         return Err(protocol("open authority differs from expected transfer"));
     }
+    open.total_len = expected_total_len;
     require_stream_open_custody_digest(expected_custody_digest, open.custody_digest)?;
     let mut state = StreamReceiverState::new(
         &open,
@@ -1080,13 +1659,12 @@ where
                     .ok_or_else(|| protocol("receiver batch byte overflow"))?;
                 if !pending.is_empty() && combined > u64::from(checkpoint_batch_bytes) {
                     let prior_through = data.offset;
-                    let (durable, generation, new_limit) = persist_batch(&open, &pending)?;
-                    if durable != prior_through {
+                    let authority = persist_batch(&open, &pending)?;
+                    if authority.durable_ciphertext_offset > prior_through {
                         return Err(protocol("Store checkpoint differs from received batch"));
                     }
-                    let StreamAction::Send(checkpoint) = state
-                        .persisted(durable, generation, new_limit)
-                        .map_err(protocol)?
+                    let StreamAction::Send(checkpoint) =
+                        state.persisted_authority(authority).map_err(protocol)?
                     else {
                         return Err(protocol(
                             "receiver produced an invalid checkpoint transition",
@@ -1108,13 +1686,15 @@ where
                     .ok_or_else(|| protocol("receiver batch byte overflow"))?;
                 pending.push(data);
                 if pending_bytes >= u64::from(checkpoint_batch_bytes) || through == open.total_len {
-                    let (durable, generation, new_limit) = persist_batch(&open, &pending)?;
-                    if durable != through {
+                    let authority = persist_batch(&open, &pending)?;
+                    if authority.durable_ciphertext_offset > through
+                        || (through == open.total_len
+                            && authority.durable_ciphertext_offset != through)
+                    {
                         return Err(protocol("Store checkpoint differs from received batch"));
                     }
-                    let StreamAction::Send(checkpoint) = state
-                        .persisted(durable, generation, new_limit)
-                        .map_err(protocol)?
+                    let StreamAction::Send(checkpoint) =
+                        state.persisted_authority(authority).map_err(protocol)?
                     else {
                         return Err(protocol(
                             "receiver produced an invalid checkpoint transition",
@@ -1136,11 +1716,13 @@ where
                 if !pending.is_empty() {
                     return Err(protocol("finish crossed an uncommitted receiver batch"));
                 }
+                let finish_authority = finish.clone();
                 let (result, code) = match state.finish(finish).map_err(protocol)? {
                     StreamAction::Promote => {
-                        let (code, digest) = promote(&open)?;
-                        let StreamAction::Send(result) =
-                            state.promoted(code, digest).map_err(protocol)?
+                        let (code, blob_id, digest) = promote(&open, &finish_authority)?;
+                        let StreamAction::Send(result) = state
+                            .promoted_blob(code, blob_id, digest)
+                            .map_err(protocol)?
                         else {
                             return Err(protocol("receiver produced an invalid result transition"));
                         };
@@ -1286,6 +1868,35 @@ impl BlobStreamProgress {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_blob_stream_v9_data_record_is_direct_and_explicitly_typed() {
+        let frame = StreamFrame::Data(StreamDataV1 {
+            transfer_id: [0x11; 32],
+            attempt_nonce: [0x22; 32],
+            sequence: 3,
+            offset: 1_048_576,
+            bytes: vec![0x33; 64],
+        });
+        let encoded = encode_direct_data_record(frame.clone()).expect("encode direct data");
+        assert_eq!(encoded.first(), Some(&ATTEMPT_DIRECT_DATA_RECORD));
+        assert_eq!(
+            decode_direct_data_record(&encoded).expect("decode direct data"),
+            frame
+        );
+    }
+
+    #[test]
+    fn completed_pack_flow_uses_the_full_bounded_data_extent() {
+        let record = EncryptedBlobStreamSegment::packed_wire_len(
+            aster_mesh::BLOB_STREAM_SEGMENT_BYTES as u64,
+            1,
+        )
+        .expect("record length");
+        let (maximum, _, _) = pack_attempt_flow(record * 2).expect("pack flow");
+        assert_eq!(maximum as usize, MAX_STREAM_EXTENT_BYTES);
+        assert!(u64::from(maximum) < record);
+    }
 
     #[test]
     fn live_blob_stream_v9_open_requires_exact_finite_custody_digest() {

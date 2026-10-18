@@ -1,8 +1,8 @@
 //! Profile-5 whole-carrier stream layout, batching, and durable checkpoints.
 
 use super::pack::{
-    BlobPackCheckpoint, BlobPackCompletion, BlobPackReader, BlobPackWriter, PinnedBlobPackRoot,
-    delete_blob_pack, recover_blob_pack,
+    BlobPackCheckpoint, BlobPackCompletion, BlobPackReader, BlobPackWriter, PACK_HEADER_LEN,
+    PinnedBlobPackRoot, delete_blob_pack, recover_blob_pack,
 };
 use super::*;
 use aster_mesh::{
@@ -120,11 +120,18 @@ impl BlobStreamPublication {
     pub const fn pack_len(&self) -> u64 {
         self.pack_len
     }
+
+    /// Exact length of the length-prefixed encrypted segment records. The
+    /// receiver recreates the canonical fixed pack header locally.
+    pub const fn wire_len(&self) -> u64 {
+        self.pack_len - PACK_HEADER_LEN
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct BlobStreamCryptoResume {
     progress: BlobStreamDurableProgress,
+    plaintext_checkpoint: aster_mesh::BlobStreamAccumulatorCheckpoint,
     ciphertext_checkpoint: aster_mesh::BlobStreamAccumulatorCheckpoint,
 }
 
@@ -135,6 +142,10 @@ impl BlobStreamCryptoResume {
 
     pub fn ciphertext_checkpoint(&self) -> aster_mesh::BlobStreamAccumulatorCheckpoint {
         self.ciphertext_checkpoint.clone()
+    }
+
+    pub fn plaintext_checkpoint(&self) -> aster_mesh::BlobStreamAccumulatorCheckpoint {
+        self.plaintext_checkpoint.clone()
     }
 }
 
@@ -172,6 +183,7 @@ impl BlobStreamPackSession {
     pub fn crypto_resume(&self) -> BlobStreamCryptoResume {
         BlobStreamCryptoResume {
             progress: self.progress,
+            plaintext_checkpoint: self.writer.plaintext_checkpoint(),
             ciphertext_checkpoint: self.writer.ciphertext_checkpoint(),
         }
     }
@@ -182,6 +194,16 @@ impl BlobStreamPackSession {
         segment: &aster_mesh::EncryptedBlobStreamSegment,
     ) -> Result<(), StoreError> {
         self.writer.append_segment(plaintext, segment)
+    }
+
+    pub fn append_encoded_segment(
+        &mut self,
+        plaintext: &[u8],
+        segment: &aster_mesh::EncryptedBlobStreamSegment,
+        encoded: &[u8],
+    ) -> Result<(), StoreError> {
+        self.writer
+            .append_encoded_segment(plaintext, segment, encoded)
     }
 
     pub fn checkpoint(
@@ -947,6 +969,34 @@ fn stream_publication_matches(
 }
 
 impl Store {
+    /// Returns completed pack-backed stream publications from one settled
+    /// control-policy snapshot. Callers must still apply their peer-specific
+    /// route/content authorization before disclosing an entry.
+    pub fn blob_stream_publications_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+    ) -> Result<Vec<BlobStreamPublication>, StoreError> {
+        self.require_live()?;
+        let authority = self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        require_control_policy_read(&read, authority, policy)?;
+        let publications = read.open_table(BLOB_STREAM_PUBLICATIONS)?;
+        let mut completed = Vec::with_capacity(
+            usize::try_from(publications.len()?)
+                .map_err(|_| StoreError::ItemCountAccountingOverflow)?,
+        );
+        for row in publications.iter()? {
+            let (_, encoded) = row?;
+            let publication = CompletedBlobStream::decode(encoded.value())?;
+            if publication.open.mission_id() != &authority {
+                return Err(provisional_schema_error());
+            }
+            completed.push(publication);
+        }
+        completed.sort_unstable_by_key(|publication| publication.acceptance_marker());
+        Ok(completed)
+    }
+
     /// Selects the newest completed stream publication for exact immutable content.
     pub fn blob_stream_for_content_with_policy(
         &self,

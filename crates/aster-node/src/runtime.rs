@@ -149,7 +149,8 @@ use crate::{
     },
     format_node_id, format_path_field, format_receipt_field,
     frame::{
-        BlobInterest, BlobInterestSelector, BlobObjectId, BlobRangeDisposition, BlobStreamPlanV1,
+        BlobInterest, BlobInterestSelector, BlobObjectId, BlobPublicationAbsentV1,
+        BlobPublicationCommitV1, BlobPublicationOpenV1, BlobRangeDisposition,
         BridgeRouteDisposition, EventApplyDisposition, EventDirection, EventInterest,
         EventInterestSelector, Frame, FrameEmissionPolicy, MAX_EVENT_INTEREST_BYTES,
         MAX_OBJECT_BYTES, MutableApplyDisposition, MutableClass, MutableTransferId,
@@ -25884,6 +25885,148 @@ struct BlobClassExchange {
     to_initiator_admission: Option<DeferredFiniteBlobStreamAdmission>,
 }
 
+async fn request_completed_pack_publication(
+    connection: &aster_iroh::Connection,
+    mission: &mut MissionSession,
+    direction: EventDirection,
+    source: Option<&blob_stream::CompletedPackStreamSource>,
+    receipt: &mut PeerReceipt,
+) -> Result<bool, NodeError> {
+    let Some(source) = source else {
+        let absent = BlobPublicationAbsentV1 { direction };
+        let response = request_mission_frame(
+            connection,
+            mission,
+            Frame::BlobPublicationAbsent(absent),
+            receipt,
+        )
+        .await?;
+        if response != Frame::BlobPublicationAbsent(absent) {
+            return Err(NodeError::Protocol(
+                "absent Blob publication acknowledgement differs".into(),
+            ));
+        }
+        return Ok(false);
+    };
+
+    let signed_open = source.publication.authenticated_open().to_vec();
+    let response = request_mission_frame(
+        connection,
+        mission,
+        Frame::BlobPublicationOpen(BlobPublicationOpenV1 {
+            signed_open: signed_open.clone(),
+        }),
+        receipt,
+    )
+    .await?;
+    if response
+        != Frame::BlobPublicationOpen(BlobPublicationOpenV1 {
+            signed_open: signed_open.clone(),
+        })
+    {
+        return Err(NodeError::Protocol(
+            "Blob publication-open acknowledgement differs".into(),
+        ));
+    }
+    let signed_commitment = source.publication.authenticated_commitment().to_vec();
+    let response = request_mission_frame(
+        connection,
+        mission,
+        Frame::BlobPublicationCommit(BlobPublicationCommitV1 {
+            signed_commitment: signed_commitment.clone(),
+        }),
+        receipt,
+    )
+    .await?;
+    if response != Frame::BlobPublicationCommit(BlobPublicationCommitV1 { signed_commitment }) {
+        return Err(NodeError::Protocol(
+            "Blob publication-commit acknowledgement differs".into(),
+        ));
+    }
+    Ok(true)
+}
+
+async fn respond_completed_pack_publication(
+    store: &Store,
+    connection: &aster_iroh::Connection,
+    mission: &mut MissionSession,
+    verifier: &ReferenceEnvelopeSealer,
+    guard: &EventLaneGuard,
+    direction: EventDirection,
+    local_interest: &BlobInterest,
+    receipt: &mut PeerReceipt,
+) -> Result<Option<blob_stream::ReceivedPackStream>, NodeError> {
+    let mut signed_open = None;
+    let mut absent = false;
+    let wire_budget = exchange_wire_budget(receipt)?;
+    let (complete, request_bytes, response_bytes) = respond_mission_frame(
+        connection,
+        mission,
+        wire_budget,
+        |frame, _, _| match frame {
+            Frame::BlobPublicationAbsent(received) if received.direction == direction => {
+                absent = true;
+                Ok((Frame::BlobPublicationAbsent(received), true))
+            }
+            Frame::BlobPublicationOpen(open) => {
+                signed_open = Some(open.signed_open.clone());
+                Ok((Frame::BlobPublicationOpen(open), false))
+            }
+            _ => Err(NodeError::Protocol(
+                "Blob publication phase received an invalid first record".into(),
+            )),
+        },
+    )
+    .await?;
+    account(receipt, request_bytes, response_bytes)?;
+    if absent {
+        if !complete {
+            return Err(NodeError::Protocol(
+                "absent Blob publication did not complete its phase".into(),
+            ));
+        }
+        return Ok(None);
+    }
+    if complete {
+        return Err(NodeError::Protocol(
+            "Blob publication open completed before commitment".into(),
+        ));
+    }
+    let signed_open = signed_open
+        .ok_or_else(|| NodeError::Protocol("Blob publication phase lost its signed open".into()))?;
+
+    let mut admitted = None;
+    let wire_budget = exchange_wire_budget(receipt)?;
+    let (complete, request_bytes, response_bytes) =
+        respond_mission_frame(connection, mission, wire_budget, |frame, _, mission| {
+            let Frame::BlobPublicationCommit(commitment) = frame else {
+                return Err(NodeError::Protocol(
+                    "Blob publication open was not followed by commitment".into(),
+                ));
+            };
+            admitted = Some(blob_stream::admit_completed_pack_source(
+                store,
+                mission,
+                verifier,
+                guard,
+                local_interest,
+                &signed_open,
+                &commitment.signed_commitment,
+            )?);
+            Ok((Frame::BlobPublicationCommit(commitment), true))
+        })
+        .await?;
+    account(receipt, request_bytes, response_bytes)?;
+    if !complete {
+        return Err(NodeError::Protocol(
+            "Blob publication commitment did not complete its phase".into(),
+        ));
+    }
+    admitted
+        .map(Some)
+        .ok_or_else(|| NodeError::Protocol("Blob publication admission was not retained".into()))
+}
+
 async fn sync_mutable_class(
     store: &Store,
     connection: &aster_iroh::Connection,
@@ -26074,93 +26217,64 @@ async fn sync_mutable_classes(
             let profile_digest = receipt.transfer_profile_digest.ok_or_else(|| {
                 NodeError::Protocol("Blob stream profile digest is missing".into())
             })?;
-            let query = BlobStreamPlanV1 {
-                direction: EventDirection::ToSessionResponder,
-                selection: None,
-            };
-            let response =
-                request_mission_frame(connection, mission, Frame::BlobStreamPlan(query), receipt)
-                    .await?;
-            let Frame::BlobStreamPlanReply(to_responder) = response else {
-                return Err(NodeError::Protocol(
-                    "Blob stream plan query received another response".into(),
-                ));
-            };
-            if to_responder.direction != EventDirection::ToSessionResponder {
-                return Err(NodeError::Protocol(
-                    "Blob stream plan reply crossed directions".into(),
-                ));
-            }
-            if let Some(selection) = to_responder.selection {
-                let settlement = blob_stream_cursor_settlement(
-                    store,
-                    mission.peer().mission_id(),
-                    EventDirection::ToSessionResponder,
-                    selection.source_id,
-                    exchange.to_responder.take(),
-                )?;
-                let outcome = blob_stream::send(
+            let to_responder = blob_stream::select_completed_pack_source(
+                store,
+                mission,
+                verifier,
+                guard,
+                &exchange.peer_interest,
+            )?;
+            if request_completed_pack_publication(
+                connection,
+                mission,
+                EventDirection::ToSessionResponder,
+                to_responder.as_ref(),
+                receipt,
+            )
+            .await?
+            {
+                let outcome = Box::pin(blob_stream::send_completed_pack(
                     store,
                     connection,
                     mission,
-                    verifier,
                     guard,
                     EventDirection::ToSessionResponder,
-                    selection,
-                    &exchange.peer_interest,
+                    to_responder.expect("advertised completed pack source"),
                     profile_digest,
-                )
+                ))
                 .await?;
                 receipt.account_blob_stream_attempt(outcome)?;
-                settlement.settle(store)?;
-            } else if let Some(settlement) = exchange.to_responder.take() {
-                settlement.settle(store)?;
             }
-            let to_initiator = blob_stream::select_receive_plan(
+            let to_initiator = respond_completed_pack_publication(
                 store,
+                connection,
+                mission,
                 verifier,
                 guard,
                 EventDirection::ToSessionInitiator,
                 &exchange.local_interest,
-                exchange.to_initiator_admission.as_ref(),
-            )?;
-            let response = request_mission_frame(
-                connection,
-                mission,
-                Frame::BlobStreamPlan(to_initiator),
                 receipt,
             )
             .await?;
-            if response != Frame::BlobStreamPlanReply(to_initiator) {
-                return Err(NodeError::Protocol(
-                    "Blob stream plan acknowledgement differs".into(),
-                ));
-            }
-            if let Some(selection) = to_initiator.selection {
-                let settlement = blob_stream_cursor_settlement(
-                    store,
-                    mission.peer().mission_id(),
-                    EventDirection::ToSessionInitiator,
-                    selection.source_id,
-                    exchange.to_initiator.take(),
-                )?;
-                let outcome = blob_stream::receive(
+            if let Some(received) = to_initiator {
+                let outcome = Box::pin(blob_stream::receive_completed_pack(
                     store,
                     connection,
                     mission,
-                    verifier,
                     guard,
                     EventDirection::ToSessionInitiator,
-                    selection,
+                    received,
                     profile_digest,
-                    exchange.to_initiator_admission.take(),
-                )
+                ))
                 .await?;
                 receipt.account_blob_stream_attempt(outcome)?;
-                settlement.settle(store)?;
-            } else if let Some(settlement) = exchange.to_initiator.take() {
-                settlement.settle(store)?;
             }
+            let _ = (
+                exchange.to_responder.take(),
+                exchange.to_initiator.take(),
+                exchange.to_responder_admission.take(),
+                exchange.to_initiator_admission.take(),
+            );
             return Ok(());
         }
         // Carrier recovery is symmetric and direction-ordered: the initiator
@@ -29209,107 +29323,64 @@ async fn serve_mutable_classes(
             let profile_digest = receipt.transfer_profile_digest.ok_or_else(|| {
                 NodeError::Protocol("Blob stream profile digest is missing".into())
             })?;
-            let wire_budget = exchange_wire_budget(receipt)?;
-            let mut to_responder = None;
-            let (complete, request_bytes, response_bytes) =
-                respond_mission_frame(connection, mission, wire_budget, |frame, _, _| {
-                    let Frame::BlobStreamPlan(query) = frame else {
-                        return Err(NodeError::Protocol(
-                            "Blob stream plan phase received another request".into(),
-                        ));
-                    };
-                    if query
-                        != (BlobStreamPlanV1 {
-                            direction: EventDirection::ToSessionResponder,
-                            selection: None,
-                        })
-                    {
-                        return Err(NodeError::Protocol(
-                            "Blob stream responder plan query differs".into(),
-                        ));
-                    }
-                    let plan = blob_stream::select_receive_plan(
-                        store,
-                        verifier,
-                        guard,
-                        EventDirection::ToSessionResponder,
-                        &exchange.local_interest,
-                        exchange.to_responder_admission.as_ref(),
-                    )?;
-                    to_responder = plan.selection;
-                    Ok((Frame::BlobStreamPlanReply(plan), true))
-                })
-                .await?;
-            if !complete {
-                return Err(NodeError::Protocol(
-                    "Blob stream responder plan did not complete".into(),
-                ));
-            }
-            account(receipt, request_bytes, response_bytes)?;
-            if let Some(selection) = to_responder {
-                let outcome = blob_stream::receive(
+            let to_responder = respond_completed_pack_publication(
+                store,
+                connection,
+                mission,
+                verifier,
+                guard,
+                EventDirection::ToSessionResponder,
+                &exchange.local_interest,
+                receipt,
+            )
+            .await?;
+            if let Some(received) = to_responder {
+                let outcome = Box::pin(blob_stream::receive_completed_pack(
                     store,
                     connection,
                     mission,
-                    verifier,
                     guard,
                     EventDirection::ToSessionResponder,
-                    selection,
+                    received,
                     profile_digest,
-                    exchange.to_responder_admission.take(),
-                )
+                ))
                 .await?;
                 receipt.account_blob_stream_attempt(outcome)?;
             }
-            let wire_budget = exchange_wire_budget(receipt)?;
-            let mut to_initiator = None;
-            let (complete, request_bytes, response_bytes) =
-                respond_mission_frame(connection, mission, wire_budget, |frame, _, mission| {
-                    let Frame::BlobStreamPlan(plan) = frame else {
-                        return Err(NodeError::Protocol(
-                            "Blob stream plan phase received another request".into(),
-                        ));
-                    };
-                    if plan.direction != EventDirection::ToSessionInitiator {
-                        return Err(NodeError::Protocol(
-                            "Blob stream initiator plan crossed directions".into(),
-                        ));
-                    }
-                    if let Some(selection) = plan.selection {
-                        blob_stream::validate_send_plan(
-                            store,
-                            mission,
-                            verifier,
-                            guard,
-                            selection,
-                            &exchange.peer_interest,
-                        )?;
-                    }
-                    to_initiator = plan.selection;
-                    Ok((Frame::BlobStreamPlanReply(plan), true))
-                })
-                .await?;
-            if !complete {
-                return Err(NodeError::Protocol(
-                    "Blob stream initiator plan did not complete".into(),
-                ));
-            }
-            account(receipt, request_bytes, response_bytes)?;
-            if let Some(selection) = to_initiator {
-                let outcome = blob_stream::send(
+            let to_initiator = blob_stream::select_completed_pack_source(
+                store,
+                mission,
+                verifier,
+                guard,
+                &exchange.peer_interest,
+            )?;
+            if request_completed_pack_publication(
+                connection,
+                mission,
+                EventDirection::ToSessionInitiator,
+                to_initiator.as_ref(),
+                receipt,
+            )
+            .await?
+            {
+                let outcome = Box::pin(blob_stream::send_completed_pack(
                     store,
                     connection,
                     mission,
-                    verifier,
                     guard,
                     EventDirection::ToSessionInitiator,
-                    selection,
-                    &exchange.peer_interest,
+                    to_initiator.expect("advertised completed pack source"),
                     profile_digest,
-                )
+                ))
                 .await?;
                 receipt.account_blob_stream_attempt(outcome)?;
             }
+            let _ = (
+                exchange.to_responder.take(),
+                exchange.to_initiator.take(),
+                exchange.to_responder_admission.take(),
+                exchange.to_initiator_admission.take(),
+            );
             return Ok(());
         }
         // Mirror the initiator's fixed order without role-dependent carrier
@@ -50068,6 +50139,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn blob_stream_provisional_contact_uses_publisher_signed_stream_authority() {
+        let mut missions = issue_missions(2);
+        let source_mission = missions.pop().unwrap();
+        let receiver_mission = missions.pop().unwrap();
+        let authority = source_mission.credentials.mission_authority_id();
+        let topic = Topic::new("opaque").unwrap();
+        let scope = Scope::new("test/runtime-contact").unwrap();
+        let interests = || {
+            MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
+                topic.clone(),
+                scope.clone(),
+                false,
+            )])
+        };
+        let source_root = root("blob-stream-provisional-source");
+        let receiver_root = root("blob-stream-provisional-receiver");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::create_dir_all(&receiver_root).unwrap();
+        #[cfg(unix)]
+        {
+            fs::set_permissions(&source_root, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::set_permissions(&receiver_root, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        let offline = start_node(NodeConfig {
+            state: source_root.clone(),
+            bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+            mission: source_mission.credentials.clone(),
+            peers: Vec::new(),
+            mutable_interests: Default::default(),
+            sync_interval: Duration::from_millis(10),
+            run_for: None,
+            application: NodeApplication::Relay,
+        })
+        .await
+        .expect("start provisional stream source");
+        let total_len = 2 * aster_mesh::BLOB_STREAM_SEGMENT_BYTES;
+        let mut stream = offline
+            .selected_blobs()
+            .open_publish_stream(crate::application::BlobPublishStreamRequest {
+                publication: live_blob_request(b"runtime/provisional-contact", &topic, &scope),
+                options: crate::application::BlobPublishOptions::durable(),
+                total_len: total_len as u64,
+            })
+            .await
+            .expect("open provisional source stream");
+        stream
+            .write(
+                0,
+                zeroize::Zeroizing::new(vec![0x71; aster_mesh::BLOB_STREAM_SEGMENT_BYTES]),
+            )
+            .await
+            .expect("write first provisional segment");
+        stream
+            .write(
+                aster_mesh::BLOB_STREAM_SEGMENT_BYTES as u64,
+                zeroize::Zeroizing::new(vec![0x72; aster_mesh::BLOB_STREAM_SEGMENT_BYTES]),
+            )
+            .await
+            .expect("write second provisional segment");
+        let published = stream.finish().await.expect("promote source stream");
+        offline.shutdown().await.expect("stop provisional source");
+
+        let source_store =
+            Arc::new(Store::open_for_mission(source_root.join(STORE_FILE), authority).unwrap());
+        let receiver_store =
+            Arc::new(Store::open_for_mission(receiver_root.join(STORE_FILE), authority).unwrap());
+        let (received, sent, _, _) = TEST_SEMANTIC_VERSION
+            .scope(
+                std::cell::Cell::new(Some(SEMANTIC_PROTOCOL_V9)),
+                blob_contact_test_pair(
+                    source_store.clone(),
+                    source_mission.credentials,
+                    interests(),
+                    receiver_store.clone(),
+                    receiver_mission.credentials,
+                    interests(),
+                ),
+            )
+            .await;
+        assert_eq!(received.blob_stream_attempts, 1);
+        assert_eq!(sent.blob_stream_attempts, 1);
+        let policy = receiver_store.control_policy_snapshot().unwrap();
+        let received = receiver_store
+            .blob_stream_for_content_with_policy(
+                &policy,
+                &topic,
+                &scope,
+                aster_mesh::BlobId::from_bytes(*published.id.as_bytes()),
+            )
+            .unwrap()
+            .expect("receiver promotes publisher-signed stream publication");
+        assert_eq!(received.authenticated_open().len() > 32, true);
+        assert_eq!(received.authenticated_commitment().len() > 32, true);
+
+        drop(source_store);
+        drop(receiver_store);
+        fs::remove_dir_all(source_root).unwrap();
+        fs::remove_dir_all(receiver_root).unwrap();
+    }
+
+    #[tokio::test]
     async fn live_blob_stream_v9_completes_retained_sixteen_mib_shape_in_one_contact() {
         let mut missions = issue_missions(2);
         let source_mission = missions.pop().unwrap();
@@ -50086,24 +50259,64 @@ mod tests {
         let receiver_root = root("blob-stream-v9-receiver-16mib");
         fs::create_dir_all(&source_root).unwrap();
         fs::create_dir_all(&receiver_root).unwrap();
-        let source_store =
-            Arc::new(Store::open_for_mission(source_root.join(STORE_FILE), authority).unwrap());
-        let receiver_store =
-            Arc::new(Store::open_for_mission(receiver_root.join(STORE_FILE), authority).unwrap());
+        #[cfg(unix)]
+        {
+            fs::set_permissions(&source_root, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::set_permissions(&receiver_root, fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let size_mib = std::env::var("ASTER_TEST_BLOB_STREAM_MIB")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|value| (1..=256).contains(value))
             .unwrap_or(16);
         let plaintext = vec![0x5a; size_mib * 1_048_576];
-        let source = publish_test_blob(
-            &source_store,
-            &mut open_test_sealer(&source_mission.credentials),
-            &topic,
-            &scope,
-            1,
-            &plaintext,
-        );
+        let offline = start_node(NodeConfig {
+            state: source_root.clone(),
+            bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+            mission: source_mission.credentials.clone(),
+            peers: Vec::new(),
+            mutable_interests: Default::default(),
+            sync_interval: Duration::from_millis(10),
+            run_for: None,
+            application: NodeApplication::Relay,
+        })
+        .await
+        .expect("start stream benchmark source");
+        let mut stream = offline
+            .selected_blobs()
+            .open_publish_stream(crate::application::BlobPublishStreamRequest {
+                publication: live_blob_request(b"runtime/stream-benchmark", &topic, &scope),
+                options: crate::application::BlobPublishOptions::durable(),
+                total_len: plaintext.len() as u64,
+            })
+            .await
+            .expect("open stream benchmark publication");
+        for (index, segment) in plaintext
+            .chunks(aster_mesh::BLOB_STREAM_SEGMENT_BYTES)
+            .enumerate()
+        {
+            stream
+                .write(
+                    (index * aster_mesh::BLOB_STREAM_SEGMENT_BYTES) as u64,
+                    zeroize::Zeroizing::new(segment.to_vec()),
+                )
+                .await
+                .expect("write stream benchmark segment");
+        }
+        let published = stream
+            .finish()
+            .await
+            .expect("finish stream benchmark source");
+        offline
+            .shutdown()
+            .await
+            .expect("stop stream benchmark source");
+
+        let source_store =
+            Arc::new(Store::open_for_mission(source_root.join(STORE_FILE), authority).unwrap());
+        let receiver_store =
+            Arc::new(Store::open_for_mission(receiver_root.join(STORE_FILE), authority).unwrap());
+        let receiver_credentials = receiver_mission.credentials.clone();
         let started = std::time::Instant::now();
         let (received, sent, _, _) = TEST_SEMANTIC_VERSION
             .scope(
@@ -50118,12 +50331,19 @@ mod tests {
                 ),
             )
             .await;
+        let contact_elapsed = started.elapsed();
         assert_eq!(received.semantic_version, SEMANTIC_PROTOCOL_V9);
         assert_eq!(sent.semantic_version, SEMANTIC_PROTOCOL_V9);
-        assert!(
-            receiver_store.get_blob(source).unwrap().is_some(),
-            "profile-5 transfer did not promote the exact publication"
-        );
+        let policy = receiver_store.control_policy_snapshot().unwrap();
+        let publication = receiver_store
+            .blob_stream_for_content_with_policy(
+                &policy,
+                &topic,
+                &scope,
+                aster_mesh::BlobId::from_bytes(*published.id.as_bytes()),
+            )
+            .unwrap()
+            .expect("profile-5 transfer promotes the exact stream publication");
         assert_eq!(received.blob_ranges_fetched, 0);
         assert_eq!(sent.blob_ranges_fetched, 0);
         assert_eq!(received.blob_stream_attempts, 1);
@@ -50144,20 +50364,44 @@ mod tests {
         assert!(received.blob_stream_receive_limit_bytes >= plaintext.len() as u64);
         assert!(received.blob_stream_writer_commits > 0);
         assert_eq!(sent.blob_stream_received_bytes, 0);
-        assert_eq!(
-            receiver_store
-                .mutable_transfer_cursor(
-                    source_mission.identity,
-                    MutableTransferCursorClass::Blob,
-                    MutableTransferCursorMode::FetchFromPeer,
-                )
-                .unwrap(),
-            Some(*source.as_bytes()),
-            "profile-5 metadata cursor advances only after settled stream completion"
-        );
+        let verifier = open_test_sealer(&receiver_credentials);
+        let open = verifier
+            .verify_blob_stream_open(publication.authenticated_open())
+            .expect("verify received stream open");
+        let commitment = verifier
+            .verify_blob_stream_commitment(&open, publication.authenticated_commitment())
+            .expect("verify received stream commitment");
+        let mut reader = receiver_store
+            .open_blob_stream_read_session_with_policy(&policy, &publication, &open, &commitment)
+            .expect("open received stream pack");
+        let mut decryptor = verifier
+            .begin_blob_stream_decrypt(&open)
+            .expect("open received stream decryptor");
+        let mut actual = Vec::with_capacity(plaintext.len());
+        while let Some(encoded) = reader
+            .next_encrypted_segment()
+            .expect("read stream segment")
+        {
+            let segment = aster_mesh::EncryptedBlobStreamSegment::decode(&encoded)
+                .expect("decode received stream segment");
+            actual.extend_from_slice(
+                &decryptor
+                    .decrypt_segment(&segment)
+                    .expect("decrypt received stream segment"),
+            );
+        }
+        decryptor
+            .finish(&commitment)
+            .expect("authenticate received stream completion");
+        assert_eq!(actual, plaintext);
         eprintln!(
-            "live_blob_stream_v9 bytes={} elapsed_ms={}",
+            "live_blob_stream_v9 bytes={} contact_ms={} verified_read_ms={} total_ms={}",
             plaintext.len(),
+            contact_elapsed.as_millis(),
+            started
+                .elapsed()
+                .saturating_sub(contact_elapsed)
+                .as_millis(),
             started.elapsed().as_millis()
         );
         drop(source_store);

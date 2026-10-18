@@ -355,14 +355,45 @@ pub struct EncryptedBlobStreamSegment {
 }
 
 impl EncryptedBlobStreamSegment {
+    const FIXED_ENCODED_BYTES: u64 =
+        (8 + 2 + 32 + 32 + 8 + 8 + 4 + 4 + 8 + 8 + 32 + GCM_NONCE_BYTES) as u64;
+
+    /// Exact wire length of canonical length-prefixed encrypted records for a
+    /// completed stream. This excludes the local pack header.
+    pub fn packed_wire_len(total_plaintext: u64, segment_count: u64) -> Option<u64> {
+        let per_segment = Self::FIXED_ENCODED_BYTES
+            .checked_add(GCM_TAG_BYTES as u64)?
+            .checked_add(4)?;
+        total_plaintext.checked_add(segment_count.checked_mul(per_segment)?)
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let mut encoded = self.aad();
         encoded.extend_from_slice(&self.ciphertext);
         encoded
     }
 
+    /// Verifies that bytes already admitted by the decoder are the canonical
+    /// encoding of this segment without allocating another ciphertext-sized
+    /// buffer.
+    pub fn validate_encoding(&self, encoded: &[u8]) -> Result<(), BlobError> {
+        let aad = self.aad();
+        let expected_len = aad
+            .len()
+            .checked_add(self.ciphertext.len())
+            .ok_or(BlobError::LengthOverflow)?;
+        if encoded.len() != expected_len
+            || encoded.get(..aad.len()) != Some(aad.as_slice())
+            || encoded.get(aad.len()..) != Some(self.ciphertext.as_slice())
+        {
+            return Err(BlobError::InvalidManifest);
+        }
+        Ok(())
+    }
+
     pub fn decode(encoded: &[u8]) -> Result<Self, BlobError> {
-        let fixed = 8 + 2 + 32 + 32 + 8 + 8 + 4 + 4 + 8 + 8 + 32 + GCM_NONCE_BYTES;
+        let fixed =
+            usize::try_from(Self::FIXED_ENCODED_BYTES).map_err(|_| BlobError::LengthOverflow)?;
         if encoded.len() < fixed + GCM_TAG_BYTES
             || encoded.len() > fixed + BLOB_STREAM_SEGMENT_BYTES + GCM_TAG_BYTES
         {
@@ -942,6 +973,11 @@ impl BlobStreamAccumulatorCheckpoint {
 
     pub const fn total_len(&self) -> u64 {
         self.total_len
+    }
+
+    /// Stable commitment carried by profile-5 resume/checkpoint records.
+    pub fn commitment(&self) -> [u8; 32] {
+        checkpoint_commitment(self)
     }
 
     /// Encodes a constant-sized checkpoint independent of Blob length.

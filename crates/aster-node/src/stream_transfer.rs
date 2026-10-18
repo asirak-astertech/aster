@@ -1001,22 +1001,7 @@ impl StreamReceiverState {
         generation: u64,
         new_limit: u64,
     ) -> Result<StreamAction, StreamError> {
-        if through < self.durable
-            || through > self.received
-            || generation < self.generation
-            || ((through == self.durable) != (generation == self.generation))
-            || new_limit < self.limit
-            || new_limit > self.total
-        {
-            return Err(StreamError::invalid("invalid durable checkpoint"));
-        }
-        self.durable = through;
-        self.generation = generation;
-        self.limit = new_limit;
-        let f = StreamCheckpointV1 {
-            transfer_id: self.transfer_id,
-            attempt_nonce: self.nonce,
-            sequence: self.send_sequence,
+        self.persisted_authority(StreamCheckpointAuthorityV1 {
             durable_plaintext_offset: through,
             durable_ciphertext_offset: through,
             next_segment_index: through.div_ceil(MAX_STREAM_EXTENT_BYTES as u64),
@@ -1024,6 +1009,49 @@ impl StreamReceiverState {
             ciphertext_commitment: [1; 32],
             checkpoint_generation: generation,
             absolute_receive_limit: new_limit,
+        })
+    }
+    pub(crate) fn persisted_authority(
+        &mut self,
+        authority: StreamCheckpointAuthorityV1,
+    ) -> Result<StreamAction, StreamError> {
+        validate_checkpoint(
+            authority.durable_plaintext_offset,
+            authority.durable_ciphertext_offset,
+            authority.next_segment_index,
+            &authority.plaintext_commitment,
+            &authority.ciphertext_commitment,
+        )?;
+        if authority.durable_plaintext_offset < self.durable_plaintext
+            || authority.durable_ciphertext_offset < self.durable
+            || authority.durable_ciphertext_offset > self.received
+            || authority.next_segment_index < self.next_segment_index
+            || authority.checkpoint_generation < self.generation
+            || ((authority.durable_ciphertext_offset == self.durable)
+                != (authority.checkpoint_generation == self.generation))
+            || authority.absolute_receive_limit < self.limit
+            || authority.absolute_receive_limit > self.total
+        {
+            return Err(StreamError::invalid("invalid durable checkpoint"));
+        }
+        self.durable_plaintext = authority.durable_plaintext_offset;
+        self.durable = authority.durable_ciphertext_offset;
+        self.next_segment_index = authority.next_segment_index;
+        self.plaintext_commitment = authority.plaintext_commitment;
+        self.ciphertext_commitment = authority.ciphertext_commitment;
+        self.generation = authority.checkpoint_generation;
+        self.limit = authority.absolute_receive_limit;
+        let f = StreamCheckpointV1 {
+            transfer_id: self.transfer_id,
+            attempt_nonce: self.nonce,
+            sequence: self.send_sequence,
+            durable_plaintext_offset: authority.durable_plaintext_offset,
+            durable_ciphertext_offset: authority.durable_ciphertext_offset,
+            next_segment_index: authority.next_segment_index,
+            plaintext_commitment: authority.plaintext_commitment,
+            ciphertext_commitment: authority.ciphertext_commitment,
+            checkpoint_generation: authority.checkpoint_generation,
+            absolute_receive_limit: authority.absolute_receive_limit,
         };
         self.send_sequence += 1;
         Ok(StreamAction::Send(StreamFrame::Checkpoint(f)))
