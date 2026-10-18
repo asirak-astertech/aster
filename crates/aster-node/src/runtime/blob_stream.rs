@@ -264,6 +264,7 @@ fn pack_frame_count(total: u64) -> u64 {
         .saturating_add(64)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn send_completed_pack(
     store: &Store,
     connection: &aster_iroh::Connection,
@@ -583,8 +584,7 @@ pub(super) async fn receive_completed_pack(
                 && current.durable_wire_offset == 0;
             let limit = current
                 .durable_wire_offset
-                .checked_add(STREAM_RECEIVE_WINDOW_BYTES)
-                .unwrap_or(u64::MAX)
+                .saturating_add(STREAM_RECEIVE_WINDOW_BYTES)
                 .min(total)
                 .max(initial_limit);
             greatest_receive_limit.fetch_max(limit, Ordering::Relaxed);
@@ -863,6 +863,7 @@ fn open_control(
 /// Drives one sender attempt over the selected adapter. The supplied reader
 /// is synchronous and bounded: it must release all Store/depot authority before
 /// this function awaits network I/O.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn drive_sender_attempt<R>(
     attempt: Arc<dyn StreamAttempt>,
     mission: &mut MissionSession,
@@ -1166,6 +1167,7 @@ pub(super) fn validate_send_plan(
 
 /// Sends one exact durable source selected by the receiver's authenticated
 /// pre-open plan.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn send(
     store: &Store,
     connection: &aster_iroh::Connection,
@@ -1263,7 +1265,7 @@ pub(super) async fn send(
             .await
             .map_err(transport)?;
     }
-    let policy = guard.policy().clone();
+    let policy = *guard.policy();
     let completion = loaded.completion.clone();
     let plan = &loaded.plan;
     let code = drive_sender_attempt(
@@ -1379,8 +1381,7 @@ pub(super) async fn receive(
     let (_, receive_limit) = layout.carrier_boundary_at_or_before(
         checkpoint
             .durable_encoded_offset
-            .checked_add(STREAM_RECEIVE_WINDOW_BYTES)
-            .unwrap_or(u64::MAX)
+            .saturating_add(STREAM_RECEIVE_WINDOW_BYTES)
             .min(layout.total_encoded_len()),
     );
     let adapter = selected_iroh_adapter(connection)?;
@@ -1487,7 +1488,7 @@ pub(super) async fn receive(
     } else {
         None
     };
-    let policy = guard.policy().clone();
+    let policy = *guard.policy();
     let commit_plan = &plan;
     let promote_plan = &plan;
     let promote_blob = blob.clone();
@@ -1547,8 +1548,7 @@ pub(super) async fn receive(
             expected_checkpoint = next;
             let (_, new_limit) = layout.carrier_boundary_at_or_before(
                 next.durable_encoded_offset
-                    .checked_add(STREAM_RECEIVE_WINDOW_BYTES)
-                    .unwrap_or(u64::MAX)
+                    .saturating_add(STREAM_RECEIVE_WINDOW_BYTES)
                     .min(layout.total_encoded_len()),
             );
             greatest_receive_limit = greatest_receive_limit.max(new_limit);
@@ -1934,8 +1934,8 @@ impl BlobStreamProgress {
         }
         let elapsed = now_ms.saturating_sub(self.last_sample_ms);
         let advanced = through.saturating_sub(self.last_sample_bytes);
-        if elapsed != 0 {
-            self.rolling_bytes_per_second = advanced.saturating_mul(1_000) / elapsed;
+        if let Some(bytes_per_second) = advanced.saturating_mul(1_000).checked_div(elapsed) {
+            self.rolling_bytes_per_second = bytes_per_second;
             self.last_sample_ms = now_ms;
             self.last_sample_bytes = through;
         }

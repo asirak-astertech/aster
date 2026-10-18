@@ -198,6 +198,16 @@ impl Drop for SelectedBlobPublishStream {
     }
 }
 
+pub(crate) struct OpenedBlobPublishStream {
+    pub token: [u8; 32],
+    pub progress: BlobPublishProgress,
+}
+
+pub(crate) struct OpenedBlobReadStream {
+    pub token: [u8; 32],
+    pub metadata: BlobReadStreamMetadata,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,14 +244,4 @@ mod tests {
             }) if actual == token
         ));
     }
-}
-
-pub(crate) struct OpenedBlobPublishStream {
-    pub token: [u8; 32],
-    pub progress: BlobPublishProgress,
-}
-
-pub(crate) struct OpenedBlobReadStream {
-    pub token: [u8; 32],
-    pub metadata: BlobReadStreamMetadata,
 }

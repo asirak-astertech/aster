@@ -1152,13 +1152,13 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
                 .unwrap_or_else(|| format!("real-node-recovery-{label}").into_bytes());
             let recovered = publish_frames!(
                 client,
-                vec![metadata_frame(&recovery_key, 1), chunk_frame(vec![0x41]),]
+                [metadata_frame(&recovery_key, 1), chunk_frame(vec![0x41])]
             )
             .expect("every rejected stream must release staging and its upload permit");
             assert!(recovered.inserted);
             let retry = publish_frames!(
                 client,
-                vec![metadata_frame(&recovery_key, 1), chunk_frame(vec![0x41]),]
+                [metadata_frame(&recovery_key, 1), chunk_frame(vec![0x41])]
             )
             .expect("exact-key recovery must remain idempotent");
             assert!(!retry.inserted);
@@ -1178,7 +1178,7 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
         let finite_payload = b"finite-blob".to_vec();
         let finite = publish_frames!(
             client,
-            vec![
+            [
                 api::PublishBlobRequest {
                     frame: Some(api::publish_blob_request::Frame::Metadata(Box::new(
                         api::PublishBlobMetadata {

@@ -680,13 +680,13 @@ protocol receipt state.
 ### 9.1 Selected semantic-v4 State and Record reconciliation
 
 The selected mechanics profile adds State and Record when the authenticated
-mission session selects semantic version `4`, `5`, `6`, `7`, or `8`. Semantic
+mission session selects semantic version `4`, `5`, `6`, `7`, `8`, or `9`. Semantic
 versions `1`, `2`, and `3` retain their Event compatibility behavior and MUST
 NOT send, accept, reserve, or count mutable frames. The current default semantic
-offer is `[8, 7, 6, 5, 4, 3, 2, 1]`; stable replication-wire/profile, handshake
+offer is `[9, 8, 7, 6, 5, 4, 3, 2, 1]`; stable replication-wire/profile, handshake
 framing, source envelopes, and suite remain version `1`. Semantic v5 inherits
 these State/Record mechanics unchanged and adds the separate Blob mechanics in
-§9.2; semantic v6, v7, and v8 inherit both ordinary lanes unchanged.
+§9.2; semantic v6, v7, v8, and v9 inherit both ordinary lanes unchanged.
 
 State and Record are independent classes (`State = 1`, `Record = 2`). Each has
 two receiver-directed lanes, so every contact has four independent reconciliation
@@ -765,9 +765,9 @@ Finish/Finished records are not an available runtime fallback.
 Semantic version `5` inherits the exact Event behavior of versions `1` through
 `4` and the semantic-v4 State/Record mechanics above. It additionally allocates
 one selected Blob source class (`MutableClass = 3`) and one Blob carrier lane.
-Semantic versions `6`, `7`, and `8` inherit that complete v5 ordinary-lane
+Semantic versions `6`, `7`, `8`, and `9` inherit that complete v5 ordinary-lane
 behavior unchanged. The current default descending offer is
-`[8, 7, 6, 5, 4, 3, 2, 1]`.
+`[9, 8, 7, 6, 5, 4, 3, 2, 1]`.
 Stable replication-wire and ABI version `1`, handshake framing,
 `ASTRENV2`/`ASTRENV3` source formats, `ASTRBT01` carriers, typed ObjectIDs, and
 the registered cryptographic suite do not change. A semantic-v1, v2, v3, or v4
@@ -1698,9 +1698,9 @@ The key schedule uses exact concatenation of the 32-byte P-256 ECDH result and
 direction/protection/confirmation labels. The stable handshake framing,
 credential/envelope encoding, cryptographic profile, and replication wire
 profile remain version `1`. Inside that framing, a default initiator offers
-semantic versions `[8, 7, 6, 5, 4, 3, 2, 1]`; an honest current responder selects
-the highest common value, so current peers select `8`, a v7-only peer selects
-`7`, a v6-only peer selects
+semantic versions `[9, 8, 7, 6, 5, 4, 3, 2, 1]`; an honest current responder selects
+the highest common value, so current peers select `9`, a v8-only peer selects
+`8`, a v7-only peer selects `7`, a v6-only peer selects
 `6`, a v5-only peer selects `5`, a v4-only peer selects `4`, a v3-only peer
 selects `3`, a v2-only peer selects `2`, and a v1-only peer selects `1`. The
 selected semantic version is bound into the public transcript, key schedule,

@@ -40,6 +40,7 @@ semantic-v5-object-kind = semantic-v4-object-kind
 semantic-v6-object-kind = semantic-v5-object-kind
 semantic-v7-object-kind = semantic-v6-object-kind
 semantic-v8-object-kind = semantic-v7-object-kind
+semantic-v9-object-kind = semantic-v8-object-kind
 object-id = bytes .size 33
 hash-256 = bytes .size 32
 priority = 0..3

@@ -13119,6 +13119,7 @@ fn cache_committed_record_route_claim(
     cache.insert_mutable(verifier, claim)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cache_staged_blob_after_transition(
     store: &Store,
     verifier: &mut ReferenceEnvelopeSealer,
@@ -13282,6 +13283,7 @@ fn apply_test_blob_receive_fault(
     Ok(Some(custody))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn accept_received_mutable(
     store: &Store,
     guard: &EventLaneGuard,
@@ -13291,7 +13293,7 @@ fn accept_received_mutable(
     sealed: &[u8],
     blob_custody: Option<ReceivedBlobCustody>,
     blob_contact_mode: Option<BlobContactMode>,
-    mut deferred_finite_stream: Option<&mut Option<DeferredFiniteBlobStreamAdmission>>,
+    deferred_finite_stream: Option<&mut Option<DeferredFiniteBlobStreamAdmission>>,
 ) -> Result<(MutableApplyDisposition, Option<[u8; 32]>), NodeError> {
     guard.check(store)?;
     if sealed.len() > MAX_OBJECT_BYTES {
@@ -13470,7 +13472,7 @@ fn accept_received_mutable(
                 && blob.ttl_ms().is_some()
                 && blob_custody.is_none()
             {
-                let admission = deferred_finite_stream.as_deref_mut().ok_or_else(|| {
+                let admission = deferred_finite_stream.ok_or_else(|| {
                     NodeError::Protocol(
                         "finite Blob stream metadata lacks a contact-local admission slot".into(),
                     )
@@ -25948,6 +25950,7 @@ async fn request_completed_pack_publication(
     Ok(Some(resume))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn respond_completed_pack_publication(
     store: &Store,
     connection: &aster_iroh::Connection,
@@ -50349,8 +50352,8 @@ mod tests {
             )
             .unwrap()
             .expect("receiver promotes publisher-signed stream publication");
-        assert_eq!(received.authenticated_open().len() > 32, true);
-        assert_eq!(received.authenticated_commitment().len() > 32, true);
+        assert!(received.authenticated_open().len() > 32);
+        assert!(received.authenticated_commitment().len() > 32);
 
         drop(source_store);
         drop(receiver_store);
