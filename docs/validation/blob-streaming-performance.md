@@ -17,6 +17,7 @@ encoding without decrypt/re-encode, and compacts its receive buffer in batches.
 | 32 MiB | 1.731 s | 18.5 MiB/s | 0.468 s | 2.200 s |
 | 128 MiB, direct-pack baseline | 3.750 s | 34.1 MiB/s | 1.991 s | 5.741 s |
 | 128 MiB, shared authenticated ciphertext checkpoint | 3.556 s | 36.0 MiB/s | 1.996 s | 5.552 s |
+| 128 MiB, zero-copy direct-data decode | 3.530 s | 36.3 MiB/s | 1.906 s | 5.437 s |
 
 The same 32-MiB path before direct data and batched compaction took 2.509 s in
 contact and 2.977 s total, so contact time fell by approximately 31%. A 16-MiB
@@ -42,6 +43,11 @@ and 128-MiB measurements indicates substantial fixed contact/authentication
 cost plus a steady-state path around 50 MiB/s. The sequential AEAD and content
 identity pipeline, especially on lower-power devices, remains the next stage to
 parallelize before claiming transport-limited operation.
+Direct-data decoding now retains the transport-owned allocation through the
+state machine and persistence batch, removing another payload-sized allocation
+and copy per extent. Its workstation elapsed-time improvement was small (0.7%
+against the immediately preceding run), but it reduces bounded memory traffic
+that is more consequential on CM4-class devices.
 
 ## 2026-10-18 bidirectional application-RPC loopback
 

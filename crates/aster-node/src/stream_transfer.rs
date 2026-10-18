@@ -1,5 +1,7 @@
 use std::fmt::{self, Display, Formatter};
 
+use bytes::Bytes;
+
 const MAGIC: &[u8; 4] = b"ASM\x01";
 pub(crate) const MAX_STREAM_EXTENT_BYTES: usize = 1_048_576;
 pub(crate) const MAX_STREAM_CHECKPOINT_BATCH_BYTES: u32 = 16 * 1_048_576;
@@ -118,7 +120,7 @@ pub(crate) struct StreamDataV1 {
     pub attempt_nonce: [u8; 32],
     pub sequence: u64,
     pub offset: u64,
-    pub bytes: Vec<u8>,
+    pub bytes: Bytes,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct StreamDataHeaderV1 {
@@ -563,7 +565,7 @@ impl StreamDataHeaderV1 {
             attempt_nonce: self.attempt_nonce,
             sequence: self.sequence,
             offset: self.offset,
-            bytes: b.to_vec(),
+            bytes: Bytes::copy_from_slice(b),
         })
     }
 }
@@ -573,6 +575,28 @@ fn decode_data(b: &[u8]) -> Result<StreamDataV1, StreamError> {
     }
     StreamDataHeaderV1::decode_for_context(9, 5, &b[..STREAM_DATA_FIXED_BYTES])?
         .decode_body(&b[STREAM_DATA_FIXED_BYTES..])
+}
+
+pub(crate) fn decode_owned_data_for_context(
+    v: u16,
+    p: u16,
+    encoded: Bytes,
+) -> Result<StreamFrame, StreamError> {
+    if encoded.len() < STREAM_DATA_FIXED_BYTES {
+        return Err(StreamError::invalid("truncated data header"));
+    }
+    let header = StreamDataHeaderV1::decode_for_context(v, p, &encoded[..STREAM_DATA_FIXED_BYTES])?;
+    let body = encoded.slice(STREAM_DATA_FIXED_BYTES..);
+    if body.len() != header.extent_len as usize {
+        return Err(StreamError::invalid("data body length differs"));
+    }
+    Ok(StreamFrame::Data(StreamDataV1 {
+        transfer_id: header.transfer_id,
+        attempt_nonce: header.attempt_nonce,
+        sequence: header.sequence,
+        offset: header.offset,
+        bytes: body,
+    }))
 }
 
 struct Reader<'a> {
@@ -706,7 +730,7 @@ impl StreamSenderState {
             attempt_nonce: self.nonce,
             sequence: self.send_sequence,
             offset: self.next,
-            bytes,
+            bytes: bytes.into(),
         };
         self.send_sequence += 1;
         self.next = end;
@@ -977,7 +1001,7 @@ impl StreamReceiverState {
         self.send_sequence += 1;
         Ok(StreamAction::Send(StreamFrame::Accept(f)))
     }
-    pub(crate) fn data(&mut self, x: StreamDataV1) -> Result<StreamAction, StreamError> {
+    pub(crate) fn data(&mut self, x: &StreamDataV1) -> Result<StreamAction, StreamError> {
         self.identity(&x.transfer_id, &x.attempt_nonce)?;
         if x.sequence != self.receive_sequence {
             return Err(StreamError::invalid("stream data sequence differs"));
@@ -1239,7 +1263,7 @@ pub(crate) fn fuzz_decode(input: &[u8]) {
             attempt_nonce,
             sequence: 0,
             offset: 0,
-            bytes: vec![0],
+            bytes: vec![0].into(),
         })),
         b"d9" => Some(StreamFrame::Checkpoint(StreamCheckpointV1 {
             transfer_id: id,
@@ -1294,7 +1318,7 @@ pub(crate) fn fuzz_decode(input: &[u8]) {
             custody_digest: None,
         };
         if let Ok(mut receiver) = StreamReceiverState::new(&open, 0, 0, 1, 1) {
-            let _ = receiver.data(data);
+            let _ = receiver.data(&data);
         }
     }
 }

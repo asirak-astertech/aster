@@ -12,7 +12,7 @@ use crate::{
     stream_transfer::{
         MAX_STREAM_CHECKPOINT_BATCH_BYTES, MAX_STREAM_EXTENT_BYTES, StreamAction, StreamDataV1,
         StreamDirection, StreamFrame, StreamOpenV1, StreamReceiverState, StreamResultCode,
-        StreamSenderState,
+        StreamSenderState, decode_owned_data_for_context,
     },
     stream_transport::{
         AttemptOpenRequest, AuthenticatedPeerSupport, AuthenticatedSupportSource,
@@ -791,14 +791,15 @@ fn encode_direct_data_record(frame: StreamFrame) -> Result<Vec<u8>, NodeError> {
     Ok(record)
 }
 
-fn decode_direct_data_record(record: &[u8]) -> Result<StreamFrame, NodeError> {
-    let Some((&kind, encoded)) = record.split_first() else {
+fn decode_direct_data_record(record: Vec<u8>) -> Result<StreamFrame, NodeError> {
+    let Some(&kind) = record.first() else {
         return Err(protocol("empty attempt record"));
     };
     if kind != ATTEMPT_DIRECT_DATA_RECORD {
         return Err(protocol("attempt record is not direct stream data"));
     }
-    let frame = StreamFrame::decode_for_context(9, 5, encoded).map_err(protocol)?;
+    let encoded = bytes::Bytes::from(record).slice(1..);
+    let frame = decode_owned_data_for_context(9, 5, encoded).map_err(protocol)?;
     if !matches!(frame, StreamFrame::Data(_)) {
         return Err(protocol("direct attempt record is not stream data"));
     }
@@ -830,7 +831,7 @@ fn open_control(
     profile_digest: [u8; 32],
     direction: EventDirection,
     nonce: [u8; 32],
-    record: &[u8],
+    record: Vec<u8>,
 ) -> Result<StreamFrame, NodeError> {
     let Some((&kind, encoded)) = record.split_first() else {
         return Err(protocol("empty attempt record"));
@@ -886,7 +887,7 @@ where
         .map_err(transport)?
         .ok_or_else(|| protocol("control stream closed before acceptance"))?;
     let StreamFrame::Accept(accepted) =
-        open_control(mission, profile_digest, direction, nonce, &accepted)?
+        open_control(mission, profile_digest, direction, nonce, accepted)?
     else {
         return Err(protocol("first control record is not acceptance"));
     };
@@ -944,7 +945,7 @@ where
             .await
             .map_err(transport)?
             .ok_or_else(|| protocol("control stream closed before settlement"))?;
-        match open_control(mission, profile_digest, direction, nonce, &control)? {
+        match open_control(mission, profile_digest, direction, nonce, control)? {
             StreamFrame::Checkpoint(checkpoint) => {
                 state.checkpoint(checkpoint).map_err(protocol)?;
             }
@@ -1694,7 +1695,7 @@ where
         profile_digest,
         direction,
         expected_nonce,
-        &protected,
+        protected,
     )?
     else {
         return Err(protocol("first data record is not open"));
@@ -1759,12 +1760,10 @@ where
             profile_digest,
             direction,
             expected_nonce,
-            &protected,
+            protected,
         )? {
             StreamFrame::Data(data) => {
-                let StreamAction::Persist { through } =
-                    state.data(data.clone()).map_err(protocol)?
-                else {
+                let StreamAction::Persist { through } = state.data(&data).map_err(protocol)? else {
                     return Err(protocol("receiver produced an invalid data transition"));
                 };
                 let data_bytes = data.bytes.len() as u64;
@@ -1990,12 +1989,12 @@ mod tests {
             attempt_nonce: [0x22; 32],
             sequence: 3,
             offset: 1_048_576,
-            bytes: vec![0x33; 64],
+            bytes: vec![0x33; 64].into(),
         });
         let encoded = encode_direct_data_record(frame.clone()).expect("encode direct data");
         assert_eq!(encoded.first(), Some(&ATTEMPT_DIRECT_DATA_RECORD));
         assert_eq!(
-            decode_direct_data_record(&encoded).expect("decode direct data"),
+            decode_direct_data_record(encoded).expect("decode direct data"),
             frame
         );
     }
