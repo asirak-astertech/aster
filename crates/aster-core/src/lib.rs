@@ -51,6 +51,8 @@ mod blob;
 mod blob_custody;
 #[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
 mod blob_custody_v2;
+#[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
+mod blob_stream;
 #[cfg(all(feature = "sqlite-store", feature = "adapter-sdk"))]
 pub mod causal;
 #[cfg(all(feature = "sqlite-store", not(feature = "adapter-sdk")))]
@@ -164,6 +166,13 @@ pub use blob_custody_v2::{
     ApplicationRecordContext, AuthenticatedBlobCustodyContactV2,
     AuthenticatedBlobCustodySendContextV2, BLOB_CUSTODY_CLAIM_V2_BYTES, BlobCustodyClaimV2,
     VerifiedBlobCustodyClaimV2,
+};
+#[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
+pub use blob_stream::{
+    BLOB_STREAM_SEGMENT_BYTES, BlobPublicationStreamId, BlobStreamAccumulator,
+    BlobStreamAccumulatorCheckpoint, BlobStreamAccumulatorDomain, BlobStreamDecryptor,
+    BlobStreamEncryptor, BlobStreamFinalCommitment, BlobStreamOpen, EncryptedBlobStreamSegment,
+    VerifiedBlobStreamFinalCommitment, VerifiedBlobStreamOpen,
 };
 #[cfg(feature = "reference-session")]
 pub use bridge_adapter::{

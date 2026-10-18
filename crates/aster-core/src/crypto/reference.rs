@@ -1619,6 +1619,75 @@ impl ReferenceEnvelopeSealer {
             .and_then(|grant| route_grant_commitment(&self.mission, grant).ok())
     }
 
+    /// Signs one bounded class-specific protocol object with the node's
+    /// authority-authenticated source credential.
+    pub(crate) fn seal_source_protocol_object(
+        &self,
+        signature_domain: &'static [u8],
+        body: &[u8],
+        maximum_body_len: usize,
+    ) -> Result<Vec<u8>, EnvelopeError> {
+        self.ensure_live()?;
+        if body.len() > maximum_body_len {
+            return Err(invalid_envelope());
+        }
+        let digest = hash_domain(signature_domain, body);
+        let signature = self
+            .provider
+            .sign(&self.signing_key, &digest)
+            .map_err(envelope_crypto_error)?;
+        let mut encoded = Vec::new();
+        push_u32_bytes(&mut encoded, &self.credential.body)?;
+        encode_signature(&mut encoded, &self.credential.signature)?;
+        push_u32_bytes(&mut encoded, body)?;
+        encode_signature(&mut encoded, &signature)?;
+        Ok(encoded)
+    }
+
+    /// Verifies one bounded class-specific protocol object and returns its
+    /// authority-authenticated source identity plus exact canonical body.
+    pub(crate) fn verify_source_protocol_object(
+        &self,
+        signature_domain: &'static [u8],
+        encoded: &[u8],
+        maximum_body_len: usize,
+    ) -> Result<(NodeId, Vec<u8>), EnvelopeError> {
+        self.ensure_live()?;
+        let mut reader = Reader::new(encoded);
+        let credential_body = reader.u32_bytes(16 * 1024)?.to_vec();
+        let credential_signature = decode_signature(&mut reader)?;
+        let credential = decode_credential(
+            credential_body,
+            credential_signature,
+            &self.mission,
+            &self.authority_verifying_key,
+            &self.provider,
+        )?;
+        let body = reader.u32_bytes(maximum_body_len)?.to_vec();
+        let signature = decode_signature(&mut reader)?;
+        reader.finish()?;
+        let digest = hash_domain(signature_domain, &body);
+        self.provider
+            .verify(&credential.verifying_key, &digest, &signature)
+            .map_err(envelope_crypto_error)?;
+        Ok((credential.identity, body))
+    }
+
+    /// Copies exact content-grant material only into an internal, immediately
+    /// zeroized stream-construction boundary.
+    pub(crate) fn blob_stream_content_grant_seed(
+        &self,
+        scope: &Scope,
+        topic: &Topic,
+        epoch: u64,
+    ) -> Option<[u8; 32]> {
+        if self.zeroized {
+            return None;
+        }
+        self.content_grant(scope, topic, epoch)
+            .map(|grant| *grant.key.expose())
+    }
+
     pub(crate) fn current_event_route_grant_commitment(
         &self,
         scope: &Scope,
