@@ -141,13 +141,31 @@ pub(super) fn select_completed_pack_source(
 pub(super) struct ReceivedPackStream {
     pub(super) open: VerifiedBlobStreamOpen,
     pub(super) commitment: VerifiedBlobStreamFinalCommitment,
-    pub(super) pack: BlobStreamPackSession,
-    pub(super) decryptor: BlobStreamDecryptor,
+    pub(super) pack: Option<BlobStreamPackSession>,
+    pub(super) decryptor: Option<BlobStreamDecryptor>,
+    existing: Option<BlobStreamPublication>,
 }
 
 impl ReceivedPackStream {
     pub(super) fn resume_authority(&self, direction: EventDirection) -> BlobPublicationResumeV1 {
-        let resume = self.pack.crypto_resume();
+        let Some(pack) = self.pack.as_ref() else {
+            let publication = self
+                .existing
+                .as_ref()
+                .expect("completed receive state has publication or pack");
+            return BlobPublicationResumeV1 {
+                direction,
+                stream_id: *self.open.open().stream_id().as_bytes(),
+                open_digest: self.open.open().digest(),
+                durable_plaintext_offset: self.open.open().total_len(),
+                durable_wire_offset: publication.wire_len(),
+                next_segment_index: self.commitment.commitment().segment_count(),
+                plaintext_commitment: *self.commitment.commitment().plaintext_root(),
+                ciphertext_commitment: *self.commitment.commitment().ciphertext_root(),
+                checkpoint_generation: 1,
+            };
+        };
+        let resume = pack.crypto_resume();
         let progress = resume.progress();
         let initial = progress.generation() == 0;
         BlobPublicationResumeV1 {
@@ -197,6 +215,26 @@ pub(super) fn admit_completed_pack_source(
     }
     let commitment = verifier.verify_blob_stream_commitment(&open, signed_commitment)?;
     let operation = BlobOperationKey::new(intent.operation_key().to_vec())?;
+    if let Some(existing) =
+        store.blob_stream_for_operation_with_policy(guard.policy(), &operation)?
+    {
+        if existing.open() != open.open()
+            || existing.authenticated_open() != open.authenticated_bytes()
+            || existing.commitment() != commitment.commitment()
+            || existing.authenticated_commitment() != commitment.authenticated_bytes()
+        {
+            return Err(protocol(
+                "completed pack replay differs from the existing publication",
+            ));
+        }
+        return Ok(ReceivedPackStream {
+            open,
+            commitment,
+            pack: None,
+            decryptor: None,
+            existing: Some(existing),
+        });
+    }
     let (reservation, _) = store.reserve_blob_stream_with_policy(
         guard.policy(),
         BlobStreamReservationRequest {
@@ -220,8 +258,9 @@ pub(super) fn admit_completed_pack_source(
     Ok(ReceivedPackStream {
         open,
         commitment,
-        pack,
-        decryptor,
+        pack: Some(pack),
+        decryptor: Some(decryptor),
+        existing: None,
     })
 }
 
@@ -412,13 +451,27 @@ pub(super) async fn receive_completed_pack(
     profile_digest: [u8; 32],
 ) -> Result<BlobStreamAttemptOutcome, NodeError> {
     guard.check(store)?;
+    if received.existing.is_some() {
+        return receive_already_present_pack(
+            connection,
+            mission,
+            direction,
+            received,
+            profile_digest,
+        )
+        .await;
+    }
     let intent_total_len = received.open.open().total_len();
     let intent_digest = received.open.open().digest();
     let transfer = *received.open.open().stream_id().as_bytes();
     let segment_count = received.commitment.commitment().segment_count();
     let total = EncryptedBlobStreamSegment::packed_wire_len(intent_total_len, segment_count)
         .ok_or_else(|| protocol("received pack wire length overflow"))?;
-    let crypto_resume = received.pack.crypto_resume();
+    let crypto_resume = received
+        .pack
+        .as_ref()
+        .expect("new completed-pack admission has a pack")
+        .crypto_resume();
     let progress = crypto_resume.progress();
     let durable_wire_offset = progress.durable_wire_offset();
     let remaining = total
@@ -536,17 +589,24 @@ pub(super) async fn receive_completed_pack(
             let authenticated = current
                 .stream
                 .decryptor
+                .as_mut()
+                .expect("new completed-pack admission has a decryptor")
                 .decrypt_segment_batch_checkpointed(&segments)
                 .map_err(protocol)?;
             for ((segment, (encoded_start, record_end, record_len)), (plaintext, checkpoint)) in
                 segments.iter().zip(record_ranges).zip(authenticated)
             {
-                current.stream.pack.append_authenticated_encoded_segment(
-                    &plaintext,
-                    segment,
-                    &current.buffered[encoded_start..record_end],
-                    checkpoint,
-                )?;
+                current
+                    .stream
+                    .pack
+                    .as_mut()
+                    .expect("new completed-pack admission has a pack")
+                    .append_authenticated_encoded_segment(
+                        &plaintext,
+                        segment,
+                        &current.buffered[encoded_start..record_end],
+                        checkpoint,
+                    )?;
                 current.buffered_consumed = record_end;
                 current.durable_wire_offset = current
                     .durable_wire_offset
@@ -563,7 +623,12 @@ pub(super) async fn receive_completed_pack(
             }
             if current.appended_since_checkpoint {
                 let checkpoint_started = std::time::Instant::now();
-                current.stream.pack.checkpoint(store, guard.policy())?;
+                current
+                    .stream
+                    .pack
+                    .as_mut()
+                    .expect("new completed-pack admission has a pack")
+                    .checkpoint(store, guard.policy())?;
                 greatest_checkpoint_latency_ms.fetch_max(
                     u64::try_from(checkpoint_started.elapsed().as_millis()).unwrap_or(u64::MAX),
                     Ordering::Relaxed,
@@ -577,7 +642,12 @@ pub(super) async fn receive_completed_pack(
                     Ordering::Relaxed,
                 );
             }
-            let resume = current.stream.pack.crypto_resume();
+            let resume = current
+                .stream
+                .pack
+                .as_ref()
+                .expect("new completed-pack admission has a pack")
+                .crypto_resume();
             let progress = resume.progress();
             let initial_authority = progress.generation() == 0
                 && progress.durable_plaintext_offset() == 0
@@ -623,12 +693,16 @@ pub(super) async fn receive_completed_pack(
                 return Err(protocol("completed pack finish authority differs"));
             }
             let final_sample = current.stream.commitment.commitment().final_custody();
-            let promotion = current.stream.pack.finish_and_promote(
-                store,
-                guard.policy(),
-                &current.stream.commitment,
-                final_sample,
-            )?;
+            let promotion = current
+                .stream
+                .pack
+                .expect("new completed-pack admission has a pack")
+                .finish_and_promote(
+                    store,
+                    guard.policy(),
+                    &current.stream.commitment,
+                    final_sample,
+                )?;
             let code = if promotion.duplicate() {
                 StreamResultCode::AlreadyPresent
             } else {
@@ -653,6 +727,98 @@ pub(super) async fn receive_completed_pack(
             checkpoint_bytes: total,
             checkpoint_latency_ms: greatest_checkpoint_latency_ms.load(Ordering::Relaxed),
             writer_commits: writer_commits.load(Ordering::Relaxed),
+            failover_recoveries: 0,
+        },
+    })
+}
+
+async fn receive_already_present_pack(
+    connection: &aster_iroh::Connection,
+    mission: &mut MissionSession,
+    direction: EventDirection,
+    received: ReceivedPackStream,
+    profile_digest: [u8; 32],
+) -> Result<BlobStreamAttemptOutcome, NodeError> {
+    let publication = received
+        .existing
+        .as_ref()
+        .expect("existing completed-pack admission has a publication");
+    let transfer = *received.open.open().stream_id().as_bytes();
+    let total = publication.wire_len();
+    // The v1 state machine requires credit for one nonzero extent plus one
+    // checkpoint batch even when the durable offset is already terminal.
+    // No data can be accepted beyond `total`; this synthetic terminal window
+    // exists only to complete the authenticated result/ack exchange.
+    let terminal_limit = total
+        .checked_add(2)
+        .ok_or_else(|| protocol("already-present terminal credit overflow"))?;
+    let generation = 1;
+    let nonce = attempt_nonce(mission.session_id(), direction, transfer, generation);
+    let checkpoint = crate::stream_transfer::StreamCheckpointAuthorityV1 {
+        durable_plaintext_offset: received.open.open().total_len(),
+        durable_ciphertext_offset: total,
+        next_segment_index: received.commitment.commitment().segment_count(),
+        plaintext_commitment: *received.commitment.commitment().plaintext_root(),
+        ciphertext_commitment: *received.commitment.commitment().ciphertext_root(),
+        checkpoint_generation: generation,
+        absolute_receive_limit: terminal_limit,
+    };
+    let signed_commitment = received.commitment.authenticated_bytes().to_vec();
+    let final_plaintext_offset = received.open.open().total_len();
+    let blob_id = *publication.blob_id().as_bytes();
+    let adapter = selected_iroh_adapter(connection)?;
+    let attempt = adapter
+        .accept_attempt(open_request(total, pack_frame_count(total))?)
+        .await
+        .map_err(transport)?;
+    let code = drive_receiver_attempt(
+        attempt,
+        mission,
+        profile_digest,
+        direction,
+        nonce,
+        transfer,
+        received.open.open().digest(),
+        total,
+        total,
+        generation,
+        Some(checkpoint),
+        None,
+        terminal_limit,
+        1,
+        1,
+        move |_, frames| {
+            if frames.is_empty() {
+                Ok(checkpoint)
+            } else {
+                Err(protocol("already-present pack received more data"))
+            }
+        },
+        move |_, finish| {
+            if finish.final_plaintext_offset != final_plaintext_offset
+                || finish.final_ciphertext_offset != total
+                || finish.signed_commitment != signed_commitment
+            {
+                return Err(protocol("already-present pack finish authority differs"));
+            }
+            Ok((
+                StreamResultCode::AlreadyPresent,
+                blob_id,
+                completed_pack_result_digest(transfer, blob_id, StreamResultCode::AlreadyPresent),
+            ))
+        },
+    )
+    .await?;
+    Ok(BlobStreamAttemptOutcome {
+        code,
+        metrics: BlobStreamAttemptMetrics {
+            transport: BlobStreamTransport::IrohQuicV1,
+            received_bytes: 0,
+            retransmitted_bytes: 0,
+            receive_limit_bytes: terminal_limit,
+            checkpoint_bytes: total,
+            checkpoint_latency_ms: 0,
+            writer_commits: 0,
             failover_recoveries: 0,
         },
     })
