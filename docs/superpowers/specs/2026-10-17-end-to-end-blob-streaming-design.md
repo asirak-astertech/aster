@@ -271,10 +271,11 @@ need one database row per segment. If an auxiliary index is required by a
 future variable-size format, it is appended and checkpointed in blocks rather
 than represented as per-segment redb rows.
 
-The writer accumulates a bounded durability batch, initially 16 MiB with a
-250-ms maximum checkpoint interval. It writes sequentially, issues one data
-durability barrier for the pack, then atomically commits one checkpoint
-generation containing:
+The protocol permits a bounded durability batch up to 16 MiB. The first
+production selection is 7 MiB inside an 8-MiB receive window, retaining one
+maximum 1-MiB extent of headroom after measured 4-MiB and 7-MiB comparisons.
+The writer writes sequentially, issues one data durability barrier for the
+pack, then atomically commits one checkpoint generation containing:
 
 - durable plaintext and ciphertext offsets;
 - next segment index;

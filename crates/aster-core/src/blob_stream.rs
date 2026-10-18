@@ -813,17 +813,26 @@ impl BlobStreamDecryptor {
         }
 
         let authenticated = std::thread::scope(|scope| {
+            let workers = std::thread::available_parallelism()
+                .map_or(1, usize::from)
+                .min(segments.len());
+            let chunk_size = segments.len().div_ceil(workers);
             let handles = segments
-                .iter()
-                .map(|segment| {
+                .chunks(chunk_size)
+                .map(|chunk| {
                     scope.spawn(|| {
-                        let plaintext = Zeroizing::new(self.decrypt_payload(segment)?);
-                        let ciphertext_leaf = accumulator_leaf(
-                            BlobStreamAccumulatorDomain::Ciphertext,
-                            segment.index,
-                            &segment.ciphertext,
-                        )?;
-                        Ok((plaintext, ciphertext_leaf))
+                        chunk
+                            .iter()
+                            .map(|segment| {
+                                let plaintext = Zeroizing::new(self.decrypt_payload(segment)?);
+                                let ciphertext_leaf = accumulator_leaf(
+                                    BlobStreamAccumulatorDomain::Ciphertext,
+                                    segment.index,
+                                    &segment.ciphertext,
+                                )?;
+                                Ok((plaintext, ciphertext_leaf))
+                            })
+                            .collect::<Result<Vec<_>, BlobError>>()
                     })
                 })
                 .collect::<Vec<_>>();
@@ -831,6 +840,7 @@ impl BlobStreamDecryptor {
                 .into_iter()
                 .map(|handle| handle.join().map_err(|_| BlobError::AuthenticationFailed)?)
                 .collect::<Result<Vec<_>, BlobError>>()
+                .map(|chunks| chunks.into_iter().flatten().collect::<Vec<_>>())
         })?;
 
         let mut ciphertext_accumulator = self.ciphertext_accumulator.clone();

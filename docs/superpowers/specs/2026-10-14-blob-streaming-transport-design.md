@@ -354,9 +354,11 @@ may discard the uncheckpointed tail, which the sender retransmits, but it cannot
 expose or acknowledge unverified nondurable progress.
 
 A checkpoint batch contains one or more complete, verified carriers assembled
-from one or more extents. The initial defaults are a 4-MiB byte threshold and a
-250-ms timer, with an 8-MiB hard maximum; constrained receivers may advertise a
-smaller batch. One files-first durability operation and one redb transaction
+from one or more extents. The selected default is a 7-MiB byte threshold inside
+an 8-MiB receive window; constrained receivers may advertise a smaller batch.
+The remaining 1 MiB admits one maximum extent while a checkpoint becomes
+durable, preventing credit/checkpoint deadlock. One files-first durability
+operation and one redb transaction
 commit all chunk markers, counters, and the cumulative checkpoint for the
 batch. The maximum crash-retransmission tail is the lesser of the advertised
 receive window and advertised checkpoint-batch limit.

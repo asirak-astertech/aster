@@ -20,6 +20,8 @@ encoding without decrypt/re-encode, and compacts its receive buffer in batches.
 | 128 MiB, zero-copy direct-data decode | 3.530 s | 36.3 MiB/s | 1.906 s | 5.437 s |
 | 128 MiB, bounded parallel segment authentication | 2.532 s | 50.6 MiB/s | 1.940 s | 4.473 s |
 | 128 MiB, parallel AEAD and ciphertext leaf hashing | 2.395 s | 53.4 MiB/s | 2.032 s | 4.428 s |
+| 256 MiB, 4-MiB batch, first/warm | 3.781 / 3.621 s | 67.7 / 70.7 MiB/s | 4.028 / 4.009 s | 7.810 / 7.631 s |
+| 256 MiB, 7-MiB batch, first/warm | 3.346 / 3.356 s | 76.5 / 76.3 MiB/s | 4.043 / 3.996 s | 7.389 / 7.353 s |
 
 The same 32-MiB path before direct data and batched compaction took 2.509 s in
 contact and 2.977 s total, so contact time fell by approximately 31%. A 16-MiB
@@ -42,8 +44,8 @@ latency as the workstation bottleneck. Reusing the decryptor's authenticated
 post-segment ciphertext checkpoint in the pack writer removed a redundant full
 ciphertext SHA-256 pass and reduced contact time by 5.2%. Comparing the 32-MiB
 and 128-MiB measurements indicates substantial fixed contact/authentication
-cost. Authenticating the independently sealed segments concurrently within the
-existing 4-MiB durability batch reduced the immediately preceding 128-MiB
+cost. Authenticating the independently sealed segments concurrently within a
+bounded durability batch reduced the immediately preceding 128-MiB
 contact time by 28.3% and raised measured payload rate from 36.3 to 50.6 MiB/s.
 Moving each ciphertext identity-leaf hash into the same worker as its AEAD
 verification reduced contact time by a further 5.4% to 2.395 s. Ordered
@@ -64,6 +66,15 @@ plaintext checkpoint to persistence was rejected: its 2.479-s contact time was
 3.5% slower than the simpler ciphertext-prehash variant. Physical CM4
 measurements are required before choosing the next optimization or making a
 transport-limited claim.
+
+The 256-MiB warm run shows that the path does not decay with object size. A
+7-MiB checkpoint threshold inside the existing 8-MiB receive window retains
+one complete 1-MiB extent beyond the batch, satisfying the checked anti-deadlock
+invariant. It reduced receiver commits from 73 to 43 and improved the two
+contact samples to 3.346/3.356 s while every measured commit remained below
+1 ms. The resulting simple workstation-only projections are about 10.5 seconds
+for 800 MiB and 13.4 seconds for 1 GiB. The post-promotion verified read shown
+in the table is test-only and is not part of contact delivery latency.
 
 ## 2026-10-18 bidirectional application-RPC loopback
 
@@ -158,8 +169,10 @@ as a size-dependent regression finding, not discarded as benchmark noise.
 An 8-MiB checkpoint-batch experiment was rejected. Carrier-boundary alignment
 can make an 8-MiB absolute receive window slightly smaller than an 8-MiB batch,
 so neither endpoint reaches the transition that grants more credit. The driver
-retains 4-MiB batches and now has a compile-time invariant requiring room for a
-maximum extent beyond the batch threshold. The experiment also exposed that
+therefore retained 4-MiB batches at this stage and added a compile-time
+invariant requiring room for a maximum extent beyond the batch threshold. A
+later measured optimization above selects 7 MiB while preserving that full
+extent of headroom. The original experiment also exposed that
 the inbound wrapper still used the legacy 30-second total deadline; inbound and
 outbound Blob contacts now select the same bounded Blob-aware deadline. A final
 256-MiB rerun passed in 23.514 seconds after both corrections.
