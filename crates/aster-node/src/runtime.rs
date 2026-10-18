@@ -50397,17 +50397,29 @@ mod tests {
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|value| (1..=256).contains(value))
             .unwrap_or(16);
+        let benchmark_bytes = 1024_u64 * 1_048_576;
+        let benchmark_store_limits =
+            StoreLimits::new(StoreLimits::default().max_items(), benchmark_bytes)
+                .expect("stream benchmark Store limits");
+        let benchmark_depot_limits = BlobDepotLimits::new(benchmark_bytes, 65_536, 16)
+            .expect("stream benchmark depot limits");
+        let benchmark_forwarding = SelectedForwardingConfig::default()
+            .with_store_limits(benchmark_store_limits)
+            .with_blob_depot_limits(benchmark_depot_limits);
         let plaintext = vec![0x5a; size_mib * 1_048_576];
-        let offline = start_node(NodeConfig {
-            state: source_root.clone(),
-            bind: SocketAddr::from(([127, 0, 0, 1], 0)),
-            mission: source_mission.credentials.clone(),
-            peers: Vec::new(),
-            mutable_interests: Default::default(),
-            sync_interval: Duration::from_millis(10),
-            run_for: None,
-            application: NodeApplication::Relay,
-        })
+        let offline = start_node_with_forwarding(
+            NodeConfig {
+                state: source_root.clone(),
+                bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+                mission: source_mission.credentials.clone(),
+                peers: Vec::new(),
+                mutable_interests: Default::default(),
+                sync_interval: Duration::from_millis(10),
+                run_for: None,
+                application: NodeApplication::Relay,
+            },
+            benchmark_forwarding,
+        )
         .await
         .expect("start stream benchmark source");
         let mut stream = offline
@@ -50440,10 +50452,24 @@ mod tests {
             .await
             .expect("stop stream benchmark source");
 
-        let source_store =
-            Arc::new(Store::open_for_mission(source_root.join(STORE_FILE), authority).unwrap());
-        let receiver_store =
-            Arc::new(Store::open_for_mission(receiver_root.join(STORE_FILE), authority).unwrap());
+        let source_store = Arc::new(
+            Store::open_with_limits_and_blob_depot_limits_for_mission(
+                source_root.join(STORE_FILE),
+                benchmark_store_limits,
+                benchmark_depot_limits,
+                authority,
+            )
+            .unwrap(),
+        );
+        let receiver_store = Arc::new(
+            Store::open_with_limits_and_blob_depot_limits_for_mission(
+                receiver_root.join(STORE_FILE),
+                benchmark_store_limits,
+                benchmark_depot_limits,
+                authority,
+            )
+            .unwrap(),
+        );
         let receiver_credentials = receiver_mission.credentials.clone();
         let started = std::time::Instant::now();
         let (received, sent, _, _) = TEST_SEMANTIC_VERSION
@@ -50523,14 +50549,16 @@ mod tests {
             .expect("authenticate received stream completion");
         assert_eq!(actual, plaintext);
         eprintln!(
-            "live_blob_stream_v9 bytes={} contact_ms={} verified_read_ms={} total_ms={}",
+            "live_blob_stream_v9 bytes={} contact_ms={} verified_read_ms={} total_ms={} max_checkpoint_ms={} writer_commits={}",
             plaintext.len(),
             contact_elapsed.as_millis(),
             started
                 .elapsed()
                 .saturating_sub(contact_elapsed)
                 .as_millis(),
-            started.elapsed().as_millis()
+            started.elapsed().as_millis(),
+            received.blob_stream_checkpoint_latency_ms,
+            received.blob_stream_writer_commits,
         );
         drop(source_store);
         drop(receiver_store);

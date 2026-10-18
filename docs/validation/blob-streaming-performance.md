@@ -15,6 +15,8 @@ encoding without decrypt/re-encode, and compacts its receive buffer in batches.
 | Payload | Contact elapsed | Contact rate | Verified read | Total elapsed |
 | ---: | ---: | ---: | ---: | ---: |
 | 32 MiB | 1.731 s | 18.5 MiB/s | 0.468 s | 2.200 s |
+| 128 MiB, direct-pack baseline | 3.750 s | 34.1 MiB/s | 1.991 s | 5.741 s |
+| 128 MiB, shared authenticated ciphertext checkpoint | 3.556 s | 36.0 MiB/s | 1.996 s | 5.552 s |
 
 The same 32-MiB path before direct data and batched compaction took 2.509 s in
 contact and 2.977 s total, so contact time fell by approximately 31%. A 16-MiB
@@ -29,6 +31,17 @@ previous 363.4-MiB/s raw Iroh ceiling, so it is not yet valid to claim that the
 transport is the only bottleneck. Resume tests separately prove that a
 half-complete durable pack sends only its missing suffix and a fully durable
 pack settles with zero data bytes.
+
+The larger fixture uses explicit 1-GiB Store/depot limits so the measurement is
+not capped by the conservative 64-MiB default. All 37 receiver pack commits in
+the optimized 128-MiB run measured below 1 ms, ruling out durable checkpoint
+latency as the workstation bottleneck. Reusing the decryptor's authenticated
+post-segment ciphertext checkpoint in the pack writer removed a redundant full
+ciphertext SHA-256 pass and reduced contact time by 5.2%. Comparing the 32-MiB
+and 128-MiB measurements indicates substantial fixed contact/authentication
+cost plus a steady-state path around 50 MiB/s. The sequential AEAD and content
+identity pipeline, especially on lower-power devices, remains the next stage to
+parallelize before claiming transport-limited operation.
 
 ## 2026-10-18 bidirectional application-RPC loopback
 

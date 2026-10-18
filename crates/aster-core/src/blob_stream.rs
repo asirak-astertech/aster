@@ -502,6 +502,10 @@ impl EncryptedBlobStreamSegment {
         self.total_len
     }
 
+    pub const fn previous_ciphertext_commitment(&self) -> [u8; 32] {
+        self.previous_ciphertext_commitment
+    }
+
     pub fn ciphertext(&self) -> &[u8] {
         &self.ciphertext
     }
@@ -622,6 +626,29 @@ pub struct BlobStreamDecryptor {
     ciphertext_accumulator: BlobStreamAccumulator,
 }
 
+/// Provider-minted proof that one exact segment passed AEAD verification and
+/// advanced the ordered ciphertext accumulator to this checkpoint.
+#[derive(Debug)]
+pub struct AuthenticatedBlobStreamSegmentCheckpoint {
+    segment_index: u64,
+    ciphertext_len: usize,
+    checkpoint: BlobStreamAccumulatorCheckpoint,
+}
+
+impl AuthenticatedBlobStreamSegmentCheckpoint {
+    pub const fn segment_index(&self) -> u64 {
+        self.segment_index
+    }
+
+    pub const fn ciphertext_len(&self) -> usize {
+        self.ciphertext_len
+    }
+
+    pub fn into_checkpoint(self) -> BlobStreamAccumulatorCheckpoint {
+        self.checkpoint
+    }
+}
+
 impl BlobStreamDecryptor {
     pub(crate) fn from_key(
         open: &VerifiedBlobStreamOpen,
@@ -711,6 +738,25 @@ impl BlobStreamDecryptor {
             .ok_or(BlobError::LengthOverflow)?;
         self.next_offset = end;
         Ok(Zeroizing::new(plaintext))
+    }
+
+    /// Decrypts one ordered segment and returns the exact authenticated
+    /// ciphertext checkpoint produced by that operation. Internal Store users
+    /// can persist this checkpoint without hashing the ciphertext a second
+    /// time.
+    pub fn decrypt_segment_checkpointed(
+        &mut self,
+        segment: &EncryptedBlobStreamSegment,
+    ) -> Result<(Zeroizing<Vec<u8>>, AuthenticatedBlobStreamSegmentCheckpoint), BlobError> {
+        let plaintext = self.decrypt_segment(segment)?;
+        Ok((
+            plaintext,
+            AuthenticatedBlobStreamSegmentCheckpoint {
+                segment_index: segment.index,
+                ciphertext_len: segment.ciphertext.len(),
+                checkpoint: self.ciphertext_accumulator.checkpoint(),
+            },
+        ))
     }
 
     /// Authenticates the complete ordered ciphertext stream against its signed commitment.

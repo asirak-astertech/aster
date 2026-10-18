@@ -216,6 +216,28 @@ impl BlobStreamPackSession {
             .append_encoded_segment(plaintext, segment, encoded)
     }
 
+    pub fn append_authenticated_encoded_segment(
+        &mut self,
+        plaintext: &[u8],
+        segment: &aster_mesh::EncryptedBlobStreamSegment,
+        encoded: &[u8],
+        authenticated: aster_mesh::AuthenticatedBlobStreamSegmentCheckpoint,
+    ) -> Result<(), StoreError> {
+        if authenticated.segment_index() != segment.index()
+            || authenticated.ciphertext_len() != segment.ciphertext().len()
+        {
+            return Err(StoreError::Blob(BlobStoreError::DepotIntegrity(
+                "authenticated Blob segment checkpoint differs",
+            )));
+        }
+        self.writer.append_authenticated_encoded_segment(
+            plaintext,
+            segment,
+            encoded,
+            authenticated.into_checkpoint(),
+        )
+    }
+
     pub fn checkpoint(
         &mut self,
         store: &Store,

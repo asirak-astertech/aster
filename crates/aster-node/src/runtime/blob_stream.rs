@@ -462,6 +462,7 @@ pub(super) async fn receive_completed_pack(
     let writer_commits = AtomicU32::new(0);
     let received_bytes = AtomicU64::new(0);
     let greatest_receive_limit = AtomicU64::new(initial_limit);
+    let greatest_checkpoint_latency_ms = AtomicU64::new(0);
     let code = drive_receiver_attempt(
         attempt,
         mission,
@@ -524,15 +525,16 @@ pub(super) async fn receive_completed_pack(
                         &current.buffered[record_start + 4..record_end],
                     )
                     .map_err(protocol)?;
-                    let plaintext = current
+                    let (plaintext, ciphertext_checkpoint) = current
                         .stream
                         .decryptor
-                        .decrypt_segment(&segment)
+                        .decrypt_segment_checkpointed(&segment)
                         .map_err(protocol)?;
-                    current.stream.pack.append_encoded_segment(
+                    current.stream.pack.append_authenticated_encoded_segment(
                         &plaintext,
                         &segment,
                         &current.buffered[record_start + 4..record_end],
+                        ciphertext_checkpoint,
                     )?;
                     current.buffered_consumed = record_end;
                     current.durable_wire_offset = current
@@ -550,7 +552,12 @@ pub(super) async fn receive_completed_pack(
                 current.buffered_consumed = 0;
             }
             if current.appended_since_checkpoint {
+                let checkpoint_started = std::time::Instant::now();
                 current.stream.pack.checkpoint(store, guard.policy())?;
+                greatest_checkpoint_latency_ms.fetch_max(
+                    u64::try_from(checkpoint_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
                 current.appended_since_checkpoint = false;
                 writer_commits.store(
                     writer_commits
@@ -635,7 +642,7 @@ pub(super) async fn receive_completed_pack(
             retransmitted_bytes: 0,
             receive_limit_bytes: greatest_receive_limit.load(Ordering::Relaxed),
             checkpoint_bytes: total,
-            checkpoint_latency_ms: 0,
+            checkpoint_latency_ms: greatest_checkpoint_latency_ms.load(Ordering::Relaxed),
             writer_commits: writer_commits.load(Ordering::Relaxed),
             failover_recoveries: 0,
         },

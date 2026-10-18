@@ -326,6 +326,26 @@ impl BlobPackWriter {
         segment: &EncryptedBlobStreamSegment,
         encoded: &[u8],
     ) -> Result<(), StoreError> {
+        self.append_encoded_segment_inner(plaintext, segment, encoded, None)
+    }
+
+    pub(crate) fn append_authenticated_encoded_segment(
+        &mut self,
+        plaintext: &[u8],
+        segment: &EncryptedBlobStreamSegment,
+        encoded: &[u8],
+        ciphertext_checkpoint: BlobStreamAccumulatorCheckpoint,
+    ) -> Result<(), StoreError> {
+        self.append_encoded_segment_inner(plaintext, segment, encoded, Some(ciphertext_checkpoint))
+    }
+
+    fn append_encoded_segment_inner(
+        &mut self,
+        plaintext: &[u8],
+        segment: &EncryptedBlobStreamSegment,
+        encoded: &[u8],
+        authenticated_ciphertext_checkpoint: Option<BlobStreamAccumulatorCheckpoint>,
+    ) -> Result<(), StoreError> {
         let expected_plaintext_next = segment
             .index()
             .checked_add(1)
@@ -340,6 +360,7 @@ impl BlobPackWriter {
             || segment.total_len() != self.total_len
             || segment.index() != self.next_index
             || segment.offset() != self.next_offset
+            || segment.previous_ciphertext_commitment() != self.ciphertext.checkpoint().commitment()
         {
             return Err(integrity("Blob pack segment does not extend this stream"));
         }
@@ -364,10 +385,30 @@ impl BlobPackWriter {
         next_plaintext
             .push_segment(segment.index(), plaintext)
             .map_err(|_| integrity("Blob pack plaintext accumulator rejected segment"))?;
-        let mut next_ciphertext = self.ciphertext.clone();
-        next_ciphertext
-            .push_segment(segment.index(), segment.ciphertext())
-            .map_err(|_| integrity("Blob pack ciphertext accumulator rejected segment"))?;
+        let next_ciphertext = if let Some(checkpoint) = authenticated_ciphertext_checkpoint {
+            let expected_ciphertext_len = self
+                .ciphertext
+                .checkpoint()
+                .total_len()
+                .checked_add(segment.ciphertext().len() as u64)
+                .ok_or_else(|| integrity("Blob pack ciphertext length overflow"))?;
+            if checkpoint.domain() != aster_mesh::BlobStreamAccumulatorDomain::Ciphertext
+                || checkpoint.next_index() != next_index
+                || checkpoint.total_len() != expected_ciphertext_len
+            {
+                return Err(integrity(
+                    "authenticated Blob ciphertext checkpoint differs",
+                ));
+            }
+            BlobStreamAccumulator::restore(checkpoint)
+                .map_err(|_| integrity("authenticated Blob ciphertext checkpoint is invalid"))?
+        } else {
+            let mut accumulator = self.ciphertext.clone();
+            accumulator
+                .push_segment(segment.index(), segment.ciphertext())
+                .map_err(|_| integrity("Blob pack ciphertext accumulator rejected segment"))?;
+            accumulator
+        };
         let append = self
             .data
             .write_all(&encoded_len.to_be_bytes())
@@ -967,6 +1008,30 @@ mod tests {
                 .append_encoded_segment(&fixture.plaintexts[1], &fixture.segments[1], &mismatched,)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn blob_pack_adopts_authenticated_ciphertext_checkpoint_without_rehashing() {
+        let fixture = stream_fixture(0x6b);
+        let mut writer = BlobPackWriter::create(&fixture.pack_root, &fixture.open).expect("writer");
+        let mut authenticated = BlobStreamAccumulator::new(BlobStreamAccumulatorDomain::Ciphertext);
+        for (index, segment) in fixture.segments.iter().enumerate() {
+            authenticated
+                .push_segment(index as u64, segment.ciphertext())
+                .expect("authenticated ciphertext checkpoint");
+            writer
+                .append_authenticated_encoded_segment(
+                    &fixture.plaintexts[index],
+                    segment,
+                    &segment.encode(),
+                    authenticated.checkpoint(),
+                )
+                .expect("append authenticated original encoding");
+        }
+
+        writer
+            .finish(&fixture.final_commitment)
+            .expect("authenticated checkpoint retains the signed final root");
     }
 
     #[test]
