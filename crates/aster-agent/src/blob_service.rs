@@ -987,7 +987,7 @@ mod tests {
                     media_type: None,
                     schema_id: Vec::new(),
                 },
-                BlobPublishOptions::finite_ttl_ms(1_000).unwrap(),
+                BlobPublishOptions::finite_ttl_ms(10_000).unwrap(),
                 fs::File::open(source_path).unwrap(),
             )
             .await
@@ -1008,7 +1008,7 @@ mod tests {
         assert_eq!(first.chunk.len(), MAX_SELECTED_BLOB_PAGE_BYTES);
         assert!(!first.complete);
 
-        tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(10_100)).await;
         let expired = stream.next().await.unwrap().unwrap_err();
         assert_eq!(expired.code, ErrorCode::NotFound);
         assert_eq!(

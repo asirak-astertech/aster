@@ -1251,8 +1251,7 @@ mod tests {
             connectrpc::bidi_streaming_handler_fn(
                 |_ctx, mut requests: connectrpc::ServiceStream<api::PublishBlobRequest>| async move {
                     let responses = futures::stream::once(async move {
-                        let _ = futures::StreamExt::next(&mut requests).await;
-                        tokio::time::sleep(Duration::from_secs(31)).await;
+                        while futures::StreamExt::next(&mut requests).await.is_some() {}
                         Ok::<_, ConnectError>(api::PublishBlobResponse::default())
                     });
                     connectrpc::Response::stream_ok(responses)
@@ -1279,13 +1278,17 @@ mod tests {
                     format!("Bearer {}", String::from_utf8_lossy(TEST_TOKEN)),
                 ),
         );
-        let mut response = client.publish_blob().await.unwrap();
-        response
-            .send(api::PublishBlobRequest::default())
-            .await
-            .unwrap();
-        response.close_send();
-        let response = response.message::<api::PublishBlobResponse>().await;
+        let response = client.publish_blob().await.unwrap();
+        let (mut send, mut receive) = response.into_split();
+        let sender = tokio::spawn(async move {
+            for _ in 0..3 {
+                send.send(api::PublishBlobRequest::default()).await.unwrap();
+                tokio::time::sleep(Duration::from_secs(20)).await;
+            }
+            send.close_send();
+        });
+        let response = receive.message::<api::PublishBlobResponse>().await;
+        sender.await.unwrap();
         assert!(
             response.is_ok(),
             "progressing Blob upload was cut off by the ordinary deadline: {response:?}"

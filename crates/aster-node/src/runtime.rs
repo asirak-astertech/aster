@@ -57666,34 +57666,37 @@ mod tests {
         );
         let writer_hold = Arc::new(TestCustodyWriterHold::new());
         let authorization_count = Arc::new(AtomicU64::new(0));
-        let (client, server) = with_test_transfer_profile_offer(
-            legacy_event_with_blob_stream_offer(),
-            contact_test_pair_with_forwarding_results(
-                TestForwardingNode {
-                    store: server_store.clone(),
-                    mission: services.member.clone(),
-                    policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::ReceiveOnly)),
-                    clock: NodeCustodyClock::injected([0x6c; 16], 0, 0),
-                    reconciliation_exchanges_before_defer: None,
-                    preopen_custody_races: Vec::new(),
-                },
-                TestForwardingNode {
-                    store: client_store.clone(),
-                    mission: services.other.clone(),
-                    policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
-                    clock: NodeCustodyClock::injected(clock_id, 0, 0),
-                    reconciliation_exchanges_before_defer: None,
-                    preopen_custody_races: vec![
-                        TestCustodyPreopenRace::HoldWriterAfterLease {
-                            transfer_id: source.transfer_id,
-                            state: writer_hold.clone(),
-                        },
-                        TestCustodyPreopenRace::CountAuthorizations {
-                            transfer_id: source.transfer_id,
-                            count: authorization_count.clone(),
-                        },
-                    ],
-                },
+        let (client, server) = with_test_semantic_version(
+            SEMANTIC_PROTOCOL_V8,
+            with_test_transfer_profile_offer(
+                legacy_event_with_blob_stream_offer(),
+                contact_test_pair_with_forwarding_results(
+                    TestForwardingNode {
+                        store: server_store.clone(),
+                        mission: services.member.clone(),
+                        policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::ReceiveOnly)),
+                        clock: NodeCustodyClock::injected([0x6c; 16], 0, 0),
+                        reconciliation_exchanges_before_defer: None,
+                        preopen_custody_races: Vec::new(),
+                    },
+                    TestForwardingNode {
+                        store: client_store.clone(),
+                        mission: services.other.clone(),
+                        policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                        clock: NodeCustodyClock::injected(clock_id, 0, 0),
+                        reconciliation_exchanges_before_defer: None,
+                        preopen_custody_races: vec![
+                            TestCustodyPreopenRace::HoldWriterAfterLease {
+                                transfer_id: source.transfer_id,
+                                state: writer_hold.clone(),
+                            },
+                            TestCustodyPreopenRace::CountAuthorizations {
+                                transfer_id: source.transfer_id,
+                                count: authorization_count.clone(),
+                            },
+                        ],
+                    },
+                ),
             ),
         )
         .await;
@@ -58147,34 +58150,37 @@ mod tests {
             },
         );
 
-        let (client, server) = with_test_transfer_profile_offer(
-            legacy_event_with_blob_stream_offer(),
-            contact_test_pair_with_forwarding_results(
-                TestForwardingNode {
-                    store: server_store.clone(),
-                    mission: services.member.clone(),
-                    policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::ReceiveOnly)),
-                    clock: NodeCustodyClock::injected([0x77; 16], 0, 0),
-                    reconciliation_exchanges_before_defer: None,
-                    preopen_custody_races: Vec::new(),
-                },
-                TestForwardingNode {
-                    store: client_store.clone(),
-                    mission: services.other.clone(),
-                    policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
-                    clock: NodeCustodyClock::injected(clock_id, 0, 0),
-                    reconciliation_exchanges_before_defer: None,
-                    preopen_custody_races: vec![
-                        TestCustodyPreopenRace::Expire {
-                            transfer_id: expired.transfer_id,
-                            tick_ms: 100,
-                        },
-                        TestCustodyPreopenRace::ItemChanged(changed.transfer_id),
-                        TestCustodyPreopenRace::LeaseLimitExceeded(lease_limited.transfer_id),
-                        TestCustodyPreopenRace::RetryLimitExceeded(retry_limited.transfer_id),
-                        TestCustodyPreopenRace::RetryNotDue(retry.transfer_id),
-                    ],
-                },
+        let (client, server) = with_test_semantic_version(
+            SEMANTIC_PROTOCOL_V8,
+            with_test_transfer_profile_offer(
+                legacy_event_with_blob_stream_offer(),
+                contact_test_pair_with_forwarding_results(
+                    TestForwardingNode {
+                        store: server_store.clone(),
+                        mission: services.member.clone(),
+                        policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::ReceiveOnly)),
+                        clock: NodeCustodyClock::injected([0x77; 16], 0, 0),
+                        reconciliation_exchanges_before_defer: None,
+                        preopen_custody_races: Vec::new(),
+                    },
+                    TestForwardingNode {
+                        store: client_store.clone(),
+                        mission: services.other.clone(),
+                        policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                        clock: NodeCustodyClock::injected(clock_id, 0, 0),
+                        reconciliation_exchanges_before_defer: None,
+                        preopen_custody_races: vec![
+                            TestCustodyPreopenRace::Expire {
+                                transfer_id: expired.transfer_id,
+                                tick_ms: 100,
+                            },
+                            TestCustodyPreopenRace::ItemChanged(changed.transfer_id),
+                            TestCustodyPreopenRace::LeaseLimitExceeded(lease_limited.transfer_id),
+                            TestCustodyPreopenRace::RetryLimitExceeded(retry_limited.transfer_id),
+                            TestCustodyPreopenRace::RetryNotDue(retry.transfer_id),
+                        ],
+                    },
+                ),
             ),
         )
         .await;
@@ -58269,7 +58275,7 @@ mod tests {
             services.other.clone(),
         )
         .await;
-        assert_eq!(finite_source.semantic_version, SEMANTIC_PROTOCOL_V8);
+        assert_eq!(finite_source.semantic_version, SEMANTIC_PROTOCOL_V9);
         assert_eq!(finite_source.offered, 1);
         assert_eq!(finite_source.event_pages_sent, 1);
         assert_eq!(finite_source.event_page_entries_sent, 1);

@@ -29405,6 +29405,18 @@ mod tests {
                 .delete_table(BLOB_CARRIER_FETCH_CURSORS)
                 .expect("carrier cursors");
             write
+                .delete_table(BLOB_STREAM_CHECKPOINTS)
+                .expect("stream checkpoints");
+            write
+                .delete_table(BLOB_STREAM_RESERVATIONS)
+                .expect("stream reservations");
+            write
+                .delete_table(BLOB_STREAM_OPERATIONS)
+                .expect("stream operations");
+            write
+                .delete_table(BLOB_STREAM_PUBLICATIONS)
+                .expect("stream publications");
+            write
                 .delete_table(pressure::BLOB_PRESSURE_METADATA)
                 .expect("pressure metadata");
             for table in [

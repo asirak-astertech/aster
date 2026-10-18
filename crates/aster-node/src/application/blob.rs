@@ -3759,7 +3759,9 @@ impl SelectedBlobNode {
                 ApplicationError::new(ApplicationErrorKind::StateUnavailable, "blob read")
             })?;
             peak_working_buffer_bytes = peak_working_buffer_bytes.max(page.len());
-            verified_chunks = verified_chunks.checked_add(1).ok_or_else(|| {
+            let page_chunks = u64::try_from(page.len().div_ceil(SELECTED_BLOB_CHUNK_SIZE as usize))
+                .map_err(|_| ApplicationError::new(ApplicationErrorKind::Integrity, "blob read"))?;
+            verified_chunks = verified_chunks.checked_add(page_chunks).ok_or_else(|| {
                 ApplicationError::new(ApplicationErrorKind::Integrity, "blob read")
             })?;
             offset = page.next_offset();
@@ -5296,7 +5298,7 @@ mod tests {
         let root = TestRoot::new("finite-read-page-boundary");
         let mut node = selected_node(&root);
         node.custody_clock = NodeCustodyClock::injected([0xd2; 16], 100, 1);
-        let bytes = payload(2 * SELECTED_BLOB_CHUNK_SIZE as usize + 11);
+        let bytes = payload(MAX_SELECTED_BLOB_PAGE_BYTES + 11);
         let published = node
             .publish_with_options(
                 request(b"blob/finite-read-page-boundary"),
@@ -5316,7 +5318,7 @@ mod tests {
             )
             .expect_err("later page must not open at the exact TTL boundary");
         assert_eq!(error.kind(), ApplicationErrorKind::ExpiredOrRetired);
-        assert_eq!(output.len(), SELECTED_BLOB_CHUNK_SIZE as usize);
+        assert_eq!(output.len(), MAX_SELECTED_BLOB_PAGE_BYTES);
     }
 
     #[test]
@@ -6810,7 +6812,7 @@ mod tests {
     async fn live_blob_handle_publishes_and_reads_exact_finite_ttl() {
         let root = TestRoot::new("live-finite-publish");
         let source_path = root.path().join("finite-source.bin");
-        let bytes = payload(SELECTED_BLOB_CHUNK_SIZE as usize + 9);
+        let bytes = payload(MAX_SELECTED_BLOB_PAGE_BYTES + 9);
         fs::write(&source_path, &bytes).expect("write finite live source");
         let mut node = selected_node(&root);
         node.custody_clock = NodeCustodyClock::injected([0xd4; 16], 1_000, 1);
@@ -8697,8 +8699,8 @@ mod tests {
             assert_eq!(read.total_len, bytes.len() as u64);
             assert_eq!(read.verified_chunks, 5);
             assert!(
-                read.peak_working_buffer_bytes <= SELECTED_BLOB_CHUNK_SIZE as usize + 16,
-                "core Blob reader exceeded its chunk-sized buffer bound"
+                read.peak_working_buffer_bytes <= MAX_SELECTED_BLOB_PAGE_BYTES,
+                "core Blob reader exceeded its bounded read-window size"
             );
             assert_eq!(read.media_type, first.media_type);
             assert_eq!(read.schema_id, first.schema_id);
