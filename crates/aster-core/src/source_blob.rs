@@ -1277,6 +1277,7 @@ mod tests {
             b"stream-provider-test".to_vec(),
             publisher.mission_authority_id(),
             1,
+            VersionVector::default(),
             topic(),
             scope(),
             BlobMetadata::new(Some("application/octet-stream".into()), b"schema".to_vec())

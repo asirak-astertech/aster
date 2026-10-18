@@ -25,6 +25,7 @@ use redb::{ReadableTable, ReadableTableMetadata};
 use super::*;
 
 const DEPOT_DIRECTORY: &str = "blob-depot-v1";
+const BLOB_PACK_DIRECTORY: &str = "stream-packs-v1";
 const DEPOT_OWNER_FILE: &str = ".aster-store-owner-v1";
 const DEPOT_OWNER_TEMP_PREFIX: &str = ".aster-store-owner-tmp-";
 const DEPOT_PENDING_PREFIX: &str = ".aster-blob-depot-pending-v1-";
@@ -1788,7 +1789,7 @@ impl<'a> BlobDepot<'a> {
 /// path or reopen it by pathname.
 pub(super) fn open_blob_pack_root(store: &Store) -> Result<OwnedDirectory, StoreError> {
     let depot = BlobDepot::open_network_mutation(store, true)?;
-    depot.root.open_child_directory("stream-packs-v1", true)
+    depot.root.open_child_directory(BLOB_PACK_DIRECTORY, true)
 }
 
 impl CoreBlobStore for BlobDepot<'_> {
@@ -4165,6 +4166,12 @@ fn reclaim_unmarked_artifacts(
         if name == "." || name == ".." || name == DEPOT_OWNER_FILE {
             continue;
         }
+        if name == BLOB_PACK_DIRECTORY {
+            // Append-only packs are a separate owner-bound namespace. Their
+            // exact files are governed by Blob stream reservation/publication
+            // authority and must never be interpreted as legacy variants.
+            continue;
+        }
         let Some(raw) = decode_hex32(&name) else {
             // Only known temporary files are reclaimable at the root. Unknown
             // artifacts fail closed rather than broadening cleanup authority.
@@ -4272,6 +4279,7 @@ fn audit_unmarked_artifacts_read(
     }
     for name in root.entry_names()? {
         if name == DEPOT_OWNER_FILE
+            || name == BLOB_PACK_DIRECTORY
             || name.starts_with(TEMP_PREFIX)
             || name.starts_with(DEPOT_OWNER_TEMP_PREFIX)
         {

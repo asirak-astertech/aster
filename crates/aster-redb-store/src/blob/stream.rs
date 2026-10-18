@@ -110,9 +110,7 @@ impl BlobStreamPackSession {
         plaintext: &[u8],
         segment: &aster_mesh::EncryptedBlobStreamSegment,
     ) -> Result<(), StoreError> {
-        self.writer
-            .append_plaintext_segment(segment.index(), plaintext)?;
-        self.writer.append_segment(segment)
+        self.writer.append_segment(plaintext, segment)
     }
 
     pub fn checkpoint(
@@ -1526,6 +1524,7 @@ mod tests {
             operation.as_bytes().to_vec(),
             publisher.mission_authority_id(),
             1,
+            VersionVector::default(),
             topic,
             scope,
             BlobMetadata::new(
@@ -1674,10 +1673,7 @@ mod tests {
         let segment = encryptor
             .encrypt_segment(0, 0, Zeroizing::new(vec![0x33; 8]))
             .expect("segment");
-        writer
-            .append_plaintext_segment(0, &[0x33; 8])
-            .expect("append plaintext");
-        writer.append_segment(&segment).expect("append");
+        writer.append_segment(&[0x33; 8], &segment).expect("append");
         let checkpoint = writer.checkpoint().expect("durable pack checkpoint");
         let advanced = fixture
             .store
@@ -1746,10 +1742,7 @@ mod tests {
         let segment = encryptor
             .encrypt_segment(0, 0, Zeroizing::new(plaintext.clone()))
             .expect("segment");
-        writer
-            .append_plaintext_segment(0, &plaintext)
-            .expect("append plaintext");
-        writer.append_segment(&segment).expect("append");
+        writer.append_segment(&plaintext, &segment).expect("append");
         let checkpoint = writer.checkpoint().expect("checkpoint");
         fixture
             .store

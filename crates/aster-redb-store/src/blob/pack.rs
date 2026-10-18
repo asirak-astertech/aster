@@ -295,15 +295,18 @@ impl BlobPackWriter {
 
     pub(crate) fn append_segment(
         &mut self,
+        plaintext: &[u8],
         segment: &EncryptedBlobStreamSegment,
     ) -> Result<(), StoreError> {
         let expected_plaintext_next = segment
             .index()
             .checked_add(1)
             .ok_or_else(|| integrity("Blob pack segment index overflow"))?;
-        if self.plaintext.checkpoint().next_index() != expected_plaintext_next
-            || self.plaintext.checkpoint().total_len()
-                != segment.offset() + u64::from(segment.plaintext_len())
+        let plaintext_len = u32::try_from(plaintext.len())
+            .map_err(|_| integrity("Blob pack plaintext segment length overflows"))?;
+        if plaintext_len != segment.plaintext_len()
+            || self.plaintext.checkpoint().next_index() != segment.index()
+            || self.plaintext.checkpoint().total_len() != segment.offset()
             || segment.stream_id() != self.stream_id
             || segment.open_digest() != &self.open_digest
             || segment.total_len() != self.total_len
@@ -318,36 +321,38 @@ impl BlobPackWriter {
         if encoded.is_empty() || encoded.len() > MAX_SEGMENT_RECORD_LEN {
             return Err(integrity("Blob pack segment exceeds record bound"));
         }
-        self.data
-            .write_all(&encoded_len.to_be_bytes())
-            .and_then(|()| self.data.write_all(&encoded))
-            .map_err(|error| blob_error(BlobStoreError::Io(error)))?;
-        self.ciphertext
-            .push_segment(segment.index(), segment.ciphertext())
-            .map_err(|_| integrity("Blob pack ciphertext accumulator rejected segment"))?;
-        self.next_index = self
-            .next_index
-            .checked_add(1)
-            .ok_or_else(|| integrity("Blob pack segment index overflow"))?;
-        self.next_offset = self
+        let next_index = expected_plaintext_next;
+        let next_offset = self
             .next_offset
             .checked_add(u64::from(segment.plaintext_len()))
             .ok_or_else(|| integrity("Blob pack plaintext offset overflow"))?;
-        self.pack_len = self
+        let next_pack_len = self
             .pack_len
             .checked_add(4 + u64::from(encoded_len))
             .ok_or_else(|| integrity("Blob pack byte length overflow"))?;
+        let mut next_plaintext = self.plaintext.clone();
+        next_plaintext
+            .push_segment(segment.index(), plaintext)
+            .map_err(|_| integrity("Blob pack plaintext accumulator rejected segment"))?;
+        let mut next_ciphertext = self.ciphertext.clone();
+        next_ciphertext
+            .push_segment(segment.index(), segment.ciphertext())
+            .map_err(|_| integrity("Blob pack ciphertext accumulator rejected segment"))?;
+        let append = self
+            .data
+            .write_all(&encoded_len.to_be_bytes())
+            .and_then(|()| self.data.write_all(&encoded));
+        if let Err(error) = append {
+            let _ = self.data.set_len(self.pack_len);
+            let _ = self.data.seek(SeekFrom::Start(self.pack_len));
+            return Err(blob_error(BlobStoreError::Io(error)));
+        }
+        self.plaintext = next_plaintext;
+        self.ciphertext = next_ciphertext;
+        self.next_index = next_index;
+        self.next_offset = next_offset;
+        self.pack_len = next_pack_len;
         Ok(())
-    }
-
-    pub(crate) fn append_plaintext_segment(
-        &mut self,
-        index: u64,
-        plaintext: &[u8],
-    ) -> Result<(), StoreError> {
-        self.plaintext
-            .push_segment(index, plaintext)
-            .map_err(|_| integrity("Blob pack plaintext accumulator rejected segment"))
     }
 
     pub(super) fn ciphertext_checkpoint(&self) -> BlobStreamAccumulatorCheckpoint {
@@ -716,6 +721,7 @@ mod tests {
     use aster_mesh::{
         BLOB_STREAM_SEGMENT_BYTES, BlobMetadata, BlobStreamFinalCommitment, BlobStreamOpen,
         Priority, ProvisioningAccess, ReferenceEnvelopeSealer, ReferenceProvisioner, Scope, Topic,
+        VersionVector,
     };
     use zeroize::Zeroizing;
 
@@ -784,6 +790,7 @@ mod tests {
             b"pack-test".to_vec(),
             publisher.mission_authority_id(),
             1,
+            VersionVector::default(),
             topic,
             scope,
             BlobMetadata::new(Some("application/octet-stream".into()), b"pack".to_vec())
@@ -860,11 +867,31 @@ mod tests {
 
     fn append_fixture_segment(writer: &mut BlobPackWriter, fixture: &StreamFixture, index: usize) {
         writer
-            .append_plaintext_segment(index as u64, &fixture.plaintexts[index])
-            .expect("append plaintext");
-        writer
-            .append_segment(&fixture.segments[index])
-            .expect("append encrypted segment");
+            .append_segment(&fixture.plaintexts[index], &fixture.segments[index])
+            .expect("append segment");
+    }
+
+    #[test]
+    fn blob_pack_rejected_append_does_not_advance_either_frontier() {
+        let fixture = stream_fixture(0x60);
+        let mut writer = BlobPackWriter::create(&fixture.pack_root, &fixture.open).expect("writer");
+        let wrong_plaintext = vec![0x44; fixture.plaintexts[0].len()];
+
+        assert!(
+            writer
+                .append_segment(
+                    &wrong_plaintext[..wrong_plaintext.len() - 1],
+                    &fixture.segments[0]
+                )
+                .is_err()
+        );
+        append_fixture_segment(&mut writer, &fixture, 0);
+        let checkpoint = writer.checkpoint().expect("checkpoint after retry");
+        assert_eq!(checkpoint.next_index(), 1);
+        assert_eq!(
+            checkpoint.plaintext_offset(),
+            fixture.plaintexts[0].len() as u64
+        );
     }
 
     #[test]

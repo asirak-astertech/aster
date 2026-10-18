@@ -7,7 +7,7 @@
 use crate::{
     blob::{BlobError, BlobId, BlobMetadata},
     custody::CustodySample,
-    model::{NodeId, Priority, Scope, Topic},
+    model::{Dot, MAX_CAUSAL_CONTEXT_ENTRIES, NodeId, Priority, Scope, Topic, VersionVector},
     source_blob::BlobStreamProviderSeal,
 };
 use aes_gcm::{
@@ -33,7 +33,7 @@ const BLOB_STREAM_KEY_SALT: &[u8] = b"aster/blob-stream/key/v1";
 const BLOB_STREAM_KEY_INFO: &[u8] = b"aster/blob-stream/aead-key/v1";
 const BLOB_STREAM_NONCE_INFO: &[u8] = b"aster/blob-stream/base-nonce/v1";
 const MAX_BLOB_STREAM_OPERATION_KEY_BYTES: usize = 256;
-const MAX_BLOB_STREAM_OPEN_BYTES: usize = 2048;
+const MAX_BLOB_STREAM_OPEN_BYTES: usize = 2048 + 40 * MAX_CAUSAL_CONTEXT_ENTRIES;
 const GCM_TAG_BYTES: usize = 16;
 const GCM_NONCE_BYTES: usize = 12;
 
@@ -62,6 +62,7 @@ pub struct BlobStreamOpen {
     operation_key: Vec<u8>,
     mission_id: [u8; 32],
     publisher_counter: u64,
+    causal_context: VersionVector,
     topic: Topic,
     scope: Scope,
     metadata: BlobMetadata,
@@ -83,6 +84,7 @@ impl BlobStreamOpen {
         operation_key: Vec<u8>,
         mission_id: [u8; 32],
         publisher_counter: u64,
+        causal_context: VersionVector,
         topic: Topic,
         scope: Scope,
         metadata: BlobMetadata,
@@ -100,6 +102,10 @@ impl BlobStreamOpen {
             || operation_key.len() > MAX_BLOB_STREAM_OPERATION_KEY_BYTES
             || mission_id == [0_u8; 32]
             || publisher_counter == 0
+            || causal_context.len() > MAX_CAUSAL_CONTEXT_ENTRIES
+            || causal_context.iter().any(|(context_publisher, counter)| {
+                *counter == 0 || (*context_publisher == publisher && *counter >= publisher_counter)
+            })
             || total_len == 0
             || content_epoch == 0
             || policy_revision == 0
@@ -116,6 +122,7 @@ impl BlobStreamOpen {
             operation_key,
             mission_id,
             publisher_counter,
+            causal_context,
             topic,
             scope,
             metadata,
@@ -140,6 +147,11 @@ impl BlobStreamOpen {
         push_u16_bytes(&mut encoded, &self.operation_key).expect("validated operation key");
         encoded.extend_from_slice(&self.mission_id);
         encoded.extend_from_slice(&self.publisher_counter.to_be_bytes());
+        encoded.extend_from_slice(&(self.causal_context.len() as u32).to_be_bytes());
+        for (publisher, counter) in self.causal_context.iter() {
+            encoded.extend_from_slice(publisher);
+            encoded.extend_from_slice(&counter.to_be_bytes());
+        }
         push_u16_bytes(&mut encoded, self.topic.as_str().as_bytes()).expect("validated topic");
         push_u16_bytes(&mut encoded, self.scope.as_str().as_bytes()).expect("validated scope");
         encode_metadata(&mut encoded, &self.metadata).expect("validated metadata");
@@ -173,6 +185,22 @@ impl BlobStreamOpen {
             .to_vec();
         let mission_id = reader.array()?;
         let publisher_counter = reader.u64()?;
+        let context_len = usize::try_from(reader.u32()?).map_err(|_| BlobError::LengthOverflow)?;
+        if context_len > MAX_CAUSAL_CONTEXT_ENTRIES {
+            return Err(BlobError::InvalidManifest);
+        }
+        let mut causal_context = VersionVector::default();
+        for _ in 0..context_len {
+            let context_publisher = reader.array()?;
+            let context_counter = reader.u64()?;
+            if context_counter == 0 || causal_context.counter(&context_publisher) != 0 {
+                return Err(BlobError::InvalidManifest);
+            }
+            causal_context.observe(Dot {
+                publisher: context_publisher,
+                counter: context_counter,
+            });
+        }
         let topic = Topic::new(reader.u16_string(128)?).map_err(|_| BlobError::InvalidManifest)?;
         let scope = Scope::new(reader.u16_string(128)?).map_err(|_| BlobError::InvalidManifest)?;
         let metadata = decode_metadata(&mut reader)?;
@@ -191,6 +219,7 @@ impl BlobStreamOpen {
             operation_key,
             mission_id,
             publisher_counter,
+            causal_context,
             topic,
             scope,
             metadata,
@@ -215,6 +244,14 @@ impl BlobStreamOpen {
 
     pub const fn publisher(&self) -> NodeId {
         self.publisher
+    }
+
+    pub const fn publisher_counter(&self) -> u64 {
+        self.publisher_counter
+    }
+
+    pub const fn causal_context(&self) -> &VersionVector {
+        &self.causal_context
     }
 
     pub fn operation_key(&self) -> &[u8] {
@@ -1329,7 +1366,7 @@ mod tests {
         BlobStreamDecryptor, BlobStreamEncryptor, BlobStreamFinalCommitment, BlobStreamOpen,
         VerifiedBlobStreamOpen, derive_stream_blob_id_for_format,
     };
-    use crate::{BlobError, BlobMetadata, CustodySample, Priority, Scope, Topic};
+    use crate::{BlobError, BlobMetadata, CustodySample, Dot, Priority, Scope, Topic, VersionVector};
     use zeroize::Zeroizing;
 
     fn digest(hex: &str) -> [u8; 32] {
@@ -1348,6 +1385,7 @@ mod tests {
             b"operation-1".to_vec(),
             [0x33; 32],
             7,
+            VersionVector::default(),
             Topic::new("imagery").expect("topic"),
             Scope::new("alpha/team").expect("scope"),
             BlobMetadata::new(media_type.map(str::to_owned), schema_id.to_vec()).expect("metadata"),
@@ -1586,6 +1624,10 @@ mod tests {
         assert_open_field_bound!(|open: &mut BlobStreamOpen| open.operation_key.push(1));
         assert_open_field_bound!(|open: &mut BlobStreamOpen| open.mission_id[0] ^= 1);
         assert_open_field_bound!(|open: &mut BlobStreamOpen| open.publisher_counter += 1);
+        assert_open_field_bound!(|open: &mut BlobStreamOpen| open.causal_context.observe(Dot {
+            publisher: [0x77; 32],
+            counter: 4,
+        }));
         assert_open_field_bound!(
             |open: &mut BlobStreamOpen| open.topic = Topic::new("other").expect("topic")
         );
