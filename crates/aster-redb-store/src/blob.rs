@@ -15715,6 +15715,23 @@ pub(crate) fn audit_blob_tables_write(
             "Blob operation usage exceeds its durable safety caps",
         )));
     }
+    let stream_publications = write.open_table(BLOB_STREAM_PUBLICATIONS)?;
+    let (stream_count, stream_bytes) = stream::audit_completed_blob_stream_causal_rows(
+        &stream_publications,
+        &accepted_dots,
+        &publisher_high,
+        &frontier,
+        shared,
+    )?;
+    stats.publications = stats
+        .publications
+        .checked_add(stream_count)
+        .ok_or(StoreError::ItemCountAccountingOverflow)?;
+    stats.total_sealed_bytes = stats
+        .total_sealed_bytes
+        .checked_add(stream_bytes)
+        .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+    drop(stream_publications);
     let depot_stats = depot::audit_depot_metadata_write(write, &deletion_audit)?;
     stats.variants = depot_stats.variants;
     stats.finalized_variants = depot_stats.finalized_variants;
@@ -16053,6 +16070,17 @@ pub(crate) fn inspect_blob_tables_read(
         stats.carrier_prefixes = network.carrier_prefixes;
         stats.network_staging_bytes = network.staging.bytes;
         stats.carrier_fetch_cursors = network.carrier_cursors;
+        let stream_publications = read.open_table(BLOB_STREAM_PUBLICATIONS)?;
+        let (stream_count, stream_bytes) =
+            stream::completed_blob_stream_usage(&stream_publications)?;
+        stats.publications = stats
+            .publications
+            .checked_add(stream_count)
+            .ok_or(StoreError::ItemCountAccountingOverflow)?;
+        stats.total_sealed_bytes = stats
+            .total_sealed_bytes
+            .checked_add(stream_bytes)
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?;
     }
     let lifecycle_usage = lifecycle::inspect_blob_lifecycle_read(read)?;
     let metadata = read.open_table(METADATA)?;
@@ -16333,6 +16361,28 @@ pub(crate) fn inspect_blob_tables_read_with_shared(
             )?)
             .or_default()
             .insert(dot.publisher);
+    }
+    if table_names.contains(BLOB_STREAM_PUBLICATIONS.name()) {
+        let stream_publications = read.open_table(BLOB_STREAM_PUBLICATIONS)?;
+        stream::audit_completed_blob_stream_causal_rows(
+            &stream_publications,
+            accepted_dots.as_ref().ok_or_else(|| {
+                blob_error(BlobStoreError::SchemaInvariant(
+                    "Blob stream publications exist without the shared accepted-dot ledger",
+                ))
+            })?,
+            publisher_high.as_ref().ok_or_else(|| {
+                blob_error(BlobStoreError::SchemaInvariant(
+                    "Blob stream publications exist without publisher high-water authority",
+                ))
+            })?,
+            frontier.as_ref().ok_or_else(|| {
+                blob_error(BlobStoreError::SchemaInvariant(
+                    "Blob stream publications exist without causal frontier authority",
+                ))
+            })?,
+            shared,
+        )?;
     }
     if read
         .list_multimap_tables()?

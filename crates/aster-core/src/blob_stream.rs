@@ -1366,7 +1366,9 @@ mod tests {
         BlobStreamDecryptor, BlobStreamEncryptor, BlobStreamFinalCommitment, BlobStreamOpen,
         VerifiedBlobStreamOpen, derive_stream_blob_id_for_format,
     };
-    use crate::{BlobError, BlobMetadata, CustodySample, Dot, Priority, Scope, Topic, VersionVector};
+    use crate::{
+        BlobError, BlobMetadata, CustodySample, Dot, Priority, Scope, Topic, VersionVector,
+    };
     use zeroize::Zeroizing;
 
     fn digest(hex: &str) -> [u8; 32] {
@@ -1624,10 +1626,12 @@ mod tests {
         assert_open_field_bound!(|open: &mut BlobStreamOpen| open.operation_key.push(1));
         assert_open_field_bound!(|open: &mut BlobStreamOpen| open.mission_id[0] ^= 1);
         assert_open_field_bound!(|open: &mut BlobStreamOpen| open.publisher_counter += 1);
-        assert_open_field_bound!(|open: &mut BlobStreamOpen| open.causal_context.observe(Dot {
-            publisher: [0x77; 32],
-            counter: 4,
-        }));
+        assert_open_field_bound!(
+            |open: &mut BlobStreamOpen| open.causal_context.observe(Dot {
+                publisher: [0x77; 32],
+                counter: 4,
+            })
+        );
         assert_open_field_bound!(
             |open: &mut BlobStreamOpen| open.topic = Topic::new("other").expect("topic")
         );

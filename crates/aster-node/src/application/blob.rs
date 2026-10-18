@@ -5551,6 +5551,44 @@ mod tests {
         assert_eq!(result.total_len, bytes.len() as u64);
         assert_eq!(result.publisher, node.identity());
         assert!(result.inserted);
+        assert_eq!(
+            node.store
+                .blob_stats()
+                .expect("stream publication stats")
+                .publications,
+            1
+        );
+    }
+
+    #[test]
+    fn selected_blob_stream_promotions_advance_the_shared_causal_counter() {
+        let root = TestRoot::new("selected-blob-stream-causal-counter");
+        let mut node = selected_node(&root);
+        let mut counters = Vec::new();
+        for operation in [b"blob/stream/causal-1".as_slice(), b"blob/stream/causal-2"] {
+            let opened = node
+                .open_publish_stream_inner(BlobPublishStreamRequest {
+                    publication: request(operation),
+                    options: BlobPublishOptions::durable(),
+                    total_len: 1,
+                })
+                .expect("open stream");
+            node.append_publish_stream_inner(opened.token, 0, Zeroizing::new(vec![0x5a]))
+                .expect("append stream");
+            counters.push(
+                node.finish_publish_stream_inner(opened.token)
+                    .expect("finish stream")
+                    .publisher_counter,
+            );
+        }
+        assert_eq!(counters, [1, 2]);
+        assert_eq!(
+            node.store
+                .blob_stats()
+                .expect("stream publication stats")
+                .publications,
+            2
+        );
     }
 
     #[test]
