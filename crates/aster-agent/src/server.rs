@@ -1249,9 +1249,8 @@ mod tests {
             api::ASTER_APPLICATION_SERVICE_SERVICE_NAME,
             "PublishBlob",
             connectrpc::bidi_streaming_handler_fn(
-                |_ctx, mut requests: connectrpc::ServiceStream<api::PublishBlobRequest>| async move {
-                    let responses = futures::stream::once(async move {
-                        while futures::StreamExt::next(&mut requests).await.is_some() {}
+                |_ctx, requests: connectrpc::ServiceStream<api::PublishBlobRequest>| async move {
+                    let responses = futures::StreamExt::map(requests, |_| {
                         Ok::<_, ConnectError>(api::PublishBlobResponse::default())
                     });
                     connectrpc::Response::stream_ok(responses)
@@ -1278,21 +1277,25 @@ mod tests {
                     format!("Bearer {}", String::from_utf8_lossy(TEST_TOKEN)),
                 ),
         );
-        let response = client.publish_blob().await.unwrap();
-        let (mut send, mut receive) = response.into_split();
-        let sender = tokio::spawn(async move {
-            for _ in 0..3 {
-                send.send(api::PublishBlobRequest::default()).await.unwrap();
+        let mut stream = client.publish_blob().await.unwrap();
+        for index in 0..3 {
+            stream
+                .send(api::PublishBlobRequest::default())
+                .await
+                .unwrap();
+            assert!(
+                stream
+                    .message::<api::PublishBlobResponse>()
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "progressing Blob upload response stream ended early"
+            );
+            if index < 2 {
                 tokio::time::sleep(Duration::from_secs(20)).await;
             }
-            send.close_send();
-        });
-        let response = receive.message::<api::PublishBlobResponse>().await;
-        sender.await.unwrap();
-        assert!(
-            response.is_ok(),
-            "progressing Blob upload was cut off by the ordinary deadline: {response:?}"
-        );
+        }
+        stream.close_send();
     }
 
     #[cfg(feature = "client")]

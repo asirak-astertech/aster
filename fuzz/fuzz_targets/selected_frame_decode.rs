@@ -314,8 +314,11 @@ fn corpus_input(input: &[u8]) -> Vec<u8> {
         return input.to_vec();
     }
     let mut decoded = Vec::with_capacity(hexadecimal.len() / 2);
-    for offset in (0..hexadecimal.len()).step_by(2) {
-        let Ok(byte) = u8::from_str_radix(&hexadecimal[offset..offset + 2], 16) else {
+    for pair in hexadecimal.as_bytes().chunks_exact(2) {
+        let Ok(pair) = std::str::from_utf8(pair) else {
+            return input.to_vec();
+        };
+        let Ok(byte) = u8::from_str_radix(pair, 16) else {
             return input.to_vec();
         };
         decoded.push(byte);
