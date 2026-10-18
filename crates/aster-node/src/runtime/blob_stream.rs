@@ -259,7 +259,7 @@ where
     else {
         return Err(protocol("first control record is not acceptance"));
     };
-    if accepted.durable_offset != expected_checkpoint.durable_offset
+    if accepted.durable_ciphertext_offset != expected_checkpoint.durable_offset
         || accepted.checkpoint_generation != expected_checkpoint.checkpoint_generation
     {
         return Err(protocol(
@@ -354,6 +354,7 @@ fn stream_open(
         session_transcript: mission.session_id(),
         exchange_id: exchange_id(mission.session_id(), direction, source),
         transfer_id: transfer,
+        open_digest: *loaded.blob.blob_id().as_bytes(),
         source_transfer_id: transfer,
         publication_id: *loaded.blob.blob_id().as_bytes(),
         variant_id: *BlobVariantId::for_content(

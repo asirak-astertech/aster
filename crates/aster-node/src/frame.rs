@@ -93,8 +93,9 @@ const EVENT_TURN_PLAN_V1: u8 = 0xd2;
 const CHANGE_TURN_HEADER_V1: u8 = 0xd3;
 const CHANGE_PAGE_V7: u8 = 0xd4;
 const CHANGE_TURN_FINISHED_V1: u8 = 0xd5;
-const BLOB_STREAM_PLAN_V1: u8 = 0xdd;
-const BLOB_STREAM_PLAN_REPLY_V1: u8 = 0xde;
+const BLOB_PUBLICATION_OPEN_V1: u8 = 0xdd;
+const BLOB_PUBLICATION_COMMIT_V1: u8 = 0xde;
+const MAX_SIGNED_BLOB_PUBLICATION_BYTES: usize = 1_048_576;
 pub(crate) const MAX_OBJECT_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_BLOB_RANGE_BYTES: usize = 16 * 1024;
 pub(crate) const BLOB_CONTENT_PROOF_BYTES: usize = 32;
@@ -131,6 +132,16 @@ pub(crate) struct BlobStreamPlanSelectionV1 {
 pub(crate) struct BlobStreamPlanV1 {
     pub(crate) direction: EventDirection,
     pub(crate) selection: Option<BlobStreamPlanSelectionV1>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct BlobPublicationOpenV1 {
+    pub(crate) signed_open: Vec<u8>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct BlobPublicationCommitV1 {
+    pub(crate) signed_commitment: Vec<u8>,
 }
 
 /// Bounded operator emission state disclosed only as a protected v3 response.
@@ -905,6 +916,8 @@ pub(crate) enum Frame {
     ChangeTurnFinished(ChangeTurnFinishedV1),
     BlobStreamPlan(BlobStreamPlanV1),
     BlobStreamPlanReply(BlobStreamPlanV1),
+    BlobPublicationOpen(BlobPublicationOpenV1),
+    BlobPublicationCommit(BlobPublicationCommitV1),
     #[allow(dead_code)] // Activated by the profile-5 runtime driver.
     Stream(StreamFrame),
 }
@@ -1539,13 +1552,18 @@ impl Frame {
                         .map_err(|error| NodeError::Protocol(error.to_string()))?,
                 );
             }
-            Self::BlobStreamPlan(plan) => {
-                output.push(BLOB_STREAM_PLAN_V1);
-                encode_blob_stream_plan(&mut output, plan)?;
+            Self::BlobStreamPlan(_) | Self::BlobStreamPlanReply(_) => {
+                return Err(NodeError::Protocol(
+                    "carrier-oriented Blob stream plans are not profile-5 records".into(),
+                ));
             }
-            Self::BlobStreamPlanReply(plan) => {
-                output.push(BLOB_STREAM_PLAN_REPLY_V1);
-                encode_blob_stream_plan(&mut output, plan)?;
+            Self::BlobPublicationOpen(open) => {
+                output.push(BLOB_PUBLICATION_OPEN_V1);
+                encode_blob_publication(&mut output, &open.signed_open)?;
+            }
+            Self::BlobPublicationCommit(commitment) => {
+                output.push(BLOB_PUBLICATION_COMMIT_V1);
+                encode_blob_publication(&mut output, &commitment.signed_commitment)?;
             }
             Self::Stream(_) => {
                 return Err(NodeError::Protocol(
@@ -1716,7 +1734,13 @@ impl Frame {
     }
 
     const fn is_v9_only(&self) -> bool {
-        matches!(self, Self::BlobStreamPlan(_) | Self::BlobStreamPlanReply(_))
+        matches!(
+            self,
+            Self::BlobStreamPlan(_)
+                | Self::BlobStreamPlanReply(_)
+                | Self::BlobPublicationOpen(_)
+                | Self::BlobPublicationCommit(_)
+        )
     }
 
     pub(crate) fn decode(input: &[u8]) -> Result<Self, NodeError> {
@@ -2298,12 +2322,16 @@ impl Frame {
             CHANGE_TURN_FINISHED_V1 => Ok(Self::ChangeTurnFinished(
                 ChangeTurnFinishedV1::decode(body).map_err(event_pages_protocol_error)?,
             )),
-            BLOB_STREAM_PLAN_V1 | BLOB_STREAM_PLAN_REPLY_V1 => {
-                let plan = decode_blob_stream_plan(body)?;
-                if tag == BLOB_STREAM_PLAN_V1 {
-                    Ok(Self::BlobStreamPlan(plan))
+            BLOB_PUBLICATION_OPEN_V1 | BLOB_PUBLICATION_COMMIT_V1 => {
+                let signed = decode_blob_publication(body)?;
+                if tag == BLOB_PUBLICATION_OPEN_V1 {
+                    Ok(Self::BlobPublicationOpen(BlobPublicationOpenV1 {
+                        signed_open: signed,
+                    }))
                 } else {
-                    Ok(Self::BlobStreamPlanReply(plan))
+                    Ok(Self::BlobPublicationCommit(BlobPublicationCommitV1 {
+                        signed_commitment: signed,
+                    }))
                 }
             }
             _ => Err(NodeError::Protocol(
@@ -2339,9 +2367,44 @@ const fn is_v7_only_tag(tag: u8) -> bool {
 }
 
 const fn is_v9_only_tag(tag: u8) -> bool {
-    matches!(tag, BLOB_STREAM_PLAN_V1 | BLOB_STREAM_PLAN_REPLY_V1)
+    matches!(tag, BLOB_PUBLICATION_OPEN_V1 | BLOB_PUBLICATION_COMMIT_V1)
 }
 
+fn encode_blob_publication(output: &mut Vec<u8>, signed: &[u8]) -> Result<(), NodeError> {
+    if signed.is_empty() || signed.len() > MAX_SIGNED_BLOB_PUBLICATION_BYTES {
+        return Err(NodeError::Protocol(
+            "signed Blob publication length out of bounds".into(),
+        ));
+    }
+    output.extend_from_slice(&9_u16.to_be_bytes());
+    output.extend_from_slice(&5_u16.to_be_bytes());
+    output.extend_from_slice(&(signed.len() as u32).to_be_bytes());
+    output.extend_from_slice(signed);
+    Ok(())
+}
+
+fn decode_blob_publication(body: &[u8]) -> Result<Vec<u8>, NodeError> {
+    if body.len() < 8
+        || u16::from_be_bytes(body[..2].try_into().expect("fixed slice")) != 9
+        || u16::from_be_bytes(body[2..4].try_into().expect("fixed slice")) != 5
+    {
+        return Err(NodeError::Protocol(
+            "Blob publication context differs".into(),
+        ));
+    }
+    let len = usize::try_from(u32::from_be_bytes(
+        body[4..8].try_into().expect("fixed slice"),
+    ))
+    .map_err(|_| NodeError::Protocol("Blob publication length overflow".into()))?;
+    if len == 0 || len > MAX_SIGNED_BLOB_PUBLICATION_BYTES || body.len() != 8 + len {
+        return Err(NodeError::Protocol(
+            "signed Blob publication length differs".into(),
+        ));
+    }
+    Ok(body[8..].to_vec())
+}
+
+#[allow(dead_code)] // Removed by the profile-5 runtime migration task.
 fn validate_blob_stream_plan_selection(
     selection: BlobStreamPlanSelectionV1,
 ) -> Result<(), NodeError> {
@@ -2358,6 +2421,7 @@ fn validate_blob_stream_plan_selection(
     Ok(())
 }
 
+#[allow(dead_code)] // Removed by the profile-5 runtime migration task.
 fn encode_blob_stream_plan(output: &mut Vec<u8>, plan: &BlobStreamPlanV1) -> Result<(), NodeError> {
     output.push(plan.direction.encode());
     match plan.selection {
@@ -2374,6 +2438,7 @@ fn encode_blob_stream_plan(output: &mut Vec<u8>, plan: &BlobStreamPlanV1) -> Res
     Ok(())
 }
 
+#[allow(dead_code)] // Removed by the profile-5 runtime migration task.
 fn decode_blob_stream_plan(body: &[u8]) -> Result<BlobStreamPlanV1, NodeError> {
     let (direction, body) = decode_direction(body)?;
     let Some((&present, body)) = body.split_first() else {
@@ -3821,71 +3886,6 @@ mod tests {
         let mut truncated = encoded;
         truncated.pop();
         assert!(Frame::decode(&truncated).is_err());
-    }
-
-    #[test]
-    fn blob_stream_plan_is_exact_and_v9_only() {
-        let selection = BlobStreamPlanSelectionV1 {
-            source_id: BlobTransferId::new([0x5a; 32]),
-            next_carrier_index: 7,
-            durable_offset: 9_001,
-            checkpoint_generation: 3,
-        };
-        for (tag, frame) in [
-            (
-                BLOB_STREAM_PLAN_V1,
-                Frame::BlobStreamPlan(BlobStreamPlanV1 {
-                    direction: EventDirection::ToSessionInitiator,
-                    selection: Some(selection),
-                }),
-            ),
-            (
-                BLOB_STREAM_PLAN_REPLY_V1,
-                Frame::BlobStreamPlanReply(BlobStreamPlanV1 {
-                    direction: EventDirection::ToSessionResponder,
-                    selection: None,
-                }),
-            ),
-        ] {
-            let encoded = frame
-                .encode_for_semantic_version(9)
-                .expect("encode v9 Blob stream plan");
-            assert_eq!(encoded[4], tag);
-            assert_eq!(
-                Frame::decode_for_semantic_version(&encoded, 9)
-                    .expect("decode v9 Blob stream plan"),
-                frame
-            );
-            assert!(frame.encode_for_semantic_version(8).is_err());
-            assert!(Frame::decode_for_semantic_version(&encoded, 8).is_err());
-            let mut trailing = encoded;
-            trailing.push(0);
-            assert!(Frame::decode_for_semantic_version(&trailing, 9).is_err());
-        }
-
-        assert!(
-            Frame::BlobStreamPlan(BlobStreamPlanV1 {
-                direction: EventDirection::ToSessionInitiator,
-                selection: Some(BlobStreamPlanSelectionV1 {
-                    checkpoint_generation: 0,
-                    ..selection
-                }),
-            })
-            .encode_for_semantic_version(9)
-            .is_err()
-        );
-        assert!(
-            Frame::BlobStreamPlan(BlobStreamPlanV1 {
-                direction: EventDirection::ToSessionInitiator,
-                selection: Some(BlobStreamPlanSelectionV1 {
-                    next_carrier_index: 0,
-                    durable_offset: 1,
-                    ..selection
-                }),
-            })
-            .encode_for_semantic_version(9)
-            .is_err()
-        );
     }
 
     #[test]

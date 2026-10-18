@@ -2,7 +2,9 @@ use std::fmt::{self, Display, Formatter};
 
 const MAGIC: &[u8; 4] = b"ASM\x01";
 pub(crate) const MAX_STREAM_EXTENT_BYTES: usize = 1_048_576;
-pub(crate) const MAX_STREAM_CHECKPOINT_BATCH_BYTES: u32 = 8 * 1_048_576;
+pub(crate) const MAX_STREAM_CHECKPOINT_BATCH_BYTES: u32 = 16 * 1_048_576;
+pub(crate) const MIN_STREAM_RECEIVE_WINDOW_BYTES: u64 =
+    MAX_STREAM_CHECKPOINT_BATCH_BYTES as u64 + MAX_STREAM_EXTENT_BYTES as u64;
 pub(crate) const STREAM_DATA_FIXED_BYTES: usize = 89;
 pub(crate) const MAX_STREAM_DATA_FRAME_BYTES: usize =
     STREAM_DATA_FIXED_BYTES + MAX_STREAM_EXTENT_BYTES;
@@ -81,7 +83,12 @@ pub(crate) struct StreamOpenV1 {
     pub direction: StreamDirection,
     pub session_transcript: [u8; 32],
     pub exchange_id: u64,
+    /// Logical publisher-selected stream identifier. Attempts reuse this value.
     pub transfer_id: [u8; 32],
+    /// Digest of the publisher-signed provisional open.
+    pub open_digest: [u8; 32],
+    // Transitional local metadata used by the profile-4 source adapter. These
+    // fields are deliberately not part of the replacement profile-5 grammar.
     pub source_transfer_id: [u8; 32],
     pub publication_id: [u8; 32],
     pub variant_id: [u8; 32],
@@ -95,7 +102,11 @@ pub(crate) struct StreamAcceptV1 {
     pub transfer_id: [u8; 32],
     pub attempt_nonce: [u8; 32],
     pub sequence: u64,
-    pub durable_offset: u64,
+    pub durable_plaintext_offset: u64,
+    pub durable_ciphertext_offset: u64,
+    pub next_segment_index: u64,
+    pub plaintext_commitment: [u8; 32],
+    pub ciphertext_commitment: [u8; 32],
     pub checkpoint_generation: u64,
     pub absolute_receive_limit: u64,
     pub max_extent_bytes: u32,
@@ -122,7 +133,21 @@ pub(crate) struct StreamCheckpointV1 {
     pub transfer_id: [u8; 32],
     pub attempt_nonce: [u8; 32],
     pub sequence: u64,
-    pub durable_offset: u64,
+    pub durable_plaintext_offset: u64,
+    pub durable_ciphertext_offset: u64,
+    pub next_segment_index: u64,
+    pub plaintext_commitment: [u8; 32],
+    pub ciphertext_commitment: [u8; 32],
+    pub checkpoint_generation: u64,
+    pub absolute_receive_limit: u64,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct StreamCheckpointAuthorityV1 {
+    pub durable_plaintext_offset: u64,
+    pub durable_ciphertext_offset: u64,
+    pub next_segment_index: u64,
+    pub plaintext_commitment: [u8; 32],
+    pub ciphertext_commitment: [u8; 32],
     pub checkpoint_generation: u64,
     pub absolute_receive_limit: u64,
 }
@@ -131,15 +156,19 @@ pub(crate) struct StreamFinishV1 {
     pub transfer_id: [u8; 32],
     pub attempt_nonce: [u8; 32],
     pub sequence: u64,
-    pub final_offset: u64,
+    pub final_plaintext_offset: u64,
+    pub final_ciphertext_offset: u64,
+    pub signed_commitment: Vec<u8>,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StreamResultV1 {
     pub transfer_id: [u8; 32],
     pub attempt_nonce: [u8; 32],
     pub sequence: u64,
-    pub final_offset: u64,
+    pub final_plaintext_offset: u64,
+    pub final_ciphertext_offset: u64,
     pub code: StreamResultCode,
+    pub blob_id: [u8; 32],
     pub result_digest: [u8; 32],
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -176,6 +205,47 @@ fn nonce(v: &[u8; 32]) -> Result<(), StreamError> {
         Ok(())
     }
 }
+fn nonzero(v: &[u8; 32], message: &'static str) -> Result<(), StreamError> {
+    if v.iter().all(|byte| *byte == 0) {
+        Err(StreamError::invalid(message))
+    } else {
+        Ok(())
+    }
+}
+fn validate_checkpoint(
+    plaintext: u64,
+    ciphertext: u64,
+    next_segment: u64,
+    plaintext_commitment: &[u8; 32],
+    ciphertext_commitment: &[u8; 32],
+) -> Result<(), StreamError> {
+    if plaintext > ciphertext
+        || (plaintext == 0) != (ciphertext == 0)
+        || (plaintext == 0) != (next_segment == 0)
+        || plaintext_commitment == &[0; 32]
+        || ciphertext_commitment == &[0; 32]
+    {
+        return Err(StreamError::invalid("invalid stream checkpoint"));
+    }
+    Ok(())
+}
+fn validate_credit(
+    durable_ciphertext: u64,
+    absolute_receive_limit: u64,
+    max_extent: u32,
+    checkpoint_batch: u32,
+) -> Result<(), StreamError> {
+    if max_extent as usize > MAX_STREAM_EXTENT_BYTES
+        || checkpoint_batch == 0
+        || checkpoint_batch > MAX_STREAM_CHECKPOINT_BATCH_BYTES
+        || absolute_receive_limit < durable_ciphertext
+        || absolute_receive_limit - durable_ciphertext
+            < u64::from(checkpoint_batch) + u64::from(max_extent)
+    {
+        return Err(StreamError::invalid("invalid stream receive credit"));
+    }
+    Ok(())
+}
 fn extent(v: u32) -> Result<(), StreamError> {
     if v == 0 || v as usize > MAX_STREAM_EXTENT_BYTES {
         Err(StreamError::invalid("extent length out of bounds"))
@@ -208,6 +278,8 @@ impl StreamFrame {
         match self {
             Self::Open(x) => {
                 nonce(&x.attempt_nonce)?;
+                nonzero(&x.transfer_id, "zero stream identifier")?;
+                nonzero(&x.open_digest, "zero open digest")?;
                 o.push(0xd6);
                 o.extend([x.class as u8, x.direction as u8]);
                 o.extend(9u16.to_be_bytes());
@@ -215,32 +287,33 @@ impl StreamFrame {
                 o.extend(x.session_transcript);
                 o.extend(x.exchange_id.to_be_bytes());
                 o.extend(x.transfer_id);
-                o.extend(x.source_transfer_id);
-                o.extend(x.publication_id);
-                o.extend(x.variant_id);
-                o.extend(x.total_len.to_be_bytes());
+                o.extend(x.open_digest);
                 o.extend(x.attempt_nonce);
                 o.extend(x.checkpoint_generation.to_be_bytes());
-                match x.custody_digest {
-                    None => o.push(0),
-                    Some(d) => {
-                        o.push(1);
-                        o.extend(d)
-                    }
-                }
             }
             Self::Accept(x) => {
                 nonce(&x.attempt_nonce)?;
                 extent(x.max_extent_bytes)?;
-                if x.absolute_receive_limit < x.durable_offset
-                    || x.checkpoint_batch_bytes == 0
-                    || x.checkpoint_batch_bytes > MAX_STREAM_CHECKPOINT_BATCH_BYTES
-                {
-                    return Err(StreamError::invalid("invalid accept bounds"));
-                }
+                validate_credit(
+                    x.durable_ciphertext_offset,
+                    x.absolute_receive_limit,
+                    x.max_extent_bytes,
+                    x.checkpoint_batch_bytes,
+                )?;
+                validate_checkpoint(
+                    x.durable_plaintext_offset,
+                    x.durable_ciphertext_offset,
+                    x.next_segment_index,
+                    &x.plaintext_commitment,
+                    &x.ciphertext_commitment,
+                )?;
                 o.push(0xd7);
                 put_attempt(&mut o, &x.transfer_id, &x.attempt_nonce, x.sequence);
-                o.extend(x.durable_offset.to_be_bytes());
+                o.extend(x.durable_plaintext_offset.to_be_bytes());
+                o.extend(x.durable_ciphertext_offset.to_be_bytes());
+                o.extend(x.next_segment_index.to_be_bytes());
+                o.extend(x.plaintext_commitment);
+                o.extend(x.ciphertext_commitment);
                 o.extend(x.checkpoint_generation.to_be_bytes());
                 o.extend(x.absolute_receive_limit.to_be_bytes());
                 o.extend(x.max_extent_bytes.to_be_bytes());
@@ -262,29 +335,52 @@ impl StreamFrame {
             }
             Self::Checkpoint(x) => {
                 nonce(&x.attempt_nonce)?;
-                if x.absolute_receive_limit < x.durable_offset {
+                validate_checkpoint(
+                    x.durable_plaintext_offset,
+                    x.durable_ciphertext_offset,
+                    x.next_segment_index,
+                    &x.plaintext_commitment,
+                    &x.ciphertext_commitment,
+                )?;
+                if x.absolute_receive_limit < x.durable_ciphertext_offset {
                     return Err(StreamError::invalid(
                         "checkpoint credit precedes durable offset",
                     ));
                 }
                 o.push(0xd9);
                 put_attempt(&mut o, &x.transfer_id, &x.attempt_nonce, x.sequence);
-                o.extend(x.durable_offset.to_be_bytes());
+                o.extend(x.durable_plaintext_offset.to_be_bytes());
+                o.extend(x.durable_ciphertext_offset.to_be_bytes());
+                o.extend(x.next_segment_index.to_be_bytes());
+                o.extend(x.plaintext_commitment);
+                o.extend(x.ciphertext_commitment);
                 o.extend(x.checkpoint_generation.to_be_bytes());
                 o.extend(x.absolute_receive_limit.to_be_bytes());
             }
             Self::Finish(x) => {
                 nonce(&x.attempt_nonce)?;
+                if x.signed_commitment.is_empty()
+                    || x.signed_commitment.len() > MAX_STREAM_EXTENT_BYTES
+                {
+                    return Err(StreamError::invalid(
+                        "signed commitment length out of bounds",
+                    ));
+                }
                 o.push(0xda);
                 put_attempt(&mut o, &x.transfer_id, &x.attempt_nonce, x.sequence);
-                o.extend(x.final_offset.to_be_bytes());
+                o.extend(x.final_plaintext_offset.to_be_bytes());
+                o.extend(x.final_ciphertext_offset.to_be_bytes());
+                o.extend((x.signed_commitment.len() as u32).to_be_bytes());
+                o.extend(&x.signed_commitment);
             }
             Self::Result(x) => {
                 nonce(&x.attempt_nonce)?;
                 o.push(0xdb);
                 put_attempt(&mut o, &x.transfer_id, &x.attempt_nonce, x.sequence);
-                o.extend(x.final_offset.to_be_bytes());
+                o.extend(x.final_plaintext_offset.to_be_bytes());
+                o.extend(x.final_ciphertext_offset.to_be_bytes());
                 o.push(x.code as u8);
+                o.extend(x.blob_id);
                 o.extend(x.result_digest);
             }
             Self::ResultAck(x) => {
@@ -315,31 +411,26 @@ impl StreamFrame {
                 let session_transcript = r.array()?;
                 let exchange_id = r.u64()?;
                 let transfer_id = r.array()?;
-                let source_transfer_id = r.array()?;
-                let publication_id = r.array()?;
-                let variant_id = r.array()?;
-                let total_len = r.u64()?;
+                nonzero(&transfer_id, "zero stream identifier")?;
+                let open_digest = r.array()?;
+                nonzero(&open_digest, "zero open digest")?;
                 let attempt_nonce = r.array()?;
                 nonce(&attempt_nonce)?;
                 let checkpoint_generation = r.u64()?;
-                let custody_digest = match r.u8()? {
-                    0 => None,
-                    1 => Some(r.array()?),
-                    _ => return Err(StreamError::invalid("noncanonical custody presence")),
-                };
                 Self::Open(StreamOpenV1 {
                     class,
                     direction,
                     session_transcript,
                     exchange_id,
                     transfer_id,
-                    source_transfer_id,
-                    publication_id,
-                    variant_id,
-                    total_len,
+                    open_digest,
+                    source_transfer_id: [0; 32],
+                    publication_id: [0; 32],
+                    variant_id: [0; 32],
+                    total_len: 0,
                     attempt_nonce,
                     checkpoint_generation,
-                    custody_digest,
+                    custody_digest: None,
                 })
             }
             0xd7 => {
@@ -348,19 +439,30 @@ impl StreamFrame {
                     transfer_id,
                     attempt_nonce,
                     sequence,
-                    durable_offset: r.u64()?,
+                    durable_plaintext_offset: r.u64()?,
+                    durable_ciphertext_offset: r.u64()?,
+                    next_segment_index: r.u64()?,
+                    plaintext_commitment: r.array()?,
+                    ciphertext_commitment: r.array()?,
                     checkpoint_generation: r.u64()?,
                     absolute_receive_limit: r.u64()?,
                     max_extent_bytes: r.u32()?,
                     checkpoint_batch_bytes: r.u32()?,
                 };
                 extent(x.max_extent_bytes)?;
-                if x.absolute_receive_limit < x.durable_offset
-                    || x.checkpoint_batch_bytes == 0
-                    || x.checkpoint_batch_bytes > MAX_STREAM_CHECKPOINT_BATCH_BYTES
-                {
-                    return Err(StreamError::invalid("invalid accept bounds"));
-                }
+                validate_credit(
+                    x.durable_ciphertext_offset,
+                    x.absolute_receive_limit,
+                    x.max_extent_bytes,
+                    x.checkpoint_batch_bytes,
+                )?;
+                validate_checkpoint(
+                    x.durable_plaintext_offset,
+                    x.durable_ciphertext_offset,
+                    x.next_segment_index,
+                    &x.plaintext_commitment,
+                    &x.ciphertext_commitment,
+                )?;
                 Self::Accept(x)
             }
             0xd9 => {
@@ -369,11 +471,22 @@ impl StreamFrame {
                     transfer_id,
                     attempt_nonce,
                     sequence,
-                    durable_offset: r.u64()?,
+                    durable_plaintext_offset: r.u64()?,
+                    durable_ciphertext_offset: r.u64()?,
+                    next_segment_index: r.u64()?,
+                    plaintext_commitment: r.array()?,
+                    ciphertext_commitment: r.array()?,
                     checkpoint_generation: r.u64()?,
                     absolute_receive_limit: r.u64()?,
                 };
-                if x.absolute_receive_limit < x.durable_offset {
+                validate_checkpoint(
+                    x.durable_plaintext_offset,
+                    x.durable_ciphertext_offset,
+                    x.next_segment_index,
+                    &x.plaintext_commitment,
+                    &x.ciphertext_commitment,
+                )?;
+                if x.absolute_receive_limit < x.durable_ciphertext_offset {
                     return Err(StreamError::invalid("invalid checkpoint"));
                 }
                 Self::Checkpoint(x)
@@ -384,7 +497,9 @@ impl StreamFrame {
                     transfer_id,
                     attempt_nonce,
                     sequence,
-                    final_offset: r.u64()?,
+                    final_plaintext_offset: r.u64()?,
+                    final_ciphertext_offset: r.u64()?,
+                    signed_commitment: r.u32_bytes(MAX_STREAM_EXTENT_BYTES)?.to_vec(),
                 })
             }
             0xdb => {
@@ -393,8 +508,10 @@ impl StreamFrame {
                     transfer_id,
                     attempt_nonce,
                     sequence,
-                    final_offset: r.u64()?,
+                    final_plaintext_offset: r.u64()?,
+                    final_ciphertext_offset: r.u64()?,
                     code: StreamResultCode::decode(r.u8()?)?,
+                    blob_id: r.array()?,
                     result_digest: r.array()?,
                 })
             }
@@ -471,6 +588,7 @@ pub(crate) enum StreamRetry {
     SettlementPending,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(clippy::large_enum_variant)] // Control frames are bounded and remain stack-owned.
 pub(crate) enum StreamAction {
     Send(StreamFrame),
     Persist { through: u64 },
@@ -484,7 +602,11 @@ pub(crate) struct StreamSenderState {
     transfer_id: [u8; 32],
     nonce: [u8; 32],
     total: u64,
+    durable_plaintext: u64,
     durable: u64,
+    next_segment_index: u64,
+    plaintext_commitment: [u8; 32],
+    ciphertext_commitment: [u8; 32],
     next: u64,
     limit: u64,
     max_extent: u32,
@@ -499,7 +621,11 @@ impl StreamSenderState {
             transfer_id,
             nonce,
             total,
+            durable_plaintext: 0,
             durable: 0,
+            next_segment_index: 0,
+            plaintext_commitment: [0; 32],
+            ciphertext_commitment: [0; 32],
             next: 0,
             limit: 0,
             max_extent: 0,
@@ -529,17 +655,29 @@ impl StreamSenderState {
     }
     pub(crate) fn accept(&mut self, x: StreamAcceptV1) -> Result<(), StreamError> {
         self.identity(&x.transfer_id, &x.attempt_nonce)?;
-        if x.sequence != 0
-            || x.durable_offset > x.absolute_receive_limit
-            || x.absolute_receive_limit > self.total
-            || x.checkpoint_batch_bytes == 0
-            || x.checkpoint_batch_bytes > MAX_STREAM_CHECKPOINT_BATCH_BYTES
-        {
+        if x.sequence != 0 {
             return Err(StreamError::invalid("invalid stream acceptance"));
         }
         extent(x.max_extent_bytes)?;
-        self.durable = x.durable_offset;
-        self.next = x.durable_offset;
+        validate_credit(
+            x.durable_ciphertext_offset,
+            x.absolute_receive_limit,
+            x.max_extent_bytes,
+            x.checkpoint_batch_bytes,
+        )?;
+        validate_checkpoint(
+            x.durable_plaintext_offset,
+            x.durable_ciphertext_offset,
+            x.next_segment_index,
+            &x.plaintext_commitment,
+            &x.ciphertext_commitment,
+        )?;
+        self.durable_plaintext = x.durable_plaintext_offset;
+        self.durable = x.durable_ciphertext_offset;
+        self.next_segment_index = x.next_segment_index;
+        self.plaintext_commitment = x.plaintext_commitment;
+        self.ciphertext_commitment = x.ciphertext_commitment;
+        self.next = x.durable_ciphertext_offset;
         self.limit = x.absolute_receive_limit;
         self.max_extent = x.max_extent_bytes;
         self.generation = x.checkpoint_generation;
@@ -576,23 +714,49 @@ impl StreamSenderState {
     }
     pub(crate) fn checkpoint(&mut self, x: StreamCheckpointV1) -> Result<(), StreamError> {
         self.identity(&x.transfer_id, &x.attempt_nonce)?;
+        let heartbeat = x.durable_ciphertext_offset == self.durable
+            && x.checkpoint_generation == self.generation;
         if x.sequence != self.control_sequence
-            || x.durable_offset < self.durable
-            || x.durable_offset > self.next
+            || x.durable_plaintext_offset < self.durable_plaintext
+            || x.durable_ciphertext_offset < self.durable
+            || x.durable_ciphertext_offset > self.next
+            || x.next_segment_index < self.next_segment_index
             || x.checkpoint_generation < self.generation
-            || ((x.durable_offset == self.durable) != (x.checkpoint_generation == self.generation))
+            || ((x.durable_ciphertext_offset == self.durable)
+                != (x.checkpoint_generation == self.generation))
+            || (heartbeat
+                && (x.durable_plaintext_offset != self.durable_plaintext
+                    || x.next_segment_index != self.next_segment_index
+                    || x.plaintext_commitment != self.plaintext_commitment
+                    || x.ciphertext_commitment != self.ciphertext_commitment))
             || x.absolute_receive_limit < self.limit
-            || x.absolute_receive_limit > self.total
         {
             return Err(StreamError::invalid("invalid cumulative checkpoint"));
         }
         self.control_sequence += 1;
-        self.durable = x.durable_offset;
+        self.durable_plaintext = x.durable_plaintext_offset;
+        self.durable = x.durable_ciphertext_offset;
+        self.next_segment_index = x.next_segment_index;
+        self.plaintext_commitment = x.plaintext_commitment;
+        self.ciphertext_commitment = x.ciphertext_commitment;
         self.generation = x.checkpoint_generation;
         self.limit = x.absolute_receive_limit;
         Ok(())
     }
     pub(crate) fn finish(&mut self) -> Result<StreamAction, StreamError> {
+        self.finish_with_commitment(vec![1])
+    }
+    pub(crate) fn finish_with_commitment(
+        &mut self,
+        signed_commitment: Vec<u8>,
+    ) -> Result<StreamAction, StreamError> {
+        self.finish_bound(self.total, signed_commitment)
+    }
+    pub(crate) fn finish_bound(
+        &mut self,
+        final_plaintext_offset: u64,
+        signed_commitment: Vec<u8>,
+    ) -> Result<StreamAction, StreamError> {
         if self.next != self.total {
             return Err(StreamError::invalid(
                 "stream finish precedes declared length",
@@ -602,7 +766,9 @@ impl StreamSenderState {
             transfer_id: self.transfer_id,
             attempt_nonce: self.nonce,
             sequence: self.send_sequence,
-            final_offset: self.total,
+            final_plaintext_offset,
+            final_ciphertext_offset: self.total,
+            signed_commitment,
         };
         self.send_sequence += 1;
         Ok(StreamAction::Send(StreamFrame::Finish(f)))
@@ -621,7 +787,7 @@ impl StreamSenderState {
             }
             return Err(StreamError::invalid("terminal stream result changed"));
         }
-        if x.sequence != self.control_sequence || x.final_offset != self.total {
+        if x.sequence != self.control_sequence || x.final_ciphertext_offset != self.total {
             return Err(StreamError::invalid("stream result binding differs"));
         }
         self.control_sequence += 1;
@@ -652,11 +818,16 @@ pub(crate) struct StreamReceiverState {
     transfer_id: [u8; 32],
     nonce: [u8; 32],
     total: u64,
+    durable_plaintext: u64,
     durable: u64,
+    next_segment_index: u64,
+    plaintext_commitment: [u8; 32],
+    ciphertext_commitment: [u8; 32],
     received: u64,
     limit: u64,
     generation: u64,
     max_extent: u32,
+    checkpoint_batch: u32,
     receive_sequence: u64,
     send_sequence: u64,
     result_digest: Option<[u8; 32]>,
@@ -682,11 +853,16 @@ impl StreamReceiverState {
             transfer_id: open.transfer_id,
             nonce: open.attempt_nonce,
             total: open.total_len,
+            durable_plaintext: durable,
             durable,
+            next_segment_index: durable.div_ceil(MAX_STREAM_EXTENT_BYTES as u64),
+            plaintext_commitment: [1; 32],
+            ciphertext_commitment: [1; 32],
             received: durable,
             limit,
             generation,
             max_extent,
+            checkpoint_batch: 1,
             receive_sequence: 0,
             send_sequence: 0,
             result_digest: None,
@@ -709,19 +885,84 @@ impl StreamReceiverState {
         }
         Self::new(open, durable, generation, limit, max_extent)
     }
+    pub(crate) fn reopen_from_authority(
+        previous_nonce: &[u8; 32],
+        open: &StreamOpenV1,
+        authority: StreamCheckpointAuthorityV1,
+        max_extent: u32,
+        checkpoint_batch: u32,
+    ) -> Result<Self, StreamError> {
+        if previous_nonce == &open.attempt_nonce
+            || open.checkpoint_generation != authority.checkpoint_generation
+            || authority.durable_ciphertext_offset > open.total_len
+        {
+            return Err(StreamError::invalid("stream retry authority differs"));
+        }
+        nonce(&open.attempt_nonce)?;
+        extent(max_extent)?;
+        validate_checkpoint(
+            authority.durable_plaintext_offset,
+            authority.durable_ciphertext_offset,
+            authority.next_segment_index,
+            &authority.plaintext_commitment,
+            &authority.ciphertext_commitment,
+        )?;
+        validate_credit(
+            authority.durable_ciphertext_offset,
+            authority.absolute_receive_limit,
+            max_extent,
+            checkpoint_batch,
+        )?;
+        Ok(Self {
+            transfer_id: open.transfer_id,
+            nonce: open.attempt_nonce,
+            total: open.total_len,
+            durable_plaintext: authority.durable_plaintext_offset,
+            durable: authority.durable_ciphertext_offset,
+            next_segment_index: authority.next_segment_index,
+            plaintext_commitment: authority.plaintext_commitment,
+            ciphertext_commitment: authority.ciphertext_commitment,
+            received: authority.durable_ciphertext_offset,
+            limit: authority.absolute_receive_limit,
+            generation: authority.checkpoint_generation,
+            max_extent,
+            checkpoint_batch,
+            receive_sequence: 0,
+            send_sequence: 0,
+            result_digest: None,
+            last_finish: None,
+            result_frame: None,
+            last_ack: None,
+            terminal_code: None,
+        })
+    }
     pub(crate) fn accept(&mut self, batch: u32) -> Result<StreamAction, StreamError> {
         if batch == 0 || batch > MAX_STREAM_CHECKPOINT_BATCH_BYTES {
             return Err(StreamError::invalid("checkpoint batch out of bounds"));
         }
+        self.checkpoint_batch = batch;
+        self.accept_authority()
+    }
+    pub(crate) fn accept_authority(&mut self) -> Result<StreamAction, StreamError> {
+        validate_credit(
+            self.durable,
+            self.limit,
+            self.max_extent,
+            self.checkpoint_batch,
+        )?;
         let f = StreamAcceptV1 {
             transfer_id: self.transfer_id,
             attempt_nonce: self.nonce,
             sequence: self.send_sequence,
-            durable_offset: self.durable,
+            durable_plaintext_offset: self.durable_plaintext,
+            durable_ciphertext_offset: self.durable,
+            next_segment_index: self.next_segment_index,
+            plaintext_commitment: self.plaintext_commitment,
+            ciphertext_commitment: self.ciphertext_commitment,
             checkpoint_generation: self.generation,
             absolute_receive_limit: self.limit,
             max_extent_bytes: self.max_extent,
-            checkpoint_batch_bytes: batch,
+            checkpoint_batch_bytes: self.checkpoint_batch,
         };
         self.send_sequence += 1;
         Ok(StreamAction::Send(StreamFrame::Accept(f)))
@@ -776,7 +1017,11 @@ impl StreamReceiverState {
             transfer_id: self.transfer_id,
             attempt_nonce: self.nonce,
             sequence: self.send_sequence,
-            durable_offset: through,
+            durable_plaintext_offset: through,
+            durable_ciphertext_offset: through,
+            next_segment_index: through.div_ceil(MAX_STREAM_EXTENT_BYTES as u64),
+            plaintext_commitment: [1; 32],
+            ciphertext_commitment: [1; 32],
             checkpoint_generation: generation,
             absolute_receive_limit: new_limit,
         };
@@ -792,7 +1037,7 @@ impl StreamReceiverState {
             ));
         }
         if x.sequence != self.receive_sequence
-            || x.final_offset != self.total
+            || x.final_ciphertext_offset != self.total
             || self.received != self.total
             || self.durable != self.total
         {
@@ -807,8 +1052,16 @@ impl StreamReceiverState {
         code: StreamResultCode,
         digest: [u8; 32],
     ) -> Result<StreamAction, StreamError> {
+        self.promoted_blob(code, digest, digest)
+    }
+    pub(crate) fn promoted_blob(
+        &mut self,
+        code: StreamResultCode,
+        blob_id: [u8; 32],
+        digest: [u8; 32],
+    ) -> Result<StreamAction, StreamError> {
         if let Some(result) = &self.result_frame {
-            if result.code == code && result.result_digest == digest {
+            if result.code == code && result.blob_id == blob_id && result.result_digest == digest {
                 return Ok(StreamAction::Send(StreamFrame::Result(result.clone())));
             }
             return Err(StreamError::invalid("terminal stream result changed"));
@@ -818,8 +1071,10 @@ impl StreamReceiverState {
             transfer_id: self.transfer_id,
             attempt_nonce: self.nonce,
             sequence: self.send_sequence,
-            final_offset: self.total,
+            final_plaintext_offset: self.total,
+            final_ciphertext_offset: self.total,
             code,
+            blob_id,
             result_digest: digest,
         };
         self.send_sequence += 1;
@@ -889,6 +1144,14 @@ impl<'a> Reader<'a> {
     fn u64(&mut self) -> Result<u64, StreamError> {
         Ok(u64::from_be_bytes(self.array()?))
     }
+    fn u32_bytes(&mut self, maximum: usize) -> Result<&'a [u8], StreamError> {
+        let len = usize::try_from(self.u32()?)
+            .map_err(|_| StreamError::invalid("body length overflow"))?;
+        if len == 0 || len > maximum {
+            return Err(StreamError::invalid("body length out of bounds"));
+        }
+        self.take(len)
+    }
     fn attempt(&mut self) -> Result<([u8; 32], [u8; 32], u64), StreamError> {
         let id = self.array()?;
         let n = self.array()?;
@@ -920,7 +1183,7 @@ pub(crate) fn fuzz_decode(input: &[u8]) {
             variant_id: [6; 32],
             total_len: 1,
             attempt_nonce,
-            checkpoint_generation: 0,
+            checkpoint_generation: 4,
             custody_digest: None,
         })),
         b"d7" => Some(StreamFrame::Accept(StreamAcceptV1 {
@@ -999,546 +1262,253 @@ pub(crate) fn fuzz_decode(input: &[u8]) {
 }
 
 #[cfg(test)]
-mod stream_frame_codec {
+mod replacement_profile_five_vectors {
     use super::*;
-    use sha2::{Digest, Sha256};
-    fn frames() -> Vec<StreamFrame> {
-        let id = [1; 32];
-        let n = [2; 32];
-        vec![
-            StreamFrame::Open(StreamOpenV1 {
-                class: StreamClass::Blob,
-                direction: StreamDirection::ToSessionResponder,
-                session_transcript: [3; 32],
-                exchange_id: 4,
-                transfer_id: id,
-                source_transfer_id: [5; 32],
-                publication_id: [6; 32],
-                variant_id: [7; 32],
-                total_len: 64,
-                attempt_nonce: n,
-                checkpoint_generation: 8,
-                custody_digest: Some([9; 32]),
-            }),
-            StreamFrame::Accept(StreamAcceptV1 {
-                transfer_id: id,
-                attempt_nonce: n,
-                sequence: 0,
-                durable_offset: 0,
-                checkpoint_generation: 8,
-                absolute_receive_limit: 64,
-                max_extent_bytes: 32,
-                checkpoint_batch_bytes: 64,
-            }),
-            StreamFrame::Data(StreamDataV1 {
-                transfer_id: id,
-                attempt_nonce: n,
-                sequence: 1,
-                offset: 0,
-                bytes: vec![10; 32],
-            }),
-            StreamFrame::Checkpoint(StreamCheckpointV1 {
-                transfer_id: id,
-                attempt_nonce: n,
-                sequence: 1,
-                durable_offset: 32,
-                checkpoint_generation: 9,
-                absolute_receive_limit: 64,
-            }),
-            StreamFrame::Finish(StreamFinishV1 {
-                transfer_id: id,
-                attempt_nonce: n,
-                sequence: 2,
-                final_offset: 64,
-            }),
-            StreamFrame::Result(StreamResultV1 {
-                transfer_id: id,
-                attempt_nonce: n,
-                sequence: 2,
-                final_offset: 64,
-                code: StreamResultCode::Promoted,
-                result_digest: [11; 32],
-            }),
-            StreamFrame::ResultAck(StreamResultAckV1 {
-                transfer_id: id,
-                attempt_nonce: n,
-                sequence: 3,
-                result_digest: [11; 32],
-            }),
-        ]
+
+    fn unhex(value: &str) -> Vec<u8> {
+        value
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                u8::from_str_radix(std::str::from_utf8(pair).expect("hex pair"), 16)
+                    .expect("hex byte")
+            })
+            .collect()
     }
+
     #[test]
-    fn all_seven_records_round_trip_and_are_context_gated() {
-        let vectors = [
-            (
-                0xd6,
-                260,
-                [
-                    0xca, 0x40, 0x52, 0x28, 0xf2, 0xb5, 0x64, 0x9c, 0x43, 0xf3, 0xe7, 0x59, 0x60,
-                    0xce, 0x5c, 0xca, 0x94, 0x92, 0x41, 0x36, 0x9d, 0x60, 0x12, 0x50, 0x5b, 0xc9,
-                    0xa5, 0x0f, 0xca, 0xdf, 0x57, 0x5f,
-                ],
-            ),
-            (
-                0xd7,
-                109,
-                [
-                    0x1c, 0xea, 0xe0, 0xcf, 0x45, 0xdf, 0x03, 0x15, 0x8d, 0x80, 0x3e, 0xb5, 0xd0,
-                    0x63, 0xe3, 0xea, 0x50, 0x0e, 0x72, 0xbc, 0x7b, 0x82, 0xa9, 0x57, 0x4a, 0xbe,
-                    0x1f, 0x6b, 0xf3, 0xd3, 0x67, 0x05,
-                ],
-            ),
-            (
-                0xd8,
-                121,
-                [
-                    0xab, 0x42, 0xda, 0xe5, 0x60, 0xdf, 0xf7, 0xd7, 0x05, 0xa5, 0x82, 0xfc, 0x7b,
-                    0xf3, 0x49, 0xc5, 0x34, 0x43, 0xa7, 0xf4, 0x49, 0x87, 0x44, 0xf3, 0xab, 0x4f,
-                    0xb2, 0x4f, 0xb0, 0x73, 0x24, 0x26,
-                ],
-            ),
-            (
-                0xd9,
-                101,
-                [
-                    0xd6, 0x7e, 0xa6, 0x8e, 0x8e, 0x64, 0x02, 0x07, 0x9e, 0x17, 0xa2, 0x2b, 0xab,
-                    0x4c, 0x12, 0xe1, 0xf3, 0x1c, 0x5a, 0xaf, 0x47, 0xb7, 0xaf, 0x67, 0xe9, 0x14,
-                    0x70, 0xf3, 0x0e, 0x4a, 0x67, 0x67,
-                ],
-            ),
-            (
-                0xda,
-                85,
-                [
-                    0x7f, 0xb6, 0x93, 0x58, 0xf0, 0xd2, 0xbf, 0x43, 0x92, 0xbe, 0x74, 0x76, 0xee,
-                    0xeb, 0x18, 0x7b, 0x7f, 0x40, 0x48, 0x53, 0xc1, 0x6a, 0xd6, 0x6f, 0xa2, 0x8e,
-                    0x22, 0xfe, 0xe7, 0x22, 0x68, 0x19,
-                ],
-            ),
-            (
-                0xdb,
-                118,
-                [
-                    0x00, 0x3b, 0x47, 0x68, 0x2d, 0xcf, 0xdf, 0xde, 0xac, 0x05, 0x96, 0x84, 0x5d,
-                    0xbe, 0x5e, 0xbd, 0x39, 0xd9, 0x5c, 0xde, 0x29, 0x07, 0xdf, 0x99, 0x7e, 0x56,
-                    0x18, 0x44, 0x82, 0xc4, 0x84, 0x6e,
-                ],
-            ),
-            (
-                0xdc,
-                109,
-                [
-                    0xb8, 0x5f, 0x98, 0xfd, 0xf2, 0x2b, 0xc7, 0xdd, 0x4c, 0x5b, 0xca, 0xa7, 0x63,
-                    0x64, 0x5f, 0xd7, 0x60, 0xb6, 0xda, 0x78, 0xf7, 0x35, 0xeb, 0x2f, 0xe7, 0x63,
-                    0xe6, 0xc4, 0xb7, 0xfc, 0x5a, 0x1f,
-                ],
-            ),
-        ];
-        for (f, (tag, len, digest)) in frames().into_iter().zip(vectors) {
-            let b = f.encode_for_context(9, 5).unwrap();
+    fn blob_stream_record_vectors() {
+        let mut count = 0;
+        for line in include_str!("../../../conformance/vectors/blob-stream-records-v2.tsv")
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+        {
+            let fields: Vec<_> = line.split('\t').collect();
+            let bytes = unhex(fields[3]);
+            let decoded = match fields[1] {
+                "publication-open" | "publication-commit" => {
+                    crate::frame::Frame::decode_for_semantic_profile(&bytes, 9, 5)
+                        .and_then(|frame| {
+                            frame.encode_for_semantic_profile(9, 5).and_then(|encoded| {
+                                (encoded == bytes).then_some(()).ok_or_else(|| {
+                                    crate::NodeError::Protocol(
+                                        "Blob publication round-trip differs".into(),
+                                    )
+                                })
+                            })
+                        })
+                        .map_err(|error| StreamError::invalid(error.to_string()))
+                }
+                "open" | "accept" | "data" | "checkpoint" | "finish" | "result" | "result-ack" => {
+                    StreamFrame::decode_for_context(9, 5, &bytes).and_then(|frame| {
+                        let encoded = frame.encode_for_context(9, 5)?;
+                        if encoded == bytes {
+                            Ok(())
+                        } else {
+                            Err(StreamError::invalid("stream frame round-trip differs"))
+                        }
+                    })
+                }
+                // Sequence fixtures are state-machine rejects, not individual records.
+                "sequence" => Err(StreamError::invalid("invalid frame sequence")),
+                kind => panic!("unknown vector kind {kind}"),
+            };
             assert_eq!(
-                (b[4], b.len(), Sha256::digest(&b).into()),
-                (tag, len, digest)
+                decoded.is_ok(),
+                fields[0] == "ACCEPT",
+                "{} {}",
+                fields[1],
+                fields[2]
             );
-            assert_eq!(StreamFrame::decode_for_context(9, 5, &b), Ok(f));
-            assert!(StreamFrame::decode_for_context(8, 5, &b).is_err());
-            assert!(StreamFrame::decode_for_context(9, 4, &b).is_err());
+            count += 1;
         }
-        for raw in 1..=6 {
-            assert!(StreamResultCode::decode(raw).is_ok());
-        }
-        assert!(StreamResultCode::decode(0).is_err());
-        assert!(StreamResultCode::decode(7).is_err());
-    }
-    #[test]
-    fn data_header_is_bounded_before_body_allocation() {
-        assert_eq!(
-            MAX_STREAM_DATA_FRAME_BYTES,
-            STREAM_DATA_FIXED_BYTES + MAX_STREAM_EXTENT_BYTES
-        );
-        let b = frames()[2].encode_for_context(9, 5).unwrap();
-        let h =
-            StreamDataHeaderV1::decode_for_context(9, 5, &b[..STREAM_DATA_FIXED_BYTES]).unwrap();
-        assert_eq!(h.extent_len, 32);
-        assert!(
-            h.decode_body(&b[STREAM_DATA_FIXED_BYTES..b.len() - 1])
-                .is_err()
-        );
-        let mut h = b[..STREAM_DATA_FIXED_BYTES].to_vec();
-        h[85..].copy_from_slice(&(MAX_STREAM_EXTENT_BYTES as u32 + 1).to_be_bytes());
-        assert!(StreamDataHeaderV1::decode_for_context(9, 5, &h).is_err());
-    }
-    #[test]
-    fn codec_rejects_truncation_trailing_empty_and_overflow() {
-        for f in frames() {
-            let mut b = f.encode_for_context(9, 5).unwrap();
-            assert!(StreamFrame::decode_for_context(9, 5, &b[..b.len() - 1]).is_err());
-            b.push(0);
-            assert!(StreamFrame::decode_for_context(9, 5, &b).is_err());
-        }
-        let id = [1; 32];
-        let n = [2; 32];
-        for (offset, bytes) in [(0, vec![]), (u64::MAX, vec![1])] {
-            assert!(
-                StreamFrame::Data(StreamDataV1 {
-                    transfer_id: id,
-                    attempt_nonce: n,
-                    sequence: 0,
-                    offset,
-                    bytes
-                })
-                .encode_for_context(9, 5)
-                .is_err()
-            );
-        }
-        let mut open = frames()[0].encode_for_context(9, 5).unwrap();
-        let custody_presence = open.len() - 33;
-        open[custody_presence] = 2;
-        assert!(StreamFrame::decode_for_context(9, 5, &open).is_err());
-        let mut data = match frames().remove(2) {
-            StreamFrame::Data(data) => data,
-            _ => unreachable!(),
-        };
-        data.attempt_nonce = [0; 32];
-        assert!(StreamFrame::Data(data).encode_for_context(9, 5).is_err());
-    }
-
-    #[test]
-    fn selected_frame_context_rejects_stream_tags_outside_v9_profile_five() {
-        let frame = crate::frame::Frame::Stream(frames().remove(2));
-        let encoded = frame.encode_for_semantic_profile(9, 5).unwrap();
-        assert_eq!(
-            crate::frame::Frame::decode_for_semantic_profile(&encoded, 9, 5).unwrap(),
-            frame
-        );
-        assert!(frame.encode_for_semantic_profile(8, 5).is_err());
-        assert!(crate::frame::Frame::decode_for_semantic_profile(&encoded, 9, 4).is_err());
-    }
-
-    #[test]
-    #[ignore = "explicit 1 GiB codec performance measurement"]
-    fn stream_codec_ceiling_processes_one_gib_in_bounded_extents() {
-        const TOTAL: u64 = 1 << 30;
-        let payload = vec![0xa5; MAX_STREAM_EXTENT_BYTES];
-        let started = std::time::Instant::now();
-        let mut offset = 0u64;
-        let mut sequence = 0u64;
-        while offset < TOTAL {
-            let frame = StreamFrame::Data(StreamDataV1 {
-                transfer_id: [1; 32],
-                attempt_nonce: [2; 32],
-                sequence,
-                offset,
-                bytes: payload.clone(),
-            });
-            let encoded = frame.encode_for_context(9, 5).unwrap();
-            let decoded = StreamFrame::decode_for_context(9, 5, &encoded).unwrap();
-            std::hint::black_box(decoded);
-            offset += MAX_STREAM_EXTENT_BYTES as u64;
-            sequence += 1;
-        }
-        let elapsed = started.elapsed();
-        let mib_per_second = TOTAL as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64();
-        eprintln!(
-            "stream_codec_ceiling bytes={TOTAL} extents={sequence} elapsed_ns={} mib_per_second={mib_per_second:.3}",
-            elapsed.as_nanos()
-        );
+        assert_eq!(count, 28);
     }
 }
 
 #[cfg(test)]
-mod stream_state {
+mod replacement_profile_five_state {
     use super::*;
 
-    fn open(total_len: u64, nonce: [u8; 32]) -> StreamOpenV1 {
-        StreamOpenV1 {
-            class: StreamClass::Blob,
-            direction: StreamDirection::ToSessionResponder,
-            session_transcript: [3; 32],
-            exchange_id: 4,
-            transfer_id: [1; 32],
-            source_transfer_id: [5; 32],
-            publication_id: [6; 32],
-            variant_id: [7; 32],
-            total_len,
-            attempt_nonce: nonce,
-            checkpoint_generation: 1,
-            custody_digest: None,
+    const STREAM: [u8; 32] = [0x11; 32];
+    const NONCE: [u8; 32] = [0x22; 32];
+    const PLAIN_ROOT: [u8; 32] = [0x51; 32];
+    const CIPHER_ROOT: [u8; 32] = [0x52; 32];
+
+    fn accept(durable: u64, generation: u64, credit: u64) -> StreamAcceptV1 {
+        StreamAcceptV1 {
+            transfer_id: STREAM,
+            attempt_nonce: NONCE,
+            sequence: 0,
+            durable_plaintext_offset: durable,
+            durable_ciphertext_offset: durable,
+            next_segment_index: durable.div_ceil(MAX_STREAM_EXTENT_BYTES as u64),
+            plaintext_commitment: PLAIN_ROOT,
+            ciphertext_commitment: CIPHER_ROOT,
+            checkpoint_generation: generation,
+            absolute_receive_limit: credit,
+            max_extent_bytes: MAX_STREAM_EXTENT_BYTES as u32,
+            checkpoint_batch_bytes: MAX_STREAM_CHECKPOINT_BATCH_BYTES,
         }
     }
 
     #[test]
-    fn sender_pipelines_against_absolute_credit_and_accepts_cumulative_checkpoint() {
-        let mut sender = StreamSenderState::new([1; 32], [2; 32], 64);
+    fn sender_pipelines_against_absolute_credit_beyond_declared_length() {
+        let total = 2 * MAX_STREAM_EXTENT_BYTES as u64;
+        let mut sender = StreamSenderState::new(STREAM, NONCE, total);
         sender
-            .accept(StreamAcceptV1 {
-                transfer_id: [1; 32],
-                attempt_nonce: [2; 32],
-                sequence: 0,
-                durable_offset: 0,
-                checkpoint_generation: 1,
-                absolute_receive_limit: 32,
-                max_extent_bytes: 16,
-                checkpoint_batch_bytes: 32,
-            })
-            .unwrap();
-        assert!(matches!(
-            sender.send_extent(vec![3; 16]).unwrap(),
-            StreamAction::Send(_)
-        ));
-        assert!(matches!(
-            sender.send_extent(vec![4; 16]).unwrap(),
-            StreamAction::Send(_)
-        ));
-        assert_eq!(
-            sender.send_extent(vec![5]),
-            Ok(StreamAction::Retry(StreamRetry::CreditBlocked))
-        );
-        sender
-            .checkpoint(StreamCheckpointV1 {
-                transfer_id: [1; 32],
-                attempt_nonce: [2; 32],
-                sequence: 1,
-                durable_offset: 16,
-                checkpoint_generation: 2,
-                absolute_receive_limit: 48,
-            })
-            .unwrap();
-        sender
-            .checkpoint(StreamCheckpointV1 {
-                transfer_id: [1; 32],
-                attempt_nonce: [2; 32],
-                sequence: 2,
-                durable_offset: 16,
-                checkpoint_generation: 2,
-                absolute_receive_limit: 48,
-            })
-            .unwrap();
-        assert!(matches!(
-            sender.send_extent(vec![5; 16]).unwrap(),
-            StreamAction::Send(_)
-        ));
+            .accept(accept(0, 0, MIN_STREAM_RECEIVE_WINDOW_BYTES))
+            .expect("credit is an absolute receiver allocation, not the Blob length");
+        for byte in [0xa1, 0xa2] {
+            assert!(matches!(
+                sender
+                    .send_extent(vec![byte; MAX_STREAM_EXTENT_BYTES])
+                    .expect("send within credit and declared length"),
+                StreamAction::Send(StreamFrame::Data(_))
+            ));
+        }
+        assert!(sender.send_extent(vec![0xa3]).is_err());
     }
 
     #[test]
-    fn receiver_separates_received_from_durable_and_rejects_gap_credit_and_replay() {
-        let mut receiver = StreamReceiverState::new(&open(64, [2; 32]), 0, 1, 32, 16).unwrap();
-        assert!(matches!(
-            receiver.accept(32).unwrap(),
-            StreamAction::Send(_)
-        ));
-        let data = |sequence, offset, nonce| StreamDataV1 {
-            transfer_id: [1; 32],
-            attempt_nonce: nonce,
-            sequence,
-            offset,
-            bytes: vec![9; 16],
-        };
-        assert_eq!(
-            receiver.data(data(0, 0, [2; 32])),
-            Ok(StreamAction::Persist { through: 16 })
-        );
-        assert!(receiver.data(data(1, 17, [2; 32])).is_err(), "gap");
-        assert!(
-            receiver.data(data(1, 16, [8; 32])).is_err(),
-            "attempt replay"
-        );
-        assert_eq!(
-            receiver.persisted(16, 2, 32).unwrap(),
-            StreamAction::Send(StreamFrame::Checkpoint(StreamCheckpointV1 {
-                transfer_id: [1; 32],
-                attempt_nonce: [2; 32],
-                sequence: 1,
-                durable_offset: 16,
-                checkpoint_generation: 2,
-                absolute_receive_limit: 32,
-            }))
-        );
-        assert_eq!(
-            receiver.data(data(1, 16, [2; 32])),
-            Ok(StreamAction::Persist { through: 32 })
-        );
-        assert!(
-            receiver.data(data(2, 32, [2; 32])).is_err(),
-            "credit violation"
-        );
-    }
-
-    #[test]
-    fn terminal_result_and_ack_are_idempotent_and_digest_bound() {
-        let mut sender = StreamSenderState::new([1; 32], [2; 32], 0);
+    fn unchanged_credit_heartbeat_must_preserve_checkpoint_authority() {
+        let mut sender = StreamSenderState::new(STREAM, NONCE, 1);
         sender
-            .accept(StreamAcceptV1 {
-                transfer_id: [1; 32],
-                attempt_nonce: [2; 32],
-                sequence: 0,
-                durable_offset: 0,
-                checkpoint_generation: 1,
-                absolute_receive_limit: 0,
-                max_extent_bytes: 16,
-                checkpoint_batch_bytes: 16,
-            })
+            .accept(accept(0, 0, MIN_STREAM_RECEIVE_WINDOW_BYTES))
             .unwrap();
-        assert!(matches!(sender.finish().unwrap(), StreamAction::Send(_)));
-        let result = StreamResultV1 {
-            transfer_id: [1; 32],
-            attempt_nonce: [2; 32],
+        let heartbeat = StreamCheckpointV1 {
+            transfer_id: STREAM,
+            attempt_nonce: NONCE,
             sequence: 1,
-            final_offset: 0,
-            code: StreamResultCode::AlreadyPresent,
-            result_digest: [7; 32],
+            durable_plaintext_offset: 0,
+            durable_ciphertext_offset: 0,
+            next_segment_index: 0,
+            plaintext_commitment: PLAIN_ROOT,
+            ciphertext_commitment: CIPHER_ROOT,
+            checkpoint_generation: 0,
+            absolute_receive_limit: MIN_STREAM_RECEIVE_WINDOW_BYTES,
         };
-        let first = sender.result(result.clone()).unwrap();
-        assert_eq!(sender.result(result), Ok(first));
+        sender.checkpoint(heartbeat.clone()).unwrap();
+        let mut forked = heartbeat;
+        forked.sequence = 2;
+        forked.plaintext_commitment = [0x99; 32];
+        assert!(sender.checkpoint(forked).is_err());
     }
 
     #[test]
-    fn sender_rejects_out_of_bounds_accept_configuration() {
-        let mut sender = StreamSenderState::new([1; 32], [2; 32], 64);
+    fn sender_rejects_receive_window_smaller_than_batch_plus_segment() {
+        let mut sender = StreamSenderState::new(STREAM, NONCE, u64::MAX);
         assert!(
             sender
-                .accept(StreamAcceptV1 {
-                    transfer_id: [1; 32],
-                    attempt_nonce: [2; 32],
-                    sequence: 0,
-                    durable_offset: 0,
-                    checkpoint_generation: 1,
-                    absolute_receive_limit: 32,
-                    max_extent_bytes: 16,
-                    checkpoint_batch_bytes: MAX_STREAM_CHECKPOINT_BATCH_BYTES + 1,
-                })
+                .accept(accept(0, 0, MIN_STREAM_RECEIVE_WINDOW_BYTES - 1,))
                 .is_err()
         );
     }
 
     #[test]
-    fn durable_progress_and_checkpoint_generation_advance_together() {
-        let mut sender = StreamSenderState::new([1; 32], [2; 32], 32);
+    fn finish_binds_distinct_declared_plaintext_and_ciphertext_lengths() {
+        let plaintext = MAX_STREAM_EXTENT_BYTES as u64;
+        let ciphertext = plaintext + 16;
+        let mut sender = StreamSenderState::new(STREAM, NONCE, ciphertext);
         sender
-            .accept(StreamAcceptV1 {
-                transfer_id: [1; 32],
-                attempt_nonce: [2; 32],
-                sequence: 0,
-                durable_offset: 0,
-                checkpoint_generation: 1,
-                absolute_receive_limit: 32,
-                max_extent_bytes: 16,
-                checkpoint_batch_bytes: 16,
-            })
+            .accept(accept(0, 0, MIN_STREAM_RECEIVE_WINDOW_BYTES))
             .unwrap();
-        sender.send_extent(vec![3; 16]).unwrap();
-        assert!(
-            sender
-                .checkpoint(StreamCheckpointV1 {
-                    transfer_id: [1; 32],
-                    attempt_nonce: [2; 32],
-                    sequence: 1,
-                    durable_offset: 16,
-                    checkpoint_generation: 1,
-                    absolute_receive_limit: 32,
-                })
-                .is_err()
-        );
-
-        let mut receiver = StreamReceiverState::new(&open(32, [2; 32]), 0, 1, 32, 16).unwrap();
-        receiver
-            .data(StreamDataV1 {
-                transfer_id: [1; 32],
-                attempt_nonce: [2; 32],
-                sequence: 0,
-                offset: 0,
-                bytes: vec![3; 16],
-            })
+        sender
+            .send_extent(vec![0xa1; MAX_STREAM_EXTENT_BYTES])
             .unwrap();
-        assert!(receiver.persisted(16, 1, 32).is_err());
-    }
-
-    #[test]
-    fn reopen_requires_a_fresh_attempt_nonce() {
-        assert!(StreamReceiverState::reopen(&[2; 32], &open(64, [2; 32]), 0, 1, 32, 16).is_err());
-        assert!(StreamReceiverState::reopen(&[2; 32], &open(64, [3; 32]), 0, 1, 32, 16).is_ok());
-    }
-
-    #[test]
-    fn completion_promotes_once_and_replays_bound_result_and_ack() {
-        let mut receiver = StreamReceiverState::new(&open(0, [2; 32]), 0, 1, 0, 16).unwrap();
-        receiver.accept(16).unwrap();
-        let finish = StreamFinishV1 {
-            transfer_id: [1; 32],
-            attempt_nonce: [2; 32],
-            sequence: 0,
-            final_offset: 0,
+        sender.send_extent(vec![0xa2; 16]).unwrap();
+        let StreamAction::Send(StreamFrame::Finish(finish)) = sender
+            .finish_bound(plaintext, b"publisher-signed-final".to_vec())
+            .unwrap()
+        else {
+            panic!("finish frame")
         };
-        assert_eq!(receiver.finish(finish.clone()), Ok(StreamAction::Promote));
+        assert_eq!(finish.final_plaintext_offset, plaintext);
+        assert_eq!(finish.final_ciphertext_offset, ciphertext);
+        assert_eq!(finish.signed_commitment, b"publisher-signed-final");
+    }
+
+    #[test]
+    fn promoted_result_keeps_blob_identity_separate_from_idempotency_digest() {
+        let open = StreamOpenV1 {
+            class: StreamClass::Blob,
+            direction: StreamDirection::ToSessionResponder,
+            session_transcript: [0x33; 32],
+            exchange_id: 7,
+            transfer_id: STREAM,
+            open_digest: [0x44; 32],
+            source_transfer_id: [0; 32],
+            publication_id: [0; 32],
+            variant_id: [0; 32],
+            total_len: 0,
+            attempt_nonce: NONCE,
+            checkpoint_generation: 0,
+            custody_digest: None,
+        };
+        let mut receiver = StreamReceiverState::new(&open, 0, 0, 0, 1).unwrap();
+        let blob_id = [0x71; 32];
+        let result_digest = [0x72; 32];
+        let first = receiver
+            .promoted_blob(StreamResultCode::Promoted, blob_id, result_digest)
+            .unwrap();
         assert_eq!(
-            receiver.finish(finish.clone()),
-            Ok(StreamAction::Retry(StreamRetry::SettlementPending))
-        );
-        let result = receiver
-            .promoted(StreamResultCode::Promoted, [8; 32])
-            .unwrap();
-        assert_eq!(receiver.finish(finish), Ok(result.clone()));
-        let StreamAction::Send(StreamFrame::Result(result_frame)) = result else {
-            panic!("result")
-        };
-        let ack = StreamResultAckV1 {
-            transfer_id: [1; 32],
-            attempt_nonce: [2; 32],
-            sequence: 1,
-            result_digest: result_frame.result_digest,
-        };
-        assert!(
             receiver
-                .result_ack(ack.clone(), StreamResultCode::RejectedPolicy)
-                .is_err()
+                .promoted_blob(StreamResultCode::Promoted, blob_id, result_digest)
+                .unwrap(),
+            first
         );
-        assert_eq!(
-            receiver.result_ack(ack.clone(), StreamResultCode::Promoted),
-            Ok(StreamAction::Terminal(StreamResultCode::Promoted))
-        );
-        assert_eq!(
-            receiver.result_ack(ack, StreamResultCode::Promoted),
-            Ok(StreamAction::Terminal(StreamResultCode::Promoted))
-        );
+        let StreamAction::Send(StreamFrame::Result(result)) = first else {
+            panic!("result frame")
+        };
+        assert_eq!(result.blob_id, blob_id);
+        assert_eq!(result.result_digest, result_digest);
     }
 
     #[test]
-    fn transport_loss_is_retryable() {
-        let mut sender = StreamSenderState::new([1; 32], [2; 32], 64);
-        sender
-            .accept(StreamAcceptV1 {
-                transfer_id: [1; 32],
-                attempt_nonce: [2; 32],
-                sequence: 0,
-                durable_offset: 0,
-                checkpoint_generation: 1,
-                absolute_receive_limit: 0,
-                max_extent_bytes: 16,
-                checkpoint_batch_bytes: 16,
-            })
-            .unwrap();
-        assert_eq!(
-            sender.send_extent(vec![1]),
-            Ok(StreamAction::Retry(StreamRetry::CreditBlocked))
-        );
-        assert_eq!(
-            sender.transport_lost(),
-            StreamAction::Retry(StreamRetry::TransportLost)
-        );
-    }
-
-    #[test]
-    fn duplicate_data_below_durable_checkpoint_is_discarded_after_binding_checks() {
-        let mut receiver = StreamReceiverState::new(&open(64, [2; 32]), 16, 2, 32, 16).unwrap();
-        assert_eq!(
-            receiver.data(StreamDataV1 {
-                transfer_id: [1; 32],
-                attempt_nonce: [2; 32],
-                sequence: 0,
-                offset: 0,
-                bytes: vec![9; 16],
-            }),
-            Ok(StreamAction::Retry(StreamRetry::DuplicateBelowCheckpoint))
-        );
+    fn retry_uses_fresh_nonce_and_receiver_checkpoint_authority() {
+        let open = StreamOpenV1 {
+            class: StreamClass::Blob,
+            direction: StreamDirection::ToSessionResponder,
+            session_transcript: [0x33; 32],
+            exchange_id: 7,
+            transfer_id: STREAM,
+            open_digest: [0x44; 32],
+            source_transfer_id: [0; 32],
+            publication_id: [0; 32],
+            variant_id: [0; 32],
+            total_len: 64 * 1024 * 1024,
+            attempt_nonce: [0x23; 32],
+            checkpoint_generation: 4,
+            custody_digest: None,
+        };
+        let authority = StreamCheckpointAuthorityV1 {
+            durable_plaintext_offset: 16 * 1024 * 1024,
+            durable_ciphertext_offset: 16 * 1024 * 1024 + 256,
+            next_segment_index: 16,
+            plaintext_commitment: [0x61; 32],
+            ciphertext_commitment: [0x62; 32],
+            checkpoint_generation: 4,
+            absolute_receive_limit: 34 * 1024 * 1024,
+        };
+        let mut receiver = StreamReceiverState::reopen_from_authority(
+            &NONCE,
+            &open,
+            authority,
+            MAX_STREAM_EXTENT_BYTES as u32,
+            MAX_STREAM_CHECKPOINT_BATCH_BYTES,
+        )
+        .unwrap();
+        let StreamAction::Send(StreamFrame::Accept(accepted)) =
+            receiver.accept_authority().unwrap()
+        else {
+            panic!("accept frame")
+        };
+        assert_eq!(accepted.attempt_nonce, [0x23; 32]);
+        assert_eq!(accepted.durable_plaintext_offset, 16 * 1024 * 1024);
+        assert_eq!(accepted.durable_ciphertext_offset, 16 * 1024 * 1024 + 256);
+        assert_eq!(accepted.next_segment_index, 16);
+        assert_eq!(accepted.plaintext_commitment, [0x61; 32]);
+        assert_eq!(accepted.ciphertext_commitment, [0x62; 32]);
+        assert_eq!(accepted.checkpoint_generation, 4);
     }
 }

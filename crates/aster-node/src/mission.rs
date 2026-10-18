@@ -3835,6 +3835,7 @@ mod tests {
                 session_transcript: sender.session_id(),
                 exchange_id: 3,
                 transfer_id: [0x31; 32],
+                open_digest: [0x30; 32],
                 source_transfer_id: [0x32; 32],
                 publication_id: [0x33; 32],
                 variant_id: [0x34; 32],

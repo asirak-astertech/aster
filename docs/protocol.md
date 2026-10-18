@@ -1052,25 +1052,27 @@ Semantic v9 reserves mechanics tags `0xd6` `StreamOpenV1`, `0xd7`
 `StreamAcceptV1`, `0xd8` `StreamDataV1`, `0xd9` `StreamCheckpointV1`, `0xda`
 `StreamFinishV1`, `0xdb` `StreamResultV1`, and `0xdc` `StreamResultAckV1` for
 profile 5. Semantic v9 also reserves ordinary mission-protected mechanics tags
-`0xdd` `BlobStreamPlanV1` and `0xde` `BlobStreamPlanReplyV1`. Tags `0xd1..0xd5`
+`0xdd` `BlobPublicationOpenV1` and `0xde` `BlobPublicationCommitV1`. Tags `0xd1..0xd5`
 and every semantic-v7/v8 byte retain their existing meanings.
 
-Before each profile-5 attempt, the receiver selects the exact admission or
-durable resume point. An already-staged source uses its Store checkpoint. A
-new finite source may use only metadata authenticated during the current
-contact to author the initial `(carrier 0, offset 0, generation 1)` selection;
-that metadata remains contact-local and creates no pending Store row until the
-custody-v2 prelude authenticates. A plan body is `direction u8 ||
-selection_present u8`; when present it continues with `source_transfer_id[32]
-|| next_carrier_index u64 || durable_offset u64 || checkpoint_generation u64`.
-The generation is nonzero, and carrier index and offset are either both zero or
-both nonzero. An absent selection has no trailing fields. Both tags are invalid
-before semantic v9. The responder returns `BlobStreamPlanReplyV1`; for an
-initiator-bound transfer it exactly echoes a sender-validated request, while
-for a responder-bound transfer it answers an empty query with the responder's
-receiver-authored selection. `StreamAcceptV1` must repeat the planned durable
-offset and generation. This permits restart recovery when metadata inventories
-already match and prevents either endpoint from guessing receiver progress.
+The publisher first emits `BlobPublicationOpenV1` containing the provider-signed
+canonical `BlobStreamOpen`. Its body is `semantic_version u16 = 9 || profile_id
+u16 = 5 || signed_open_len u32 || signed_open[signed_open_len]`. The final
+mission record uses the same envelope with tag `0xde` and a provider-signed
+canonical `BlobStreamFinalCommitment`. Signed bodies are nonempty and at most
+1,048,576 bytes. Decoding grants no authority: only provider verification may
+mint `VerifiedBlobStreamOpen` or `VerifiedBlobStreamFinalCommitment` and thereby
+authorize provisional storage, encryption state, or promotion. The open binds
+the logical stream ID, publisher, mission, operation key, metadata, declared
+plaintext length, content epoch, policy revision, authorization digest, and
+publication salt. The final commitment binds that open, both accumulator roots,
+segment count, final custody, and resulting Blob identity.
+
+Each transport attempt reuses the signed logical open and chooses a fresh,
+nonzero attempt nonce. The receiver is authoritative for resume: it supplies
+the last durable plaintext and ciphertext offsets, next segment index, both
+accumulator commitments, checkpoint generation, and a new absolute receive
+limit. The sender MUST NOT infer progress from an earlier attempt.
 
 The profile-5 mechanics prefix is `"ASM\x01" || tag`. All integers are
 unsigned big-endian. The attempt tuple used after `StreamOpenV1` is
@@ -1078,64 +1080,59 @@ unsigned big-endian. The attempt tuple used after `StreamOpenV1` is
 unknown class/direction/result value, truncation, trailing bytes, arithmetic
 overflow, or a record decoded outside semantic v9/profile 5 fails closed.
 
-The canonical record bodies are:
+The canonical attempt record bodies are:
 
 | Tag | Body after prefix and tag |
 | --- | --- |
-| `0xd6` StreamOpenV1 | `class u8 || direction u8 || semantic_version u16 = 9 || profile_id u16 = 5 || session_transcript[32] || exchange_id u64 || transfer_id[32] || source_transfer_id[32] || publication_id[32] || variant_id[32] || total_len u64 || attempt_nonce[32] || checkpoint_generation u64 || custody_present u8 || custody_digest[32] iff present` |
-| `0xd7` StreamAcceptV1 | `attempt tuple || durable_offset u64 || checkpoint_generation u64 || absolute_receive_limit u64 || max_extent_bytes u32 || checkpoint_batch_bytes u32` |
+| `0xd6` StreamOpenV1 | `class u8 || direction u8 || semantic_version u16 = 9 || profile_id u16 = 5 || session_transcript[32] || exchange_id u64 || stream_id[32] || open_digest[32] || attempt_nonce[32] || checkpoint_generation u64` |
+| `0xd7` StreamAcceptV1 | `attempt tuple || durable_plaintext_offset u64 || durable_ciphertext_offset u64 || next_segment_index u64 || plaintext_commitment[32] || ciphertext_commitment[32] || checkpoint_generation u64 || absolute_receive_limit u64 || max_extent_bytes u32 || checkpoint_batch_bytes u32` |
 | `0xd8` StreamDataV1 | `attempt tuple || offset u64 || extent_len u32 || extent[extent_len]` |
-| `0xd9` StreamCheckpointV1 | `attempt tuple || durable_offset u64 || checkpoint_generation u64 || absolute_receive_limit u64` |
-| `0xda` StreamFinishV1 | `attempt tuple || final_offset u64` |
-| `0xdb` StreamResultV1 | `attempt tuple || final_offset u64 || result_code u8 || result_digest[32]` |
+| `0xd9` StreamCheckpointV1 | `attempt tuple || durable_plaintext_offset u64 || durable_ciphertext_offset u64 || next_segment_index u64 || plaintext_commitment[32] || ciphertext_commitment[32] || checkpoint_generation u64 || absolute_receive_limit u64` |
+| `0xda` StreamFinishV1 | `attempt tuple || final_plaintext_offset u64 || final_ciphertext_offset u64 || signed_commitment_len u32 || signed_commitment[signed_commitment_len]` |
+| `0xdb` StreamResultV1 | `attempt tuple || final_plaintext_offset u64 || final_ciphertext_offset u64 || result_code u8 || blob_id[32] || result_digest[32]` |
 | `0xdc` StreamResultAckV1 | `attempt tuple || result_digest[32]` |
 
 `class = 1` is Blob. Result codes are `1` Promoted, `2` AlreadyPresent, `3`
 DeferredCapacity, `4` RetiredExpired, `5` RejectedPolicy, and `6`
 IntegrityFailure. Extents are nonempty and at most 1,048,576 bytes;
-checkpoint batches are nonzero and at most 8 MiB. A reader MUST consume and
+checkpoint batches are nonzero and at most 16 MiB. A reader MUST consume and
 validate the fixed 89-byte StreamData header, reserve the exact declared body
 against the global streaming budget, and only then read or allocate the body.
-Credit is an absolute offset and never decreases within an attempt. Durable
-offsets and checkpoint generations never move backward. Reopen uses a fresh
-nonce and resumes only from the receiver's durable offset. Duplicate terminal
-records replay the same digest-bound result or acknowledgement and never repeat
-promotion. The selected runtime likewise defers the existing per-peer Blob
-metadata cursor CAS for profile 5: a validated mutable source result records a
-contact-local settlement capability, and only successful completion of the
-bound stream result/ack exchange consumes it. If a failed attempt leaves the
-metadata inventories equal, the next receiver-authored plan reconstructs the
-same settlement from the current durable cursor and exact selected source; it
-still cannot be consumed before that reconnect's result acknowledgement. Any
-error before that boundary leaves the durable cursor unchanged. Profile-4
-cursor timing is unchanged.
+Credit is a ciphertext-stream absolute offset and never decreases within an
+attempt. Every acceptance satisfies `absolute_receive_limit -
+durable_ciphertext_offset >= checkpoint_batch_bytes + max_extent_bytes`; with
+the initial 16-MiB batch and 1-MiB extent, the minimum window is 17 MiB. Credit
+may exceed declared ciphertext length; the sender clamps data to that length.
+This permits positive-credit pipelining while one batch becomes durable and one
+following extent is already in flight.
 
-Finite profile-5 work uses `BlobCustodyClaimV2[208]`. Its field widths and age
-semantics are identical to `BlobCustodyClaimV1`, but its fixed header is
-`"ASTRBL09" || format_version u16 = 2 || semantic_version u16 = 9 ||
-profile_id u16 = 5`. Lane ID 4 is bound by the record context rather than
-duplicated in the fixed claim body. Each protected stream record authenticates
-`"ASTER/v9-lane-record/v1\0" || semantic_version u16 ||
-transfer_profile_digest[32] || lane u16 || profile u16 || direction u8 ||
-attempt_nonce[32] || record_sequence u64`. A custody contact capability also
-binds the session transcript and exact claim digest under
-`"ASTER/v9-blob-custody-contact/v2\0"`. These send/contact capabilities are
-non-clone, exact-context values; decoding raw claim bytes grants no Store
-authority. Semantic-v8 claim bytes and domains remain unchanged.
+Checkpoint plaintext offset, ciphertext offset, segment index, and generation
+are cumulative and never move backward. Advancing durable content advances the
+generation and carries the exact accumulator checkpoints persisted with that
+generation. A heartbeat may retain generation, offsets, roots, and credit
+unchanged; it may increase credit, but MUST NOT change one checkpoint field
+without advancing to a fully persisted generation. Accumulator commitments are
+the fixed-width canonical checkpoint commitments defined by the profile-5
+stream format, never serialized hash-library state.
 
-A finite profile-5 attempt carries exactly one custody-v2 protected record as
-the first record on the attempt data half, immediately before `StreamOpenV1`.
-The receiver authenticates that record in the same v9 Blob context and attempt
-nonce, requires its session, direction, exchange, and source transfer to match
-the receiver-authored plan, and durably merges its non-younger age before
-opening the stream. For a first contact this same boundary atomically stages
-the finite source under semantic-v9/profile-5 provenance and establishes its
-zero checkpoint; for reopen it updates the existing finite pending source
-without rejuvenating its age. The following `StreamOpenV1.custody_digest` MUST
-equal the authenticated claim digest. Durable attempts carry no custody prelude
-and MUST set no custody digest. The receiver MUST NOT emit `StreamAcceptV1`,
-credit, or any other control record before these checks and the Store admission
-or age merge succeed.
+`StreamFinishV1` is valid only after all declared ciphertext bytes are durable
+and its signed final commitment verifies against the provisional open, exact
+plaintext/ciphertext lengths, both final roots, and segment count. Verification
+failure never promotes provisional bytes. Successful Store promotion is atomic
+with creation of the immutable descriptor; only then may the receiver emit
+Promoted or AlreadyPresent. Duplicate finish, result, and acknowledgement
+records replay the same Blob ID and result digest without repeating promotion.
+Errors before settlement leave receiver durable authority unchanged.
+
+This semantic-v9/profile-5 grammar replaces the pre-release carrier-plan
+grammar in place. Old profile-5 plans, pending rows, carrier indexes, and
+checkpoints are incompatible development state and MUST NOT resume. Semantic
+v7/v8 profile 4 remains byte-identical and independently resumable. Profile 5
+does not require an existing manifest or carrier before bytes begin: the signed
+provisional open is admission authority and the signed final commitment
+completes identity. Framing, attempt identity, credit, checkpoints, bounded
+buffers, retry, settlement, and transport selection are reusable substrate;
+Blob signing, identity, custody, and promotion are its class-specific adapter.
 
 For each admitted Blob direction, profile 4 sends one protected `ABRS || 0x01`
 schedule containing at most 64 canonical `BlobRangeFetchV5` tuples and receives
@@ -2260,7 +2257,7 @@ and visible quota/eviction policy. Evictions and conflicts surface to the app.
 | semantic-v7/v8/v9 lane | 1 Event, 2 State, 3 Record, 4 Blob, 5 EventBridge; critical extension bit `0x8000` |
 | semantic-v7/v8/v9 transfer profile | 1 `LegacyV6`, 2 `EventPagesV1`, 3 reserved `BlobCustodyV1` (not offered or selected), 4 `BlobRangesStreamV1` (Blob only; v7 durable-only, v8 authenticated custody), 5 `BlobStreamV1` (Blob only; v9); critical extension bit `0x8000` |
 | semantic-v7/v8 mechanics tag | `0xd1` TransferProfileOfferV1, `0xd2` EventTurnPlanV1, `0xd3` ChangeTurnHeaderV1, `0xd4` ChangePageV7, `0xd5` ChangeTurnFinishedV1 |
-| semantic-v9 Blob stream tag | `0xd6` StreamOpenV1, `0xd7` StreamAcceptV1, `0xd8` StreamDataV1, `0xd9` StreamCheckpointV1, `0xda` StreamFinishV1, `0xdb` StreamResultV1, `0xdc` StreamResultAckV1 (profile-5 context); `0xdd` BlobStreamPlanV1 and `0xde` BlobStreamPlanReplyV1 (mission-protected pre-open context); all invalid before v9 |
+| semantic-v9 Blob stream tag | `0xd6` StreamOpenV1, `0xd7` StreamAcceptV1, `0xd8` StreamDataV1, `0xd9` StreamCheckpointV1, `0xda` StreamFinishV1, `0xdb` StreamResultV1, `0xdc` StreamResultAckV1 (profile-5 attempt context); `0xdd` BlobPublicationOpenV1 and `0xde` BlobPublicationCommitV1 (mission-protected publication context); all invalid before v9 |
 | source envelope format | 2 singleton hybrid authentication; semantics 2 through 9 add 3 content-committing batch authentication |
 | batch authentication mode | 1 exact proof reference, Merkle path, and P-256 item signature |
 | suite | `0x0001` provisional hybrid reference suite |
