@@ -495,54 +495,63 @@ pub(super) async fn receive_completed_pack(
                         .ok_or_else(|| protocol("received pack byte count overflow"))?,
                     Ordering::Relaxed,
                 );
-                loop {
-                    let available = current
-                        .buffered
-                        .len()
-                        .saturating_sub(current.buffered_consumed);
-                    if available < 4 {
-                        break;
-                    }
-                    let record_start = current.buffered_consumed;
-                    let segment_len = u32::from_be_bytes(
-                        current.buffered[record_start..record_start + 4]
-                            .try_into()
-                            .expect("four-byte segment length"),
-                    ) as usize;
-                    let record_len = 4_usize
-                        .checked_add(segment_len)
-                        .ok_or_else(|| protocol("received segment length overflow"))?;
-                    if segment_len == 0 || segment_len > 2 * 1024 * 1024 {
-                        return Err(protocol("received encrypted segment length is invalid"));
-                    }
-                    if available < record_len {
-                        break;
-                    }
-                    let record_end = record_start
-                        .checked_add(record_len)
-                        .ok_or_else(|| protocol("received segment end overflow"))?;
-                    let segment = EncryptedBlobStreamSegment::decode(
-                        &current.buffered[record_start + 4..record_end],
-                    )
-                    .map_err(protocol)?;
-                    let (plaintext, ciphertext_checkpoint) = current
-                        .stream
-                        .decryptor
-                        .decrypt_segment_checkpointed(&segment)
-                        .map_err(protocol)?;
-                    current.stream.pack.append_authenticated_encoded_segment(
-                        &plaintext,
-                        &segment,
-                        &current.buffered[record_start + 4..record_end],
-                        ciphertext_checkpoint,
-                    )?;
-                    current.buffered_consumed = record_end;
-                    current.durable_wire_offset = current
-                        .durable_wire_offset
-                        .checked_add(record_len as u64)
-                        .ok_or_else(|| protocol("received durable wire offset overflow"))?;
-                    current.appended_since_checkpoint = true;
+            }
+
+            let mut record_cursor = current.buffered_consumed;
+            let mut segments = Vec::new();
+            let mut record_ranges = Vec::new();
+            loop {
+                let available = current.buffered.len().saturating_sub(record_cursor);
+                if available < 4 {
+                    break;
                 }
+                let segment_len = u32::from_be_bytes(
+                    current.buffered[record_cursor..record_cursor + 4]
+                        .try_into()
+                        .expect("four-byte segment length"),
+                ) as usize;
+                let record_len = 4_usize
+                    .checked_add(segment_len)
+                    .ok_or_else(|| protocol("received segment length overflow"))?;
+                if segment_len == 0 || segment_len > 2 * 1024 * 1024 {
+                    return Err(protocol("received encrypted segment length is invalid"));
+                }
+                if available < record_len {
+                    break;
+                }
+                let record_end = record_cursor
+                    .checked_add(record_len)
+                    .ok_or_else(|| protocol("received segment end overflow"))?;
+                segments.push(
+                    EncryptedBlobStreamSegment::decode(
+                        &current.buffered[record_cursor + 4..record_end],
+                    )
+                    .map_err(protocol)?,
+                );
+                record_ranges.push((record_cursor + 4, record_end, record_len));
+                record_cursor = record_end;
+            }
+
+            let authenticated = current
+                .stream
+                .decryptor
+                .decrypt_segment_batch_checkpointed(&segments)
+                .map_err(protocol)?;
+            for ((segment, (encoded_start, record_end, record_len)), (plaintext, checkpoint)) in
+                segments.iter().zip(record_ranges).zip(authenticated)
+            {
+                current.stream.pack.append_authenticated_encoded_segment(
+                    &plaintext,
+                    segment,
+                    &current.buffered[encoded_start..record_end],
+                    checkpoint,
+                )?;
+                current.buffered_consumed = record_end;
+                current.durable_wire_offset = current
+                    .durable_wire_offset
+                    .checked_add(record_len as u64)
+                    .ok_or_else(|| protocol("received durable wire offset overflow"))?;
+                current.appended_since_checkpoint = true;
             }
             if current.buffered_consumed == current.buffered.len() {
                 current.buffered.clear();

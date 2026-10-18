@@ -635,6 +635,11 @@ pub struct AuthenticatedBlobStreamSegmentCheckpoint {
     checkpoint: BlobStreamAccumulatorCheckpoint,
 }
 
+/// Plaintext and ordered ciphertext checkpoint produced by authenticating one
+/// segment in a bounded batch.
+pub type AuthenticatedBlobStreamSegment =
+    (Zeroizing<Vec<u8>>, AuthenticatedBlobStreamSegmentCheckpoint);
+
 impl AuthenticatedBlobStreamSegmentCheckpoint {
     pub const fn segment_index(&self) -> u64 {
         self.segment_index
@@ -714,6 +719,18 @@ impl BlobStreamDecryptor {
         {
             return Err(BlobError::AuthenticationFailed);
         }
+        let plaintext = self.decrypt_payload(segment)?;
+        self.ciphertext_accumulator
+            .push_segment(segment.index, &segment.ciphertext)?;
+        self.next_index = self
+            .next_index
+            .checked_add(1)
+            .ok_or(BlobError::LengthOverflow)?;
+        self.next_offset = end;
+        Ok(Zeroizing::new(plaintext))
+    }
+
+    fn decrypt_payload(&self, segment: &EncryptedBlobStreamSegment) -> Result<Vec<u8>, BlobError> {
         let mut key_array = Array(*self.key);
         let cipher = Aes256Gcm::new(&key_array);
         key_array.as_mut_slice().zeroize();
@@ -730,14 +747,7 @@ impl BlobStreamDecryptor {
         if plaintext.len() != segment.plaintext_len as usize {
             return Err(BlobError::AuthenticationFailed);
         }
-        self.ciphertext_accumulator
-            .push_segment(segment.index, &segment.ciphertext)?;
-        self.next_index = self
-            .next_index
-            .checked_add(1)
-            .ok_or(BlobError::LengthOverflow)?;
-        self.next_offset = end;
-        Ok(Zeroizing::new(plaintext))
+        Ok(plaintext)
     }
 
     /// Decrypts one ordered segment and returns the exact authenticated
@@ -757,6 +767,81 @@ impl BlobStreamDecryptor {
                 checkpoint: self.ciphertext_accumulator.checkpoint(),
             },
         ))
+    }
+
+    /// Decrypts a bounded ordered batch while authenticating independent AEAD
+    /// segments concurrently. Ordered ciphertext commitments are prepared on
+    /// cloned state, so any failed segment leaves the decryptor retryable.
+    pub fn decrypt_segment_batch_checkpointed(
+        &mut self,
+        segments: &[EncryptedBlobStreamSegment],
+    ) -> Result<Vec<AuthenticatedBlobStreamSegment>, BlobError> {
+        if segments.len() <= 1 {
+            return segments
+                .iter()
+                .map(|segment| self.decrypt_segment_checkpointed(segment))
+                .collect();
+        }
+
+        let mut ciphertext_accumulator = self.ciphertext_accumulator.clone();
+        let mut next_index = self.next_index;
+        let mut next_offset = self.next_offset;
+        let mut checkpoints = Vec::with_capacity(segments.len());
+        for segment in segments {
+            let expected_previous = checkpoint_commitment(&ciphertext_accumulator.checkpoint());
+            let expected_nonce = segment_nonce(&self.base_nonce, next_index);
+            if segment.stream_id != self.open.open.stream_id
+                || segment.open_digest != self.open.open.digest()
+                || segment.index != next_index
+                || segment.offset != next_offset
+                || segment.total_len != self.open.open.total_len
+                || segment.content_epoch != self.open.open.content_epoch
+                || segment.previous_ciphertext_commitment != expected_previous
+                || segment.nonce != expected_nonce
+                || segment.ciphertext.len() != segment.plaintext_len as usize + GCM_TAG_BYTES
+            {
+                return Err(BlobError::AuthenticationFailed);
+            }
+            let end = segment
+                .offset
+                .checked_add(u64::from(segment.plaintext_len))
+                .ok_or(BlobError::LengthOverflow)?;
+            if end > self.open.open.total_len
+                || (end < self.open.open.total_len
+                    && segment.plaintext_len as usize != BLOB_STREAM_SEGMENT_BYTES)
+            {
+                return Err(BlobError::AuthenticationFailed);
+            }
+            ciphertext_accumulator.push_segment(segment.index, &segment.ciphertext)?;
+            checkpoints.push(AuthenticatedBlobStreamSegmentCheckpoint {
+                segment_index: segment.index,
+                ciphertext_len: segment.ciphertext.len(),
+                checkpoint: ciphertext_accumulator.checkpoint(),
+            });
+            next_index = next_index.checked_add(1).ok_or(BlobError::LengthOverflow)?;
+            next_offset = end;
+        }
+
+        let plaintexts = std::thread::scope(|scope| {
+            let handles = segments
+                .iter()
+                .map(|segment| scope.spawn(|| self.decrypt_payload(segment)))
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .map_err(|_| BlobError::AuthenticationFailed)?
+                        .map(Zeroizing::new)
+                })
+                .collect::<Result<Vec<_>, BlobError>>()
+        })?;
+
+        self.ciphertext_accumulator = ciphertext_accumulator;
+        self.next_index = next_index;
+        self.next_offset = next_offset;
+        Ok(plaintexts.into_iter().zip(checkpoints).collect())
     }
 
     /// Authenticates the complete ordered ciphertext stream against its signed commitment.
@@ -1717,6 +1802,73 @@ mod tests {
             fresh.decrypt_segment(&tampered),
             Err(BlobError::AuthenticationFailed)
         ));
+    }
+
+    #[test]
+    fn blob_stream_segment_batch_matches_sequential_and_is_failure_atomic() {
+        let open = open_with_metadata(Some("image/tiff"), b"schema-a");
+        let mut encryptor = BlobStreamEncryptor::from_key(&open, [0x77; 32]).expect("encryptor");
+        let first = encryptor
+            .encrypt_segment(0, 0, Zeroizing::new(vec![0x81; BLOB_STREAM_SEGMENT_BYTES]))
+            .expect("first encrypted segment");
+        let tail = encryptor
+            .encrypt_segment(
+                1,
+                BLOB_STREAM_SEGMENT_BYTES as u64,
+                Zeroizing::new(b"tail".to_vec()),
+            )
+            .expect("tail encrypted segment");
+        let segments = [first, tail];
+
+        let mut sequential =
+            BlobStreamDecryptor::from_key(&open, [0x77; 32]).expect("sequential decryptor");
+        let expected = segments
+            .iter()
+            .map(|segment| {
+                sequential
+                    .decrypt_segment_checkpointed(segment)
+                    .expect("sequential segment")
+            })
+            .collect::<Vec<_>>();
+
+        let mut batched =
+            BlobStreamDecryptor::from_key(&open, [0x77; 32]).expect("batch decryptor");
+        let actual = batched
+            .decrypt_segment_batch_checkpointed(&segments)
+            .expect("authenticated batch");
+        assert_eq!(actual.len(), expected.len());
+        for ((actual_plaintext, actual_checkpoint), (expected_plaintext, expected_checkpoint)) in
+            actual.iter().zip(&expected)
+        {
+            assert_eq!(actual_plaintext.as_slice(), expected_plaintext.as_slice());
+            assert_eq!(
+                actual_checkpoint.segment_index,
+                expected_checkpoint.segment_index
+            );
+            assert_eq!(
+                actual_checkpoint.ciphertext_len,
+                expected_checkpoint.ciphertext_len
+            );
+            assert_eq!(actual_checkpoint.checkpoint, expected_checkpoint.checkpoint);
+        }
+
+        let mut tampered = segments.clone();
+        tampered[1].ciphertext[0] ^= 0x80;
+        let mut retryable =
+            BlobStreamDecryptor::from_key(&open, [0x77; 32]).expect("retryable decryptor");
+        assert!(matches!(
+            retryable.decrypt_segment_batch_checkpointed(&tampered),
+            Err(BlobError::AuthenticationFailed)
+        ));
+        let retried = retryable
+            .decrypt_segment_batch_checkpointed(&segments)
+            .expect("valid retry after failed batch");
+        assert_eq!(retried.len(), 2);
+        assert_eq!(
+            retried[0].0.as_slice(),
+            vec![0x81; BLOB_STREAM_SEGMENT_BYTES]
+        );
+        assert_eq!(retried[1].0.as_slice(), b"tail");
     }
 
     #[test]
