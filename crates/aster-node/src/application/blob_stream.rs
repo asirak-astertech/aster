@@ -26,6 +26,62 @@ pub struct SelectedBlobPublishStream {
     durable_offset: u64,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub struct BlobReadFrame {
+    pub offset: u64,
+    pub bytes: Zeroizing<Vec<u8>>,
+}
+
+pub struct SelectedBlobReadStream {
+    commands: mpsc::Sender<SelectedApplicationCommand>,
+    token: [u8; 32],
+    closed: bool,
+}
+
+impl SelectedBlobReadStream {
+    pub(crate) fn new(commands: mpsc::Sender<SelectedApplicationCommand>, token: [u8; 32]) -> Self {
+        Self {
+            commands,
+            token,
+            closed: false,
+        }
+    }
+
+    pub async fn next(
+        &mut self,
+        max_bytes: usize,
+    ) -> Result<Option<BlobReadFrame>, ApplicationError> {
+        let (response, received) = oneshot::channel();
+        self.commands
+            .send(SelectedApplicationCommand::Blob(
+                SelectedBlobCommand::NextReadStream {
+                    token: self.token,
+                    max_bytes,
+                    response,
+                },
+            ))
+            .await
+            .map_err(|_| actor_unavailable("blob stream read"))?;
+        let frame = received
+            .await
+            .map_err(|_| actor_unavailable("blob stream read"))??;
+        if frame.is_none() {
+            self.closed = true;
+        }
+        Ok(frame)
+    }
+}
+
+impl Drop for SelectedBlobReadStream {
+    fn drop(&mut self) {
+        if !self.closed {
+            _ = self.commands.try_send(SelectedApplicationCommand::Blob(
+                SelectedBlobCommand::CloseReadStream { token: self.token },
+            ));
+        }
+    }
+}
+
 impl SelectedBlobPublishStream {
     pub(crate) fn new(
         commands: mpsc::Sender<SelectedApplicationCommand>,
@@ -89,4 +145,8 @@ impl SelectedBlobPublishStream {
 pub(crate) struct OpenedBlobPublishStream {
     pub token: [u8; 32],
     pub progress: BlobPublishProgress,
+}
+
+pub(crate) struct OpenedBlobReadStream {
+    pub token: [u8; 32],
 }

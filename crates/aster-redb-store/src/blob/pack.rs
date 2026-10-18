@@ -165,6 +165,24 @@ pub(crate) struct BlobPackCompletion {
 }
 
 impl BlobPackCompletion {
+    pub(super) const fn from_completed(
+        open_digest: [u8; 32],
+        stream_id: BlobPublicationStreamId,
+        total_len: u64,
+        pack_len: u64,
+        segment_count: u64,
+        descriptor_digest: [u8; 32],
+    ) -> Self {
+        Self {
+            open_digest,
+            stream_id,
+            total_len,
+            pack_len,
+            segment_count,
+            descriptor_digest,
+        }
+    }
+
     pub(super) const fn open_digest(&self) -> &[u8; 32] {
         &self.open_digest
     }

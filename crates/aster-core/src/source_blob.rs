@@ -578,6 +578,7 @@ impl ReferenceEnvelopeSealer {
         Ok(VerifiedBlobStreamOpen::from_provider(
             open,
             self.mission_authority_id(),
+            signed_open.to_vec(),
             BlobStreamProviderSeal(()),
         ))
     }
@@ -617,6 +618,7 @@ impl ReferenceEnvelopeSealer {
         }
         Ok(VerifiedBlobStreamFinalCommitment::from_provider(
             commitment,
+            signed_commitment.to_vec(),
             BlobStreamProviderSeal(()),
         ))
     }
@@ -1297,6 +1299,7 @@ mod tests {
         let verified_open = reader
             .verify_blob_stream_open(&signed_open)
             .expect("verified open");
+        assert_eq!(verified_open.authenticated_bytes(), signed_open);
         let mut tampered_open = signed_open.clone();
         *tampered_open.last_mut().expect("signed byte") ^= 1;
         assert!(reader.verify_blob_stream_open(&tampered_open).is_err());
@@ -1335,9 +1338,10 @@ mod tests {
         let signed_commitment = publisher
             .seal_blob_stream_commitment(&commitment)
             .expect("signed commitment");
-        reader
+        let verified_commitment = reader
             .verify_blob_stream_commitment(&verified_open, &signed_commitment)
             .expect("verified commitment");
+        assert_eq!(verified_commitment.authenticated_bytes(), signed_commitment);
         let mut tampered_commitment = signed_commitment;
         *tampered_commitment.last_mut().expect("signed byte") ^= 1;
         assert!(

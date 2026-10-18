@@ -29,10 +29,10 @@ pub use pressure::BlobCapacityRecoveryResult;
 pub use stream::{
     BlobStreamCheckpoint, BlobStreamCommitOutcome, BlobStreamCryptoResume,
     BlobStreamDurableProgress, BlobStreamPackSession, BlobStreamPromotion,
-    BlobStreamProvenanceUpgrade, BlobStreamPublication, BlobStreamReservation,
-    BlobStreamReservationRequest, BlobStreamSource, DEFAULT_BLOB_STREAM_CHECKPOINT_BATCH_BYTES,
-    DEFAULT_BLOB_STREAM_CHECKPOINT_INTERVAL, MAX_BLOB_STREAM_CHECKPOINT_BATCH_BYTES,
-    VerifiedBlobStreamCheckpointBatch,
+    BlobStreamProvenanceUpgrade, BlobStreamPublication, BlobStreamReadSession,
+    BlobStreamReservation, BlobStreamReservationRequest, BlobStreamSource,
+    DEFAULT_BLOB_STREAM_CHECKPOINT_BATCH_BYTES, DEFAULT_BLOB_STREAM_CHECKPOINT_INTERVAL,
+    MAX_BLOB_STREAM_CHECKPOINT_BATCH_BYTES, VerifiedBlobStreamCheckpointBatch,
 };
 
 use std::collections::{BTreeMap, BTreeSet};

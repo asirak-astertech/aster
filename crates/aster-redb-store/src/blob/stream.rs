@@ -1,8 +1,8 @@
 //! Profile-5 whole-carrier stream layout, batching, and durable checkpoints.
 
 use super::pack::{
-    BlobPackCheckpoint, BlobPackCompletion, BlobPackWriter, PinnedBlobPackRoot, delete_blob_pack,
-    recover_blob_pack,
+    BlobPackCheckpoint, BlobPackCompletion, BlobPackReader, BlobPackWriter, PinnedBlobPackRoot,
+    delete_blob_pack, recover_blob_pack,
 };
 use super::*;
 use aster_mesh::{
@@ -46,6 +46,7 @@ pub struct BlobStreamReservation {
     source: BlobStreamSource,
     reserved_bytes: u64,
     open: BlobStreamOpen,
+    authenticated_open: Vec<u8>,
 }
 
 impl BlobStreamReservation {
@@ -78,9 +79,13 @@ pub struct BlobStreamPromotion {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BlobStreamPublication {
     open: BlobStreamOpen,
+    commitment: BlobStreamFinalCommitment,
+    authenticated_open: Vec<u8>,
+    authenticated_commitment: Vec<u8>,
     blob_id: BlobId,
     acceptance_marker: u64,
     pack_len: u64,
+    descriptor_digest: [u8; 32],
 }
 
 impl BlobStreamPublication {
@@ -94,6 +99,18 @@ impl BlobStreamPublication {
 
     pub const fn open(&self) -> &BlobStreamOpen {
         &self.open
+    }
+
+    pub const fn commitment(&self) -> &BlobStreamFinalCommitment {
+        &self.commitment
+    }
+
+    pub fn authenticated_open(&self) -> &[u8] {
+        &self.authenticated_open
+    }
+
+    pub fn authenticated_commitment(&self) -> &[u8] {
+        &self.authenticated_commitment
     }
 
     pub const fn acceptance_marker(&self) -> u64 {
@@ -125,6 +142,26 @@ pub struct BlobStreamPackSession {
     writer: BlobPackWriter,
     reservation: BlobStreamReservation,
     progress: BlobStreamDurableProgress,
+}
+
+/// Store-owned sequential reader over one authenticated completed pack.
+pub struct BlobStreamReadSession {
+    reader: BlobPackReader,
+    next_index: u64,
+}
+
+impl BlobStreamReadSession {
+    pub fn next_encrypted_segment(&mut self) -> Result<Option<Vec<u8>>, StoreError> {
+        let mut encoded = Vec::new();
+        if !self.reader.read_segment(self.next_index, &mut encoded)? {
+            return Ok(None);
+        }
+        self.next_index = self
+            .next_index
+            .checked_add(1)
+            .ok_or(StoreError::ItemCountAccountingOverflow)?;
+        Ok(Some(encoded))
+    }
 }
 
 impl BlobStreamPackSession {
@@ -388,6 +425,7 @@ impl ProvisionalBlobStream {
 
     fn encode(&self) -> Result<Vec<u8>, StoreError> {
         let open = self.open.encode();
+        let authenticated_open = &self.reservation.authenticated_open;
         let checkpoint = self
             .checkpoint
             .as_ref()
@@ -403,7 +441,10 @@ impl ProvisionalBlobStream {
                 "Blob stream checkpoint is oversized",
             ))
         })?;
-        let mut encoded = Vec::with_capacity(96 + open.len() + checkpoint.len());
+        let authenticated_open_len =
+            u32::try_from(authenticated_open.len()).map_err(|_| provisional_schema_error())?;
+        let mut encoded =
+            Vec::with_capacity(100 + open.len() + authenticated_open.len() + checkpoint.len());
         encoded.extend_from_slice(PROVISIONAL_MAGIC);
         encoded.push(PROVISIONAL_VERSION);
         match self.reservation.source {
@@ -419,6 +460,8 @@ impl ProvisionalBlobStream {
         encoded.extend_from_slice(&self.reservation.reserved_bytes.to_be_bytes());
         encoded.extend_from_slice(&open_len.to_be_bytes());
         encoded.extend_from_slice(&open);
+        encoded.extend_from_slice(&authenticated_open_len.to_be_bytes());
+        encoded.extend_from_slice(authenticated_open);
         encoded.extend_from_slice(&checkpoint_len.to_be_bytes());
         encoded.extend_from_slice(&checkpoint);
         Ok(encoded)
@@ -442,13 +485,19 @@ impl ProvisionalBlobStream {
         let open_end = open_start
             .checked_add(open_len)
             .ok_or(StoreError::PayloadByteAccountingOverflow)?;
-        let checkpoint_len = usize::try_from(read_u32(encoded, open_end)?)
+        let authenticated_open_len = usize::try_from(read_u32(encoded, open_end)?)
             .map_err(|_| provisional_schema_error())?;
-        let checkpoint_start = open_end + 4;
+        let authenticated_open_start = open_end + 4;
+        let authenticated_open_end = authenticated_open_start
+            .checked_add(authenticated_open_len)
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+        let checkpoint_len = usize::try_from(read_u32(encoded, authenticated_open_end)?)
+            .map_err(|_| provisional_schema_error())?;
+        let checkpoint_start = authenticated_open_end + 4;
         let checkpoint_end = checkpoint_start
             .checked_add(checkpoint_len)
             .ok_or(StoreError::PayloadByteAccountingOverflow)?;
-        if checkpoint_end != encoded.len() || reserved_bytes == 0 {
+        if checkpoint_end != encoded.len() || reserved_bytes == 0 || authenticated_open_len == 0 {
             return Err(provisional_schema_error());
         }
         let open = BlobStreamOpen::decode(
@@ -473,6 +522,7 @@ impl ProvisionalBlobStream {
             source,
             reserved_bytes,
             open: open.clone(),
+            authenticated_open: encoded[authenticated_open_start..authenticated_open_end].to_vec(),
         };
         if checkpoint.as_ref().is_some_and(|checkpoint| {
             checkpoint.stream_id() != open.stream_id()
@@ -516,10 +566,25 @@ impl CompletedBlobStream {
         let commitment_end = commitment_start
             .checked_add(commitment_len)
             .ok_or(StoreError::PayloadByteAccountingOverflow)?;
-        if commitment_end != encoded.len()
+        let authenticated_open_len = usize::try_from(read_u32(encoded, commitment_end)?)
+            .map_err(|_| provisional_schema_error())?;
+        let authenticated_open_start = commitment_end + 4;
+        let authenticated_open_end = authenticated_open_start
+            .checked_add(authenticated_open_len)
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+        let authenticated_commitment_len =
+            usize::try_from(read_u32(encoded, authenticated_open_end)?)
+                .map_err(|_| provisional_schema_error())?;
+        let authenticated_commitment_start = authenticated_open_end + 4;
+        let authenticated_commitment_end = authenticated_commitment_start
+            .checked_add(authenticated_commitment_len)
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+        if authenticated_commitment_end != encoded.len()
             || descriptor_digest == [0; 32]
             || pack_len == 0
             || acceptance_marker == 0
+            || authenticated_open_len == 0
+            || authenticated_commitment_len == 0
         {
             return Err(provisional_schema_error());
         }
@@ -547,9 +612,15 @@ impl CompletedBlobStream {
         }
         Ok(Self {
             open,
+            commitment,
+            authenticated_open: encoded[authenticated_open_start..authenticated_open_end].to_vec(),
+            authenticated_commitment: encoded
+                [authenticated_commitment_start..authenticated_commitment_end]
+                .to_vec(),
             blob_id,
             acceptance_marker,
             pack_len,
+            descriptor_digest,
         })
     }
 }
@@ -823,7 +894,18 @@ fn encode_stream_publication(
     let commitment_bytes = commitment.commitment().encode();
     let commitment_len =
         u32::try_from(commitment_bytes.len()).map_err(|_| provisional_schema_error())?;
-    let mut encoded = Vec::with_capacity(161 + open_bytes.len() + commitment_bytes.len());
+    let authenticated_open = &reservation.authenticated_open;
+    let authenticated_commitment = commitment.authenticated_bytes();
+    let authenticated_open_len =
+        u32::try_from(authenticated_open.len()).map_err(|_| provisional_schema_error())?;
+    let authenticated_commitment_len =
+        u32::try_from(authenticated_commitment.len()).map_err(|_| provisional_schema_error())?;
+    let mut encoded = Vec::with_capacity(
+        169 + open_bytes.len()
+            + commitment_bytes.len()
+            + authenticated_open.len()
+            + authenticated_commitment.len(),
+    );
     encoded.extend_from_slice(PUBLICATION_MAGIC);
     encoded.push(PROVISIONAL_VERSION);
     encoded.extend_from_slice(reservation.stream_id.as_bytes());
@@ -836,6 +918,10 @@ fn encode_stream_publication(
     encoded.extend_from_slice(&open_bytes);
     encoded.extend_from_slice(&commitment_len.to_be_bytes());
     encoded.extend_from_slice(&commitment_bytes);
+    encoded.extend_from_slice(&authenticated_open_len.to_be_bytes());
+    encoded.extend_from_slice(authenticated_open);
+    encoded.extend_from_slice(&authenticated_commitment_len.to_be_bytes());
+    encoded.extend_from_slice(authenticated_commitment);
     Ok(encoded)
 }
 
@@ -861,6 +947,88 @@ fn stream_publication_matches(
 }
 
 impl Store {
+    /// Selects the newest completed stream publication for exact immutable content.
+    pub fn blob_stream_for_content_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        topic: &aster_mesh::Topic,
+        scope: &aster_mesh::Scope,
+        blob_id: BlobId,
+    ) -> Result<Option<BlobStreamPublication>, StoreError> {
+        self.require_live()?;
+        let authority = self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        require_control_policy_read(&read, authority, policy)?;
+        let publications = read.open_table(BLOB_STREAM_PUBLICATIONS)?;
+        let mut selected: Option<BlobStreamPublication> = None;
+        for row in publications.iter()? {
+            let (_, encoded) = row?;
+            let candidate = CompletedBlobStream::decode(encoded.value())?;
+            if candidate.blob_id == blob_id
+                && candidate.open.topic() == topic
+                && candidate.open.scope() == scope
+                && selected
+                    .as_ref()
+                    .is_none_or(|current| candidate.acceptance_marker > current.acceptance_marker)
+            {
+                selected = Some(candidate);
+            }
+        }
+        Ok(selected)
+    }
+
+    /// Rechecks one exact completed stream projection without scanning content peers.
+    pub fn require_blob_stream_publication_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        publication: &BlobStreamPublication,
+    ) -> Result<(), StoreError> {
+        self.require_live()?;
+        let authority = self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        require_control_policy_read(&read, authority, policy)?;
+        let encoded = read
+            .open_table(BLOB_STREAM_PUBLICATIONS)?
+            .get(publication.stream_id().as_bytes().as_slice())?
+            .map(|value| value.value().to_vec())
+            .ok_or_else(|| blob_error(BlobStoreError::CompletionMismatch))?;
+        if CompletedBlobStream::decode(&encoded)? != *publication {
+            return Err(blob_error(BlobStoreError::CompletionMismatch));
+        }
+        Ok(())
+    }
+
+    /// Opens a sequential pack reader only after the caller re-verifies both signed authorities.
+    pub fn open_blob_stream_read_session_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        publication: &BlobStreamPublication,
+        open: &VerifiedBlobStreamOpen,
+        commitment: &VerifiedBlobStreamFinalCommitment,
+    ) -> Result<BlobStreamReadSession, StoreError> {
+        self.require_blob_stream_publication_with_policy(policy, publication)?;
+        if open.open() != publication.open()
+            || open.authenticated_bytes() != publication.authenticated_open()
+            || commitment.commitment() != publication.commitment()
+            || commitment.authenticated_bytes() != publication.authenticated_commitment()
+        {
+            return Err(blob_error(BlobStoreError::CompletionMismatch));
+        }
+        let completion = BlobPackCompletion::from_completed(
+            publication.open.digest(),
+            publication.open.stream_id(),
+            publication.open.total_len(),
+            publication.pack_len,
+            publication.commitment.segment_count(),
+            publication.descriptor_digest,
+        );
+        let root = PinnedBlobPackRoot::open(self)?;
+        Ok(BlobStreamReadSession {
+            reader: BlobPackReader::open(&root, &completion)?,
+            next_index: 0,
+        })
+    }
+
     /// Resolves a completed stream operation under one exact settled policy.
     /// Provisional operations return `None` so the caller can resume them.
     pub fn blob_stream_for_operation_with_policy(
@@ -906,6 +1074,7 @@ impl Store {
     ) -> Result<(BlobStreamReservation, BlobStreamDurableProgress), StoreError> {
         self.require_live()?;
         let authority = self.require_bound_mission()?;
+        let authenticated_open = open.authenticated_bytes().to_vec();
         let open = open.open();
         if request.operation.as_bytes() != open.operation_key() {
             return Err(blob_error(BlobStoreError::OperationConflict));
@@ -934,6 +1103,7 @@ impl Store {
         {
             let existing = ProvisionalBlobStream::decode(&existing)?;
             if existing.open != *open
+                || existing.reservation.authenticated_open != authenticated_open
                 || existing.reservation.source != request.source
                 || existing.reservation.operation != request.operation.as_bytes()
             {
@@ -996,6 +1166,7 @@ impl Store {
             source: request.source,
             reserved_bytes,
             open: open.clone(),
+            authenticated_open,
         };
         let provisional = ProvisionalBlobStream {
             reservation: reservation.clone(),

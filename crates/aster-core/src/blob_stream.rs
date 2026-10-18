@@ -308,17 +308,20 @@ impl BlobStreamOpen {
 pub struct VerifiedBlobStreamOpen {
     open: BlobStreamOpen,
     mission_authority_id: NodeId,
+    authenticated_bytes: Vec<u8>,
 }
 
 impl VerifiedBlobStreamOpen {
-    pub(crate) const fn from_provider(
+    pub(crate) fn from_provider(
         open: BlobStreamOpen,
         mission_authority_id: NodeId,
+        authenticated_bytes: Vec<u8>,
         _seal: BlobStreamProviderSeal,
     ) -> Self {
         Self {
             open,
             mission_authority_id,
+            authenticated_bytes,
         }
     }
 
@@ -328,6 +331,11 @@ impl VerifiedBlobStreamOpen {
 
     pub(crate) const fn mission_authority_id(&self) -> NodeId {
         self.mission_authority_id
+    }
+
+    /// Returns the exact provider-authenticated envelope that produced this capability.
+    pub fn authenticated_bytes(&self) -> &[u8] {
+        &self.authenticated_bytes
     }
 }
 
@@ -655,6 +663,29 @@ impl BlobStreamDecryptor {
         self.next_offset = end;
         Ok(Zeroizing::new(plaintext))
     }
+
+    /// Authenticates the complete ordered ciphertext stream against its signed commitment.
+    pub fn finish(self, commitment: &VerifiedBlobStreamFinalCommitment) -> Result<(), BlobError> {
+        let commitment = commitment.commitment();
+        let ciphertext_len = self
+            .next_offset
+            .checked_add(
+                self.next_index
+                    .checked_mul(GCM_TAG_BYTES as u64)
+                    .ok_or(BlobError::LengthOverflow)?,
+            )
+            .ok_or(BlobError::LengthOverflow)?;
+        let ciphertext_root = self.ciphertext_accumulator.finish(ciphertext_len)?;
+        if commitment.open_digest != self.open.open.digest()
+            || commitment.stream_id != self.open.open.stream_id
+            || commitment.total_len != self.next_offset
+            || commitment.segment_count != self.next_index
+            || commitment.ciphertext_root != ciphertext_root
+        {
+            return Err(BlobError::AuthenticationFailed);
+        }
+        Ok(())
+    }
 }
 
 /// Publisher-authenticated final binding for one complete stream.
@@ -829,18 +860,28 @@ impl BlobStreamFinalCommitment {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VerifiedBlobStreamFinalCommitment {
     commitment: BlobStreamFinalCommitment,
+    authenticated_bytes: Vec<u8>,
 }
 
 impl VerifiedBlobStreamFinalCommitment {
-    pub(crate) const fn from_provider(
+    pub(crate) fn from_provider(
         commitment: BlobStreamFinalCommitment,
+        authenticated_bytes: Vec<u8>,
         _seal: BlobStreamProviderSeal,
     ) -> Self {
-        Self { commitment }
+        Self {
+            commitment,
+            authenticated_bytes,
+        }
     }
 
     pub const fn commitment(&self) -> &BlobStreamFinalCommitment {
         &self.commitment
+    }
+
+    /// Returns the exact provider-authenticated envelope that produced this capability.
+    pub fn authenticated_bytes(&self) -> &[u8] {
+        &self.authenticated_bytes
     }
 }
 
@@ -1415,6 +1456,7 @@ mod tests {
         VerifiedBlobStreamOpen {
             mission_authority_id: *open.mission_id(),
             open,
+            authenticated_bytes: vec![1],
         }
     }
 

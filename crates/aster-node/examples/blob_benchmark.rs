@@ -241,6 +241,38 @@ async fn main() -> Result<(), E> {
             u128::from(len) * 1_000_000_000 / publication_ns.max(1),
             published.id
         );
+        let read_start = Instant::now();
+        let mut output_hash = Sha256::new();
+        let mut read_bytes = 0_u64;
+        let mut reader = handle
+            .open_read_stream(BlobReadRequest {
+                id: published.id,
+                topic: topic.clone(),
+                scope: scope.clone(),
+            })
+            .await?;
+        while let Some(frame) = reader.next(MAX_SELECTED_BLOB_PAGE_BYTES).await? {
+            if frame.offset != read_bytes {
+                return Err("stream benchmark read offset mismatch".into());
+            }
+            output_hash.update(&frame.bytes);
+            read_bytes = read_bytes
+                .checked_add(frame.bytes.len() as u64)
+                .ok_or("stream benchmark read length overflow")?;
+        }
+        let read_ns = read_start.elapsed().as_nanos();
+        let actual: String = output_hash
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(read_bytes, len);
+        assert_eq!(actual, expected);
+        println!(
+            "BENCH_STREAM_READ {{\"bytes\":{len},\"read_ns\":{read_ns},\"bytes_per_second\":{}}}",
+            u128::from(len) * 1_000_000_000 / read_ns.max(1),
+        );
+        drop(reader);
         let shutdown_receipt = peerless.shutdown().await?;
         receipt("publisher_stream_local", &shutdown_receipt);
         println!(

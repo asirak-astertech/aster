@@ -80,7 +80,10 @@ pub use blob::{
     MAX_SELECTED_LIVE_BLOB_BYTES, MAX_SELECTED_LIVE_BLOB_CHUNKS, PendingBlobTransferStatus,
     SelectedBlobHandle, SelectedBlobNode, SelectedBlobOptions,
 };
-pub use blob_stream::{BlobPublishProgress, BlobPublishStreamRequest, SelectedBlobPublishStream};
+pub use blob_stream::{
+    BlobPublishProgress, BlobPublishStreamRequest, BlobReadFrame, SelectedBlobPublishStream,
+    SelectedBlobReadStream,
+};
 pub(crate) use record::SelectedRecordCommand;
 pub use record::{
     MAX_SELECTED_RECORD_DELIVERIES, MAX_SELECTED_RECORD_SUBSCRIPTION_SCAN,
