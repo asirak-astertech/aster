@@ -29,8 +29,8 @@ pub use pressure::BlobCapacityRecoveryResult;
 pub use stream::{
     BlobStreamCheckpoint, BlobStreamCommitOutcome, BlobStreamCryptoResume,
     BlobStreamDurableProgress, BlobStreamPackSession, BlobStreamPromotion,
-    BlobStreamProvenanceUpgrade, BlobStreamReservation, BlobStreamReservationRequest,
-    BlobStreamSource, DEFAULT_BLOB_STREAM_CHECKPOINT_BATCH_BYTES,
+    BlobStreamProvenanceUpgrade, BlobStreamPublication, BlobStreamReservation,
+    BlobStreamReservationRequest, BlobStreamSource, DEFAULT_BLOB_STREAM_CHECKPOINT_BATCH_BYTES,
     DEFAULT_BLOB_STREAM_CHECKPOINT_INTERVAL, MAX_BLOB_STREAM_CHECKPOINT_BATCH_BYTES,
     VerifiedBlobStreamCheckpointBatch,
 };
@@ -15716,13 +15716,14 @@ pub(crate) fn audit_blob_tables_write(
         )));
     }
     let stream_publications = write.open_table(BLOB_STREAM_PUBLICATIONS)?;
-    let (stream_count, stream_bytes) = stream::audit_completed_blob_stream_causal_rows(
-        &stream_publications,
-        &accepted_dots,
-        &publisher_high,
-        &frontier,
-        shared,
-    )?;
+    let (stream_count, stream_bytes, stream_last_marker) =
+        stream::audit_completed_blob_stream_causal_rows(
+            &stream_publications,
+            &accepted_dots,
+            &publisher_high,
+            &frontier,
+            shared,
+        )?;
     stats.publications = stats
         .publications
         .checked_add(stream_count)
@@ -15731,6 +15732,11 @@ pub(crate) fn audit_blob_tables_write(
         .total_sealed_bytes
         .checked_add(stream_bytes)
         .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+    stats.acceptance_markers = stats
+        .acceptance_markers
+        .checked_add(stream_count)
+        .ok_or(StoreError::ItemCountAccountingOverflow)?;
+    stats.last_acceptance_marker = stats.last_acceptance_marker.max(stream_last_marker);
     drop(stream_publications);
     let depot_stats = depot::audit_depot_metadata_write(write, &deletion_audit)?;
     stats.variants = depot_stats.variants;
@@ -16071,7 +16077,7 @@ pub(crate) fn inspect_blob_tables_read(
         stats.network_staging_bytes = network.staging.bytes;
         stats.carrier_fetch_cursors = network.carrier_cursors;
         let stream_publications = read.open_table(BLOB_STREAM_PUBLICATIONS)?;
-        let (stream_count, stream_bytes) =
+        let (stream_count, stream_bytes, stream_last_marker) =
             stream::completed_blob_stream_usage(&stream_publications)?;
         stats.publications = stats
             .publications
@@ -16081,6 +16087,11 @@ pub(crate) fn inspect_blob_tables_read(
             .total_sealed_bytes
             .checked_add(stream_bytes)
             .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+        stats.acceptance_markers = stats
+            .acceptance_markers
+            .checked_add(stream_count)
+            .ok_or(StoreError::ItemCountAccountingOverflow)?;
+        stats.last_acceptance_marker = stats.last_acceptance_marker.max(stream_last_marker);
     }
     let lifecycle_usage = lifecycle::inspect_blob_lifecycle_read(read)?;
     let metadata = read.open_table(METADATA)?;

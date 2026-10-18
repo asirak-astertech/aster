@@ -36,8 +36,8 @@ use aster_redb_store::{
     BlobDeliveryAck as StoreBlobDeliveryAck, BlobDeliveryToken as StoreBlobDeliveryToken,
     BlobDepotCompletion, BlobOperationKey, BlobOperationRequest, BlobPublicationDisposition,
     BlobPublicationIntent, BlobReadPlan, BlobSemanticId, BlobSourceProjection, BlobSourceRetention,
-    BlobStoreError, BlobStreamPackSession, BlobStreamReservationRequest, BlobStreamSource,
-    BlobSubscriptionId as StoreBlobSubscriptionId, BlobSubscriptionKey,
+    BlobStoreError, BlobStreamPackSession, BlobStreamPublication, BlobStreamReservationRequest,
+    BlobStreamSource, BlobSubscriptionId as StoreBlobSubscriptionId, BlobSubscriptionKey,
     BlobSubscriptionPollSelection, BlobSubscriptionRemoveOutcome, BlobSubscriptionSpec,
     BlobTransferStatusSnapshot as StoreBlobTransferStatusSnapshot, BlobVariantId,
     ControlPolicySnapshot, ControlTransferId, DEFAULT_BLOB_STREAM_CHECKPOINT_INTERVAL,
@@ -1473,6 +1473,7 @@ pub struct SelectedBlobNode {
     source_route_cache: Arc<AuthenticatedEventRouteCache>,
     custody_clock: NodeCustodyClock,
     publish_streams: std::collections::BTreeMap<[u8; 32], LocalBlobPublishStream>,
+    completed_publish_streams: std::collections::BTreeMap<[u8; 32], BlobPublishResult>,
     #[cfg(test)]
     final_read_gate: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
     #[cfg(test)]
@@ -1564,6 +1565,7 @@ impl SelectedBlobNode {
             source_route_cache,
             custody_clock,
             publish_streams: std::collections::BTreeMap::new(),
+            completed_publish_streams: std::collections::BTreeMap::new(),
             #[cfg(test)]
             final_read_gate: None,
             #[cfg(test)]
@@ -1611,6 +1613,7 @@ impl SelectedBlobNode {
             source_route_cache,
             custody_clock,
             publish_streams: std::collections::BTreeMap::new(),
+            completed_publish_streams: std::collections::BTreeMap::new(),
             #[cfg(test)]
             final_read_gate: None,
             #[cfg(test)]
@@ -1876,6 +1879,37 @@ impl SelectedBlobNode {
             epoch,
             "blob stream open",
         )?;
+        if let Some(completed) = self
+            .store
+            .blob_stream_for_operation_with_policy(&policy, &operation)
+            .map_err(|error| application_error("blob stream open", error.into()))?
+        {
+            let result = completed_blob_stream_result(&completed, &request)?;
+            if self
+                .completed_publish_streams
+                .keys()
+                .any(|existing| existing != &token)
+            {
+                return Err(ApplicationError::new(
+                    ApplicationErrorKind::ResourceLimit,
+                    "blob stream open",
+                ));
+            }
+            self.completed_publish_streams.insert(token, result);
+            return Ok(OpenedBlobPublishStream {
+                token,
+                progress: BlobPublishProgress {
+                    accepted_offset: request.total_len,
+                    durable_offset: request.total_len,
+                },
+            });
+        }
+        if !self.completed_publish_streams.is_empty() {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::ResourceLimit,
+                "blob stream open",
+            ));
+        }
         let initial_sample = self.finite_publish_initial_sample(request.options)?;
         let causal = self
             .store
@@ -1987,6 +2021,12 @@ impl SelectedBlobNode {
         offset: u64,
         bytes: Zeroizing<Vec<u8>>,
     ) -> Result<BlobPublishProgress, ApplicationError> {
+        if self.completed_publish_streams.contains_key(&token) {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::InvalidRequest,
+                "blob stream write",
+            ));
+        }
         let stream = self.publish_streams.get_mut(&token).ok_or_else(|| {
             ApplicationError::new(ApplicationErrorKind::NotFound, "blob stream write")
         })?;
@@ -2042,6 +2082,9 @@ impl SelectedBlobNode {
         &mut self,
         token: [u8; 32],
     ) -> Result<BlobPublishResult, ApplicationError> {
+        if let Some(result) = self.completed_publish_streams.remove(&token) {
+            return Ok(result);
+        }
         let mut stream = self.publish_streams.remove(&token).ok_or_else(|| {
             ApplicationError::new(ApplicationErrorKind::NotFound, "blob stream finish")
         })?;
@@ -2100,7 +2143,7 @@ impl SelectedBlobNode {
             total_len: stream.total_len,
             media_type: stream.request.media_type,
             schema_id: stream.request.schema_id,
-            acceptance_marker: 0,
+            acceptance_marker: promotion.acceptance_marker(),
             inserted: !promotion.duplicate(),
         })
     }
@@ -4395,6 +4438,38 @@ impl SelectedBlobNode {
     }
 }
 
+fn completed_blob_stream_result(
+    completed: &BlobStreamPublication,
+    request: &BlobPublishStreamRequest,
+) -> Result<BlobPublishResult, ApplicationError> {
+    let open = completed.open();
+    if open.topic() != &request.publication.topic
+        || open.scope() != &request.publication.scope
+        || open.priority() != request.publication.priority
+        || open.ttl_ms() != request.options.ttl_ms()
+        || open.total_len() != request.total_len
+        || open.metadata().media_type() != request.publication.media_type.as_deref()
+        || open.metadata().schema_id() != request.publication.schema_id
+    {
+        return Err(ApplicationError::new(
+            ApplicationErrorKind::Conflict,
+            "blob stream open",
+        ));
+    }
+    Ok(BlobPublishResult {
+        id: BlobId::from_core(completed.blob_id()),
+        publisher: open.publisher(),
+        publisher_counter: open.publisher_counter(),
+        priority: open.priority(),
+        ttl_ms: open.ttl_ms(),
+        total_len: open.total_len(),
+        media_type: open.metadata().media_type().map(str::to_owned),
+        schema_id: open.metadata().schema_id().to_vec(),
+        acceptance_marker: completed.acceptance_marker(),
+        inserted: false,
+    })
+}
+
 fn blob_publish_result(blob: &VerifiedStoredBlob, inserted: bool) -> BlobPublishResult {
     let metadata = blob.blob.manifest().metadata();
     BlobPublishResult {
@@ -5587,6 +5662,62 @@ mod tests {
                 .blob_stats()
                 .expect("stream publication stats")
                 .publications,
+            2
+        );
+    }
+
+    #[test]
+    fn selected_blob_publish_stream_exact_completed_retry_returns_original_result() {
+        let root = TestRoot::new("selected-blob-stream-completed-retry");
+        let mut node = selected_node(&root);
+        let publication = request(b"blob/stream/completed-retry");
+        let stream_request = BlobPublishStreamRequest {
+            publication: publication.clone(),
+            options: BlobPublishOptions::durable(),
+            total_len: 1,
+        };
+        let opened = node
+            .open_publish_stream_inner(stream_request.clone())
+            .expect("open initial stream");
+        node.append_publish_stream_inner(opened.token, 0, Zeroizing::new(vec![0x6a]))
+            .expect("append initial stream");
+        let first = node
+            .finish_publish_stream_inner(opened.token)
+            .expect("finish initial stream");
+        assert_ne!(first.acceptance_marker, 0);
+        drop(node);
+
+        let mut node = selected_node(&root);
+
+        let replay = node
+            .open_publish_stream_inner(stream_request)
+            .expect("open completed retry");
+        assert_eq!(replay.progress.accepted_offset, 1);
+        assert_eq!(replay.progress.durable_offset, 1);
+        let replayed = node
+            .finish_publish_stream_inner(replay.token)
+            .expect("finish completed retry");
+
+        assert_eq!(
+            replayed,
+            BlobPublishResult {
+                inserted: false,
+                ..first
+            }
+        );
+        let policy = node.current_policy("completed retry counter").unwrap();
+        assert_eq!(
+            node.store
+                .reserve_local_blob_with_policy(
+                    &policy,
+                    node.identity(),
+                    &publication.topic,
+                    &publication.scope,
+                    None,
+                    None,
+                )
+                .expect("next causal reservation")
+                .counter(),
             2
         );
     }

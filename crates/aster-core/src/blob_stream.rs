@@ -270,6 +270,14 @@ impl BlobStreamOpen {
         &self.scope
     }
 
+    pub const fn metadata(&self) -> &BlobMetadata {
+        &self.metadata
+    }
+
+    pub const fn priority(&self) -> Priority {
+        self.priority
+    }
+
     pub const fn total_len(&self) -> u64 {
         self.total_len
     }

@@ -70,7 +70,39 @@ pub struct BlobStreamDurableProgress {
 pub struct BlobStreamPromotion {
     stream_id: BlobPublicationStreamId,
     blob_id: BlobId,
+    acceptance_marker: u64,
     duplicate: bool,
+}
+
+/// Durable application-visible projection of one completed Blob stream.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlobStreamPublication {
+    open: BlobStreamOpen,
+    blob_id: BlobId,
+    acceptance_marker: u64,
+    pack_len: u64,
+}
+
+impl BlobStreamPublication {
+    pub const fn stream_id(&self) -> BlobPublicationStreamId {
+        self.open.stream_id()
+    }
+
+    pub const fn blob_id(&self) -> BlobId {
+        self.blob_id
+    }
+
+    pub const fn open(&self) -> &BlobStreamOpen {
+        &self.open
+    }
+
+    pub const fn acceptance_marker(&self) -> u64 {
+        self.acceptance_marker
+    }
+
+    pub const fn pack_len(&self) -> u64 {
+        self.pack_len
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -161,6 +193,10 @@ impl BlobStreamPromotion {
         self.blob_id
     }
 
+    pub const fn acceptance_marker(self) -> u64 {
+        self.acceptance_marker
+    }
+
     pub const fn duplicate(self) -> bool {
         self.duplicate
     }
@@ -190,10 +226,7 @@ struct ProvisionalBlobStream {
     checkpoint: Option<BlobPackCheckpoint>,
 }
 
-struct CompletedBlobStream {
-    open: BlobStreamOpen,
-    pack_len: u64,
-}
+type CompletedBlobStream = BlobStreamPublication;
 
 pub(super) fn audit_blob_stream_authority_rows(
     reservations: &impl ReadableTable<&'static [u8], &'static [u8]>,
@@ -254,9 +287,10 @@ pub(super) fn audit_blob_stream_authority_rows(
 
 pub(super) fn completed_blob_stream_usage(
     publications: &impl ReadableTable<&'static [u8], &'static [u8]>,
-) -> Result<(u64, u64), StoreError> {
+) -> Result<(u64, u64, u64), StoreError> {
     let mut rows = 0_u64;
     let mut bytes = 0_u64;
+    let mut last_marker = 0_u64;
     for row in publications.iter()? {
         let (_, value) = row?;
         let completed = CompletedBlobStream::decode(value.value())?;
@@ -266,8 +300,9 @@ pub(super) fn completed_blob_stream_usage(
         bytes = bytes
             .checked_add(completed.pack_len)
             .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+        last_marker = last_marker.max(completed.acceptance_marker);
     }
-    Ok((rows, bytes))
+    Ok((rows, bytes, last_marker))
 }
 
 pub(super) fn audit_completed_blob_stream_causal_rows(
@@ -276,7 +311,7 @@ pub(super) fn audit_completed_blob_stream_causal_rows(
     publisher_high: &impl ReadableTable<&'static [u8], u64>,
     frontier: &impl ReadableTable<&'static [u8], u64>,
     shared: &mut StateAuditSnapshot,
-) -> Result<(u64, u64), StoreError> {
+) -> Result<(u64, u64, u64), StoreError> {
     let usage = completed_blob_stream_usage(publications)?;
     for row in publications.iter()? {
         let (_, value) = row?;
@@ -468,9 +503,10 @@ impl CompletedBlobStream {
         let blob_id = BlobId::from_bytes(read_array(encoded, 73)?);
         let descriptor_digest = read_array(encoded, 105)?;
         let pack_len = read_u64(encoded, 137)?;
+        let acceptance_marker = read_u64(encoded, 145)?;
         let open_len =
-            usize::try_from(read_u32(encoded, 145)?).map_err(|_| provisional_schema_error())?;
-        let open_start = 149_usize;
+            usize::try_from(read_u32(encoded, 153)?).map_err(|_| provisional_schema_error())?;
+        let open_start = 157_usize;
         let open_end = open_start
             .checked_add(open_len)
             .ok_or(StoreError::PayloadByteAccountingOverflow)?;
@@ -480,7 +516,11 @@ impl CompletedBlobStream {
         let commitment_end = commitment_start
             .checked_add(commitment_len)
             .ok_or(StoreError::PayloadByteAccountingOverflow)?;
-        if commitment_end != encoded.len() || descriptor_digest == [0; 32] || pack_len == 0 {
+        if commitment_end != encoded.len()
+            || descriptor_digest == [0; 32]
+            || pack_len == 0
+            || acceptance_marker == 0
+        {
             return Err(provisional_schema_error());
         }
         let open = BlobStreamOpen::decode(
@@ -505,7 +545,12 @@ impl CompletedBlobStream {
         {
             return Err(provisional_schema_error());
         }
-        Ok(Self { open, pack_len })
+        Ok(Self {
+            open,
+            blob_id,
+            acceptance_marker,
+            pack_len,
+        })
     }
 }
 
@@ -771,13 +816,14 @@ fn encode_stream_publication(
     reservation: &BlobStreamReservation,
     commitment: &VerifiedBlobStreamFinalCommitment,
     completion: &BlobPackCompletion,
+    acceptance_marker: u64,
 ) -> Result<Vec<u8>, StoreError> {
     let open_bytes = reservation.open.encode();
     let open_len = u32::try_from(open_bytes.len()).map_err(|_| provisional_schema_error())?;
     let commitment_bytes = commitment.commitment().encode();
     let commitment_len =
         u32::try_from(commitment_bytes.len()).map_err(|_| provisional_schema_error())?;
-    let mut encoded = Vec::with_capacity(157 + open_bytes.len() + commitment_bytes.len());
+    let mut encoded = Vec::with_capacity(161 + open_bytes.len() + commitment_bytes.len());
     encoded.extend_from_slice(PUBLICATION_MAGIC);
     encoded.push(PROVISIONAL_VERSION);
     encoded.extend_from_slice(reservation.stream_id.as_bytes());
@@ -785,6 +831,7 @@ fn encode_stream_publication(
     encoded.extend_from_slice(commitment.commitment().blob_id().as_bytes());
     encoded.extend_from_slice(completion.descriptor_digest());
     encoded.extend_from_slice(&completion.pack_len().to_be_bytes());
+    encoded.extend_from_slice(&acceptance_marker.to_be_bytes());
     encoded.extend_from_slice(&open_len.to_be_bytes());
     encoded.extend_from_slice(&open_bytes);
     encoded.extend_from_slice(&commitment_len.to_be_bytes());
@@ -797,11 +844,58 @@ fn stream_publication_matches(
     reservation: &BlobStreamReservation,
     commitment: &VerifiedBlobStreamFinalCommitment,
     completion: &BlobPackCompletion,
-) -> Result<bool, StoreError> {
-    Ok(encoded == encode_stream_publication(reservation, commitment, completion)?)
+) -> Result<Option<u64>, StoreError> {
+    let completed = CompletedBlobStream::decode(encoded)?;
+    if encoded
+        == encode_stream_publication(
+            reservation,
+            commitment,
+            completion,
+            completed.acceptance_marker,
+        )?
+    {
+        Ok(Some(completed.acceptance_marker))
+    } else {
+        Ok(None)
+    }
 }
 
 impl Store {
+    /// Resolves a completed stream operation under one exact settled policy.
+    /// Provisional operations return `None` so the caller can resume them.
+    pub fn blob_stream_for_operation_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        operation: &BlobOperationKey,
+    ) -> Result<Option<BlobStreamPublication>, StoreError> {
+        self.require_live()?;
+        let authority = self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        require_control_policy_read(&read, authority, policy)?;
+        let Some(stream_id) = read
+            .open_table(BLOB_STREAM_OPERATIONS)?
+            .get(operation.as_bytes())?
+            .map(|value| value.value().to_vec())
+        else {
+            return Ok(None);
+        };
+        let Some(encoded) = read
+            .open_table(BLOB_STREAM_PUBLICATIONS)?
+            .get(stream_id.as_slice())?
+            .map(|value| value.value().to_vec())
+        else {
+            return Ok(None);
+        };
+        let publication = CompletedBlobStream::decode(&encoded)?;
+        if publication.open.operation_key() != operation.as_bytes()
+            || publication.open.mission_id() != &authority
+            || publication.open.stream_id().as_bytes().as_slice() != stream_id.as_slice()
+        {
+            return Err(provisional_schema_error());
+        }
+        Ok(Some(publication))
+    }
+
     /// Reserves bounded provisional capacity for one verified Blob stream.
     /// Exact replay returns the same opaque reservation and durable progress.
     pub fn reserve_blob_stream_with_policy(
@@ -1042,12 +1136,15 @@ impl Store {
             .get(key)?
             .map(|row| row.value().to_vec())
         {
-            if !stream_publication_matches(&existing, reservation, commitment, &completion)? {
+            let Some(acceptance_marker) =
+                stream_publication_matches(&existing, reservation, commitment, &completion)?
+            else {
                 return Err(blob_error(BlobStoreError::OperationConflict));
-            }
+            };
             return Ok(BlobStreamPromotion {
                 stream_id: reservation.stream_id,
                 blob_id: final_commitment.blob_id(),
+                acceptance_marker,
                 duplicate: true,
             });
         }
@@ -1117,7 +1214,7 @@ impl Store {
             dot.publisher,
             SemanticDataClass::Blob,
         )?;
-        {
+        let acceptance_marker = {
             let mut metadata = write.open_table(METADATA)?;
             let current_items = metadata
                 .get(BLOB_ITEM_COUNT)?
@@ -1125,6 +1222,12 @@ impl Store {
             let current_bytes = metadata
                 .get(BLOB_TOTAL_BYTES)?
                 .map_or(0, |value| value.value());
+            let previous_marker = metadata
+                .get(LAST_BLOB_ACCEPTANCE_MARKER)?
+                .map_or(0, |value| value.value());
+            let marker = previous_marker
+                .checked_add(1)
+                .ok_or(StoreError::AcceptanceMarkerExhausted)?;
             metadata.insert(
                 BLOB_ITEM_COUNT,
                 current_items
@@ -1137,9 +1240,12 @@ impl Store {
                     .checked_add(completion.pack_len())
                     .ok_or(StoreError::PayloadByteAccountingOverflow)?,
             )?;
-        }
+            metadata.insert(LAST_BLOB_ACCEPTANCE_MARKER, marker)?;
+            marker
+        };
 
-        let publication = encode_stream_publication(reservation, commitment, &completion)?;
+        let publication =
+            encode_stream_publication(reservation, commitment, &completion, acceptance_marker)?;
         write
             .open_table(BLOB_STREAM_PUBLICATIONS)?
             .insert(key, publication.as_slice())?;
@@ -1158,6 +1264,7 @@ impl Store {
         Ok(BlobStreamPromotion {
             stream_id: reservation.stream_id,
             blob_id: final_commitment.blob_id(),
+            acceptance_marker,
             duplicate: false,
         })
     }
@@ -2051,6 +2158,7 @@ mod tests {
             .expect("promotion");
         assert!(!promoted.duplicate());
         assert_eq!(promoted.blob_id(), commitment.commitment().blob_id());
+        assert_eq!(promoted.acceptance_marker(), 1);
 
         let read = fixture.store.database.begin_read().expect("read");
         let publications = read.open_table(BLOB_STREAM_PUBLICATIONS).unwrap();
@@ -2082,24 +2190,27 @@ mod tests {
             .blob_stats()
             .expect("stream publication stats");
         assert_eq!(stats.publications, 1);
+        assert_eq!(stats.acceptance_markers, 1);
+        assert_eq!(stats.last_acceptance_marker, 1);
         assert_eq!(stats.total_sealed_bytes, expected_pack_len);
         let read = fixture.store.database.begin_read().expect("strict read");
         let mut shared = StateAuditSnapshot::default();
         let inspection = inspect_blob_tables_read_with_shared(&read, &mut shared)
             .expect("strict stream publication inspection");
         assert_eq!(inspection.stats.publications, 1);
-        assert!(
+        let duplicate = fixture
+            .store
+            .promote_blob_stream_with_policy(&policy, &reservation, &commitment, completion, None)
+            .expect("duplicate promotion");
+        assert!(duplicate.duplicate());
+        assert_eq!(duplicate.acceptance_marker(), 1);
+        assert_eq!(
             fixture
                 .store
-                .promote_blob_stream_with_policy(
-                    &policy,
-                    &reservation,
-                    &commitment,
-                    completion,
-                    None,
-                )
-                .expect("duplicate promotion")
-                .duplicate()
+                .blob_stats()
+                .expect("duplicate stream publication stats")
+                .last_acceptance_marker,
+            1
         );
     }
 
