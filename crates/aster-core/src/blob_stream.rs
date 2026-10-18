@@ -386,8 +386,24 @@ impl EncryptedBlobStreamSegment {
         self.index
     }
 
+    pub const fn stream_id(&self) -> BlobPublicationStreamId {
+        self.stream_id
+    }
+
+    pub const fn open_digest(&self) -> &[u8; 32] {
+        &self.open_digest
+    }
+
     pub const fn offset(&self) -> u64 {
         self.offset
+    }
+
+    pub const fn plaintext_len(&self) -> u32 {
+        self.plaintext_len
+    }
+
+    pub const fn total_len(&self) -> u64 {
+        self.total_len
     }
 
     pub fn ciphertext(&self) -> &[u8] {
@@ -629,6 +645,18 @@ impl BlobStreamFinalCommitment {
 
     pub const fn blob_id(&self) -> BlobId {
         self.blob_id
+    }
+
+    pub const fn total_len(&self) -> u64 {
+        self.total_len
+    }
+
+    pub const fn segment_count(&self) -> u64 {
+        self.segment_count
+    }
+
+    pub const fn ciphertext_root(&self) -> &[u8; 32] {
+        &self.ciphertext_root
     }
 
     pub const fn open_digest(&self) -> &[u8; 32] {

@@ -459,6 +459,7 @@ dependencies = [
  "redb",
  "rustix",
  "sha2 0.11.0",
+ "zeroize",
 ]
 
 [[package]]

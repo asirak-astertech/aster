@@ -14,6 +14,8 @@ pub(crate) mod depot;
 pub(crate) mod lease;
 #[allow(dead_code)] // Lifecycle authority becomes active in Tasks 2-4.
 pub(crate) mod lifecycle;
+#[allow(dead_code)] // Wired into durable stream promotion in Tasks 4-7.
+pub(crate) mod pack;
 #[allow(dead_code)]
 pub(crate) mod pressure;
 mod stream;

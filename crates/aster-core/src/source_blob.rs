@@ -526,6 +526,16 @@ impl std::fmt::Debug for BlobContentVerification {
 }
 
 impl ReferenceEnvelopeSealer {
+    /// Returns the current route-authority binding required by a new Blob
+    /// stream open for this exact scope and content epoch.
+    pub fn blob_stream_authorization_digest(
+        &self,
+        scope: &Scope,
+        content_epoch: u64,
+    ) -> Option<[u8; 32]> {
+        self.current_source_route_grant_commitment(scope, content_epoch)
+    }
+
     /// Signs a canonical provisional Blob publication intent.
     pub fn seal_blob_stream_open(&self, open: &BlobStreamOpen) -> Result<Vec<u8>, EnvelopeError> {
         if open.publisher() != self.identity()
