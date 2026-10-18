@@ -27,9 +27,11 @@ pub use lifecycle::{
 #[doc(hidden)]
 pub use pressure::BlobCapacityRecoveryResult;
 pub use stream::{
-    BlobStreamCheckpoint, BlobStreamCommitOutcome, BlobStreamProvenanceUpgrade,
-    DEFAULT_BLOB_STREAM_CHECKPOINT_BATCH_BYTES, DEFAULT_BLOB_STREAM_CHECKPOINT_INTERVAL,
-    MAX_BLOB_STREAM_CHECKPOINT_BATCH_BYTES, VerifiedBlobStreamCheckpointBatch,
+    BlobStreamCheckpoint, BlobStreamCommitOutcome, BlobStreamDurableProgress, BlobStreamPromotion,
+    BlobStreamProvenanceUpgrade, BlobStreamReservation, BlobStreamReservationRequest,
+    BlobStreamSource, DEFAULT_BLOB_STREAM_CHECKPOINT_BATCH_BYTES,
+    DEFAULT_BLOB_STREAM_CHECKPOINT_INTERVAL, MAX_BLOB_STREAM_CHECKPOINT_BATCH_BYTES,
+    VerifiedBlobStreamCheckpointBatch,
 };
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -88,6 +90,12 @@ pub(crate) const BLOB_CARRIER_FETCH_CURSORS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.blob-carrier-fetch-cursors.v1");
 pub(crate) const BLOB_STREAM_CHECKPOINTS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.blob-stream-checkpoints.v1");
+pub(crate) const BLOB_STREAM_RESERVATIONS: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("aster.blob-stream-reservations.v1");
+pub(crate) const BLOB_STREAM_OPERATIONS: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("aster.blob-stream-operations.v1");
+pub(crate) const BLOB_STREAM_PUBLICATIONS: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("aster.blob-stream-publications.v1");
 
 pub(crate) const BLOB_ITEM_COUNT: &str = "semantic_blob_item_count";
 pub(crate) const BLOB_TOTAL_BYTES: &str = "semantic_blob_total_bytes";
@@ -16420,6 +16428,9 @@ fn initialize_blob_network_schema(write: &redb::WriteTransaction) -> Result<(), 
     let _ = write.open_table(BLOB_CARRIER_PREFIXES)?;
     let _ = write.open_table(BLOB_CARRIER_FETCH_CURSORS)?;
     let _ = write.open_table(BLOB_STREAM_CHECKPOINTS)?;
+    let _ = write.open_table(BLOB_STREAM_RESERVATIONS)?;
+    let _ = write.open_table(BLOB_STREAM_OPERATIONS)?;
+    let _ = write.open_table(BLOB_STREAM_PUBLICATIONS)?;
     let mut metadata = write.open_table(BLOB_NETWORK_METADATA)?;
     if metadata.get(BLOB_NETWORK_SCHEMA_VERSION_FIELD)?.is_none() {
         metadata.insert(
@@ -16446,22 +16457,26 @@ fn legacy_blob_table_names() -> [&'static str; 9] {
     ]
 }
 
-fn network_blob_table_names() -> [&'static str; 5] {
+fn network_blob_table_names() -> [&'static str; 8] {
     [
         BLOB_PENDING_SOURCES.name(),
         BLOB_CARRIER_PREFIXES.name(),
         BLOB_NETWORK_METADATA.name(),
         BLOB_CARRIER_FETCH_CURSORS.name(),
         BLOB_STREAM_CHECKPOINTS.name(),
+        BLOB_STREAM_RESERVATIONS.name(),
+        BLOB_STREAM_OPERATIONS.name(),
+        BLOB_STREAM_PUBLICATIONS.name(),
     ]
 }
 
-fn blob_table_names() -> [&'static str; 14] {
+fn blob_table_names() -> [&'static str; 17] {
     let legacy = legacy_blob_table_names();
     let network = network_blob_table_names();
     [
         legacy[0], legacy[1], legacy[2], legacy[3], legacy[4], legacy[5], legacy[6], legacy[7],
-        legacy[8], network[0], network[1], network[2], network[3], network[4],
+        legacy[8], network[0], network[1], network[2], network[3], network[4], network[5],
+        network[6], network[7],
     ]
 }
 
@@ -16719,7 +16734,7 @@ fn audit_blob_network_tables_write_with_publications(
     let checkpoints = write.open_table(BLOB_STREAM_CHECKPOINTS)?;
     let imports = write.open_table(BLOB_IMPORTS)?;
     let chunks = write.open_table(BLOB_CHUNKS)?;
-    audit_blob_network_rows(
+    let audit = audit_blob_network_rows(
         &pending,
         &carriers,
         &metadata,
@@ -16730,7 +16745,17 @@ fn audit_blob_network_tables_write_with_publications(
         &chunks,
         mission_authority,
         pending_encoding,
-    )
+    )?;
+    let stream_reservations = write.open_table(BLOB_STREAM_RESERVATIONS)?;
+    let stream_operations = write.open_table(BLOB_STREAM_OPERATIONS)?;
+    let stream_publications = write.open_table(BLOB_STREAM_PUBLICATIONS)?;
+    stream::audit_blob_stream_authority_rows(
+        &stream_reservations,
+        &stream_operations,
+        &stream_publications,
+        mission_authority,
+    )?;
+    Ok(audit)
 }
 
 fn inspect_blob_network_tables_read_with_publications(
@@ -16745,7 +16770,8 @@ fn inspect_blob_network_tables_read_with_publications(
     let checkpoints = read.open_table(BLOB_STREAM_CHECKPOINTS)?;
     let imports = read.open_table(BLOB_IMPORTS)?;
     let chunks = read.open_table(BLOB_CHUNKS)?;
-    audit_blob_network_rows(
+    let authority = read_mission_binding_read(read)?;
+    let audit = audit_blob_network_rows(
         &pending,
         &carriers,
         &metadata,
@@ -16754,9 +16780,19 @@ fn inspect_blob_network_tables_read_with_publications(
         publications,
         &imports,
         &chunks,
-        read_mission_binding_read(read)?,
+        authority,
         pending_encoding,
-    )
+    )?;
+    let stream_reservations = read.open_table(BLOB_STREAM_RESERVATIONS)?;
+    let stream_operations = read.open_table(BLOB_STREAM_OPERATIONS)?;
+    let stream_publications = read.open_table(BLOB_STREAM_PUBLICATIONS)?;
+    stream::audit_blob_stream_authority_rows(
+        &stream_reservations,
+        &stream_operations,
+        &stream_publications,
+        authority,
+    )?;
+    Ok(audit)
 }
 
 /// Rechecks only the durable authority and aggregate staging counters needed

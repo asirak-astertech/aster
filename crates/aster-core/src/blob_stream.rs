@@ -241,6 +241,18 @@ impl BlobStreamOpen {
         self.content_epoch
     }
 
+    pub const fn policy_revision(&self) -> u64 {
+        self.policy_revision
+    }
+
+    pub const fn ttl_ms(&self) -> Option<u64> {
+        self.ttl_ms
+    }
+
+    pub const fn initial_custody(&self) -> Option<CustodySample> {
+        self.initial_custody
+    }
+
     pub const fn authorization_digest(&self) -> &[u8; 32] {
         &self.authorization_digest
     }
@@ -657,6 +669,14 @@ impl BlobStreamFinalCommitment {
 
     pub const fn ciphertext_root(&self) -> &[u8; 32] {
         &self.ciphertext_root
+    }
+
+    pub const fn ttl_ms(&self) -> Option<u64> {
+        self.ttl_ms
+    }
+
+    pub const fn final_custody(&self) -> Option<CustodySample> {
+        self.final_custody
     }
 
     pub const fn open_digest(&self) -> &[u8; 32] {

@@ -66,7 +66,23 @@ impl BlobPackCheckpoint {
         self.pack_len
     }
 
-    fn encode(&self) -> Vec<u8> {
+    pub(super) const fn open_digest(&self) -> &[u8; 32] {
+        &self.open_digest
+    }
+
+    pub(super) const fn stream_id(&self) -> BlobPublicationStreamId {
+        self.stream_id
+    }
+
+    pub(super) const fn total_len(&self) -> u64 {
+        self.total_len
+    }
+
+    pub(super) const fn plaintext_offset(&self) -> u64 {
+        self.plaintext_offset
+    }
+
+    pub(super) fn encode(&self) -> Vec<u8> {
         let accumulator = self.ciphertext.encode();
         debug_assert_eq!(accumulator.len(), ACCUMULATOR_CHECKPOINT_LEN);
         let mut bytes = Vec::with_capacity(Self::ENCODED_LEN);
@@ -87,7 +103,7 @@ impl BlobPackCheckpoint {
         bytes
     }
 
-    fn decode(bytes: &[u8]) -> Result<Self, StoreError> {
+    pub(super) fn decode(bytes: &[u8]) -> Result<Self, StoreError> {
         const ACCUMULATOR_OFFSET: usize = 118;
         if bytes.len() != Self::ENCODED_LEN
             || &bytes[..8] != CHECKPOINT_MAGIC
@@ -132,6 +148,32 @@ pub(crate) struct BlobPackCompletion {
     pack_len: u64,
     segment_count: u64,
     descriptor_digest: [u8; 32],
+}
+
+impl BlobPackCompletion {
+    pub(super) const fn open_digest(&self) -> &[u8; 32] {
+        &self.open_digest
+    }
+
+    pub(super) const fn stream_id(&self) -> BlobPublicationStreamId {
+        self.stream_id
+    }
+
+    pub(super) const fn total_len(&self) -> u64 {
+        self.total_len
+    }
+
+    pub(super) const fn pack_len(&self) -> u64 {
+        self.pack_len
+    }
+
+    pub(super) const fn segment_count(&self) -> u64 {
+        self.segment_count
+    }
+
+    pub(super) const fn descriptor_digest(&self) -> &[u8; 32] {
+        &self.descriptor_digest
+    }
 }
 
 pub(crate) struct BlobPackWriter {
