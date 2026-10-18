@@ -81,8 +81,8 @@ pub use blob::{
     SelectedBlobHandle, SelectedBlobNode, SelectedBlobOptions,
 };
 pub use blob_stream::{
-    BlobPublishProgress, BlobPublishStreamRequest, BlobReadFrame, SelectedBlobPublishStream,
-    SelectedBlobReadStream,
+    BlobPublishProgress, BlobPublishStreamRequest, BlobReadFrame, BlobReadStreamMetadata,
+    SelectedBlobPublishStream, SelectedBlobReadStream,
 };
 pub(crate) use record::SelectedRecordCommand;
 pub use record::{

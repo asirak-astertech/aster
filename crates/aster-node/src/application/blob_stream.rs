@@ -3,7 +3,11 @@
 use tokio::sync::{mpsc, oneshot};
 use zeroize::Zeroizing;
 
-use super::blob::{BlobPublishOptions, BlobPublishRequest, BlobPublishResult, SelectedBlobCommand};
+use aster_mesh::{NodeId, Priority, Scope, Topic};
+
+use super::blob::{
+    BlobId, BlobPublishOptions, BlobPublishRequest, BlobPublishResult, SelectedBlobCommand,
+};
 use super::{ApplicationError, SelectedApplicationCommand, actor_unavailable};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -32,19 +36,44 @@ pub struct BlobReadFrame {
     pub bytes: Zeroizing<Vec<u8>>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlobReadStreamMetadata {
+    pub id: BlobId,
+    pub publisher: NodeId,
+    pub publisher_counter: u64,
+    pub topic: Topic,
+    pub scope: Scope,
+    pub priority: Priority,
+    pub ttl_ms: Option<u64>,
+    pub total_len: u64,
+    pub media_type: Option<String>,
+    pub schema_id: Vec<u8>,
+    pub acceptance_marker: u64,
+}
+
 pub struct SelectedBlobReadStream {
     commands: mpsc::Sender<SelectedApplicationCommand>,
     token: [u8; 32],
+    metadata: BlobReadStreamMetadata,
     closed: bool,
 }
 
 impl SelectedBlobReadStream {
-    pub(crate) fn new(commands: mpsc::Sender<SelectedApplicationCommand>, token: [u8; 32]) -> Self {
+    pub(crate) fn new(
+        commands: mpsc::Sender<SelectedApplicationCommand>,
+        token: [u8; 32],
+        metadata: BlobReadStreamMetadata,
+    ) -> Self {
         Self {
             commands,
             token,
+            metadata,
             closed: false,
         }
+    }
+
+    pub const fn metadata(&self) -> &BlobReadStreamMetadata {
+        &self.metadata
     }
 
     pub async fn next(
@@ -149,4 +178,5 @@ pub(crate) struct OpenedBlobPublishStream {
 
 pub(crate) struct OpenedBlobReadStream {
     pub token: [u8; 32],
+    pub metadata: BlobReadStreamMetadata,
 }

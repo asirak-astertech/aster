@@ -53,8 +53,9 @@ use tokio::sync::{mpsc, oneshot};
 use zeroize::{Zeroize as _, Zeroizing};
 
 use super::blob_stream::{
-    BlobPublishProgress, BlobPublishStreamRequest, BlobReadFrame, OpenedBlobPublishStream,
-    OpenedBlobReadStream, SelectedBlobPublishStream, SelectedBlobReadStream,
+    BlobPublishProgress, BlobPublishStreamRequest, BlobReadFrame, BlobReadStreamMetadata,
+    OpenedBlobPublishStream, OpenedBlobReadStream, SelectedBlobPublishStream,
+    SelectedBlobReadStream,
 };
 use super::{
     ApplicationError, ApplicationErrorKind, SelectedApplicationCommand, actor_unavailable,
@@ -1085,6 +1086,7 @@ impl SelectedBlobHandle {
         Ok(SelectedBlobReadStream::new(
             self.commands.clone(),
             opened.token,
+            opened.metadata,
         ))
     }
 
@@ -1511,6 +1513,7 @@ struct LocalBlobPublishStream {
     options: BlobPublishOptions,
     total_len: u64,
     accepted_offset: u64,
+    pending: Zeroizing<Vec<u8>>,
     segment_count: u64,
     publisher_counter: u64,
     last_checkpoint_at: Instant,
@@ -2085,6 +2088,7 @@ impl SelectedBlobNode {
                 options: request.options,
                 total_len: request.total_len,
                 accepted_offset: durable_offset,
+                pending: Zeroizing::new(Vec::with_capacity(BLOB_STREAM_SEGMENT_BYTES)),
                 segment_count,
                 publisher_counter: causal.counter(),
                 last_checkpoint_at: Instant::now(),
@@ -2124,24 +2128,33 @@ impl SelectedBlobNode {
             || bytes.is_empty()
             || bytes.len() > BLOB_STREAM_SEGMENT_BYTES
             || end > stream.total_len
-            || (end < stream.total_len && bytes.len() != BLOB_STREAM_SEGMENT_BYTES)
+            || stream.pending.len().checked_add(bytes.len()).is_none()
+            || stream.pending.len() + bytes.len() > BLOB_STREAM_SEGMENT_BYTES
         {
             return Err(ApplicationError::new(
                 ApplicationErrorKind::InvalidRequest,
                 "blob stream write",
             ));
         }
-        let plaintext = bytes.to_vec();
-        let segment = stream
-            .encryptor
-            .encrypt_segment(stream.segment_count, offset, bytes)
-            .map_err(|error| blob_core_error("blob stream write", error))?;
-        stream
-            .pack
-            .append_segment(&plaintext, &segment)
-            .map_err(|error| application_error("blob stream write", error.into()))?;
-        stream.segment_count += 1;
+        stream.pending.extend_from_slice(&bytes);
         stream.accepted_offset = end;
+        if stream.pending.len() == BLOB_STREAM_SEGMENT_BYTES || end == stream.total_len {
+            let segment_offset = end - stream.pending.len() as u64;
+            let plaintext = stream.pending.to_vec();
+            let pending = std::mem::replace(
+                &mut stream.pending,
+                Zeroizing::new(Vec::with_capacity(BLOB_STREAM_SEGMENT_BYTES)),
+            );
+            let segment = stream
+                .encryptor
+                .encrypt_segment(stream.segment_count, segment_offset, pending)
+                .map_err(|error| blob_core_error("blob stream write", error))?;
+            stream
+                .pack
+                .append_segment(&plaintext, &segment)
+                .map_err(|error| application_error("blob stream write", error.into()))?;
+            stream.segment_count += 1;
+        }
         let durable = stream.pack.progress().durable_plaintext_offset();
         if end - durable >= 16 * 1024 * 1024
             || stream.last_checkpoint_at.elapsed() >= DEFAULT_BLOB_STREAM_CHECKPOINT_INTERVAL
@@ -2172,7 +2185,7 @@ impl SelectedBlobNode {
         let mut stream = self.publish_streams.remove(&token).ok_or_else(|| {
             ApplicationError::new(ApplicationErrorKind::NotFound, "blob stream finish")
         })?;
-        if stream.accepted_offset != stream.total_len {
+        if stream.accepted_offset != stream.total_len || !stream.pending.is_empty() {
             self.publish_streams.insert(token, stream);
             return Err(ApplicationError::new(
                 ApplicationErrorKind::InvalidRequest,
@@ -2288,6 +2301,20 @@ impl SelectedBlobNode {
             .begin_blob_stream_decrypt(&open)
             .map_err(|error| application_error("blob stream read open", error.into()))?;
         let token = *publication.stream_id().as_bytes();
+        let publication_open = publication.open();
+        let metadata = BlobReadStreamMetadata {
+            id: BlobId::from_core(publication.blob_id()),
+            publisher: publication_open.publisher(),
+            publisher_counter: publication_open.publisher_counter(),
+            topic: publication_open.topic().clone(),
+            scope: publication_open.scope().clone(),
+            priority: publication_open.priority(),
+            ttl_ms: publication_open.ttl_ms(),
+            total_len: publication_open.total_len(),
+            media_type: publication_open.metadata().media_type().map(str::to_owned),
+            schema_id: publication_open.metadata().schema_id().to_vec(),
+            acceptance_marker: publication.acceptance_marker(),
+        };
         self.read_streams.insert(
             token,
             LocalBlobReadStream {
@@ -2302,7 +2329,7 @@ impl SelectedBlobNode {
                 last_validation_at: Instant::now(),
             },
         );
-        Ok(OpenedBlobReadStream { token })
+        Ok(OpenedBlobReadStream { token, metadata })
     }
 
     fn next_read_stream_inner(
@@ -6118,22 +6145,16 @@ mod tests {
             })
             .await
             .expect("open live Blob stream");
-        let first = stream
-            .write(
-                0,
-                Zeroizing::new(bytes[..BLOB_STREAM_SEGMENT_BYTES].to_vec()),
-            )
-            .await
-            .expect("write first live segment");
-        assert_eq!(first.accepted_offset, BLOB_STREAM_SEGMENT_BYTES as u64);
-        let second = stream
-            .write(
-                BLOB_STREAM_SEGMENT_BYTES as u64,
-                Zeroizing::new(bytes[BLOB_STREAM_SEGMENT_BYTES..].to_vec()),
-            )
-            .await
-            .expect("write final live segment");
-        assert_eq!(second.accepted_offset, bytes.len() as u64);
+        let mut offset = 0_usize;
+        while offset < bytes.len() {
+            let end = (offset + 64 * 1024).min(bytes.len());
+            let progress = stream
+                .write(offset as u64, Zeroizing::new(bytes[offset..end].to_vec()))
+                .await
+                .expect("write live frame");
+            assert_eq!(progress.accepted_offset, end as u64);
+            offset = end;
+        }
         let published = stream.finish().await.expect("finish live Blob stream");
         assert_eq!(published.total_len, bytes.len() as u64);
         assert_eq!(published.publisher, identity);
