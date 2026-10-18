@@ -452,6 +452,24 @@ impl BlobStreamEncryptor {
         })
     }
 
+    pub(crate) fn from_key_checkpoint(
+        open: &VerifiedBlobStreamOpen,
+        content_grant_seed: [u8; 32],
+        next_offset: u64,
+        checkpoint: BlobStreamAccumulatorCheckpoint,
+    ) -> Result<Self, BlobError> {
+        if checkpoint.domain() != BlobStreamAccumulatorDomain::Ciphertext
+            || next_offset > open.open.total_len
+        {
+            return Err(BlobError::InvalidManifest);
+        }
+        let mut encryptor = Self::from_key(open, content_grant_seed)?;
+        encryptor.next_index = checkpoint.next_index();
+        encryptor.next_offset = next_offset;
+        encryptor.ciphertext_accumulator = BlobStreamAccumulator::restore(checkpoint)?;
+        Ok(encryptor)
+    }
+
     pub fn encrypt_segment(
         &mut self,
         index: u64,
@@ -671,6 +689,10 @@ impl BlobStreamFinalCommitment {
         &self.ciphertext_root
     }
 
+    pub const fn plaintext_root(&self) -> &[u8; 32] {
+        &self.plaintext_root
+    }
+
     pub const fn ttl_ms(&self) -> Option<u64> {
         self.ttl_ms
     }
@@ -824,6 +846,18 @@ pub struct BlobStreamAccumulatorCheckpoint {
 }
 
 impl BlobStreamAccumulatorCheckpoint {
+    pub const fn domain(&self) -> BlobStreamAccumulatorDomain {
+        self.domain
+    }
+
+    pub const fn next_index(&self) -> u64 {
+        self.next_index
+    }
+
+    pub const fn total_len(&self) -> u64 {
+        self.total_len
+    }
+
     /// Encodes a constant-sized checkpoint independent of Blob length.
     pub fn encode(&self) -> Vec<u8> {
         let mut encoded = Vec::with_capacity(ACCUMULATOR_CHECKPOINT_ENCODED_LEN);

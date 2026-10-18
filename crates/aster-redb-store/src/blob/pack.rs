@@ -47,12 +47,13 @@ pub(crate) struct BlobPackCheckpoint {
     next_index: u64,
     plaintext_offset: u64,
     pack_len: u64,
+    plaintext: BlobStreamAccumulatorCheckpoint,
     ciphertext: BlobStreamAccumulatorCheckpoint,
 }
 
 impl BlobPackCheckpoint {
     pub(crate) const ENCODED_LEN: usize =
-        8 + 2 + 8 + 32 + 32 + 8 + 8 + 8 + 8 + 4 + ACCUMULATOR_CHECKPOINT_LEN + 32;
+        8 + 2 + 8 + 32 + 32 + 8 + 8 + 8 + 8 + 4 + 2 * ACCUMULATOR_CHECKPOINT_LEN + 32;
 
     pub(crate) const fn generation(&self) -> u64 {
         self.generation
@@ -83,8 +84,10 @@ impl BlobPackCheckpoint {
     }
 
     pub(super) fn encode(&self) -> Vec<u8> {
-        let accumulator = self.ciphertext.encode();
-        debug_assert_eq!(accumulator.len(), ACCUMULATOR_CHECKPOINT_LEN);
+        let plaintext = self.plaintext.encode();
+        let ciphertext = self.ciphertext.encode();
+        debug_assert_eq!(plaintext.len(), ACCUMULATOR_CHECKPOINT_LEN);
+        debug_assert_eq!(ciphertext.len(), ACCUMULATOR_CHECKPOINT_LEN);
         let mut bytes = Vec::with_capacity(Self::ENCODED_LEN);
         bytes.extend_from_slice(CHECKPOINT_MAGIC);
         bytes.extend_from_slice(&PACK_VERSION.to_be_bytes());
@@ -95,8 +98,9 @@ impl BlobPackCheckpoint {
         bytes.extend_from_slice(&self.next_index.to_be_bytes());
         bytes.extend_from_slice(&self.plaintext_offset.to_be_bytes());
         bytes.extend_from_slice(&self.pack_len.to_be_bytes());
-        bytes.extend_from_slice(&(accumulator.len() as u32).to_be_bytes());
-        bytes.extend_from_slice(&accumulator);
+        bytes.extend_from_slice(&(ACCUMULATOR_CHECKPOINT_LEN as u32).to_be_bytes());
+        bytes.extend_from_slice(&plaintext);
+        bytes.extend_from_slice(&ciphertext);
         let checksum = Sha256::digest(&bytes);
         bytes.extend_from_slice(&checksum);
         debug_assert_eq!(bytes.len(), Self::ENCODED_LEN);
@@ -123,8 +127,13 @@ impl BlobPackCheckpoint {
             next_index: read_u64(bytes, 90)?,
             plaintext_offset: read_u64(bytes, 98)?,
             pack_len: read_u64(bytes, 106)?,
-            ciphertext: BlobStreamAccumulatorCheckpoint::decode(
+            plaintext: BlobStreamAccumulatorCheckpoint::decode(
                 &bytes[ACCUMULATOR_OFFSET..ACCUMULATOR_OFFSET + ACCUMULATOR_CHECKPOINT_LEN],
+            )
+            .map_err(|_| integrity("Blob pack accumulator checkpoint is invalid"))?,
+            ciphertext: BlobStreamAccumulatorCheckpoint::decode(
+                &bytes[ACCUMULATOR_OFFSET + ACCUMULATOR_CHECKPOINT_LEN
+                    ..ACCUMULATOR_OFFSET + 2 * ACCUMULATOR_CHECKPOINT_LEN],
             )
             .map_err(|_| integrity("Blob pack accumulator checkpoint is invalid"))?,
         };
@@ -133,6 +142,11 @@ impl BlobPackCheckpoint {
             || checkpoint.total_len == 0
             || checkpoint.plaintext_offset > checkpoint.total_len
             || checkpoint.pack_len < PACK_HEADER_LEN
+            || checkpoint.plaintext.domain() != BlobStreamAccumulatorDomain::Plaintext
+            || checkpoint.ciphertext.domain() != BlobStreamAccumulatorDomain::Ciphertext
+            || checkpoint.plaintext.next_index() != checkpoint.next_index
+            || checkpoint.plaintext.total_len() != checkpoint.plaintext_offset
+            || checkpoint.ciphertext.next_index() != checkpoint.next_index
         {
             return Err(integrity("Blob pack checkpoint invariants failed"));
         }
@@ -186,6 +200,7 @@ pub(crate) struct BlobPackWriter {
     next_offset: u64,
     pack_len: u64,
     generation: u64,
+    plaintext: BlobStreamAccumulator,
     ciphertext: BlobStreamAccumulator,
     #[cfg(test)]
     data_barriers: u64,
@@ -222,6 +237,7 @@ impl BlobPackWriter {
             next_offset: 0,
             pack_len: PACK_HEADER_LEN,
             generation: 0,
+            plaintext: BlobStreamAccumulator::new(BlobStreamAccumulatorDomain::Plaintext),
             ciphertext: BlobStreamAccumulator::new(BlobStreamAccumulatorDomain::Ciphertext),
             #[cfg(test)]
             data_barriers: 0,
@@ -266,6 +282,8 @@ impl BlobPackWriter {
             next_offset: checkpoint.plaintext_offset,
             pack_len: checkpoint.pack_len,
             generation: checkpoint.generation,
+            plaintext: BlobStreamAccumulator::restore(checkpoint.plaintext.clone())
+                .map_err(|_| integrity("Blob pack plaintext accumulator cannot be restored"))?,
             ciphertext: BlobStreamAccumulator::restore(checkpoint.ciphertext.clone())
                 .map_err(|_| integrity("Blob pack accumulator cannot be restored"))?,
             #[cfg(test)]
@@ -279,7 +297,14 @@ impl BlobPackWriter {
         &mut self,
         segment: &EncryptedBlobStreamSegment,
     ) -> Result<(), StoreError> {
-        if segment.stream_id() != self.stream_id
+        let expected_plaintext_next = segment
+            .index()
+            .checked_add(1)
+            .ok_or_else(|| integrity("Blob pack segment index overflow"))?;
+        if self.plaintext.checkpoint().next_index() != expected_plaintext_next
+            || self.plaintext.checkpoint().total_len()
+                != segment.offset() + u64::from(segment.plaintext_len())
+            || segment.stream_id() != self.stream_id
             || segment.open_digest() != &self.open_digest
             || segment.total_len() != self.total_len
             || segment.index() != self.next_index
@@ -315,6 +340,38 @@ impl BlobPackWriter {
         Ok(())
     }
 
+    pub(crate) fn append_plaintext_segment(
+        &mut self,
+        index: u64,
+        plaintext: &[u8],
+    ) -> Result<(), StoreError> {
+        self.plaintext
+            .push_segment(index, plaintext)
+            .map_err(|_| integrity("Blob pack plaintext accumulator rejected segment"))
+    }
+
+    pub(super) fn ciphertext_checkpoint(&self) -> BlobStreamAccumulatorCheckpoint {
+        self.ciphertext.checkpoint()
+    }
+
+    pub(super) fn final_roots(&self) -> Result<([u8; 32], [u8; 32]), StoreError> {
+        if self.next_offset != self.total_len {
+            return Err(integrity("Blob pack is not complete"));
+        }
+        let plaintext_root = self
+            .plaintext
+            .clone()
+            .finish(self.total_len)
+            .map_err(|_| integrity("Blob pack plaintext root is incomplete"))?;
+        let ciphertext_checkpoint = self.ciphertext.checkpoint();
+        let ciphertext_root = self
+            .ciphertext
+            .clone()
+            .finish(ciphertext_total_len(&ciphertext_checkpoint)?)
+            .map_err(|_| integrity("Blob pack ciphertext root is incomplete"))?;
+        Ok((plaintext_root, ciphertext_root))
+    }
+
     pub(crate) fn checkpoint(&mut self) -> Result<BlobPackCheckpoint, StoreError> {
         self.data
             .sync_data()
@@ -335,6 +392,7 @@ impl BlobPackWriter {
             next_index: self.next_index,
             plaintext_offset: self.next_offset,
             pack_len: self.pack_len,
+            plaintext: self.plaintext.checkpoint(),
             ciphertext: self.ciphertext.checkpoint(),
         };
         let slot = if generation & 1 == 0 {
@@ -358,6 +416,11 @@ impl BlobPackWriter {
         let checkpoint = self.checkpoint()?;
         let commitment = commitment.commitment();
         let ciphertext_len = ciphertext_total_len(&checkpoint.ciphertext)?;
+        let plaintext_root = self
+            .plaintext
+            .clone()
+            .finish(self.total_len)
+            .map_err(|_| integrity("Blob pack plaintext root is incomplete"))?;
         let ciphertext_root = self
             .ciphertext
             .clone()
@@ -367,6 +430,7 @@ impl BlobPackWriter {
             || commitment.stream_id() != self.stream_id
             || commitment.total_len() != self.total_len
             || commitment.segment_count() != self.next_index
+            || commitment.plaintext_root() != &plaintext_root
             || commitment.ciphertext_root() != &ciphertext_root
             || self.next_offset != self.total_len
         {
@@ -685,6 +749,7 @@ mod tests {
         _root: TestRoot,
         pack_root: PinnedBlobPackRoot,
         open: VerifiedBlobStreamOpen,
+        plaintexts: Vec<Vec<u8>>,
         segments: Vec<EncryptedBlobStreamSegment>,
         final_commitment: VerifiedBlobStreamFinalCommitment,
     }
@@ -787,22 +852,32 @@ mod tests {
             _root: root,
             pack_root,
             open,
+            plaintexts: vec![vec![0x31; BLOB_STREAM_SEGMENT_BYTES], vec![0x32; 7]],
             segments,
             final_commitment,
         }
     }
 
+    fn append_fixture_segment(writer: &mut BlobPackWriter, fixture: &StreamFixture, index: usize) {
+        writer
+            .append_plaintext_segment(index as u64, &fixture.plaintexts[index])
+            .expect("append plaintext");
+        writer
+            .append_segment(&fixture.segments[index])
+            .expect("append encrypted segment");
+    }
+
     #[test]
     fn blob_pack_checkpoint_encoding_is_constant_sized() {
-        assert_eq!(BlobPackCheckpoint::ENCODED_LEN, 2234);
+        assert_eq!(BlobPackCheckpoint::ENCODED_LEN, 4318);
     }
 
     #[test]
     fn blob_pack_appends_segments_without_per_segment_barrier() {
         let fixture = stream_fixture(0x61);
         let mut writer = BlobPackWriter::create(&fixture.pack_root, &fixture.open).expect("writer");
-        for segment in &fixture.segments {
-            writer.append_segment(segment).expect("append");
+        for index in 0..fixture.segments.len() {
+            append_fixture_segment(&mut writer, &fixture, index);
         }
         assert_eq!(writer.test_barriers(), (0, 0));
         let checkpoint = writer.checkpoint().expect("checkpoint");
@@ -814,13 +889,9 @@ mod tests {
     fn blob_pack_checkpoint_is_constant_sized_and_monotonic() {
         let fixture = stream_fixture(0x62);
         let mut writer = BlobPackWriter::create(&fixture.pack_root, &fixture.open).expect("writer");
-        writer
-            .append_segment(&fixture.segments[0])
-            .expect("append first");
+        append_fixture_segment(&mut writer, &fixture, 0);
         let first = writer.checkpoint().expect("first checkpoint");
-        writer
-            .append_segment(&fixture.segments[1])
-            .expect("append second");
+        append_fixture_segment(&mut writer, &fixture, 1);
         let second = writer.checkpoint().expect("second checkpoint");
         assert_eq!(first.encode().len(), BlobPackCheckpoint::ENCODED_LEN);
         assert_eq!(second.encode().len(), BlobPackCheckpoint::ENCODED_LEN);
@@ -837,8 +908,8 @@ mod tests {
     fn blob_pack_reader_streams_verified_segments() {
         let fixture = stream_fixture(0x63);
         let mut writer = BlobPackWriter::create(&fixture.pack_root, &fixture.open).expect("writer");
-        for segment in &fixture.segments {
-            writer.append_segment(segment).expect("append");
+        for index in 0..fixture.segments.len() {
+            append_fixture_segment(&mut writer, &fixture, index);
         }
         let completion = writer.finish(&fixture.final_commitment).expect("finish");
         let mut reader = BlobPackReader::open(&fixture.pack_root, &completion).expect("reader");
@@ -858,13 +929,9 @@ mod tests {
     fn blob_pack_crash_recovery_truncates_uncheckpointed_tail() {
         let fixture = stream_fixture(0x64);
         let mut writer = BlobPackWriter::create(&fixture.pack_root, &fixture.open).expect("writer");
-        writer
-            .append_segment(&fixture.segments[0])
-            .expect("append first");
+        append_fixture_segment(&mut writer, &fixture, 0);
         let durable = writer.checkpoint().expect("durable checkpoint");
-        writer
-            .append_segment(&fixture.segments[1])
-            .expect("uncheckpointed append");
+        append_fixture_segment(&mut writer, &fixture, 1);
         let tail_len = writer.pack_len;
         drop(writer);
 
@@ -881,9 +948,7 @@ mod tests {
                 .len(),
             durable.pack_len()
         );
-        resumed
-            .append_segment(&fixture.segments[1])
-            .expect("append after resume");
+        append_fixture_segment(&mut resumed, &fixture, 1);
         let next = resumed.checkpoint().expect("next checkpoint");
         assert_eq!(next.generation(), durable.generation() + 1);
         assert_eq!(next.next_index(), 2);
@@ -893,13 +958,9 @@ mod tests {
     fn blob_pack_crash_recovery_ignores_torn_newer_journal_slot() {
         let fixture = stream_fixture(0x65);
         let mut writer = BlobPackWriter::create(&fixture.pack_root, &fixture.open).expect("writer");
-        writer
-            .append_segment(&fixture.segments[0])
-            .expect("append first");
+        append_fixture_segment(&mut writer, &fixture, 0);
         let first = writer.checkpoint().expect("first checkpoint");
-        writer
-            .append_segment(&fixture.segments[1])
-            .expect("append second");
+        append_fixture_segment(&mut writer, &fixture, 1);
         let second = writer.checkpoint().expect("second checkpoint");
         assert!(second.generation() > first.generation());
         drop(writer);
@@ -923,8 +984,8 @@ mod tests {
     fn blob_pack_descriptor_identity_mismatch_fails_closed() {
         let fixture = stream_fixture(0x66);
         let mut writer = BlobPackWriter::create(&fixture.pack_root, &fixture.open).expect("writer");
-        for segment in &fixture.segments {
-            writer.append_segment(segment).expect("append");
+        for index in 0..fixture.segments.len() {
+            append_fixture_segment(&mut writer, &fixture, index);
         }
         let completion = writer
             .finish(&fixture.final_commitment)
@@ -943,9 +1004,7 @@ mod tests {
 
         let fixture = stream_fixture(0x67);
         let mut writer = BlobPackWriter::create(&fixture.pack_root, &fixture.open).expect("writer");
-        writer
-            .append_segment(&fixture.segments[0])
-            .expect("append first");
+        append_fixture_segment(&mut writer, &fixture, 0);
         let checkpoint = writer.checkpoint().expect("checkpoint");
         drop(writer);
         let pack = fixture.stream_directory().join(PACK_FILE);
@@ -960,8 +1019,8 @@ mod tests {
     fn blob_pack_deletion_is_bounded_and_idempotent() {
         let fixture = stream_fixture(0x68);
         let mut writer = BlobPackWriter::create(&fixture.pack_root, &fixture.open).expect("writer");
-        for segment in &fixture.segments {
-            writer.append_segment(segment).expect("append");
+        for index in 0..fixture.segments.len() {
+            append_fixture_segment(&mut writer, &fixture, index);
         }
         writer
             .finish(&fixture.final_commitment)

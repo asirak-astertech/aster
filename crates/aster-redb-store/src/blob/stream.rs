@@ -1,6 +1,9 @@
 //! Profile-5 whole-carrier stream layout, batching, and durable checkpoints.
 
-use super::pack::{BlobPackCheckpoint, BlobPackCompletion};
+use super::pack::{
+    BlobPackCheckpoint, BlobPackCompletion, BlobPackWriter, PinnedBlobPackRoot, delete_blob_pack,
+    recover_blob_pack,
+};
 use super::*;
 use aster_mesh::{
     BLOB_STREAM_SEGMENT_BYTES, BlobId, BlobPublicationStreamId, BlobStore as CoreBlobStore,
@@ -20,7 +23,7 @@ const PROVISIONAL_MAGIC: &[u8; 8] = b"ASTRPR01";
 const PUBLICATION_MAGIC: &[u8; 8] = b"ASTRPB01";
 const PROVISIONAL_VERSION: u8 = 1;
 const PACK_RECORD_OVERHEAD: u64 = 186;
-const PACK_FIXED_RESERVATION_BYTES: u64 = 82 + 2 * 2234 + 1024;
+const PACK_FIXED_RESERVATION_BYTES: u64 = 82 + 2 * BlobPackCheckpoint::ENCODED_LEN as u64 + 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BlobStreamSource {
@@ -66,6 +69,87 @@ pub struct BlobStreamPromotion {
     stream_id: BlobPublicationStreamId,
     blob_id: BlobId,
     duplicate: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct BlobStreamCryptoResume {
+    progress: BlobStreamDurableProgress,
+    ciphertext_checkpoint: aster_mesh::BlobStreamAccumulatorCheckpoint,
+}
+
+impl BlobStreamCryptoResume {
+    pub const fn progress(&self) -> BlobStreamDurableProgress {
+        self.progress
+    }
+
+    pub fn ciphertext_checkpoint(&self) -> aster_mesh::BlobStreamAccumulatorCheckpoint {
+        self.ciphertext_checkpoint.clone()
+    }
+}
+
+pub struct BlobStreamPackSession {
+    writer: BlobPackWriter,
+    reservation: BlobStreamReservation,
+    progress: BlobStreamDurableProgress,
+}
+
+impl BlobStreamPackSession {
+    pub const fn progress(&self) -> BlobStreamDurableProgress {
+        self.progress
+    }
+
+    pub fn crypto_resume(&self) -> BlobStreamCryptoResume {
+        BlobStreamCryptoResume {
+            progress: self.progress,
+            ciphertext_checkpoint: self.writer.ciphertext_checkpoint(),
+        }
+    }
+
+    pub fn append_segment(
+        &mut self,
+        plaintext: &[u8],
+        segment: &aster_mesh::EncryptedBlobStreamSegment,
+    ) -> Result<(), StoreError> {
+        self.writer
+            .append_plaintext_segment(segment.index(), plaintext)?;
+        self.writer.append_segment(segment)
+    }
+
+    pub fn checkpoint(
+        &mut self,
+        store: &Store,
+        policy: &ControlPolicySnapshot,
+    ) -> Result<BlobStreamDurableProgress, StoreError> {
+        let checkpoint = self.writer.checkpoint()?;
+        self.progress = store.commit_blob_pack_checkpoint_with_policy(
+            policy,
+            &self.reservation,
+            self.progress,
+            checkpoint,
+        )?;
+        Ok(self.progress)
+    }
+
+    pub fn final_roots(&self) -> Result<([u8; 32], [u8; 32]), StoreError> {
+        self.writer.final_roots()
+    }
+
+    pub fn finish_and_promote(
+        self,
+        store: &Store,
+        policy: &ControlPolicySnapshot,
+        commitment: &VerifiedBlobStreamFinalCommitment,
+        final_sample: Option<CustodySample>,
+    ) -> Result<BlobStreamPromotion, StoreError> {
+        let completion = self.writer.finish(commitment)?;
+        store.promote_blob_stream_with_policy(
+            policy,
+            &self.reservation,
+            commitment,
+            completion,
+            final_sample,
+        )
+    }
 }
 
 impl BlobStreamPromotion {
@@ -627,6 +711,53 @@ impl Store {
             .insert(request.operation.as_bytes(), stream_key)?;
         write.commit()?;
         Ok((reservation, BlobStreamDurableProgress::default()))
+    }
+
+    pub fn open_blob_stream_pack_session(
+        &self,
+        policy: &ControlPolicySnapshot,
+        reservation: &BlobStreamReservation,
+        open: &VerifiedBlobStreamOpen,
+    ) -> Result<BlobStreamPackSession, StoreError> {
+        self.require_live()?;
+        let authority = self.require_bound_mission()?;
+        let encoded = {
+            let read = self.database.begin_read()?;
+            require_control_policy_read(&read, authority, policy)?;
+            read.open_table(BLOB_STREAM_RESERVATIONS)?
+                .get(reservation.stream_id.as_bytes().as_slice())?
+                .map(|row| row.value().to_vec())
+                .ok_or_else(|| blob_error(BlobStoreError::ReservationChanged))?
+        };
+        let provisional = ProvisionalBlobStream::decode(&encoded)?;
+        if provisional.reservation != *reservation || provisional.open != *open.open() {
+            return Err(blob_error(BlobStoreError::ReservationChanged));
+        }
+        let root = PinnedBlobPackRoot::open(self)?;
+        let writer = if let Some(checkpoint) = &provisional.checkpoint {
+            BlobPackWriter::resume(&root, checkpoint)?
+        } else {
+            if recover_blob_pack(&root, reservation.open_digest)?.is_some() {
+                return Err(blob_error(BlobStoreError::ReservationChanged));
+            }
+            match BlobPackWriter::create(&root, open) {
+                Ok(writer) => writer,
+                Err(StoreError::Blob(BlobStoreError::Io(error)))
+                    if error.kind() == std::io::ErrorKind::AlreadyExists =>
+                {
+                    // With no redb checkpoint, every pack artifact is an
+                    // unacknowledged crash tail and may be discarded exactly.
+                    delete_blob_pack(&root, reservation.open_digest)?;
+                    BlobPackWriter::create(&root, open)?
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        Ok(BlobStreamPackSession {
+            writer,
+            reservation: reservation.clone(),
+            progress: provisional.progress(),
+        })
     }
 
     #[allow(dead_code)] // Invoked by the actor-owned receive session in Task 5.
@@ -1543,6 +1674,9 @@ mod tests {
         let segment = encryptor
             .encrypt_segment(0, 0, Zeroizing::new(vec![0x33; 8]))
             .expect("segment");
+        writer
+            .append_plaintext_segment(0, &[0x33; 8])
+            .expect("append plaintext");
         writer.append_segment(&segment).expect("append");
         let checkpoint = writer.checkpoint().expect("durable pack checkpoint");
         let advanced = fixture
@@ -1612,6 +1746,9 @@ mod tests {
         let segment = encryptor
             .encrypt_segment(0, 0, Zeroizing::new(plaintext.clone()))
             .expect("segment");
+        writer
+            .append_plaintext_segment(0, &plaintext)
+            .expect("append plaintext");
         writer.append_segment(&segment).expect("append");
         let checkpoint = writer.checkpoint().expect("checkpoint");
         fixture
@@ -1693,5 +1830,62 @@ mod tests {
                 .expect("duplicate promotion")
                 .duplicate()
         );
+    }
+
+    #[test]
+    fn blob_stream_pack_session_restores_crypto_and_plaintext_frontiers() {
+        let fixture = provisional_fixture(0x75);
+        let policy = fixture.store.control_policy_snapshot().expect("policy");
+        let (reservation, _) = fixture
+            .store
+            .reserve_blob_stream_with_policy(
+                &policy,
+                BlobStreamReservationRequest {
+                    operation: &fixture.operation,
+                    source: BlobStreamSource::LocalApplication,
+                },
+                &fixture.open,
+            )
+            .expect("reservation");
+        let mut session = fixture
+            .store
+            .open_blob_stream_pack_session(&policy, &reservation, &fixture.open)
+            .expect("session");
+        let plaintext = vec![0x52; 8];
+        let mut encryptor = fixture
+            .publisher
+            .begin_blob_stream_encrypt(&fixture.open)
+            .expect("encryptor");
+        let segment = encryptor
+            .encrypt_segment(0, 0, Zeroizing::new(plaintext.clone()))
+            .expect("segment");
+        session
+            .append_segment(&plaintext, &segment)
+            .expect("session append");
+        let durable = session
+            .checkpoint(&fixture.store, &policy)
+            .expect("session checkpoint");
+        assert_eq!(durable.durable_plaintext_offset(), 8);
+        let expected_roots = session.final_roots().expect("roots");
+        drop(session);
+
+        let resumed = fixture
+            .store
+            .open_blob_stream_pack_session(&policy, &reservation, &fixture.open)
+            .expect("resumed session");
+        assert_eq!(resumed.progress(), durable);
+        assert_eq!(
+            resumed.final_roots().expect("resumed roots"),
+            expected_roots
+        );
+        let crypto = resumed.crypto_resume();
+        let _encryptor = fixture
+            .publisher
+            .resume_blob_stream_encrypt(
+                &fixture.open,
+                crypto.progress().durable_plaintext_offset(),
+                crypto.ciphertext_checkpoint(),
+            )
+            .expect("resume encryption without plaintext replay");
     }
 }

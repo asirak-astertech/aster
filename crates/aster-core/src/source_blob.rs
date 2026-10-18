@@ -14,8 +14,9 @@ use crate::{
         inspect_selected_blob_manifest, verify_source_authenticated_store_completion,
     },
     blob_stream::{
-        BlobStreamDecryptor, BlobStreamEncryptor, BlobStreamFinalCommitment, BlobStreamOpen,
-        VerifiedBlobStreamFinalCommitment, VerifiedBlobStreamOpen,
+        BlobStreamAccumulatorCheckpoint, BlobStreamDecryptor, BlobStreamEncryptor,
+        BlobStreamFinalCommitment, BlobStreamOpen, VerifiedBlobStreamFinalCommitment,
+        VerifiedBlobStreamOpen,
     },
     crypto::ReferenceEnvelopeSealer,
     envelope::{EnvelopeError, EnvelopeHeader, EnvelopeSealer, SealRequest, SealedEnvelope},
@@ -641,6 +642,39 @@ impl ReferenceEnvelopeSealer {
             .ok_or_else(|| blob_stream_authentication_error(BlobError::AuthenticationFailed))?;
         let result =
             BlobStreamEncryptor::from_key(open, seed).map_err(blob_stream_authentication_error);
+        seed.zeroize();
+        result
+    }
+
+    /// Restores publisher encryption at one receiver-authoritative durable
+    /// checkpoint without replaying earlier plaintext.
+    pub fn resume_blob_stream_encrypt(
+        &self,
+        open: &VerifiedBlobStreamOpen,
+        next_plaintext_offset: u64,
+        ciphertext_checkpoint: BlobStreamAccumulatorCheckpoint,
+    ) -> Result<BlobStreamEncryptor, EnvelopeError> {
+        if open.open().publisher() != self.identity()
+            || open.mission_authority_id() != self.mission_authority_id()
+        {
+            return Err(blob_stream_authentication_error(
+                BlobError::AuthenticationFailed,
+            ));
+        }
+        let mut seed = self
+            .blob_stream_content_grant_seed(
+                open.open().scope(),
+                open.open().topic(),
+                open.open().content_epoch(),
+            )
+            .ok_or_else(|| blob_stream_authentication_error(BlobError::AuthenticationFailed))?;
+        let result = BlobStreamEncryptor::from_key_checkpoint(
+            open,
+            seed,
+            next_plaintext_offset,
+            ciphertext_checkpoint,
+        )
+        .map_err(blob_stream_authentication_error);
         seed.zeroize();
         result
     }

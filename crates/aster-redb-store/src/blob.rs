@@ -27,7 +27,8 @@ pub use lifecycle::{
 #[doc(hidden)]
 pub use pressure::BlobCapacityRecoveryResult;
 pub use stream::{
-    BlobStreamCheckpoint, BlobStreamCommitOutcome, BlobStreamDurableProgress, BlobStreamPromotion,
+    BlobStreamCheckpoint, BlobStreamCommitOutcome, BlobStreamCryptoResume,
+    BlobStreamDurableProgress, BlobStreamPackSession, BlobStreamPromotion,
     BlobStreamProvenanceUpgrade, BlobStreamReservation, BlobStreamReservationRequest,
     BlobStreamSource, DEFAULT_BLOB_STREAM_CHECKPOINT_BATCH_BYTES,
     DEFAULT_BLOB_STREAM_CHECKPOINT_INTERVAL, MAX_BLOB_STREAM_CHECKPOINT_BATCH_BYTES,
