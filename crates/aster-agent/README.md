@@ -136,6 +136,14 @@ request up to 1,800 seconds and remain bounded by connection lifetime and
 stream progress checks. These are implementation limits, not RPC compatibility
 guarantees or performance claims.
 
+`PublishBlob` is bidirectional. After metadata, the agent returns the exact
+Store-authoritative durable offset and canonical request-frame size; the client
+resumes there with contiguous frames of exactly that size except for the exact
+terminal remainder. The agent reports only durable checkpoints and emits
+the publication receipt after an explicit finish has been durably promoted.
+Disconnecting never turns accepted-but-uncheckpointed bytes into resume
+authority.
+
 `blob-read` currently requires Linux, an owner-controlled destination directory
 (owned by the current user and not writable by group or other users), and a
 filesystem that supports named staging, atomic no-replace rename, and directory

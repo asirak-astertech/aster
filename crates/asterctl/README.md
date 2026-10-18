@@ -108,7 +108,7 @@ streams each window directly into its private no-replace output staging file.
 
 `blob-publish` requires a nonempty regular source file. The path remains local
 and is never sent to the agent. The client sends metadata first, then streams
-canonical chunks of at most 64 KiB without buffering the whole Blob or treating
+canonical 64-KiB data frames (with only the terminal data frame shorter) without buffering the whole Blob or treating
 the current backend size policy as a public maximum. The current agent may
 reject a source above its configured backend limit. Keep the opened source
 file's contents and length unchanged until the command exits. Detectable size
@@ -117,6 +117,13 @@ same-length mutation is outside the command contract and can produce mixed
 source bytes. `--schema-id` is Base64;
 `--ttl-ms` accepts positive unsigned 64-bit milliseconds, including
 `18446744073709551615`. Omitting it selects durable publication.
+
+Before reading payload bytes, `asterctl` waits for the agent's durable resume
+offset and seeks the already-open regular file to that position. Every request
+data frame carries its absolute offset; concurrent response processing rejects a
+regressing durable checkpoint or one beyond bytes successfully sent. An explicit finish closes the
+payload grammar, and success is reported only after the terminal durable
+publication receipt.
 
 `blob-read` requires an exact Blob ID, topic, scope, and destination. On Linux,
 it requires a destination directory owned by the current user and not writable

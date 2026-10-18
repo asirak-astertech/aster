@@ -1245,16 +1245,17 @@ mod tests {
         // Break caught: applying the ordinary 30-second absolute RPC deadline
         // to a progressing Blob upload makes operationally large sources
         // impossible to ingest through the public streaming API.
-        let router = Router::new().route_client_stream(
+        let router = Router::new().route_bidi_stream(
             api::ASTER_APPLICATION_SERVICE_SERVICE_NAME,
             "PublishBlob",
-            connectrpc::client_streaming_handler_fn(
+            connectrpc::bidi_streaming_handler_fn(
                 |_ctx, mut requests: connectrpc::ServiceStream<api::PublishBlobRequest>| async move {
-                    let _ = futures::StreamExt::next(&mut requests).await;
-                    tokio::time::sleep(Duration::from_secs(31)).await;
-                    Ok::<_, ConnectError>(connectrpc::Response::new(
-                        api::PublishBlobResponse::default(),
-                    ))
+                    let responses = futures::stream::once(async move {
+                        let _ = futures::StreamExt::next(&mut requests).await;
+                        tokio::time::sleep(Duration::from_secs(31)).await;
+                        Ok::<_, ConnectError>(api::PublishBlobResponse::default())
+                    });
+                    connectrpc::Response::stream_ok(responses)
                 },
             ),
         );
@@ -1278,9 +1279,13 @@ mod tests {
                     format!("Bearer {}", String::from_utf8_lossy(TEST_TOKEN)),
                 ),
         );
-        let response = client
-            .publish_blob(futures::stream::iter([api::PublishBlobRequest::default()]))
-            .await;
+        let mut response = client.publish_blob().await.unwrap();
+        response
+            .send(api::PublishBlobRequest::default())
+            .await
+            .unwrap();
+        response.close_send();
+        let response = response.message::<api::PublishBlobResponse>().await;
         assert!(
             response.is_ok(),
             "progressing Blob upload was cut off by the ordinary deadline: {response:?}"

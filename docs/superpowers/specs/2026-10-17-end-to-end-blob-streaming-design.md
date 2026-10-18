@@ -369,10 +369,18 @@ integrity conflict and preserves bounded evidence.
 ## Local application publish stream
 
 The agent API uses the same pipeline rather than staging a complete file before
-calling the node. Its opening request carries metadata and declared length;
-subsequent messages carry bounded bytes under server-issued backpressure. The
-node returns cumulative accepted and durable offsets so an interrupted seekable
-client can reopen the idempotent operation and resume from local durable state.
+calling the node. `PublishBlob` is bidirectional. Its first request carries
+metadata and declared length; the first response carries the exact accepted and
+durable resume offset and the canonical request-frame size. Subsequent requests
+carry contiguous `(offset, bytes)` data frames of exactly that size, except that
+the terminal data frame carries the exact remainder, followed by one explicit
+finish. This canonical shape bounds frame-count work independently of Blob size;
+it intentionally does not advertise arbitrary smaller request frames. Responses carry only monotonic
+Store-authoritative checkpoints, followed by exactly one completed publication
+receipt after promotion. EOF before finish, data gaps, offset replay, a second
+metadata or finish, and frames after finish are malformed. The node returns
+cumulative accepted and durable offsets so an interrupted seekable client can
+reopen the idempotent operation and resume from local durable state.
 
 `asterctl` reads its source file sequentially from the requested offset. It
 does not copy the complete source into agent staging. A non-seekable producer

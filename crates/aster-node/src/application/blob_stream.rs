@@ -28,6 +28,7 @@ pub struct SelectedBlobPublishStream {
     token: [u8; 32],
     accepted_offset: u64,
     durable_offset: u64,
+    closed: bool,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -122,6 +123,7 @@ impl SelectedBlobPublishStream {
             token,
             accepted_offset: progress.accepted_offset,
             durable_offset: progress.durable_offset,
+            closed: false,
         }
     }
 
@@ -154,7 +156,7 @@ impl SelectedBlobPublishStream {
         Ok(progress)
     }
 
-    pub async fn finish(self) -> Result<BlobPublishResult, ApplicationError> {
+    pub async fn finish(mut self) -> Result<BlobPublishResult, ApplicationError> {
         let (response, received) = oneshot::channel();
         self.commands
             .send(SelectedApplicationCommand::Blob(
@@ -165,9 +167,72 @@ impl SelectedBlobPublishStream {
             ))
             .await
             .map_err(|_| actor_unavailable("blob stream finish"))?;
-        received
+        let result = received
             .await
-            .map_err(|_| actor_unavailable("blob stream finish"))?
+            .map_err(|_| actor_unavailable("blob stream finish"))?;
+        if result.is_ok() {
+            self.closed = true;
+        }
+        result
+    }
+}
+
+impl Drop for SelectedBlobPublishStream {
+    fn drop(&mut self) {
+        if !self.closed {
+            let command =
+                SelectedApplicationCommand::Blob(SelectedBlobCommand::ClosePublishStream {
+                    token: self.token,
+                });
+            if let Err(mpsc::error::TrySendError::Full(command)) = self.commands.try_send(command) {
+                let commands = self.commands.clone();
+                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                    runtime.spawn(async move {
+                        _ = commands.send(command).await;
+                    });
+                } else {
+                    _ = commands.blocking_send(command);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn dropped_publish_stream_eventually_closes_when_command_lane_is_full() {
+        let token = [0x5a; 32];
+        let (commands, mut received) = mpsc::channel(1);
+        commands
+            .send(SelectedApplicationCommand::Blob(
+                SelectedBlobCommand::CloseReadStream { token: [0x11; 32] },
+            ))
+            .await
+            .expect("fill command lane");
+        let stream = SelectedBlobPublishStream::new(
+            commands,
+            token,
+            BlobPublishProgress {
+                accepted_offset: 0,
+                durable_offset: 0,
+            },
+        );
+
+        drop(stream);
+        _ = received.recv().await.expect("receive lane filler");
+        let close = tokio::time::timeout(std::time::Duration::from_secs(1), received.recv())
+            .await
+            .expect("close enqueue deadline")
+            .expect("receive close command");
+        assert!(matches!(
+            close,
+            SelectedApplicationCommand::Blob(SelectedBlobCommand::ClosePublishStream {
+                token: actual
+            }) if actual == token
+        ));
     }
 }
 

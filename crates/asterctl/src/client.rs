@@ -4,7 +4,16 @@ use connectrpc::{
     Protocol,
     client::{ClientConfig, Http2Connection, HttpClient, SharedHttp2Connection},
 };
-use std::{fs::File, net::SocketAddr, path::PathBuf, time::Duration};
+use std::{
+    fs::File,
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -403,21 +412,123 @@ pub async fn publish_blob(
     metadata: api::PublishBlobMetadata,
     file: File,
     timeout: Duration,
-) -> Result<api::PublishBlobResponse, MutationError> {
+) -> Result<api::PublishBlobReceipt, MutationError> {
     let requested = metadata.clone();
-    let (frames, reader) = blob_publish::stream_file(metadata, file);
-    let result = blob_client(address, token, timeout)
-        .publish_blob(frames)
-        .await;
-    let read_result = reader.await.map_err(|_| {
-        MutationError::unknown("source reader failed while request may have been sent")
-    })?;
-    if let Err(reason) = read_result {
-        return Err(MutationError::unknown(reason));
-    }
-    let response = result
+    let total_len = metadata.total_len;
+    let mut rpc = blob_client(address, token, timeout)
+        .publish_blob()
+        .await
+        .map_err(|error| MutationError::rpc_error(&error, "publish_blob"))?;
+    rpc.send(api::PublishBlobRequest {
+        frame: Some(api::publish_blob_request::Frame::Metadata(Box::new(
+            metadata,
+        ))),
+        ..Default::default()
+    })
+    .await
+    .map_err(|error| MutationError::rpc_error(&error, "publish_blob"))?;
+    let accepted = rpc
+        .message::<api::PublishBlobResponse>()
+        .await
         .map_err(|error| MutationError::rpc_error(&error, "publish_blob"))?
-        .into_owned();
+        .ok_or_else(|| MutationError::unknown("agent ended Blob upload before acceptance"))?
+        .to_owned_message();
+    let api::publish_blob_response::Frame::Accepted(accepted) = accepted
+        .frame
+        .ok_or_else(|| MutationError::unknown("agent omitted Blob acceptance"))?
+    else {
+        return Err(MutationError::unknown(
+            "agent sent Blob progress before acceptance",
+        ));
+    };
+    if accepted.accepted_offset != accepted.durable_offset
+        || accepted.canonical_frame_bytes != blob_publish::CHUNK_BYTES as u32
+        || accepted.durable_offset > total_len
+        || (accepted.durable_offset != total_len
+            && !accepted
+                .durable_offset
+                .is_multiple_of(blob_publish::CHUNK_BYTES as u64))
+    {
+        return Err(MutationError::unknown(
+            "agent returned an invalid Blob resume offset",
+        ));
+    }
+    let resume_offset = accepted.durable_offset;
+    let sent_offset = Arc::new(AtomicU64::new(resume_offset));
+    let (mut send, mut receive) = rpc.into_split();
+    let (mut frames, reader) = blob_publish::stream_file(file, total_len, resume_offset);
+    let sender_offset = Arc::clone(&sent_offset);
+    let sender = async move {
+        while let Some(frame) = frames.next().await {
+            let end = match frame.frame.as_ref() {
+                Some(api::publish_blob_request::Frame::Data(data)) => data
+                    .offset
+                    .checked_add(data.bytes.len() as u64)
+                    .ok_or_else(|| MutationError::unknown("Blob request offset overflow"))?,
+                _ => return Err(MutationError::unknown("invalid local Blob data frame")),
+            };
+            send.send(frame)
+                .await
+                .map_err(|error| MutationError::rpc_error(&error, "publish_blob"))?;
+            sender_offset.store(end, Ordering::Release);
+        }
+        send.send(api::PublishBlobRequest {
+            frame: Some(api::publish_blob_request::Frame::Finish(Box::default())),
+            ..Default::default()
+        })
+        .await
+        .map_err(|error| MutationError::rpc_error(&error, "publish_blob"))?;
+        send.close_send();
+        reader
+            .await
+            .map_err(|_| {
+                MutationError::unknown("source reader failed while request may have been sent")
+            })?
+            .map_err(MutationError::unknown)
+    };
+    let receiver = async move {
+        let mut accepted_offset = resume_offset;
+        let mut durable_offset = resume_offset;
+        let mut receipt = None;
+        while let Some(response) = receive
+            .message::<api::PublishBlobResponse>()
+            .await
+            .map_err(|error| MutationError::rpc_error(&error, "publish_blob"))?
+        {
+            match response.to_owned_message().frame {
+                Some(api::publish_blob_response::Frame::Checkpoint(checkpoint))
+                    if receipt.is_none()
+                        && blob_publish::checkpoint_is_valid(
+                            &checkpoint,
+                            accepted_offset,
+                            durable_offset,
+                            sent_offset.load(Ordering::Acquire),
+                            total_len,
+                        ) =>
+                {
+                    accepted_offset = checkpoint.accepted_offset;
+                    durable_offset = checkpoint.durable_offset;
+                }
+                Some(api::publish_blob_response::Frame::Complete(complete))
+                    if receipt.is_none() =>
+                {
+                    receipt = Some(*complete);
+                }
+                _ => {
+                    return Err(MutationError::unknown(
+                        "agent returned an invalid Blob progress sequence",
+                    ));
+                }
+            }
+        }
+        receipt.ok_or_else(|| MutationError::unknown("agent omitted Blob completion"))
+    };
+    let (sent, received) = tokio::join!(sender, receiver);
+    let response = match (sent, received) {
+        (_, Err(error)) => return Err(error),
+        (Err(error), Ok(_)) => return Err(error),
+        (Ok(()), Ok(response)) => response,
+    };
     if !blob_publish::receipt_matches(&requested, &response) {
         return Err(MutationError::unknown("invalid publication receipt"));
     }
@@ -596,8 +707,8 @@ mod tests {
         }
     }
 
-    fn receipt(metadata: &api::PublishBlobMetadata) -> api::PublishBlobResponse {
-        api::PublishBlobResponse {
+    fn receipt(metadata: &api::PublishBlobMetadata) -> api::PublishBlobReceipt {
+        api::PublishBlobReceipt {
             id: vec![1; 32],
             publisher: vec![2; 32],
             publisher_counter: 3,
@@ -612,7 +723,7 @@ mod tests {
         }
     }
 
-    fn read_page(offset: u64, chunk: Vec<u8>, complete: bool) -> api::ReadBlobResponse {
+    fn read_page(offset: u64, data: Vec<u8>, complete: bool) -> api::ReadBlobResponse {
         api::ReadBlobResponse {
             id: vec![1; 32],
             publisher: vec![2; 32],
@@ -626,7 +737,7 @@ mod tests {
             schema_id: b"schema".to_vec(),
             acceptance_marker: 4,
             offset,
-            chunk,
+            chunk: data,
             complete,
             ..Default::default()
         }
@@ -846,22 +957,60 @@ mod tests {
         let observed_by_handler = Arc::clone(&observed);
         let publish_response = expected_receipt.clone();
         let router = connectrpc::Router::new()
-            .route_client_stream(
+            .route_bidi_stream(
                 SERVICE,
                 "PublishBlob",
-                connectrpc::client_streaming_handler_fn(
-                    move |_ctx, mut requests: connectrpc::ServiceStream<api::PublishBlobRequest>| {
+                connectrpc::bidi_streaming_handler_fn(
+                    move |_ctx, requests: connectrpc::ServiceStream<api::PublishBlobRequest>| {
                         let observed = Arc::clone(&observed_by_handler);
                         let response = publish_response.clone();
                         async move {
-                            let mut frames = Vec::new();
-                            while let Some(frame) =
-                                poll_fn(|context| requests.as_mut().poll_next(context)).await
-                            {
-                                frames.push(frame?);
-                            }
-                            *observed.lock().unwrap() = frames;
-                            Ok::<_, connectrpc::ConnectError>(connectrpc::Response::new(response))
+                            let responses = futures::stream::try_unfold(
+                                (requests, observed, response, 0_u8),
+                                |(mut requests, observed, response, phase)| async move {
+                                    match phase {
+                                        0 => Ok(Some((
+                                            api::PublishBlobResponse {
+                                                frame: Some(
+                                                    api::publish_blob_response::Frame::Accepted(
+                                                        Box::new(api::PublishBlobAccepted {
+                                                            canonical_frame_bytes:
+                                                                blob_publish::CHUNK_BYTES as u32,
+                                                            ..Default::default()
+                                                        }),
+                                                    ),
+                                                ),
+                                                ..Default::default()
+                                            },
+                                            (requests, observed, response, 1),
+                                        ))),
+                                        1 => {
+                                            let mut frames = Vec::new();
+                                            while let Some(frame) = poll_fn(|context| {
+                                                requests.as_mut().poll_next(context)
+                                            })
+                                            .await
+                                            {
+                                                frames.push(frame?);
+                                            }
+                                            *observed.lock().unwrap() = frames;
+                                            Ok(Some((
+                                                api::PublishBlobResponse {
+                                                    frame: Some(
+                                                        api::publish_blob_response::Frame::Complete(
+                                                            Box::new(response.clone()),
+                                                        ),
+                                                    ),
+                                                    ..Default::default()
+                                                },
+                                                (requests, observed, response, 2),
+                                            )))
+                                        }
+                                        _ => Ok(None),
+                                    }
+                                },
+                            );
+                            connectrpc::Response::stream_ok(responses)
                         }
                     },
                 ),
@@ -872,12 +1021,12 @@ mod tests {
                 connectrpc::streaming_handler_fn(
                     |_ctx, _request: api::ReadBlobRequest| async move {
                         connectrpc::Response::stream_ok(connectrpc::stream_iter([
+                            Ok(read_page(0, vec![0x5a; blob_publish::CHUNK_BYTES], false)),
                             Ok(read_page(
-                                0,
-                                vec![0x5a; blob_publish::CHUNK_BYTES],
-                                false,
+                                blob_publish::CHUNK_BYTES as u64,
+                                vec![0x5a],
+                                true,
                             )),
-                            Ok(read_page(blob_publish::CHUNK_BYTES as u64, vec![0x5a], true)),
                         ]))
                     },
                 ),
@@ -914,19 +1063,24 @@ mod tests {
         assert_eq!(response, expected_receipt);
         {
             let frames = observed.lock().unwrap();
-            assert_eq!(frames.len(), 3);
+            assert_eq!(frames.len(), 4);
             assert!(matches!(
                 frames[0].frame,
                 Some(api::publish_blob_request::Frame::Metadata(_))
             ));
             assert!(matches!(
                 frames[1].frame.as_ref(),
-                Some(api::publish_blob_request::Frame::Chunk(chunk))
-                    if chunk.len() == blob_publish::CHUNK_BYTES
+                Some(api::publish_blob_request::Frame::Data(chunk))
+                    if chunk.offset == 0 && chunk.bytes.len() == blob_publish::CHUNK_BYTES
             ));
             assert!(matches!(
                 frames[2].frame.as_ref(),
-                Some(api::publish_blob_request::Frame::Chunk(chunk)) if chunk.len() == 1
+                Some(api::publish_blob_request::Frame::Data(chunk))
+                    if chunk.offset == blob_publish::CHUNK_BYTES as u64 && chunk.bytes.len() == 1
+            ));
+            assert!(matches!(
+                frames[3].frame,
+                Some(api::publish_blob_request::Frame::Finish(_))
             ));
         }
 
@@ -958,13 +1112,20 @@ mod tests {
     }
 
     async fn publish_error(error: connectrpc::ConnectError) -> MutationError {
-        let router = connectrpc::Router::new().route_client_stream(
+        let router = connectrpc::Router::new().route_bidi_stream(
             SERVICE,
             "PublishBlob",
-            connectrpc::client_streaming_handler_fn(
+            connectrpc::bidi_streaming_handler_fn(
                 move |_ctx, _requests: connectrpc::ServiceStream<api::PublishBlobRequest>| {
                     let error = error.clone();
-                    async move { Err::<connectrpc::Response<api::PublishBlobResponse>, _>(error) }
+                    async move {
+                        Err::<
+                            connectrpc::Response<
+                                connectrpc::ServiceStream<api::PublishBlobResponse>,
+                            >,
+                            _,
+                        >(error)
+                    }
                 },
             ),
         );
@@ -1063,15 +1224,15 @@ mod tests {
 
     #[tokio::test]
     async fn blob_native_http2_fixture_classifies_client_deadline_as_unknown() {
-        let router = connectrpc::Router::new().route_client_stream(
+        let router = connectrpc::Router::new().route_bidi_stream(
             SERVICE,
             "PublishBlob",
-            connectrpc::client_streaming_handler_fn(
+            connectrpc::bidi_streaming_handler_fn(
                 |_ctx, _requests: connectrpc::ServiceStream<api::PublishBlobRequest>| async move {
                     std::future::pending::<()>().await;
-                    Ok::<_, connectrpc::ConnectError>(connectrpc::Response::new(
-                        api::PublishBlobResponse::default(),
-                    ))
+                    connectrpc::Response::stream_ok(futures::stream::empty::<
+                        Result<api::PublishBlobResponse, connectrpc::ConnectError>,
+                    >())
                 },
             ),
         );

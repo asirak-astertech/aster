@@ -41,7 +41,7 @@ impl BlobConnectService {
         &self,
         ctx: RequestContext,
         mut requests: connectrpc::InboundStream<api::PublishBlobRequest>,
-    ) -> ServiceResult<api::PublishBlobResponse> {
+    ) -> ServiceResult<ServiceStream<api::PublishBlobResponse>> {
         let operation = PublicOperation::PublishBlob;
         if ctx.protocol() == Some(connectrpc::Protocol::GrpcWeb) {
             return Err(unsupported_transport(operation));
@@ -52,11 +52,11 @@ impl BlobConnectService {
             .ok_or_else(|| malformed(operation))?
             .map_err(|_| malformed(operation))?
             .to_owned_message();
-        let (parsed, mut grammar) = UploadGrammar::start(first, self.max_publish_bytes)?;
-        let _permit = Arc::clone(&self.uploads)
+        let (parsed, grammar) = UploadGrammar::start(first, self.max_publish_bytes)?;
+        let permit = Arc::clone(&self.uploads)
             .try_acquire_owned()
             .map_err(|_| resource_exhausted(operation))?;
-        let mut stream = self
+        let stream = self
             .blobs
             .open_publish_stream(BlobPublishStreamRequest {
                 publication: parsed.request,
@@ -65,23 +65,18 @@ impl BlobConnectService {
             })
             .await
             .map_err(|error| connect_blob_application_error(error, operation))?;
-        let mut offset = stream.durable_offset();
-
-        while let Some(frame) = requests.next().await {
-            let frame = frame.map_err(|_| malformed(operation))?.to_owned_message();
-            let chunk = Zeroizing::new(grammar.accept(frame)?);
-            let progress = stream
-                .write(offset, chunk)
-                .await
-                .map_err(|error| connect_blob_application_error(error, operation))?;
-            offset = progress.accepted_offset;
-        }
-        grammar.finish()?;
-        let result = stream
-            .finish()
-            .await
-            .map_err(|error| connect_blob_application_error(error, operation))?;
-        Ok(publish_response(result).into())
+        let durable_offset = stream.durable_offset();
+        let grammar = grammar.resume(durable_offset)?;
+        let state = PublishStreamState {
+            requests,
+            stream: Some(stream),
+            grammar: Some(grammar),
+            durable_offset,
+            accepted_pending: true,
+            complete: false,
+            _permit: permit,
+        };
+        Response::stream_ok(futures::stream::try_unfold(state, next_publish_response))
     }
 
     pub(crate) async fn read(
@@ -227,17 +222,32 @@ impl UploadGrammar {
         ))
     }
 
+    fn resume(mut self, durable_offset: u64) -> Result<Self, ConnectError> {
+        if durable_offset > self.total_len
+            || (durable_offset != self.total_len
+                && !durable_offset.is_multiple_of(BLOB_RPC_FRAME_BYTES as u64))
+        {
+            return Err(internal(PublicOperation::PublishBlob));
+        }
+        self.received = durable_offset;
+        self.frames = chunk_frames_for_len(durable_offset)?;
+        Ok(self)
+    }
+
     fn accept(&mut self, frame: api::PublishBlobRequest) -> Result<Vec<u8>, ConnectError> {
         let operation = PublicOperation::PublishBlob;
-        let api::publish_blob_request::Frame::Chunk(chunk) =
+        let api::publish_blob_request::Frame::Data(chunk) =
             frame.frame.ok_or_else(|| malformed(operation))?
         else {
             return Err(malformed(operation));
         };
-        if chunk.is_empty() || chunk.len() > BLOB_RPC_FRAME_BYTES {
+        if chunk.offset != self.received
+            || chunk.bytes.is_empty()
+            || chunk.bytes.len() > BLOB_RPC_FRAME_BYTES
+        {
             return Err(malformed(operation));
         }
-        let chunk_len = u64::try_from(chunk.len()).map_err(|_| malformed(operation))?;
+        let chunk_len = u64::try_from(chunk.bytes.len()).map_err(|_| malformed(operation))?;
         let remaining = self
             .total_len
             .checked_sub(self.received)
@@ -257,7 +267,7 @@ impl UploadGrammar {
         if self.frames > self.maximum_frames {
             return Err(malformed(operation));
         }
-        Ok(chunk)
+        Ok(chunk.bytes)
     }
 
     fn finish(self) -> Result<(), ConnectError> {
@@ -265,6 +275,77 @@ impl UploadGrammar {
             Ok(())
         } else {
             Err(malformed(PublicOperation::PublishBlob))
+        }
+    }
+}
+
+fn chunk_frames_for_len(len: u64) -> Result<u64, ConnectError> {
+    if len == 0 {
+        return Ok(0);
+    }
+    maximum_chunk_frames_for_len(len)
+}
+
+struct PublishStreamState {
+    requests: connectrpc::InboundStream<api::PublishBlobRequest>,
+    stream: Option<aster_node::application::SelectedBlobPublishStream>,
+    grammar: Option<UploadGrammar>,
+    durable_offset: u64,
+    accepted_pending: bool,
+    complete: bool,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+async fn next_publish_response(
+    mut state: PublishStreamState,
+) -> Result<Option<(api::PublishBlobResponse, PublishStreamState)>, ConnectError> {
+    let operation = PublicOperation::PublishBlob;
+    if state.complete {
+        return Ok(None);
+    }
+    if state.accepted_pending {
+        state.accepted_pending = false;
+        return Ok(Some((publish_accepted(state.durable_offset), state)));
+    }
+    loop {
+        let Some(frame) = state.requests.next().await else {
+            return Err(malformed(operation));
+        };
+        let frame = frame.map_err(|_| malformed(operation))?.to_owned_message();
+        if matches!(
+            frame.frame,
+            Some(api::publish_blob_request::Frame::Finish(_))
+        ) {
+            let grammar = state.grammar.take().ok_or_else(|| internal(operation))?;
+            grammar.finish()?;
+            if state.requests.next().await.is_some() {
+                return Err(malformed(operation));
+            }
+            let stream = state.stream.take().ok_or_else(|| internal(operation))?;
+            let result = stream
+                .finish()
+                .await
+                .map_err(|error| connect_blob_application_error(error, operation))?;
+            state.complete = true;
+            return Ok(Some((publish_complete(result), state)));
+        }
+        let grammar = state.grammar.as_mut().ok_or_else(|| internal(operation))?;
+        let offset = grammar.received;
+        let chunk = Zeroizing::new(grammar.accept(frame)?);
+        let stream = state.stream.as_mut().ok_or_else(|| internal(operation))?;
+        let progress = stream
+            .write(offset, chunk)
+            .await
+            .map_err(|error| connect_blob_application_error(error, operation))?;
+        if progress.accepted_offset != grammar.received
+            || progress.durable_offset < state.durable_offset
+            || progress.durable_offset > progress.accepted_offset
+        {
+            return Err(internal(operation));
+        }
+        if progress.durable_offset > state.durable_offset {
+            state.durable_offset = progress.durable_offset;
+            return Ok(Some((publish_checkpoint(progress), state)));
         }
     }
 }
@@ -439,8 +520,46 @@ fn parse_read_request(
     ))
 }
 
-fn publish_response(result: BlobPublishResult) -> api::PublishBlobResponse {
+fn publish_accepted(offset: u64) -> api::PublishBlobResponse {
     api::PublishBlobResponse {
+        frame: Some(api::publish_blob_response::Frame::Accepted(Box::new(
+            api::PublishBlobAccepted {
+                accepted_offset: offset,
+                durable_offset: offset,
+                canonical_frame_bytes: BLOB_RPC_FRAME_BYTES as u32,
+                ..Default::default()
+            },
+        ))),
+        ..Default::default()
+    }
+}
+
+fn publish_checkpoint(
+    progress: aster_node::application::BlobPublishProgress,
+) -> api::PublishBlobResponse {
+    api::PublishBlobResponse {
+        frame: Some(api::publish_blob_response::Frame::Checkpoint(Box::new(
+            api::PublishBlobCheckpoint {
+                accepted_offset: progress.accepted_offset,
+                durable_offset: progress.durable_offset,
+                ..Default::default()
+            },
+        ))),
+        ..Default::default()
+    }
+}
+
+fn publish_complete(result: BlobPublishResult) -> api::PublishBlobResponse {
+    api::PublishBlobResponse {
+        frame: Some(api::publish_blob_response::Frame::Complete(Box::new(
+            publish_receipt(result),
+        ))),
+        ..Default::default()
+    }
+}
+
+fn publish_receipt(result: BlobPublishResult) -> api::PublishBlobReceipt {
+    api::PublishBlobReceipt {
         id: result.id.as_bytes().to_vec(),
         publisher: result.publisher.to_vec(),
         publisher_counter: result.publisher_counter,
@@ -458,7 +577,7 @@ fn publish_response(result: BlobPublishResult) -> api::PublishBlobResponse {
 fn read_response(
     metadata: &ReadMetadata,
     offset: u64,
-    chunk: Vec<u8>,
+    data: Vec<u8>,
     complete: bool,
 ) -> api::ReadBlobResponse {
     api::ReadBlobResponse {
@@ -474,7 +593,7 @@ fn read_response(
         schema_id: metadata.schema_id.clone(),
         acceptance_marker: metadata.acceptance_marker,
         offset,
-        chunk,
+        chunk: data,
         complete,
         ..Default::default()
     }
@@ -633,9 +752,15 @@ mod tests {
         UploadGrammar::start(first, MAX_SELECTED_LIVE_BLOB_BYTES)
     }
 
-    fn chunk(bytes: Vec<u8>) -> api::PublishBlobRequest {
+    fn chunk(offset: u64, bytes: Vec<u8>) -> api::PublishBlobRequest {
         api::PublishBlobRequest {
-            frame: Some(api::publish_blob_request::Frame::Chunk(bytes)),
+            frame: Some(api::publish_blob_request::Frame::Data(Box::new(
+                api::PublishBlobData {
+                    offset,
+                    bytes,
+                    ..Default::default()
+                },
+            ))),
             ..Default::default()
         }
     }
@@ -665,7 +790,7 @@ mod tests {
             ErrorCode::InvalidArgument
         );
         assert_eq!(
-            start_upload(chunk(vec![1])).unwrap_err().code,
+            start_upload(chunk(0, vec![1])).unwrap_err().code,
             ErrorCode::InvalidArgument
         );
 
@@ -691,7 +816,7 @@ mod tests {
 
         let (_, mut empty_chunk) = start_upload(metadata_frame(1, None)).unwrap();
         assert_eq!(
-            empty_chunk.accept(chunk(Vec::new())).unwrap_err().code,
+            empty_chunk.accept(chunk(0, Vec::new())).unwrap_err().code,
             ErrorCode::InvalidArgument
         );
 
@@ -702,7 +827,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             oversized_chunk
-                .accept(chunk(vec![0; MAX_SELECTED_BLOB_PAGE_BYTES + 1]))
+                .accept(chunk(0, vec![0; MAX_SELECTED_BLOB_PAGE_BYTES + 1]))
                 .unwrap_err()
                 .code,
             ErrorCode::InvalidArgument
@@ -713,9 +838,38 @@ mod tests {
 
         let (_, mut long) = start_upload(metadata_frame(1, None)).unwrap();
         assert_eq!(
-            long.accept(chunk(vec![1, 2])).unwrap_err().code,
+            long.accept(chunk(0, vec![1, 2])).unwrap_err().code,
             ErrorCode::InvalidArgument
         );
+    }
+
+    #[test]
+    fn blob_upload_resumes_only_from_canonical_durable_offsets() {
+        let total = BLOB_RPC_FRAME_BYTES as u64 * 2 + 1;
+        let (_, grammar) = start_upload(metadata_frame(total, None)).unwrap();
+        let mut grammar = grammar.resume(BLOB_RPC_FRAME_BYTES as u64).unwrap();
+        assert_eq!(grammar.received, BLOB_RPC_FRAME_BYTES as u64);
+        assert_eq!(grammar.frames, 1);
+        assert_eq!(
+            grammar
+                .accept(chunk(0, vec![0; BLOB_RPC_FRAME_BYTES]))
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidArgument
+        );
+        grammar
+            .accept(chunk(
+                BLOB_RPC_FRAME_BYTES as u64,
+                vec![0; BLOB_RPC_FRAME_BYTES],
+            ))
+            .unwrap();
+        grammar
+            .accept(chunk(BLOB_RPC_FRAME_BYTES as u64 * 2, vec![0]))
+            .unwrap();
+        grammar.finish().unwrap();
+
+        let (_, grammar) = start_upload(metadata_frame(total, None)).unwrap();
+        assert_eq!(grammar.resume(1).unwrap_err().code, ErrorCode::DataLoss);
     }
 
     #[test]
@@ -780,201 +934,10 @@ mod tests {
         );
     }
 
-    #[cfg(any())]
-    #[tokio::test]
-    async fn cancelled_handler_keeps_upload_permit_until_node_operation_finishes() {
-        let uploads = Arc::new(Semaphore::new(1));
-        let permit = Arc::clone(&uploads).try_acquire_owned().unwrap();
-        let entered = Arc::new(Notify::new());
-        let release = Arc::new(Notify::new());
-        let operation_entered = Arc::clone(&entered);
-        let operation_release = Arc::clone(&release);
-        let handler = tokio::spawn(await_upload_with_permit(permit, async move {
-            operation_entered.notify_one();
-            operation_release.notified().await;
-        }));
-
-        entered.notified().await;
-        handler.abort();
-        assert!(handler.await.unwrap_err().is_cancelled());
-        assert!(
-            Arc::clone(&uploads).try_acquire_owned().is_err(),
-            "a cancelled handler must not release capacity while the node operation is live"
-        );
-
-        release.notify_one();
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            loop {
-                if Arc::clone(&uploads).try_acquire_owned().is_ok() {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("node completion releases upload capacity");
-    }
-
-    #[cfg(all(any(), target_os = "linux"))]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn blocking_writer_reports_the_final_write_failure_before_releasing_capacity() {
-        let uploads = Arc::new(Semaphore::new(1));
-        let permit = Arc::clone(&uploads).try_acquire_owned().unwrap();
-        let file = fs::OpenOptions::new()
-            .write(true)
-            .open("/dev/full")
-            .unwrap();
-        let (commands, receiver) = tokio::sync::mpsc::channel(1);
-        let task = tokio::task::spawn_blocking(move || run_blocking_writer(file, permit, receiver));
-        let (completed, result) = tokio::sync::oneshot::channel();
-        commands
-            .send(WriterCommand::Write(Zeroizing::new(vec![0x5a]), completed))
-            .await
-            .unwrap();
-
-        assert!(result.await.unwrap().is_err());
-        assert!(Arc::clone(&uploads).try_acquire_owned().is_err());
-        drop(commands);
-        task.await.unwrap();
-        assert!(Arc::clone(&uploads).try_acquire_owned().is_ok());
-    }
-
-    #[cfg(all(any(), target_os = "linux"))]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cancelled_blocking_write_keeps_capacity_until_current_io_and_cleanup_finish() {
-        use std::os::fd::AsRawFd as _;
-
-        let uploads = Arc::new(Semaphore::new(1));
-        let permit = Arc::clone(&uploads).try_acquire_owned().unwrap();
-        let fixture = StagingTestRoot::new();
-        let file_path = fixture.0.join("writer-cleanup");
-        let file = fs::File::create(&file_path).unwrap();
-        let descriptor_path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
-        let (commands, receiver) = tokio::sync::mpsc::channel(1);
-        let task = tokio::task::spawn_blocking(move || run_blocking_writer(file, permit, receiver));
-        let (completed, _result) = tokio::sync::oneshot::channel();
-        commands
-            .send(WriterCommand::Write(Zeroizing::new(vec![0x7b]), completed))
-            .await
-            .unwrap();
-
-        assert!(Arc::clone(&uploads).try_acquire_owned().is_err());
-        assert!(descriptor_path.exists());
-        drop(commands);
-        let reacquired = tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            loop {
-                if descriptor_path.exists() {
-                    assert!(Arc::clone(&uploads).try_acquire_owned().is_err());
-                    tokio::task::yield_now().await;
-                    continue;
-                }
-                if let Ok(permit) = Arc::clone(&uploads).try_acquire_owned() {
-                    break permit;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("writer cleanup deadline");
-        task.await.unwrap();
-        drop(reacquired);
-    }
-
-    #[cfg(all(any(), target_os = "linux"))]
-    #[test]
-    fn fallocate_failures_distinguish_capacity_from_unsupported_filesystems() {
-        assert_eq!(
-            classify_fallocate_error(rustix::io::Errno::NOSPC).code,
-            ErrorCode::ResourceExhausted
-        );
-        assert_eq!(
-            classify_fallocate_error(rustix::io::Errno::DQUOT).code,
-            ErrorCode::ResourceExhausted
-        );
-        assert_eq!(
-            classify_fallocate_error(rustix::io::Errno::OPNOTSUPP).code,
-            ErrorCode::FailedPrecondition
-        );
-    }
-
-    #[cfg(all(any(), target_os = "linux"))]
-    #[test]
-    fn staging_uses_pinned_directory_after_configured_path_is_replaced() {
-        use std::os::fd::AsRawFd as _;
-
-        let fixture = StagingTestRoot::new();
-        let configured = fixture.0.join("configured");
-        let pinned_location = fixture.0.join("pinned");
-        let redirect = fixture.0.join("redirect");
-        fs::create_dir(&configured).unwrap();
-        fs::create_dir(&redirect).unwrap();
-        let staging = PinnedStagingDirectory::open(&configured).unwrap();
-
-        fs::rename(&configured, &pinned_location).unwrap();
-        symlink(&redirect, &configured).unwrap();
-
-        let file = open_private_staging(&staging, 4096).unwrap();
-        let metadata = file.metadata().unwrap();
-        let descriptor_target =
-            fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).unwrap();
-        assert_eq!(metadata.len(), 4096);
-        assert_eq!(metadata.mode() & 0o777, 0o600);
-        assert!(
-            descriptor_target.starts_with(&pinned_location),
-            "the anonymous staging inode must belong to the pinned directory"
-        );
-        assert!(
-            fs::read_dir(&pinned_location).unwrap().next().is_none(),
-            "the pinned directory must not retain a linked staging name"
-        );
-        assert!(
-            fs::read_dir(&redirect).unwrap().next().is_none(),
-            "path replacement must not redirect staging"
-        );
-    }
-
-    #[cfg(all(any(), target_os = "linux"))]
-    #[test]
-    fn staging_accepts_a_configured_symlink_but_pins_its_exact_target() {
-        let fixture = StagingTestRoot::new();
-        let target = fixture.0.join("target");
-        let configured = fixture.0.join("configured");
-        let replacement = fixture.0.join("replacement");
-        fs::create_dir(&target).unwrap();
-        fs::create_dir(&replacement).unwrap();
-        symlink(&target, &configured).unwrap();
-
-        let staging = PinnedStagingDirectory::open(&configured).unwrap();
-        fs::remove_file(&configured).unwrap();
-        symlink(&replacement, &configured).unwrap();
-
-        let file = open_private_staging(&staging, 4096).unwrap();
-        assert_eq!(
-            file.metadata().unwrap().dev(),
-            fs::metadata(&target).unwrap().dev()
-        );
-        assert!(fs::read_dir(&replacement).unwrap().next().is_none());
-    }
-
     #[test]
     fn rpc_blob_frame_size_is_a_stable_agent_contract() {
         assert_eq!(crate::BLOB_RPC_FRAME_BYTES, 64 * 1024);
         assert_eq!(crate::BLOB_RPC_READ_FRAME_BYTES, 1024 * 1024);
-    }
-
-    #[cfg(all(any(), target_os = "linux"))]
-    #[test]
-    fn staging_reserves_real_blocks_before_upload_bytes_are_accepted() {
-        let fixture = StagingTestRoot::new();
-        let staging = PinnedStagingDirectory::open(&fixture.0).unwrap();
-        let total_len = 1024 * 1024;
-        let file = open_private_staging(&staging, total_len).unwrap();
-        let metadata = file.metadata().unwrap();
-        assert_eq!(metadata.len(), total_len);
-        assert!(
-            metadata.blocks() * 512 >= total_len,
-            "staging reservation must allocate blocks rather than create a sparse extent"
-        );
     }
 
     #[cfg(target_os = "linux")]

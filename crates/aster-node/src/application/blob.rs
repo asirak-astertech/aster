@@ -1264,6 +1264,9 @@ pub(crate) enum SelectedBlobCommand {
         token: [u8; 32],
         response: oneshot::Sender<Result<BlobPublishResult, ApplicationError>>,
     },
+    ClosePublishStream {
+        token: [u8; 32],
+    },
     OpenReadStream {
         request: BlobReadRequest,
         response: oneshot::Sender<Result<OpenedBlobReadStream, ApplicationError>>,
@@ -1321,6 +1324,7 @@ impl SelectedBlobCommand {
             Self::FinishPublishStream { response, .. } => {
                 _ = response.send(Err(actor_unavailable("blob stream finish")));
             }
+            Self::ClosePublishStream { .. } => {}
             Self::OpenReadStream { response, .. } => {
                 _ = response.send(Err(actor_unavailable("blob stream read open")));
             }
@@ -1378,6 +1382,7 @@ impl SelectedBlobCommand {
                     "blob stream finish",
                 )));
             }
+            Self::ClosePublishStream { .. } => {}
             Self::OpenReadStream { response, .. } => {
                 _ = response.send(Err(ApplicationError::new(
                     ApplicationErrorKind::ResourceLimit,
@@ -1803,6 +1808,11 @@ impl SelectedBlobNode {
                 _ = response.send(result);
                 Ok(())
             }
+            SelectedBlobCommand::ClosePublishStream { token } => {
+                self.publish_streams.remove(&token);
+                self.completed_publish_streams.remove(&token);
+                Ok(())
+            }
             SelectedBlobCommand::OpenReadStream { request, response } => {
                 let result = self.open_read_stream_inner(request);
                 _ = response.send(result);
@@ -1944,13 +1954,10 @@ impl SelectedBlobNode {
                     "blob stream open",
                 ));
             }
-            return Ok(OpenedBlobPublishStream {
-                token,
-                progress: BlobPublishProgress {
-                    accepted_offset: existing.accepted_offset,
-                    durable_offset: existing.pack.progress().durable_plaintext_offset(),
-                },
-            });
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::ResourceLimit,
+                "blob stream open",
+            ));
         }
         if !self.publish_streams.is_empty() {
             return Err(ApplicationError::new(
@@ -6178,6 +6185,119 @@ mod tests {
         drop(reader);
         drop(handle);
         worker.await.expect("join live Blob stream worker");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropped_live_publish_stream_reopens_at_its_durable_offset() {
+        let root = TestRoot::new("live-blob-publish-stream-resume-after-drop");
+        let mut node = selected_node(&root);
+        let identity = node.identity();
+        let mission_authority = node.mission_authority();
+        let admission = Arc::new(AtomicBool::new(true));
+        let worker_admission = Arc::clone(&admission);
+        let (commands, mut received) = mpsc::channel(2);
+        let handle = SelectedBlobHandle::new(
+            commands,
+            admission,
+            identity,
+            mission_authority,
+            MAX_SELECTED_LIVE_BLOB_BYTES,
+        );
+        let worker = tokio::task::spawn_blocking(move || {
+            while let Some(command) = received.blocking_recv() {
+                let SelectedApplicationCommand::Blob(command) = command else {
+                    panic!("resume test received another application class");
+                };
+                node.execute_live(command, &worker_admission)
+                    .expect("execute resume command");
+            }
+        });
+        let stream_request = BlobPublishStreamRequest {
+            publication: request(b"blob/live-stream/resume-after-drop"),
+            options: BlobPublishOptions::durable(),
+            total_len: 2 * BLOB_STREAM_SEGMENT_BYTES as u64,
+        };
+        let mut expected_bytes = vec![0x61; BLOB_STREAM_SEGMENT_BYTES];
+        expected_bytes.extend(vec![0x62; BLOB_STREAM_SEGMENT_BYTES]);
+        let premature = handle
+            .open_publish_stream(stream_request.clone())
+            .await
+            .expect("open premature stream");
+        assert_eq!(
+            premature
+                .finish()
+                .await
+                .expect_err("reject premature finish")
+                .kind(),
+            ApplicationErrorKind::InvalidRequest
+        );
+        let mut interrupted = handle
+            .open_publish_stream(stream_request.clone())
+            .await
+            .expect("open interrupted stream");
+        tokio::time::sleep(DEFAULT_BLOB_STREAM_CHECKPOINT_INTERVAL + Duration::from_millis(25))
+            .await;
+        interrupted
+            .write(0, Zeroizing::new(vec![0x61; BLOB_STREAM_SEGMENT_BYTES]))
+            .await
+            .expect("write checkpointed segment");
+        assert_eq!(
+            interrupted.durable_offset(),
+            BLOB_STREAM_SEGMENT_BYTES as u64
+        );
+        interrupted
+            .write(
+                BLOB_STREAM_SEGMENT_BYTES as u64,
+                Zeroizing::new(vec![0x62; 64 * 1024]),
+            )
+            .await
+            .expect("write uncheckpointed tail");
+        drop(interrupted);
+
+        let mut resumed = handle
+            .open_publish_stream(stream_request)
+            .await
+            .expect("reopen from durable authority");
+        let durable = resumed.durable_offset();
+        assert_eq!(durable, BLOB_STREAM_SEGMENT_BYTES as u64);
+        resumed
+            .write(
+                durable,
+                Zeroizing::new(vec![0x62; BLOB_STREAM_SEGMENT_BYTES]),
+            )
+            .await
+            .expect("replay tail from durable offset");
+        let published = resumed.finish().await.expect("finish resumed stream");
+        assert_eq!(published.total_len, 2 * BLOB_STREAM_SEGMENT_BYTES as u64);
+        assert_eq!(
+            published.id,
+            BlobId::from_bytes([
+                0x66, 0x76, 0xb9, 0xb5, 0xce, 0x4f, 0x1f, 0x3a, 0xc7, 0xbc, 0xd7, 0x82, 0x31, 0xbe,
+                0x44, 0x4d, 0xd8, 0x07, 0x3d, 0x8a, 0xf9, 0x95, 0x21, 0x82, 0x4e, 0x99, 0xf1, 0x79,
+                0xaa, 0xb6, 0x5b, 0x07,
+            ])
+        );
+
+        let mut reader = handle
+            .open_read_stream(BlobReadRequest {
+                id: published.id,
+                topic: blob_topic(),
+                scope: blob_scope(),
+            })
+            .await
+            .expect("open resumed Blob read stream");
+        let mut read_offset = 0_usize;
+        while let Some(frame) = reader.next(1024 * 1024).await.expect("read resumed Blob") {
+            assert_eq!(frame.offset, read_offset as u64);
+            let end = read_offset + frame.bytes.len();
+            assert_eq!(&*frame.bytes, &expected_bytes[read_offset..end]);
+            read_offset = end;
+        }
+        assert_eq!(read_offset, expected_bytes.len());
+
+        drop(reader);
+        drop(handle);
+        worker.await.expect("join resume worker");
     }
 
     struct CountingCursor {

@@ -151,6 +151,576 @@ fn blob_mission() -> UnprotectedReferenceMission {
 
 #[cfg(target_os = "linux")]
 #[test]
+#[ignore = "release-only local end-to-end Blob streaming benchmark"]
+fn real_node_blob_bidi_stream_benchmark() {
+    const TOTAL_LEN: u64 = 64 * 1024 * 1024;
+    const FRAME_LEN: usize = 64 * 1024;
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let state = TestState::new();
+        let node = start_node(NodeConfig {
+            state: state.0.clone(),
+            bind: "127.0.0.1:0".parse().expect("mesh bind"),
+            mission: blob_mission(),
+            peers: Vec::new(),
+            mutable_interests: MutableSourceInterests::default(),
+            sync_interval: Duration::from_millis(50),
+            run_for: None,
+            application: NodeApplication::Relay,
+        })
+        .await
+        .expect("start selected node");
+        let agent = BoundAgent::bind("127.0.0.1:0".parse().expect("agent bind"))
+            .await
+            .expect("bind agent");
+        let address = agent.local_addr().expect("agent address");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let server = tokio::spawn(
+            agent
+                .serve_with_blobs(
+                    node.selected_events(),
+                    node.selected_blobs(),
+                    node.state_root().to_path_buf(),
+                    ClientToken::from_bytes(TEST_TOKEN.to_vec()).expect("valid token"),
+                    shutdown_rx,
+                )
+                .expect("combined service"),
+        );
+        let client = api::AsterApplicationServiceClient::new(
+            Http2Connection::connect_plaintext(
+                format!("http://{address}").parse().expect("transport URI"),
+            )
+            .await
+            .expect("connect HTTP/2")
+            .shared(8),
+            ClientConfig::new(format!("http://{address}").parse().expect("client URI"))
+                .with_protocol(Protocol::Grpc)
+                .with_default_header(
+                    "authorization",
+                    format!("Bearer {}", String::from_utf8_lossy(TEST_TOKEN)),
+                ),
+        );
+
+        let started = std::time::Instant::now();
+        let mut call = client.publish_blob().await.expect("open publish RPC");
+        call.send(api::PublishBlobRequest {
+            frame: Some(api::publish_blob_request::Frame::Metadata(Box::new(
+                api::PublishBlobMetadata {
+                    operation_key: b"local-rpc-release-benchmark".to_vec(),
+                    topic: "imagery.maps".to_owned(),
+                    scope: "mission/team/alpha".to_owned(),
+                    priority: api::Priority::Routine.into(),
+                    total_len: TOTAL_LEN,
+                    ..Default::default()
+                },
+            ))),
+            ..Default::default()
+        })
+        .await
+        .expect("send metadata");
+        let accepted = call
+            .message::<api::PublishBlobResponse>()
+            .await
+            .expect("receive acceptance")
+            .expect("acceptance response")
+            .to_owned_message();
+        assert!(matches!(
+            accepted.frame,
+            Some(api::publish_blob_response::Frame::Accepted(ref accepted))
+                if accepted.durable_offset == 0 && accepted.accepted_offset == 0
+        ));
+        let (mut send, mut receive) = call.into_split();
+        let sender = async move {
+            let bytes = vec![0x5a; FRAME_LEN];
+            let mut offset = 0_u64;
+            while offset < TOTAL_LEN {
+                send.send(api::PublishBlobRequest {
+                    frame: Some(api::publish_blob_request::Frame::Data(Box::new(
+                        api::PublishBlobData {
+                            offset,
+                            bytes: bytes.clone(),
+                            ..Default::default()
+                        },
+                    ))),
+                    ..Default::default()
+                })
+                .await
+                .expect("send payload frame");
+                offset += FRAME_LEN as u64;
+            }
+            send.send(api::PublishBlobRequest {
+                frame: Some(api::publish_blob_request::Frame::Finish(Box::default())),
+                ..Default::default()
+            })
+            .await
+            .expect("send finish");
+            send.close_send();
+        };
+        let receiver = async move {
+            let mut checkpoints = 0_u64;
+            let mut receipt = None;
+            while let Some(response) = receive
+                .message::<api::PublishBlobResponse>()
+                .await
+                .expect("receive progress")
+            {
+                match response.to_owned_message().frame {
+                    Some(api::publish_blob_response::Frame::Checkpoint(_)) => checkpoints += 1,
+                    Some(api::publish_blob_response::Frame::Complete(complete)) => {
+                        receipt = Some(*complete)
+                    }
+                    _ => panic!("unexpected Blob progress frame"),
+                }
+            }
+            (checkpoints, receipt.expect("completion receipt"))
+        };
+        let ((), (checkpoints, receipt)) = tokio::join!(sender, receiver);
+        let elapsed = started.elapsed();
+        assert_eq!(receipt.total_len, TOTAL_LEN);
+        assert!(receipt.inserted);
+        assert!(checkpoints > 0);
+        eprintln!(
+            "blob_rpc_publish bytes={TOTAL_LEN} seconds={:.6} bytes_per_second={:.0} mebibytes_per_second={:.2} checkpoints={checkpoints}",
+            elapsed.as_secs_f64(),
+            TOTAL_LEN as f64 / elapsed.as_secs_f64(),
+            TOTAL_LEN as f64 / elapsed.as_secs_f64() / (1024.0 * 1024.0),
+        );
+
+        const RESUME_TOTAL: u64 = 20 * 1024 * 1024;
+        const FIRST_CHECKPOINT: u64 = 16 * 1024 * 1024;
+        let resume_metadata = || api::PublishBlobRequest {
+            frame: Some(api::publish_blob_request::Frame::Metadata(Box::new(
+                api::PublishBlobMetadata {
+                    operation_key: b"local-rpc-resume-benchmark".to_vec(),
+                    topic: "imagery.maps".to_owned(),
+                    scope: "mission/team/alpha".to_owned(),
+                    priority: api::Priority::Routine.into(),
+                    total_len: RESUME_TOTAL,
+                    ..Default::default()
+                },
+            ))),
+            ..Default::default()
+        };
+        let mut interrupted = client.publish_blob().await.expect("open interrupted RPC");
+        interrupted
+            .send(resume_metadata())
+            .await
+            .expect("send interrupted metadata");
+        let accepted = interrupted
+            .message::<api::PublishBlobResponse>()
+            .await
+            .expect("receive initial acceptance")
+            .expect("initial acceptance")
+            .to_owned_message();
+        assert!(matches!(
+            accepted.frame,
+            Some(api::publish_blob_response::Frame::Accepted(ref accepted))
+                if accepted.durable_offset == 0
+        ));
+        let resume_bytes = vec![0x39; FRAME_LEN];
+        let mut offset = 0_u64;
+        while offset < FIRST_CHECKPOINT {
+            interrupted
+                .send(api::PublishBlobRequest {
+                    frame: Some(api::publish_blob_request::Frame::Data(Box::new(
+                        api::PublishBlobData {
+                            offset,
+                            bytes: resume_bytes.clone(),
+                            ..Default::default()
+                        },
+                    ))),
+                    ..Default::default()
+                })
+                .await
+                .expect("send pre-interruption frame");
+            offset += FRAME_LEN as u64;
+        }
+        let durable_offset = loop {
+            let response = interrupted
+                .message::<api::PublishBlobResponse>()
+                .await
+                .expect("receive pre-interruption checkpoint")
+                .expect("checkpoint response")
+                .to_owned_message();
+            if let Some(api::publish_blob_response::Frame::Checkpoint(checkpoint)) = response.frame
+            {
+                break checkpoint.durable_offset;
+            }
+        };
+        assert!(durable_offset > 0);
+        assert!(durable_offset <= FIRST_CHECKPOINT);
+        assert_eq!(durable_offset % (1024 * 1024), 0);
+        interrupted
+            .send(api::PublishBlobRequest {
+                frame: Some(api::publish_blob_request::Frame::Data(Box::new(
+                    api::PublishBlobData {
+                        offset,
+                        bytes: resume_bytes.clone(),
+                        ..Default::default()
+                    },
+                ))),
+                ..Default::default()
+            })
+            .await
+            .expect("send uncheckpointed tail");
+        drop(interrupted);
+
+        let mut resumed = loop {
+            let mut candidate = client.publish_blob().await.expect("reopen publish RPC");
+            candidate
+                .send(resume_metadata())
+                .await
+                .expect("send resume metadata");
+            match candidate.message::<api::PublishBlobResponse>().await {
+                Ok(Some(response)) => break (candidate, response.to_owned_message()),
+                Err(error) if error.code == ErrorCode::ResourceExhausted => {
+                    tokio::task::yield_now().await;
+                }
+                other => panic!("resume negotiation failed: {other:?}"),
+            }
+        };
+        let accepted = resumed.1.frame.expect("resumed acceptance frame");
+        let api::publish_blob_response::Frame::Accepted(accepted) = accepted else {
+            panic!("expected resumed acceptance")
+        };
+        assert!(accepted.durable_offset >= durable_offset);
+        assert!(accepted.durable_offset <= FIRST_CHECKPOINT);
+        assert_eq!(accepted.durable_offset % (1024 * 1024), 0);
+        assert_eq!(accepted.accepted_offset, accepted.durable_offset);
+        let resumed_offset = accepted.durable_offset;
+        offset = resumed_offset;
+        while offset < RESUME_TOTAL {
+            let send_result = resumed
+                .0
+                .send(api::PublishBlobRequest {
+                    frame: Some(api::publish_blob_request::Frame::Data(Box::new(
+                        api::PublishBlobData {
+                            offset,
+                            bytes: resume_bytes.clone(),
+                            ..Default::default()
+                        },
+                    ))),
+                    ..Default::default()
+                })
+                .await;
+            if let Err(send_error) = send_result {
+                let server_error = resumed.0.message::<api::PublishBlobResponse>().await;
+                panic!(
+                    "send resumed frame failed at offset {offset}: send={send_error:?} server={server_error:?}"
+                );
+            }
+            offset += FRAME_LEN as u64;
+        }
+        resumed
+            .0
+            .send(api::PublishBlobRequest {
+                frame: Some(api::publish_blob_request::Frame::Finish(Box::default())),
+                ..Default::default()
+            })
+            .await
+            .expect("finish resumed publication");
+        resumed.0.close_send();
+        let mut resumed_complete = None;
+        while let Some(response) = resumed
+            .0
+            .message::<api::PublishBlobResponse>()
+            .await
+            .expect("receive resumed progress")
+        {
+            if let Some(api::publish_blob_response::Frame::Complete(complete)) =
+                response.to_owned_message().frame
+            {
+                resumed_complete = Some(*complete);
+            }
+        }
+        assert_eq!(
+            resumed_complete.expect("resumed completion").total_len,
+            RESUME_TOTAL
+        );
+        eprintln!(
+            "blob_rpc_resume durable_offset={resumed_offset} replayed_tail_bytes={} total_bytes={RESUME_TOTAL}",
+            FIRST_CHECKPOINT + FRAME_LEN as u64 - resumed_offset
+        );
+
+        shutdown_tx.send(true).expect("request agent shutdown");
+        server.await.expect("agent task").expect("agent shutdown");
+        node.shutdown().await.expect("node shutdown");
+    });
+}
+
+async fn assert_exact_blob_rpc_resume(
+    client: &api::AsterApplicationServiceClient<connectrpc::client::SharedHttp2Connection>,
+) {
+    const RESUME_FRAME: usize = 64 * 1024;
+    const RESUME_SEGMENT: u64 = 1024 * 1024;
+    const RESUME_TOTAL: u64 = 2 * RESUME_SEGMENT;
+    let resume_metadata = || api::PublishBlobRequest {
+        frame: Some(api::publish_blob_request::Frame::Metadata(Box::new(
+            api::PublishBlobMetadata {
+                operation_key: b"real-node-blob-exact-resume".to_vec(),
+                topic: "imagery.maps".to_owned(),
+                scope: "mission/team/alpha".to_owned(),
+                priority: api::Priority::Routine.into(),
+                media_type: Some("application/x-aster-test".to_owned()),
+                schema_id: b"schema/blob-v1".to_vec(),
+                total_len: RESUME_TOTAL,
+                ..Default::default()
+            },
+        ))),
+        ..Default::default()
+    };
+    let mut interrupted = client.publish_blob().await.expect("open exact-resume RPC");
+    interrupted
+        .send(resume_metadata())
+        .await
+        .expect("send exact-resume metadata");
+    let accepted = interrupted
+        .message::<api::PublishBlobResponse>()
+        .await
+        .expect("receive exact-resume acceptance")
+        .expect("exact-resume acceptance")
+        .to_owned_message();
+    assert!(matches!(
+        accepted.frame,
+        Some(api::publish_blob_response::Frame::Accepted(ref accepted))
+            if accepted.accepted_offset == 0
+                && accepted.durable_offset == 0
+                && accepted.canonical_frame_bytes == RESUME_FRAME as u32
+    ));
+    tokio::time::sleep(Duration::from_millis(275)).await;
+    let first = vec![0x61; RESUME_FRAME];
+    let mut resume_offset = 0_u64;
+    while resume_offset < RESUME_SEGMENT {
+        interrupted
+            .send(api::PublishBlobRequest {
+                frame: Some(api::publish_blob_request::Frame::Data(Box::new(
+                    api::PublishBlobData {
+                        offset: resume_offset,
+                        bytes: first.clone(),
+                        ..Default::default()
+                    },
+                ))),
+                ..Default::default()
+            })
+            .await
+            .expect("send checkpointed exact-resume frame");
+        resume_offset += RESUME_FRAME as u64;
+    }
+    let checkpoint = loop {
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            interrupted.message::<api::PublishBlobResponse>(),
+        )
+        .await
+        .expect("exact-resume checkpoint deadline")
+        .expect("receive exact-resume checkpoint")
+        .expect("exact-resume checkpoint response")
+        .to_owned_message();
+        if let Some(api::publish_blob_response::Frame::Checkpoint(checkpoint)) = response.frame {
+            break checkpoint;
+        }
+    };
+    assert_eq!(checkpoint.accepted_offset, RESUME_SEGMENT);
+    assert_eq!(checkpoint.durable_offset, RESUME_SEGMENT);
+    interrupted
+        .send(api::PublishBlobRequest {
+            frame: Some(api::publish_blob_request::Frame::Data(Box::new(
+                api::PublishBlobData {
+                    offset: RESUME_SEGMENT,
+                    bytes: vec![0x62; RESUME_FRAME],
+                    ..Default::default()
+                },
+            ))),
+            ..Default::default()
+        })
+        .await
+        .expect("send non-durable exact-resume tail");
+    drop(interrupted);
+
+    let (resumed, accepted) = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let mut candidate = client
+                .publish_blob()
+                .await
+                .expect("reopen exact-resume RPC");
+            candidate
+                .send(resume_metadata())
+                .await
+                .expect("resend exact-resume metadata");
+            match candidate.message::<api::PublishBlobResponse>().await {
+                Ok(Some(response)) => break (candidate, response.to_owned_message()),
+                Err(error) if error.code == ErrorCode::ResourceExhausted => {
+                    tokio::task::yield_now().await;
+                }
+                other => panic!("exact-resume negotiation failed: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("exact-resume cleanup deadline");
+    let Some(api::publish_blob_response::Frame::Accepted(accepted)) = accepted.frame else {
+        panic!("expected exact resumed acceptance")
+    };
+    assert_eq!(accepted.accepted_offset, RESUME_SEGMENT);
+    assert_eq!(accepted.durable_offset, RESUME_SEGMENT);
+    let (mut resumed_send, mut resumed_receive) = resumed.into_split();
+    let resumed_sender = async move {
+        let mut offset = RESUME_SEGMENT;
+        let second = vec![0x62; RESUME_FRAME];
+        while offset < RESUME_TOTAL {
+            resumed_send
+                .send(api::PublishBlobRequest {
+                    frame: Some(api::publish_blob_request::Frame::Data(Box::new(
+                        api::PublishBlobData {
+                            offset,
+                            bytes: second.clone(),
+                            ..Default::default()
+                        },
+                    ))),
+                    ..Default::default()
+                })
+                .await
+                .expect("send resumed exact-resume frame");
+            offset += RESUME_FRAME as u64;
+        }
+        resumed_send
+            .send(api::PublishBlobRequest {
+                frame: Some(api::publish_blob_request::Frame::Finish(Box::default())),
+                ..Default::default()
+            })
+            .await
+            .expect("finish exact-resume publication");
+        resumed_send.close_send();
+    };
+    let resumed_receiver = async move {
+        let mut receipt = None;
+        while let Some(response) = resumed_receive
+            .message::<api::PublishBlobResponse>()
+            .await
+            .expect("receive exact-resume completion")
+        {
+            if let Some(api::publish_blob_response::Frame::Complete(complete)) =
+                response.to_owned_message().frame
+            {
+                receipt = Some(*complete);
+            }
+        }
+        receipt.expect("exact-resume receipt")
+    };
+    let ((), resumed_receipt) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(resumed_sender, resumed_receiver)
+    })
+    .await
+    .expect("exact-resume completion deadline");
+    assert_eq!(
+        resumed_receipt.id,
+        [
+            0x66, 0x76, 0xb9, 0xb5, 0xce, 0x4f, 0x1f, 0x3a, 0xc7, 0xbc, 0xd7, 0x82, 0x31, 0xbe,
+            0x44, 0x4d, 0xd8, 0x07, 0x3d, 0x8a, 0xf9, 0x95, 0x21, 0x82, 0x4e, 0x99, 0xf1, 0x79,
+            0xaa, 0xb6, 0x5b, 0x07,
+        ]
+    );
+    let mut resumed_read = client
+        .read_blob(api::ReadBlobRequest {
+            id: resumed_receipt.id.clone(),
+            topic: "imagery.maps".to_owned(),
+            scope: "mission/team/alpha".to_owned(),
+            ..Default::default()
+        })
+        .await
+        .expect("open exact-resume read");
+    let mut resumed_bytes = Vec::new();
+    loop {
+        let page = tokio::time::timeout(Duration::from_secs(5), resumed_read.message())
+            .await
+            .expect("exact-resume read deadline")
+            .expect("read exact-resume page");
+        let Some(page) = page else { break };
+        resumed_bytes.extend_from_slice(&page.to_owned_message().chunk);
+    }
+    let mut expected_resumed = vec![0x61; RESUME_SEGMENT as usize];
+    expected_resumed.extend(vec![0x62; RESUME_SEGMENT as usize]);
+    assert_eq!(resumed_bytes, expected_resumed);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn real_node_blob_bidi_disconnect_resumes_exact_bytes() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let state = TestState::new();
+        let node = start_node(NodeConfig {
+            state: state.0.clone(),
+            bind: "127.0.0.1:0".parse().expect("mesh bind"),
+            mission: blob_mission(),
+            peers: Vec::new(),
+            mutable_interests: MutableSourceInterests::default(),
+            sync_interval: Duration::from_millis(50),
+            run_for: None,
+            application: NodeApplication::Relay,
+        })
+        .await
+        .expect("start exact-resume node");
+        let agent = BoundAgent::bind("127.0.0.1:0".parse().expect("agent bind"))
+            .await
+            .expect("bind exact-resume agent");
+        let address = agent.local_addr().expect("agent address");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let server = tokio::spawn(
+            agent
+                .serve_with_blobs(
+                    node.selected_events(),
+                    node.selected_blobs(),
+                    node.state_root().to_path_buf(),
+                    ClientToken::from_bytes(TEST_TOKEN.to_vec()).expect("valid token"),
+                    shutdown_rx,
+                )
+                .expect("construct exact-resume service"),
+        );
+        let client = api::AsterApplicationServiceClient::new(
+            Http2Connection::connect_plaintext(
+                format!("http://{address}")
+                    .parse()
+                    .expect("exact-resume transport URI"),
+            )
+            .await
+            .expect("connect exact-resume HTTP/2")
+            .shared(8),
+            ClientConfig::new(
+                format!("http://{address}")
+                    .parse()
+                    .expect("exact-resume client URI"),
+            )
+            .with_protocol(Protocol::Grpc)
+            .with_default_header(
+                "authorization",
+                format!("Bearer {}", String::from_utf8_lossy(TEST_TOKEN)),
+            ),
+        );
+
+        assert_exact_blob_rpc_resume(&client).await;
+
+        shutdown_tx
+            .send(true)
+            .expect("request exact-resume shutdown");
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("exact-resume agent shutdown timeout")
+            .expect("exact-resume agent task")
+            .expect("exact-resume agent serve");
+        node.shutdown().await.expect("exact-resume node shutdown");
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -208,6 +778,33 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
             ),
         );
 
+        macro_rules! publish_frames {
+            ($client:expr, $frames:expr) => {{
+                async {
+                    let mut call = $client.publish_blob().await?;
+                    for frame in $frames {
+                        call.send(frame).await?;
+                    }
+                    call.send(api::PublishBlobRequest {
+                        frame: Some(api::publish_blob_request::Frame::Finish(Box::default())),
+                        ..Default::default()
+                    })
+                    .await?;
+                    call.close_send();
+                    let mut receipt = None;
+                    while let Some(response) = call.message::<api::PublishBlobResponse>().await? {
+                        if let Some(api::publish_blob_response::Frame::Complete(complete)) =
+                            response.to_owned_message().frame
+                        {
+                            receipt = Some(*complete);
+                        }
+                    }
+                    receipt.ok_or_else(|| ConnectError::data_loss("missing Blob completion"))
+                }
+                .await
+            }};
+        }
+
         let pending_upload = |key: &'static [u8], polled: Arc<tokio::sync::Notify>| {
             let mut metadata = Some(api::PublishBlobRequest {
                 frame: Some(api::publish_blob_request::Frame::Metadata(Box::new(
@@ -247,27 +844,38 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
                     ..Default::default()
                 },
                 api::PublishBlobRequest {
-                    frame: Some(api::publish_blob_request::Frame::Chunk(vec![0x31])),
+                    frame: Some(api::publish_blob_request::Frame::Data(Box::new(
+                        api::PublishBlobData {
+                            offset: 0,
+                            bytes: vec![0x31],
+                            ..Default::default()
+                        },
+                    ))),
                     ..Default::default()
                 },
             ]
         };
         let cancelled_polled = Arc::new(tokio::sync::Notify::new());
         let cancelled_client = client.clone();
-        let cancelled_stream =
+        let mut cancelled_stream =
             pending_upload(b"real-node-blob-cancelled", Arc::clone(&cancelled_polled));
-        let cancelled =
-            tokio::spawn(async move { cancelled_client.publish_blob(cancelled_stream).await });
+        let cancelled_ready = Arc::clone(&cancelled_polled);
+        let cancelled = tokio::spawn(async move {
+            let mut call = cancelled_client.publish_blob().await?;
+            if let Some(frame) = futures::StreamExt::next(&mut cancelled_stream).await {
+                call.send(frame).await?;
+            }
+            let _ = call.message::<api::PublishBlobResponse>().await?;
+            cancelled_ready.notify_one();
+            futures::future::pending::<()>().await;
+            Ok::<(), ConnectError>(())
+        });
         cancelled_polled.notified().await;
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                let probe = client
-                    .publish_blob(connectrpc::stream_iter(one_byte_upload(
-                        b"real-node-capacity-probe",
-                        2,
-                    )))
-                    .await
-                    .expect_err("capacity probe is intentionally short");
+                let probe =
+                    publish_frames!(client, one_byte_upload(b"real-node-capacity-probe", 2))
+                        .expect_err("capacity probe is intentionally short");
                 if probe.code == ErrorCode::ResourceExhausted {
                     break;
                 }
@@ -281,14 +889,8 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
         assert!(cancelled.await.unwrap_err().is_cancelled());
         let recovered_cancelled = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                match client
-                    .publish_blob(connectrpc::stream_iter(one_byte_upload(
-                        b"real-node-blob-cancelled",
-                        1,
-                    )))
-                    .await
-                {
-                    Ok(response) => break response.into_owned(),
+                match publish_frames!(client, one_byte_upload(b"real-node-blob-cancelled", 1)) {
+                    Ok(response) => break response,
                     Err(error) if error.code == ErrorCode::ResourceExhausted => {
                         tokio::task::yield_now().await;
                     }
@@ -315,10 +917,18 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
             ),
         );
         let deadline_polled = Arc::new(tokio::sync::Notify::new());
-        let deadline_stream =
+        let mut deadline_stream =
             pending_upload(b"real-node-blob-deadline", Arc::clone(&deadline_polled));
-        let deadline_task =
-            tokio::spawn(async move { deadline_client.publish_blob(deadline_stream).await });
+        let deadline_ready = Arc::clone(&deadline_polled);
+        let deadline_task = tokio::spawn(async move {
+            let mut call = deadline_client.publish_blob().await?;
+            if let Some(frame) = futures::StreamExt::next(&mut deadline_stream).await {
+                call.send(frame).await?;
+            }
+            let _ = call.message::<api::PublishBlobResponse>().await?;
+            deadline_ready.notify_one();
+            call.message::<api::PublishBlobResponse>().await
+        });
         deadline_polled.notified().await;
         let deadline = deadline_task
             .await
@@ -354,13 +964,17 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
                 ..Default::default()
             },
             api::PublishBlobRequest {
-                frame: Some(api::publish_blob_request::Frame::Chunk(vec![0x44])),
+                frame: Some(api::publish_blob_request::Frame::Data(Box::new(
+                    api::PublishBlobData {
+                        offset: 0,
+                        bytes: vec![0x44],
+                        ..Default::default()
+                    },
+                ))),
                 ..Default::default()
             },
         ];
-        let grpc_web_error = grpc_web_client
-            .publish_blob(connectrpc::stream_iter(grpc_web_frames.clone()))
-            .await
+        let grpc_web_error = publish_frames!(grpc_web_client, grpc_web_frames.clone())
             .expect_err("gRPC-Web request streaming must be rejected");
         assert_public_reason(
             &grpc_web_error,
@@ -368,11 +982,8 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
             api::PublicErrorReason::UnsupportedValue,
             "publish_blob",
         );
-        let after_grpc_web = client
-            .publish_blob(connectrpc::stream_iter(grpc_web_frames))
-            .await
-            .expect("gRPC-Web rejection must not mutate Blob state")
-            .into_owned();
+        let after_grpc_web = publish_frames!(client, grpc_web_frames)
+            .expect("gRPC-Web rejection must not mutate Blob state");
         assert!(after_grpc_web.inserted);
 
         let payload = vec![0x5a; 65_536 + 3];
@@ -395,31 +1006,31 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
                 ..Default::default()
             },
             api::PublishBlobRequest {
-                frame: Some(api::publish_blob_request::Frame::Chunk(
-                    payload[..65_536].to_vec(),
-                )),
+                frame: Some(api::publish_blob_request::Frame::Data(Box::new(
+                    api::PublishBlobData {
+                        offset: 0,
+                        bytes: payload[..65_536].to_vec(),
+                        ..Default::default()
+                    },
+                ))),
                 ..Default::default()
             },
             api::PublishBlobRequest {
-                frame: Some(api::publish_blob_request::Frame::Chunk(
-                    payload[65_536..].to_vec(),
-                )),
+                frame: Some(api::publish_blob_request::Frame::Data(Box::new(
+                    api::PublishBlobData {
+                        offset: 65_536,
+                        bytes: payload[65_536..].to_vec(),
+                        ..Default::default()
+                    },
+                ))),
                 ..Default::default()
             },
         ];
-        let published = client
-            .publish_blob(connectrpc::stream_iter(frames.clone()))
-            .await
-            .expect("publish durable Blob")
-            .into_owned();
+        let published = publish_frames!(client, frames.clone()).expect("publish durable Blob");
         assert!(published.inserted);
         assert_eq!(published.ttl_ms, None);
         assert_eq!(published.total_len, payload.len() as u64);
-        let retried = client
-            .publish_blob(connectrpc::stream_iter(frames))
-            .await
-            .expect("retry durable Blob")
-            .into_owned();
+        let retried = publish_frames!(client, frames).expect("retry durable Blob");
         assert!(!retried.inserted);
         assert_eq!(retried.id, published.id);
         assert_eq!(retried.ttl_ms, None);
@@ -471,7 +1082,13 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
             ..Default::default()
         };
         let chunk_frame = |bytes| api::PublishBlobRequest {
-            frame: Some(api::publish_blob_request::Frame::Chunk(bytes)),
+            frame: Some(api::publish_blob_request::Frame::Data(Box::new(
+                api::PublishBlobData {
+                    offset: 0,
+                    bytes,
+                    ..Default::default()
+                },
+            ))),
             ..Default::default()
         };
         let malformed_cases = vec![
@@ -521,10 +1138,7 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
             ),
         ];
         for (label, frames, code, reason, rejected_key) in malformed_cases {
-            let error = client
-                .publish_blob(connectrpc::stream_iter(frames))
-                .await
-                .expect_err(label);
+            let error = publish_frames!(client, frames).expect_err(label);
             assert_public_reason_with_retryability(
                 &error,
                 code,
@@ -536,23 +1150,17 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
             let recovery_key = rejected_key
                 .map(<[u8]>::to_vec)
                 .unwrap_or_else(|| format!("real-node-recovery-{label}").into_bytes());
-            let recovered = client
-                .publish_blob(connectrpc::stream_iter(vec![
-                    metadata_frame(&recovery_key, 1),
-                    chunk_frame(vec![0x41]),
-                ]))
-                .await
-                .expect("every rejected stream must release staging and its upload permit")
-                .into_owned();
+            let recovered = publish_frames!(
+                client,
+                vec![metadata_frame(&recovery_key, 1), chunk_frame(vec![0x41]),]
+            )
+            .expect("every rejected stream must release staging and its upload permit");
             assert!(recovered.inserted);
-            let retry = client
-                .publish_blob(connectrpc::stream_iter(vec![
-                    metadata_frame(&recovery_key, 1),
-                    chunk_frame(vec![0x41]),
-                ]))
-                .await
-                .expect("exact-key recovery must remain idempotent")
-                .into_owned();
+            let retry = publish_frames!(
+                client,
+                vec![metadata_frame(&recovery_key, 1), chunk_frame(vec![0x41]),]
+            )
+            .expect("exact-key recovery must remain idempotent");
             assert!(!retry.inserted);
             assert_eq!(retry.id, recovered.id);
         }
@@ -568,8 +1176,9 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
         );
 
         let finite_payload = b"finite-blob".to_vec();
-        let finite = client
-            .publish_blob(connectrpc::stream_iter(vec![
+        let finite = publish_frames!(
+            client,
+            vec![
                 api::PublishBlobRequest {
                     frame: Some(api::publish_blob_request::Frame::Metadata(Box::new(
                         api::PublishBlobMetadata {
@@ -587,13 +1196,18 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
                     ..Default::default()
                 },
                 api::PublishBlobRequest {
-                    frame: Some(api::publish_blob_request::Frame::Chunk(finite_payload)),
+                    frame: Some(api::publish_blob_request::Frame::Data(Box::new(
+                        api::PublishBlobData {
+                            offset: 0,
+                            bytes: finite_payload,
+                            ..Default::default()
+                        },
+                    ))),
                     ..Default::default()
                 },
-            ]))
-            .await
-            .expect("publish finite Blob")
-            .into_owned();
+            ]
+        )
+        .expect("publish finite Blob");
         assert_eq!(finite.ttl_ms, Some(1_000));
         tokio::time::sleep(Duration::from_millis(1_100)).await;
 

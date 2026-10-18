@@ -3,6 +3,42 @@
 This file records development evidence for semantic v9/profile 5. It is not
 device qualification and does not replace the three-CM4 acceptance run.
 
+## 2026-10-18 bidirectional application-RPC loopback
+
+The profile-5 application boundary now uses a bidirectional `PublishBlob`
+grammar: metadata is followed by a Store-authoritative accepted offset,
+offset-bearing 64-KiB data frames, monotonic durable checkpoints, an explicit
+finish frame, and a terminal publication receipt. The agent feeds these frames
+directly into the single-pass node stream; `asterctl` seeks an already-open
+regular file to the accepted durable offset before sending payload bytes.
+
+A release-only real-node benchmark exercised the complete local path (HTTP/2
+gRPC client, agent grammar and backpressure, application actor, encryption,
+append-only pack, durable checkpoints, promotion, and completion response):
+
+| Payload | Elapsed | Rate | Durable checkpoint responses |
+| ---: | ---: | ---: | ---: |
+| 64 MiB | 1.632833 s | 39.20 MiB/s | 6 |
+
+This is approximately 25.3 times the earlier 1.55-MiB/s CM4 application
+publish baseline. It is workstation loopback evidence, not a CM4, radio,
+Jetson, replication, or transport-limited qualification result. It does show
+that the new application streaming protocol does not reintroduce the old
+whole-file staging or per-frame transaction bottleneck.
+
+The same run forced an interruption after sending 16 MiB plus a partial 64-KiB
+tail. The 250-ms checkpoint cadence had durably committed 11 MiB. Reopening the
+same operation returned exactly that Store-authoritative offset, replayed
+5,308,416 bytes, and completed a 20-MiB publication. This caught and fixed an
+actor-session lifecycle defect where a dropped publish handle had previously
+left accepted-but-nondurable state active.
+
+Reproduction command:
+
+```text
+cargo test --release --locked -p aster-agent --all-features real_node_blob_bidi_stream_benchmark -- --ignored --nocapture
+```
+
 ## 2026-10-16 local loopback ceilings
 
 The merged semantic-v8/profile-4 selected-stack benchmark transferred 64 MiB

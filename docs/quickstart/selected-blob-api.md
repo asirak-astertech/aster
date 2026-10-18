@@ -162,13 +162,21 @@ exactly `"ttlMs": "60000"`; durable JSON omits `ttlMs`. The value is the
 original authenticated lifetime, never a countdown or deletion time. Blob
 plaintext is written only to the requested output and is never printed.
 
-The RPC and CLI use checked `u64` lengths and bounded 64-KiB frames/pages; they
+The publish RPC and CLI use checked `u64` lengths and canonical 64-KiB data
+frames, with only the terminal data frame shorter; read pages remain bounded. They
 do not promise a fixed total-size ceiling. Configured profile-5 depot bounds
 determine large-object admission. Ordinary RPCs retain a 10-second default and
 30-second maximum. Progressing `PublishBlob` and `ReadBlob` streams may request
 up to 1,800 seconds and remain bounded by connection lifetime and progress
 checks. These values describe this implementation, not durable RPC semantics
 or performance qualification.
+
+Blob publication is a bidirectional protocol. The client sends metadata first,
+waits for the Store-authoritative durable offset, seeks its open regular file,
+and then sends explicit canonical `(offset, bytes)` frames followed by finish. The agent
+returns monotonic durable checkpoints during transfer and the publication
+receipt only after promotion. A retry with the same operation key resumes from
+the returned durable offset; non-durable tail bytes are replayed.
 
 `blob-read` currently requires Linux, a destination directory owned by the
 current user and not writable by group or other users, and a filesystem that

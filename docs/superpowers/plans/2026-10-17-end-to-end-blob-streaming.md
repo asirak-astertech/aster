@@ -510,11 +510,11 @@ git commit -m "feat(node): stream Blob application sessions"
 - Consumes: Task 5 node publish/read sessions.
 - Produces: bidirectional `PublishBlob` accepted/checkpoint/complete responses, operation-key resume from a durable offset, and direct streaming `ReadBlob` frames for operators.
 
-- [ ] **Step 1: Write failing protobuf/grammar tests**
+- [x] **Step 1: Write failing protobuf/grammar tests**
 
-Change `PublishBlob` to bidirectional streaming. Request variants are `metadata`, `data { offset, bytes }`, and `finish`; response variants are `accepted { durable_offset, max_frame_bytes }`, `checkpoint { durable_offset }`, and `complete { publication }`. Require metadata first and exactly one finish after declared bytes. Tests reject data-before-accept, offset gaps, oversized chunks, premature finish, extra frames, and mismatched complete metadata.
+Change `PublishBlob` to bidirectional streaming. Request variants are `metadata`, `data { offset, bytes }`, and `finish`; response variants are `accepted { durable_offset, canonical_frame_bytes }`, `checkpoint { durable_offset }`, and `complete { publication }`. Require metadata first, every non-terminal data frame to have exactly the advertised canonical size, the terminal data frame to carry the exact remainder, and exactly one finish after declared bytes. Tests reject data-before-accept, offset gaps, noncanonical data frames, premature finish, extra frames, and mismatched complete metadata.
 
-- [ ] **Step 2: Regenerate bindings and verify RED**
+- [x] **Step 2: Regenerate bindings and verify RED**
 
 Run: `cargo test --locked -p aster-agent blob_upload --lib`
 
@@ -522,23 +522,29 @@ The crate build script regenerates ConnectRPC bindings from `proto/aster/applica
 
 Expected: service tests fail until the bidi bridge is implemented.
 
-- [ ] **Step 3: Replace whole-file staging with direct node-session bridging**
+- [x] **Step 3: Replace whole-file staging with direct node-session bridging**
 
 Delete `PinnedStagingDirectory`, `PreparedUpload`, and `BlockingUploadWriter` from the profile-5 route. After metadata, open Task 5 session, send `accepted`, forward bounded frames under ConnectRPC backpressure, emit only Store-authoritative checkpoints, and send `complete` after promotion. On disconnect retain resumable Store state; never acknowledge non-durable bytes as resume authority.
 
-- [ ] **Step 4: Write the disconnect/reopen integration test from Review Focus**
+- [x] **Step 4: Write the disconnect/reopen integration test from Review Focus**
 
-Publish more than one durability batch, disconnect after accepted non-checkpointed bytes, reopen with the same operation key, assert returned offset equals the last durable checkpoint, seek/replay from that offset, and verify final `BlobId` and bytes exactly once.
+In a non-ignored real-node/agent HTTP/2 test, force a deterministic durability
+checkpoint, disconnect after accepted non-checkpointed bytes, reopen with the
+same operation key, assert the returned offset equals that exact checkpoint,
+seek/replay from that offset, and verify the final `BlobId` and bytes exactly.
+Keep the larger multi-batch disconnect case in the ignored release performance
+test so routine CI proves protocol correctness without making throughput-scale
+work part of the fast gate.
 
-- [ ] **Step 5: Implement seekable CLI resume and mutation checks**
+- [x] **Step 5: Implement seekable CLI resume and mutation checks**
 
 `asterctl` sends metadata, waits for `accepted`, seeks the already-open regular file to `durable_offset`, streams `(offset, bytes)` frames, and verifies checkpoints never regress or exceed sent data. Continue checking source length and descriptor identity through completion so replacement/truncation fails visibly.
 
-- [ ] **Step 6: Bridge `ReadBlob` to one Task 5 read session**
+- [x] **Step 6: Bridge `ReadBlob` to one Task 5 read session**
 
 Remove page-by-page node admission. Stream bounded plaintext responses from `SelectedBlobReadStream`, keep metadata stable, and close the session on client cancellation. The CLI retains its owner-only temporary output, exact offset validation, one final file sync, no-replace rename, and directory sync.
 
-- [ ] **Step 7: Run focused agent/CLI tests**
+- [x] **Step 7: Run focused agent/CLI tests**
 
 Run: `cargo test --locked -p aster-agent blob --lib --tests`
 
@@ -546,7 +552,7 @@ Run: `cargo test --locked -p asterctl blob --lib --tests`
 
 Expected: grammar, disconnect/resume, cancellation, no-replace output, exact hash, and bounded-frame tests pass.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add proto/aster/application/v1alpha1/aster.proto crates/aster-agent/src/blob_service.rs crates/aster-agent/src/lib.rs crates/aster-agent/src/event_service.rs crates/aster-agent/tests/real_node_connect.rs crates/asterctl/src/blob_publish.rs crates/asterctl/src/blob_read.rs crates/asterctl/src/client.rs crates/asterctl/tests/blob.rs
