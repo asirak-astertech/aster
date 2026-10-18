@@ -150,9 +150,9 @@ use crate::{
     format_node_id, format_path_field, format_receipt_field,
     frame::{
         BlobInterest, BlobInterestSelector, BlobObjectId, BlobPublicationAbsentV1,
-        BlobPublicationCommitV1, BlobPublicationOpenV1, BlobRangeDisposition,
-        BridgeRouteDisposition, EventApplyDisposition, EventDirection, EventInterest,
-        EventInterestSelector, Frame, FrameEmissionPolicy, MAX_EVENT_INTEREST_BYTES,
+        BlobPublicationCommitV1, BlobPublicationOpenV1, BlobPublicationResumeV1,
+        BlobRangeDisposition, BridgeRouteDisposition, EventApplyDisposition, EventDirection,
+        EventInterest, EventInterestSelector, Frame, FrameEmissionPolicy, MAX_EVENT_INTEREST_BYTES,
         MAX_OBJECT_BYTES, MutableApplyDisposition, MutableClass, MutableTransferId,
     },
     mission::{
@@ -22345,29 +22345,20 @@ impl DeferredBlobCursorSettlement {
     }
 }
 
-fn blob_stream_cursor_settlement(
+fn settle_completed_blob_stream_cursor(
     store: &Store,
-    peer: NodeId,
-    direction: EventDirection,
-    source: BlobTransferId,
-    deferred: Option<DeferredBlobCursorSettlement>,
-) -> Result<DeferredBlobCursorSettlement, NodeError> {
-    if let Some(deferred) = deferred {
-        if deferred.peer != peer || deferred.direction != direction || deferred.source != source {
-            return Err(NodeError::Protocol(
-                "deferred Blob cursor settlement differs from stream selection".into(),
-            ));
-        }
-        return Ok(deferred);
+    settlement: &mut Option<DeferredBlobCursorSettlement>,
+    outcome: blob_stream::BlobStreamAttemptOutcome,
+) -> Result<(), NodeError> {
+    if matches!(
+        outcome.code,
+        crate::stream_transfer::StreamResultCode::Promoted
+            | crate::stream_transfer::StreamResultCode::AlreadyPresent
+    ) && let Some(settlement) = settlement.take()
+    {
+        settlement.settle(store)?;
     }
-    let expected = store.mutable_transfer_cursor(
-        peer,
-        MutableTransferCursorClass::Blob,
-        mutable_transfer_cursor_mode(direction),
-    )?;
-    Ok(DeferredBlobCursorSettlement::new(
-        peer, direction, expected, source,
-    ))
+    Ok(())
 }
 
 const fn mutable_lane_fetch_result_exchanges(direction: EventDirection) -> usize {
@@ -25891,7 +25882,7 @@ async fn request_completed_pack_publication(
     direction: EventDirection,
     source: Option<&blob_stream::CompletedPackStreamSource>,
     receipt: &mut PeerReceipt,
-) -> Result<bool, NodeError> {
+) -> Result<Option<BlobPublicationResumeV1>, NodeError> {
     let Some(source) = source else {
         let absent = BlobPublicationAbsentV1 { direction };
         let response = request_mission_frame(
@@ -25906,7 +25897,7 @@ async fn request_completed_pack_publication(
                 "absent Blob publication acknowledgement differs".into(),
             ));
         }
-        return Ok(false);
+        return Ok(None);
     };
 
     let signed_open = source.publication.authenticated_open().to_vec();
@@ -25938,12 +25929,23 @@ async fn request_completed_pack_publication(
         receipt,
     )
     .await?;
-    if response != Frame::BlobPublicationCommit(BlobPublicationCommitV1 { signed_commitment }) {
+    let Frame::BlobPublicationResume(resume) = response else {
         return Err(NodeError::Protocol(
-            "Blob publication-commit acknowledgement differs".into(),
+            "Blob publication commitment lacks receiver resume authority".into(),
+        ));
+    };
+    if resume.direction != direction
+        || resume.stream_id != *source.open.open().stream_id().as_bytes()
+        || resume.open_digest != source.open.open().digest()
+        || resume.durable_plaintext_offset > source.open.open().total_len()
+        || resume.durable_wire_offset > source.publication.wire_len()
+        || resume.next_segment_index > source.commitment.commitment().segment_count()
+    {
+        return Err(NodeError::Protocol(
+            "Blob publication resume authority differs".into(),
         ));
     }
-    Ok(true)
+    Ok(Some(resume))
 }
 
 async fn respond_completed_pack_publication(
@@ -26004,7 +26006,7 @@ async fn respond_completed_pack_publication(
                     "Blob publication open was not followed by commitment".into(),
                 ));
             };
-            admitted = Some(blob_stream::admit_completed_pack_source(
+            let received = blob_stream::admit_completed_pack_source(
                 store,
                 mission,
                 verifier,
@@ -26012,8 +26014,10 @@ async fn respond_completed_pack_publication(
                 local_interest,
                 &signed_open,
                 &commitment.signed_commitment,
-            )?);
-            Ok((Frame::BlobPublicationCommit(commitment), true))
+            )?;
+            let resume = received.resume_authority(direction);
+            admitted = Some(received);
+            Ok((Frame::BlobPublicationResume(resume), true))
         })
         .await?;
     account(receipt, request_bytes, response_bytes)?;
@@ -26224,7 +26228,7 @@ async fn sync_mutable_classes(
                 guard,
                 &exchange.peer_interest,
             )?;
-            if request_completed_pack_publication(
+            if let Some(resume) = request_completed_pack_publication(
                 connection,
                 mission,
                 EventDirection::ToSessionResponder,
@@ -26240,10 +26244,12 @@ async fn sync_mutable_classes(
                     guard,
                     EventDirection::ToSessionResponder,
                     to_responder.expect("advertised completed pack source"),
+                    resume,
                     profile_digest,
                 ))
                 .await?;
                 receipt.account_blob_stream_attempt(outcome)?;
+                settle_completed_blob_stream_cursor(store, &mut exchange.to_responder, outcome)?;
             }
             let to_initiator = respond_completed_pack_publication(
                 store,
@@ -26268,6 +26274,7 @@ async fn sync_mutable_classes(
                 ))
                 .await?;
                 receipt.account_blob_stream_attempt(outcome)?;
+                settle_completed_blob_stream_cursor(store, &mut exchange.to_initiator, outcome)?;
             }
             let _ = (
                 exchange.to_responder.take(),
@@ -29354,7 +29361,7 @@ async fn serve_mutable_classes(
                 guard,
                 &exchange.peer_interest,
             )?;
-            if request_completed_pack_publication(
+            if let Some(resume) = request_completed_pack_publication(
                 connection,
                 mission,
                 EventDirection::ToSessionInitiator,
@@ -29370,6 +29377,7 @@ async fn serve_mutable_classes(
                     guard,
                     EventDirection::ToSessionInitiator,
                     to_initiator.expect("advertised completed pack source"),
+                    resume,
                     profile_digest,
                 ))
                 .await?;
@@ -33158,12 +33166,22 @@ mod tests {
         .unwrap();
         let peer = services.other.identity();
         let source = BlobTransferId::new([0x37; 32]);
-        let settlement = DeferredBlobCursorSettlement::new(
+        let mut settlement = Some(DeferredBlobCursorSettlement::new(
             peer,
             EventDirection::ToSessionResponder,
             None,
             source,
-        );
+        ));
+        let metrics = blob_stream::BlobStreamAttemptMetrics {
+            transport: BlobStreamTransport::IrohQuicV1,
+            received_bytes: 0,
+            retransmitted_bytes: 0,
+            receive_limit_bytes: 0,
+            checkpoint_bytes: 0,
+            checkpoint_latency_ms: 0,
+            writer_commits: 0,
+            failover_recoveries: 0,
+        };
 
         assert_eq!(
             store
@@ -33175,7 +33193,36 @@ mod tests {
                 .unwrap(),
             None
         );
-        settlement.settle(&store).unwrap();
+        settle_completed_blob_stream_cursor(
+            &store,
+            &mut settlement,
+            blob_stream::BlobStreamAttemptOutcome {
+                code: crate::stream_transfer::StreamResultCode::DeferredCapacity,
+                metrics,
+            },
+        )
+        .unwrap();
+        assert!(settlement.is_some());
+        assert_eq!(
+            store
+                .mutable_transfer_cursor(
+                    peer,
+                    MutableTransferCursorClass::Blob,
+                    MutableTransferCursorMode::OfferToPeer,
+                )
+                .unwrap(),
+            None
+        );
+        settle_completed_blob_stream_cursor(
+            &store,
+            &mut settlement,
+            blob_stream::BlobStreamAttemptOutcome {
+                code: crate::stream_transfer::StreamResultCode::Promoted,
+                metrics,
+            },
+        )
+        .unwrap();
+        assert!(settlement.is_none());
         assert_eq!(
             store
                 .mutable_transfer_cursor(
@@ -50138,8 +50185,7 @@ mod tests {
         blob_ranges_stream_completion_case(Some(true)).await;
     }
 
-    #[tokio::test]
-    async fn blob_stream_provisional_contact_uses_publisher_signed_stream_authority() {
+    async fn blob_stream_completed_pack_resume_case(preseed_segments: usize) {
         let mut missions = issue_missions(2);
         let source_mission = missions.pop().unwrap();
         let receiver_mission = missions.pop().unwrap();
@@ -50153,8 +50199,8 @@ mod tests {
                 false,
             )])
         };
-        let source_root = root("blob-stream-provisional-source");
-        let receiver_root = root("blob-stream-provisional-receiver");
+        let source_root = root(&format!("blob-stream-resume-{preseed_segments}-source"));
+        let receiver_root = root(&format!("blob-stream-resume-{preseed_segments}-receiver"));
         fs::create_dir_all(&source_root).unwrap();
         fs::create_dir_all(&receiver_root).unwrap();
         #[cfg(unix)]
@@ -50206,6 +50252,73 @@ mod tests {
             Arc::new(Store::open_for_mission(source_root.join(STORE_FILE), authority).unwrap());
         let receiver_store =
             Arc::new(Store::open_for_mission(receiver_root.join(STORE_FILE), authority).unwrap());
+        let receiver_credentials = receiver_mission.credentials.clone();
+        let source_policy = source_store.control_policy_snapshot().unwrap();
+        let source_publication = source_store
+            .blob_stream_for_content_with_policy(
+                &source_policy,
+                &topic,
+                &scope,
+                aster_mesh::BlobId::from_bytes(*published.id.as_bytes()),
+            )
+            .unwrap()
+            .expect("source stream publication");
+        let verifier = open_test_sealer(&receiver_credentials);
+        let open = verifier
+            .verify_blob_stream_open(source_publication.authenticated_open())
+            .expect("verify source stream open");
+        let commitment = verifier
+            .verify_blob_stream_commitment(&open, source_publication.authenticated_commitment())
+            .expect("verify source stream commitment");
+        let receiver_policy = receiver_store.control_policy_snapshot().unwrap();
+        let operation =
+            aster_redb_store::BlobOperationKey::new(open.open().operation_key().to_vec())
+                .expect("stream operation key");
+        let (reservation, _) = receiver_store
+            .reserve_blob_stream_with_policy(
+                &receiver_policy,
+                aster_redb_store::BlobStreamReservationRequest {
+                    operation: &operation,
+                    source: aster_redb_store::BlobStreamSource::AuthenticatedPeer(
+                        source_mission.identity,
+                    ),
+                },
+                &open,
+            )
+            .expect("reserve receiver resume pack");
+        let mut receiver_pack = receiver_store
+            .open_blob_stream_pack_session(&receiver_policy, &reservation, &open)
+            .expect("open receiver resume pack");
+        let mut source_reader = source_store
+            .open_blob_stream_read_session_with_policy(
+                &source_policy,
+                &source_publication,
+                &open,
+                &commitment,
+            )
+            .expect("open source pack reader");
+        let mut decryptor = verifier
+            .begin_blob_stream_decrypt(&open)
+            .expect("open receiver resume decryptor");
+        for _ in 0..preseed_segments {
+            let encoded = source_reader
+                .next_encrypted_segment()
+                .expect("read source segment")
+                .expect("source segment for durable resume prefix");
+            let segment = aster_mesh::EncryptedBlobStreamSegment::decode(&encoded)
+                .expect("decode source segment");
+            let plaintext = decryptor
+                .decrypt_segment(&segment)
+                .expect("authenticate source segment");
+            receiver_pack
+                .append_encoded_segment(&plaintext, &segment, &encoded)
+                .expect("append receiver resume segment");
+        }
+        let resumed = receiver_pack
+            .checkpoint(&receiver_store, &receiver_policy)
+            .expect("checkpoint receiver resume segment");
+        let durable_wire_offset = resumed.durable_wire_offset();
+        drop(receiver_pack);
         let (received, sent, _, _) = TEST_SEMANTIC_VERSION
             .scope(
                 std::cell::Cell::new(Some(SEMANTIC_PROTOCOL_V9)),
@@ -50221,6 +50334,11 @@ mod tests {
             .await;
         assert_eq!(received.blob_stream_attempts, 1);
         assert_eq!(sent.blob_stream_attempts, 1);
+        assert_eq!(
+            received.blob_stream_received_bytes,
+            source_publication.wire_len() - durable_wire_offset,
+            "resumed contact transfers only the missing encrypted suffix"
+        );
         let policy = receiver_store.control_policy_snapshot().unwrap();
         let received = receiver_store
             .blob_stream_for_content_with_policy(
@@ -50238,6 +50356,16 @@ mod tests {
         drop(receiver_store);
         fs::remove_dir_all(source_root).unwrap();
         fs::remove_dir_all(receiver_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn blob_stream_resume_transfers_only_the_missing_suffix() {
+        blob_stream_completed_pack_resume_case(1).await;
+    }
+
+    #[tokio::test]
+    async fn blob_stream_resume_settles_after_all_data_is_durable() {
+        blob_stream_completed_pack_resume_case(2).await;
     }
 
     #[tokio::test]

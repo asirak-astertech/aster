@@ -1052,8 +1052,9 @@ Semantic v9 reserves mechanics tags `0xd6` `StreamOpenV1`, `0xd7`
 `StreamAcceptV1`, `0xd8` `StreamDataV1`, `0xd9` `StreamCheckpointV1`, `0xda`
 `StreamFinishV1`, `0xdb` `StreamResultV1`, and `0xdc` `StreamResultAckV1` for
 profile 5. Semantic v9 also reserves ordinary mission-protected mechanics tags
-`0xdd` `BlobPublicationOpenV1` and `0xde` `BlobPublicationCommitV1`. Tags `0xd1..0xd5`
-and every semantic-v7/v8 byte retain their existing meanings.
+`0xdd` `BlobPublicationOpenV1`, `0xde` `BlobPublicationCommitV1`, `0xdf`
+`BlobPublicationAbsentV1`, and `0xe0` `BlobPublicationResumeV1`. Tags
+`0xd1..0xd5` and every semantic-v7/v8 byte retain their existing meanings.
 
 The publisher first emits `BlobPublicationOpenV1` containing the provider-signed
 canonical `BlobStreamOpen`. Its body is `semantic_version u16 = 9 || profile_id
@@ -1067,6 +1068,23 @@ the logical stream ID, publisher, mission, operation key, metadata, declared
 plaintext length, content epoch, policy revision, authorization digest, and
 publication salt. The final commitment binds that open, both accumulator roots,
 segment count, final custody, and resulting Blob identity.
+
+For completed-publication transfer, the requester sends the signed open and
+the responder returns the same open before accepting its signed final
+commitment. The responder then returns its durable authority as
+`BlobPublicationResumeV1`; a source without the requested publication returns
+the direction-bound `BlobPublicationAbsentV1`. Their bodies are:
+
+| Tag | Body after prefix and tag |
+| --- | --- |
+| `0xdf` BlobPublicationAbsentV1 | `semantic_version u16 = 9 || profile_id u16 = 5 || direction u8` |
+| `0xe0` BlobPublicationResumeV1 | `semantic_version u16 = 9 || profile_id u16 = 5 || direction u8 || stream_id[32] || open_digest[32] || durable_plaintext_offset u64 || durable_wire_offset u64 || next_segment_index u64 || plaintext_commitment[32] || ciphertext_commitment[32] || checkpoint_generation u64` |
+
+The resume record is receiver-authored. Stream and open identities and both
+commitments are nonzero. Generation zero is canonical only with zero offsets,
+zero next-segment index, and the profile-5 initial commitments; any durable
+progress requires a nonzero generation. The sender must match the subsequent
+`StreamAcceptV1` exactly to this authority before sending data.
 
 Each transport attempt reuses the signed logical open and chooses a fresh,
 nonzero attempt nonce. The receiver is authoritative for resume: it supplies
@@ -1091,6 +1109,16 @@ The canonical attempt record bodies are:
 | `0xda` StreamFinishV1 | `attempt tuple || final_plaintext_offset u64 || final_ciphertext_offset u64 || signed_commitment_len u32 || signed_commitment[signed_commitment_len]` |
 | `0xdb` StreamResultV1 | `attempt tuple || final_plaintext_offset u64 || final_ciphertext_offset u64 || result_code u8 || blob_id[32] || result_digest[32]` |
 | `0xdc` StreamResultAckV1 | `attempt tuple || result_digest[32]` |
+
+Each attempt-stream record has one outer kind byte. `0xa0 || protected` carries
+exactly one mission-AEAD-protected control record and must not carry
+`StreamDataV1`. `0xa1 || StreamDataV1` carries canonical data directly and may
+not carry a control record. Direct data remains bound to the authenticated QUIC
+peer and attempt tuple, contains already segment-AEAD-protected pack bytes, and
+is accepted durably only after segment verification; the publisher-signed open
+and final commitment bind the complete logical publication. This avoids a
+second whole-extent mission encryption/copy while retaining end-to-end content
+authentication. Unknown outer kinds fail closed.
 
 `class = 1` is Blob. Result codes are `1` Promoted, `2` AlreadyPresent, `3`
 DeferredCapacity, `4` RetiredExpired, `5` RejectedPolicy, and `6`
@@ -2257,7 +2285,7 @@ and visible quota/eviction policy. Evictions and conflicts surface to the app.
 | semantic-v7/v8/v9 lane | 1 Event, 2 State, 3 Record, 4 Blob, 5 EventBridge; critical extension bit `0x8000` |
 | semantic-v7/v8/v9 transfer profile | 1 `LegacyV6`, 2 `EventPagesV1`, 3 reserved `BlobCustodyV1` (not offered or selected), 4 `BlobRangesStreamV1` (Blob only; v7 durable-only, v8 authenticated custody), 5 `BlobStreamV1` (Blob only; v9); critical extension bit `0x8000` |
 | semantic-v7/v8 mechanics tag | `0xd1` TransferProfileOfferV1, `0xd2` EventTurnPlanV1, `0xd3` ChangeTurnHeaderV1, `0xd4` ChangePageV7, `0xd5` ChangeTurnFinishedV1 |
-| semantic-v9 Blob stream tag | `0xd6` StreamOpenV1, `0xd7` StreamAcceptV1, `0xd8` StreamDataV1, `0xd9` StreamCheckpointV1, `0xda` StreamFinishV1, `0xdb` StreamResultV1, `0xdc` StreamResultAckV1 (profile-5 attempt context); `0xdd` BlobPublicationOpenV1 and `0xde` BlobPublicationCommitV1 (mission-protected publication context); all invalid before v9 |
+| semantic-v9 Blob stream tag | `0xd6` StreamOpenV1, `0xd7` StreamAcceptV1, `0xd8` StreamDataV1, `0xd9` StreamCheckpointV1, `0xda` StreamFinishV1, `0xdb` StreamResultV1, `0xdc` StreamResultAckV1 (profile-5 attempt context); `0xdd` BlobPublicationOpenV1, `0xde` BlobPublicationCommitV1, `0xdf` BlobPublicationAbsentV1, and `0xe0` BlobPublicationResumeV1 (mission-protected publication context); attempt-stream outer kind `0xa0` is mission-protected control and `0xa1` is canonical direct data; all invalid before v9 |
 | source envelope format | 2 singleton hybrid authentication; semantics 2 through 9 add 3 content-committing batch authentication |
 | batch authentication mode | 1 exact proof reference, Merkle path, and P-256 item signature |
 | suite | `0x0001` provisional hybrid reference suite |

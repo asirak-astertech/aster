@@ -892,8 +892,18 @@ impl StreamReceiverState {
         max_extent: u32,
         checkpoint_batch: u32,
     ) -> Result<Self, StreamError> {
-        if previous_nonce == &open.attempt_nonce
-            || open.checkpoint_generation != authority.checkpoint_generation
+        if previous_nonce == &open.attempt_nonce {
+            return Err(StreamError::invalid("stream retry authority differs"));
+        }
+        Self::new_from_authority(open, authority, max_extent, checkpoint_batch)
+    }
+    pub(crate) fn new_from_authority(
+        open: &StreamOpenV1,
+        authority: StreamCheckpointAuthorityV1,
+        max_extent: u32,
+        checkpoint_batch: u32,
+    ) -> Result<Self, StreamError> {
+        if open.checkpoint_generation != authority.checkpoint_generation
             || authority.durable_ciphertext_offset > open.total_len
         {
             return Err(StreamError::invalid("stream retry authority differs"));
@@ -1314,7 +1324,7 @@ mod replacement_profile_five_vectors {
             let fields: Vec<_> = line.split('\t').collect();
             let bytes = unhex(fields[3]);
             let decoded = match fields[1] {
-                "publication-open" | "publication-commit" => {
+                "publication-open" | "publication-commit" | "publication-resume" => {
                     crate::frame::Frame::decode_for_semantic_profile(&bytes, 9, 5)
                         .and_then(|frame| {
                             frame.encode_for_semantic_profile(9, 5).and_then(|encoded| {
@@ -1350,7 +1360,7 @@ mod replacement_profile_five_vectors {
             );
             count += 1;
         }
-        assert_eq!(count, 28);
+        assert_eq!(count, 33);
     }
 }
 

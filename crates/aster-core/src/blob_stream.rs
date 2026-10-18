@@ -641,6 +641,24 @@ impl BlobStreamDecryptor {
         })
     }
 
+    pub(crate) fn from_key_checkpoint(
+        open: &VerifiedBlobStreamOpen,
+        content_grant_seed: [u8; 32],
+        next_offset: u64,
+        checkpoint: BlobStreamAccumulatorCheckpoint,
+    ) -> Result<Self, BlobError> {
+        if checkpoint.domain() != BlobStreamAccumulatorDomain::Ciphertext
+            || next_offset > open.open.total_len
+        {
+            return Err(BlobError::InvalidManifest);
+        }
+        let mut decryptor = Self::from_key(open, content_grant_seed)?;
+        decryptor.next_index = checkpoint.next_index();
+        decryptor.next_offset = next_offset;
+        decryptor.ciphertext_accumulator = BlobStreamAccumulator::restore(checkpoint)?;
+        Ok(decryptor)
+    }
+
     pub fn decrypt_segment(
         &mut self,
         segment: &EncryptedBlobStreamSegment,

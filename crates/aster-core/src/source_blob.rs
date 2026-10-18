@@ -704,6 +704,37 @@ impl ReferenceEnvelopeSealer {
         result
     }
 
+    /// Restores receiver authentication at one durable pack checkpoint without
+    /// replaying or decrypting the already committed ciphertext prefix.
+    pub fn resume_blob_stream_decrypt(
+        &self,
+        open: &VerifiedBlobStreamOpen,
+        next_plaintext_offset: u64,
+        ciphertext_checkpoint: BlobStreamAccumulatorCheckpoint,
+    ) -> Result<BlobStreamDecryptor, EnvelopeError> {
+        if open.mission_authority_id() != self.mission_authority_id() {
+            return Err(blob_stream_authentication_error(
+                BlobError::AuthenticationFailed,
+            ));
+        }
+        let mut seed = self
+            .blob_stream_content_grant_seed(
+                open.open().scope(),
+                open.open().topic(),
+                open.open().content_epoch(),
+            )
+            .ok_or_else(|| blob_stream_authentication_error(BlobError::AuthenticationFailed))?;
+        let result = BlobStreamDecryptor::from_key_checkpoint(
+            open,
+            seed,
+            next_plaintext_offset,
+            ciphertext_checkpoint,
+        )
+        .map_err(blob_stream_authentication_error);
+        seed.zeroize();
+        result
+    }
+
     /// Reports whether this node owns the exact route capability for a Blob scope epoch.
     pub fn can_route_blob(&self, scope: &Scope, epoch: u64) -> bool {
         self.can_route_event(scope, epoch)

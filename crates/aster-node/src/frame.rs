@@ -96,6 +96,7 @@ const CHANGE_TURN_FINISHED_V1: u8 = 0xd5;
 const BLOB_PUBLICATION_OPEN_V1: u8 = 0xdd;
 const BLOB_PUBLICATION_COMMIT_V1: u8 = 0xde;
 const BLOB_PUBLICATION_ABSENT_V1: u8 = 0xdf;
+const BLOB_PUBLICATION_RESUME_V1: u8 = 0xe0;
 const MAX_SIGNED_BLOB_PUBLICATION_BYTES: usize = 1_048_576;
 pub(crate) const MAX_OBJECT_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_BLOB_RANGE_BYTES: usize = 16 * 1024;
@@ -148,6 +149,19 @@ pub(crate) struct BlobPublicationCommitV1 {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct BlobPublicationAbsentV1 {
     pub(crate) direction: EventDirection,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BlobPublicationResumeV1 {
+    pub(crate) direction: EventDirection,
+    pub(crate) stream_id: [u8; 32],
+    pub(crate) open_digest: [u8; 32],
+    pub(crate) durable_plaintext_offset: u64,
+    pub(crate) durable_wire_offset: u64,
+    pub(crate) next_segment_index: u64,
+    pub(crate) plaintext_commitment: [u8; 32],
+    pub(crate) ciphertext_commitment: [u8; 32],
+    pub(crate) checkpoint_generation: u64,
 }
 
 /// Bounded operator emission state disclosed only as a protected v3 response.
@@ -920,11 +934,10 @@ pub(crate) enum Frame {
     ChangeTurnHeader(ChangeTurnHeaderV1),
     ChangePage(ChangePageV7),
     ChangeTurnFinished(ChangeTurnFinishedV1),
-    BlobStreamPlan(BlobStreamPlanV1),
-    BlobStreamPlanReply(BlobStreamPlanV1),
     BlobPublicationOpen(BlobPublicationOpenV1),
     BlobPublicationCommit(BlobPublicationCommitV1),
     BlobPublicationAbsent(BlobPublicationAbsentV1),
+    BlobPublicationResume(BlobPublicationResumeV1),
     #[allow(dead_code)] // Activated by the profile-5 runtime driver.
     Stream(StreamFrame),
 }
@@ -1559,11 +1572,6 @@ impl Frame {
                         .map_err(|error| NodeError::Protocol(error.to_string()))?,
                 );
             }
-            Self::BlobStreamPlan(_) | Self::BlobStreamPlanReply(_) => {
-                return Err(NodeError::Protocol(
-                    "carrier-oriented Blob stream plans are not profile-5 records".into(),
-                ));
-            }
             Self::BlobPublicationOpen(open) => {
                 output.push(BLOB_PUBLICATION_OPEN_V1);
                 encode_blob_publication(&mut output, &open.signed_open)?;
@@ -1577,6 +1585,21 @@ impl Frame {
                 output.extend_from_slice(&9_u16.to_be_bytes());
                 output.extend_from_slice(&5_u16.to_be_bytes());
                 output.push(absent.direction.encode());
+            }
+            Self::BlobPublicationResume(resume) => {
+                validate_blob_publication_resume(resume)?;
+                output.push(BLOB_PUBLICATION_RESUME_V1);
+                output.extend_from_slice(&9_u16.to_be_bytes());
+                output.extend_from_slice(&5_u16.to_be_bytes());
+                output.push(resume.direction.encode());
+                output.extend_from_slice(&resume.stream_id);
+                output.extend_from_slice(&resume.open_digest);
+                output.extend_from_slice(&resume.durable_plaintext_offset.to_be_bytes());
+                output.extend_from_slice(&resume.durable_wire_offset.to_be_bytes());
+                output.extend_from_slice(&resume.next_segment_index.to_be_bytes());
+                output.extend_from_slice(&resume.plaintext_commitment);
+                output.extend_from_slice(&resume.ciphertext_commitment);
+                output.extend_from_slice(&resume.checkpoint_generation.to_be_bytes());
             }
             Self::Stream(_) => {
                 return Err(NodeError::Protocol(
@@ -1749,11 +1772,10 @@ impl Frame {
     const fn is_v9_only(&self) -> bool {
         matches!(
             self,
-            Self::BlobStreamPlan(_)
-                | Self::BlobStreamPlanReply(_)
-                | Self::BlobPublicationOpen(_)
+            Self::BlobPublicationOpen(_)
                 | Self::BlobPublicationCommit(_)
                 | Self::BlobPublicationAbsent(_)
+                | Self::BlobPublicationResume(_)
         )
     }
 
@@ -2361,6 +2383,37 @@ impl Frame {
                     direction: EventDirection::decode(body[4])?,
                 }))
             }
+            BLOB_PUBLICATION_RESUME_V1 => {
+                if body.len() != 165
+                    || u16::from_be_bytes(body[..2].try_into().expect("fixed slice")) != 9
+                    || u16::from_be_bytes(body[2..4].try_into().expect("fixed slice")) != 5
+                {
+                    return Err(NodeError::Protocol(
+                        "Blob publication resume context differs".into(),
+                    ));
+                }
+                let resume = BlobPublicationResumeV1 {
+                    direction: EventDirection::decode(body[4])?,
+                    stream_id: body[5..37].try_into().expect("fixed slice"),
+                    open_digest: body[37..69].try_into().expect("fixed slice"),
+                    durable_plaintext_offset: u64::from_be_bytes(
+                        body[69..77].try_into().expect("fixed slice"),
+                    ),
+                    durable_wire_offset: u64::from_be_bytes(
+                        body[77..85].try_into().expect("fixed slice"),
+                    ),
+                    next_segment_index: u64::from_be_bytes(
+                        body[85..93].try_into().expect("fixed slice"),
+                    ),
+                    plaintext_commitment: body[93..125].try_into().expect("fixed slice"),
+                    ciphertext_commitment: body[125..157].try_into().expect("fixed slice"),
+                    checkpoint_generation: u64::from_be_bytes(
+                        body[157..165].try_into().expect("fixed slice"),
+                    ),
+                };
+                validate_blob_publication_resume(&resume)?;
+                Ok(Self::BlobPublicationResume(resume))
+            }
             _ => Err(NodeError::Protocol(
                 "unknown or malformed mechanics frame".into(),
             )),
@@ -2396,8 +2449,31 @@ const fn is_v7_only_tag(tag: u8) -> bool {
 const fn is_v9_only_tag(tag: u8) -> bool {
     matches!(
         tag,
-        BLOB_PUBLICATION_OPEN_V1 | BLOB_PUBLICATION_COMMIT_V1 | BLOB_PUBLICATION_ABSENT_V1
+        BLOB_PUBLICATION_OPEN_V1
+            | BLOB_PUBLICATION_COMMIT_V1
+            | BLOB_PUBLICATION_ABSENT_V1
+            | BLOB_PUBLICATION_RESUME_V1
     )
+}
+
+fn validate_blob_publication_resume(resume: &BlobPublicationResumeV1) -> Result<(), NodeError> {
+    let initial = resume.checkpoint_generation == 0;
+    if resume.stream_id == [0; 32]
+        || resume.open_digest == [0; 32]
+        || resume.plaintext_commitment == [0; 32]
+        || resume.ciphertext_commitment == [0; 32]
+        || (initial
+            && (resume.plaintext_commitment != [1; 32] || resume.ciphertext_commitment != [1; 32]))
+        || initial
+            != (resume.durable_plaintext_offset == 0
+                && resume.durable_wire_offset == 0
+                && resume.next_segment_index == 0)
+    {
+        return Err(NodeError::Protocol(
+            "Blob publication resume authority is invalid".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn encode_blob_publication(output: &mut Vec<u8>, signed: &[u8]) -> Result<(), NodeError> {
@@ -2432,81 +2508,6 @@ fn decode_blob_publication(body: &[u8]) -> Result<Vec<u8>, NodeError> {
         ));
     }
     Ok(body[8..].to_vec())
-}
-
-#[allow(dead_code)] // Removed by the profile-5 runtime migration task.
-fn validate_blob_stream_plan_selection(
-    selection: BlobStreamPlanSelectionV1,
-) -> Result<(), NodeError> {
-    if selection.checkpoint_generation == 0 {
-        return Err(NodeError::Protocol(
-            "Blob stream plan checkpoint generation is zero".into(),
-        ));
-    }
-    if (selection.next_carrier_index == 0) != (selection.durable_offset == 0) {
-        return Err(NodeError::Protocol(
-            "Blob stream plan checkpoint origin differs".into(),
-        ));
-    }
-    Ok(())
-}
-
-#[allow(dead_code)] // Removed by the profile-5 runtime migration task.
-fn encode_blob_stream_plan(output: &mut Vec<u8>, plan: &BlobStreamPlanV1) -> Result<(), NodeError> {
-    output.push(plan.direction.encode());
-    match plan.selection {
-        None => output.push(0),
-        Some(selection) => {
-            validate_blob_stream_plan_selection(selection)?;
-            output.push(1);
-            output.extend_from_slice(selection.source_id.as_bytes());
-            output.extend_from_slice(&selection.next_carrier_index.to_be_bytes());
-            output.extend_from_slice(&selection.durable_offset.to_be_bytes());
-            output.extend_from_slice(&selection.checkpoint_generation.to_be_bytes());
-        }
-    }
-    Ok(())
-}
-
-#[allow(dead_code)] // Removed by the profile-5 runtime migration task.
-fn decode_blob_stream_plan(body: &[u8]) -> Result<BlobStreamPlanV1, NodeError> {
-    let (direction, body) = decode_direction(body)?;
-    let Some((&present, body)) = body.split_first() else {
-        return Err(NodeError::Protocol(
-            "Blob stream plan selection flag is missing".into(),
-        ));
-    };
-    let selection = match present {
-        0 if body.is_empty() => None,
-        1 if body.len() == 56 => {
-            let source_id = BlobTransferId::new(body[..32].try_into().map_err(|_| {
-                NodeError::Protocol("Blob stream plan source identifier differs".into())
-            })?);
-            let selection = BlobStreamPlanSelectionV1 {
-                source_id,
-                next_carrier_index: u64::from_be_bytes(body[32..40].try_into().map_err(|_| {
-                    NodeError::Protocol("Blob stream plan carrier index differs".into())
-                })?),
-                durable_offset: u64::from_be_bytes(body[40..48].try_into().map_err(|_| {
-                    NodeError::Protocol("Blob stream plan durable offset differs".into())
-                })?),
-                checkpoint_generation: u64::from_be_bytes(body[48..56].try_into().map_err(
-                    |_| NodeError::Protocol("Blob stream plan generation differs".into()),
-                )?),
-            };
-            validate_blob_stream_plan_selection(selection)?;
-            Some(selection)
-        }
-        _ => {
-            return Err(NodeError::Protocol(
-                "Blob stream plan selection encoding differs".into(),
-            ));
-        }
-    };
-    Ok(BlobStreamPlanV1 {
-        direction,
-        selection,
-    })
 }
 
 fn validate_semantic_version(semantic_version: u16) -> Result<(), NodeError> {
@@ -3934,6 +3935,33 @@ mod tests {
         );
         assert!(frame.encode_for_semantic_version(8).is_err());
         assert!(Frame::decode_for_semantic_version(&encoded, 8).is_err());
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert!(Frame::decode_for_semantic_version(&trailing, 9).is_err());
+    }
+
+    #[test]
+    fn blob_publication_resume_binds_receiver_durable_authority() {
+        let frame = Frame::BlobPublicationResume(BlobPublicationResumeV1 {
+            direction: EventDirection::ToSessionResponder,
+            stream_id: [0x11; 32],
+            open_digest: [0x22; 32],
+            durable_plaintext_offset: 1_048_576,
+            durable_wire_offset: 1_048_754,
+            next_segment_index: 1,
+            plaintext_commitment: [0x33; 32],
+            ciphertext_commitment: [0x44; 32],
+            checkpoint_generation: 1,
+        });
+        let encoded = frame
+            .encode_for_semantic_version(9)
+            .expect("encode Blob resume authority");
+        assert_eq!(encoded[4], BLOB_PUBLICATION_RESUME_V1);
+        assert_eq!(
+            Frame::decode_for_semantic_version(&encoded, 9).expect("decode Blob resume authority"),
+            frame
+        );
+        assert!(frame.encode_for_semantic_version(8).is_err());
         let mut trailing = encoded;
         trailing.push(0);
         assert!(Frame::decode_for_semantic_version(&trailing, 9).is_err());

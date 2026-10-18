@@ -162,6 +162,16 @@ pub struct BlobStreamReadSession {
 }
 
 impl BlobStreamReadSession {
+    pub fn resume_at(
+        &mut self,
+        next_segment_index: u64,
+        wire_offset: u64,
+    ) -> Result<(), StoreError> {
+        self.reader.resume_at(next_segment_index, wire_offset)?;
+        self.next_index = next_segment_index;
+        Ok(())
+    }
+
     pub fn next_encrypted_segment(&mut self) -> Result<Option<Vec<u8>>, StoreError> {
         let mut encoded = Vec::new();
         if !self.reader.read_segment(self.next_index, &mut encoded)? {
@@ -276,6 +286,16 @@ impl BlobStreamDurableProgress {
 
     pub const fn durable_pack_len(self) -> u64 {
         self.durable_pack_len
+    }
+
+    /// Durable bytes of canonical encrypted segment records, excluding the
+    /// local-only fixed pack header.
+    pub const fn durable_wire_offset(self) -> u64 {
+        if self.durable_pack_len == 0 {
+            0
+        } else {
+            self.durable_pack_len - PACK_HEADER_LEN
+        }
     }
 }
 

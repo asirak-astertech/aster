@@ -7,7 +7,7 @@ use crate::application::{
     BlobStreamTerminalCategory, BlobStreamTransferPhase, BlobStreamTransferStatus,
 };
 use crate::{
-    frame::{BlobInterest, BlobStreamPlanSelectionV1, BlobStreamPlanV1},
+    frame::{BlobInterest, BlobPublicationResumeV1, BlobStreamPlanSelectionV1, BlobStreamPlanV1},
     mission::MissionSession,
     stream_transfer::{
         MAX_STREAM_CHECKPOINT_BATCH_BYTES, MAX_STREAM_EXTENT_BYTES, StreamAction, StreamDataV1,
@@ -145,6 +145,33 @@ pub(super) struct ReceivedPackStream {
     pub(super) decryptor: BlobStreamDecryptor,
 }
 
+impl ReceivedPackStream {
+    pub(super) fn resume_authority(&self, direction: EventDirection) -> BlobPublicationResumeV1 {
+        let resume = self.pack.crypto_resume();
+        let progress = resume.progress();
+        let initial = progress.generation() == 0;
+        BlobPublicationResumeV1 {
+            direction,
+            stream_id: *self.open.open().stream_id().as_bytes(),
+            open_digest: self.open.open().digest(),
+            durable_plaintext_offset: progress.durable_plaintext_offset(),
+            durable_wire_offset: progress.durable_wire_offset(),
+            next_segment_index: progress.next_segment_index(),
+            plaintext_commitment: if initial {
+                [1; 32]
+            } else {
+                resume.plaintext_checkpoint().commitment()
+            },
+            ciphertext_commitment: if initial {
+                [1; 32]
+            } else {
+                resume.ciphertext_checkpoint().commitment()
+            },
+            checkpoint_generation: progress.generation(),
+        }
+    }
+}
+
 pub(super) fn admit_completed_pack_source(
     store: &Store,
     mission: &MissionSession,
@@ -179,7 +206,17 @@ pub(super) fn admit_completed_pack_source(
         &open,
     )?;
     let pack = store.open_blob_stream_pack_session(guard.policy(), &reservation, &open)?;
-    let decryptor = verifier.begin_blob_stream_decrypt(&open)?;
+    let resume = pack.crypto_resume();
+    let progress = resume.progress();
+    let decryptor = if progress.generation() == 0 {
+        verifier.begin_blob_stream_decrypt(&open)?
+    } else {
+        verifier.resume_blob_stream_decrypt(
+            &open,
+            progress.durable_plaintext_offset(),
+            resume.ciphertext_checkpoint(),
+        )?
+    };
     Ok(ReceivedPackStream {
         open,
         commitment,
@@ -202,7 +239,10 @@ fn completed_pack_result_digest(
 }
 
 fn pack_attempt_flow(total: u64) -> Result<(u32, u32, u64), NodeError> {
-    if total < 2 {
+    if total == 0 {
+        return Ok((1, 1, 2));
+    }
+    if total == 1 {
         return Err(protocol("completed pack wire length is too short"));
     }
     let max_extent = total
@@ -231,6 +271,7 @@ pub(super) async fn send_completed_pack(
     guard: &EventLaneGuard,
     direction: EventDirection,
     source: CompletedPackStreamSource,
+    resume: BlobPublicationResumeV1,
     profile_digest: [u8; 32],
 ) -> Result<BlobStreamAttemptOutcome, NodeError> {
     guard.check(store)?;
@@ -252,7 +293,14 @@ pub(super) async fn send_completed_pack(
     )?;
     let transfer = *source.publication.stream_id().as_bytes();
     let source_id = BlobTransferId::new(transfer);
-    let generation = 0;
+    if resume.direction != direction
+        || resume.stream_id != transfer
+        || resume.open_digest != source.open.open().digest()
+    {
+        return Err(protocol("completed pack resume identity differs"));
+    }
+    reader.resume_at(resume.next_segment_index, resume.durable_wire_offset)?;
+    let generation = resume.checkpoint_generation;
     let nonce = attempt_nonce(mission.session_id(), direction, transfer, generation);
     let open = StreamOpenV1 {
         class: crate::stream_transfer::StreamClass::Blob,
@@ -276,13 +324,13 @@ pub(super) async fn send_completed_pack(
         .map_err(transport)?;
     let selection = BlobStreamPlanSelectionV1 {
         source_id,
-        next_carrier_index: 0,
-        durable_offset: 0,
+        next_carrier_index: resume.next_segment_index,
+        durable_offset: resume.durable_wire_offset,
         checkpoint_generation: generation,
     };
     let mut buffered = Vec::new();
     let mut buffered_offset = 0_usize;
-    let mut wire_offset = 0_u64;
+    let mut wire_offset = resume.durable_wire_offset;
     let signed_commitment = source.publication.authenticated_commitment().to_vec();
     let code = drive_sender_attempt(
         attempt,
@@ -291,6 +339,7 @@ pub(super) async fn send_completed_pack(
         direction,
         open,
         selection,
+        Some(resume),
         source.open.open().total_len(),
         signed_commitment,
         move |offset, maximum| {
@@ -368,15 +417,35 @@ pub(super) async fn receive_completed_pack(
     let segment_count = received.commitment.commitment().segment_count();
     let total = EncryptedBlobStreamSegment::packed_wire_len(intent_total_len, segment_count)
         .ok_or_else(|| protocol("received pack wire length overflow"))?;
-    let (max_extent, checkpoint_batch, initial_limit) = pack_attempt_flow(total)?;
-    if received.pack.progress().durable_pack_len() != 0
-        || received.pack.progress().generation() != 0
-    {
-        return Err(protocol(
-            "completed pack resume is not yet attached to receiver authority",
-        ));
-    }
-    let generation = 0;
+    let crypto_resume = received.pack.crypto_resume();
+    let progress = crypto_resume.progress();
+    let durable_wire_offset = progress.durable_wire_offset();
+    let remaining = total
+        .checked_sub(durable_wire_offset)
+        .ok_or_else(|| protocol("receiver durable offset exceeds completed pack"))?;
+    let (max_extent, checkpoint_batch, relative_limit) = pack_attempt_flow(remaining)?;
+    let generation = progress.generation();
+    let initial_limit = durable_wire_offset
+        .checked_add(relative_limit)
+        .ok_or_else(|| protocol("receiver absolute credit overflow"))?
+        .max(durable_wire_offset);
+    let initial_checkpoint = crate::stream_transfer::StreamCheckpointAuthorityV1 {
+        durable_plaintext_offset: progress.durable_plaintext_offset(),
+        durable_ciphertext_offset: durable_wire_offset,
+        next_segment_index: progress.next_segment_index(),
+        plaintext_commitment: if generation == 0 {
+            [1; 32]
+        } else {
+            crypto_resume.plaintext_checkpoint().commitment()
+        },
+        ciphertext_commitment: if generation == 0 {
+            [1; 32]
+        } else {
+            crypto_resume.ciphertext_checkpoint().commitment()
+        },
+        checkpoint_generation: generation,
+        absolute_receive_limit: initial_limit,
+    };
     let nonce = attempt_nonce(mission.session_id(), direction, transfer, generation);
     let adapter = selected_iroh_adapter(connection)?;
     let attempt = adapter
@@ -387,7 +456,7 @@ pub(super) async fn receive_completed_pack(
         stream: received,
         buffered: Vec::new(),
         buffered_consumed: 0,
-        durable_wire_offset: 0,
+        durable_wire_offset,
         appended_since_checkpoint: false,
     }));
     let writer_commits = AtomicU32::new(0);
@@ -402,8 +471,9 @@ pub(super) async fn receive_completed_pack(
         transfer,
         intent_digest,
         total,
-        0,
+        durable_wire_offset,
         generation,
+        Some(initial_checkpoint),
         None,
         initial_limit,
         max_extent,
@@ -783,6 +853,7 @@ pub(super) async fn drive_sender_attempt<R>(
     direction: EventDirection,
     open: StreamOpenV1,
     expected_checkpoint: BlobStreamPlanSelectionV1,
+    expected_resume: Option<BlobPublicationResumeV1>,
     final_plaintext_offset: u64,
     signed_commitment: Vec<u8>,
     mut read_extent: R,
@@ -817,6 +888,18 @@ where
     {
         return Err(protocol(
             "acceptance differs from the authenticated pre-open plan",
+        ));
+    }
+    if expected_resume.is_some_and(|resume| {
+        accepted.durable_plaintext_offset != resume.durable_plaintext_offset
+            || accepted.durable_ciphertext_offset != resume.durable_wire_offset
+            || accepted.next_segment_index != resume.next_segment_index
+            || accepted.plaintext_commitment != resume.plaintext_commitment
+            || accepted.ciphertext_commitment != resume.ciphertext_commitment
+            || accepted.checkpoint_generation != resume.checkpoint_generation
+    }) {
+        return Err(protocol(
+            "acceptance differs from receiver pre-open resume authority",
         ));
     }
     state.accept(accepted).map_err(protocol)?;
@@ -1173,6 +1256,7 @@ pub(super) async fn send(
         direction,
         open,
         selection,
+        None,
         layout.total_encoded_len(),
         vec![1],
         move |offset, maximum| {
@@ -1410,6 +1494,7 @@ pub(super) async fn receive(
         layout.total_encoded_len(),
         checkpoint.durable_encoded_offset,
         checkpoint.generation,
+        None,
         expected_custody_digest,
         receive_limit,
         MAX_STREAM_EXTENT_BYTES as u32,
@@ -1567,6 +1652,7 @@ pub(super) async fn drive_receiver_attempt<P, M>(
     expected_total_len: u64,
     durable_offset: u64,
     checkpoint_generation: u64,
+    initial_authority: Option<crate::stream_transfer::StreamCheckpointAuthorityV1>,
     expected_custody_digest: Option<[u8; 32]>,
     absolute_receive_limit: u64,
     max_extent_bytes: u32,
@@ -1617,15 +1703,36 @@ where
     }
     open.total_len = expected_total_len;
     require_stream_open_custody_digest(expected_custody_digest, open.custody_digest)?;
-    let mut state = StreamReceiverState::new(
-        &open,
-        durable_offset,
-        checkpoint_generation,
-        absolute_receive_limit,
-        max_extent_bytes,
-    )
-    .map_err(protocol)?;
-    let StreamAction::Send(accept) = state.accept(checkpoint_batch_bytes).map_err(protocol)? else {
+    let mut state = if let Some(authority) = initial_authority {
+        if authority.durable_ciphertext_offset != durable_offset
+            || authority.checkpoint_generation != checkpoint_generation
+            || authority.absolute_receive_limit != absolute_receive_limit
+        {
+            return Err(protocol("initial receiver authority differs"));
+        }
+        StreamReceiverState::new_from_authority(
+            &open,
+            authority,
+            max_extent_bytes,
+            checkpoint_batch_bytes,
+        )
+        .map_err(protocol)?
+    } else {
+        StreamReceiverState::new(
+            &open,
+            durable_offset,
+            checkpoint_generation,
+            absolute_receive_limit,
+            max_extent_bytes,
+        )
+        .map_err(protocol)?
+    };
+    let accept = if initial_authority.is_some() {
+        state.accept_authority().map_err(protocol)?
+    } else {
+        state.accept(checkpoint_batch_bytes).map_err(protocol)?
+    };
+    let StreamAction::Send(accept) = accept else {
         return Err(protocol("receiver produced an invalid accept transition"));
     };
     let protected = protect(mission, profile_digest, direction, expected_nonce, accept)?;

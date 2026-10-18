@@ -318,10 +318,27 @@ The attempt grammar contains:
 - `StreamResult`: promotion or typed terminal outcome; and
 - `StreamResultAck`: idempotent settlement acknowledgement.
 
+Before a completed-publication attempt, the mission protocol exchanges the
+publisher-signed open and final commitment and obtains a receiver-authored
+resume authority. That authority binds the exact stream/open identity, durable
+plaintext and pack offsets, next segment, both accumulator commitments, and
+checkpoint generation. It replaces the earlier carrier-oriented plan: the
+sender seeks the immutable pack directly to the durable wire offset and sends
+only the missing suffix. If every byte is already durable, the same grammar
+performs settlement without replaying data.
+
 Data frames are scheduling envelopes. They may split or combine segment
 records subject to bounded parser memory; neither frame nor segment boundaries
 cause synchronous persistence. The sender may keep enough frames in flight to
 fill the receiver-advertised window and transport bandwidth-delay product.
+
+Attempt control records remain mission-AEAD protected. Data records use an
+explicit direct-data outer kind on the same authenticated QUIC attempt and
+carry canonical segment-AEAD-protected pack bytes without a second
+whole-extent mission encryption and allocation. A direct record may contain
+only `StreamData`; a protected record may contain only control. The signed
+publication commitments, attempt tuple, segment verification, durable
+checkpoint, and final promotion checks remain mandatory.
 
 Credit is an absolute maximum accepted ciphertext offset. Duplicate or
 reordered control frames cannot mint capacity. Checkpoints are cumulative and

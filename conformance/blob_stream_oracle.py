@@ -26,6 +26,14 @@ def publication(tag, signed):
     return MAGIC + bytes([tag]) + u16(SEMANTIC) + u16(PROFILE) + u32(len(signed)) + signed
 
 
+def publication_resume(plain=0, wire=0, next_segment=0, generation=0,
+                       direction=2, stream=b"\x11" * 32, open_digest=b"\x44" * 32,
+                       plain_commit=b"\x01" * 32, cipher_commit=b"\x01" * 32):
+    return (MAGIC + b"\xe0" + u16(SEMANTIC) + u16(PROFILE) + bytes([direction])
+            + stream + open_digest + u64(plain) + u64(wire) + u64(next_segment)
+            + plain_commit + cipher_commit + u64(generation))
+
+
 def stream_open(semantic=SEMANTIC, profile=PROFILE, stream=b"\x11" * 32,
                 nonce=b"\x22" * 32, generation=0):
     return (MAGIC + b"\xd6\x01\x02" + u16(semantic) + u16(profile)
@@ -85,6 +93,10 @@ def profile5_corpus():
     signed_final = b"publisher-signed-final-commitment"
     add(True, "publication-open", "signed", publication(0xdd, signed_open))
     add(True, "publication-commit", "signed", publication(0xde, signed_final))
+    add(True, "publication-resume", "initial", publication_resume())
+    add(True, "publication-resume", "one-segment",
+        publication_resume(MIB, MIB + 178, 1, 1,
+                           plain_commit=b"\x51" * 32, cipher_commit=b"\x52" * 32))
     add(True, "open", "fresh-attempt", stream_open())
     for name, values in [
         ("zero", (0, 0, 0, 0, WINDOW)),
@@ -113,6 +125,12 @@ def profile5_corpus():
         checkpoint(MIB, MIB + 16, 1, 1, MIB + 16 + WINDOW, plain_commit=b"\0" * 32))
     add(False, "publication-open", "trailing", publication(0xdd, signed_open) + b"\0")
     add(False, "publication-commit", "oversized", publication(0xde, b"X" * (MIB + 1)))
+    add(False, "publication-resume", "zero-stream-id",
+        publication_resume(stream=b"\0" * 32))
+    add(False, "publication-resume", "generation-zero-with-progress",
+        publication_resume(MIB, MIB + 178, 1, 0))
+    add(False, "publication-resume", "wrong-initial-commitment",
+        publication_resume(plain_commit=b"\x51" * 32))
 
     initial = accept(0, 0, 0, 0, WINDOW)
     first_data = data(0, b"A" * 32, 1)

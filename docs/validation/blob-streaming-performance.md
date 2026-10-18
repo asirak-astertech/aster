@@ -3,6 +3,33 @@
 This file records development evidence for semantic v9/profile 5. It is not
 device qualification and does not replace the three-CM4 acceptance run.
 
+## 2026-10-18 completed-pack direct-stream loopback
+
+A focused optimized production-driver run now transfers the immutable
+encrypted pack directly from its stored wire offset. Attempt control remains
+mission protected; data is explicitly typed and retains authenticated QUIC,
+segment AEAD verification, publisher-signed open/final commitments, and
+durable-checkpoint enforcement. The receiver appends the verified original
+encoding without decrypt/re-encode, and compacts its receive buffer in batches.
+
+| Payload | Contact elapsed | Contact rate | Verified read | Total elapsed |
+| ---: | ---: | ---: | ---: | ---: |
+| 32 MiB | 1.731 s | 18.5 MiB/s | 0.468 s | 2.200 s |
+
+The same 32-MiB path before direct data and batched compaction took 2.509 s in
+contact and 2.977 s total, so contact time fell by approximately 31%. A 16-MiB
+optimized run before the direct-data change took 2.099 s total (about 7.6
+MiB/s). All measured runs completed byte-for-byte verification. A 64-MiB
+attempt reached the development fixture Store's default encrypted-payload cap;
+that was an admission limit rather than a transport failure.
+
+This remains workstation loopback development evidence, not physical-device
+qualification. At 18.5 MiB/s the production path is still far below the
+previous 363.4-MiB/s raw Iroh ceiling, so it is not yet valid to claim that the
+transport is the only bottleneck. Resume tests separately prove that a
+half-complete durable pack sends only its missing suffix and a fully durable
+pack settles with zero data bytes.
+
 ## 2026-10-18 bidirectional application-RPC loopback
 
 The profile-5 application boundary now uses a bidirectional `PublishBlob`

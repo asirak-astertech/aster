@@ -595,6 +595,29 @@ impl BlobPackReader {
         self.cursor += 4 + len as u64;
         Ok(true)
     }
+
+    pub(crate) fn resume_at(
+        &mut self,
+        next_index: u64,
+        wire_offset: u64,
+    ) -> Result<(), StoreError> {
+        let cursor = PACK_HEADER_LEN
+            .checked_add(wire_offset)
+            .ok_or_else(|| integrity("Blob pack reader resume offset overflow"))?;
+        if next_index > self.completion.segment_count
+            || cursor > self.completion.pack_len
+            || ((next_index == self.completion.segment_count)
+                != (cursor == self.completion.pack_len))
+        {
+            return Err(integrity("Blob pack reader resume boundary differs"));
+        }
+        self.data
+            .seek(SeekFrom::Start(cursor))
+            .map_err(|error| blob_error(BlobStoreError::Io(error)))?;
+        self.next_index = next_index;
+        self.cursor = cursor;
+        Ok(())
+    }
 }
 
 pub(crate) fn recover_blob_pack(
