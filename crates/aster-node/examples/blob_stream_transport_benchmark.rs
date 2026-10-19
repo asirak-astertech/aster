@@ -2,17 +2,20 @@
 
 use aster_iroh::{CarrierSecurityProfile, Endpoint, EndpointConfig, ExpectedPeer, SecretKey};
 use aster_mesh::{
-    BlobMetadata, BlobPublicationStreamId, BlobStreamOpen, BlobStreamSegmentOpener,
-    BlobStreamSegmentSealer, Priority, Scope, Topic, VersionVector,
+    BlobMetadata, BlobPublicationStreamId, BlobStreamFinalCommitment, BlobStreamOpen, Priority,
+    ProvisioningAccess, ProvisioningBundle, ReferenceEnvelopeSealer, ReferenceProvisioner, Scope,
+    Topic, VerifiedBlobStreamOpen, VersionVector,
 };
 use aster_node::stream_validation::{self, StreamValidationReport};
 use aster_node::{application::blob_stream::publish_blob_stream, stream_pipeline::PipelineLimits};
+use aster_redb_store::Store;
 use std::{
     collections::BTreeSet,
     error::Error,
     io::{Read, Write as _},
     net::SocketAddr,
-    path::PathBuf,
+    path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -78,16 +81,24 @@ impl Read for PatternReader {
     }
 }
 
-fn blob_open(total_len: u64) -> BlobStreamOpen {
-    BlobStreamOpen::new(
+fn blob_fixture(
+    total_len: u64,
+    fixture_path: &Path,
+) -> Result<(Arc<ReferenceEnvelopeSealer>, VerifiedBlobStreamOpen), AnyError> {
+    let topic = Topic::new("imagery")?;
+    let scope = Scope::new("mission/validation")?;
+    let provider = Arc::new(ReferenceEnvelopeSealer::open(
+        ProvisioningBundle::from_bytes(&std::fs::read(fixture_path)?)?,
+    )?);
+    let open = BlobStreamOpen::new(
         BlobPublicationStreamId::from_bytes([0x12; 32]).expect("stream ID"),
-        [0x22; 32],
+        provider.identity(),
         b"device-network-pipeline".to_vec(),
-        [0x32; 32],
+        provider.mission_authority_id(),
         1,
         VersionVector::default(),
-        Topic::new("imagery").expect("topic"),
-        Scope::new("mission/validation").expect("scope"),
+        topic,
+        scope.clone(),
         BlobMetadata::new(Some("application/octet-stream".into()), Vec::new()).expect("metadata"),
         Priority::Immediate,
         None,
@@ -95,10 +106,38 @@ fn blob_open(total_len: u64) -> BlobStreamOpen {
         total_len,
         1,
         1,
-        [0x42; 32],
+        provider
+            .blob_stream_authorization_digest(&scope, 1)
+            .ok_or("missing Blob stream authorization")?,
         [0x52; 32],
-    )
-    .expect("Blob open")
+    )?;
+    let signed = provider.seal_blob_stream_open(&open)?;
+    let verified = provider.verify_blob_stream_open(&signed)?;
+    Ok((provider, verified))
+}
+
+fn initialize_blob_fixture(path: &Path) -> Result<(), AnyError> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let topic = Topic::new("imagery")?;
+    let scope = Scope::new("mission/validation")?;
+    let access = ProvisioningAccess::member(scope, vec![1], vec![topic])?;
+    let mut provisioner = ReferenceProvisioner::from_seed([0x84; 32])?;
+    let bundle = provisioner.issue_control_authority(1, &[access])?;
+    let encoded = bundle.to_bytes()?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(&encoded)?;
+    file.sync_all()?;
+    println!(
+        "ASTER_BLOB_FIXTURE {{\"path\":\"{}\",\"bytes\":{}}}",
+        path.display(),
+        encoded.len()
+    );
+    Ok(())
 }
 
 fn pack_limits() -> PipelineLimits {
@@ -119,14 +158,16 @@ fn print_pack_report(
                 .collect::<String>()
         })
         .collect::<Vec<_>>();
-    let mib_s = report.wire_bytes as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64();
+    let mib_s = report.attempt_bytes as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64();
     let completed = report
         .pipeline
         .as_ref()
         .map_or(0, |value| value.completed_items());
     println!(
-        "ASTER_BLOB_NETWORK {{\"role\":\"{role}\",\"wire_bytes\":{},\"elapsed_ns\":{},\"mib_s\":{mib_s:.3},\"checkpoints\":{},\"segments\":{completed},\"plaintext_root\":\"{}\",\"ciphertext_root\":\"{}\",\"path\":\"{:?}\"}}",
+        "ASTER_BLOB_NETWORK {{\"role\":\"{role}\",\"wire_bytes\":{},\"resumed_from\":{},\"attempt_bytes\":{},\"elapsed_ns\":{},\"mib_s\":{mib_s:.3},\"checkpoints\":{},\"segments\":{completed},\"plaintext_root\":\"{}\",\"ciphertext_root\":\"{}\",\"path\":\"{:?}\"}}",
         report.wire_bytes,
+        report.resumed_from,
+        report.attempt_bytes,
         elapsed.as_nanos(),
         report.checkpoints,
         roots[0],
@@ -135,9 +176,14 @@ fn print_pack_report(
     );
 }
 
-async fn pack_receive(bind: SocketAddr, plaintext_len: u64) -> Result<(), AnyError> {
+async fn pack_receive(
+    fixture_path: PathBuf,
+    bind: SocketAddr,
+    plaintext_len: u64,
+) -> Result<(), AnyError> {
     let root = TempPack::new("receive")?;
-    let open = blob_open(plaintext_len);
+    let (provider, verified) = blob_fixture(plaintext_len, &fixture_path)?;
+    let open = verified.open();
     let wire_len =
         stream_validation::expected_pack_wire_len(plaintext_len).map_err(std::io::Error::other)?;
     let endpoint = Endpoint::bind_with_security_profile(
@@ -161,13 +207,7 @@ async fn pack_receive(bind: SocketAddr, plaintext_len: u64) -> Result<(), AnyErr
     let report = stream_validation::receive_completed_pack(
         connection.clone(),
         &open,
-        BlobStreamSegmentOpener::from_test_key(
-            *open.stream_id().as_bytes(),
-            open.digest(),
-            open.content_epoch(),
-            [0x62; 32],
-            [0x72; 12],
-        ),
+        provider.blob_stream_segment_opener(&verified)?,
         &root.0,
         wire_len,
         pack_limits(),
@@ -180,27 +220,105 @@ async fn pack_receive(bind: SocketAddr, plaintext_len: u64) -> Result<(), AnyErr
     Ok(())
 }
 
-async fn pack_send(bind: SocketAddr, peer: SocketAddr, plaintext_len: u64) -> Result<(), AnyError> {
+async fn pack_store_receive(
+    state_root: PathBuf,
+    fixture_path: PathBuf,
+    bind: SocketAddr,
+    plaintext_len: u64,
+) -> Result<(), AnyError> {
+    std::fs::create_dir_all(&state_root)?;
+    let pack_root = state_root.join("pack");
+    std::fs::create_dir_all(&pack_root)?;
+    let (provider, verified) = blob_fixture(plaintext_len, &fixture_path)?;
+    let wire_len =
+        stream_validation::expected_pack_wire_len(plaintext_len).map_err(std::io::Error::other)?;
+    let store = Arc::new(Store::open_for_mission(
+        state_root.join("state.redb"),
+        provider.mission_authority_id(),
+    )?);
+    let policy = store.control_policy_snapshot()?;
+    let verifier = {
+        let provider = Arc::clone(&provider);
+        Arc::new(move |open: &VerifiedBlobStreamOpen, bytes: &[u8]| {
+            provider
+                .verify_blob_stream_commitment(open, bytes)
+                .map_err(|error| error.to_string())
+        }) as stream_validation::BlobCommitmentVerifier
+    };
+    let session = stream_validation::BlobReceiveStoreSession::new(
+        Arc::clone(&store),
+        policy.clone(),
+        verified.clone(),
+        provider.identity(),
+        verifier,
+    )
+    .map_err(std::io::Error::other)?;
+    let endpoint = Endpoint::bind_with_security_profile(
+        SecretKey::from_bytes(&[0x71; 32]),
+        config(bind),
+        CarrierSecurityProfile::IrohQuicV1,
+    )
+    .await?;
+    println!(
+        "ASTER_STREAM_LISTEN {{\"id\":\"{}\",\"bind\":\"{}\",\"state_root\":\"{}\"}}",
+        endpoint.id(),
+        bind,
+        state_root.display()
+    );
+    std::io::stdout().flush()?;
+    let connection = endpoint
+        .accept(&BTreeSet::from([
+            SecretKey::from_bytes(&[0x72; 32]).public()
+        ]))
+        .await?;
+    let path = connection.path_witness();
+    let started = Instant::now();
+    let report = stream_validation::receive_completed_pack_with_store(
+        connection.clone(),
+        session,
+        provider.blob_stream_segment_opener(&verified)?,
+        &pack_root,
+        wire_len,
+        pack_limits(),
+    )
+    .await
+    .map_err(std::io::Error::other)?;
+    print_pack_report("store-receive", &report, started.elapsed(), &path);
+    let publications = store.blob_stream_publications_with_policy(&policy)?;
+    println!(
+        "ASTER_BLOB_STORE {{\"publications\":{},\"state_root\":\"{}\"}}",
+        publications.len(),
+        state_root.display()
+    );
+    connection.close();
+    endpoint.close().await;
+    Ok(())
+}
+
+async fn pack_send(
+    fixture_path: PathBuf,
+    bind: SocketAddr,
+    peer: SocketAddr,
+    plaintext_len: u64,
+) -> Result<(), AnyError> {
     let root = TempPack::new("send")?;
-    let open = blob_open(plaintext_len);
+    let (provider, verified) = blob_fixture(plaintext_len, &fixture_path)?;
+    let open = verified.open();
     let published = publish_blob_stream(
         PatternReader {
             offset: 0,
             total: plaintext_len,
         },
         &open,
-        BlobStreamSegmentSealer::from_test_key(
-            *open.stream_id().as_bytes(),
-            open.digest(),
-            open.content_epoch(),
-            [0x62; 32],
-            [0x72; 12],
-        ),
+        provider.blob_stream_segment_sealer(&verified)?,
         &root.0,
         pack_limits(),
     )
     .await?;
     let roots = (published.plaintext_root, published.ciphertext_root);
+    let commitment =
+        BlobStreamFinalCommitment::new(&verified, roots.0, roots.1, published.segment_count, None)?;
+    let signed_commitment = provider.seal_blob_stream_commitment(&commitment)?;
     println!(
         "ASTER_BLOB_PACK_READY {{\"plaintext_bytes\":{plaintext_len},\"segments\":{}}}",
         published.segment_count
@@ -225,7 +343,7 @@ async fn pack_send(bind: SocketAddr, peer: SocketAddr, plaintext_len: u64) -> Re
         &open,
         &root.0,
         roots,
-        open.digest().to_vec(),
+        signed_commitment,
     )
     .await
     .map_err(std::io::Error::other)?;
@@ -343,6 +461,9 @@ async fn loopback(bytes: u64) -> Result<(), AnyError> {
 async fn main() -> Result<(), AnyError> {
     let args = std::env::args().collect::<Vec<_>>();
     match args.as_slice() {
+        [_, role, fixture] if role == "fixture-init" => {
+            initialize_blob_fixture(Path::new(fixture))
+        }
         [_, role, bytes] if role == "loopback" => loopback(bytes.parse()?).await,
         [_, role, bind, bytes] if role == "receive" => {
             receive(bind.parse()?, bytes.parse()?).await
@@ -350,12 +471,27 @@ async fn main() -> Result<(), AnyError> {
         [_, role, bind, peer, bytes] if role == "send" => {
             send(bind.parse()?, peer.parse()?, bytes.parse()?).await
         }
-        [_, role, bind, bytes] if role == "pack-receive" => {
-            pack_receive(bind.parse()?, bytes.parse()?).await
+        [_, role, fixture, bind, bytes] if role == "pack-receive" => {
+            pack_receive(PathBuf::from(fixture), bind.parse()?, bytes.parse()?).await
         }
-        [_, role, bind, peer, bytes] if role == "pack-send" => {
-            pack_send(bind.parse()?, peer.parse()?, bytes.parse()?).await
+        [_, role, root, fixture, bind, bytes] if role == "pack-store-receive" => {
+            pack_store_receive(
+                PathBuf::from(root),
+                PathBuf::from(fixture),
+                bind.parse()?,
+                bytes.parse()?,
+            )
+            .await
         }
-        _ => Err("usage: blob_stream_transport_benchmark loopback BYTES | receive BIND BYTES | send BIND PEER BYTES | pack-receive BIND PLAINTEXT_BYTES | pack-send BIND PEER PLAINTEXT_BYTES".into()),
+        [_, role, fixture, bind, peer, bytes] if role == "pack-send" => {
+            pack_send(
+                PathBuf::from(fixture),
+                bind.parse()?,
+                peer.parse()?,
+                bytes.parse()?,
+            )
+            .await
+        }
+        _ => Err("usage: blob_stream_transport_benchmark fixture-init FIXTURE | loopback BYTES | receive BIND BYTES | send BIND PEER BYTES | pack-receive FIXTURE BIND PLAINTEXT_BYTES | pack-store-receive STATE_ROOT FIXTURE BIND PLAINTEXT_BYTES | pack-send FIXTURE BIND PEER PLAINTEXT_BYTES".into()),
     }
 }

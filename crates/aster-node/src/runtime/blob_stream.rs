@@ -33,6 +33,8 @@ const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 #[derive(Debug)]
 pub struct BlobNetworkReport {
     pub wire_bytes: u64,
+    pub resumed_from: u64,
+    pub attempt_bytes: u64,
     pub roots: ([u8; 32], [u8; 32]),
     pub checkpoints: u64,
     pub pipeline: Option<PipelineReport>,
@@ -368,6 +370,8 @@ pub async fn send_completed_pack(
     }
     Ok(BlobNetworkReport {
         wire_bytes: wire_len,
+        resumed_from: resume_offset,
+        attempt_bytes: wire_len - resume_offset,
         roots,
         checkpoints,
         pipeline: None,
@@ -540,6 +544,7 @@ async fn receive_completed_pack_inner(
         .as_ref()
         .map_or_else(BlobStreamResume::default, |(_, resume)| *resume);
     let durable_wire = resume.durable_wire_offset();
+    let resumed_from = durable_wire;
     let mut writer = BlobPackWriter::open_projected(
         root,
         open,
@@ -762,6 +767,8 @@ async fn receive_completed_pack_inner(
         .map_err(|error| failure("finish control stream", format!("{error:?}")))?;
     Ok(BlobNetworkReport {
         wire_bytes: wire_len,
+        resumed_from,
+        attempt_bytes: wire_len - resumed_from,
         roots,
         checkpoints,
         pipeline: Some(pipeline),
@@ -1131,6 +1138,13 @@ mod tests {
 
         assert_eq!(sent.roots, roots);
         assert_eq!(received.roots, roots);
+        assert_eq!(sent.resumed_from, partial_resume.durable_wire_offset());
+        assert_eq!(received.resumed_from, partial_resume.durable_wire_offset());
+        assert_eq!(
+            sent.attempt_bytes,
+            wire_len - partial_resume.durable_wire_offset()
+        );
+        assert_eq!(received.attempt_bytes, sent.attempt_bytes);
         assert_eq!(
             received.pipeline.as_ref().unwrap().completed_items(),
             published.segment_count - 1

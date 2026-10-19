@@ -133,6 +133,12 @@ The workstation-to-CM4 ZeroTier path has a repeatable MTU/fragmentation symptom:
 
 After the local three-device matrix, `rpi4-2` continued answering ZeroTier ICMP (92–276 ms in one five-packet sample) but could not complete a small SSH command within 20 seconds. It therefore did not participate in the final network pair. Its local 64 MiB through 1 GiB authenticated pipeline results remain valid.
 
+## Local cross-process durable-resume rehearsal
+
+After receiver lifecycle promotion and durable resume were integrated, the persistent benchmark receiver was exercised across actual process termination on loopback before a new ARM64 deployment. The first 1 GiB attempt was terminated after the receiver had projected byte `604,056,960`. A fresh receiver and sender process reopened the same authenticated fixture, redb authority, and pack directory. Both roles accepted that exact offset, transferred only the remaining `469,822,080` wire bytes (448 segments), reproduced the original plaintext and ciphertext Merkle roots, and exposed exactly one final publication. The resumed suffix ran at 97.849 MiB/s sender and 97.931 MiB/s receiver on loopback.
+
+The benchmark reports `wire_bytes`, `resumed_from`, and `attempt_bytes` separately so a suffix duration cannot be misreported as full-object throughput. This is local implementation evidence only; an interrupted exact 1 GiB run on the CM4 WLAN path remains required.
+
 ## Qualification boundary
 
 This evidence establishes that:
@@ -142,4 +148,4 @@ This evidence establishes that:
 - the composed encrypted-pack receiver remains transport-limited while authenticating, ordering, checkpointing, and settling 1 GiB; and
 - the previous 1.5 MiB/s serial processing path is no longer the limiting design.
 
-It does not yet qualify production deployment. Remaining implementation includes receiver-side provisional lifecycle reservation and atomic promotion, application RPC streaming, resume/fault injection, three-device fairness for the fused path, and CI/full-matrix evidence.
+It does not yet qualify production deployment. Receiver-side provisional lifecycle reservation, atomic promotion, and cross-process resume now have focused/local evidence. Remaining implementation and evidence include application RPC integration, interrupted 1 GiB resume on the CM4 WLAN path, three-device fairness for the fused path, and CI/full-matrix evidence.
