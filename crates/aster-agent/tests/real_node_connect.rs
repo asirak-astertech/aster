@@ -10,7 +10,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
     task::Poll,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use aster_agent::{
@@ -147,6 +147,180 @@ fn blob_mission() -> UnprotectedReferenceMission {
             .expect("encode Blob mission"),
     )
     .expect("load disposable Blob test mission")
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "release-only local application Blob streaming benchmark"]
+fn real_node_blob_bidi_stream_benchmark() {
+    let total_len = std::env::var("ASTER_BLOB_BENCH_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(64 * 1024 * 1024);
+    assert!(total_len > 0);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let state = TestState::new();
+        let node = start_node(NodeConfig {
+            state: state.0.clone(),
+            bind: "127.0.0.1:0".parse().expect("mesh bind"),
+            mission: blob_mission(),
+            peers: Vec::new(),
+            mutable_interests: MutableSourceInterests::default(),
+            sync_interval: Duration::from_millis(50),
+            run_for: None,
+            application: NodeApplication::Relay,
+        })
+        .await
+        .expect("start benchmark node");
+        let agent = BoundAgent::bind("127.0.0.1:0".parse().expect("agent bind"))
+            .await
+            .expect("bind benchmark agent");
+        let address = agent.local_addr().expect("agent address");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let server = tokio::spawn(
+            agent
+                .serve_with_blobs(
+                    node.selected_events(),
+                    node.selected_blobs(),
+                    node.state_root().to_path_buf(),
+                    ClientToken::from_bytes(TEST_TOKEN.to_vec()).expect("valid token"),
+                    shutdown_rx,
+                )
+                .expect("construct benchmark service"),
+        );
+        let client = api::AsterApplicationServiceClient::new(
+            Http2Connection::connect_plaintext(
+                format!("http://{address}")
+                    .parse()
+                    .expect("benchmark transport URI"),
+            )
+            .await
+            .expect("connect benchmark HTTP/2")
+            .shared(8),
+            ClientConfig::new(
+                format!("http://{address}")
+                    .parse()
+                    .expect("benchmark client URI"),
+            )
+            .with_protocol(Protocol::Grpc)
+            .with_default_header(
+                "authorization",
+                format!("Bearer {}", String::from_utf8_lossy(TEST_TOKEN)),
+            ),
+        );
+
+        let started = Instant::now();
+        let mut call = client.publish_blob().await.expect("open benchmark upload");
+        call.send(api::PublishBlobRequest {
+            frame: Some(api::publish_blob_request::Frame::Metadata(Box::new(
+                api::PublishBlobMetadata {
+                    operation_key: format!("application-benchmark-{total_len}").into_bytes(),
+                    topic: "imagery.maps".to_owned(),
+                    scope: "mission/team/alpha".to_owned(),
+                    priority: api::Priority::Routine.into(),
+                    media_type: Some("application/octet-stream".to_owned()),
+                    total_len,
+                    ..Default::default()
+                },
+            ))),
+            ..Default::default()
+        })
+        .await
+        .expect("send benchmark metadata");
+        let accepted = call
+            .message::<api::PublishBlobResponse>()
+            .await
+            .expect("receive benchmark acceptance")
+            .expect("benchmark acceptance")
+            .to_owned_message();
+        assert!(matches!(
+            accepted.frame,
+            Some(api::publish_blob_response::Frame::Accepted(ref accepted))
+                if accepted.durable_offset == 0
+        ));
+        let (mut send, mut receive) = call.into_split();
+        let sender = async move {
+            let frame = vec![0x5a; 64 * 1024];
+            let mut offset = 0_u64;
+            while offset < total_len {
+                let len = usize::try_from((total_len - offset).min(frame.len() as u64))
+                    .expect("frame length");
+                send.send(api::PublishBlobRequest {
+                    frame: Some(api::publish_blob_request::Frame::Data(Box::new(
+                        api::PublishBlobData {
+                            offset,
+                            bytes: frame[..len].to_vec(),
+                            ..Default::default()
+                        },
+                    ))),
+                    ..Default::default()
+                })
+                .await
+                .expect("send benchmark data");
+                offset += len as u64;
+            }
+            send.send(api::PublishBlobRequest {
+                frame: Some(api::publish_blob_request::Frame::Finish(Box::default())),
+                ..Default::default()
+            })
+            .await
+            .expect("finish benchmark upload");
+            send.close_send();
+        };
+        let receiver = async move {
+            let mut checkpoints = 0_u64;
+            let mut receipt = None;
+            while let Some(response) = receive
+                .message::<api::PublishBlobResponse>()
+                .await
+                .expect("receive benchmark progress")
+            {
+                match response.to_owned_message().frame {
+                    Some(api::publish_blob_response::Frame::Checkpoint(_)) => checkpoints += 1,
+                    Some(api::publish_blob_response::Frame::Complete(complete)) => {
+                        receipt = Some(*complete)
+                    }
+                    _ => panic!("unexpected benchmark progress"),
+                }
+            }
+            (checkpoints, receipt.expect("benchmark receipt"))
+        };
+        let ((), (checkpoints, receipt)) = tokio::join!(sender, receiver);
+        let publish_seconds = started.elapsed().as_secs_f64();
+        assert_eq!(receipt.total_len, total_len);
+
+        let read_started = Instant::now();
+        let mut read = client
+            .read_blob(api::ReadBlobRequest {
+                id: receipt.id,
+                topic: "imagery.maps".to_owned(),
+                scope: "mission/team/alpha".to_owned(),
+                ..Default::default()
+            })
+            .await
+            .expect("open benchmark read");
+        let mut read_bytes = 0_u64;
+        while let Some(page) = read.message().await.expect("read benchmark page") {
+            let page = page.to_owned_message();
+            assert!(page.chunk.iter().all(|byte| *byte == 0x5a));
+            read_bytes += page.chunk.len() as u64;
+        }
+        let read_seconds = read_started.elapsed().as_secs_f64();
+        assert_eq!(read_bytes, total_len);
+        eprintln!(
+            "APPLICATION_BLOB_BENCH bytes={total_len} publish_seconds={publish_seconds:.6} publish_mib_per_second={:.3} read_seconds={read_seconds:.6} read_mib_per_second={:.3} checkpoints={checkpoints}",
+            total_len as f64 / publish_seconds / (1024.0 * 1024.0),
+            total_len as f64 / read_seconds / (1024.0 * 1024.0),
+        );
+
+        shutdown_tx.send(true).expect("request benchmark shutdown");
+        server.await.expect("benchmark server task").expect("benchmark server");
+        node.shutdown().await.expect("benchmark node shutdown");
+    });
 }
 
 #[cfg(target_os = "linux")]
