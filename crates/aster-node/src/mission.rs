@@ -2951,6 +2951,31 @@ mod tests {
         Ok((initiator_session, responder_session))
     }
 
+    fn establish_with_semantic_version(
+        initiator: &IssuedNode,
+        responder: &IssuedNode,
+        semantic_version: u16,
+    ) -> Result<(MissionSession, MissionSession), MissionSessionError> {
+        let (initiator_state, first) =
+            MissionSessionInitiator::start_with_semantic_versions_for_test(
+                initiator.bundle(),
+                binding(responder),
+                responder.carrier,
+                vec![semantic_version],
+            )?;
+        let responder_state = MissionSessionResponder::open(
+            responder.bundle(),
+            binding(initiator),
+            initiator.carrier,
+        )?;
+        let (responder_pending, second) = responder_state.receive_client(first.as_bytes())?;
+        let (initiator_pending, third) = initiator_state.receive_server(second.as_bytes())?;
+        let (responder_session, fourth) =
+            responder_pending.receive_client_auth(third.as_bytes())?;
+        let initiator_session = initiator_pending.receive_finished(fourth.as_bytes())?;
+        Ok((initiator_session, responder_session))
+    }
+
     fn loopback(endpoint: &Endpoint) -> SocketAddr {
         endpoint
             .bound_sockets()
