@@ -159,3 +159,52 @@ impl Publication {
         Ok((self.request, self.identity))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn publication_limit_includes_metadata_and_payload() {
+        let max_request_bytes = 1024 * 1024;
+        // Valid CLI metadata plus a 64 KiB payload cannot reach 1 MiB.
+        // Construct oversized metadata directly to exercise the independent
+        // encoded-request guard without weakening argument or payload limits.
+        let publication = |metadata_bytes| Publication {
+            request: api::PublishNumberedEventRequest {
+                client_id: vec![b'c'; 64],
+                session: u64::MAX,
+                operation_sequence: u64::MAX,
+                topic: "x".to_owned(),
+                scope: "x".to_owned(),
+                priority: api::Priority::Routine.into(),
+                logical_key: vec![b'x'; metadata_bytes],
+                payload: vec![42; MAX_PAYLOAD_BYTES],
+                ..Default::default()
+            },
+            identity: journal::Identity {
+                path: "unused-test-journal.redb".into(),
+                client_id: vec![b'c'; 64],
+            },
+            ..Default::default()
+        };
+        let template = publication(max_request_bytes);
+        let overhead = template.request.encoded_len() as usize - max_request_bytes;
+        let metadata_bytes = max_request_bytes - overhead;
+        let exact = publication(metadata_bytes);
+        assert_eq!(exact.request.encoded_len() as usize, max_request_bytes);
+        let (mut accepted, _) = exact.into_request(std::io::empty()).unwrap();
+        assert_eq!(accepted.payload.len(), MAX_PAYLOAD_BYTES);
+        assert_eq!(accepted.logical_key.len(), metadata_bytes);
+        assert_eq!(accepted.session, 0);
+        assert_eq!(accepted.operation_sequence, 0);
+        accepted.session = u64::MAX;
+        accepted.operation_sequence = u64::MAX;
+        assert_eq!(accepted.encoded_len() as usize, max_request_bytes);
+
+        let over = publication(metadata_bytes + 1);
+        assert_eq!(over.request.payload.len(), MAX_PAYLOAD_BYTES);
+        assert_eq!(over.request.encoded_len() as usize, max_request_bytes + 1);
+        assert_eq!(over.into_request(std::io::empty()).unwrap_err(), SIZE_ERROR);
+    }
+}
