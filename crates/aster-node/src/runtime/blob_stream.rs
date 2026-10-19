@@ -260,6 +260,14 @@ pub async fn send_completed_pack(
         .finish_data()
         .await
         .map_err(|error| failure("finish data stream", format!("{error:?}")))?;
+    if attempt
+        .receive_control()
+        .await
+        .map_err(|error| failure("receive control EOF", format!("{error:?}")))?
+        .is_some()
+    {
+        return Err("control stream contained data after terminal result".into());
+    }
     Ok(BlobNetworkReport {
         wire_bytes: wire_len,
         roots,
