@@ -2162,9 +2162,13 @@ impl SelectedBlobNode {
                 .map_err(|error| application_error("blob stream write", error.into()))?;
             stream.segment_count += 1;
         }
-        let durable = stream.pack.progress().durable_plaintext_offset();
+        let durable_progress = stream.pack.progress();
+        let durable = durable_progress.durable_plaintext_offset();
+        let has_checkpointable_segment =
+            stream.segment_count > durable_progress.next_segment_index();
         if end - durable >= 16 * 1024 * 1024
-            || stream.last_checkpoint_at.elapsed() >= DEFAULT_BLOB_STREAM_CHECKPOINT_INTERVAL
+            || (has_checkpointable_segment
+                && stream.last_checkpoint_at.elapsed() >= DEFAULT_BLOB_STREAM_CHECKPOINT_INTERVAL)
         {
             let policy = self
                 .store
@@ -6058,13 +6062,19 @@ mod tests {
             .checked_sub(Duration::from_millis(251))
             .expect("test instant");
 
+        let partial = node
+            .append_publish_stream_inner(opened.token, 0, Zeroizing::new(vec![0x51; 64 * 1024]))
+            .expect("append timed partial segment");
+        assert_eq!(partial.accepted_offset, 64 * 1024);
+        assert_eq!(partial.durable_offset, 0);
+
         let progress = node
             .append_publish_stream_inner(
                 opened.token,
-                0,
-                Zeroizing::new(vec![0x51; BLOB_STREAM_SEGMENT_BYTES]),
+                64 * 1024,
+                Zeroizing::new(vec![0x51; BLOB_STREAM_SEGMENT_BYTES - 64 * 1024]),
             )
-            .expect("append timed segment");
+            .expect("complete timed segment");
         assert_eq!(progress.accepted_offset, BLOB_STREAM_SEGMENT_BYTES as u64);
         assert_eq!(progress.durable_offset, BLOB_STREAM_SEGMENT_BYTES as u64);
     }

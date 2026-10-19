@@ -56429,6 +56429,16 @@ mod tests {
         ])
     }
 
+    fn legacy_event_with_v9_blob_stream_offer() -> TransferProfileOfferV1 {
+        TransferProfileOfferV1::from_lanes(vec![
+            (LaneId::EventBridge, vec![TransferProfileId::LegacyV6]),
+            (LaneId::Blob, vec![TransferProfileId::BlobStreamV1]),
+            (LaneId::Record, vec![TransferProfileId::LegacyV6]),
+            (LaneId::State, vec![TransferProfileId::LegacyV6]),
+            (LaneId::Event, vec![TransferProfileId::LegacyV6]),
+        ])
+    }
+
     async fn with_test_transfer_profile_offer<F>(
         offer: TransferProfileOfferV1,
         future: F,
@@ -60395,31 +60405,28 @@ mod tests {
         let source_clock_id = [0x4e; 16];
         let receiver_clock_id = [0x4f; 16];
 
-        let (first_receiver, first_source) = with_test_semantic_version(
-            SEMANTIC_PROTOCOL_V8,
-            with_test_transfer_profile_offer(
-                legacy_event_with_blob_stream_offer(),
-                contact_test_pair_with_forwarding(
-                    TestForwardingNode {
-                        store: source_store.clone(),
-                        mission: source_mission.clone(),
-                        policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
-                        clock: NodeCustodyClock::injected(source_clock_id, 0, 0),
-                        reconciliation_exchanges_before_defer: None,
-                        preopen_custody_races: Vec::new(),
-                    },
-                    TestForwardingNode {
-                        store: receiver_store.clone(),
-                        mission: receiver_mission.clone(),
-                        policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
-                        clock: NodeCustodyClock::injected(receiver_clock_id, 0, 0),
-                        reconciliation_exchanges_before_defer: None,
-                        preopen_custody_races: vec![
-                            TestCustodyPreopenRace::ForceRouteOnly(common_id),
-                            TestCustodyPreopenRace::ForceRouteOnly(due_id),
-                        ],
-                    },
-                ),
+        let (first_receiver, first_source) = with_test_transfer_profile_offer(
+            legacy_event_with_v9_blob_stream_offer(),
+            contact_test_pair_with_forwarding(
+                TestForwardingNode {
+                    store: source_store.clone(),
+                    mission: source_mission.clone(),
+                    policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                    clock: NodeCustodyClock::injected(source_clock_id, 0, 0),
+                    reconciliation_exchanges_before_defer: None,
+                    preopen_custody_races: Vec::new(),
+                },
+                TestForwardingNode {
+                    store: receiver_store.clone(),
+                    mission: receiver_mission.clone(),
+                    policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                    clock: NodeCustodyClock::injected(receiver_clock_id, 0, 0),
+                    reconciliation_exchanges_before_defer: None,
+                    preopen_custody_races: vec![
+                        TestCustodyPreopenRace::ForceRouteOnly(common_id),
+                        TestCustodyPreopenRace::ForceRouteOnly(due_id),
+                    ],
+                },
             ),
         )
         .await;
