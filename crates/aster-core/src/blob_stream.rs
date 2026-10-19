@@ -778,7 +778,14 @@ impl BlobStreamSegmentSealer {
                 },
             )
             .map_err(|_| BlobError::AuthenticationFailed)?;
-        let leaves = segment_leaves(&aad, &partition.plaintext, &ciphertext);
+        let leaves = segment_leaves(
+            partition.index,
+            partition.offset,
+            partition.total_len,
+            &aad,
+            &partition.plaintext,
+            &ciphertext,
+        );
         Ok((
             EncryptedBlobStreamSegment {
                 stream_id: partition.stream_id,
@@ -883,7 +890,14 @@ impl BlobStreamSegmentOpener {
         if plaintext.len() != segment.plaintext_len as usize {
             return Err(BlobError::AuthenticationFailed);
         }
-        let leaves = segment_leaves(&aad, &plaintext, &segment.ciphertext);
+        let leaves = segment_leaves(
+            segment.index,
+            segment.offset,
+            segment.total_len,
+            &aad,
+            &plaintext,
+            &segment.ciphertext,
+        );
         Ok((plaintext, leaves))
     }
 }
@@ -950,9 +964,29 @@ fn hash_parts(domain: &[u8], parts: &[&[u8]]) -> [u8; 32] {
     hash.finalize().into()
 }
 
-fn segment_leaves(aad: &[u8], plaintext: &[u8], ciphertext: &[u8]) -> BlobStreamSegmentLeaves {
+fn segment_leaves(
+    index: u64,
+    offset: u64,
+    total_len: u64,
+    aad: &[u8],
+    plaintext: &[u8],
+    ciphertext: &[u8],
+) -> BlobStreamSegmentLeaves {
+    let plaintext_position = [
+        index.to_be_bytes(),
+        offset.to_be_bytes(),
+        total_len.to_be_bytes(),
+        (plaintext.len() as u64).to_be_bytes(),
+    ]
+    .concat();
     BlobStreamSegmentLeaves {
-        plaintext: hash_parts(b"ASTER/blob-stream/plain-leaf/v2\0", &[aad, plaintext]),
+        // Content identity must survive republishing the same bytes under a new stream,
+        // publisher, epoch, or encryption key. Position and length remain committed so
+        // segment insertion, deletion, duplication, and reordering still change the root.
+        plaintext: hash_parts(
+            b"ASTER/blob-stream/plain-leaf/v2\0",
+            &[&plaintext_position, plaintext],
+        ),
         ciphertext: hash_parts(b"ASTER/blob-stream/cipher-leaf/v2\0", &[aad, ciphertext]),
         plaintext_len: plaintext.len() as u64,
         ciphertext_len: ciphertext.len() as u64,
@@ -1577,6 +1611,49 @@ mod tests {
         let expected = roots_for_order(&[0, 1, 2, 3]);
         assert_eq!(roots_for_order(&[1, 0, 3, 2]), expected);
         assert_eq!(roots_for_order(&[3, 1, 2, 0]), expected);
+    }
+
+    #[test]
+    fn plaintext_root_is_stable_across_distinct_publication_contexts() {
+        let plaintext = vec![0x5a; BLOB_STREAM_SEGMENT_BYTES];
+        let make_partition = |stream_id, open_digest| {
+            BlobStreamPlainPartition::new(
+                stream_id,
+                open_digest,
+                7,
+                0,
+                0,
+                BLOB_STREAM_SEGMENT_BYTES as u64,
+                plaintext.clone(),
+            )
+            .expect("partition")
+        };
+        let first = BlobStreamSegmentSealer::new([0x11; 32], [0x22; 32], 7, [0x33; 32], [0x44; 12])
+            .seal(make_partition([0x11; 32], [0x22; 32]))
+            .expect("first publication")
+            .1;
+        let second =
+            BlobStreamSegmentSealer::new([0x61; 32], [0x62; 32], 7, [0x63; 32], [0x64; 12])
+                .seal(make_partition([0x61; 32], [0x62; 32]))
+                .expect("second publication")
+                .1;
+
+        assert_eq!(first.plaintext, second.plaintext);
+        assert_ne!(first.ciphertext, second.ciphertext);
+
+        let finish = |leaves| {
+            let mut frontier = BlobStreamFrontier::new();
+            frontier
+                .append(BlobStreamSubtree::leaf(0, leaves))
+                .expect("append");
+            frontier
+                .finish(BLOB_STREAM_SEGMENT_BYTES as u64)
+                .expect("finish")
+        };
+        let first_roots = finish(first);
+        let second_roots = finish(second);
+        assert_eq!(first_roots.0, second_roots.0);
+        assert_ne!(first_roots.1, second_roots.1);
     }
 
     #[test]
