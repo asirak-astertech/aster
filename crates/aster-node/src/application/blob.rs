@@ -282,8 +282,11 @@ pub const MAX_SELECTED_BLOB_PAGE_BYTES: usize = 8 * SELECTED_BLOB_CHUNK_SIZE as 
 const MAX_SELECTED_BLOB_PAGE_CHUNKS: u64 =
     MAX_SELECTED_BLOB_PAGE_BYTES as u64 / SELECTED_BLOB_CHUNK_SIZE as u64 + 1;
 const BLOB_STREAM_CHECKPOINT_SEGMENTS: u64 = 64;
-const BLOB_STREAM_MAP_WORKERS: usize = 4;
-const BLOB_STREAM_MAP_QUEUE_ITEMS: usize = 8;
+// CM4 policy reserves one runtime/network lane and one ordered storage lane.
+// Two crypto workers keep the pipeline concurrent without oversubscribing all
+// four cores; device evidence may tune this policy at checkpoint boundaries.
+const BLOB_STREAM_MAP_WORKERS: usize = 2;
+const BLOB_STREAM_MAP_QUEUE_ITEMS: usize = 4;
 
 /// Maximum number of immutable Blob publication notifications returned by one poll.
 pub const MAX_SELECTED_BLOB_DELIVERIES: usize = MAX_BLOB_POLL_DELIVERIES;

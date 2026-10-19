@@ -942,7 +942,7 @@ impl BlobStreamSegmentOpener {
         segment: &EncryptedBlobStreamSegment,
     ) -> Result<(Zeroizing<Vec<u8>>, BlobStreamSegmentLeaves), BlobError> {
         self.open_borrowed(segment.header(), &segment.ciphertext)
-        .map(|(_, plaintext, leaves)| (plaintext, leaves))
+            .map(|(_, plaintext, leaves)| (plaintext, leaves))
     }
 
     pub fn open_encoded(
