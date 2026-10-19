@@ -48,16 +48,25 @@ fn report(
     let reorder = report.stage(PipelineStage::Reorder);
     let sink = report.stage(PipelineStage::Sink);
     println!(
-        "ASTER_STREAM_BENCH {{\"phase\":\"{label}\",\"bytes\":{bytes},\"elapsed_ns\":{elapsed_ns},\"mib_s\":{:.3},\"items\":{},\"peak_items\":{},\"peak_bytes\":{},\"peak_reorder\":{},\"admission_ns\":{},\"map_ns\":{},\"reorder_ns\":{},\"sink_ns\":{}}}",
+        "ASTER_STREAM_BENCH {{\"phase\":\"{label}\",\"bytes\":{bytes},\"elapsed_ns\":{elapsed_ns},\"mib_s\":{:.3},\"items\":{},\"workers\":{},\"peak_items\":{},\"peak_bytes\":{},\"peak_reorder\":{},\"admission_queue_ns\":{},\"admission_service_ns\":{},\"admission_output_blocked_ns\":{},\"map_queue_ns\":{},\"map_service_ns\":{},\"map_output_blocked_ns\":{},\"reorder_queue_ns\":{},\"reorder_service_ns\":{},\"reorder_output_blocked_ns\":{},\"sink_queue_ns\":{},\"sink_service_ns\":{},\"sink_output_blocked_ns\":{}}}",
         rate_mib(bytes, elapsed_ns),
         report.completed_items(),
+        report.worker_count(),
         report.peak_in_flight_items(),
         report.peak_in_flight_bytes(),
         report.peak_reorder_items(),
+        admission.queue_wait_ns,
         admission.service_ns,
+        admission.output_blocked_ns,
+        map.queue_wait_ns,
         map.service_ns,
+        map.output_blocked_ns,
+        reorder.queue_wait_ns,
         reorder.service_ns,
+        reorder.output_blocked_ns,
+        sink.queue_wait_ns,
         sink.service_ns,
+        sink.output_blocked_ns,
     );
 }
 

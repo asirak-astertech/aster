@@ -4,12 +4,16 @@ use std::{
     fmt::{self, Display, Formatter},
     future::Future,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc as std_mpsc,
+    },
     time::{Duration, Instant},
 };
 use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore, mpsc},
-    task::JoinSet,
+    task::JoinHandle,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -127,7 +131,9 @@ const PIPELINE_STAGE_COUNT: usize = 4;
 pub struct StageObservation {
     pub items: u64,
     pub bytes: u64,
+    pub queue_wait_ns: u64,
     pub service_ns: u64,
+    pub output_blocked_ns: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -138,6 +144,7 @@ pub struct PipelineReport {
     peak_in_flight_items: usize,
     peak_in_flight_bytes: usize,
     peak_reorder_items: usize,
+    worker_count: usize,
     stages: [StageObservation; PIPELINE_STAGE_COUNT],
 }
 
@@ -156,6 +163,9 @@ impl PipelineReport {
     }
     pub const fn peak_reorder_items(&self) -> usize {
         self.peak_reorder_items
+    }
+    pub const fn worker_count(&self) -> usize {
+        self.worker_count
     }
     pub const fn stage(&self, stage: PipelineStage) -> StageObservation {
         self.stages[stage as usize]
@@ -183,28 +193,54 @@ impl Error for PipelineError {}
 
 struct Pending<T> {
     mapped: MappedPartition<T>,
+    queue_wait: Duration,
     map_time: Duration,
+    mapped_at: Instant,
     _item_permit: OwnedSemaphorePermit,
     _byte_permit: OwnedSemaphorePermit,
 }
 
-async fn abort_and_join<T: Send + 'static>(jobs: &mut JoinSet<Result<Pending<T>, PipelineError>>) {
-    jobs.abort_all();
-    while jobs.join_next().await.is_some() {}
+struct Work {
+    partition: StreamPartition,
+    queued_at: Instant,
+    item_permit: OwnedSemaphorePermit,
+    byte_permit: OwnedSemaphorePermit,
+}
+
+async fn stop_workers(
+    work_sender: std_mpsc::Sender<Work>,
+    cancelled: Arc<AtomicBool>,
+    workers: Vec<JoinHandle<()>>,
+) -> bool {
+    cancelled.store(true, Ordering::Release);
+    drop(work_sender);
+    let mut panicked = false;
+    for worker in workers {
+        panicked |= worker.await.is_err();
+    }
+    panicked
 }
 
 fn add_observation(
     stages: &mut [StageObservation; PIPELINE_STAGE_COUNT],
     stage: PipelineStage,
     bytes: usize,
-    elapsed: Duration,
+    queue_wait: Duration,
+    service: Duration,
+    output_blocked: Duration,
 ) {
     let observation = &mut stages[stage as usize];
     observation.items = observation.items.saturating_add(1);
     observation.bytes = observation.bytes.saturating_add(bytes as u64);
+    observation.queue_wait_ns = observation
+        .queue_wait_ns
+        .saturating_add(queue_wait.as_nanos().min(u128::from(u64::MAX)) as u64);
     observation.service_ns = observation
         .service_ns
-        .saturating_add(elapsed.as_nanos().min(u128::from(u64::MAX)) as u64);
+        .saturating_add(service.as_nanos().min(u128::from(u64::MAX)) as u64);
+    observation.output_blocked_ns = observation
+        .output_blocked_ns
+        .saturating_add(output_blocked.as_nanos().min(u128::from(u64::MAX)) as u64);
 }
 
 enum PartitionSourcePoll {
@@ -347,200 +383,246 @@ where
     let item_budget = Arc::new(Semaphore::new(limits.max_in_flight_items));
     let byte_budget = Arc::new(Semaphore::new(limits.max_in_flight_bytes));
     let map = Arc::new(map);
-    let mut jobs = JoinSet::new();
-    let mut reorder = BTreeMap::<u64, Pending<T>>::new();
-    let mut stages = [StageObservation::default(); PIPELINE_STAGE_COUNT];
-    let mut accepted_items = 0_u64;
-    let mut completed_items = 0_u64;
-    let mut next_index = initial_index;
-    let mut peak_items = 0_usize;
-    let mut peak_bytes = 0_usize;
-    let mut peak_reorder = 0_usize;
-    let mut next_partition = None;
-    let mut source_done = false;
-
-    loop {
-        while jobs.len() < limits.workers
-            && jobs.len() + reorder.len() < limits.max_in_flight_items
-            && jobs.len() + reorder.len() < limits.max_reorder_items
-        {
-            if next_partition.is_none() && !source_done {
-                let next = if jobs.is_empty() && reorder.is_empty() {
-                    source.next_partition().await
-                } else {
-                    match source.try_next_partition() {
-                        PartitionSourcePoll::Ready(next) => next,
-                        PartitionSourcePoll::Pending => break,
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let (work_sender, work_receiver) = std_mpsc::channel::<Work>();
+    let work_receiver = Arc::new(Mutex::new(work_receiver));
+    let (result_sender, mut result_receiver) = mpsc::unbounded_channel();
+    let mut workers = Vec::with_capacity(limits.workers);
+    for _ in 0..limits.workers {
+        let receiver = Arc::clone(&work_receiver);
+        let results = result_sender.clone();
+        let map = Arc::clone(&map);
+        let cancelled = Arc::clone(&cancelled);
+        workers.push(tokio::task::spawn_blocking(move || {
+            loop {
+                if cancelled.load(Ordering::Acquire) {
+                    break;
+                }
+                let work = match receiver.lock() {
+                    Ok(receiver) => receiver.recv(),
+                    Err(_) => {
+                        _ = results.send(Err(PipelineError::WorkerPanicked));
+                        break;
                     }
                 };
-                match next {
-                    Ok(Some(partition)) => next_partition = Some(partition),
-                    Ok(None) => source_done = true,
-                    Err(error) => {
-                        abort_and_join(&mut jobs).await;
-                        return Err(error);
-                    }
+                let Ok(work) = work else {
+                    break;
+                };
+                if cancelled.load(Ordering::Acquire) {
+                    break;
+                }
+                let started = Instant::now();
+                let queue_wait = started.saturating_duration_since(work.queued_at);
+                let index = work.partition.index;
+                let bytes = work.partition.len();
+                let mapped =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| map(work.partition)));
+                let result = match mapped {
+                    Ok(Ok(value)) => Ok(Pending {
+                        mapped: MappedPartition {
+                            index,
+                            input_bytes: bytes,
+                            value,
+                        },
+                        queue_wait,
+                        map_time: started.elapsed(),
+                        mapped_at: Instant::now(),
+                        _item_permit: work.item_permit,
+                        _byte_permit: work.byte_permit,
+                    }),
+                    Ok(Err(error)) => Err(error),
+                    Err(_) => Err(PipelineError::WorkerPanicked),
+                };
+                let terminal = result.is_err();
+                if results.send(result).is_err() || terminal {
+                    break;
                 }
             }
-            let Some(next) = next_partition.as_ref() else {
-                break;
-            };
-            if next.len() > limits.max_in_flight_bytes {
-                jobs.abort_all();
-                return Err(PipelineError::PartitionTooLarge);
+        }));
+    }
+    drop(result_sender);
+
+    let outcome = async {
+        let mut reorder = BTreeMap::<u64, Pending<T>>::new();
+        let mut stages = [StageObservation::default(); PIPELINE_STAGE_COUNT];
+        let mut accepted_items = 0_u64;
+        let mut completed_items = 0_u64;
+        let mut next_index = initial_index;
+        let mut peak_items = 0_usize;
+        let mut peak_bytes = 0_usize;
+        let mut peak_reorder = 0_usize;
+        let mut next_partition = None;
+        let mut source_done = false;
+
+        loop {
+            let mut in_flight_items = limits.max_in_flight_items - item_budget.available_permits();
+            while in_flight_items < limits.max_in_flight_items
+                && in_flight_items < limits.max_reorder_items
+            {
+                if next_partition.is_none() && !source_done {
+                    let next = if in_flight_items == 0 {
+                        source.next_partition().await
+                    } else {
+                        match source.try_next_partition() {
+                            PartitionSourcePoll::Ready(next) => next,
+                            PartitionSourcePoll::Pending => break,
+                        }
+                    };
+                    match next {
+                        Ok(Some(partition)) => next_partition = Some(partition),
+                        Ok(None) => source_done = true,
+                        Err(error) => return Err(error),
+                    }
+                }
+                let Some(next) = next_partition.as_ref() else {
+                    break;
+                };
+                if next.len() > limits.max_in_flight_bytes {
+                    return Err(PipelineError::PartitionTooLarge);
+                }
+                if next.len() > byte_budget.available_permits() {
+                    break;
+                }
+                let partition = next_partition.take().expect("buffered partition");
+                let index = partition.index;
+                if partition.is_empty() {
+                    return Err(PipelineError::EmptyPartition);
+                }
+                let expected = initial_index.checked_add(accepted_items).ok_or(
+                    PipelineError::NonContiguousIndex {
+                        expected: u64::MAX,
+                        actual: index,
+                    },
+                )?;
+                if index != expected {
+                    return Err(PipelineError::NonContiguousIndex {
+                        expected,
+                        actual: index,
+                    });
+                }
+                let bytes = partition.len();
+                let admission_started = Instant::now();
+                let item_permit = Arc::clone(&item_budget)
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| PipelineError::WorkerPanicked)?;
+                let byte_permit = Arc::clone(&byte_budget)
+                    .acquire_many_owned(bytes as u32)
+                    .await
+                    .map_err(|_| PipelineError::WorkerPanicked)?;
+                add_observation(
+                    &mut stages,
+                    PipelineStage::Admission,
+                    bytes,
+                    Duration::ZERO,
+                    admission_started.elapsed(),
+                    Duration::ZERO,
+                );
+                accepted_items += 1;
+                let current_items = limits.max_in_flight_items - item_budget.available_permits();
+                let in_flight_bytes = limits.max_in_flight_bytes - byte_budget.available_permits();
+                peak_items = peak_items.max(current_items);
+                peak_bytes = peak_bytes.max(in_flight_bytes);
+                work_sender
+                    .send(Work {
+                        partition,
+                        queued_at: Instant::now(),
+                        item_permit,
+                        byte_permit,
+                    })
+                    .map_err(|_| PipelineError::WorkerPanicked)?;
+                in_flight_items = limits.max_in_flight_items - item_budget.available_permits();
             }
-            if next.len() > byte_budget.available_permits() {
-                break;
+
+            let in_flight_items = limits.max_in_flight_items - item_budget.available_permits();
+            if in_flight_items == 0 {
+                if source_done && next_partition.is_none() && reorder.is_empty() {
+                    break;
+                }
+                continue;
             }
-            let partition = next_partition.take().expect("buffered partition");
-            let index = partition.index;
-            if partition.is_empty() {
-                jobs.abort_all();
-                return Err(PipelineError::EmptyPartition);
-            }
-            let expected = initial_index.checked_add(accepted_items).ok_or(
-                PipelineError::NonContiguousIndex {
-                    expected: u64::MAX,
-                    actual: index,
-                },
-            )?;
-            if index != expected {
-                jobs.abort_all();
+
+            let pending = result_receiver
+                .recv()
+                .await
+                .ok_or(PipelineError::WorkerPanicked)??;
+            let reorder_started = Instant::now();
+            let index = pending.mapped.index;
+            let bytes = pending.mapped.input_bytes;
+            if reorder.insert(index, pending).is_some() {
                 return Err(PipelineError::NonContiguousIndex {
-                    expected,
+                    expected: next_index,
                     actual: index,
                 });
             }
-            let bytes = partition.len();
-            let admission_started = Instant::now();
-            let item_permit = Arc::clone(&item_budget)
-                .acquire_owned()
-                .await
-                .map_err(|_| PipelineError::WorkerPanicked)?;
-            let byte_permit = Arc::clone(&byte_budget)
-                .acquire_many_owned(bytes as u32)
-                .await
-                .map_err(|_| PipelineError::WorkerPanicked)?;
+            peak_reorder = peak_reorder.max(reorder.len());
             add_observation(
                 &mut stages,
-                PipelineStage::Admission,
+                PipelineStage::Reorder,
                 bytes,
-                admission_started.elapsed(),
+                Duration::ZERO,
+                reorder_started.elapsed(),
+                Duration::ZERO,
             );
-            accepted_items += 1;
-            let in_flight_items = limits.max_in_flight_items - item_budget.available_permits();
-            let in_flight_bytes = limits.max_in_flight_bytes - byte_budget.available_permits();
-            peak_items = peak_items.max(in_flight_items);
-            peak_bytes = peak_bytes.max(in_flight_bytes);
-            let map = Arc::clone(&map);
-            jobs.spawn_blocking(move || {
-                let started = Instant::now();
-                let value = map(partition)?;
-                Ok::<_, PipelineError>(Pending {
-                    mapped: MappedPartition {
-                        index,
-                        input_bytes: bytes,
-                        value,
-                    },
-                    map_time: started.elapsed(),
-                    _item_permit: item_permit,
-                    _byte_permit: byte_permit,
-                })
-            });
-        }
 
-        if jobs.is_empty() {
-            if source_done && next_partition.is_none() && reorder.is_empty() {
-                break;
-            }
-            if let Some(pending) = reorder.remove(&next_index) {
+            while let Some(pending) = reorder.remove(&next_index) {
                 let bytes = pending.mapped.input_bytes;
-                add_observation(&mut stages, PipelineStage::Map, bytes, pending.map_time);
+                add_observation(
+                    &mut stages,
+                    PipelineStage::Map,
+                    bytes,
+                    pending.queue_wait,
+                    pending.map_time,
+                    pending.mapped_at.elapsed(),
+                );
                 let sink_started = Instant::now();
                 if let Err(error) = sink(pending.mapped).await {
-                    abort_and_join(&mut jobs).await;
                     return Err(PipelineError::SinkFailed(error.to_string()));
                 }
                 add_observation(
                     &mut stages,
                     PipelineStage::Sink,
                     bytes,
+                    Duration::ZERO,
                     sink_started.elapsed(),
+                    Duration::ZERO,
                 );
                 completed_items += 1;
                 next_index += 1;
-                continue;
             }
-            return Err(PipelineError::NonContiguousIndex {
-                expected: next_index,
-                actual: reorder.keys().next().copied().unwrap_or(next_index),
-            });
         }
 
-        let joined = jobs.join_next().await.expect("non-empty join set");
-        let pending = match joined {
-            Ok(Ok(pending)) => pending,
-            Ok(Err(error)) => {
-                abort_and_join(&mut jobs).await;
-                return Err(error);
-            }
-            Err(_) => {
-                abort_and_join(&mut jobs).await;
-                return Err(PipelineError::WorkerPanicked);
-            }
-        };
-        let reorder_started = Instant::now();
-        let index = pending.mapped.index;
-        let bytes = pending.mapped.input_bytes;
-        if reorder.insert(index, pending).is_some() {
-            jobs.abort_all();
-            return Err(PipelineError::NonContiguousIndex {
-                expected: next_index,
-                actual: index,
-            });
-        }
-        peak_reorder = peak_reorder.max(reorder.len());
-        add_observation(
-            &mut stages,
-            PipelineStage::Reorder,
-            bytes,
-            reorder_started.elapsed(),
-        );
-
-        while let Some(pending) = reorder.remove(&next_index) {
-            let bytes = pending.mapped.input_bytes;
-            add_observation(&mut stages, PipelineStage::Map, bytes, pending.map_time);
-            let sink_started = Instant::now();
-            if let Err(error) = sink(pending.mapped).await {
-                abort_and_join(&mut jobs).await;
-                return Err(PipelineError::SinkFailed(error.to_string()));
-            }
-            add_observation(
-                &mut stages,
-                PipelineStage::Sink,
-                bytes,
-                sink_started.elapsed(),
-            );
-            completed_items += 1;
-            next_index += 1;
-        }
+        Ok(PipelineReport {
+            job_id,
+            accepted_items,
+            completed_items,
+            peak_in_flight_items: peak_items,
+            peak_in_flight_bytes: peak_bytes,
+            peak_reorder_items: peak_reorder,
+            worker_count: limits.workers,
+            stages,
+        })
     }
+    .await;
 
-    Ok(PipelineReport {
-        job_id,
-        accepted_items,
-        completed_items,
-        peak_in_flight_items: peak_items,
-        peak_in_flight_bytes: peak_bytes,
-        peak_reorder_items: peak_reorder,
-        stages,
-    })
+    let worker_panicked = stop_workers(work_sender, cancelled, workers).await;
+    if worker_panicked && outcome.is_ok() {
+        Err(PipelineError::WorkerPanicked)
+    } else {
+        outcome
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
+    use std::{
+        collections::HashSet,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
     #[tokio::test]
     async fn pipeline_accepts_async_partitions_and_preserves_order() {
@@ -662,6 +744,98 @@ mod tests {
         assert!(report.peak_in_flight_items() <= 3);
         assert!(report.peak_in_flight_bytes() <= 192);
         assert!(report.peak_reorder_items() <= 3);
+    }
+
+    #[tokio::test]
+    async fn pipeline_uses_one_fixed_worker_set_for_the_complete_job() {
+        let threads = Arc::new(Mutex::new(HashSet::new()));
+        let observed_threads = Arc::clone(&threads);
+        let report = run_ordered_pipeline(
+            StreamJobId::from_bytes([0x81; 16]),
+            (0..64)
+                .map(|index| StreamPartition::new(index, vec![0; 16]))
+                .collect::<Vec<_>>(),
+            PipelineLimits::new(2, 4, 64, 4).expect("limits"),
+            move |partition| {
+                observed_threads
+                    .lock()
+                    .expect("thread set")
+                    .insert(std::thread::current().id());
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                Ok(partition.into_bytes())
+            },
+            |_| std::future::ready(Ok(())),
+        )
+        .await
+        .expect("pipeline");
+
+        assert_eq!(report.worker_count(), 2);
+        assert!(threads.lock().expect("thread set").len() <= 2);
+    }
+
+    #[tokio::test]
+    async fn pipeline_early_validation_failure_joins_active_workers() {
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
+        let active = Arc::new(AtomicUsize::new(0));
+        let active_worker = Arc::clone(&active);
+        let mut index = 0_u64;
+        let partitions = std::iter::from_fn(move || {
+            let partition = match index {
+                0 => StreamPartition::new(0, vec![0; 16]),
+                1 => {
+                    started_rx
+                        .recv_timeout(std::time::Duration::from_secs(1))
+                        .expect("first worker started");
+                    StreamPartition::new(1, vec![0; 33])
+                }
+                _ => return None,
+            };
+            index += 1;
+            Some(partition)
+        });
+        let result = run_ordered_pipeline(
+            StreamJobId::from_bytes([0x82; 16]),
+            partitions,
+            PipelineLimits::new(2, 2, 32, 2).expect("limits"),
+            move |partition| {
+                active_worker.fetch_add(1, Ordering::SeqCst);
+                started_tx.send(()).expect("signal worker start");
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                active_worker.fetch_sub(1, Ordering::SeqCst);
+                Ok(partition.into_bytes())
+            },
+            |_| std::future::ready(Ok(())),
+        )
+        .await;
+
+        assert!(matches!(result, Err(PipelineError::PartitionTooLarge)));
+        assert_eq!(active.load(Ordering::SeqCst), 0, "worker still running");
+    }
+
+    #[tokio::test]
+    async fn pipeline_reports_queue_service_and_output_blocking_separately() {
+        let report = run_ordered_pipeline(
+            StreamJobId::from_bytes([0x83; 16]),
+            (0..8)
+                .map(|index| StreamPartition::new(index, vec![0; 16]))
+                .collect::<Vec<_>>(),
+            PipelineLimits::new(2, 4, 64, 4).expect("limits"),
+            |partition| {
+                if partition.index() == 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Ok(partition.into_bytes())
+            },
+            |_| std::future::ready(Ok(())),
+        )
+        .await
+        .expect("pipeline");
+
+        let map = report.stage(PipelineStage::Map);
+        assert_eq!(map.items, 8);
+        assert!(map.queue_wait_ns > 0);
+        assert!(map.service_ns > 0);
+        assert!(map.output_blocked_ns > 0);
     }
 
     #[tokio::test]
