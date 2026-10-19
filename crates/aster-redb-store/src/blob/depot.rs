@@ -25,6 +25,7 @@ use redb::{ReadableTable, ReadableTableMetadata};
 use super::*;
 
 const DEPOT_DIRECTORY: &str = "blob-depot-v1";
+const BLOB_PACK_DIRECTORY: &str = "stream-packs-v2";
 const DEPOT_OWNER_FILE: &str = ".aster-store-owner-v1";
 const DEPOT_OWNER_TEMP_PREFIX: &str = ".aster-store-owner-tmp-";
 const DEPOT_PENDING_PREFIX: &str = ".aster-blob-depot-pending-v1-";
@@ -1509,6 +1510,13 @@ impl<'a> BlobDepot<'a> {
         self.active = Some(active_from_import(&incoming));
         Ok(())
     }
+}
+
+/// Opens the owner-bound directory used by append-only stream packs.
+/// The returned capability remains descriptor-backed on Unix.
+pub(super) fn open_blob_pack_root(store: &Store) -> Result<OwnedDirectory, StoreError> {
+    let depot = BlobDepot::open_network_mutation(store, true)?;
+    depot.root.open_child_directory(BLOB_PACK_DIRECTORY, true)
 }
 
 impl CoreBlobStore for BlobDepot<'_> {
@@ -3879,6 +3887,11 @@ fn reclaim_unmarked_artifacts(
         if name == "." || name == ".." || name == DEPOT_OWNER_FILE {
             continue;
         }
+        if name == BLOB_PACK_DIRECTORY {
+            // Packs have separate redb reservation/publication authority and
+            // must never be interpreted or reclaimed as legacy variants.
+            continue;
+        }
         let Some(raw) = decode_hex32(&name) else {
             // Only known temporary files are reclaimable at the root. Unknown
             // artifacts fail closed rather than broadening cleanup authority.
@@ -3986,6 +3999,7 @@ fn audit_unmarked_artifacts_read(
     }
     for name in root.entry_names()? {
         if name == DEPOT_OWNER_FILE
+            || name == BLOB_PACK_DIRECTORY
             || name.starts_with(TEMP_PREFIX)
             || name.starts_with(DEPOT_OWNER_TEMP_PREFIX)
         {
@@ -5258,7 +5272,7 @@ fn hex_nibble(byte: u8) -> Option<u8> {
     }
 }
 
-struct OwnedDirectory {
+pub(super) struct OwnedDirectory {
     path: PathBuf,
     created_by_open: bool,
     #[cfg(unix)]
@@ -5424,6 +5438,15 @@ fn read_manifest_deletion_file(
 }
 
 impl OwnedDirectory {
+    pub(super) fn read_private_file_if_present(
+        &self,
+        name: &str,
+        max_len: u64,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        self.read_private_regular_file_if_present(name, max_len)
+            .map_err(|error| error.error)
+    }
+
     fn open_root_if_present(store_path: &Path) -> Result<Option<Self>, StoreError> {
         Self::open_root_internal(store_path)
     }
@@ -6346,7 +6369,11 @@ impl OwnedDirectory {
     }
 
     #[cfg(unix)]
-    fn open_child_directory(&self, name: &str, create: bool) -> Result<Self, StoreError> {
+    pub(super) fn open_child_directory(
+        &self,
+        name: &str,
+        create: bool,
+    ) -> Result<Self, StoreError> {
         let mut created = false;
         let descriptor = match rustix::fs::openat(
             &self.file,
@@ -6399,7 +6426,11 @@ impl OwnedDirectory {
     }
 
     #[cfg(not(unix))]
-    fn open_child_directory(&self, name: &str, create: bool) -> Result<Self, StoreError> {
+    pub(super) fn open_child_directory(
+        &self,
+        name: &str,
+        create: bool,
+    ) -> Result<Self, StoreError> {
         let path = self.path.join(name);
         match std::fs::symlink_metadata(&path) {
             Ok(metadata) if !metadata.is_dir() => {
@@ -6420,7 +6451,7 @@ impl OwnedDirectory {
     }
 
     #[cfg(unix)]
-    fn write_atomic(&self, final_name: &str, bytes: &[u8]) -> Result<(), StoreError> {
+    pub(super) fn write_atomic(&self, final_name: &str, bytes: &[u8]) -> Result<(), StoreError> {
         let temp_name = format!(
             "{TEMP_PREFIX}{}-{}",
             std::process::id(),
@@ -6459,7 +6490,7 @@ impl OwnedDirectory {
     }
 
     #[cfg(not(unix))]
-    fn write_atomic(&self, final_name: &str, bytes: &[u8]) -> Result<(), StoreError> {
+    pub(super) fn write_atomic(&self, final_name: &str, bytes: &[u8]) -> Result<(), StoreError> {
         let temp = self.path.join(format!(
             "{TEMP_PREFIX}{}-{}",
             std::process::id(),
@@ -6478,6 +6509,110 @@ impl OwnedDirectory {
         File::open(&self.path)?.sync_all()?;
         maybe_inject_fault(&self.path, DepotFaultPoint::DirectorySynced)?;
         Ok(())
+    }
+
+    pub(super) fn open_private_rw_file(
+        &self,
+        name: &str,
+        create_new: bool,
+    ) -> Result<File, StoreError> {
+        require_relative_leaf_name(name)?;
+        #[cfg(unix)]
+        {
+            let mut flags = rustix::fs::OFlags::RDWR
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC;
+            if create_new {
+                flags |= rustix::fs::OFlags::CREATE | rustix::fs::OFlags::EXCL;
+            }
+            let descriptor = rustix::fs::openat(
+                &self.file,
+                name,
+                flags,
+                rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+            )
+            .map_err(|error| {
+                if error == rustix::io::Errno::LOOP
+                    || error == rustix::io::Errno::ISDIR
+                    || error == rustix::io::Errno::NOTDIR
+                {
+                    blob_error(BlobStoreError::DepotIntegrity(
+                        "Blob pack file was replaced by another filesystem type",
+                    ))
+                } else {
+                    blob_error(BlobStoreError::Io(error.into()))
+                }
+            })?;
+            let file = File::from(descriptor);
+            validate_private_pack_file(&file)?;
+            Ok(file)
+        }
+        #[cfg(not(unix))]
+        {
+            let path = self.path.join(name);
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true).write(true).create_new(create_new);
+            let file = options.open(path)?;
+            if !file.metadata()?.is_file() {
+                return Err(blob_error(BlobStoreError::DepotIntegrity(
+                    "Blob pack file is not regular",
+                )));
+            }
+            Ok(file)
+        }
+    }
+
+    pub(super) fn open_private_rw_file_if_present(
+        &self,
+        name: &str,
+    ) -> Result<Option<File>, StoreError> {
+        require_relative_leaf_name(name)?;
+        #[cfg(unix)]
+        {
+            let descriptor = match rustix::fs::openat(
+                &self.file,
+                name,
+                rustix::fs::OFlags::RDWR
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            ) {
+                Ok(descriptor) => descriptor,
+                Err(error) if error == rustix::io::Errno::NOENT => return Ok(None),
+                Err(error)
+                    if error == rustix::io::Errno::LOOP
+                        || error == rustix::io::Errno::ISDIR
+                        || error == rustix::io::Errno::NOTDIR =>
+                {
+                    return Err(blob_error(BlobStoreError::DepotIntegrity(
+                        "Blob pack file was replaced by another filesystem type",
+                    )));
+                }
+                Err(error) => return Err(blob_error(BlobStoreError::Io(error.into()))),
+            };
+            let file = File::from(descriptor);
+            validate_private_pack_file(&file)?;
+            Ok(Some(file))
+        }
+        #[cfg(not(unix))]
+        {
+            let path = self.path.join(name);
+            let file = match std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+            {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(blob_error(BlobStoreError::Io(error))),
+            };
+            if !file.metadata()?.is_file() {
+                return Err(blob_error(BlobStoreError::DepotIntegrity(
+                    "Blob pack file is not regular",
+                )));
+            }
+            Ok(Some(file))
+        }
     }
 
     #[cfg(unix)]
@@ -6803,6 +6938,34 @@ impl OwnedDirectory {
         File::open(&self.path)?.sync_all()?;
         Ok(())
     }
+}
+
+fn require_relative_leaf_name(name: &str) -> Result<(), StoreError> {
+    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\']) {
+        return Err(blob_error(BlobStoreError::DepotIntegrity(
+            "Blob pack filename is not a relative leaf",
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_private_pack_file(file: &File) -> Result<(), StoreError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = file
+        .metadata()
+        .map_err(|error| blob_error(BlobStoreError::Io(error)))?;
+    if !metadata.is_file()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.mode() & 0o777 != 0o600
+        || metadata.nlink() != 1
+    {
+        return Err(blob_error(BlobStoreError::DepotIntegrity(
+            "Blob pack type, ownership, mode, or link count mismatches",
+        )));
+    }
+    Ok(())
 }
 
 fn read_exact_chunk_file_parts(

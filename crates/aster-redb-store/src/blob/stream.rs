@@ -414,6 +414,7 @@ fn map_pack_error(error: BlobPackError) -> StoreError {
     blob_error(BlobStoreError::DepotIntegrity(match error {
         BlobPackError::Invalid(message) => message,
         BlobPackError::Io(_) => "Blob pack checkpoint I/O error",
+        BlobPackError::Store(_) => "Blob pack checkpoint Store error",
     }))
 }
 
@@ -1325,7 +1326,7 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pack::BlobPackWriter;
+    use crate::pack::{BlobPackWriter, PinnedBlobPackRoot};
     use crate::{BlobOperationKey, Store};
     use aster_mesh::{
         BlobMetadata, BlobPublicationStreamId, BlobStreamOpen, BlobStreamPlainPartition, Priority,
@@ -1460,8 +1461,8 @@ mod tests {
         let (reservation, initial) = store
             .reserve_blob_stream_with_policy(&policy, request, &open)
             .unwrap();
-        let pack_root = root.0.join("pack");
-        let mut writer = BlobPackWriter::create(&pack_root, open.open()).unwrap();
+        let pack_root = PinnedBlobPackRoot::open(&store).unwrap();
+        let mut writer = BlobPackWriter::create_pinned(&pack_root, open.open()).unwrap();
         let sealer = publisher.blob_stream_segment_sealer(&open).unwrap();
         let plaintext = vec![0x33; aster_mesh::BLOB_STREAM_SEGMENT_BYTES];
         let (segment, leaves) = sealer
@@ -1505,6 +1506,18 @@ mod tests {
             reopened.blob_stream_resume(&reservation).unwrap(),
             projected
         );
+        let reopened_root = PinnedBlobPackRoot::open(&reopened).unwrap();
+        let resumed = BlobPackWriter::open_projected_pinned(
+            &reopened_root,
+            open.open(),
+            projected.generation(),
+            projected.next_segment_index(),
+            projected.durable_plaintext_offset(),
+            projected.durable_pack_len(),
+            projected.durable_wire_offset(),
+        )
+        .unwrap();
+        assert_eq!(resumed.next_index(), 1);
         assert!(reopened.blob_inventory().unwrap().is_empty());
     }
 

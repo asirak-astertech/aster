@@ -13,6 +13,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use super::depot::{OwnedDirectory, open_blob_pack_root};
+use crate::{Store, StoreError};
+
 const PACK_MAGIC: &[u8; 8] = b"ASTRPK02";
 const CHECKPOINT_MAGIC: &[u8; 8] = b"ASTRCP02";
 const PACK_VERSION: u16 = 2;
@@ -25,6 +28,7 @@ const MAX_RECORD_BYTES: usize = 2 * 1024 * 1024;
 #[derive(Debug)]
 pub enum BlobPackError {
     Io(std::io::Error),
+    Store(StoreError),
     Invalid(&'static str),
 }
 
@@ -32,6 +36,7 @@ impl Display for BlobPackError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(error) => Display::fmt(error, formatter),
+            Self::Store(error) => Display::fmt(error, formatter),
             Self::Invalid(message) => formatter.write_str(message),
         }
     }
@@ -42,6 +47,94 @@ impl Error for BlobPackError {}
 impl From<std::io::Error> for BlobPackError {
     fn from(error: std::io::Error) -> Self {
         Self::Io(error)
+    }
+}
+
+impl From<StoreError> for BlobPackError {
+    fn from(error: StoreError) -> Self {
+        Self::Store(error)
+    }
+}
+
+/// Store-owned capability for Blob pack placement. The directory remains
+/// descriptor-pinned on Unix so stream reopen never follows a replaced path.
+#[doc(hidden)]
+pub struct PinnedBlobPackRoot {
+    directory: OwnedDirectory,
+}
+
+impl PinnedBlobPackRoot {
+    pub fn open(store: &Store) -> Result<Self, StoreError> {
+        Ok(Self {
+            directory: open_blob_pack_root(store)?,
+        })
+    }
+
+    fn stream(&self, open: &BlobStreamOpen, create: bool) -> Result<BlobPackRoot, BlobPackError> {
+        Ok(BlobPackRoot::Pinned(self.directory.open_child_directory(
+            &hex32(open.stream_id().as_bytes()),
+            create,
+        )?))
+    }
+}
+
+enum BlobPackRoot {
+    Path(PathBuf),
+    Pinned(OwnedDirectory),
+}
+
+impl BlobPackRoot {
+    fn open_data(&self, create_new: bool) -> Result<File, BlobPackError> {
+        match self {
+            Self::Path(root) => Ok(OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(create_new)
+                .open(root.join(PACK_FILE))?),
+            Self::Pinned(root) => Ok(root.open_private_rw_file(PACK_FILE, create_new)?),
+        }
+    }
+
+    fn open_existing_data(&self) -> Result<Option<File>, BlobPackError> {
+        match self {
+            Self::Path(root) => match OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(root.join(PACK_FILE))
+            {
+                Ok(file) => Ok(Some(file)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(error.into()),
+            },
+            Self::Pinned(root) => Ok(root.open_private_rw_file_if_present(PACK_FILE)?),
+        }
+    }
+
+    fn read_checkpoint(&self, name: &str) -> Result<Option<Vec<u8>>, BlobPackError> {
+        match self {
+            Self::Path(root) => match fs::read(root.join(name)) {
+                Ok(bytes) => Ok(Some(bytes)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(error.into()),
+            },
+            Self::Pinned(root) => Ok(root.read_private_file_if_present(name, 16 * 1024)?),
+        }
+    }
+
+    fn write_checkpoint(&self, name: &str, bytes: &[u8]) -> Result<(), BlobPackError> {
+        match self {
+            Self::Path(root) => {
+                let mut journal = OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(root.join(name))?;
+                journal.write_all(bytes)?;
+                journal.sync_all()?;
+                Ok(())
+            }
+            Self::Pinned(root) => Ok(root.write_atomic(name, bytes)?),
+        }
     }
 }
 
@@ -159,7 +252,7 @@ impl BlobPackCheckpoint {
 }
 
 pub struct BlobPackWriter {
-    root: PathBuf,
+    root: BlobPackRoot,
     data: File,
     open_digest: [u8; 32],
     stream_id: BlobPublicationStreamId,
@@ -172,13 +265,28 @@ pub struct BlobPackWriter {
 }
 
 impl BlobPackWriter {
+    pub const fn next_index(&self) -> u64 {
+        self.next_index
+    }
+
+    pub const fn plaintext_offset(&self) -> u64 {
+        self.plaintext_offset
+    }
+
     pub fn create(root: &Path, open: &BlobStreamOpen) -> Result<Self, BlobPackError> {
         fs::create_dir_all(root)?;
-        let mut data = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(root.join(PACK_FILE))?;
+        Self::create_in(BlobPackRoot::Path(root.to_owned()), open)
+    }
+
+    pub fn create_pinned(
+        root: &PinnedBlobPackRoot,
+        open: &BlobStreamOpen,
+    ) -> Result<Self, BlobPackError> {
+        Self::create_in(root.stream(open, true)?, open)
+    }
+
+    fn create_in(root: BlobPackRoot, open: &BlobStreamOpen) -> Result<Self, BlobPackError> {
+        let mut data = root.open_data(true)?;
         let open_digest = open.digest();
         data.write_all(PACK_MAGIC)?;
         data.write_all(&PACK_VERSION.to_be_bytes())?;
@@ -187,7 +295,7 @@ impl BlobPackWriter {
         data.write_all(&open.total_len().to_be_bytes())?;
         data.sync_all()?;
         let mut writer = Self {
-            root: root.to_owned(),
+            root,
             data,
             open_digest,
             stream_id: open.stream_id(),
@@ -203,12 +311,20 @@ impl BlobPackWriter {
     }
 
     pub fn resume(root: &Path, open: &BlobStreamOpen) -> Result<Self, BlobPackError> {
-        let mut data = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(root.join(PACK_FILE))?;
+        Self::resume_in(BlobPackRoot::Path(root.to_owned()), open)
+    }
+
+    pub fn resume_pinned(
+        root: &PinnedBlobPackRoot,
+        open: &BlobStreamOpen,
+    ) -> Result<Self, BlobPackError> {
+        Self::resume_in(root.stream(open, false)?, open)
+    }
+
+    fn resume_in(root: BlobPackRoot, open: &BlobStreamOpen) -> Result<Self, BlobPackError> {
+        let mut data = root.open_data(false)?;
         validate_header(&mut data, open)?;
-        let checkpoint = recover_checkpoint(root, open, data.metadata()?.len())?;
+        let checkpoint = recover_checkpoint(&root, open, data.metadata()?.len())?;
         Self::restore(root, open, data, checkpoint)
     }
 
@@ -227,25 +343,62 @@ impl BlobPackWriter {
         pack_len: u64,
         payload_len: u64,
     ) -> Result<Self, BlobPackError> {
-        let mut data = match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(root.join(PACK_FILE))
-        {
-            Ok(data) => data,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound && generation == 0 => {
+        Self::open_projected_in(
+            BlobPackRoot::Path(root.to_owned()),
+            open,
+            generation,
+            next_index,
+            plaintext_offset,
+            pack_len,
+            payload_len,
+        )
+    }
+
+    pub fn open_projected_pinned(
+        root: &PinnedBlobPackRoot,
+        open: &BlobStreamOpen,
+        generation: u64,
+        next_index: u64,
+        plaintext_offset: u64,
+        pack_len: u64,
+        payload_len: u64,
+    ) -> Result<Self, BlobPackError> {
+        let root = root.stream(open, generation == 0)?;
+        Self::open_projected_in(
+            root,
+            open,
+            generation,
+            next_index,
+            plaintext_offset,
+            pack_len,
+            payload_len,
+        )
+    }
+
+    fn open_projected_in(
+        root: BlobPackRoot,
+        open: &BlobStreamOpen,
+        generation: u64,
+        next_index: u64,
+        plaintext_offset: u64,
+        pack_len: u64,
+        payload_len: u64,
+    ) -> Result<Self, BlobPackError> {
+        let mut data = match root.open_existing_data()? {
+            Some(data) => data,
+            None if generation == 0 => {
                 if next_index != 0 || plaintext_offset != 0 || pack_len != 0 || payload_len != 0 {
                     return Err(BlobPackError::Invalid(
                         "non-empty Blob projection has zero generation",
                     ));
                 }
-                return Self::create(root, open);
+                return Self::create_in(root, open);
             }
-            Err(error) => return Err(error.into()),
+            None => return Err(BlobPackError::Invalid("Blob pack data is unavailable")),
         };
         validate_header(&mut data, open)?;
         let data_len = data.metadata()?.len();
-        let checkpoint = recover_checkpoints(root, open, data_len)?
+        let checkpoint = recover_checkpoints(&root, open, data_len)?
             .into_iter()
             .filter(|checkpoint| {
                 if generation == 0 {
@@ -268,7 +421,7 @@ impl BlobPackWriter {
     }
 
     fn restore(
-        root: &Path,
+        root: BlobPackRoot,
         open: &BlobStreamOpen,
         mut data: File,
         checkpoint: BlobPackCheckpoint,
@@ -277,7 +430,7 @@ impl BlobPackWriter {
         data.sync_data()?;
         data.seek(SeekFrom::Start(checkpoint.pack_len))?;
         Ok(Self {
-            root: root.to_owned(),
+            root,
             data,
             open_digest: open.digest(),
             stream_id: open.stream_id(),
@@ -345,18 +498,12 @@ impl BlobPackWriter {
             pack_len: self.pack_len,
             frontier: self.frontier.checkpoint(),
         };
-        let path = self.root.join(if generation % 2 == 0 {
+        let name = if generation % 2 == 0 {
             CHECKPOINT_ZERO
         } else {
             CHECKPOINT_ONE
-        });
-        let mut journal = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path)?;
-        journal.write_all(&checkpoint.encode())?;
-        journal.sync_all()?;
+        };
+        self.root.write_checkpoint(name, &checkpoint.encode())?;
         self.generation = generation;
         Ok(checkpoint)
     }
@@ -380,9 +527,22 @@ pub struct BlobPackReader {
 
 impl BlobPackReader {
     pub fn open(root: &Path, open: &BlobStreamOpen) -> Result<Self, BlobPackError> {
-        let mut data = File::open(root.join(PACK_FILE))?;
+        Self::open_in(BlobPackRoot::Path(root.to_owned()), open)
+    }
+
+    pub fn open_pinned(
+        root: &PinnedBlobPackRoot,
+        open: &BlobStreamOpen,
+    ) -> Result<Self, BlobPackError> {
+        Self::open_in(root.stream(open, false)?, open)
+    }
+
+    fn open_in(root: BlobPackRoot, open: &BlobStreamOpen) -> Result<Self, BlobPackError> {
+        let mut data = root
+            .open_existing_data()?
+            .ok_or(BlobPackError::Invalid("Blob pack data is unavailable"))?;
         validate_header(&mut data, open)?;
-        let checkpoint = recover_checkpoint(root, open, data.metadata()?.len())?;
+        let checkpoint = recover_checkpoint(&root, open, data.metadata()?.len())?;
         data.seek(SeekFrom::Start(PACK_HEADER_LEN))?;
         Ok(Self {
             data,
@@ -458,7 +618,7 @@ fn validate_header(data: &mut File, open: &BlobStreamOpen) -> Result<(), BlobPac
 }
 
 fn recover_checkpoint(
-    root: &Path,
+    root: &BlobPackRoot,
     open: &BlobStreamOpen,
     data_len: u64,
 ) -> Result<BlobPackCheckpoint, BlobPackError> {
@@ -469,13 +629,13 @@ fn recover_checkpoint(
 }
 
 fn recover_checkpoints(
-    root: &Path,
+    root: &BlobPackRoot,
     open: &BlobStreamOpen,
     data_len: u64,
 ) -> Result<Vec<BlobPackCheckpoint>, BlobPackError> {
     let mut valid = Vec::new();
     for name in [CHECKPOINT_ZERO, CHECKPOINT_ONE] {
-        let Ok(bytes) = fs::read(root.join(name)) else {
+        let Some(bytes) = root.read_checkpoint(name)? else {
             continue;
         };
         let Ok(checkpoint) = BlobPackCheckpoint::decode(&bytes) else {
@@ -537,6 +697,16 @@ impl<'a> Reader<'a> {
             Err(BlobPackError::Invalid("trailing record bytes"))
         }
     }
+}
+
+fn hex32(value: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(64);
+    for byte in value {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
 }
 
 #[cfg(test)]
