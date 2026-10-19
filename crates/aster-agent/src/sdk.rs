@@ -189,9 +189,23 @@ impl NumberedPipelinedPublicationState {
     }
 }
 
+/// Observations of the actual transport loop for integration tests only.
+#[cfg(feature = "sdk-test-support")]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PublicationPipelineTestStats {
+    pub stream_sessions: usize,
+    pub send_batches: usize,
+    pub requests_sent: usize,
+    pub max_in_flight: usize,
+}
+
 struct NumberedPipelinedEventPublisher<'a, T> {
     client: &'a api::AsterApplicationServiceClient<T>,
     max_disconnect_retries: usize,
+    window: usize,
+    #[cfg(feature = "sdk-test-support")]
+    test_stats: Option<std::sync::Arc<std::sync::Mutex<PublicationPipelineTestStats>>>,
 }
 
 impl<'a, T> NumberedPipelinedEventPublisher<'a, T>
@@ -211,6 +225,9 @@ where
         Self {
             client,
             max_disconnect_retries,
+            window: PIPELINED_PUBLICATION_WINDOW,
+            #[cfg(feature = "sdk-test-support")]
+            test_stats: None,
         }
     }
 
@@ -231,18 +248,37 @@ where
         while !state.is_complete() {
             state.reconnect();
             let mut stream = self.client.publish_numbered_events().await?;
+            #[cfg(feature = "sdk-test-support")]
+            if let Some(stats) = &self.test_stats {
+                stats.lock().expect("pipeline test stats").stream_sessions += 1;
+            }
             let deadline = tokio::time::Instant::now() + PIPELINED_PUBLICATION_SESSION;
             let mut rotate = false;
             let mut session_made_progress = false;
 
             while !state.is_complete() && !rotate {
-                for request in state.fill_window(PIPELINED_PUBLICATION_WINDOW) {
+                let batch = state.fill_window(self.window);
+                #[cfg(feature = "sdk-test-support")]
+                if !batch.is_empty()
+                    && let Some(stats) = &self.test_stats
+                {
+                    let mut stats = stats.lock().expect("pipeline test stats");
+                    stats.send_batches += 1;
+                    stats.max_in_flight = stats.max_in_flight.max(state.sent);
+                }
+                for request in batch {
                     let send = stream.send(api::PublishNumberedEventsRequest {
                         publication: request.into(),
                         ..Default::default()
                     });
                     match tokio::time::timeout_at(deadline, send).await {
-                        Ok(Ok(())) => {}
+                        Ok(Ok(())) =>
+                        {
+                            #[cfg(feature = "sdk-test-support")]
+                            if let Some(stats) = &self.test_stats {
+                                stats.lock().expect("pipeline test stats").requests_sent += 1;
+                            }
+                        }
                         Err(_) => {
                             record_no_progress_rotation(
                                 session_made_progress,
@@ -997,6 +1033,64 @@ where
     where
         T::ResponseBody: Unpin,
     {
+        self.publish_journaled_pipeline_inner(
+            sequences,
+            max_disconnect_retries,
+            PIPELINED_PUBLICATION_WINDOW,
+            #[cfg(feature = "sdk-test-support")]
+            None,
+        )
+        .await
+    }
+
+    /// Integration-test seam: lower the network window without changing the
+    /// production ceiling or the journal capacity. Not a customer SDK API.
+    #[cfg(feature = "sdk-test-support")]
+    #[doc(hidden)]
+    pub async fn publish_journaled_pipeline_with_window_for_test(
+        &self,
+        sequences: &[u64],
+        max_disconnect_retries: usize,
+        window: usize,
+    ) -> Result<(
+        Vec<api::CommittedPublicationResult>,
+        PublicationPipelineTestStats,
+    )>
+    where
+        T::ResponseBody: Unpin,
+    {
+        let stats = std::sync::Arc::new(std::sync::Mutex::new(
+            PublicationPipelineTestStats::default(),
+        ));
+        let results = self
+            .publish_journaled_pipeline_inner(
+                sequences,
+                max_disconnect_retries,
+                window,
+                Some(stats.clone()),
+            )
+            .await?;
+        let stats = *stats.lock().expect("pipeline test stats");
+        Ok((results, stats))
+    }
+
+    async fn publish_journaled_pipeline_inner(
+        &self,
+        sequences: &[u64],
+        max_disconnect_retries: usize,
+        window: usize,
+        #[cfg(feature = "sdk-test-support")] test_stats: Option<
+            std::sync::Arc<std::sync::Mutex<PublicationPipelineTestStats>>,
+        >,
+    ) -> Result<Vec<api::CommittedPublicationResult>>
+    where
+        T::ResponseBody: Unpin,
+    {
+        if !(1..=PIPELINED_PUBLICATION_WINDOW).contains(&window) {
+            return Err(NumberedEventSdkError::Protocol(
+                "publication window must be between one and eight".to_owned(),
+            ));
+        }
         let state = self.journal.read_state()?;
         require_recovered(&state)?;
         if sequences.len() > MAX_PUBLICATION_JOURNAL_ENTRIES {
@@ -1024,7 +1118,13 @@ where
             requests.push(entry.intent);
             expected = sequence.checked_add(1);
         }
-        let publisher = NumberedPipelinedEventPublisher::new(&self.client, max_disconnect_retries);
+        let mut publisher =
+            NumberedPipelinedEventPublisher::new(&self.client, max_disconnect_retries);
+        publisher.window = window;
+        #[cfg(feature = "sdk-test-support")]
+        {
+            publisher.test_stats = test_stats;
+        }
         let responses = publisher
             .publish_all(requests, |request, response| {
                 let published = match &response.outcome {
@@ -1686,6 +1786,25 @@ mod tests {
         let before = journal_image(&sdk.journal);
         assert!(sdk.journal_publication(intent()).is_err());
         assert_eq!(journal_image(&sdk.journal), before);
+        drop(sdk);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(feature = "sdk-test-support")]
+    #[tokio::test]
+    async fn test_pipeline_window_cannot_exceed_production_ceiling_or_be_zero() {
+        let (path, sdk) = bounded_sdk("test-window-validation", vec![]);
+        let before = journal_image(&sdk.journal);
+        for window in [0, PIPELINED_PUBLICATION_WINDOW + 1] {
+            assert!(
+                sdk.publish_journaled_pipeline_with_window_for_test(&[], 0, window)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("publication window must be between one and eight")
+            );
+            assert_eq!(journal_image(&sdk.journal), before);
+        }
         drop(sdk);
         std::fs::remove_file(path).unwrap();
     }

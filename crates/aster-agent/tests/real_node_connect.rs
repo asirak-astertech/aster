@@ -1717,7 +1717,8 @@ async fn numbered_sdk_recovers_its_committed_result_across_restart() {
     assert_eq!(operations.numbered_reverse_rows, 0);
 
     // Exercise the journal-backed numbered pipeline over real native HTTP/2,
-    // across more than one bounded window, using the same selected node.
+    // with eight retained entries. The explicit test-support feature lowers
+    // only the network window to four and observes refill within one stream.
     for (index, protocol) in [Protocol::Connect, Protocol::Grpc].into_iter().enumerate() {
         let client_id = format!("numbered-pipeline-{index}");
         let path = state.0.join(format!("pipeline-{index}.redb"));
@@ -1734,40 +1735,59 @@ async fn numbered_sdk_recovers_its_committed_result_across_restart() {
         )
         .unwrap();
         sdk.recover().await.unwrap();
-        let suffixes: Vec<_> = (0_u8..17).collect();
-        let mut all_sequences = Vec::new();
-        for batch in suffixes.chunks(aster_agent::sdk::MAX_PUBLICATION_JOURNAL_ENTRIES) {
-            let sequences: Vec<_> = batch
-                .iter()
-                .map(|&suffix| {
-                    sdk.journal_publication(api::PublishNumberedEventRequest {
-                        topic: "chat.events".to_owned(),
-                        scope: "mission/team/alpha".to_owned(),
-                        priority: api::Priority::Routine.into(),
-                        logical_key: vec![suffix],
-                        payload: vec![suffix],
-                        ..Default::default()
-                    })
-                    .unwrap()
+        let sequences: Vec<_> = (0_u8..8)
+            .map(|suffix| {
+                sdk.journal_publication(api::PublishNumberedEventRequest {
+                    topic: "chat.events".to_owned(),
+                    scope: "mission/team/alpha".to_owned(),
+                    priority: api::Priority::Routine.into(),
+                    logical_key: vec![suffix],
+                    payload: vec![suffix],
+                    ..Default::default()
                 })
-                .collect();
-            let results = sdk
-                .publish_journaled_pipeline(&sequences, 1)
-                .await
-                .expect("numbered native pipeline");
-            assert_eq!(
-                results
-                    .iter()
-                    .map(|result| result.operation_sequence)
-                    .collect::<Vec<_>>(),
-                sequences
+                .unwrap()
+            })
+            .collect();
+        assert_eq!(aster_agent::sdk::MAX_PUBLICATION_JOURNAL_ENTRIES, 8);
+        assert!(
+            sdk.journal_publication(api::PublishNumberedEventRequest::default())
+                .is_err(),
+            "all eight journal slots remain occupied"
+        );
+        #[cfg(feature = "sdk-test-support")]
+        let results = {
+            let (results, stats) = tokio::time::timeout(
+                Duration::from_secs(30),
+                sdk.publish_journaled_pipeline_with_window_for_test(&sequences, 1, 4),
+            )
+            .await
+            .expect("one invocation must refill the four-request window")
+            .expect("numbered native pipeline");
+            assert_eq!(stats.stream_sessions, 1, "refill must use the same stream");
+            assert_eq!(stats.requests_sent, 8, "all eight requests use that stream");
+            assert_eq!(stats.max_in_flight, 4, "the actual network window is four");
+            assert!(
+                stats.send_batches > 1,
+                "the stream must refill after results"
             );
-            for &sequence in &sequences {
-                sdk.acknowledge(sequence).await.unwrap();
-            }
-            all_sequences.extend(sequences);
+            results
+        };
+        #[cfg(not(feature = "sdk-test-support"))]
+        let results = sdk
+            .publish_journaled_pipeline(&sequences, 1)
+            .await
+            .expect("numbered native pipeline with production window");
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.operation_sequence)
+                .collect::<Vec<_>>(),
+            sequences
+        );
+        assert_eq!(sequences, (1..=8).collect::<Vec<u64>>());
+        for sequence in sequences {
+            sdk.acknowledge(sequence).await.unwrap();
         }
-        assert_eq!(all_sequences, (1..=17).collect::<Vec<u64>>());
         drop(sdk);
         let reopened = NumberedEventSdk::open(
             api::AsterApplicationServiceClient::new(HttpClient::plaintext(), config()),

@@ -305,3 +305,22 @@ bindings, and generated-client reproduction. No parser, framing, or envelope
 behavior changed, so the P1 fuzz campaigns above were not rerun for this fix.
 This maintenance adds no requirement-status or physical power-loss
 qualification credit.
+
+## 2026-10-19 Restore real pipeline window-refill coverage
+
+The earlier P1 adaptation split 17 operations into eight/eight/one retained
+batches and did not preserve refill coverage within one invocation. The real
+Connect and gRPC integration now retains eight entries and uses the opt-in
+`sdk-test-support` feature to lower only that test's network window to four.
+Observations from the transport loop must show one stream, eight successful
+sends, a maximum of four in flight, and multiple send batches. All results are
+checked in order, acknowledged, and verified absent after reopen/recovery.
+The production entry point still uses eight in flight, and journals still
+retain at most eight entries. Test windows outside one through eight fail
+before transport or journal mutation. Test configuration and observations are
+absent without the explicit test-support feature.
+
+Focused verification passed for both wire protocols with test support enabled
+and with the production window; all 36 SDK tests passed. These are automated
+same-implementation checks and add no physical performance or qualification
+credit. The scheduling-test concern remains outside this follow-up.
