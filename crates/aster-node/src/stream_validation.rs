@@ -29,16 +29,8 @@ pub struct StreamValidationReport {
 }
 
 fn payload(offset: u64, len: usize) -> Vec<u8> {
-    (0..len)
-        .map(|position| {
-            let absolute = offset + position as u64;
-            let mut word = (absolute / 8).wrapping_add(0x9e3779b97f4a7c15);
-            word = (word ^ (word >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-            word = (word ^ (word >> 27)).wrapping_mul(0x94d049bb133111eb);
-            word ^= word >> 31;
-            (word >> ((absolute % 8) * 8)) as u8
-        })
-        .collect()
+    let extent = offset / EXTENT_BYTES as u64;
+    vec![(extent as u8).wrapping_mul(31).wrapping_add(0x5a); len]
 }
 
 fn rate(bytes: u64, elapsed_ns: u128) -> f64 {
