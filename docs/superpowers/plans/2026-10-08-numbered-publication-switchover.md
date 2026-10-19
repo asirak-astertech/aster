@@ -226,3 +226,25 @@ admin/backup targets require Linux. Requirements trace validation passed with
 348 baseline IDs and 140 exact selected mappings, preserving upstream evidence
 changes. This integration adds no physical, Linux deployment, or production
 qualification and changes no requirement evidence boundary of its own.
+
+## 2026-10-19 rewritten-main migration
+
+The rewritten `main` at `4e9df921f03dff2df069a34d676b2a16500d6b74`
+has the same complete file tree as the prior `fcf9f1b` base:
+`c0a306a40c902709cc81bc65b5f1ebd2558efa87`. The original PR base
+`f4f93c6` remains an ancestor, so all 28 signed PR commits can be retained
+without replay or replacement. Replacement merge `4524646` uses the rewritten
+`main` as its second parent and preserves exactly the previously tested
+`4eec24b` result tree, `6b0c42c9d8c5ee441a3a46fed18dc26118ec0aa0`.
+None of the three unsigned commits rejected during the earlier push is an
+ancestor of this replacement. All 106 inherited main commits newly reachable
+from the PR head carry signatures.
+
+This migration changes ancestry only. The full October 16 validation above,
+including 2,155 passing workspace tests, real-agent CLI smoke, and seven fuzz
+campaigns, applies to the identical implementation tree; it is not a new
+execution or qualification claim. Historical source IDs, frozen receipts,
+and requirement evidence boundaries remain intact. The October 19 `mise run check-foundation` gate passed on the migrated
+checkout: formatting, schemas, requirements trace (348 baseline IDs and 140
+exact selected mappings), retained receipts, policy, tool regressions, and
+dependency boundaries. The replacement merge signature also verifies locally.
