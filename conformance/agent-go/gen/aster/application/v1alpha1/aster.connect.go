@@ -77,6 +77,12 @@ const (
 	// AsterApplicationServiceQueryEventGapsProcedure is the fully-qualified name of the
 	// AsterApplicationService's QueryEventGaps RPC.
 	AsterApplicationServiceQueryEventGapsProcedure = "/aster.application.v1alpha1.AsterApplicationService/QueryEventGaps"
+	// AsterApplicationServicePublishBlobProcedure is the fully-qualified name of the
+	// AsterApplicationService's PublishBlob RPC.
+	AsterApplicationServicePublishBlobProcedure = "/aster.application.v1alpha1.AsterApplicationService/PublishBlob"
+	// AsterApplicationServiceReadBlobProcedure is the fully-qualified name of the
+	// AsterApplicationService's ReadBlob RPC.
+	AsterApplicationServiceReadBlobProcedure = "/aster.application.v1alpha1.AsterApplicationService/ReadBlob"
 )
 
 // AsterApplicationServiceClient is a client for the
@@ -112,6 +118,10 @@ type AsterApplicationServiceClient interface {
 	DeleteEventSubscription(context.Context, *connect.Request[DeleteEventSubscriptionRequest]) (*connect.Response[DeleteEventSubscriptionResponse], error)
 	// QueryEventGaps reports authenticated gaps in one exact publisher stream.
 	QueryEventGaps(context.Context, *connect.Request[QueryEventGapsRequest]) (*connect.Response[QueryEventGapsResponse], error)
+	// PublishBlob accepts one metadata frame followed by canonical plaintext chunks.
+	PublishBlob(context.Context) *connect.ClientStreamForClient[PublishBlobRequest, PublishBlobResponse]
+	// ReadBlob streams freshly authenticated bounded plaintext pages.
+	ReadBlob(context.Context, *connect.Request[ReadBlobRequest]) (*connect.ServerStreamForClient[ReadBlobResponse], error)
 }
 
 // NewAsterApplicationServiceClient constructs a client for the
@@ -216,6 +226,18 @@ func NewAsterApplicationServiceClient(httpClient connect.HTTPClient, baseURL str
 			connect.WithSchema(asterApplicationServiceMethods.ByName("QueryEventGaps")),
 			connect.WithClientOptions(opts...),
 		),
+		publishBlob: connect.NewClient[PublishBlobRequest, PublishBlobResponse](
+			httpClient,
+			baseURL+AsterApplicationServicePublishBlobProcedure,
+			connect.WithSchema(asterApplicationServiceMethods.ByName("PublishBlob")),
+			connect.WithClientOptions(opts...),
+		),
+		readBlob: connect.NewClient[ReadBlobRequest, ReadBlobResponse](
+			httpClient,
+			baseURL+AsterApplicationServiceReadBlobProcedure,
+			connect.WithSchema(asterApplicationServiceMethods.ByName("ReadBlob")),
+			connect.WithClientOptions(opts...),
+		),
 	}
 }
 
@@ -236,6 +258,8 @@ type asterApplicationServiceClient struct {
 	acknowledgeEvent                  *connect.Client[AcknowledgeEventRequest, AcknowledgeEventResponse]
 	deleteEventSubscription           *connect.Client[DeleteEventSubscriptionRequest, DeleteEventSubscriptionResponse]
 	queryEventGaps                    *connect.Client[QueryEventGapsRequest, QueryEventGapsResponse]
+	publishBlob                       *connect.Client[PublishBlobRequest, PublishBlobResponse]
+	readBlob                          *connect.Client[ReadBlobRequest, ReadBlobResponse]
 }
 
 // GetStatus calls aster.application.v1alpha1.AsterApplicationService.GetStatus.
@@ -322,6 +346,16 @@ func (c *asterApplicationServiceClient) QueryEventGaps(ctx context.Context, req 
 	return c.queryEventGaps.CallUnary(ctx, req)
 }
 
+// PublishBlob calls aster.application.v1alpha1.AsterApplicationService.PublishBlob.
+func (c *asterApplicationServiceClient) PublishBlob(ctx context.Context) *connect.ClientStreamForClient[PublishBlobRequest, PublishBlobResponse] {
+	return c.publishBlob.CallClientStream(ctx)
+}
+
+// ReadBlob calls aster.application.v1alpha1.AsterApplicationService.ReadBlob.
+func (c *asterApplicationServiceClient) ReadBlob(ctx context.Context, req *connect.Request[ReadBlobRequest]) (*connect.ServerStreamForClient[ReadBlobResponse], error) {
+	return c.readBlob.CallServerStream(ctx, req)
+}
+
 // AsterApplicationServiceHandler is an implementation of the
 // aster.application.v1alpha1.AsterApplicationService service.
 type AsterApplicationServiceHandler interface {
@@ -355,6 +389,10 @@ type AsterApplicationServiceHandler interface {
 	DeleteEventSubscription(context.Context, *connect.Request[DeleteEventSubscriptionRequest]) (*connect.Response[DeleteEventSubscriptionResponse], error)
 	// QueryEventGaps reports authenticated gaps in one exact publisher stream.
 	QueryEventGaps(context.Context, *connect.Request[QueryEventGapsRequest]) (*connect.Response[QueryEventGapsResponse], error)
+	// PublishBlob accepts one metadata frame followed by canonical plaintext chunks.
+	PublishBlob(context.Context, *connect.ClientStream[PublishBlobRequest]) (*connect.Response[PublishBlobResponse], error)
+	// ReadBlob streams freshly authenticated bounded plaintext pages.
+	ReadBlob(context.Context, *connect.Request[ReadBlobRequest], *connect.ServerStream[ReadBlobResponse]) error
 }
 
 // NewAsterApplicationServiceHandler builds an HTTP handler from the service implementation. It
@@ -454,6 +492,18 @@ func NewAsterApplicationServiceHandler(svc AsterApplicationServiceHandler, opts 
 		connect.WithSchema(asterApplicationServiceMethods.ByName("QueryEventGaps")),
 		connect.WithHandlerOptions(opts...),
 	)
+	asterApplicationServicePublishBlobHandler := connect.NewClientStreamHandler(
+		AsterApplicationServicePublishBlobProcedure,
+		svc.PublishBlob,
+		connect.WithSchema(asterApplicationServiceMethods.ByName("PublishBlob")),
+		connect.WithHandlerOptions(opts...),
+	)
+	asterApplicationServiceReadBlobHandler := connect.NewServerStreamHandler(
+		AsterApplicationServiceReadBlobProcedure,
+		svc.ReadBlob,
+		connect.WithSchema(asterApplicationServiceMethods.ByName("ReadBlob")),
+		connect.WithHandlerOptions(opts...),
+	)
 	return "/aster.application.v1alpha1.AsterApplicationService/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case AsterApplicationServiceGetStatusProcedure:
@@ -486,6 +536,10 @@ func NewAsterApplicationServiceHandler(svc AsterApplicationServiceHandler, opts 
 			asterApplicationServiceDeleteEventSubscriptionHandler.ServeHTTP(w, r)
 		case AsterApplicationServiceQueryEventGapsProcedure:
 			asterApplicationServiceQueryEventGapsHandler.ServeHTTP(w, r)
+		case AsterApplicationServicePublishBlobProcedure:
+			asterApplicationServicePublishBlobHandler.ServeHTTP(w, r)
+		case AsterApplicationServiceReadBlobProcedure:
+			asterApplicationServiceReadBlobHandler.ServeHTTP(w, r)
 		default:
 			http.NotFound(w, r)
 		}
@@ -553,4 +607,12 @@ func (UnimplementedAsterApplicationServiceHandler) DeleteEventSubscription(conte
 
 func (UnimplementedAsterApplicationServiceHandler) QueryEventGaps(context.Context, *connect.Request[QueryEventGapsRequest]) (*connect.Response[QueryEventGapsResponse], error) {
 	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("aster.application.v1alpha1.AsterApplicationService.QueryEventGaps is not implemented"))
+}
+
+func (UnimplementedAsterApplicationServiceHandler) PublishBlob(context.Context, *connect.ClientStream[PublishBlobRequest]) (*connect.Response[PublishBlobResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("aster.application.v1alpha1.AsterApplicationService.PublishBlob is not implemented"))
+}
+
+func (UnimplementedAsterApplicationServiceHandler) ReadBlob(context.Context, *connect.Request[ReadBlobRequest], *connect.ServerStream[ReadBlobResponse]) error {
+	return connect.NewError(connect.CodeUnimplemented, errors.New("aster.application.v1alpha1.AsterApplicationService.ReadBlob is not implemented"))
 }

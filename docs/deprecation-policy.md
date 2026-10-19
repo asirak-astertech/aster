@@ -27,29 +27,38 @@ Unknown optional extensions remain ignorable throughout a major version.
 Unknown critical values fail only the containing object/session and never cause
 silent reinterpretation. Stable replication-wire, credential/envelope, crypto-
 profile, and handshake-framing encodings remain version `1`. The current
-handshake separately negotiates semantic versions `7`, `6`, `5`, `4`, `3`,
-`2`, and `1` and complete suite `0x0001`; a default offer is
-`[7, 6, 5, 4, 3, 2, 1]`, and an honest responder selects the
-highest common semantic version. Offer and selection are transcript, KDF,
+handshake separately negotiates semantic versions `8` through `1` and complete
+suite `0x0001`; a default offer is `[8, 7, 6, 5, 4, 3, 2, 1]`, and an honest
+responder selects the highest common semantic version. Offer and selection are transcript, KDF,
 confirmation, and hybrid-authentication bound, so an unauthenticated on-path
 rewrite fails.
 
 Semantic version `7` inherits every semantic-v6 lane and adds a mandatory
-post-handshake per-lane transfer-profile exchange. Every lane must retain
-`LegacyV6`; Event directions may select `EventPagesV1` for exact durable,
+post-handshake per-lane transfer-profile exchange. Semantic version `8`
+inherits that exchange, changes the lane AAD domain, and adds authenticated
+finite Blob custody. Protocol draft.3 requires `BlobRangesStreamV1` profile 4
+for selected Blob transfer: v7 is durable-only and v8 admits durable plus
+authenticated finite sources. The historical v5/v6 carrier dialogue has no
+runtime fallback.
+An incompatible offer fails the authenticated profile exchange, and older
+semantic Blob carrier attempts fail before carrier IO; both endpoints must
+upgrade. Stored source, manifest, and durable-prefix formats are unchanged.
+Historical vector IDs retain their bytes; new stream-only vectors use new IDs.
+Other lanes retain `LegacyV6`; Event directions may select `EventPagesV1` for exact durable,
 finite-TTL, tombstone, route-only, mixed, and bounded blind ReceiveOnly
-traffic. Semantic-v7 page frames are invalid in v1-v6 sessions, and v7
-does not reinterpret any v1-v6 byte or stable object.
+traffic. Semantic-v7/v8 page frames are invalid in v1-v6 sessions, and neither
+version reinterprets any v1-v6 byte or stable object.
 
 Semantic version `4` adds the selected protected, class- and direction-separated
-State/Record mechanics lanes; semantic version `5` inherits them and adds the
-selected direct-content Blob source/carrier mechanics. Semantic version `6`
+State/Record mechanics lanes; semantic version `5` inherits them and allocates
+the historical direct-content Blob frames. Semantic version `6`
 inherits every v5 ordinary lane unchanged and adds an opt-in selected Event
 bridge lane that runs only when both authenticated endpoints enable it. Event
-remains compatible across semantic versions `1` through `7`; State/Record
+remains compatible across semantic versions `1` through `8`; State/Record
 frames are absent from v1-v3 contacts, Blob frames are absent from v1-v4
 contacts, Event-bridge frames are absent from v1-v5 contacts, and v7 profile/page
 frames are absent from v1-v6 contacts.
+Selected Blob carrier IO is absent at v5/v6 and requires v7/v8 profile 4.
 This is a negotiated-behavior addition: stable wire/profile, handshake framing,
 suite, and source-object formats are not renumbered. A v4 State/Record object is
 therefore never silently downgraded into an Event or processed by a v1-v3

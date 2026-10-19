@@ -176,14 +176,19 @@ async fn run_legacy(mut arguments: Arguments) -> Result<(), BoxError> {
     };
     #[cfg(not(feature = "nearby-discovery"))]
     let node = start_node(config).await?;
+    let pinned_state = node.state_root().to_path_buf();
     let events = node.selected_events();
+    let blobs = node.selected_blobs();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    // Construct every fallible route before announcing readiness.
+    let server = agent.serve_with_blobs(events, blobs, pinned_state, client_token, shutdown_rx)?;
 
     println!(
-        "AGENT status=ready listen=http://{listen} mesh_bind={mesh_bind} state={} protocol=connect+grpc+grpc-web api=aster.application.v1alpha1 event_live=true state_live=false record_live=false plaintext=loopback-only",
+        "AGENT status=ready listen=http://{listen} mesh_bind={mesh_bind} state={} protocol=connect+grpc+grpc-web api=aster.application.v1alpha1 event_live=true blob_live={} state_live=false record_live=false plaintext=loopback-only",
         format_path_field(&state),
+        cfg!(target_os = "linux"),
     );
 
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let mut signals = translated_signals()?;
     let signal = tokio::spawn(async move {
         while let Some(signal) = signals.recv().await {
@@ -193,7 +198,7 @@ async fn run_legacy(mut arguments: Arguments) -> Result<(), BoxError> {
             }
         }
     });
-    let server_result = agent.serve(events, client_token, shutdown_rx).await;
+    let server_result = server.await;
     signal.abort();
     let node_result = node.shutdown().await;
     server_result?;

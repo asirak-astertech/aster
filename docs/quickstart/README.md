@@ -28,8 +28,8 @@ capacity, or release authorization.
 
 | Application boundary | API | Guide |
 |---|---|---|
-| Local Connect, gRPC, or gRPC-Web client | Authenticated Event-only `aster.application.v1alpha1` service | [ConnectRPC agent](connect-agent.md) |
-| Command-line node introspection and control | `asterctl`; `status`, `publish`, `query`, and `subscribe` | [asterctl](../../crates/asterctl/README.md) |
+| Local Connect, gRPC, or gRPC-Web client | Authenticated Event operations plus Linux native-gRPC Blob publish/read | [ConnectRPC agent](connect-agent.md) |
+| Command-line node introspection and control | `asterctl`; Event commands plus Linux `blob-publish` and `blob-read` | [asterctl](../../crates/asterctl/README.md) |
 | Selected live or stopped Event in Rust | `SelectedEventHandle` or `SelectedEventNode` | [Event API](selected-event-api.md) |
 | Selected live or stopped control administration in Rust | `SelectedControlHandle` or `SelectedControlAdmin` | [Event control operations](selected-event-api.md#publish-controls-through-the-live-actor) |
 | Selected live or stopped State in Rust | `SelectedStateHandle` or `SelectedStateNode` | [State API](selected-state-api.md) |
@@ -42,8 +42,10 @@ capacity, or release authorization.
 
 The selected Rust handles share the running node’s bounded actor and store
 authority. The broader Rust/C/Go/Python examples are offline semantic API
-exercises and are not selected-live-node bindings. The local agent currently
-exposes Event and local status; State, Record, and Blob RPCs remain open.
+exercises and are not selected-live-node bindings. The selected Linux local
+agent exposes Event operations and local status plus native-gRPC Blob
+publish/read streams consumed by `asterctl`; State and Record RPCs and Blob
+subscription/status operations remain open.
 
 For operation selection and cross-language names, use
 [Application recipes](../application-recipes.md).

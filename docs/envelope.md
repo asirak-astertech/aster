@@ -1,8 +1,8 @@
 # Aster Fixed Binary Security Objects
 
-- Specification version: 0.1.0-draft.1
+- Specification version: 0.1.0-draft.2
 - Stable wire/cryptographic profile: `1`, suite `0x0001`
-- Negotiated semantic versions: default/highest `7`, compatibility `6`, `5`, `4`, `3`, `2`, and `1`
+- Negotiated semantic versions: default/highest `8`, compatibility `7`, `6`, `5`, `4`, `3`, `2`, and `1`
 - Status: normative for the implemented reference profile
 - Date: 2026-08-25
 
@@ -17,7 +17,7 @@ profile `0x0002` remains an interoperability gate.
 
 The key words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY**
 are normative. This document defines the base fixed binary security objects
-emitted or accepted by the reference profile. The semantic-version-2/3/v4/v5/v6/v7 batch
+emitted or accepted by the reference profile. The semantic-version-2/3/v4/v5/v6/v7/v8 batch
 additions are defined normatively in [protocol.md](protocol.md) §6.1; together,
 these sections are the interoperability authority for the fixed bytes. Rust
 types and local database rows are not wire formats.
@@ -138,16 +138,17 @@ that 32-byte value itself is the input to both signature algorithms.
 | Provisioning bundle | `"ASTRPB03"` | unprotected local provisioning-inner format; not a network object |
 | Rekey recipient registry | `"ASTRRKR1"` | signed administrative artifact; at most 16 MiB; not a mesh replication object |
 | Authority credential body | none; embedded with `b32` | network security object; embedded bound 16 KiB |
-| Singleton source envelope | `"ASTRENV2"` | network/stable-store format-2 object; semantic versions 1 through 7 |
-| Compact batch source envelope | `"ASTRENV3"`, kind `1` | semantic-version-2/3/v4/v5/v6/v7 network/stable-store format-3 object; exact bytes in [protocol.md](protocol.md) §6.1 |
-| Source-batch proof | `"ASTRENV3"`, kind `3` | semantic-version-2/3/v4/v5/v6/v7 network/stable-store format-3 object; exact bytes in [protocol.md](protocol.md) §6.1 |
+| Singleton source envelope | `"ASTRENV2"` | network/stable-store format-2 object; semantic versions 1 through 8 |
+| Compact batch source envelope | `"ASTRENV3"`, kind `1` | semantic-version-2/3/v4/v5/v6/v7/v8 network/stable-store format-3 object; exact bytes in [protocol.md](protocol.md) §6.1 |
+| Source-batch proof | `"ASTRENV3"`, kind `3` | semantic-version-2/3/v4/v5/v6/v7/v8 network/stable-store format-3 object; exact bytes in [protocol.md](protocol.md) §6.1 |
 | Revocation control | source-envelope kind `2`, protected `"ASTRCA02"` | delegated-control format 2 inside `ASTRENV2` |
 | Scope-epoch control | source-envelope kind `3`, protected `"ASTRCA02"` | delegated-control format 2 inside `ASTRENV2` |
-| Bridge authorization | `"ASTRBA01"`, protected ObjectKind `4` | semantic-version-2/3/v4/v5/v6/v7 authorization format 2; at most 65,536 bytes total |
-| Bridge route wrapper | `"ASTRBW01"`, protected ObjectKind `5` | semantic-version-2/3/v4/v5/v6/v7 wrapper format 1; at most 524,322 bytes total |
+| Bridge authorization | `"ASTRBA01"`, protected ObjectKind `4` | semantic-version-2/3/v4/v5/v6/v7/v8 authorization format 2; at most 65,536 bytes total |
+| Bridge route wrapper | `"ASTRBW01"`, protected ObjectKind `5` | semantic-version-2/3/v4/v5/v6/v7/v8 wrapper format 1; at most 524,322 bytes total |
 | Bridge edge enrollment | `"ASTRBE01"` | provider-authenticated administrative capability; at most 32 KiB; not a mesh replication object |
 | Legacy per-hop forwarding wrapper | `"ASTRFWD1"` | provider-owned network object; protected body at most 64 KiB including tag |
-| Semantic-v3-format custody claim, used by v3/v4/v5/v6/v7 | `"ASTRCU03"` inside `"ASTRFR01"` | exact 150-byte plaintext; exact current outer record 202 bytes, hard bound 256 bytes |
+| Semantic-v3-format custody claim, used by v3/v4/v5/v6/v7/v8 | `"ASTRCU03"` inside `"ASTRFR01"` | exact 150-byte plaintext; exact current outer record 202 bytes, hard bound 256 bytes |
+| Semantic-v8 Blob custody claim | `"ASTRBL08"` in a v8 Blob mutable source frame | exact 208-byte canonical claim; decoded bytes remain untrusted until exact-context verification |
 | Handshake flight | `"ASTRHS01"` | network, at most 64 KiB per flight |
 | Protected transport frame | `"ASTRFR01"` | network; plaintext at most 16 MiB |
 | Blob manifest | `"ASTRBM01"` | canonical source-authenticated object, at most 1 MiB |
@@ -505,10 +506,12 @@ signature.
 
 No multi-item batch certificate, proof, or credential cache reference is encoded
 inside an `ASTRENV2` format-2 object. Semantic-version-2, semantic-version-3,
-semantic-version-4, semantic-version-5, and semantic-version-6 sessions also support the separate `ASTRENV3` format-3 source-batch proof and
-compact item representations defined in [protocol.md](protocol.md) §6.1. Those bytes MUST NOT
+semantic-version-4, semantic-version-5, semantic-version-6, semantic-version-7,
+and semantic-version-8 sessions also support the separate `ASTRENV3` format-3
+source-batch proof and compact item representations defined in
+[protocol.md](protocol.md) §6.1. Those bytes MUST NOT
 be inserted into or reinterpreted as an `ASTRENV2` object; format 2 remains the
-singleton fallback for semantic-version-2/3/v4/v5/v6/v7 peers and the only source-envelope
+singleton fallback for semantic-version-2/3/v4/v5/v6/v7/v8 peers and the only source-envelope
 format accepted by semantic version 1.
 
 ## 6. Authority control objects
@@ -788,7 +791,7 @@ generation in independent durable state and supply it as the minimum generation
 on import; using the zero-minimum convenience import after losing that state
 does not provide rollback detection.
 
-### 6.2 Semantic-v2/v3/v4/v5/v6/v7 bridge delegated control authentication
+### 6.2 Semantic-v2/v3/v4/v5/v6/v7/v8 bridge delegated control authentication
 
 A semantic-version-2, semantic-version-3, semantic-version-4,
 semantic-version-5, semantic-version-6, or semantic-version-7 ObjectKind `4` bridge authorization
@@ -933,7 +936,7 @@ No decoder may reinterpret one format as the other.
 
 ### 7.1 Semantic-v3-format session custody claim
 
-A selected semantic-v3, semantic-v4, semantic-v5, semantic-v6, or semantic-v7 Event or RouteEvent offer carries exactly one custody
+A selected semantic-v3, semantic-v4, semantic-v5, semantic-v6, semantic-v7, or semantic-v8 Event or RouteEvent offer carries exactly one custody
 claim encrypted as an `ASTRFR01` record from §9. The application AAD is the
 exact ASCII string `"aster/custody-wrapper/v3"`, distinct from normal transport
 frames. The plaintext is exactly 150 bytes:
@@ -978,6 +981,54 @@ keys bind the actually negotiated session. With the current §9
 encoding the complete record is exactly 202 bytes; implementations MUST reject
 an empty record or one larger than 256 bytes. Stable source bytes remain in the
 ordinary peer-neutral transfer path and are not embedded in this claim.
+
+### 7.2 Semantic-v8 Blob custody claim
+
+`BlobCustodyClaimV1` is a fixed-domain claim carried only by the semantic-v8
+Blob mutable-frame grammar in [protocol.md](protocol.md) §9.4. It is exactly 208
+bytes:
+
+```text
+magic                           "ASTRBL08"         8
+format_version                  u16 = 1             2
+semantic_version                u16 = 8             2
+profile_id                      u16 = 4             2
+session_transcript              32 bytes           32
+exchange_id                     u64                 8
+direction                       u8 = 1 or 2          1
+source_transfer_id              32 bytes           32
+source_len                      u64, nonzero         8
+publication_id                  32 bytes           32
+blob_id                         32 bytes           32
+priority                        u8 = 0..3            1
+ttl_ms                          u64, nonzero         8
+prior_cumulative_age_ms         u64                 8
+sender_clock_id                 16 bytes           16
+sender_tick_ms                  u64                 8
+hop_delta_ms                    u64                 8
+```
+
+Direction `1` means the authenticated session initiator receives the source;
+direction `2` means the responder receives it. `session_transcript`, exchange,
+direction, typed transfer ID, and source length MUST equal the live protected
+exchange. Publication ID, BlobID, priority, and positive TTL MUST equal the
+freshly content-verified source envelope. Sender sample and hop contribution
+are verifier inputs, never values trusted merely because the claim decoded.
+`prior_cumulative_age_ms + hop_delta_ms` is checked and overflow fails. The
+settlement digest is ordinary SHA-256 over all 208 canonical bytes, with no
+additional prefix.
+
+Decoding proves only grammar. The verifier reconstructs all fields from the
+authenticated session and exact content-verified source, compares the complete
+claim, and only then returns a nonconstructible verified Blob custody
+capability. Store admission MUST accept that capability, never the decoded
+claim. The exact vectors are in
+`conformance/vectors/blob-custody-v8.tsv`. Under semantic v8 with authenticated
+Blob profile `4`, that capability admits the exact finite source to the selected
+pending-store and range-stream lifecycle; inventory, range service, cursor
+advancement, completion, and promotion each still recheck the current source
+and lifecycle policy. Semantic v7 uses the same raw stream profile for durable
+sources only and cannot reinterpret a decoded v8 claim as authority.
 
 ## 8. Handshake flights and transcript
 
@@ -1024,6 +1075,7 @@ anonymous_mission_proof         AEAD with ciphertext exactly 16 bytes
 
 Both offer lists MUST be nonempty, nonzero, duplicate-free, and in strictly
 descending numeric order. The default semantic-version list is
+`[8, 7, 6, 5, 4, 3, 2, 1]`; a v7-only compatibility initiator may send
 `[7, 6, 5, 4, 3, 2, 1]`; a v6-only compatibility initiator may send
 `[6, 5, 4, 3, 2, 1]`, a v2 compatibility initiator may send `[2, 1]`, and a
 v1-only compatibility initiator sends `[1]`. The suite list contains only
@@ -1081,7 +1133,7 @@ cause a fresh response; deployments MUST rate-limit handshake work.
 After the kind-`2` prefix:
 
 ```text
-selected_semantic_version       u16 = 1, 2, 3, 4, 5, 6, or 7
+selected_semantic_version       u16 = 1, 2, 3, 4, 5, 6, 7, or 8
 selected_suite_id               u16 = 0x0001
 responder_nonce                 32 fresh random bytes
 responder_p256_ephemeral        b16(exactly 33 bytes)
@@ -1337,11 +1389,11 @@ ciphertext         b32(plaintext || GCM tag)     variable
 Application plaintext is at most 16 MiB; ciphertext is therefore 16 through
 `16 MiB + 16` bytes. The whole encoded frame is bounded by the reference decoder
 at `16 MiB + 128` bytes. The sender has exactly one record sequence in each
-direction, shared by the ordinary and semantic-v7 contextual AAD domains. It
+direction, shared by the ordinary and semantic-v7/v8 contextual AAD domains. It
 starts at zero, increments by one for each encryption attempt in either domain,
 never repeats, and fails closed after using `u64::MAX`.
 
-For semantic versions 1 through 7, the application AAD for normal transport
+For semantic versions 1 through 8, the application AAD for normal transport
 frames is the exact ASCII string `"aster/transport-frame/v1"`. Record AEAD
 associated data is:
 
@@ -1349,8 +1401,9 @@ associated data is:
 "ASTER-RECORD-AAD-v1" || sequence u64 || b32(application_aad)
 ```
 
-The subsequent semantic-v7-only Event plan/header/page/terminal records instead
-use this exact application AAD:
+The subsequent semantic-v7/v8 Event plan/header/page/terminal records and
+`BlobRangesStreamV1` schedule/acceptance/data/terminal records use this exact
+application AAD:
 
 ```text
 context =
@@ -1368,10 +1421,16 @@ application_aad =
 Direction is `1` ToSessionInitiator or `2` ToSessionResponder. `context_length`
 is the unsigned big-endian byte length of the complete context. Lane/profile IDs
 and the profile digest are defined in [protocol.md](protocol.md) section 9.4.
-Opening under a different digest, lane, profile, or direction MUST fail
-authentication. The profile offer and every negotiated `LegacyV6`
-Event/State/Record/Blob/EventBridge frame keep the ordinary exact ASCII
+Semantic v8 uses the byte-identical field layout with the exact context domain
+`"ASTER/v8-lane-record/v1" || 0x00` and `semantic_version u16 = 8`.
+Opening under another semantic version/domain or a different digest, lane,
+profile, or direction MUST fail authentication. The profile offer and every
+negotiated `LegacyV6` Event/State/Record/EventBridge frame keep the ordinary exact ASCII
 application AAD `"aster/transport-frame/v1"`; v1-v6 bytes remain unchanged.
+Blob source metadata also retains ordinary AAD, while carrier streaming binds
+lane `4`, profile `4`, and its exact direction. The selected runtime no longer
+executes legacy Blob carrier Result/Ack or Finish/Finished exchanges; their
+historical byte definitions below are not a fallback path.
 
 AES-256-GCM uses the directional traffic key from §8 and the transmitted nonce.
 The nonce is not derived from the record sequence. Both AAD domains share the
@@ -1382,7 +1441,7 @@ starting value. Other implementations MAY use another construction but MUST
 guarantee key/nonce uniqueness across both domains under the directional key.
 
 The receiver has exactly two fixed 128-record sliding replay windows in each
-receive direction: one for ordinary records and one for semantic-v7 contextual
+receive direction: one for ordinary records and one for semantic-v7/v8 contextual
 records. It MUST authenticate a record under the selected exact AAD domain
 before mutating either window, then apply the authenticated record sequence only
 to that domain's window. In either window, a sequence greater than the recorded
@@ -1400,17 +1459,19 @@ direction, ordinary or contextual, therefore uses sequence zero.
 
 The selected-node mechanics plaintext is protected as the ordinary §9
 application record with the exact ordinary transport-frame AAD above. Semantics v4, v5,
-v6, and v7 add no
+v6, v7, and v8 add no
 new outer record, source envelope, or suite. Every selected mechanics plaintext
 starts with `"ASM\x01" || tag u8`. The mutable tags are invalid unless the
-completed session negotiated semantic version `4`, `5`, `6`, or `7`; class `3` is
-valid only at v5, v6, or v7, and v1-v3 Event-compatible sessions reject every
-mutable class.
+completed session negotiated semantic version `4`, `5`, `6`, `7`, or `8`; class
+`3` is valid only at v5 through v8, and v1-v3 Event-compatible sessions reject
+every mutable class. Semantic-v8 Blob source and result records append the exact
+custody claim/digest fields defined in [protocol.md](protocol.md) §9.4; the base
+fields below remain byte-identical.
 
 The common mutable fields are:
 
 ```text
-class       u8: 1 State, 2 Record, 3 Blob source under semantic v5, v6, or v7
+class       u8: 1 State, 2 Record, 3 Blob source under semantic v5 through v8
 direction   u8: 1 ToSessionInitiator, 2 ToSessionResponder
 transfer_id 32 bytes; its typed class MUST equal class
 disposition u8: 0 Duplicate, 1 Inserted, 2 DeferredCapacity
@@ -1440,13 +1501,16 @@ the contact. The exact sequencing, capacity meaning, fairness cursor, mode
 behavior, and finite-TTL rejection are normative in
 [protocol.md](protocol.md) §9.1.
 
-### 9.2 Semantic-v5 selected Blob mechanics plaintext
+### 9.2 Historical semantic-v5 Blob mechanics plaintext
 
-Semantic v5 reuses the protected §9 record and the mutable source grammar
+Semantic v5 allocated the protected §9 record and the mutable source grammar
 above with `class = 3` for Blob source envelopes. It reserves separate exact
 Blob interest and carrier-range tags; v1-v4 sessions reject all of them. Source
 and carrier formats remain `ASTRENV2`/`ASTRENV3` and `ASTRBT01` version 1.
-Semantic v6 inherits these Blob mechanics byte-for-byte.
+Semantic v6 inherited these Blob mechanics byte-for-byte. The definitions below
+remain parser and compatibility codec allocations, not a current carrier
+fallback. Current Blob carrier transfer requires semantic v7/v8 profile 4 and
+uses the receipt-free grammar in [protocol.md](protocol.md) §9.4.
 
 BlobInterest (`0x6b`) and BlobInterestReply (`0x6c`) encode:
 
@@ -1491,22 +1555,23 @@ BlobCarrierFinish (`0xb1`) and BlobCarrierFinished (`0xb2`) encode `direction ||
 remaining u64`; each is exactly 14 plaintext bytes and `remaining` is at most
 the selected reconciliation cardinality bound. Finished echoes the requester's
 remaining count for sequencing only; it is not independent proof of requester
-disk state. The exact per-range Result/Ack tuples bind accepted durable-prefix
-progress. The exact authorization,
-sequencing, source-before-carrier, peer-neutral durable-prefix, completion, and
-policy rules are normative in [protocol.md](protocol.md) §9.2.
+disk state. The historical per-range Result/Ack tuples bound accepted
+durable-prefix progress. Their authorization, sequencing, source-before-carrier,
+peer-neutral durable-prefix, completion, and policy rules remain documented in
+[protocol.md](protocol.md) §9.2 for compatibility analysis.
 
-The runtime reserves exactly 17,127 protected bytes for one full carrier-range
-settlement: one 123-byte Fetch, one maximum 16,480-byte Range, two 92-byte
+The historical six-frame carrier-range settlement occupied exactly 17,127
+protected bytes: one 123-byte Fetch, one maximum 16,480-byte Range, two 92-byte
 Result/Ack plaintexts, two 14-byte Finish/Finished plaintexts, and 52 bytes of
-record protection for each of the six frames. This is three exchanges and does
-not change any codec limit.
+record protection for each of the six frames. The current minimum nonempty
+profile-4 stream inherits this unchanged three-exchange sizing allocation; the
+legacy settlement is not emitted.
 
 ### 9.3 Semantic-v6 selected Event-bridge mechanics plaintext
 
 Semantic v6 inherits every v5 ordinary mechanics plaintext byte-for-byte and
 adds six Event-bridge tags under the same `"ASM\x01" || tag` prefix. They are
-invalid unless the completed session negotiated semantic version `6` or `7`; v1-v5
+invalid unless the completed session negotiated semantic version `6`, `7`, or `8`; v1-v5
 sessions reject them. The lane proceeds beyond its hello only when both
 authenticated endpoints send the canonical `enabled = 1` value.
 
@@ -1854,7 +1919,7 @@ cross-field length, hash, AEAD tag, required signature, or trailing-byte rule
 above fails. Authentication errors exposed to an unauthenticated peer SHOULD be
 indistinguishable.
 
-Semantic-version-2/3/v4/v5/v6/v7 multi-item source authentication and inclusion proofs are
+Semantic-version-2/3/v4/v5/v6/v7/v8 multi-item source authentication and inclusion proofs are
 implemented as the separate `ASTRENV3` format-3 objects defined normatively in
 [protocol.md](protocol.md) §6.1. They are not unresolved extensions to
 `ASTRENV2` and MUST be rejected by semantic-version-1 sessions.

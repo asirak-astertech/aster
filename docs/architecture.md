@@ -9,7 +9,7 @@ the complete protocol and semantic reference implementation.
 | Event | Direct Iroh or one operator-pinned controlled Iroh relay | Live Rust handle, stopped Rust handle, and local ConnectRPC agent |
 | State | Class-specific direct-Iroh reconciliation | Cloneable live Rust handle and exclusive stopped Rust facade |
 | Record | Class-specific direct-Iroh reconciliation | Cloneable live Rust handle and exclusive stopped Rust facade |
-| Blob | Semantic-v5 direct source/carrier transfer | Cloneable live Rust handle, exclusive stopped Rust handle, and encrypted local depot |
+| Blob | Semantic-v7/v8 profile-4 direct range stream; v7 durable-only, v8 authenticated finite custody | Cloneable live Rust handle, exclusive stopped Rust handle, and encrypted local depot |
 
 Read the diagrams from broadest to narrowest: application surfaces, runtime
 ownership, then the publication and contact flows for each mechanism. Exact
@@ -40,7 +40,7 @@ flowchart LR
     Record --> Exclusive
     Blob --> Depot["Encrypted local depot"]
     Actor --> Depot
-    Actor --> Network["Event · State · Record · v5 Blob reconciliation"]
+    Actor --> Network["Event · State · Record · v7/v8 Blob reconciliation"]
 ```
 
 The running actor and stopped handles never own the store at the same time.
@@ -49,8 +49,9 @@ the running actor, or use their stopped facades after the actor exits. Objects
 published through either mode reconcile under the same authority. Blob
 applications likewise publish through the live handle or stopped facade; the
 live handle returns only bounded pages, while the stopped facade supports
-caller-owned streaming. Semantic v5 separately transfers already-durable Blob
-sources and bounded carrier prefixes directly between content-capable peers.
+caller-owned streaming. Semantic v7/v8 profile 4 separately transfers Blob
+sources and bounded carrier prefixes directly between content-capable peers;
+v7 is durable-only and v8 additionally admits authenticated finite custody.
 
 ### Runtime trust path
 
@@ -81,10 +82,20 @@ frontier, ordered control effects, policy/selector snapshots, at-least-once Even
 Event representations, and the terminal zeroization marker. State, Record, and
 Blob operation rows have separate dedicated count/byte ceilings and also
 participate in aggregate store quotas; no unbounded idempotency table is
-implied. Blob ciphertext is stored outside redb under separate committed-byte,
-chunk, and variant ceilings, while redb remains the authority for exact
-publication and committed-file markers. On its first successful open, redb
-persists a domain-separated commitment over a random owner token, canonical
+implied. Blob lifecycle authority is separately non-evictable and capacity-
+bounded: permanent physical-lineage fences and accepted-publication replay
+fences have independent row/encoded-byte limits, while publication lifecycle
+rows have their own row limit. The selected defaults are 65,536 rows and 16 MiB
+for each fence class and 65,536 publication lifecycle rows. Exact typed
+references distinguish publication roots from pending-source roots for each
+depot variant. These lifecycle limits are not retention durations and cannot be
+reclaimed by pressure eviction.
+
+Blob ciphertext is stored outside redb under separate committed-byte, chunk,
+and variant ceilings, while redb remains the authority for exact publication,
+reference, fence, accounting, and committed-file markers. On its first
+successful open, redb persists a domain-separated commitment over a random
+owner token, canonical
 database path, and Unix device/inode when available. The fixed sibling depot’s
 private marker must carry the same binding before any chunk/variant scan or
 reclaim. The first database to initialize a parent’s depot wins; another cannot
@@ -111,8 +122,8 @@ actor has exited and must close before a new actor starts.
 
 For a semantic-v7 contact, the first protected exchange negotiates a transfer
 profile independently for Event, State, Record, Blob, and EventBridge. Every
-lane must offer `LegacyV6`; only Event may additionally select
-`EventPagesV1`. Exact Event differences and bounded blind traffic into a
+non-Blob lane offers `LegacyV6`; Event may additionally select
+`EventPagesV1`. Blob requires `BlobRangesStreamV1`, with no legacy fallback. Exact Event differences and bounded blind traffic into a
 ReceiveOnly peer can then move in one ordered bounded unidirectional turn.
 Finite entries carry session-authenticated cumulative age, while durable and
 tombstone entries carry no age wrapper. The receiver commits each complete page
@@ -124,6 +135,19 @@ The sender's persisted per-peer,
 per-priority cursor rotates attempts only within the same priority tier and is
 never delivery evidence. Its allocation and the sender page-packing target are
 local implementation details, not wire limits.
+
+Event/RouteEvent finite lifetime uses one shared lower-bound custody state
+machine in core and redb. Exact continuity permits normal forwarding. Once
+continuity is lost, forwarding remains permanently disabled for that row, while
+valid later clock domains are used only to accumulate provable same-domain
+intervals. The redb expiration index doubles as a bounded re-anchor queue:
+unanchored rows use a sentinel, older generations are processed before current
+deadlines, and every age/checkpoint/index change commits atomically. This avoids
+both wall-clock reconstruction and an unbounded restart scan. Reaching TTL on
+the conservative lower bound feeds the existing marked-then-retired Event
+lifecycle, including lease drain. Wire claims and durable item encoding do not
+change. On Linux, semantic-v8 Blob uses the same conservative lower-bound
+lifetime model; Blob route-only custody remains later work.
 
 Each mission-authenticated contact runs class-separated State and Record
 Negentropy/fetch lanes after its control and Event lanes. A receiver supplies
@@ -257,8 +281,9 @@ owned, already-open regular file positioned at byte zero, rejects empty input,
 and is capped at 64 MiB/1,024 canonical 64-KiB chunks. A live read returns one
 freshly authenticated, zeroize-on-drop plaintext page of `1..=64 KiB`; the
 stopped facade retains its synchronous caller-owned streaming interface. The
-runtime separately adds semantic-v5 Blob source and carrier-range frames; v1-v4
-emit none. `BlobId` commits the exact plaintext bytes, canonical chunk profile,
+runtime separately uses semantic-v7/v8 profile-4 Blob source and range-stream
+frames; v5/v6 carrier attempts fail before IO. `BlobId` commits the exact
+plaintext bytes, canonical chunk profile,
 and media/schema identity metadata. It is not a metadata-independent whole-byte
 content identifier.
 
@@ -343,8 +368,34 @@ new signed publication while reusing the same immutable completed variant in
 one content group and epoch. Rekey creates a distinct encrypted variant even
 when object identity is unchanged.
 
-Under semantic v5, a content-capable receiver reconciles exact Blob source IDs
-before requesting only missing, peer-neutral 16-KiB carrier prefixes. Every
+The durable Blob lifecycle schema wraps live publications and operation rows,
+counts publication and exact typed variant-reference roots, and retains two
+separately bounded permanent security fences. A lineage fence binds each depot
+variant to its accepted physical lineage and depot-owner binding. A replay fence
+binds each accepted publisher dot to the exact semantic publication, transfer,
+source length, and source digest. Local publication admits the replay fence,
+publication lifecycle row, publication reference, ordinary publication indexes,
+causal rows, and operation result in one redb transaction. Network staging
+admits the lineage fence, pending reference, pending source, depot plan, and
+accounting atomically; promotion atomically replaces that pending reference with
+a publication reference while installing replay/publication/causal authority and
+removing pending rows; abort atomically removes only the pending source and its
+reference. The lineage fence and depot import remain after abort.
+
+Opening a predecessor store reconstructs and audits the complete lifecycle
+image, checks all configured lifecycle capacities and the paired physical depot,
+and then commits wrappers, fences, references, counters, and maintenance cursors
+together.
+Any audit or injected failure leaves the predecessor untouched. Read-only
+inspection reconstructs predecessor state only in memory. Once current, every
+open strictly checks exact bidirectional correspondence among base rows,
+lifecycle rows, typed references, permanent fences, accounting, and cursor
+shape; it does not repair a partial or contradictory current schema.
+
+Under semantic v7/v8 profile 4, a content-capable receiver reconciles exact Blob
+source IDs before requesting only missing, peer-neutral 16-KiB carrier prefixes.
+V7 selects durable work only; v8 also selects finite work with exact
+authenticated custody provenance. Every
 source and range send requires the authenticated peer's current exact content
 proof plus route and nonrevocation authority. Pending bytes remain outside
 ordinary publication until the exact depot, full-content, and current-lineage
@@ -355,10 +406,10 @@ route-only Blob relay or custody.
 expected chunk record and bound durable per-chunk metadata rows and
 epoch-specific import variants. Rows and variants include retained unpublished
 imports, whether expected-only or already finalized, and continue to consume
-admission until a future explicit-GC policy exists. The limits do not claim to
-measure redb allocation, directory blocks, snapshots, backups, swap, unrelated
-attacker-created directory entries, or every filesystem overhead. Unix
-depot operations use owner-controlled directory descriptors, no-follow checks,
+admission through any deletion attempt until durable finalization. The limits
+do not claim to measure redb allocation, directory blocks, snapshots, backups,
+swap, unrelated attacker-created directory entries, or every filesystem
+overhead. Unix depot operations use owner-controlled directory descriptors, no-follow checks,
 and private modes; the non-Unix fallback is not credited with equivalent
 filesystem hardening. Terminal software zeroization destroys the retained
 mission/content and identity secrets and locks the store, but deliberately
@@ -367,6 +418,37 @@ cryptographic shredding, not Blob-file deletion or physical sanitization.
 Current code has a durable metadata-only exact-publication Blob delivery
 ledger. Its local counts do not grant authority and are neither peer nor
 convergence status.
+
+Blob maintenance persists one cursor for each of six ordered classes plus the
+next class: expired publications/pending sources, invalid pending work,
+unreferenced local import staging, unreferenced completed variants, expired
+retirement records, and manifest-backed physical deletion. One turn selects one
+class, scans a wrapping page, advances to the next class, and commits the class
+cursor and rotation together. The selected runtime requires nonzero row, file,
+and byte budgets and uses 16 rows, one file, and 2 MiB per turn. It runs one turn
+after the strict startup audit before Blob command admission, then schedules at
+most one background turn after operational application/control work on each
+periodic actor tick; the actor remains available while that blocking page runs.
+
+For an exact staging or completed variant with no durable reference or active
+lease, admission atomically persists a deletion manifest before removing its
+import and chunk rows. Descriptor-relative physical work is bounded and
+restartable: completed filesystem units are durably marked, ambiguous units are
+reconciled, and full depot accounting remains charged until finalization. The
+runtime performs exactly one bounded startup page before Blob command admission,
+then schedules background pages behind operational priority and yields between
+bounded filesystem units. An exact depot byte, chunk, or variant capacity
+failure may run one separately bounded, cursor-neutral pass over exact
+already-unreferenced work and retry the admission once. Other resource limits
+do not trigger that pass. Proven expiry and eligible pressure recovery retire
+exact work as one bounded atomic unit; policy or continuity failures otherwise
+withhold or reject it. Permanent fences remain, and retained retirement records
+expire after 45 days of accumulated conservative lower-bound age. Finite Blob
+TTL and bounded strictly-lower-priority pressure recovery are selected under
+semantic-v8 custody on Linux. The selected Linux local-agent and `asterctl`
+path exposes bounded Blob publish/read operations with durable or finite TTL.
+Route-only custody, public GC controls, Blob subscription/status RPCs and CLI
+commands, and FFI lifecycle controls remain unimplemented.
 
 ## Live application command and status flow
 

@@ -63,7 +63,6 @@ class RealAgentTest(unittest.TestCase):
                             break
                         self.assertIsNone(agent.poll(), "test agent exited during startup")
                         self.assertLess(time.monotonic(), deadline, "test agent did not become ready")
-                        time.sleep(0.1)
                     self.assertEqual(len(base64.b64decode(json.loads(status.stdout)["identity"])), 32)
                     self.assertTrue(cli("status").stdout)
                     self.assertEqual(cli("subscriptions").stdout, b"")
@@ -81,6 +80,56 @@ class RealAgentTest(unittest.TestCase):
                     self.assertTrue(first["inserted"])
                     self.assertEqual(first["result"], replay)
                     self.assertEqual(first["result"]["operationSequence"], "1")
+                    if sys.platform == "linux":
+                        blob_payload = bytes(range(256)) * 257 + b"multi-page-tail"
+                        blob_source = root / "durable-blob.bin"
+                        blob_source.write_bytes(blob_payload)
+                        durable_blob = ["--json", "blob-publish", "--file", str(blob_source),
+                                        "--topic", "chat.events", "--scope", "mission/team/alpha",
+                                        "--operation-key", "cli-smoke-blob-durable"]
+                        durable_first = json.loads(cli(*durable_blob).stdout)
+                        durable_retry = json.loads(cli(*durable_blob).stdout)
+                        self.assertTrue(durable_first["inserted"])
+                        self.assertFalse(durable_retry["inserted"])
+                        self.assertEqual(durable_first["id"], durable_retry["id"])
+                        self.assertNotIn("ttlMs", durable_first)
+                        durable_output = root / "durable-output.bin"
+                        durable_read = json.loads(cli(
+                            "--json", "blob-read", "--id", durable_first["id"],
+                            "--topic", "chat.events", "--scope", "mission/team/alpha",
+                            "--output", str(durable_output)).stdout)
+                        self.assertEqual(durable_output.read_bytes(), blob_payload)
+                        self.assertEqual(durable_read["id"], durable_first["id"])
+                        self.assertNotIn("ttlMs", durable_read)
+
+                        finite_source = root / "finite-blob.bin"
+                        finite_source.write_bytes(blob_payload + b"finite")
+                        finite_blob = json.loads(cli(
+                            "--json", "blob-publish", "--file", str(finite_source),
+                            "--topic", "chat.events", "--scope", "mission/team/alpha",
+                            "--operation-key", "cli-smoke-blob-finite", "--ttl-ms", "60000").stdout)
+                        self.assertEqual(finite_blob["ttlMs"], "60000")
+                        finite_output = root / "finite-output.bin"
+                        finite_read = json.loads(cli(
+                            "--json", "blob-read", "--id", finite_blob["id"],
+                            "--topic", "chat.events", "--scope", "mission/team/alpha",
+                            "--output", str(finite_output)).stdout)
+                        self.assertEqual(finite_output.read_bytes(), blob_payload + b"finite")
+                        self.assertEqual(finite_read["ttlMs"], "60000")
+
+                        no_clobber = root / "existing-output.bin"
+                        no_clobber.write_bytes(b"sentinel")
+                        refused = cli("blob-read", "--id", durable_first["id"],
+                                      "--topic", "chat.events", "--scope", "mission/team/alpha",
+                                      "--output", str(no_clobber), success=False)
+                        self.assertNotEqual(refused.returncode, 0)
+                        self.assertEqual(no_clobber.read_bytes(), b"sentinel")
+                        zero_ttl = cli("blob-publish", "--file", str(blob_source),
+                                       "--topic", "chat.events", "--scope", "mission/team/alpha",
+                                       "--operation-key", "cli-smoke-blob-zero", "--ttl-ms", "0",
+                                       success=False)
+                        self.assertNotEqual(zero_ttl.returncode, 0)
+                        self.assertIn(b"TTL must be an integer from 1", zero_ttl.stderr)
                     events = json.loads(cli("--json", "query", "--topic", "chat.events",
                                             "--scope", "mission/team/*", "--limit", "1").stdout)
                     self.assertEqual(len(events), 1)

@@ -52,15 +52,31 @@ mandatory-access-control profile. The manual operator procedure is
 
 | Check | Runner | Purpose |
 | --- | --- | --- |
-| `quality` | `ubuntu-24.04` | Runs the exact-source Python process contract, Rust and Go formatting, Apache-2.0-only project-license and package checks, exact 348-row implementation-requirements traceability, the selected-node dependency boundary, vendored netlink source-equivalence and 13-test compatibility gates, the retained-libp2p-oracle boundary, selected live-Event, live-mutable, live-State-subscription, live-Record-subscription, live-Blob, and live-Blob-subscription receipt checker tests, real-process smokes, C ABI build and C/C++ header checks, Rust/Python conformance, Python/Go binding tests, and lab-controller tests. |
+| `Cargo lockfiles` | `ubuntu-24.04` | Checks every committed Cargo graph with `cargo fetch --locked` before Cargo builds start, and tests rejection of stale or missing lockfiles offline. |
+| `quality` | `ubuntu-24.04` | Runs the exact-source Python process contract, Rust and Go formatting, Apache-2.0-only project-license and package checks, exact 348-row implementation-requirements traceability, the selected-node dependency boundary, vendored netlink source-equivalence and 13-test compatibility gates, selected live-Event, live-mutable, live-State-subscription, live-Record-subscription, live-Blob, and live-Blob-subscription receipt checker tests, real-process smokes, C ABI build and C/C++ header checks, Rust/Python conformance, Python/Go binding tests, and lab-controller tests. |
 | `Rust Clippy` | `ubuntu-24.04` | Runs locked Clippy for every workspace target and feature, with warnings denied. |
 | `Rust tests (1/2)` and `Rust tests (2/2)` | `ubuntu-24.04` | Run two disjoint nextest partitions covering the complete locked, all-feature Rust workspace suite. Partition 1 also runs all workspace doctests with Cargo. Both start independently of Clippy and use the existing resource wrapper. |
 | `macOS tests` | `macos-14` | Runs all Rust workspace tests on the supported Apple runner with Rust 1.97.1. |
 | `Rust 1.91 MSRV` | `ubuntu-24.04` | Checks every workspace target and feature with the declared minimum supported Rust version. |
-| `dependency policy` | `ubuntu-24.04` | Enforces the retained-libp2p-oracle boundary, applies `deny.toml` to the root and fuzz dependency graphs, and audits both lockfiles against a freshly downloaded RustSec database. |
+| `dependency policy` | `ubuntu-24.04` | Applies `deny.toml` to the root and fuzz dependency graphs, and audits both lockfiles against a freshly downloaded RustSec database. |
 | `age reference interoperability` | `ubuntu-24.04` | Installs exact `govulncheck` v1.6.0, runs `mise run age-reference-audit`, then runs `mise run age-reference-interop`: the Go oracle's reachable vulnerability and compiled-module license gates must pass before exact reference Go `filippo.io/age` v1.3.1 and the Rust provider exchange classic-X25519 artifacts in both directions, compare recovered plaintext, and agree on the recipient. |
 | `bounded fuzz smoke` | `ubuntu-24.04` | Runs all nine fixed 10,000-case hostile-input campaigns with the pinned nightly toolchain and `cargo-fuzz`: semantic wire decode, fragment decode, reference-envelope inspection, selected mechanics-frame decode, selected Negentropy, classical-profile decode, systemd credential decode, systemd admin-record decode, and systemd backup decode. |
 | `required` | `ubuntu-24.04` | Fails unless every validation lane completed successfully; this is the branch-protection check. |
+
+The `Cargo lockfiles` lane runs `sh tools/check-cargo-lockfiles.sh` against the
+root, fuzz, and standalone conformance-runner manifests with Rust 1.97.1. It
+reports each failing graph without regenerating lockfiles. Cargo build lanes
+wait for it; the `required` aggregation explicitly requires its success, so a
+failed gate and skipped dependent jobs cannot produce a successful aggregate.
+Each build runner still acquires its own dependencies before offline checks.
+
+Dependabot uses one Cargo configuration covering `/` and `/fuzz`, grouped by
+`dependency-name`, to coordinate each dependency's version update in one PR.
+This does not require the two lockfiles to contain identical graphs. GitHub's
+cross-directory grouping applies to version updates, not security updates;
+all PRs still face the lockfile gate. The actual next Dependabot run remains
+the integration check for this shared-manifest layout. See the public
+[Dependabot grouping reference](https://docs.github.com/en/code-security/reference/supply-chain-security/dependabot-options-reference#group-by-groups).
 
 The Rust dependency downloads happen before Cargo validation is switched to
 offline mode. The dependency-policy job is intentionally different: it obtains
@@ -663,7 +679,9 @@ and source hashes are recorded in the
 [prior semantic-v3 custody requirements evidence](requirements-status.md#prior-semantic-v3-selected-event-custody-automated-evidence).
 
 This is current-code automated evidence, not a retained physical acceptance
-receipt. Finite TTL is Linux/Event/v3-format only, inherited in v3/v4/v5/v6/v7;
+receipt. That retained finite-TTL boundary is Linux/Event/v3-format only,
+inherited in v3-v8; semantic-v8 Blob finite custody/lifecycle is separate
+current-code evidence without retained credit.
 receive-only is not physical RF silence. V1/v2 deterministic whole-contact
 partials, generic cross-class priority eviction, selected State/Record custody
 or future TTL design (the current finite form rejects), long-offline and
@@ -671,8 +689,8 @@ many-node scale, mixed implementations, operational provisioning with a
 production backend or protected stock CLI/binding, and release gates remain
 open. Caller-provided protected Rust `NodeConfig` construction is tracked by the
 separate current-code gate below.
-Networked Blob was outside that Event-custody receipt; the separate semantic-v5
-software gate below does not relabel it.
+Networked Blob was outside that Event-custody receipt; the separate historical
+v5 compatibility and current v7/v8 stream/lifecycle gates below do not relabel it.
 
 The subsequent stopped protected-provisioning/control-administration Step 4
 gate is pinned separately in the
@@ -759,7 +777,8 @@ provider destruction is added. The post-enqueue cancellation cell is Unix-only.
 ## Semantic-v7 Event page current-code gate
 
 `V-EVENT-PAGES-V7` is an additive current-code gate. It checks semantic
-`[7,6,5,4,3,2,1]` selection and v7/v6 fallback, canonical per-lane profile
+`[8,7,6,5,4,3,2,1]` selection, v8/v7 page inheritance, and v7/v6 fallback,
+canonical per-lane profile
 negotiation, contextual record AAD, bounded ordered uni turns, receipt-free
 durable, finite-TTL, mixed, route-only, and blind ReceiveOnly Event convergence,
 finite custody-age admission without per-peer receipt/lease/retry state,
@@ -775,14 +794,14 @@ rows and 6 representative malformed REJECT rows; the `aster-node` vector tests
 regenerate it from the reference codecs and route every REJECT row through its
 corresponding decoder.
 
-The semantic-v4 State/Record gate is inherited unchanged by v5, v6, and v7 and
+The semantic-v4 State/Record gate is inherited unchanged through v8 and
 is additive to those frozen slices. The frozen v6 gate used default/highest 6
-with `[6, 5, 4, 3, 2, 1]`; the current v7 gate uses default/highest 7 with
-`[7, 6, 5, 4, 3, 2, 1]`. Semantic v6 preserves the v5 ordinary Event,
-State/Record, and Blob lanes byte-for-byte and adds only the mutually enabled
-Event-bridge mechanics lane. Selected mutable frames are absent in v1-v3,
-selected Blob frames are absent in v1-v4, and selected bridge frames are absent
-in v1-v5. Focused validation
+with `[6, 5, 4, 3, 2, 1]`; the current default/highest is 8 with
+`[8, 7, 6, 5, 4, 3, 2, 1]`. Semantic v6 preserves the historical v5 ordinary
+frame allocation and adds only the mutually enabled Event-bridge mechanics
+lane; selected Blob carrier IO now requires v7/v8 profile 4. Selected mutable
+frames are absent in v1-v3 and selected bridge frames are absent in v1-v5.
+Focused validation
 must cover the complete State/Record class and direction grammar, including all
 20 structured mutable tags in `selected_frame_decode`; exact offer
 `MutableApplyResult`, fetch `MutableFetchResult` plus required exact
@@ -1114,9 +1133,12 @@ implementation; scale/resource/soak result; State, Record, or Blob acceptance;
 post-policy fresh completion or beta delivery; indefinite retention/GC; release
 artifact; or production authorization.
 
-The semantic-v5 direct Blob gate is additive to the earlier stopped/local Blob
-gate. It must cover all Blob interest/source/range/result/ack/finish frame bytes,
-malformed and cross-tuple rejection, and v1-v4 zero-Blob behavior. Provider
+The historical semantic-v5 direct Blob gate is retained as codec and
+durable-storage compatibility evidence; Result/Ack/Finish is not current
+carrier behavior. The current network gate requires semantic-v7/v8 profile 4,
+the stdlib-only same-team construction oracle plus shared ABRS/ABRD/ABRE record vectors,
+malformed schedule/hash/index/count/terminal
+rejection, and v5/v6 pre-carrier failure. Provider
 tests require a current 32-byte peer content proof plus route authority and
 nonrevocation and reject route-only, wrong peer/topic/scope/epoch/authority,
 tamper, stale proof, and same-epoch replacement. Store tests require source-
@@ -1125,9 +1147,10 @@ before-carrier staging, contiguous peer-neutral prefixes of at most 16 KiB,
 fresh full-content/current-lineage completion, and zero ordinary visibility
 before atomic promotion. A new physical lineage for the same `(BlobID, content
 group, numeric epoch)` must fail with `PhysicalLineageConflict`; republish or
-resume requires an epoch advance. Finish/Finished is only the requester's
-remaining-count echo, while each exact Result/Ack binds accepted prefix
-progress. Read-only, writable, and terminal-preservation opens must cross-audit
+resume requires an epoch advance. Current range streaming has no per-range
+storage receipt; durable prefixes are the recovery authority, while a valid
+schedule-bound terminal plus FIN authorizes completion and one cursor outcome.
+Read-only, writable, and terminal-preservation opens must cross-audit
 pending source/manifest route/carriers against the depot plan and completed
 namespace, rejecting a changed plan, a self-consistent missing plan, or a
 pending/completed collision without repair. Writable predecessor migration must add all
@@ -1150,10 +1173,11 @@ second reopen must preserve the same bounded quota charge.
 Runtime races are part of the gate. One regression must pause exact restage
 between fresh authentication and cache insertion while an abort wins, then
 prove the shared source/store/cache lifecycle lock leaves neither an orphan
-claim nor an unclaimed durable source and requires no restart. Another must use
-a multi-carrier source whose manifest-last carrier is not its greatest ID and
-prove terminal poison advances to the lexicographic maximum so a later source
-is selected.
+claim nor an unclaimed durable source and requires no restart. A terminal
+content failure must abort only its exact pending source and leave the turn
+cursor-neutral. Separately, the successful terminal source-rotation helper must
+use a multi-carrier source whose manifest-last carrier is not its greatest ID
+and select the later source after advancing to that maximum.
 
 The final runtime gate is one small bounded three-node direct-Iroh case: source
 and first receiver make only partial carrier progress, runtime/store/provider
@@ -1182,7 +1206,7 @@ cargo test --locked -p aster-node runtime::tests::blob_source_carrier_reopen_res
 cargo test --locked -p aster-node runtime::tests::stale_pending_blob_cleanup_removes_visibility_but_retains_reserved_staging -- --exact
 cargo test --locked -p aster-node runtime::tests::pending_blob_abort_reconciles_concurrent_exact_restage_without_restart -- --exact
 cargo test --locked -p aster-node runtime::tests::blob_lifecycle_lock_serializes_delayed_projection_insert_and_abort -- --exact
-cargo test --locked -p aster-node runtime::tests::terminal_blob_poison_advances_scheduler_past_source_to_later_candidate -- --exact
+cargo test --locked -p aster-node runtime::tests::terminal_source_rotation_uses_maximum_object_before_later_candidate -- --exact
 cargo test --locked -p aster-node runtime::tests::authenticated_peer_without_scope_grant_learns_no_event_id_and_cannot_fetch -- --exact
 cargo check --locked --manifest-path fuzz/Cargo.toml --bin selected_frame_decode
 ```
@@ -1192,7 +1216,8 @@ all-open-path audit, and predecessor-migration results plus the frozen source
 manifest are recorded in the [prior semantic-v5 Blob requirements evidence](requirements-status.md#prior-semantic-v5-direct-blob-network-automated-evidence).
 Independent final audit found no remaining P0–P3. The repair retains the bounded
 non-public physical-lineage fence, serializes durable-source/cache transitions,
-and advances terminal cursor state to the lexicographic maximum. Exactly six
+keeps terminal failures cursor-neutral, and uses the lexicographic maximum for
+authorized terminal source rotation. Exactly six
 requirements moved to `implemented-uncredited`; this current-code automation
 creates no retained Blob receipt or `observed-bounded` credit and does not
 relabel historical Event/control evidence.
@@ -1623,7 +1648,7 @@ current code additionally has durable Event Consume/Carry selectors, live and
 stopped-state poll/ack, idempotent unsubscribe, verified gap inspection,
 bounded last-contact status, protected receiver-directed filtering, and
 separate live and stopped State and Record projections plus stopped Blob
-streaming and semantic-v5 direct Blob transfer/resume automation;
+streaming and semantic-v7/v8 profile-4 Blob transfer/resume automation;
 it does not turn the retained parent roots into PR-B, PR-C, State, Record, or
 Blob receipts. Those retained parent tests do not claim networked State/Record
 or Blob, remote Blob chunks, global convergence, generalized control
@@ -1668,38 +1693,36 @@ is a visible stakeholder deviation from the frozen OSI-only requirement, not a
 claim of outside-counsel review or requirements credit. Passing this gate does
 not by itself authorize a release or declare browser-WASM supported.
 
-An advisory-independent retained-oracle gate separately parses locked,
-offline, all-feature Cargo metadata. It requires
-`aster-libp2p-provider` to remain unpublished and allows no dependency consumer
-other than `aster-lab`'s optional `libp2p-candidate` feature. It also rejects
-default or aliased activation, renamed or remote provider dependencies, and
-local intermediary consumers outside the workspace. The provider remains
-directly buildable as a workspace test package so explicit and workspace-wide
-validation can exercise the retained oracle without activating it in a default
-or shipping consumer. Mutation tests cover each escape route in both the
-primary and dependency-policy lanes.
+[Decision 0045](../decisions/0045-remove-libp2p-test-oracle.md) supersedes
+Decision 0029's retention policy. The experimental provider and only its lab
+integration are removed; the rest of `aster-lab` remains.
 
-The root lockfile also contains `hickory-proto` and `hickory-resolver` 0.25.2
-because the `libp2p` 0.56.0 aggregate manifest exposes DNS and mDNS as optional
-features. Aster disables libp2p default features and enables neither optional
-feature, so neither Hickory package is present in the resolved workspace graph,
-including with every Aster workspace feature and target enabled. They are also
-absent from the independent fuzz graph. The raw-lock tools cannot represent
-that reachability distinction, so only the root raw-lock `cargo audit` command
-narrowly ignores `RUSTSEC-2026-0118` and `RUSTSEC-2026-0119`. Feature-aware
-`cargo deny` sees neither inactive package and carries no Hickory ignore.
+The provider removal also removes the optional Hickory 0.25.2 lock entries.
+The root audit no longer ignores `RUSTSEC-2026-0118` or `RUSTSEC-2026-0119`.
+The dependency-exception scope gate now requires only the retained safe
+`hickory-proto` 0.26.1 lock entry and still rejects vulnerable active Hickory.
+The unrelated age advisory disposition, exact license exceptions, and netlink
+patch remain unchanged.
 
-This is a lock-only tooling disposition, not a runtime vulnerability waiver or
-admission of DNS, mDNS, or Hickory. Before either ignore can be used,
-`tools/check-dependency-exception-scope.sh` requires the affected lock-only
-package set to remain exactly `hickory-proto`/`hickory-resolver` 0.25.2 and
-permits the separately resolved, fixed 0.26.1 versions used by Iroh. It proves
-that the affected 0.25.2 versions are absent from the full workspace and fuzz
-dependency graphs. Its adversarial regression injects an active vulnerable
-Hickory version and requires the gate to fail. Package/version drift or future
-feature activation therefore blocks CI before the audit suppression is
-applied. Remove both ignores when the aggregate libp2p lock no longer contains
-the affected optional versions.
+Current-stack regressions in `aster-node::runtime::tests` exercise production
+mission-authenticated contacts over persistent direct-loopback Iroh endpoints:
+`current_stack_near_two_mib_events_each_direction` sends two Events each way,
+each with `MAX_OBJECT_BYTES - 11 * 1024` plaintext bytes. The measured envelope
+overhead is checked to be above 10 KiB and at most 11 KiB; every sealed Event
+must fit the existing object bound. Exact source bytes and authenticated
+plaintext are checked at the receiver. This is near-two-MiB payload volume per
+direction, not two exact one-MiB plaintext Events or throughput evidence.
+`current_stack_exact_64_kib_event_after_fresh_auth_reconnect` completes and
+closes a contact, retains both endpoint identities and addresses, rejects a
+fresh contact with the wrong expected mission identity without insertion, then
+reauthenticates and delivers exact 64-KiB Events each way. Contacts do not overlap.
+Existing resource tests remain; no replay scenario or telemetry is added.
+
+The manual runtime-volume diagnostic and its workflow are preserved byte for
+byte under `archive/diagnostics/runtime-volume/`; its active workflow and CI
+caller are removed. The archived telemetry patch is historical, not a current
+execution recipe or a port to the selected runtime. These changes grant no
+requirements, target-resource, interoperability, or release credit.
 
 The age interoperability lane keeps its independent Go module in
 `tools/age-reference/go.mod` and `go.sum`. Its acquisition step canonicalizes
@@ -1839,7 +1862,7 @@ cargo install --locked cargo-deny --version 0.20.2
 cargo install --locked cargo-audit --version 0.22.2
 cargo deny fetch all
 CARGO_NET_OFFLINE=true sh ./tools/check-dependency-exception-scope.sh
-cargo audit --ignore RUSTSEC-2026-0118 --ignore RUSTSEC-2026-0119 --file Cargo.lock
+cargo audit --file Cargo.lock
 cargo deny --locked --offline check
 cargo deny --manifest-path fuzz/Cargo.toml --config deny.toml --locked --offline check
 cargo audit --no-fetch --file fuzz/Cargo.lock

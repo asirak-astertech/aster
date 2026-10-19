@@ -1,0 +1,72 @@
+." Copyright 2026 Defense Unicorns, Inc.
+." SPDX-License-Identifier: Apache-2.0
+." Clean Room — Privileged
+.TH ASTERCTL-BLOB-READ 1 "2026-10-15" "Aster" "User Commands"
+.SH NAME
+asterctl-blob-read \- read an authenticated Aster Blob to a new local file
+.SH SYNOPSIS
+.SY asterctl
+.RI [ GLOBAL-OPTIONS ]
+.B blob-read
+.BI \-\-id " ID"
+.BI \-\-topic " TOPIC"
+.BI \-\-scope " SCOPE"
+.BI \-\-output " PATH"
+.YS
+.SH DESCRIPTION
+.B asterctl blob-read
+streams a Blob from a running Aster agent into a newly created local file.
+It validates contiguous offsets, bounded pages, stable immutable metadata and
+TTL, the authenticated completion marker, and the exact declared total length.
+.PP
+On Linux, bytes are written to an anonymous temporary inode in the pinned
+destination directory. After the complete file is synchronized, the command
+publishes that exact open inode with an atomic no-replace descriptor link. No
+named partial path exists, and closing the descriptor discards an incomplete
+read. The command never overwrites an existing or concurrently created
+destination.
+.PP
+The command fails before contacting the agent on non-Linux platforms and when
+the destination filesystem cannot create the required anonymous temporary. If
+descriptor-link publication is unsupported, finalization fails without
+publishing an output path.
+.SH OPTIONS
+.TP
+.BI \-\-id " ID"
+Required Blob ID as Base64-encoded 32 bytes.
+.TP
+.BI \-\-topic " TOPIC"
+Required exact Blob topic.
+.TP
+.BI \-\-scope " SCOPE"
+Required exact Blob scope.
+.TP
+.BI \-\-output " PATH"
+Required destination path. It must not already exist.
+.SH OUTPUT
+Blob bytes are written only to
+.BR \-\-output .
+After a complete verified stream, stdout reports Blob ID, publisher, publisher
+counter, topic, scope, priority, total length, optional media type, schema ID,
+acceptance marker, and original TTL. It never prints Blob plaintext.
+.PP
+Text renders TTL as exactly
+.B TTL: durable
+or
+.BR "TTL: MILLISECONDS ms" .
+Finite JSON uses an exact decimal string in
+.BR ttlMs ;
+durable JSON omits that field.
+.SH EXIT STATUS
+.TP
+.B 0
+The complete verified Blob was written.
+.TP
+.B 1
+Read or local-file handling failed; no partial output is retained.
+.TP
+.B 2
+Invalid or missing arguments.
+.SH SEE ALSO
+.BR asterctl (1),
+.BR asterctl-blob-publish (1)

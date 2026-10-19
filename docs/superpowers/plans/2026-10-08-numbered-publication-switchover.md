@@ -199,3 +199,30 @@ clients. All seven supported fuzz targets passed 10,000 runs each; two systemd
 targets still require Linux. Requirements trace validation passed with the
 upstream PR #52 additions: 348 baseline IDs and 140 exact selected mappings.
 The earlier Linux process/physical qualification limitations still apply.
+
+## 2026-10-16 current-main integration
+
+Merged `main` through `fcf9f1b054f9623b61435659994fad0bc6c51779` into the
+existing PR history. Preserved the upstream Blob lifecycle, pressure, streaming,
+agent/CLI, dependency and CI-policy changes beside numbered-only Event
+publication. Regenerated the combined schema descriptor and Go clients.
+
+The numbered store-open path now carries explicit Blob lifecycle and lease
+limits without bypassing legacy-publication preflight or writer refusal. The
+numbered coalescing dispatcher uses the current Blob worker admission wrapper.
+Regression coverage checks byte-preserving legacy refusal through that new
+open path, combined agent numbered publication before unsupported Blob upload,
+and rejection of mixed Blob/journal CLI commands. The real CLI smoke retains
+numbered publication/retry and Linux-only Blob file checks. Linux-only upstream
+test helpers are gated for strict macOS linting.
+
+Verification on macOS passed: `mise run check`, with strict workspace Clippy,
+2,155 passing workspace tests (two platform skips), documentation tests, real
+playground/hello sessions, Go process-restart/exact-retry/conflict/acknowledgement/
+bounded-load journal recovery, bindings, conformance, 203 lab tests, and
+reproducible generated Go clients. The separate real-agent CLI smoke also passed.
+Fuzz smoke passed seven supported targets at 10,000 runs each; the two systemd
+admin/backup targets require Linux. Requirements trace validation passed with
+348 baseline IDs and 140 exact selected mappings, preserving upstream evidence
+changes. This integration adds no physical, Linux deployment, or production
+qualification and changes no requirement evidence boundary of its own.

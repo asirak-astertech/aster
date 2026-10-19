@@ -3,7 +3,7 @@ use std::fmt::{Display, Write};
 use buffa::{EnumValue, Enumeration};
 
 use super::{Bytes, Double};
-use crate::api;
+use crate::{api, blob_read};
 
 pub(super) fn status(s: &api::GetStatusResponse) -> String {
     let mut text = String::from("NODE:\n");
@@ -136,6 +136,72 @@ pub(super) fn status(s: &api::GetStatusResponse) -> String {
         field(&mut text, "Profile saturated", yes_no(s.profile_saturated));
     }
     text
+}
+
+pub(super) fn publish_blob(blob: &api::PublishBlobResponse) -> String {
+    let mut text = String::from("BLOB:\n");
+    field(&mut text, "ID", scalar(Bytes(&blob.id)));
+    field(&mut text, "Publisher", scalar(Bytes(&blob.publisher)));
+    field(
+        &mut text,
+        "Publisher counter",
+        count(blob.publisher_counter),
+    );
+    field(&mut text, "Priority", state(blob.priority, "PRIORITY_"));
+    field(
+        &mut text,
+        "Total length",
+        format!("{} bytes", blob.total_len),
+    );
+    if let Some(media_type) = &blob.media_type {
+        field(&mut text, "Media type", format!("{media_type:?}"));
+    }
+    field(&mut text, "Schema ID", scalar(Bytes(&blob.schema_id)));
+    field(
+        &mut text,
+        "Acceptance marker",
+        count(blob.acceptance_marker),
+    );
+    field(&mut text, "Inserted", yes_no(blob.inserted));
+    writeln!(text, "  TTL: {}", blob_ttl(blob.ttl_ms)).expect("write to string");
+    text
+}
+
+pub(super) fn read_blob(blob: &blob_read::Metadata) -> String {
+    let mut text = String::from("BLOB:\n");
+    field(&mut text, "ID", scalar(Bytes(&blob.id)));
+    field(&mut text, "Publisher", scalar(Bytes(&blob.publisher)));
+    field(
+        &mut text,
+        "Publisher counter",
+        count(blob.publisher_counter),
+    );
+    field(&mut text, "Topic", format!("{:?}", blob.topic));
+    field(&mut text, "Scope", format!("{:?}", blob.scope));
+    field(&mut text, "Priority", state(blob.priority, "PRIORITY_"));
+    field(
+        &mut text,
+        "Total length",
+        format!("{} bytes", blob.total_len),
+    );
+    if let Some(media_type) = &blob.media_type {
+        field(&mut text, "Media type", format!("{media_type:?}"));
+    }
+    field(&mut text, "Schema ID", scalar(Bytes(&blob.schema_id)));
+    field(
+        &mut text,
+        "Acceptance marker",
+        count(blob.acceptance_marker),
+    );
+    writeln!(text, "  TTL: {}", blob_ttl(blob.ttl_ms)).expect("write to string");
+    text
+}
+
+fn blob_ttl(ttl_ms: Option<u64>) -> String {
+    match ttl_ms {
+        None => "durable".to_owned(),
+        Some(ttl_ms) => format!("{ttl_ms} ms"),
+    }
 }
 
 pub(super) fn event(event: &api::Event) -> String {

@@ -45,3 +45,10 @@ pub fn identity(value: &str) -> Option<Vec<u8>> {
         .ok()?;
     (bytes.len() == 32).then_some(bytes)
 }
+
+pub fn base64(value: &str) -> Option<Vec<u8>> {
+    buffa::json_helpers::bytes::deserialize(serde::de::value::StrDeserializer::<
+        serde::de::value::Error,
+    >::new(value))
+    .ok()
+}

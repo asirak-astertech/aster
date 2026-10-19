@@ -74,10 +74,12 @@ mod record;
 mod state;
 pub(crate) use blob::SelectedBlobCommand;
 pub use blob::{
-    BLOB_DELIVERY_TOKEN_BYTES, BlobAcknowledgement, BlobDelivery, BlobDeliveryPage,
-    BlobDeliveryStatus, BlobDeliveryToken, BlobDepotLimits, BlobId, BlobPollRequest,
-    BlobPublicationId, BlobPublishRequest, BlobPublishResult, BlobReadPage, BlobReadPageRequest,
-    BlobReadRequest, BlobReadResult, BlobSubscription, BlobSubscriptionId, BlobSubscriptionRequest,
+    BLOB_DELIVERY_TOKEN_BYTES, BlobAcknowledgement, BlobDelivery, BlobDeliveryItem,
+    BlobDeliveryPage, BlobDeliveryStatus, BlobDeliveryToken, BlobDepotLimits,
+    BlobGcFailureCategory, BlobGcRetryState, BlobGcStatus, BlobId, BlobPollRequest,
+    BlobPublicationId, BlobPublishOptions, BlobPublishRequest, BlobPublishResult, BlobReadPage,
+    BlobReadPageRequest, BlobReadRequest, BlobReadResult, BlobRetirementDelivery,
+    BlobRetirementReason, BlobSubscription, BlobSubscriptionId, BlobSubscriptionRequest,
     BlobTransferPhase, BlobTransferStatus, BlobUnsubscribe, MAX_SELECTED_BLOB_DELIVERIES,
     MAX_SELECTED_BLOB_PAGE_BYTES, MAX_SELECTED_BLOB_SUBSCRIPTION_SCAN,
     MAX_SELECTED_LIVE_BLOB_BYTES, MAX_SELECTED_LIVE_BLOB_CHUNKS, PendingBlobTransferStatus,
@@ -119,6 +121,10 @@ const MAX_SELECTED_EVENT_PLAN_RETRIES: usize = 4;
 #[non_exhaustive]
 pub enum ApplicationErrorKind {
     InvalidRequest,
+    /// A well-formed value requires functionality unavailable on this host.
+    UnsupportedValue,
+    /// No live or retained retirement evidence identifies the requested value.
+    NotFound,
     RequestRejected,
     UnauthorizedOrRevoked,
     PolicyUnsettled,
@@ -143,11 +149,29 @@ pub enum ApplicationErrorKind {
 /// The underlying store, source-envelope, carrier, and provider errors remain
 /// private so an application cannot couple itself to privileged mechanics or
 /// learn exact transfer/schema details through an error path.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy)]
 pub struct ApplicationError {
     kind: ApplicationErrorKind,
     operation: &'static str,
 }
+
+impl fmt::Debug for ApplicationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ApplicationError")
+            .field("kind", &self.kind)
+            .field("operation", &self.operation)
+            .finish()
+    }
+}
+
+impl PartialEq for ApplicationError {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind && self.operation == other.operation
+    }
+}
+
+impl Eq for ApplicationError {}
 
 impl ApplicationError {
     /// Stable category suitable for application control flow.
@@ -169,6 +193,8 @@ impl fmt::Display for ApplicationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let disposition = match self.kind {
             ApplicationErrorKind::InvalidRequest => "invalid application request",
+            ApplicationErrorKind::UnsupportedValue => "unsupported application request value",
+            ApplicationErrorKind::NotFound => "selected application value was not found",
             ApplicationErrorKind::RequestRejected => "request rejected by selected data policy",
             ApplicationErrorKind::UnauthorizedOrRevoked => {
                 "application identity or selected data is not currently authorized"
@@ -2785,6 +2811,7 @@ fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
         // integrity failure rather than a caller-actionable request result.
         StoreError::Bridge(_) => ApplicationErrorKind::Integrity,
         StoreError::Custody(error) => custody_store_error_kind(error),
+        StoreError::BlobDeliveryNotFound => ApplicationErrorKind::NotFound,
         StoreError::InvalidEventOperationKey { .. }
         | StoreError::InvalidStateOperationKey { .. }
         | StoreError::InvalidRecordOperationKey { .. }
@@ -2815,7 +2842,6 @@ fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
         | StoreError::RecordDeliveryAttemptChanged { .. }
         | StoreError::BlobSubscriptionNotFound
         | StoreError::BlobSubscriptionPollLimitExceeded { .. }
-        | StoreError::BlobDeliveryNotFound
         | StoreError::InvalidBlobDeliveryToken
         | StoreError::BlobDeliveryTokenBindingMismatch
         | StoreError::BlobSubscriptionIncarnationChanged { .. }
@@ -3001,7 +3027,10 @@ fn custody_store_error_kind(error: &CustodyStoreError) -> ApplicationErrorKind {
         CustodyStoreError::MissionNotBound
         | CustodyStoreError::MissionMismatch
         | CustodyStoreError::ItemNotFound
-        | CustodyStoreError::LeaseNotFound => ApplicationErrorKind::StateUnavailable,
+        | CustodyStoreError::LeaseNotFound
+        | CustodyStoreError::LegacyCustodyMigrationRequired => {
+            ApplicationErrorKind::StateUnavailable
+        }
         // A recognized predecessor schema is not corrupt. It requires the
         // same explicit fresh-store boundary as other non-migratable legacy
         // application state.
@@ -3016,6 +3045,8 @@ fn custody_store_error_kind(error: &CustodyStoreError) -> ApplicationErrorKind {
 fn blob_store_error_kind(error: &BlobStoreError) -> ApplicationErrorKind {
     match error {
         BlobStoreError::InvalidDepotLimits
+        | BlobStoreError::InvalidLifecycleLimits
+        | BlobStoreError::InvalidMaintenanceBudget
         | BlobStoreError::InvalidOperationKey { .. }
         | BlobStoreError::InvalidPublication(_)
         | BlobStoreError::InvalidCarrierObjectId
@@ -3026,13 +3057,16 @@ fn blob_store_error_kind(error: &BlobStoreError) -> ApplicationErrorKind {
         BlobStoreError::PublisherRevoked(_)
         | BlobStoreError::KeyEpochStale { .. }
         | BlobStoreError::KeyEpochNotActive { .. } => ApplicationErrorKind::UnauthorizedOrRevoked,
+        BlobStoreError::NotFound => ApplicationErrorKind::NotFound,
+        BlobStoreError::ExpiredOrRetired => ApplicationErrorKind::ExpiredOrRetired,
         BlobStoreError::ReservationChanged
         | BlobStoreError::ReadPlanChanged
         | BlobStoreError::PhysicalLineageMigrationRequired => ApplicationErrorKind::PolicyUnsettled,
         BlobStoreError::OperationConflict
         | BlobStoreError::PendingSourceConflict
         | BlobStoreError::CarrierPrefixConflict
-        | BlobStoreError::PhysicalLineageConflict => ApplicationErrorKind::Conflict,
+        | BlobStoreError::PhysicalLineageConflict
+        | BlobStoreError::SourceRepresentationConflict => ApplicationErrorKind::Conflict,
         BlobStoreError::PublicationLimitExceeded { .. }
         | BlobStoreError::CausalFrontierLimitExceeded { .. }
         | BlobStoreError::OperationLimitExceeded { .. }
@@ -3040,15 +3074,17 @@ fn blob_store_error_kind(error: &BlobStoreError) -> ApplicationErrorKind {
         | BlobStoreError::DepotByteLimitExceeded { .. }
         | BlobStoreError::DepotChunkLimitExceeded { .. }
         | BlobStoreError::DepotVariantLimitExceeded { .. }
+        | BlobStoreError::LineageFenceCapacity { .. }
+        | BlobStoreError::ReplayFenceCapacity { .. }
+        | BlobStoreError::PublicationLifecycleCapacity { .. }
         | BlobStoreError::NetworkSourceTooLarge { .. }
         | BlobStoreError::NetworkBlobTooLarge { .. }
         | BlobStoreError::NetworkStagingRowLimitExceeded { .. }
-        | BlobStoreError::NetworkStagingByteLimitExceeded { .. } => {
-            ApplicationErrorKind::ResourceLimit
-        }
-        BlobStoreError::PendingSourceMissing | BlobStoreError::Io(_) => {
-            ApplicationErrorKind::StateUnavailable
-        }
+        | BlobStoreError::NetworkStagingByteLimitExceeded { .. }
+        | BlobStoreError::LeaseCapacity => ApplicationErrorKind::ResourceLimit,
+        BlobStoreError::PendingSourceMissing
+        | BlobStoreError::VariantDeleting
+        | BlobStoreError::Io(_) => ApplicationErrorKind::StateUnavailable,
         BlobStoreError::Verification(_)
         | BlobStoreError::SchemaInvariant(_)
         | BlobStoreError::DepotIntegrity(_)
@@ -3072,6 +3108,18 @@ mod tests {
     };
 
     static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn application_error_public_projection_is_sanitized() {
+        let ordinary = ApplicationError::new(
+            ApplicationErrorKind::ResourceLimit,
+            "Blob publication admission",
+        );
+        assert_eq!(ordinary.kind(), ApplicationErrorKind::ResourceLimit);
+        assert_eq!(ordinary.operation(), "Blob publication admission");
+        assert!(std::error::Error::source(&ordinary).is_none());
+        assert!(!format!("{ordinary:?}").contains("cause"));
+    }
 
     #[test]
     fn mutable_cursor_and_frontier_store_errors_have_narrow_application_kinds() {
@@ -3106,6 +3154,58 @@ mod tests {
                 "test integrity"
             )),
             ApplicationErrorKind::Integrity
+        );
+    }
+
+    #[test]
+    fn blob_lifecycle_store_errors_keep_narrow_application_kinds() {
+        for error in [
+            BlobStoreError::InvalidLifecycleLimits,
+            BlobStoreError::InvalidMaintenanceBudget,
+        ] {
+            assert_eq!(
+                blob_store_error_kind(&error),
+                ApplicationErrorKind::InvalidRequest
+            );
+        }
+        for error in [
+            BlobStoreError::LineageFenceCapacity {
+                required_rows: 2,
+                required_bytes: 2,
+                max_rows: 1,
+                max_bytes: 1,
+            },
+            BlobStoreError::ReplayFenceCapacity {
+                required_rows: 2,
+                required_bytes: 2,
+                max_rows: 1,
+                max_bytes: 1,
+            },
+            BlobStoreError::PublicationLifecycleCapacity {
+                required_rows: 2,
+                max_rows: 1,
+            },
+        ] {
+            assert_eq!(
+                blob_store_error_kind(&error),
+                ApplicationErrorKind::ResourceLimit
+            );
+        }
+        assert_eq!(
+            blob_store_error_kind(&BlobStoreError::SourceRepresentationConflict),
+            ApplicationErrorKind::Conflict
+        );
+        assert_eq!(
+            blob_store_error_kind(&BlobStoreError::ExpiredOrRetired),
+            ApplicationErrorKind::ExpiredOrRetired
+        );
+        assert_eq!(
+            blob_store_error_kind(&BlobStoreError::LeaseCapacity),
+            ApplicationErrorKind::ResourceLimit
+        );
+        assert_eq!(
+            blob_store_error_kind(&BlobStoreError::VariantDeleting),
+            ApplicationErrorKind::StateUnavailable
         );
     }
 

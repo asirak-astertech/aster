@@ -1,18 +1,17 @@
 #![allow(
     dead_code,
-    reason = "semantic-v7 profile negotiation consumes these Task 1 contracts in Task 3"
+    reason = "semantic-v7 profile negotiation consumes these contracts in the runtime"
 )]
-
-use std::collections::BTreeSet;
-use std::fmt;
 
 use aster_mesh::{MAX_CUSTODY_WRAPPER_BYTES, Priority};
 use aster_redb_store::EventTransferId;
+use std::collections::BTreeSet;
 
 use crate::frame::EventDirection;
 use sha2::{Digest, Sha256};
 
 pub(crate) const SEMANTIC_PROTOCOL_V7: u16 = 7;
+pub(crate) const SEMANTIC_PROTOCOL_V8: u16 = 8;
 pub(crate) const MAX_CHANGE_PAGE_PROTECTED_BYTES: usize = aster_iroh::DEFAULT_MAX_EXCHANGE_BYTES;
 const MECHANICS_FRAME_OVERHEAD_BYTES: usize = crate::frame::MECHANICS_FRAME_PREFIX_BYTES;
 pub(crate) const MAX_CHANGE_PAGE_CODEC_BYTES: usize = MAX_CHANGE_PAGE_PROTECTED_BYTES
@@ -53,357 +52,14 @@ fn planned_change_page_entry_bytes(
 const _: () = assert!(MAX_CHANGE_PAGE_ENTRIES <= u16::MAX as usize);
 
 pub(crate) const MAX_EVENT_TURN_PLAN_CODEC_BYTES: usize = 1 + 1 + 1 + 32 + 4 + 32 + 4 + 4;
-const OFFER_CODEC_VERSION: u8 = 1;
-const CRITICAL_ID_MASK: u16 = 0x8000;
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct EventPagesError(String);
-
-impl EventPagesError {
-    fn invalid(message: impl Into<String>) -> Self {
-        Self(message.into())
-    }
-}
-
-impl fmt::Display for EventPagesError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for EventPagesError {}
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-#[repr(u16)]
-pub(crate) enum LaneId {
-    Event = 1,
-    State = 2,
-    Record = 3,
-    Blob = 4,
-    EventBridge = 5,
-}
-
-impl LaneId {
-    const DESCENDING: [Self; 5] = [
-        Self::EventBridge,
-        Self::Blob,
-        Self::Record,
-        Self::State,
-        Self::Event,
-    ];
-    fn decode(value: u16) -> Option<Self> {
-        match value {
-            1 => Some(Self::Event),
-            2 => Some(Self::State),
-            3 => Some(Self::Record),
-            4 => Some(Self::Blob),
-            5 => Some(Self::EventBridge),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-#[repr(u16)]
-pub(crate) enum TransferProfileId {
-    LegacyV6 = 1,
-    EventPagesV1 = 2,
-}
-
-impl TransferProfileId {
-    fn decode(value: u16) -> Option<Self> {
-        match value {
-            1 => Some(Self::LegacyV6),
-            2 => Some(Self::EventPagesV1),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct TransferProfileOfferV1 {
-    lanes: Vec<(u16, Vec<u16>)>,
-}
-
-impl TransferProfileOfferV1 {
-    pub(crate) fn current() -> Self {
-        Self {
-            lanes: vec![
-                (
-                    LaneId::EventBridge as u16,
-                    vec![TransferProfileId::LegacyV6 as u16],
-                ),
-                (
-                    LaneId::Blob as u16,
-                    vec![TransferProfileId::LegacyV6 as u16],
-                ),
-                (
-                    LaneId::Record as u16,
-                    vec![TransferProfileId::LegacyV6 as u16],
-                ),
-                (
-                    LaneId::State as u16,
-                    vec![TransferProfileId::LegacyV6 as u16],
-                ),
-                (
-                    LaneId::Event as u16,
-                    vec![
-                        TransferProfileId::EventPagesV1 as u16,
-                        TransferProfileId::LegacyV6 as u16,
-                    ],
-                ),
-            ],
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn legacy_only() -> Self {
-        Self {
-            lanes: LaneId::DESCENDING
-                .into_iter()
-                .map(|lane| (lane as u16, vec![TransferProfileId::LegacyV6 as u16]))
-                .collect(),
-        }
-    }
-
-    #[cfg(test)]
-    fn from_lanes(lanes: Vec<(LaneId, Vec<TransferProfileId>)>) -> Self {
-        Self {
-            lanes: lanes
-                .into_iter()
-                .map(|(lane, profiles)| {
-                    (
-                        lane as u16,
-                        profiles.into_iter().map(|profile| profile as u16).collect(),
-                    )
-                })
-                .collect(),
-        }
-    }
-
-    #[cfg(test)]
-    fn known_lanes(&self) -> Vec<(LaneId, Vec<TransferProfileId>)> {
-        self.lanes
-            .iter()
-            .filter_map(|(raw_lane, raw_profiles)| {
-                LaneId::decode(*raw_lane).map(|lane| {
-                    (
-                        lane,
-                        raw_profiles
-                            .iter()
-                            .filter_map(|profile| TransferProfileId::decode(*profile))
-                            .collect(),
-                    )
-                })
-            })
-            .collect()
-    }
-
-    fn validate(&self) -> Result<(), EventPagesError> {
-        if self.lanes.is_empty() || self.lanes.len() > u8::MAX as usize {
-            return Err(EventPagesError::invalid(
-                "transfer-profile lane count is invalid",
-            ));
-        }
-        let mut last_lane = None;
-        let mut known_lanes = BTreeSet::new();
-        for (raw_lane, profiles) in &self.lanes {
-            if last_lane.is_some_and(|previous| *raw_lane >= previous) {
-                return Err(EventPagesError::invalid(
-                    "transfer-profile lanes are duplicate or noncanonical",
-                ));
-            }
-            last_lane = Some(*raw_lane);
-            if profiles.is_empty() || profiles.len() > u8::MAX as usize {
-                return Err(EventPagesError::invalid("profile list count is invalid"));
-            }
-            if !profiles.windows(2).all(|pair| pair[0] > pair[1]) {
-                return Err(EventPagesError::invalid(
-                    "profile IDs are duplicate or noncanonical",
-                ));
-            }
-            for raw_profile in profiles {
-                if TransferProfileId::decode(*raw_profile).is_none()
-                    && raw_profile & CRITICAL_ID_MASK != 0
-                {
-                    return Err(EventPagesError::invalid(
-                        "unknown critical transfer-profile ID",
-                    ));
-                }
-            }
-
-            let Some(lane) = LaneId::decode(*raw_lane) else {
-                if raw_lane & CRITICAL_ID_MASK != 0 {
-                    return Err(EventPagesError::invalid("unknown critical lane ID"));
-                }
-                continue;
-            };
-            known_lanes.insert(lane);
-            if !profiles.contains(&(TransferProfileId::LegacyV6 as u16)) {
-                return Err(EventPagesError::invalid(
-                    "every fixed lane must offer LegacyV6",
-                ));
-            }
-            if lane != LaneId::Event && profiles.contains(&(TransferProfileId::EventPagesV1 as u16))
-            {
-                return Err(EventPagesError::invalid(
-                    "EventPagesV1 is valid only for the Event lane",
-                ));
-            }
-        }
-        if known_lanes.len() != LaneId::DESCENDING.len() {
-            return Err(EventPagesError::invalid(
-                "transfer-profile offer must contain every fixed lane",
-            ));
-        }
-        Ok(())
-    }
-
-    pub(crate) fn encode(&self) -> Result<Vec<u8>, EventPagesError> {
-        self.validate()?;
-        let mut output = Vec::with_capacity(4 + self.lanes.len() * 6);
-        output.push(OFFER_CODEC_VERSION);
-        output.push(
-            u8::try_from(self.lanes.len())
-                .map_err(|_| EventPagesError::invalid("lane count overflows"))?,
-        );
-        for (lane, profiles) in &self.lanes {
-            output.extend_from_slice(&lane.to_be_bytes());
-            output.push(
-                u8::try_from(profiles.len())
-                    .map_err(|_| EventPagesError::invalid("profile count overflows"))?,
-            );
-            for profile in profiles {
-                output.extend_from_slice(&profile.to_be_bytes());
-            }
-        }
-        Ok(output)
-    }
-
-    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, EventPagesError> {
-        let mut cursor = Cursor::new(bytes);
-        if cursor.u8()? != OFFER_CODEC_VERSION {
-            return Err(EventPagesError::invalid(
-                "unsupported transfer-profile offer codec version",
-            ));
-        }
-        let lane_count = usize::from(cursor.u8()?);
-        let mut lanes = Vec::with_capacity(lane_count.min(LaneId::DESCENDING.len()));
-        for _ in 0..lane_count {
-            let raw_lane = cursor.u16()?;
-            let profile_count = usize::from(cursor.u8()?);
-            let mut profiles = Vec::with_capacity(profile_count);
-            for _ in 0..profile_count {
-                profiles.push(cursor.u16()?);
-            }
-            lanes.push((raw_lane, profiles));
-        }
-        cursor.finish()?;
-        let offer = Self { lanes };
-        offer.validate()?;
-        Ok(offer)
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct NegotiatedTransferProfiles {
-    lanes: Vec<(LaneId, Vec<TransferProfileId>)>,
-}
-
-impl NegotiatedTransferProfiles {
-    pub(crate) fn profile(&self, lane: LaneId) -> Option<TransferProfileId> {
-        self.lanes
-            .iter()
-            .find(|(candidate, _)| *candidate == lane)
-            .and_then(|(_, profiles)| profiles.first().copied())
-    }
-    pub(crate) fn contains(&self, lane: LaneId, profile: TransferProfileId) -> bool {
-        self.lanes
-            .iter()
-            .find(|(candidate, _)| *candidate == lane)
-            .is_some_and(|(_, profiles)| profiles.contains(&profile))
-    }
-    fn encode(&self) -> Vec<u8> {
-        let mut output = Vec::new();
-        output.push(u8::try_from(self.lanes.len()).expect("fixed lane count fits u8"));
-        for (lane, profiles) in &self.lanes {
-            output.extend_from_slice(&(*lane as u16).to_be_bytes());
-            output.push(u8::try_from(profiles.len()).expect("bounded profile count fits u8"));
-            for profile in profiles {
-                output.extend_from_slice(&(*profile as u16).to_be_bytes());
-            }
-        }
-        output
-    }
-}
-
-pub(crate) fn negotiate_transfer_profiles(
-    initiator: &TransferProfileOfferV1,
-    responder: &TransferProfileOfferV1,
-) -> Result<NegotiatedTransferProfiles, EventPagesError> {
-    initiator.validate()?;
-    responder.validate()?;
-    let mut lanes = Vec::with_capacity(LaneId::DESCENDING.len());
-    for lane in LaneId::DESCENDING {
-        let left = profiles_for(initiator, lane)?;
-        let right = profiles_for(responder, lane)?;
-        let common: Vec<_> = left
-            .iter()
-            .copied()
-            .filter(|profile| right.contains(profile))
-            .collect();
-        if common.is_empty() {
-            return Err(EventPagesError::invalid(format!(
-                "no common transfer profile for lane {}",
-                lane as u16
-            )));
-        }
-        lanes.push((lane, common));
-    }
-    Ok(NegotiatedTransferProfiles { lanes })
-}
-
-fn profiles_for(
-    offer: &TransferProfileOfferV1,
-    lane: LaneId,
-) -> Result<Vec<TransferProfileId>, EventPagesError> {
-    offer
-        .lanes
-        .iter()
-        .find(|(candidate, _)| *candidate == lane as u16)
-        .map(|(_, profiles)| {
-            profiles
-                .iter()
-                .filter_map(|profile| TransferProfileId::decode(*profile))
-                .collect()
-        })
-        .ok_or_else(|| EventPagesError::invalid("fixed lane is missing from profile offer"))
-}
-
-pub(crate) fn transfer_profile_digest(
-    initiator: &TransferProfileOfferV1,
-    responder: &TransferProfileOfferV1,
-    negotiated: &NegotiatedTransferProfiles,
-) -> [u8; 32] {
-    let initiator = initiator.encode().expect("validated initiator offer");
-    let responder = responder.encode().expect("validated responder offer");
-    let intersections = negotiated.encode();
-    let mut hasher = Sha256::new();
-    hasher.update(b"ASTER/transfer-profile-digest/v1\0");
-    hash_field(&mut hasher, &initiator);
-    hash_field(&mut hasher, &responder);
-    hash_field(&mut hasher, &intersections);
-    hasher.finalize().into()
-}
-
-fn hash_field(hasher: &mut Sha256, bytes: &[u8]) {
-    hasher.update(
-        u32::try_from(bytes.len())
-            .expect("bounded profile bytes")
-            .to_be_bytes(),
-    );
-    hasher.update(bytes);
-}
+#[cfg(test)]
+pub(crate) use aster_mesh::negotiate_transfer_profiles;
+pub(crate) use aster_mesh::{
+    NegotiatedTransferProfiles, TransferLaneId as LaneId, TransferProfileId,
+    TransferProfileOfferV1, negotiate_transfer_profiles_for_semantic_version,
+    transfer_profile_digest,
+};
+pub(crate) type EventPagesError = aster_mesh::TransferProfileError;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum LegacyDifference {
@@ -1856,13 +1512,78 @@ mod tests {
     use super::*;
 
     #[test]
+    fn blob_stream_profile_is_version_neutral_and_fails_closed() {
+        let v7 = TransferProfileOfferV1::for_semantic_version(SEMANTIC_PROTOCOL_V7)
+            .expect("v7 transfer-profile offer");
+        let v8 =
+            TransferProfileOfferV1::for_semantic_version(8).expect("v8 transfer-profile offer");
+
+        assert_eq!(v7, TransferProfileOfferV1::current());
+        assert_eq!(v8, v7);
+        assert_eq!(
+            v7.encode().expect("v7 canonical offer"),
+            vec![
+                1, 5, // codec version and lane count
+                0, 5, 1, 0, 1, // EventBridge: LegacyV6
+                0, 4, 1, 0, 4, // Blob: BlobRangesStreamV1
+                0, 3, 1, 0, 1, // Record: LegacyV6
+                0, 2, 1, 0, 1, // State: LegacyV6
+                0, 1, 2, 0, 2, 0, 1, // Event: EventPagesV1, LegacyV6
+            ],
+            "semantic-v7/v8 stream offer encoding is an immutable compatibility vector"
+        );
+        for semantic_version in [SEMANTIC_PROTOCOL_V7, 8] {
+            assert_eq!(
+                negotiate_transfer_profiles_for_semantic_version(semantic_version, &v7, &v8)
+                    .expect("version-scoped stream negotiation")
+                    .profile(LaneId::Blob),
+                Some(TransferProfileId::BlobRangesStreamV1)
+            );
+        }
+
+        let stream_on_event = TransferProfileOfferV1::from_lanes(vec![
+            (LaneId::EventBridge, vec![TransferProfileId::LegacyV6]),
+            (LaneId::Blob, vec![TransferProfileId::BlobRangesStreamV1]),
+            (LaneId::Record, vec![TransferProfileId::LegacyV6]),
+            (LaneId::State, vec![TransferProfileId::LegacyV6]),
+            (
+                LaneId::Event,
+                vec![
+                    TransferProfileId::BlobRangesStreamV1,
+                    TransferProfileId::EventPagesV1,
+                    TransferProfileId::LegacyV6,
+                ],
+            ),
+        ]);
+        assert!(stream_on_event.encode().is_err());
+
+        let legacy = TransferProfileOfferV1::legacy_only();
+        assert!(negotiate_transfer_profiles(&v8, &legacy).is_err());
+
+        let duplicate_stream = TransferProfileOfferV1::from_lanes(vec![
+            (LaneId::EventBridge, vec![TransferProfileId::LegacyV6]),
+            (
+                LaneId::Blob,
+                vec![
+                    TransferProfileId::BlobRangesStreamV1,
+                    TransferProfileId::BlobRangesStreamV1,
+                ],
+            ),
+            (LaneId::Record, vec![TransferProfileId::LegacyV6]),
+            (LaneId::State, vec![TransferProfileId::LegacyV6]),
+            (LaneId::Event, vec![TransferProfileId::LegacyV6]),
+        ]);
+        assert!(duplicate_stream.encode().is_err());
+    }
+
+    #[test]
     fn canonical_offer_and_intersection_cover_every_lane_without_disabling_legacy() {
         let offer = TransferProfileOfferV1::current();
         assert_eq!(
             offer.known_lanes(),
             vec![
                 (LaneId::EventBridge, vec![TransferProfileId::LegacyV6]),
-                (LaneId::Blob, vec![TransferProfileId::LegacyV6]),
+                (LaneId::Blob, vec![TransferProfileId::BlobRangesStreamV1]),
                 (LaneId::Record, vec![TransferProfileId::LegacyV6]),
                 (LaneId::State, vec![TransferProfileId::LegacyV6]),
                 (
@@ -2206,10 +1927,63 @@ mod tests {
         assert!(oversized.encode().is_err());
     }
 
+    #[test]
+    fn blob_stream_only_offer_matches_versioned_vector() {
+        let encoded = TransferProfileOfferV1::current().encode().unwrap();
+        assert_eq!(
+            format!(
+                "# aster-blob-ranges-stream-vectors/v1\tsemantic=7,8\toracle=python-stdlib\nACCEPT\toffer-blob-stream-only-v1\t{}\n",
+                vector_hex(&encoded)
+            ),
+            include_str!("../../../conformance/vectors/blob-ranges-stream-v1.tsv")
+        );
+        for semantic_version in [SEMANTIC_PROTOCOL_V7, SEMANTIC_PROTOCOL_V8] {
+            assert_eq!(
+                TransferProfileOfferV1::decode(&encoded).unwrap(),
+                TransferProfileOfferV1::for_semantic_version(semantic_version)
+                    .expect("versioned Blob stream offer")
+            );
+        }
+    }
+
+    #[test]
+    fn blob_ranges_stream_rejects_unsupported_peer_without_fallback() {
+        let current = TransferProfileOfferV1::current();
+        let legacy = legacy_only_offer();
+        let selected = negotiate_transfer_profiles(&current, &current).unwrap();
+        assert_eq!(selected.profile(LaneId::Blob).unwrap() as u16, 4);
+        assert_eq!(TransferProfileId::decode(3), None);
+        let mut reserved = current.encode().unwrap();
+        reserved[9] = 2;
+        reserved[10..12].copy_from_slice(&3u16.to_be_bytes());
+        reserved.splice(12..12, 1u16.to_be_bytes());
+        let reserved = TransferProfileOfferV1::decode(&reserved).unwrap();
+        assert!(negotiate_transfer_profiles(&current, &reserved).is_err());
+        assert!(negotiate_transfer_profiles(&reserved, &current).is_err());
+        for (left, right) in [(&current, &legacy), (&legacy, &current)] {
+            let error = negotiate_transfer_profiles(left, right).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("no common transfer profile for lane 4")
+            );
+        }
+    }
+
     fn legacy_only_offer() -> TransferProfileOfferV1 {
         TransferProfileOfferV1::from_lanes(vec![
             (LaneId::EventBridge, vec![TransferProfileId::LegacyV6]),
             (LaneId::Blob, vec![TransferProfileId::LegacyV6]),
+            (LaneId::Record, vec![TransferProfileId::LegacyV6]),
+            (LaneId::State, vec![TransferProfileId::LegacyV6]),
+            (LaneId::Event, vec![TransferProfileId::LegacyV6]),
+        ])
+    }
+
+    fn legacy_event_offer() -> TransferProfileOfferV1 {
+        TransferProfileOfferV1::from_lanes(vec![
+            (LaneId::EventBridge, vec![TransferProfileId::LegacyV6]),
+            (LaneId::Blob, vec![TransferProfileId::BlobRangesStreamV1]),
             (LaneId::Record, vec![TransferProfileId::LegacyV6]),
             (LaneId::State, vec![TransferProfileId::LegacyV6]),
             (LaneId::Event, vec![TransferProfileId::LegacyV6]),
@@ -2227,7 +2001,17 @@ mod tests {
     }
 
     fn canonical_event_page_vectors() -> Vec<(&'static str, Vec<u8>)> {
-        let current = TransferProfileOfferV1::current();
+        // Historical vectors bind the original explicit offers, not new defaults.
+        let current = TransferProfileOfferV1::from_lanes(vec![
+            (LaneId::EventBridge, vec![TransferProfileId::LegacyV6]),
+            (LaneId::Blob, vec![TransferProfileId::LegacyV6]),
+            (LaneId::Record, vec![TransferProfileId::LegacyV6]),
+            (LaneId::State, vec![TransferProfileId::LegacyV6]),
+            (
+                LaneId::Event,
+                vec![TransferProfileId::EventPagesV1, TransferProfileId::LegacyV6],
+            ),
+        ]);
         let legacy = legacy_only_offer();
         let current_profiles = negotiate_transfer_profiles(&current, &current).unwrap();
         let fallback_profiles = negotiate_transfer_profiles(&current, &legacy).unwrap();
@@ -2625,7 +2409,7 @@ mod tests {
             }
         );
 
-        let legacy = legacy_only_offer();
+        let legacy = legacy_event_offer();
         let fallback_profiles = negotiate_transfer_profiles(&current, &legacy).unwrap();
         let fallback_digest = transfer_profile_digest(&current, &legacy, &fallback_profiles);
         let fallback = build_local_event_send_plan(
@@ -2652,7 +2436,7 @@ mod tests {
     #[test]
     fn asymmetric_page_support_falls_back_to_complete_legacy_direction() {
         let current = TransferProfileOfferV1::current();
-        let legacy = legacy_only_offer();
+        let legacy = legacy_event_offer();
         let profiles = negotiate_transfer_profiles(&current, &legacy).unwrap();
         let digest = transfer_profile_digest(&current, &legacy, &profiles);
         let difference = vec![id(1), id(2)];
@@ -3051,7 +2835,7 @@ mod tests {
             "EventPagesV1 must not accept an exact LegacyActive substitution"
         );
 
-        let legacy = legacy_only_offer();
+        let legacy = legacy_event_offer();
         let legacy_profiles = negotiate_transfer_profiles(&current, &legacy).unwrap();
         let legacy_digest = transfer_profile_digest(&current, &legacy, &legacy_profiles);
         let legacy_plan = EventTurnPlanV1::LegacyActive {

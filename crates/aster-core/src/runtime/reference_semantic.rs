@@ -4846,6 +4846,7 @@ fn semantic_restart_progress_allowed(
             | wire::SEMANTIC_PROTOCOL_V5
             | wire::SEMANTIC_PROTOCOL_V6
             | wire::SEMANTIC_PROTOCOL_V7
+            | wire::SEMANTIC_PROTOCOL_V8
     ) {
         return false;
     }
@@ -4868,6 +4869,7 @@ fn semantic_restart_progress_allowed(
             | wire::SEMANTIC_PROTOCOL_V5
             | wire::SEMANTIC_PROTOCOL_V6
             | wire::SEMANTIC_PROTOCOL_V7
+            | wire::SEMANTIC_PROTOCOL_V8
     ) {
         return false;
     }
@@ -5011,9 +5013,10 @@ mod tests {
         open_reference_node,
     };
     use crate::engine::{BatchPublishItem, NodeConfig, PublishRequest};
-    use crate::model::{DataClass, Scope, Topic};
+    use crate::model::{DataClass, Priority, Scope, Topic};
     use crate::store::{
-        BatchStoragePolicy, ControlKind, RejectedControl, StoredBridgeAuthorization, StoredControl,
+        BatchStoragePolicy, ControlKind, RecordStore, RejectedControl, StoredBridgeAuthorization,
+        StoredControl, transfer_storage_key,
     };
     use std::fs;
     use std::io::Cursor;
@@ -5053,6 +5056,43 @@ mod tests {
 
     fn test_authority(label: &str) -> (std::path::PathBuf, ReferenceSemanticRuntimeAuthority) {
         test_authority_with_blob_config(label, BlobStoreConfig::default())
+    }
+
+    #[test]
+    fn authenticated_v8_session_hydrates_real_sqlite_durable_progress() {
+        let (root, authority) = test_authority("v8-durable-progress");
+        let object_id = ObjectId::new(ObjectKind::SourceEnvelope, [0xe8; 32]);
+        {
+            let mut backend = authority.backend.lock().unwrap();
+            let store = backend.node_mut().store_mut();
+            store
+                .begin_transfer_for_semantic_version(
+                    object_id,
+                    3,
+                    Priority::Routine,
+                    None,
+                    wire::SEMANTIC_PROTOCOL_V8,
+                )
+                .unwrap();
+            store
+                .put_sealed_chunk(transfer_storage_key(object_id), 3, 0, &[8, 8, 8], None)
+                .unwrap();
+        }
+
+        let mut session = authority.session();
+        session.authorize_adjacency([0xe9; 32]).unwrap();
+        let progress = session
+            .durable_progress_for_semantic_version(8, wire::SEMANTIC_PROTOCOL_V8)
+            .unwrap();
+        assert!(progress.iter().any(|entry| {
+            entry.object_id == object_id
+                && entry.origin_semantic_version == Some(wire::SEMANTIC_PROTOCOL_V8)
+                && entry.total_len == 3
+        }));
+
+        drop(session);
+        drop(authority);
+        let _ = fs::remove_dir_all(root);
     }
 
     fn test_authority_with_signed_control(
@@ -5943,6 +5983,40 @@ mod tests {
     }
 
     #[test]
+    fn lower_bound_runtime_age_stays_withheld_until_certain_expiry() {
+        let clock = [0x45; 16];
+        let mut age = runtime_custody_age(10, true, Some(clock), Some(1_000), true);
+
+        assert_eq!(
+            crate::custody::evaluate_custody(
+                Some(30),
+                false,
+                &mut age,
+                Some(CustodySample {
+                    clock_id: clock,
+                    tick_ms: 1_019,
+                }),
+            ),
+            crate::custody::CustodyDisposition::Indeterminate
+        );
+        assert_eq!(age.cumulative_age_ms(), 29);
+        assert_eq!(age.continuity(), CustodyContinuity::Lost);
+        assert_eq!(
+            crate::custody::evaluate_custody(
+                Some(30),
+                false,
+                &mut age,
+                Some(CustodySample {
+                    clock_id: clock,
+                    tick_ms: 1_020,
+                }),
+            ),
+            crate::custody::CustodyDisposition::Expired { age_ms: 30 }
+        );
+        assert_eq!(age.continuity(), CustodyContinuity::Lost);
+    }
+
+    #[test]
     fn restart_progress_never_downgrades_an_ambiguous_source_partial() {
         let source = |origin_semantic_version| RuntimeTransferProgress {
             object_id: ObjectId::new(ObjectKind::SourceEnvelope, [0x31; 32]),
@@ -6027,7 +6101,11 @@ mod tests {
             &proof,
             wire::SEMANTIC_PROTOCOL_V7
         ));
-        assert!(!semantic_restart_progress_allowed(&proof, 8));
+        assert!(semantic_restart_progress_allowed(
+            &proof,
+            wire::SEMANTIC_PROTOCOL_V8
+        ));
+        assert!(!semantic_restart_progress_allowed(&proof, 9));
     }
 
     #[test]

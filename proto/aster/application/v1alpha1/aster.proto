@@ -21,6 +21,7 @@ enum PublicErrorReason {
   PUBLIC_ERROR_REASON_SEQUENCE_RETIRED = 15;
   PUBLIC_ERROR_REASON_RECOVERY_REQUIRED = 16;
   PUBLIC_ERROR_REASON_LEGACY_STATE_REQUIRES_FRESH_STORE = 17;
+  PUBLIC_ERROR_REASON_EXPIRED_OR_RETIRED = 18;
 }
 
 message PublicErrorDetail {
@@ -32,7 +33,7 @@ message PublicErrorDetail {
 
 // AsterApplicationService is the process-local, high-level application API.
 //
-// The alpha surface exposes only the live Event and status operations backed
+// The alpha surface exposes only the live Event, Blob, and status operations backed
 // by the running node's sole durable-store authority. It intentionally omits
 // cryptographic material, carriers, reconciliation mechanics, sealed bytes,
 // provisioning secrets, and stopped-only State/Record operations.
@@ -67,6 +68,65 @@ service AsterApplicationService {
   rpc DeleteEventSubscription(DeleteEventSubscriptionRequest) returns (DeleteEventSubscriptionResponse);
   // QueryEventGaps reports authenticated gaps in one exact publisher stream.
   rpc QueryEventGaps(QueryEventGapsRequest) returns (QueryEventGapsResponse);
+  // PublishBlob accepts one metadata frame followed by canonical plaintext chunks.
+  rpc PublishBlob(stream PublishBlobRequest) returns (PublishBlobResponse);
+  // ReadBlob streams freshly authenticated bounded plaintext pages.
+  rpc ReadBlob(ReadBlobRequest) returns (stream ReadBlobResponse);
+}
+
+message PublishBlobMetadata {
+  bytes operation_key = 1;
+  string topic = 2;
+  string scope = 3;
+  Priority priority = 4;
+  optional string media_type = 5;
+  bytes schema_id = 6;
+  uint64 total_len = 7;
+  // Original source-authenticated duration; omission means durable.
+  optional uint64 ttl_ms = 8;
+}
+
+message PublishBlobRequest {
+  oneof frame {
+    PublishBlobMetadata metadata = 1;
+    bytes chunk = 2;
+  }
+}
+
+message PublishBlobResponse {
+  bytes id = 1;
+  bytes publisher = 2;
+  uint64 publisher_counter = 3;
+  Priority priority = 4;
+  optional uint64 ttl_ms = 5;
+  uint64 total_len = 6;
+  optional string media_type = 7;
+  bytes schema_id = 8;
+  uint64 acceptance_marker = 9;
+  bool inserted = 10;
+}
+
+message ReadBlobRequest {
+  bytes id = 1;
+  string topic = 2;
+  string scope = 3;
+}
+
+message ReadBlobResponse {
+  bytes id = 1;
+  bytes publisher = 2;
+  uint64 publisher_counter = 3;
+  string topic = 4;
+  string scope = 5;
+  Priority priority = 6;
+  optional uint64 ttl_ms = 7;
+  uint64 total_len = 8;
+  optional string media_type = 9;
+  bytes schema_id = 10;
+  uint64 acceptance_marker = 11;
+  uint64 offset = 12;
+  bytes chunk = 13;
+  bool complete = 14;
 }
 
 message ListEventSubscriptionsRequest {}

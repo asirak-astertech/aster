@@ -26,6 +26,8 @@ pub enum PublicOperation {
     AcknowledgeEvent,
     DeleteEventSubscription,
     QueryEventGaps,
+    PublishBlob,
+    ReadBlob,
 }
 
 impl PublicOperation {
@@ -48,6 +50,8 @@ impl PublicOperation {
             Self::AcknowledgeEvent => "acknowledge_event",
             Self::DeleteEventSubscription => "delete_event_subscription",
             Self::QueryEventGaps => "query_event_gaps",
+            Self::PublishBlob => "publish_blob",
+            Self::ReadBlob => "read_blob",
         }
     }
 
@@ -90,6 +94,7 @@ impl api::PublicErrorReason {
             Self::LegacyStateRequiresFreshStore => {
                 "legacy publication state requires a fresh store"
             }
+            Self::ExpiredOrRetired => "durable object expired or was retired",
             Self::Draining => "service is draining",
             Self::StateUnavailable => "service state is unavailable",
             Self::AuthenticationFailed => "authentication failed",
@@ -116,6 +121,7 @@ pub(crate) fn is_public_error_message(message: &str) -> bool {
         R::SequenceRetired,
         R::RecoveryRequired,
         R::LegacyStateRequiresFreshStore,
+        R::ExpiredOrRetired,
         R::Draining,
         R::StateUnavailable,
         R::AuthenticationFailed,
@@ -176,6 +182,13 @@ fn application_error_mapping(kind: ApplicationErrorKind, operation: &str) -> Pub
             retry_delay: None,
         };
     };
+    application_error_mapping_for_operation(kind, operation)
+}
+
+fn application_error_mapping_for_operation(
+    kind: ApplicationErrorKind,
+    operation: PublicOperation,
+) -> PublicErrorMapping {
     let (code, reason, retryable) = match kind {
         ApplicationErrorKind::InvalidRequest => (
             ErrorCode::InvalidArgument,
@@ -259,6 +272,45 @@ fn application_error_mapping(kind: ApplicationErrorKind, operation: &str) -> Pub
         retryable,
         retry_delay: None,
     }
+}
+
+/// Converts Blob failures using the Blob operation selected by the public route.
+/// Recent retirement remains distinct from an identity that was never observed.
+pub(crate) fn connect_blob_application_error(
+    error: ApplicationError,
+    operation: PublicOperation,
+) -> ConnectError {
+    let mapping = match error.kind() {
+        ApplicationErrorKind::NotFound => PublicErrorMapping {
+            code: ErrorCode::NotFound,
+            reason: api::PublicErrorReason::MissingDurableObject,
+            operation,
+            retryable: false,
+            retry_delay: None,
+        },
+        ApplicationErrorKind::ExpiredOrRetired => PublicErrorMapping {
+            code: ErrorCode::NotFound,
+            reason: api::PublicErrorReason::ExpiredOrRetired,
+            operation,
+            retryable: false,
+            retry_delay: None,
+        },
+        ApplicationErrorKind::UnsupportedValue => PublicErrorMapping {
+            code: ErrorCode::InvalidArgument,
+            reason: api::PublicErrorReason::UnsupportedValue,
+            operation,
+            retryable: false,
+            retry_delay: None,
+        },
+        kind => application_error_mapping_for_operation(kind, operation),
+    };
+    public_error(
+        mapping.code,
+        mapping.reason,
+        mapping.operation,
+        mapping.retryable,
+        mapping.retry_delay,
+    )
 }
 
 /// Converts the selected-node error taxonomy without exposing its text or source.

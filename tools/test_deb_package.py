@@ -47,7 +47,8 @@ with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
         checked.add(name)
     assert {"usr/bin/aster", "usr/bin/aster-agent", "usr/bin/asterctl", "usr/sbin/aster-credential-admin"} <= checked
     for page in ("asterctl", "asterctl-publish", "asterctl-query", "asterctl-subscribe",
-                 "asterctl-subscriptions", "asterctl-unsubscribe"):
+                 "asterctl-subscriptions", "asterctl-unsubscribe", "asterctl-blob-publish",
+                 "asterctl-blob-read"):
         assert gzip.decompress(read(f"usr/share/man/man1/{page}.1.gz"))
     assert members["etc/aster/provisioning"].mode == 0o700
     assert members["var/lib/aster/provisioning-systemd"].mode == 0o700

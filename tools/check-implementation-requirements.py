@@ -338,8 +338,14 @@ BLOB_NETWORK_SLICE = (
     "crates/aster-node/src/runtime.rs::tests::"
     "blob_lifecycle_lock_serializes_delayed_projection_insert_and_abort; "
     "crates/aster-node/src/runtime.rs::tests::"
-    "terminal_blob_poison_advances_scheduler_past_source_to_later_candidate; "
-    "docs/protocol.md#92-selected-semantic-v5-direct-blob-transfer; "
+    "terminal_source_rotation_uses_maximum_object_before_later_candidate; "
+    "crates/aster-node/src/runtime.rs::tests::"
+    "blob_ranges_stream_expiry_between_ranges_retires_pending_without_cursor_advance; "
+    "crates/aster-node/src/runtime.rs::tests::"
+    "blob_ranges_stream_sender_stops_service_after_mid_schedule_lifetime_loss; "
+    "crates/aster-node/src/runtime.rs::tests::"
+    "v5_v6_blob_intent_fails_explicitly_before_blob_io; "
+    "docs/protocol.md#92-historical-semantic-v5-direct-blob-transfer; docs/blob-ranges-stream.md; "
     "docs/quickstart/selected-blob-api.md"
 )
 BLOB_LIVE_SLICE = (
@@ -795,7 +801,7 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
         "observed-bounded",
         "aster-core + aster-redb-store + aster-node",
         f"{BLOB_LOCAL_SLICE}; {BLOB_NETWORK_SLICE}; {BLOB_LIVE_SLICE}; {BLOB_SUBSCRIPTION_SLICE}; {LIVE_BLOB_ACCEPTANCE_SLICE}; {LIVE_BLOB_RECEIPT}; {LIVE_BLOB_SUBSCRIPTION_EVIDENCE}; SelectedBlobNode and the cloneable actor-owned SelectedBlobHandle prepare a manifest-bounded digest set, commit encrypted chunks under the fixed 64-KiB profile outside redb, source-seal one canonical manifest, expose synchronous stopped streaming or bounded live zeroize-on-drop plaintext pages, and durably select exact source-authenticated immutable Blob publications for metadata-only at-least-once application delivery; the retained live transfer run published and read one 98,304-byte two-chunk Blob while peerless, seeded a replica, retained exact nonpublic interrupted progress across receiver reopen, resumed from that distinct replica, and read the authenticated result before and after a final peerless receiver reopen; the retained delivery run independently published two exact source publications sharing one immutable BlobId and one completed depot variant, delivered only metadata, force-terminated the receiver after one flushed attempt, durably redelivered, acknowledged both exact publications, and reopened peerless with an empty queue",
-        "The transfer receipt remains one same-implementation, one-host, three-participant, small two-chunk observation, while the delivery receipt is a one-host peerless same-implementation observation of one 38-byte Blob and metadata-only delivery. Both retain operator-attested source/binary/execution linkage. Blob peer/convergence status, route-only relay/custody, Blob TTL/GC, language bindings, power-loss or filesystem-crash recovery, long-offline recovery, physical/resource acceptance, mixed implementations, large-Blob/RSS evidence, and release authorization remain open.",
+        "The transfer receipt remains one same-implementation, one-host, three-participant, small two-chunk observation, while the delivery receipt is a one-host peerless same-implementation observation of one 38-byte Blob and metadata-only delivery. Both retain operator-attested source/binary/execution linkage. Blob peer/convergence status, route-only relay/custody, retained Blob TTL/GC acceptance and public lifecycle controls, language bindings, power-loss or filesystem-crash recovery, long-offline recovery, physical/resource acceptance, mixed implementations, large-Blob/RSS evidence, and release authorization remain open.",
     ),
     "DM-5.1-11": selected_claim(
         "observed-bounded",
@@ -867,17 +873,17 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
     "DM-5.1-19": selected_claim(
         "implemented-uncredited", "aster-core + aster-redb-store + aster-node",
         f"{EVENT_SLICE}; {EVENT_SUBSCRIPTION_SLICE}; {EVENT_LIVE_SLICE}; {MUTABLE_NETWORK_SLICE}; {BLOB_NETWORK_SLICE}; Event, State, Record, and Blob scope/epoch are source-authenticated; current route grants and current source lineage filter inventory/transfer, while every v5 Blob inventory/source/range send additionally requires the authenticated peer's current exact topic/scope/epoch content proof and current physical lineage",
-        "Repeated dynamic multi-scope lifecycle, route-only Blob custody, physical peers, and independent interoperability remain open. Same-epoch replacement withholds old proofs and rows; cleanup deliberately retains bounded quota-charged depot expected/committed staging, backing files/chunks where present, reserved-byte authority, and the non-public retained physical-lineage fence until an explicit GC protocol.",
+        "Repeated dynamic multi-scope lifecycle, route-only Blob custody, physical peers, and independent interoperability remain open. Same-epoch replacement withholds old proofs and rows; cleanup deliberately retains bounded quota-charged depot expected/committed staging, backing files/chunks where present, reserved-byte authority, and the non-public retained physical-lineage fence until bounded Blob lifecycle maintenance reclaims them; retained Blob GC acceptance remains open.",
     ),
     "DM-5.1-20": selected_claim(
         "implemented-uncredited", "aster-core + aster-redb-store + aster-node",
         f"{CUSTODY_SLICE}; {MUTABLE_NETWORK_SLICE}; {BLOB_NETWORK_SLICE}; selected Event priority is source-authenticated, persisted, used by bounded v3/v4/v5 scheduling/retry, and participates in the explicit Event/RouteEvent pressure order; AtLeast remains an Event-only threshold and does not suppress semantic-v4/v5 State/Record or v5 Blob work",
-        "State, Record, and Blob remain outside selected custody priority scheduling and eviction; mutable/Blob continuation is not priority or cross-class eviction credit, and no physical-link, independent, or release acceptance credit is claimed.",
+        "State and Record remain outside selected custody priority scheduling and eviction; Blob has bounded class-local finite-first and lower-priority pressure recovery in current code, not cross-class eviction or retained acceptance credit, and no physical-link, independent, or release acceptance credit is claimed.",
     ),
     "DM-5.1-21": selected_claim(
         "implemented-uncredited", "aster-core + aster-redb-store + aster-node",
-        f"{CUSTODY_SLICE}; {MUTABLE_NETWORK_SLICE}; {BLOB_NETWORK_SLICE}; selected Event TTL is source-authenticated, semantic-v3/v4/v5 custody carries checked cumulative age, Linux publication may choose a positive finite TTL, ttl=None remains durable, and selected State/Record/Blob finite TTL is structurally rejected",
-        "Finite selected Event publication fails closed on non-Linux targets; State/Record/Blob forwarding age, expiry, and GC, powered-off elapsed-time recovery, physical systems, independent interoperability, and release acceptance remain open.",
+        f"{CUSTODY_SLICE}; {MUTABLE_NETWORK_SLICE}; {BLOB_NETWORK_SLICE}; selected Event TTL is source-authenticated, semantic-v3/v4/v5 custody carries checked cumulative age, Linux publication may choose a positive finite TTL, ttl=None remains durable, and selected State/Record finite TTL remains structurally rejected while semantic-v8 profile-4 Blob finite lifetime, custody, expiry, retirement, pressure eviction, tombstone cleanup, and replay fencing are implemented in current code",
+        "Finite selected Event publication fails closed on non-Linux targets; State/Record forwarding age, expiry, and GC; retained Blob lifecycle acceptance, powered-off elapsed-time recovery, physical systems, independent interoperability, and release acceptance remain open.",
     ),
     "DM-5.1-22": selected_claim(
         "observed-bounded", "aster-core + aster-node",
@@ -1489,8 +1495,8 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
     "DM-11-15": selected_claim(
         "implemented-uncredited",
         "aster-core + aster-redb-store + aster-node",
-        f"{CUSTODY_SLICE}; {MUTABLE_NETWORK_SLICE}; {BLOB_NETWORK_SLICE}; the selected Event MVP surface includes positive source-authenticated TTL publication, cumulative semantic-v3/v4/v5 custody, exact expiry withholding, collection, and permanent replay fences; selected State/Record/Blob finite TTL is rejected",
-        "Finite TTL is Linux-only and Event/RouteEvent-only; State/Record/Blob forwarding age, expiry, custody, and GC, the complete MVP, other platforms/classes, physical acceptance, bindings, protected provisioning, and release gates remain open.",
+        f"{CUSTODY_SLICE}; {MUTABLE_NETWORK_SLICE}; {BLOB_NETWORK_SLICE}; the selected Event MVP surface includes positive source-authenticated TTL publication, cumulative semantic-v3/v4/v5 custody, exact expiry withholding, collection, and permanent replay fences; selected State/Record finite TTL remains rejected while semantic-v8 profile-4 Blob finite lifetime, custody, expiry, retirement, pressure eviction, tombstone cleanup, and replay fencing are implemented in current code",
+        "Finite TTL is Linux-only and Event/RouteEvent-only; State/Record forwarding age, expiry, custody, and GC; retained Blob lifecycle acceptance, the complete MVP, other platforms/classes, physical acceptance, bindings, protected provisioning, and release gates remain open.",
     ),
     "DM-11-16": selected_claim(
         "implemented-uncredited",

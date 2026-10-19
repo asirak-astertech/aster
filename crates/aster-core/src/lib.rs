@@ -47,6 +47,8 @@ pub mod blob;
 mod blob;
 #[cfg(all(feature = "reference-session", not(feature = "sqlite-store")))]
 mod blob;
+#[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
+mod blob_custody;
 #[cfg(all(feature = "sqlite-store", feature = "adapter-sdk"))]
 pub mod causal;
 #[cfg(all(feature = "sqlite-store", not(feature = "adapter-sdk")))]
@@ -116,6 +118,8 @@ mod store;
 pub mod sync;
 #[cfg(all(feature = "sqlite-store", not(feature = "adapter-sdk")))]
 mod sync;
+#[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
+mod transfer_profile;
 #[cfg(all(feature = "sqlite-store", feature = "adapter-sdk"))]
 pub mod wire;
 #[cfg(all(feature = "sqlite-store", not(feature = "adapter-sdk")))]
@@ -145,6 +149,12 @@ pub use blob::{
     MAX_BLOB_SCHEMA_ID_BYTES, MAX_BLOB_TRANSFER_OBJECT_BYTES, MIN_BLOB_CHUNK_SIZE, PreparedBlob,
     ReferenceBlobService, SELECTED_BLOB_CHUNK_SIZE, VerifiedBlobContentCompletion,
     VerifiedBlobTransferObject, VerifiedBlobTransferPlan, prepare_blob,
+};
+#[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
+pub use blob_custody::{
+    AuthenticatedBlobCustodyContactV1, AuthenticatedBlobCustodySendContextV1,
+    BLOB_CUSTODY_CLAIM_V1_BYTES, BlobCustodyClaimV1, BlobCustodyDirectionV1, BlobCustodyError,
+    BlobCustodyTransferId, OpenedBlobSourceFrameV1, VerifiedBlobCustodyClaimV1,
 };
 #[cfg(feature = "reference-session")]
 pub use bridge_adapter::{
@@ -236,6 +246,12 @@ pub use source_state::{
 };
 #[cfg(feature = "sqlite-store")]
 pub use store::{BridgeFilter, EventGap, PeerSnapshot, QuotaUsage, SubscriptionId};
+#[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
+pub use transfer_profile::{
+    NegotiatedTransferProfiles, TransferLaneId, TransferProfileError, TransferProfileId,
+    TransferProfileOfferV1, negotiate_transfer_profiles,
+    negotiate_transfer_profiles_for_semantic_version, transfer_profile_digest,
+};
 
 /// Stable replication-wire, credential, and cryptographic-profile version.
 pub const REPLICATION_WIRE_VERSION: u16 = 1;
@@ -248,10 +264,10 @@ pub const REPLICATION_WIRE_VERSION: u16 = 1;
 pub const PROTOCOL_VERSION: u16 = REPLICATION_WIRE_VERSION;
 
 /// Semantic replication version offered first by a default initiator.
-pub const DEFAULT_SEMANTIC_VERSION: u16 = 7;
+pub const DEFAULT_SEMANTIC_VERSION: u16 = 8;
 
 /// Highest semantic replication version implemented by this build.
-pub const HIGHEST_SUPPORTED_SEMANTIC_VERSION: u16 = 7;
+pub const HIGHEST_SUPPORTED_SEMANTIC_VERSION: u16 = 8;
 
 #[cfg(feature = "sqlite-store")]
 const _: () = assert!(batch::DATA_CLASS_EVENT == model::DataClass::Event as u8);
@@ -266,9 +282,9 @@ mod version_surface_tests {
         #[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
         assert_eq!(
             crypto::SUPPORTED_SEMANTIC_PROTOCOL_VERSIONS,
-            &[7, 6, 5, 4, 3, 2, 1]
+            &[8, 7, 6, 5, 4, 3, 2, 1]
         );
-        assert_eq!(DEFAULT_SEMANTIC_VERSION, 7);
+        assert_eq!(DEFAULT_SEMANTIC_VERSION, 8);
         assert_eq!(HIGHEST_SUPPORTED_SEMANTIC_VERSION, DEFAULT_SEMANTIC_VERSION);
         #[cfg(feature = "sqlite-store")]
         assert_eq!(batch::DATA_CLASS_EVENT, DataClass::Event as u8);

@@ -1,5 +1,6 @@
 use aster_mesh::{
-    MAX_CUSTODY_WRAPPER_BYTES, MAX_SELECTED_BRIDGE_WRAPPER_BYTES, Priority, Scope, Topic,
+    BLOB_CUSTODY_CLAIM_V1_BYTES, BlobCustodyClaimV1, MAX_CUSTODY_WRAPPER_BYTES,
+    MAX_SELECTED_BRIDGE_WRAPPER_BYTES, Priority, Scope, Topic,
 };
 use aster_negentropy::{MAX_CARDINALITY_LIMIT, MAX_FRAME_SIZE_LIMIT};
 use aster_redb_store::{
@@ -94,6 +95,8 @@ const CHANGE_TURN_FINISHED_V1: u8 = 0xd5;
 pub(crate) const MAX_OBJECT_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_BLOB_RANGE_BYTES: usize = 16 * 1024;
 pub(crate) const BLOB_CONTENT_PROOF_BYTES: usize = 32;
+pub(crate) const BLOB_CUSTODY_CLAIM_FIELD_MAX_BYTES: usize = 1 + 2 + BLOB_CUSTODY_CLAIM_V1_BYTES;
+pub(crate) const BLOB_CUSTODY_DIGEST_FIELD_MAX_BYTES: usize = 1 + 32;
 pub(crate) const MAX_EVENT_INTEREST_SELECTORS: usize = 256;
 const MAX_EVENT_NAME_BYTES: usize = 128;
 pub(crate) const MAX_EVENT_INTEREST_BYTES: usize =
@@ -768,26 +771,31 @@ pub(crate) enum Frame {
         direction: EventDirection,
         id: MutableTransferId,
         bytes: Vec<u8>,
+        claim: Option<BlobCustodyClaimV1>,
     },
     MutableOffer {
         direction: EventDirection,
         id: MutableTransferId,
         bytes: Vec<u8>,
+        claim: Option<BlobCustodyClaimV1>,
     },
     MutableApplyResult {
         direction: EventDirection,
         id: MutableTransferId,
         disposition: MutableApplyDisposition,
+        custody_digest: Option<[u8; 32]>,
     },
     MutableFetchResult {
         direction: EventDirection,
         id: MutableTransferId,
         disposition: MutableApplyDisposition,
+        custody_digest: Option<[u8; 32]>,
     },
     MutableFetchResultAck {
         direction: EventDirection,
         id: MutableTransferId,
         disposition: MutableApplyDisposition,
+        custody_digest: Option<[u8; 32]>,
     },
     MutableFinish {
         class: MutableClass,
@@ -895,6 +903,13 @@ impl Frame {
     }
 
     pub(crate) fn encode(&self) -> Result<Vec<u8>, NodeError> {
+        self.encode_with_v8_blob_fields(false)
+    }
+
+    fn encode_with_v8_blob_fields(
+        &self,
+        include_v8_blob_fields: bool,
+    ) -> Result<Vec<u8>, NodeError> {
         let mut output = Vec::new();
         output.extend_from_slice(MAGIC);
         match self {
@@ -1252,46 +1267,71 @@ impl Frame {
                 direction,
                 id,
                 bytes,
+                claim,
             } => {
                 output.push(MUTABLE_OBJECT);
                 encode_mutable_id(&mut output, *direction, *id);
                 encode_bytes(&mut output, bytes, MAX_OBJECT_BYTES, "mutable object")?;
+                encode_blob_claim_field(&mut output, *id, claim.as_ref(), include_v8_blob_fields)?;
             }
             Self::MutableOffer {
                 direction,
                 id,
                 bytes,
+                claim,
             } => {
                 output.push(MUTABLE_OFFER);
                 encode_mutable_id(&mut output, *direction, *id);
                 encode_bytes(&mut output, bytes, MAX_OBJECT_BYTES, "mutable offer")?;
+                encode_blob_claim_field(&mut output, *id, claim.as_ref(), include_v8_blob_fields)?;
             }
             Self::MutableApplyResult {
                 direction,
                 id,
                 disposition,
+                custody_digest,
             } => {
                 output.push(MUTABLE_APPLY_RESULT);
                 encode_mutable_id(&mut output, *direction, *id);
                 output.push(disposition.encode());
+                encode_blob_digest_field(
+                    &mut output,
+                    *id,
+                    custody_digest.as_ref(),
+                    include_v8_blob_fields,
+                )?;
             }
             Self::MutableFetchResult {
                 direction,
                 id,
                 disposition,
+                custody_digest,
             } => {
                 output.push(MUTABLE_FETCH_RESULT);
                 encode_mutable_id(&mut output, *direction, *id);
                 output.push(disposition.encode());
+                encode_blob_digest_field(
+                    &mut output,
+                    *id,
+                    custody_digest.as_ref(),
+                    include_v8_blob_fields,
+                )?;
             }
             Self::MutableFetchResultAck {
                 direction,
                 id,
                 disposition,
+                custody_digest,
             } => {
                 output.push(MUTABLE_FETCH_RESULT_ACK);
                 encode_mutable_id(&mut output, *direction, *id);
                 output.push(disposition.encode());
+                encode_blob_digest_field(
+                    &mut output,
+                    *id,
+                    custody_digest.as_ref(),
+                    include_v8_blob_fields,
+                )?;
             }
             Self::MutableFinish {
                 class,
@@ -1490,7 +1530,11 @@ impl Frame {
                 "semantic v1-v6 session cannot emit a v7-only mechanics frame".into(),
             ));
         }
-        self.encode()
+        if semantic_version >= crate::event_pages::SEMANTIC_PROTOCOL_V8 {
+            self.encode_with_v8_blob_fields(true)
+        } else {
+            self.encode()
+        }
     }
 
     pub(crate) fn decode_for_semantic_version(
@@ -1508,7 +1552,82 @@ impl Frame {
                 "semantic v1-v6 session rejected a v7-only mechanics frame".into(),
             ));
         }
-        Self::decode(input)
+        if semantic_version >= crate::event_pages::SEMANTIC_PROTOCOL_V8 {
+            Self::decode_v8_blob_fields(input)
+        } else {
+            Self::decode(input)
+        }
+    }
+
+    fn decode_v8_blob_fields(input: &[u8]) -> Result<Self, NodeError> {
+        if input.len() < 5 || &input[..4] != MAGIC {
+            return Err(NodeError::Protocol(
+                "invalid mechanics frame version".into(),
+            ));
+        }
+        let tag = input[4];
+        let body = &input[5..];
+        match tag {
+            MUTABLE_OBJECT | MUTABLE_OFFER => {
+                let (direction, id, body) = decode_mutable_id(body)?;
+                if id.class() != MutableClass::Blob {
+                    return Self::decode(input);
+                }
+                let (bytes, trailing) =
+                    decode_leading_bytes(body, MAX_OBJECT_BYTES, "mutable object")?;
+                let claim = decode_blob_claim_field(trailing)?;
+                if tag == MUTABLE_OBJECT {
+                    Ok(Self::MutableObject {
+                        direction,
+                        id,
+                        bytes: bytes.to_vec(),
+                        claim,
+                    })
+                } else {
+                    Ok(Self::MutableOffer {
+                        direction,
+                        id,
+                        bytes: bytes.to_vec(),
+                        claim,
+                    })
+                }
+            }
+            MUTABLE_APPLY_RESULT | MUTABLE_FETCH_RESULT | MUTABLE_FETCH_RESULT_ACK => {
+                let (direction, id, body) = decode_mutable_id(body)?;
+                if id.class() != MutableClass::Blob {
+                    return Self::decode(input);
+                }
+                let Some((&disposition, trailing)) = body.split_first() else {
+                    return Err(NodeError::Protocol(
+                        "mutable Blob result disposition is missing".into(),
+                    ));
+                };
+                let disposition = MutableApplyDisposition::decode(disposition)?;
+                let custody_digest = decode_blob_digest_field(trailing)?;
+                match tag {
+                    MUTABLE_APPLY_RESULT => Ok(Self::MutableApplyResult {
+                        direction,
+                        id,
+                        disposition,
+                        custody_digest,
+                    }),
+                    MUTABLE_FETCH_RESULT => Ok(Self::MutableFetchResult {
+                        direction,
+                        id,
+                        disposition,
+                        custody_digest,
+                    }),
+                    MUTABLE_FETCH_RESULT_ACK => Ok(Self::MutableFetchResultAck {
+                        direction,
+                        id,
+                        disposition,
+                        custody_digest,
+                    }),
+                    _ => unreachable!("matched one of three result tags"),
+                }
+            }
+            _ => Self::decode(input),
+        }
     }
 
     const fn is_v7_only(&self) -> bool {
@@ -1887,12 +2006,14 @@ impl Frame {
                         direction,
                         id,
                         bytes,
+                        claim: None,
                     })
                 } else {
                     Ok(Self::MutableOffer {
                         direction,
                         id,
                         bytes,
+                        claim: None,
                     })
                 }
             }
@@ -1907,6 +2028,7 @@ impl Frame {
                     direction,
                     id,
                     disposition: MutableApplyDisposition::decode(body[0])?,
+                    custody_digest: None,
                 })
             }
             MUTABLE_FETCH_RESULT | MUTABLE_FETCH_RESULT_ACK => {
@@ -1922,12 +2044,14 @@ impl Frame {
                         direction,
                         id,
                         disposition,
+                        custody_digest: None,
                     })
                 } else {
                     Ok(Self::MutableFetchResultAck {
                         direction,
                         id,
                         disposition,
+                        custody_digest: None,
                     })
                 }
             }
@@ -2129,7 +2253,7 @@ const fn is_v7_only_tag(tag: u8) -> bool {
 }
 
 fn validate_semantic_version(semantic_version: u16) -> Result<(), NodeError> {
-    if !(1..=crate::event_pages::SEMANTIC_PROTOCOL_V7).contains(&semantic_version) {
+    if !(1..=crate::event_pages::SEMANTIC_PROTOCOL_V8).contains(&semantic_version) {
         return Err(NodeError::Protocol(format!(
             "unsupported semantic protocol version {semantic_version}"
         )));
@@ -2860,6 +2984,116 @@ fn encode_bytes(
     Ok(())
 }
 
+fn encode_blob_claim_field(
+    output: &mut Vec<u8>,
+    id: MutableTransferId,
+    claim: Option<&BlobCustodyClaimV1>,
+    include_v8_blob_fields: bool,
+) -> Result<(), NodeError> {
+    if id.class() != MutableClass::Blob {
+        if claim.is_some() {
+            return Err(NodeError::Protocol(
+                "Blob custody claim crossed mutable classes".into(),
+            ));
+        }
+        return Ok(());
+    }
+    if !include_v8_blob_fields {
+        if claim.is_some() {
+            return Err(NodeError::Protocol(
+                "Blob custody claim requires semantic v8".into(),
+            ));
+        }
+        return Ok(());
+    }
+    match claim {
+        None => output.push(0),
+        Some(claim) => {
+            output.push(1);
+            output.extend_from_slice(
+                &u16::try_from(BLOB_CUSTODY_CLAIM_V1_BYTES)
+                    .expect("fixed Blob custody claim length fits u16")
+                    .to_be_bytes(),
+            );
+            output.extend_from_slice(&claim.encode());
+        }
+    }
+    Ok(())
+}
+
+fn decode_blob_claim_field(input: &[u8]) -> Result<Option<BlobCustodyClaimV1>, NodeError> {
+    match input {
+        [0] => Ok(None),
+        [1, length @ ..] if length.len() >= 2 => {
+            let encoded_len = u16::from_be_bytes([length[0], length[1]]) as usize;
+            let encoded = &length[2..];
+            if encoded_len != BLOB_CUSTODY_CLAIM_V1_BYTES || encoded.len() != encoded_len {
+                return Err(NodeError::Protocol(
+                    "v8 Blob custody claim length differs".into(),
+                ));
+            }
+            BlobCustodyClaimV1::decode(encoded)
+                .map(Some)
+                .map_err(|_| NodeError::Protocol("v8 Blob custody claim is invalid".into()))
+        }
+        [] => Err(NodeError::Protocol(
+            "v8 Blob custody claim presence is missing".into(),
+        )),
+        _ => Err(NodeError::Protocol(
+            "v8 Blob custody claim field differs".into(),
+        )),
+    }
+}
+
+fn encode_blob_digest_field(
+    output: &mut Vec<u8>,
+    id: MutableTransferId,
+    digest: Option<&[u8; 32]>,
+    include_v8_blob_fields: bool,
+) -> Result<(), NodeError> {
+    if id.class() != MutableClass::Blob {
+        if digest.is_some() {
+            return Err(NodeError::Protocol(
+                "Blob custody digest crossed mutable classes".into(),
+            ));
+        }
+        return Ok(());
+    }
+    if !include_v8_blob_fields {
+        if digest.is_some() {
+            return Err(NodeError::Protocol(
+                "Blob custody digest requires semantic v8".into(),
+            ));
+        }
+        return Ok(());
+    }
+    match digest {
+        None => output.push(0),
+        Some(digest) => {
+            output.push(1);
+            output.extend_from_slice(digest);
+        }
+    }
+    Ok(())
+}
+
+fn decode_blob_digest_field(input: &[u8]) -> Result<Option<[u8; 32]>, NodeError> {
+    match input {
+        [0] => Ok(None),
+        [1, digest @ ..] if digest.len() == 32 => {
+            Ok(Some(digest.try_into().map_err(|_| {
+                NodeError::Protocol("v8 Blob custody digest length differs".into())
+            })?))
+        }
+        [] => Err(NodeError::Protocol(
+            "v8 Blob custody digest presence is missing".into(),
+        )),
+        _ => Err(NodeError::Protocol(
+            "v8 Blob custody digest field differs".into(),
+        )),
+    }
+}
+
 fn decode_bytes<'a>(input: &'a [u8], maximum: usize, label: &str) -> Result<&'a [u8], NodeError> {
     if input.len() < 4 {
         return Err(NodeError::Protocol(
@@ -3145,26 +3379,31 @@ mod tests {
                 direction: to_initiator,
                 id: state_id,
                 bytes: b"state".to_vec(),
+                claim: None,
             },
             Frame::MutableOffer {
                 direction: to_responder,
                 id: record_id,
                 bytes: b"record".to_vec(),
+                claim: None,
             },
             Frame::MutableApplyResult {
                 direction: to_responder,
                 id: record_id,
                 disposition: MutableApplyDisposition::Inserted,
+                custody_digest: None,
             },
             Frame::MutableFetchResult {
                 direction: to_initiator,
                 id: state_id,
                 disposition: MutableApplyDisposition::DeferredCapacity,
+                custody_digest: None,
             },
             Frame::MutableFetchResultAck {
                 direction: to_initiator,
                 id: state_id,
                 disposition: MutableApplyDisposition::DeferredCapacity,
+                custody_digest: None,
             },
             Frame::MutableFinish {
                 class: MutableClass::Record,
@@ -3304,6 +3543,7 @@ mod tests {
                 direction: EventDirection::ToSessionResponder,
                 id,
                 disposition,
+                custody_digest: None,
             };
             let encoded = frame.encode().expect("encode mutable apply result");
             assert_eq!(encoded.last().copied(), Some(encoded_outcome));
@@ -3314,6 +3554,7 @@ mod tests {
             direction: EventDirection::ToSessionResponder,
             id,
             disposition: MutableApplyDisposition::Inserted,
+            custody_digest: None,
         }
         .encode()
         .expect("encode mutable apply result");
@@ -3333,11 +3574,13 @@ mod tests {
                 direction: EventDirection::ToSessionInitiator,
                 id,
                 disposition,
+                custody_digest: None,
             };
             let ack = Frame::MutableFetchResultAck {
                 direction: EventDirection::ToSessionInitiator,
                 id,
                 disposition,
+                custody_digest: None,
             };
             let encoded_result = result.encode().expect("encode mutable fetch result");
             let encoded_ack = ack.encode().expect("encode mutable fetch result ack");
@@ -3360,6 +3603,7 @@ mod tests {
             direction: EventDirection::ToSessionInitiator,
             id,
             disposition: MutableApplyDisposition::DeferredCapacity,
+            custody_digest: None,
         };
         let encoded = result.encode().expect("encode exact fetch-result tuple");
 
@@ -3371,6 +3615,7 @@ mod tests {
                 direction: EventDirection::ToSessionInitiator,
                 id,
                 disposition: MutableApplyDisposition::DeferredCapacity,
+                custody_digest: None,
             }
         );
 
@@ -4354,18 +4599,232 @@ mod tests {
         ];
 
         for frame in frames {
-            let encoded = frame
-                .encode_for_semantic_version(7)
-                .expect("v7 frame encodes for v7");
-            assert_eq!(
-                Frame::decode_for_semantic_version(&encoded, 7).expect("v7 frame decodes for v7"),
-                frame
-            );
+            for semantic_version in 7..=8 {
+                let encoded = frame
+                    .encode_for_semantic_version(semantic_version)
+                    .expect("v7-or-later frame encodes");
+                assert_eq!(
+                    Frame::decode_for_semantic_version(&encoded, semantic_version)
+                        .expect("v7-or-later frame decodes"),
+                    frame
+                );
+            }
+            let encoded = frame.encode().expect("mechanics frame");
             for legacy_version in 1..=6 {
                 assert!(frame.encode_for_semantic_version(legacy_version).is_err());
                 assert!(Frame::decode_for_semantic_version(&encoded, legacy_version).is_err());
             }
         }
+    }
+
+    fn literal_hex(encoded: &str) -> Vec<u8> {
+        assert_eq!(encoded.len() % 2, 0, "literal hexadecimal width");
+        (0..encoded.len())
+            .step_by(2)
+            .map(|offset| {
+                u8::from_str_radix(&encoded[offset..offset + 2], 16)
+                    .expect("literal hexadecimal byte")
+            })
+            .collect()
+    }
+
+    fn literal_blob_custody_claim() -> aster_mesh::BlobCustodyClaimV1 {
+        aster_mesh::BlobCustodyClaimV1::decode(&literal_hex("41535452424c30380001000800041111111111111111111111111111111111111111111111111111111111111111000000000000000001222222222222222222222222222222222222222222222222222222222222222200000000000000013333333333333333333333333333333333333333333333333333333333333333444444444444444444444444444444444444444444444444444444444444444400000000000000000100000000000000005555555555555555555555555555555500000000000000000000000000000000"))
+            .expect("literal canonical Blob custody claim")
+    }
+
+    #[test]
+    fn v8_blob_source_claim_field_is_exact_and_v1_through_v7_stay_unchanged() {
+        // Mutation caught: changing a legacy Blob/State/Record byte, omitting
+        // v8 presence/length framing, accepting duplicates, or crossing classes.
+        let id = MutableTransferId::Blob(BlobTransferId::new([0xaa; 32]));
+        let legacy = literal_hex(
+            "41534d01830302aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000178",
+        );
+        let durable = Frame::MutableOffer {
+            direction: EventDirection::ToSessionResponder,
+            id,
+            bytes: b"x".to_vec(),
+            claim: None,
+        };
+        for semantic_version in 1..=7 {
+            assert_eq!(
+                durable
+                    .encode_for_semantic_version(semantic_version)
+                    .expect("legacy durable Blob offer"),
+                legacy
+            );
+            assert_eq!(
+                Frame::decode_for_semantic_version(&legacy, semantic_version)
+                    .expect("legacy durable Blob offer decode"),
+                durable
+            );
+        }
+        let mut durable_v8 = legacy.clone();
+        durable_v8.push(0);
+        assert_eq!(
+            durable.encode_for_semantic_version(8).expect("v8 durable"),
+            durable_v8
+        );
+        assert_eq!(
+            Frame::decode_for_semantic_version(&durable_v8, 8).expect("decode v8 durable"),
+            durable
+        );
+        assert!(Frame::decode_for_semantic_version(&legacy, 8).is_err());
+
+        let claim = literal_blob_custody_claim();
+        let finite = Frame::MutableOffer {
+            direction: EventDirection::ToSessionResponder,
+            id,
+            bytes: b"x".to_vec(),
+            claim: Some(claim),
+        };
+        let mut finite_v8 = legacy.clone();
+        finite_v8.extend_from_slice(&[1, 0, 208]);
+        finite_v8.extend_from_slice(&claim.encode());
+        assert_eq!(
+            finite.encode_for_semantic_version(8).expect("v8 finite"),
+            finite_v8
+        );
+        assert_eq!(
+            Frame::decode_for_semantic_version(&finite_v8, 8).expect("decode v8 finite"),
+            finite
+        );
+        assert!(finite.encode_for_semantic_version(7).is_err());
+
+        let mut invalid_discriminator = legacy.clone();
+        invalid_discriminator.push(2);
+        assert!(Frame::decode_for_semantic_version(&invalid_discriminator, 8).is_err());
+        let mut wrong_length = finite_v8.clone();
+        let length_offset = legacy.len() + 1;
+        wrong_length[length_offset..length_offset + 2].copy_from_slice(&207u16.to_be_bytes());
+        assert!(Frame::decode_for_semantic_version(&wrong_length, 8).is_err());
+        let mut truncated = finite_v8.clone();
+        truncated.pop();
+        assert!(Frame::decode_for_semantic_version(&truncated, 8).is_err());
+        let mut duplicated = finite_v8.clone();
+        duplicated.extend_from_slice(&[1, 0, 208]);
+        duplicated.extend_from_slice(&claim.encode());
+        assert!(Frame::decode_for_semantic_version(&duplicated, 8).is_err());
+        let mut surplus = durable_v8.clone();
+        surplus.push(0);
+        assert!(Frame::decode_for_semantic_version(&surplus, 8).is_err());
+
+        for (class, id) in [
+            (
+                MutableClass::State,
+                MutableTransferId::State(StateTransferId::new([0x41; 32])),
+            ),
+            (
+                MutableClass::Record,
+                MutableTransferId::Record(RecordTransferId::new([0x42; 32])),
+            ),
+        ] {
+            assert_eq!(id.class(), class);
+            let frame = Frame::MutableObject {
+                direction: EventDirection::ToSessionInitiator,
+                id,
+                bytes: b"s".to_vec(),
+                claim: None,
+            };
+            assert_eq!(
+                frame.encode_for_semantic_version(8).expect("v8 non-Blob"),
+                frame.encode().expect("legacy non-Blob")
+            );
+        }
+    }
+
+    #[test]
+    fn v8_blob_settlement_digest_field_is_exact_and_class_scoped() {
+        // Mutation caught: omitting a digest presence byte, accepting an
+        // unknown/trailing field, or changing legacy/non-Blob result bytes.
+        let id = MutableTransferId::Blob(BlobTransferId::new([0xab; 32]));
+        let digest = [0xcd; 32];
+        type SettlementMaker = fn(MutableTransferId, Option<[u8; 32]>) -> Frame;
+        let makers: [SettlementMaker; 3] = [
+            |id, custody_digest| Frame::MutableApplyResult {
+                direction: EventDirection::ToSessionInitiator,
+                id,
+                disposition: MutableApplyDisposition::Inserted,
+                custody_digest,
+            },
+            |id, custody_digest| Frame::MutableFetchResult {
+                direction: EventDirection::ToSessionInitiator,
+                id,
+                disposition: MutableApplyDisposition::Inserted,
+                custody_digest,
+            },
+            |id, custody_digest| Frame::MutableFetchResultAck {
+                direction: EventDirection::ToSessionInitiator,
+                id,
+                disposition: MutableApplyDisposition::Inserted,
+                custody_digest,
+            },
+        ];
+        for make in makers {
+            let durable = make(id, None);
+            let legacy = durable.encode().expect("legacy settlement");
+            for semantic_version in 1..=7 {
+                assert_eq!(
+                    durable
+                        .encode_for_semantic_version(semantic_version)
+                        .expect("legacy durable settlement"),
+                    legacy
+                );
+            }
+            let mut durable_v8 = legacy.clone();
+            durable_v8.push(0);
+            assert_eq!(
+                durable
+                    .encode_for_semantic_version(8)
+                    .expect("v8 durable result"),
+                durable_v8
+            );
+            assert_eq!(
+                Frame::decode_for_semantic_version(&durable_v8, 8)
+                    .expect("decode v8 durable result"),
+                durable
+            );
+
+            let finite = make(id, Some(digest));
+            let mut finite_v8 = legacy.clone();
+            finite_v8.push(1);
+            finite_v8.extend_from_slice(&digest);
+            assert_eq!(
+                finite
+                    .encode_for_semantic_version(8)
+                    .expect("v8 finite result"),
+                finite_v8
+            );
+            assert_eq!(
+                Frame::decode_for_semantic_version(&finite_v8, 8).expect("decode v8 finite result"),
+                finite
+            );
+            assert!(finite.encode_for_semantic_version(7).is_err());
+
+            let mut invalid_discriminator = legacy.clone();
+            invalid_discriminator.push(2);
+            assert!(Frame::decode_for_semantic_version(&invalid_discriminator, 8).is_err());
+            let mut truncated = finite_v8.clone();
+            truncated.pop();
+            assert!(Frame::decode_for_semantic_version(&truncated, 8).is_err());
+            let mut surplus = durable_v8.clone();
+            surplus.push(0);
+            assert!(Frame::decode_for_semantic_version(&surplus, 8).is_err());
+        }
+
+        let state = Frame::MutableApplyResult {
+            direction: EventDirection::ToSessionResponder,
+            id: MutableTransferId::State(StateTransferId::new([0x51; 32])),
+            disposition: MutableApplyDisposition::Duplicate,
+            custody_digest: None,
+        };
+        assert_eq!(
+            state
+                .encode_for_semantic_version(8)
+                .expect("v8 State result"),
+            state.encode().expect("legacy State result")
+        );
     }
 
     #[test]
@@ -4374,7 +4833,7 @@ mod tests {
             direction: EventDirection::ToSessionInitiator,
         };
         let raw = frame.encode().unwrap();
-        for semantic_version in 1..=7 {
+        for semantic_version in 1..=8 {
             assert_eq!(
                 frame.encode_for_semantic_version(semantic_version).unwrap(),
                 raw
@@ -4384,6 +4843,6 @@ mod tests {
                 frame
             );
         }
-        assert!(Frame::decode_for_semantic_version(&raw, 8).is_err());
+        assert!(Frame::decode_for_semantic_version(&raw, 9).is_err());
     }
 }

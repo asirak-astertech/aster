@@ -37,6 +37,7 @@ libc.workspace = true
 rustix = { workspace = true, features = ["time"] }
 
 [dev-dependencies]
+aster-mesh = { package = "aster-core", path = "../aster-core", default-features = false, features = ["reference-session", "test-utils"] }
 aster-iroh = { path = "../aster-iroh", features = ["test-utils"] }
 aster-redb-store = { path = "../aster-redb-store", features = ["test-utils"] }
 

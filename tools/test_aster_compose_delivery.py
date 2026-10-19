@@ -656,7 +656,7 @@ class RepositoryPolicyTests(unittest.TestCase):
         self.assertEqual(workflow.count("runs-on: ${{ matrix.runner }}"), 1)
         self.assertEqual(
             workflow.count(
-                "docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e"
+                "docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069"
             ),
             1,
         )
@@ -702,7 +702,7 @@ class RepositoryPolicyTests(unittest.TestCase):
              "actions/checkout@main"),
             ("docker buildx build", "docker run --rm"),
             (
-                "docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e",
+                "docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069",
                 "docker/setup-buildx-action@main",
             ),
             ("driver: docker-container", "driver: docker"),

@@ -186,8 +186,9 @@ implementation version and conformance-vector digest under test.
 | V-CLASS | reducers | State projection, Event gaps, Record sibling retention, annotations, stale-guarded explicit resolution, an in-process regression proving replicated ingest does not execute policy code, canonical Blob manifest/chunks, and local streaming |
 | V-MERKLE | exact anti-entropy | typed 33-byte ObjectIDs, 66-nibble tree roots, probe traces, equal-root wire-descent short circuit with local snapshot accounting, adversarial prefixes, and 100,000/cap-plus-one snapshot behavior for SQLite and custom stores |
 | V-MUTABLE-V4 | selected State/Record mechanics inherited by v5 | `[5,4,3,2,1]` negotiation with v1-v3 mutable absence and v4/v5 State/Record parity; every class/direction frame and all malformed/truncated/trailing/unknown variants; exact offer apply result and fetch-result/ack sequencing; exact finish remainder; current-lineage and same-epoch replacement behavior; Normal/AtLeast/ReceiveOnly boundaries; fatal over-1-MiB rejection; 4,096-row/16-MiB class caps; typed effective ordinary-aggregate/per-class item/byte, 1,024-version per-key projection, and causal-frontier deferral; durable 256-peer/1,024-row fair-cursor rotation, CAS race, prune, reopen, audit, and terminal preservation |
-| V-BLOB-V5 | selected direct Blob source and carrier mechanics | v1-v4 zero Blob frames; exact canonical interest/source/range/result/ack/finish bytes and class/direction/tuple sequencing, including the 76,807-byte maximum protected interest, 153,718-byte two-frame interest exchange, and 17,127-byte six-frame carrier settlement reserve; source-before-carrier; peer/mission/topic/scope/epoch/current-grant proof with route and revocation checks at inventory/source/every range; wrong/tampered/stale/same-epoch proof rejection; old-lineage withholding plus `PhysicalLineageConflict` until numeric epoch advance; 16-KiB contiguous peer-neutral durable prefixes resumed from a different eligible peer after runtime/store/cache teardown and reopen; exact startup removal of pending source/cache/prefix visibility after same-epoch replacement, epoch advance, or publisher revocation while retaining bounded quota-charged depot expected/committed staging; 64-MiB/1,024-chunk admission and 10,000-row/64-MiB staging bounds; typed deferral without eviction; pending invisibility; exact depot plus fresh full-content and current-lineage completion before atomic publication; all-open-path cross-table audit binding pending source/manifest route/carriers to the depot plan and excluding simultaneous pending/completed state without repair; all-or-none writable nine-to-13-table migration with owner-token rules and read-only/partial-group nonmigration; requester Finish echo distinguished from per-range durable Result/Ack; Normal/AtLeast work and ReceiveOnly zero Blob |
-| V-EVENT-PAGES-V7 | semantic-v7 transfer profiles and receipt-free Event pages | current-code evidence: highest-common `[7,6,5,4,3,2,1]` selection and v7/v6 fallback; checked-in canonical offers/intersections/digests, exact and blind plan variants, header, durable and finite-evidence pages, terminal, fallback, and representative malformed vectors; unknown optional/critical profile handling; contextual-AAD substitution rejection; bounded uni-turn local ordered-phase enforcement plus truncation, reset, lower-frame, and aggregate-limit rejection; durable, finite-TTL, mixed, route-only, and blind ReceiveOnly page paths without per-Event result/receipt/lease/retry settlement; finite-age authorization and atomic receiver checkpoint admission; zero-schedule/no-stream behavior; pre-header and per-page policy revalidation; interrupted-page durable prefix and remainder-only reconnect; stable acceptance FIFO within strict priority; derived item/frame/byte receiver bounds and later-lane item/frame/byte reservation. Physical-device matrix results, mixed implementations, broad hostile-network fuzzing, and release performance remain open. |
+| V-BLOB-V5 | historical Blob codec and durable-storage compatibility | v1-v4 zero Blob frames; exact canonical historical interest/source/range/result/ack/finish bytes and class/direction/tuple sequencing, including the 76,807-byte maximum protected interest, 153,718-byte two-frame interest exchange, and inherited 17,127-byte six-frame sizing allocation; source-before-carrier; peer/mission/topic/scope/epoch/current-grant proof with route and revocation checks at inventory/source/every range; wrong/tampered/stale/same-epoch proof rejection; old-lineage withholding plus `PhysicalLineageConflict` until numeric epoch advance; 16-KiB contiguous peer-neutral durable prefixes resumed from a different eligible peer after runtime/store/cache teardown and reopen; exact startup removal of pending source/cache/prefix visibility after same-epoch replacement, epoch advance, or publisher revocation while retaining bounded quota-charged depot expected/committed staging; 64-MiB/1,024-chunk admission and 10,000-row/64-MiB staging bounds; typed deferral without eviction; pending invisibility; exact depot plus fresh full-content and current-lineage completion before atomic publication; all-open-path cross-table audit binding pending source/manifest route/carriers to the depot plan and excluding simultaneous pending/completed state without repair; all-or-none writable nine-to-13-table migration with owner-token rules and read-only/partial-group nonmigration. Result/Ack/Finish remain parser, fuzz, and storage-transition evidence only; current carrier emission and resume are gated by `V-BLOB-RANGES-V7-V8`. |
+| V-BLOB-RANGES-V7-V8 | selected profile-4 Blob range stream and v8 custody | stdlib-only same-team Python construction oracle plus shared v7/v8 stream-record vectors: identical v7/v8 profile-4 offers, canonical multi-range `ABRS`, Data and Unavailable `ABRD`, `ABRE`, and duplicate/order/truncation/trailing/count/hash/index rejection; exact v8 claim/source/settlement framing, complete context substitution including TTL and age fields, checked age overflow, and digest binding; executable semantic-version/profile resolution, v7/v8 AAD-domain substitution rejection, v7 durable-only filtering, v8 exact-provenance custody, terminal-gated completion/promotion/cursor behavior, and peer-neutral suffix recovery. These are current-code checks, not device, mixed-implementation, independent-interoperability, performance, or release evidence. |
+| V-EVENT-PAGES-V7 | semantic-v7 transfer profiles and receipt-free Event pages | current-code evidence: v8 inherits the v7 Event-pages profile, the default offer is `[8,7,6,5,4,3,2,1]`, and v7/v6 fallback remains explicit; checked-in canonical offers/intersections/digests, exact and blind plan variants, header, durable and finite-evidence pages, terminal, fallback, and representative malformed vectors; unknown optional/critical profile handling; contextual-AAD substitution rejection; bounded uni-turn local ordered-phase enforcement plus truncation, reset, lower-frame, and aggregate-limit rejection; durable, finite-TTL, mixed, route-only, and blind ReceiveOnly page paths without per-Event result/receipt/lease/retry settlement; finite-age authorization and atomic receiver checkpoint admission; zero-schedule/no-stream behavior; pre-header and per-page policy revalidation; interrupted-page durable prefix and remainder-only reconnect; stable acceptance FIFO within strict priority; derived item/frame/byte receiver bounds and later-lane item/frame/byte reservation. Physical-device matrix results, mixed implementations, broad hostile-network fuzzing, and release performance remain open. |
 | V-BLOB-LIVE | selected live Blob application boundary | cloneable handle publication from an already-open regular nonempty file at cursor zero, with two-pass mutation detection, cancellation, durable idempotency, a 64-MiB/1,024 canonical 64-KiB-chunk ceiling, and no caller-path reopen; live absolute-offset reads returning at most 64 KiB in zeroize-on-drop plaintext and withholding plaintext across rekey; fresh selected source plus current policy/lineage and exact authenticated `BlobDepotCompletion` capability around depot access; shared application-lane capacity 32 and joined Blob-worker capacity one with bounded saturation; `FatalBlobCoherence` closure of all application admission and actor termination; shutdown and live/stopped terminal zeroization join/closure behavior while audit rows and encrypted depot ciphertext remain preserved |
 | V-BLOB-DELIVERY | selected durable Blob application delivery | exact source-publication identity distinct from `BlobId`; metadata-only bounded poll; durable selector replay, pending attempts, acknowledgement receipts, and monotonic cursors; attempt-token rotation with earlier same-tenure token validity; malformed and cross-publication rejection; exact re-acknowledgement; forced receiver-process replacement; final peerless empty-ledger reopen; local status explicitly separated from peer/convergence status |
 | V-FRAG | carrier segments | every supported MTU, order, duplicate, truncation, overlap, bounds |
@@ -195,7 +196,8 @@ implementation version and conformance-vector digest under test.
 | V-EXT | evolution | optional skip/preserve and critical rejection; transactional core SQLite schema-14→15 provenance migration preserving existing v1-v4 rows and v5 restart provenance |
 | V-FFI | ABI | layouts, ownership, panic containment, repeated lifecycle, invalid pointers/lengths, atomic batch result ordering/rollback, and finalized-Blob writer batches |
 
-`V-BLOB-V5` cleanup evidence MUST retain one exact non-public physical-lineage
+`V-BLOB-V5` historical storage-compatibility evidence MUST retain one exact
+non-public physical-lineage
 depot import, whether expected-only or already finalized, and any
 expected/committed chunk staging under the
 existing byte, chunk, and variant caps after removing pending
@@ -213,7 +215,7 @@ source, 128 KiB per carrier, 16 KiB per range, 10,000 aggregate staging rows,
 
 `V-BLOB-LIVE` is a current-code application/runtime gate, not retained network
 acceptance. Its 64-KiB canonical chunks and at-most-64-KiB application pages are
-separate from the semantic-v5 carrier range ceiling of 16 KiB. Its terminal
+separate from the historical semantic-v5 carrier range ceiling of 16 KiB. Its terminal
 zeroization cases establish bounded cryptographic shredding and admission
 closure while intentionally preserving the encrypted depot; they do not prove
 physical-media sanitization, mixed-implementation behavior, resource targets,
@@ -246,7 +248,7 @@ and deployment cryptographic requirements remain open gates.
 | A-03 | concurrent Record | after resynchronization, all concurrent heads remain retained and annotated; replicated ingestion invokes no registered policy and publishes no merge revision; explicit resolution of the exact current sibling set publishes one dominating revision without deleting its inputs |
 | A-04 | relay path | producer and consumer lack direct path; ciphertext relay delivers; relay key cannot decrypt content |
 | A-05 | constrained link | at 3 kbps and seeded 50% loss, higher priority begins first; no expired frame reaches link |
-| A-06 | emission | threshold suppresses lower Event lanes without discarding them while v4/v5 State/Record and v5 Blob still run; ReceiveOnly exposes no mutable or Blob lane; PassiveOnly behavior matches declared physical mode |
+| A-06 | emission | threshold suppresses lower Event lanes without discarding them while v4-v8 State/Record and v7/v8 profile-4 Blob still run; ReceiveOnly exposes no mutable or Blob lane; PassiveOnly behavior matches declared physical mode |
 | A-07 | revocation/rekey | after control arrival, revoked handshake fails and fresh epoch is unreadable with revoked keys |
 | A-08 | NAT | direct UDP path forms through test cone NAT; restrictive case uses separately deployed opaque relay |
 | A-09 | capture confidentiality | payload plaintext is absent; protected metadata is absent unless the exact declared security-profile exposure budget permits it, and observed leakage does not exceed that budget |
@@ -366,25 +368,26 @@ Normal and AtLeast run mutable lanes; ReceiveOnly and v1-v3 disclose none.
 These are current-code same-implementation software gates, not retained,
 physical, mixed-implementation, scale, or release receipts.
 
-The semantic-v5 Blob gate separately requires a small bounded three-node
-direct-Iroh case. One content-capable source must supply the authenticated Blob
-source before carrier work, the first receiver contact must preserve only a
-proper prefix, runtime/store/provider-cache ownership must tear down, and a
-different eligible content-capable peer must continue the exact complement
-after reopen. No pending prefix may enter ordinary publication inventory, query,
+The historical semantic-v5 Blob gate retains codec, proof, storage, and
+promotion-transition compatibility evidence only; it is not an active carrier
+emission gate. Current same-implementation network checks are
+`V-BLOB-RANGES-V7-V8`: one content-capable source supplies the authenticated
+Blob source before carrier work, the first receiver contact preserves only a
+proper prefix, runtime/store/provider-cache ownership tears down, and a
+different eligible content-capable peer continues the exact complement after
+reopen. No pending prefix may enter ordinary publication inventory, query,
 read, or serving; visibility may appear only after exact depot completion, a
 fresh streamed full-content proof, and fresh current route/physical lineage
-agree in one promotion transaction. Focused frame, provider, store, and runtime
-regressions must also cover every proof substitution, source/carrier tuple and
-Result/Ack mismatch, stale/same-epoch lineage, the epoch-advance requirement,
-all exact bounds, and v1-v4/ReceiveOnly absence. This is current-code
-same-implementation loopback automation for one small Blob; by itself it has no
-retained execution root. The current live Blob application handle and the
-separate retained composition of this resume mechanism are covered by
-`V-BLOB-LIVE`. Both tiers predate the current metadata-only Blob delivery queue
-and therefore claim no retained delivery evidence. The queue's local ledger
-counts are not peer/convergence status. Neither evidence tier claims route-only
-Blob relay/custody, the 100+ MiB or RSS target, physical-media behavior, mixed
+agree in one promotion transaction. Focused regressions cover exact source and
+carrier tuples, stream hash/index/count/terminal failures, stale/same-epoch
+lineage, the epoch-advance requirement, exact bounds, v5/v6 pre-carrier
+rejection, and ReceiveOnly absence. This automation has no retained execution
+root. The current live Blob application handle and the separate retained
+composition of the durable resume mechanism are covered by `V-BLOB-LIVE`.
+Those tiers predate the current metadata-only Blob delivery queue and therefore
+claim no retained delivery evidence. The queue's local ledger counts are not
+peer/convergence status. None of this evidence claims route-only Blob
+relay/custody, the 100+ MiB or RSS target, physical-media behavior, mixed
 implementation, or release acceptance.
 
 The delivery queue separately has a dated
@@ -585,8 +588,9 @@ unauthenticated staging exhaustion never evicts a committed item
 
 Targets: deterministic decoder, every fixed object in `envelope.md`, source
 envelopes, controls, custody wrappers, handshakes, protected frames (including
-all 20 semantic-v4/v5 mutable tags and all semantic-v5 Blob interest/range/
-result/finish tags), fragments,
+all 20 semantic-v4/v5 mutable tags, historical semantic-v5 Blob
+interest/range/result/finish tags, and the current profile-4 schedule decoder),
+fragments,
 overlapping ranges, Merkle probes, dotted contexts, bridge filters, store
 authorizations/wrappers/path dependencies, store recovery, and FFI call
 sequences.
@@ -596,11 +600,12 @@ objects; truncated tags/signatures; wrong inclusion proofs; inconsistent fragmen
 overlap; TTL underflow; old epochs; replayed session counters; malformed public
 keys; same-dot/different-item; route-root/chunk-count substitution; poisoned
 partial restart; staging exhaustion; zero-length and maximum-length blobs.
-Selected-v5 Blob seeds additionally cover proof substitution and tamper,
+Historical selected-v5 Blob seeds additionally cover proof substitution and tamper,
 wrong kind-2 carrier IDs, source/carrier/length/offset crossing, noncanonical
 interest order, stale and conflicting physical lineage, mismatched Result/Ack,
 over-16-KiB ranges, prefix conflict, carrier-complete but content-incomplete
-promotion, and Blob frames under v1-v4.
+promotion, and Blob frames under v1-v4. Current profile-4 seeds add duplicate,
+out-of-order, truncated, trailing, count/hash/index, and terminal mismatches.
 Batch seeds additionally include semantic-v1/format-2 downgrade substitution,
 mixed batch fields, counter/Event range overflow, reordered leaves, wrong empty
 padding, short/long/reordered paths, proof-ID and BatchID substitution, missing
