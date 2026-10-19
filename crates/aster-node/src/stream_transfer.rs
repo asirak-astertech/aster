@@ -6,6 +6,7 @@ pub(crate) const MAX_STREAM_CHECKPOINT_BATCH_BYTES: u32 = 8 * 1_048_576;
 pub(crate) const STREAM_DATA_FIXED_BYTES: usize = 89;
 pub(crate) const MAX_STREAM_DATA_FRAME_BYTES: usize =
     STREAM_DATA_FIXED_BYTES + MAX_STREAM_EXTENT_BYTES;
+pub(crate) const MAX_STREAM_SEMANTIC_COMMITMENT_BYTES: usize = 64 * 1024;
 pub(crate) const STREAM_TAGS: std::ops::RangeInclusive<u8> = 0xd6..=0xdc;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -132,6 +133,7 @@ pub(crate) struct StreamFinishV1 {
     pub attempt_nonce: [u8; 32],
     pub sequence: u64,
     pub final_offset: u64,
+    pub semantic_commitment: Vec<u8>,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StreamResultV1 {
@@ -179,6 +181,15 @@ fn nonce(v: &[u8; 32]) -> Result<(), StreamError> {
 fn extent(v: u32) -> Result<(), StreamError> {
     if v == 0 || v as usize > MAX_STREAM_EXTENT_BYTES {
         Err(StreamError::invalid("extent length out of bounds"))
+    } else {
+        Ok(())
+    }
+}
+fn validate_semantic_commitment(bytes: &[u8]) -> Result<(), StreamError> {
+    if bytes.is_empty() || bytes.len() > MAX_STREAM_SEMANTIC_COMMITMENT_BYTES {
+        Err(StreamError::invalid(
+            "semantic commitment length is out of bounds",
+        ))
     } else {
         Ok(())
     }
@@ -275,9 +286,16 @@ impl StreamFrame {
             }
             Self::Finish(x) => {
                 nonce(&x.attempt_nonce)?;
+                validate_semantic_commitment(&x.semantic_commitment)?;
                 o.push(0xda);
                 put_attempt(&mut o, &x.transfer_id, &x.attempt_nonce, x.sequence);
                 o.extend(x.final_offset.to_be_bytes());
+                o.extend(
+                    u32::try_from(x.semantic_commitment.len())
+                        .map_err(|_| StreamError::invalid("semantic commitment overflow"))?
+                        .to_be_bytes(),
+                );
+                o.extend(&x.semantic_commitment);
             }
             Self::Result(x) => {
                 nonce(&x.attempt_nonce)?;
@@ -380,11 +398,20 @@ impl StreamFrame {
             }
             0xda => {
                 let (transfer_id, attempt_nonce, sequence) = r.attempt()?;
+                let final_offset = r.u64()?;
+                let commitment_len = usize::try_from(r.u32()?)
+                    .map_err(|_| StreamError::invalid("semantic commitment overflow"))?;
+                if commitment_len == 0 || commitment_len > MAX_STREAM_SEMANTIC_COMMITMENT_BYTES {
+                    return Err(StreamError::invalid(
+                        "semantic commitment length is out of bounds",
+                    ));
+                }
                 Self::Finish(StreamFinishV1 {
                     transfer_id,
                     attempt_nonce,
                     sequence,
-                    final_offset: r.u64()?,
+                    final_offset,
+                    semantic_commitment: r.take(commitment_len)?.to_vec(),
                 })
             }
             0xdb => {
@@ -577,17 +604,22 @@ impl StreamSenderState {
         self.limit = x.absolute_receive_limit;
         Ok(())
     }
-    pub(crate) fn finish(&mut self) -> Result<StreamAction, StreamError> {
+    pub(crate) fn finish(
+        &mut self,
+        semantic_commitment: Vec<u8>,
+    ) -> Result<StreamAction, StreamError> {
         if self.next != self.total {
             return Err(StreamError::invalid(
                 "stream finish precedes declared length",
             ));
         }
+        validate_semantic_commitment(&semantic_commitment)?;
         let f = StreamFinishV1 {
             transfer_id: self.transfer_id,
             attempt_nonce: self.nonce,
             sequence: self.send_sequence,
             final_offset: self.total,
+            semantic_commitment,
         };
         self.send_sequence += 1;
         Ok(StreamAction::Send(StreamFrame::Finish(f)))
@@ -770,6 +802,7 @@ impl StreamReceiverState {
     }
     pub(crate) fn finish(&mut self, x: StreamFinishV1) -> Result<StreamAction, StreamError> {
         self.identity(&x.transfer_id, &x.attempt_nonce)?;
+        validate_semantic_commitment(&x.semantic_commitment)?;
         if self.last_finish.as_ref() == Some(&x) {
             return Ok(self.result_frame.clone().map_or(
                 StreamAction::Retry(StreamRetry::SettlementPending),
@@ -938,6 +971,7 @@ pub(crate) fn fuzz_decode(input: &[u8]) {
             attempt_nonce,
             sequence: 1,
             final_offset: 1,
+            semantic_commitment: vec![8],
         })),
         b"db" => Some(StreamFrame::Result(StreamResultV1 {
             transfer_id: id,
@@ -1035,6 +1069,7 @@ mod stream_frame_codec {
                 attempt_nonce: n,
                 sequence: 2,
                 final_offset: 64,
+                semantic_commitment: vec![12; 3],
             }),
             StreamFrame::Result(StreamResultV1 {
                 transfer_id: id,
@@ -1093,11 +1128,11 @@ mod stream_frame_codec {
             ),
             (
                 0xda,
-                85,
+                92,
                 [
-                    0x7f, 0xb6, 0x93, 0x58, 0xf0, 0xd2, 0xbf, 0x43, 0x92, 0xbe, 0x74, 0x76, 0xee,
-                    0xeb, 0x18, 0x7b, 0x7f, 0x40, 0x48, 0x53, 0xc1, 0x6a, 0xd6, 0x6f, 0xa2, 0x8e,
-                    0x22, 0xfe, 0xe7, 0x22, 0x68, 0x19,
+                    0xd3, 0x55, 0x3c, 0x10, 0x59, 0xdf, 0xe7, 0xe0, 0x00, 0x06, 0x93, 0x96, 0x3a,
+                    0x66, 0x62, 0xd1, 0x04, 0x01, 0xa8, 0x20, 0x9f, 0xde, 0xf4, 0x0c, 0x8f, 0xf3,
+                    0x6b, 0xff, 0x36, 0x05, 0xf9, 0xeb,
                 ],
             ),
             (
@@ -1364,7 +1399,10 @@ mod stream_state {
                 checkpoint_batch_bytes: 16,
             })
             .unwrap();
-        assert!(matches!(sender.finish().unwrap(), StreamAction::Send(_)));
+        assert!(matches!(
+            sender.finish(vec![9]).unwrap(),
+            StreamAction::Send(_)
+        ));
         let result = StreamResultV1 {
             transfer_id: [1; 32],
             attempt_nonce: [2; 32],
@@ -1375,6 +1413,29 @@ mod stream_state {
         };
         let first = sender.result(result.clone()).unwrap();
         assert_eq!(sender.result(result), Ok(first));
+    }
+
+    #[test]
+    fn finish_requires_one_bounded_semantic_commitment() {
+        let mut sender = StreamSenderState::new([1; 32], [2; 32], 0);
+        sender
+            .accept(StreamAcceptV1 {
+                transfer_id: [1; 32],
+                attempt_nonce: [2; 32],
+                sequence: 0,
+                durable_offset: 0,
+                checkpoint_generation: 1,
+                absolute_receive_limit: 0,
+                max_extent_bytes: 16,
+                checkpoint_batch_bytes: 16,
+            })
+            .unwrap();
+        assert!(sender.finish(Vec::new()).is_err());
+        assert!(
+            sender
+                .finish(vec![0; MAX_STREAM_SEMANTIC_COMMITMENT_BYTES + 1])
+                .is_err()
+        );
     }
 
     #[test]
@@ -1453,6 +1514,7 @@ mod stream_state {
             attempt_nonce: [2; 32],
             sequence: 0,
             final_offset: 0,
+            semantic_commitment: vec![9],
         };
         assert_eq!(receiver.finish(finish.clone()), Ok(StreamAction::Promote));
         assert_eq!(

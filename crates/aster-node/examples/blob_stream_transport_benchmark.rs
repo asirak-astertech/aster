@@ -220,9 +220,15 @@ async fn pack_send(bind: SocketAddr, peer: SocketAddr, plaintext_len: u64) -> Re
         .await?;
     let path = connection.path_witness();
     let started = Instant::now();
-    let report = stream_validation::send_completed_pack(connection.clone(), &open, &root.0, roots)
-        .await
-        .map_err(std::io::Error::other)?;
+    let report = stream_validation::send_completed_pack(
+        connection.clone(),
+        &open,
+        &root.0,
+        roots,
+        open.digest().to_vec(),
+    )
+    .await
+    .map_err(std::io::Error::other)?;
     print_pack_report("send", &report, started.elapsed(), &path);
     connection.close();
     endpoint.close().await;

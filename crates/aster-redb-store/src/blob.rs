@@ -44,6 +44,10 @@ use super::*;
 
 pub use depot::{AuthenticatedBlobReadDepot, BlobDepot, BlobDepotCompletion};
 pub use lease::{BlobLeaseLimitError, BlobLeaseLimits};
+pub use stream::{
+    BlobStreamConflictEvidence, BlobStreamPromotion, BlobStreamPublication, BlobStreamReservation,
+    BlobStreamReservationRequest, BlobStreamResume, BlobStreamSource,
+};
 
 pub(crate) const BLOB_PUBLICATIONS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.semantic-blob-publications.v1");

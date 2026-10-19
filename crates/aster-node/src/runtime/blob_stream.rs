@@ -6,16 +6,24 @@ use crate::{
         StreamPartition, run_ordered_channel_pipeline,
     },
     stream_transfer::{
-        MAX_STREAM_CHECKPOINT_BATCH_BYTES, StreamAction, StreamClass, StreamDirection, StreamFrame,
-        StreamOpenV1, StreamReceiverState, StreamResultCode, StreamSenderState,
+        MAX_STREAM_CHECKPOINT_BATCH_BYTES, MAX_STREAM_SEMANTIC_COMMITMENT_BYTES, StreamAction,
+        StreamClass, StreamDirection, StreamFrame, StreamOpenV1, StreamReceiverState,
+        StreamResultCode, StreamSenderState,
     },
     stream_transport::{AttemptOpenRequest, IrohQuicV1Adapter, StreamTransportAdapter},
 };
 use aster_iroh::Connection;
-use aster_mesh::{BlobStreamOpen, BlobStreamSegmentOpener, EncryptedBlobStreamSegment};
-use aster_redb_store::pack::{BlobPackReader, BlobPackWriter};
+use aster_mesh::{
+    BlobStreamOpen, BlobStreamSegmentOpener, EncryptedBlobStreamSegment, NodeId,
+    VerifiedBlobStreamFinalCommitment, VerifiedBlobStreamOpen,
+};
+use aster_redb_store::{
+    BlobOperationKey, BlobStreamReservation, BlobStreamReservationRequest, BlobStreamResume,
+    BlobStreamSource, ControlPolicySnapshot, Store,
+    pack::{BlobPackCheckpoint, BlobPackReader, BlobPackWriter},
+};
 use sha2::{Digest, Sha256};
-use std::{path::Path, time::Duration};
+use std::{path::Path, sync::Arc, time::Duration};
 use tokio::{sync::mpsc, time::Instant};
 
 const EXTENT_BYTES: usize = 256 * 1024;
@@ -28,6 +36,55 @@ pub struct BlobNetworkReport {
     pub roots: ([u8; 32], [u8; 32]),
     pub checkpoints: u64,
     pub pipeline: Option<PipelineReport>,
+}
+
+pub type BlobCommitmentVerifier = Arc<
+    dyn Fn(&VerifiedBlobStreamOpen, &[u8]) -> Result<VerifiedBlobStreamFinalCommitment, String>
+        + Send
+        + Sync,
+>;
+
+pub struct BlobReceiveStoreSession {
+    store: Arc<Store>,
+    policy: ControlPolicySnapshot,
+    open: VerifiedBlobStreamOpen,
+    operation: BlobOperationKey,
+    source: BlobStreamSource,
+    verify_commitment: BlobCommitmentVerifier,
+}
+
+impl BlobReceiveStoreSession {
+    pub fn new(
+        store: Arc<Store>,
+        policy: ControlPolicySnapshot,
+        open: VerifiedBlobStreamOpen,
+        peer: NodeId,
+        verify_commitment: BlobCommitmentVerifier,
+    ) -> Result<Self, String> {
+        let operation = BlobOperationKey::new(open.open().operation_key().to_vec())
+            .map_err(|error| failure("stream operation", error))?;
+        Ok(Self {
+            store,
+            policy,
+            open,
+            operation,
+            source: BlobStreamSource::AuthenticatedPeer(peer),
+            verify_commitment,
+        })
+    }
+
+    fn reserve(&self) -> Result<(BlobStreamReservation, BlobStreamResume), String> {
+        self.store
+            .reserve_blob_stream_with_policy(
+                &self.policy,
+                BlobStreamReservationRequest {
+                    operation: &self.operation,
+                    source: self.source,
+                },
+                &self.open,
+            )
+            .map_err(|error| failure("reserve stream", error))
+    }
 }
 
 fn failure(context: &str, error: impl std::fmt::Display) -> String {
@@ -64,7 +121,7 @@ fn attempt_bounds(bytes: u64) -> Result<(usize, usize), String> {
                 .and_then(|count| count.checked_mul(128))
                 .and_then(|overhead| value.checked_add(overhead))
         })
-        .and_then(|value| value.checked_add(4096))
+        .and_then(|value| value.checked_add(MAX_STREAM_SEMANTIC_COMMITMENT_BYTES + 4096))
         .ok_or("data stream bound overflow")?;
     let control = usize::try_from(checkpoints)
         .ok()
@@ -151,6 +208,7 @@ pub async fn send_completed_pack(
     open: &BlobStreamOpen,
     root: &Path,
     roots: ([u8; 32], [u8; 32]),
+    semantic_commitment: Vec<u8>,
 ) -> Result<BlobNetworkReport, String> {
     let wire_len = completed_pack_wire_len(root, open)?;
     if wire_len != expected_pack_wire_len(open.total_len())? {
@@ -227,7 +285,10 @@ pub async fn send_completed_pack(
         .checkpoint(checkpoint)
         .map_err(|error| error.to_string())?;
     checkpoints += 1;
-    let StreamAction::Send(finish) = state.finish().map_err(|error| error.to_string())? else {
+    let StreamAction::Send(finish) = state
+        .finish(semantic_commitment)
+        .map_err(|error| error.to_string())?
+    else {
         return Err("sender did not produce finish".into());
     };
     attempt
@@ -242,16 +303,22 @@ pub async fn send_completed_pack(
     let StreamFrame::Result(result) = decoded(&result)? else {
         return Err("terminal control frame was not result".into());
     };
-    if result.code != StreamResultCode::Promoted
-        || result.result_digest != result_digest(open, roots)
+    if !matches!(
+        result.code,
+        StreamResultCode::Promoted | StreamResultCode::AlreadyPresent
+    ) || result.result_digest != result_digest(open, roots)
     {
         return Err("receiver result did not bind the expected Blob roots".into());
     }
-    let (StreamAction::Send(ack), StreamAction::Terminal(StreamResultCode::Promoted)) =
+    let expected_result = result.code;
+    let (StreamAction::Send(ack), StreamAction::Terminal(settled)) =
         state.result(result).map_err(|error| error.to_string())?
     else {
         return Err("sender settlement action differed".into());
     };
+    if settled != expected_result {
+        return Err("sender settled a different result code".into());
+    }
     attempt
         .send_data(&encoded(ack)?)
         .await
@@ -336,23 +403,27 @@ impl RecordParser {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct DurableProgress {
     wire_offset: u64,
-    generation: u64,
+    checkpoint: BlobPackCheckpoint,
 }
 
 async fn send_durable_checkpoint(
     attempt: &std::sync::Arc<dyn crate::stream_transport::StreamReceiveAttempt>,
     state: &mut StreamReceiverState,
-    progress: DurableProgress,
+    progress: &DurableProgress,
     wire_len: u64,
     current_limit: &mut u64,
 ) -> Result<(), String> {
     let window = u64::from(MAX_STREAM_CHECKPOINT_BATCH_BYTES) + MAX_RECORD_BYTES as u64;
     let new_limit = wire_len.min((*current_limit).max(progress.wire_offset.saturating_add(window)));
     let StreamAction::Send(checkpoint) = state
-        .persisted(progress.wire_offset, progress.generation, new_limit)
+        .persisted(
+            progress.wire_offset,
+            progress.checkpoint.generation(),
+            new_limit,
+        )
         .map_err(|error| error.to_string())?
     else {
         return Err("receiver did not produce checkpoint".into());
@@ -372,6 +443,39 @@ pub async fn receive_completed_pack(
     root: &Path,
     wire_len: u64,
     limits: PipelineLimits,
+) -> Result<BlobNetworkReport, String> {
+    receive_completed_pack_inner(connection, open, opener, root, wire_len, limits, None).await
+}
+
+pub async fn receive_completed_pack_with_store(
+    connection: Connection,
+    session: BlobReceiveStoreSession,
+    opener: BlobStreamSegmentOpener,
+    root: &Path,
+    wire_len: u64,
+    limits: PipelineLimits,
+) -> Result<BlobNetworkReport, String> {
+    let open = session.open.open().clone();
+    receive_completed_pack_inner(
+        connection,
+        &open,
+        opener,
+        root,
+        wire_len,
+        limits,
+        Some(session),
+    )
+    .await
+}
+
+async fn receive_completed_pack_inner(
+    connection: Connection,
+    open: &BlobStreamOpen,
+    opener: BlobStreamSegmentOpener,
+    root: &Path,
+    wire_len: u64,
+    limits: PipelineLimits,
+    store_session: Option<BlobReceiveStoreSession>,
 ) -> Result<BlobNetworkReport, String> {
     let (max_data_bytes, max_control_bytes) = attempt_bounds(wire_len)?;
     let attempt = IrohQuicV1Adapter::new(connection)
@@ -397,6 +501,10 @@ pub async fn receive_completed_pack(
     {
         return Err("transport open differs from authenticated Blob open".into());
     }
+    let mut store_state = store_session
+        .as_ref()
+        .map(BlobReceiveStoreSession::reserve)
+        .transpose()?;
     let window = u64::from(MAX_STREAM_CHECKPOINT_BATCH_BYTES) + MAX_RECORD_BYTES as u64;
     let mut current_limit = wire_len.min(window);
     let mut state =
@@ -466,7 +574,7 @@ pub async fn receive_completed_pack(
                             durable_tx
                                 .send(DurableProgress {
                                     wire_offset: wire_end,
-                                    generation: checkpoint.generation(),
+                                    checkpoint,
                                 })
                                 .map_err(|_| {
                                     PipelineError::SinkFailed("checkpoint consumer closed".into())
@@ -513,8 +621,27 @@ pub async fn receive_completed_pack(
                 .recv()
                 .await
                 .ok_or("verification pipeline closed before checkpoint")?;
-            send_durable_checkpoint(&attempt, &mut state, progress, wire_len, &mut current_limit)
-                .await?;
+            if let (Some(session), Some((reservation, resume))) =
+                (store_session.as_ref(), store_state.as_mut())
+            {
+                *resume = session
+                    .store
+                    .checkpoint_blob_stream(
+                        &session.policy,
+                        reservation,
+                        *resume,
+                        progress.checkpoint.clone(),
+                    )
+                    .map_err(|error| failure("project durable checkpoint", error))?;
+            }
+            send_durable_checkpoint(
+                &attempt,
+                &mut state,
+                &progress,
+                wire_len,
+                &mut current_limit,
+            )
+            .await?;
             durable_wire = progress.wire_offset;
             checkpoints += 1;
         }
@@ -533,12 +660,30 @@ pub async fn receive_completed_pack(
     let StreamFrame::Finish(finish) = decoded(&finish)? else {
         return Err("terminal data frame was not finish".into());
     };
+    let semantic_commitment = finish.semantic_commitment.clone();
     let StreamAction::Promote = state.finish(finish).map_err(|error| error.to_string())? else {
         return Err("receiver did not reach promotion".into());
     };
+    let result_code = if let (Some(session), Some((reservation, _))) =
+        (store_session.as_ref(), store_state.as_ref())
+    {
+        let commitment = (session.verify_commitment)(&session.open, &semantic_commitment)
+            .map_err(|error| failure("verify final commitment", error))?;
+        let promotion = session
+            .store
+            .promote_blob_stream_with_policy(&session.policy, reservation, &commitment)
+            .map_err(|error| failure("promote stream", error))?;
+        if promotion.duplicate() {
+            StreamResultCode::AlreadyPresent
+        } else {
+            StreamResultCode::Promoted
+        }
+    } else {
+        StreamResultCode::Promoted
+    };
     let digest = result_digest(open, roots);
     let StreamAction::Send(result) = state
-        .promoted(StreamResultCode::Promoted, digest)
+        .promoted(result_code, digest)
         .map_err(|error| error.to_string())?
     else {
         return Err("receiver did not produce result".into());
@@ -555,12 +700,15 @@ pub async fn receive_completed_pack(
     let StreamFrame::ResultAck(ack) = decoded(&ack)? else {
         return Err("settlement frame was not result acknowledgement".into());
     };
-    let StreamAction::Terminal(StreamResultCode::Promoted) = state
-        .result_ack(ack, StreamResultCode::Promoted)
+    let StreamAction::Terminal(settled) = state
+        .result_ack(ack, result_code)
         .map_err(|error| error.to_string())?
     else {
         return Err("receiver settlement action differed".into());
     };
+    if settled != result_code {
+        return Err("receiver settled a different result code".into());
+    }
     attempt
         .finish_control()
         .await
@@ -579,12 +727,17 @@ mod tests {
     use crate::{application::blob_stream::publish_blob_stream, stream_pipeline::PipelineLimits};
     use aster_iroh::{CarrierSecurityProfile, Endpoint, EndpointConfig, ExpectedPeer, SecretKey};
     use aster_mesh::{
-        BLOB_STREAM_SEGMENT_BYTES, BlobMetadata, BlobPublicationStreamId, BlobStreamOpen,
-        BlobStreamSegmentOpener, BlobStreamSegmentSealer, Priority, Scope, Topic, VersionVector,
+        BLOB_STREAM_SEGMENT_BYTES, BlobMetadata, BlobPublicationStreamId,
+        BlobStreamFinalCommitment, BlobStreamOpen, BlobStreamSegmentOpener,
+        BlobStreamSegmentSealer, Priority, ProvisioningAccess, ReferenceEnvelopeSealer,
+        ReferenceProvisioner, Scope, Topic, VersionVector,
     };
     use std::{
         collections::BTreeSet,
-        sync::atomic::{AtomicU64, Ordering},
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        },
     };
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -720,9 +873,15 @@ mod tests {
             })
             .await
             .expect("connect");
-        let sent = send_completed_pack(connection, &open, &source_root.0, roots)
-            .await
-            .expect("send");
+        let sent = send_completed_pack(
+            connection,
+            &open,
+            &source_root.0,
+            roots,
+            open.digest().to_vec(),
+        )
+        .await
+        .expect("send");
         let received = receiver.await.expect("receiver task");
 
         assert_eq!(sent.roots, roots);
@@ -738,6 +897,152 @@ mod tests {
                 .completed_items(),
             published.segment_count
         );
+        client.close().await;
+        server.close().await;
+    }
+
+    #[tokio::test]
+    async fn receiver_projects_pack_checkpoints_and_promotes_through_store() {
+        let source_root = TempRoot::new("store-source");
+        let receiver_root = TempRoot::new("store-receiver");
+        let total_len = 2 * BLOB_STREAM_SEGMENT_BYTES + 17;
+        let topic = Topic::new("imagery").unwrap();
+        let scope = Scope::new("mission/alpha").unwrap();
+        let access =
+            ProvisioningAccess::member(scope.clone(), vec![1], vec![topic.clone()]).unwrap();
+        let mut provisioner = ReferenceProvisioner::from_seed([0x84; 32]).unwrap();
+        let provider = Arc::new(
+            ReferenceEnvelopeSealer::open(
+                provisioner.issue_control_authority(1, &[access]).unwrap(),
+            )
+            .unwrap(),
+        );
+        let open = BlobStreamOpen::new(
+            BlobPublicationStreamId::from_bytes([0x85; 32]).unwrap(),
+            provider.identity(),
+            b"network-store-session".to_vec(),
+            provider.mission_authority_id(),
+            1,
+            VersionVector::default(),
+            topic,
+            scope.clone(),
+            BlobMetadata::new(Some("application/octet-stream".into()), Vec::new()).unwrap(),
+            Priority::Immediate,
+            None,
+            None,
+            total_len as u64,
+            1,
+            1,
+            provider
+                .blob_stream_authorization_digest(&scope, 1)
+                .unwrap(),
+            [0x86; 32],
+        )
+        .unwrap();
+        let signed_open = provider.seal_blob_stream_open(&open).unwrap();
+        let verified_open = provider.verify_blob_stream_open(&signed_open).unwrap();
+        let limits = PipelineLimits::new(2, 4, 5 * 1024 * 1024, 4).unwrap();
+        let published = publish_blob_stream(
+            std::io::Cursor::new(vec![0x5d; total_len]),
+            verified_open.open(),
+            provider.blob_stream_segment_sealer(&verified_open).unwrap(),
+            &source_root.0,
+            limits,
+        )
+        .await
+        .unwrap();
+        let roots = (published.plaintext_root, published.ciphertext_root);
+        let commitment = BlobStreamFinalCommitment::new(
+            &verified_open,
+            roots.0,
+            roots.1,
+            published.segment_count,
+            None,
+        )
+        .unwrap();
+        let signed_commitment = provider.seal_blob_stream_commitment(&commitment).unwrap();
+        let wire_len = completed_pack_wire_len(&source_root.0, verified_open.open()).unwrap();
+        let store = Arc::new(
+            Store::open_for_mission(
+                receiver_root.0.join("state.redb"),
+                provider.mission_authority_id(),
+            )
+            .unwrap(),
+        );
+        let policy = store.control_policy_snapshot().unwrap();
+        let verifier = {
+            let provider = Arc::clone(&provider);
+            Arc::new(move |open: &VerifiedBlobStreamOpen, bytes: &[u8]| {
+                provider
+                    .verify_blob_stream_commitment(open, bytes)
+                    .map_err(|error| error.to_string())
+            }) as BlobCommitmentVerifier
+        };
+        let session = BlobReceiveStoreSession::new(
+            Arc::clone(&store),
+            policy,
+            verified_open.clone(),
+            provider.identity(),
+            verifier,
+        )
+        .unwrap();
+
+        let config = EndpointConfig::direct("127.0.0.1:0".parse().unwrap());
+        let server = Endpoint::bind_with_security_profile(
+            SecretKey::generate(),
+            config,
+            CarrierSecurityProfile::IrohQuicV1,
+        )
+        .await
+        .unwrap();
+        let client = Endpoint::bind_with_security_profile(
+            SecretKey::generate(),
+            config,
+            CarrierSecurityProfile::IrohQuicV1,
+        )
+        .await
+        .unwrap();
+        let address = server
+            .bound_sockets()
+            .into_iter()
+            .find(std::net::SocketAddr::is_ipv4)
+            .unwrap();
+        let receiver = tokio::spawn({
+            let server = server.clone();
+            let allowed = BTreeSet::from([client.id()]);
+            let root = receiver_root.0.join("pack");
+            let opener = provider.blob_stream_segment_opener(&verified_open).unwrap();
+            async move {
+                let connection = server.accept(&allowed).await.unwrap();
+                receive_completed_pack_with_store(
+                    connection, session, opener, &root, wire_len, limits,
+                )
+                .await
+            }
+        });
+        let connection = client
+            .connect(ExpectedPeer {
+                id: server.id(),
+                address,
+            })
+            .await
+            .unwrap();
+        let sent = send_completed_pack(
+            connection,
+            verified_open.open(),
+            &source_root.0,
+            roots,
+            signed_commitment,
+        )
+        .await
+        .unwrap();
+        let received = receiver.await.unwrap().unwrap();
+
+        assert_eq!(sent.roots, roots);
+        assert_eq!(received.roots, roots);
+        let publications = store.blob_stream_publications_with_policy(&policy).unwrap();
+        assert_eq!(publications.len(), 1);
+        assert_eq!(publications[0].blob_id(), commitment.blob_id());
         client.close().await;
         server.close().await;
     }

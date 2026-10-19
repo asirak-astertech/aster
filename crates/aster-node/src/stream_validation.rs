@@ -16,7 +16,9 @@ use sha2::{Digest, Sha256};
 use std::time::{Duration, Instant as StdInstant};
 use tokio::time::Instant;
 
-pub use crate::runtime::blob_stream::BlobNetworkReport;
+pub use crate::runtime::blob_stream::{
+    BlobCommitmentVerifier, BlobNetworkReport, BlobReceiveStoreSession,
+};
 use aster_mesh::{BlobStreamOpen, BlobStreamSegmentOpener};
 use std::path::Path;
 
@@ -33,8 +35,16 @@ pub async fn send_completed_pack(
     open: &BlobStreamOpen,
     root: &Path,
     roots: ([u8; 32], [u8; 32]),
+    semantic_commitment: Vec<u8>,
 ) -> Result<BlobNetworkReport, String> {
-    crate::runtime::blob_stream::send_completed_pack(connection, open, root, roots).await
+    crate::runtime::blob_stream::send_completed_pack(
+        connection,
+        open,
+        root,
+        roots,
+        semantic_commitment,
+    )
+    .await
 }
 
 pub async fn receive_completed_pack(
@@ -47,6 +57,20 @@ pub async fn receive_completed_pack(
 ) -> Result<BlobNetworkReport, String> {
     crate::runtime::blob_stream::receive_completed_pack(
         connection, open, opener, root, wire_len, limits,
+    )
+    .await
+}
+
+pub async fn receive_completed_pack_with_store(
+    connection: Connection,
+    session: BlobReceiveStoreSession,
+    opener: BlobStreamSegmentOpener,
+    root: &Path,
+    wire_len: u64,
+    limits: crate::stream_pipeline::PipelineLimits,
+) -> Result<BlobNetworkReport, String> {
+    crate::runtime::blob_stream::receive_completed_pack_with_store(
+        connection, session, opener, root, wire_len, limits,
     )
     .await
 }
@@ -198,7 +222,10 @@ pub async fn send(connection: Connection, bytes: u64) -> Result<StreamValidation
         .checkpoint(final_checkpoint)
         .map_err(|error| error.to_string())?;
     checkpoints += 1;
-    let StreamAction::Send(finish) = state.finish().map_err(|error| error.to_string())? else {
+    let StreamAction::Send(finish) = state
+        .finish(hasher.clone().finalize().to_vec())
+        .map_err(|error| error.to_string())?
+    else {
         return Err("sender did not produce finish".into());
     };
     attempt
