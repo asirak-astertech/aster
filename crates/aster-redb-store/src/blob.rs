@@ -17,6 +17,7 @@ pub(crate) mod lifecycle;
 pub mod pack;
 #[allow(dead_code)]
 pub(crate) mod pressure;
+pub mod stream;
 
 pub use lifecycle::{
     BlobLifecycleLimits, BlobMaintenanceBudget, BlobMaintenanceCandidate, BlobMaintenanceClass,
@@ -78,6 +79,10 @@ pub(crate) const BLOB_NETWORK_METADATA: TableDefinition<&str, u64> =
 // both ordinary semantic quotas and the network byte/row staging partition.
 pub(crate) const BLOB_CARRIER_FETCH_CURSORS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.blob-carrier-fetch-cursors.v1");
+pub(crate) const BLOB_STREAM_RESERVATIONS: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("aster.blob-stream-reservations.v2");
+pub(crate) const BLOB_STREAM_OPERATIONS: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("aster.blob-stream-operations.v2");
 
 pub(crate) const BLOB_ITEM_COUNT: &str = "semantic_blob_item_count";
 pub(crate) const BLOB_TOTAL_BYTES: &str = "semantic_blob_total_bytes";
@@ -14795,9 +14800,10 @@ pub(crate) fn blob_schema_present_write(
     write: &redb::WriteTransaction,
 ) -> Result<bool, StoreError> {
     let tables = blob_table_names();
+    let stream_tables = stream_blob_table_names();
     if write
         .list_multimap_tables()?
-        .any(|table| tables.contains(&table.name()))
+        .any(|table| tables.contains(&table.name()) || stream_tables.contains(&table.name()))
     {
         return Err(blob_error(BlobStoreError::SchemaInvariant(
             "mission-scoped Blob schema has the wrong table kind",
@@ -14817,6 +14823,10 @@ pub(crate) fn blob_schema_present_write(
         .iter()
         .filter(|table| existing.contains(**table))
         .count();
+    let stream_present = stream_tables
+        .iter()
+        .filter(|table| existing.contains(**table))
+        .count();
     let metadata = write.open_table(METADATA)?;
     let global = blob_global_metadata_fields();
     let global_present = global
@@ -14824,7 +14834,10 @@ pub(crate) fn blob_schema_present_write(
         .map(|field| metadata.get(*field).map(|value| value.is_some()))
         .collect::<Result<Vec<_>, _>>()?;
     drop(metadata);
-    if legacy_present == 0 && network_present == 0 && global_present.iter().all(|present| !present)
+    if legacy_present == 0
+        && network_present == 0
+        && stream_present == 0
+        && global_present.iter().all(|present| !present)
     {
         lifecycle::require_blob_lifecycle_absent_write(write)?;
         deletion::require_blob_deletion_absent_write(write)?;
@@ -14832,6 +14845,7 @@ pub(crate) fn blob_schema_present_write(
     }
     if legacy_present != legacy.len()
         || !matches!(network_present, 0 | 4)
+        || !matches!(stream_present, 0 | 2)
         || global_present.iter().any(|present| !present)
     {
         return Err(blob_error(BlobStoreError::SchemaInvariant(
@@ -14840,6 +14854,9 @@ pub(crate) fn blob_schema_present_write(
     }
     if network_present == 0 {
         initialize_blob_network_schema(write)?;
+    }
+    if stream_present == 0 {
+        initialize_blob_stream_schema(write)?;
     }
     Ok(true)
 }
@@ -15332,6 +15349,7 @@ pub(crate) fn audit_blob_tables_write(
     stats.carrier_prefixes = network.carrier_prefixes;
     stats.network_staging_bytes = network.staging.bytes;
     stats.carrier_fetch_cursors = network.carrier_cursors;
+    stream::audit_blob_stream_tables_write(write, read_mission_binding(write)?)?;
     let mut metadata = write.open_table(METADATA)?;
     audit_or_initialize_counter(&mut metadata, BLOB_ITEM_COUNT, stats.publications)?;
     audit_or_initialize_counter(&mut metadata, BLOB_TOTAL_BYTES, stats.total_sealed_bytes)?;
@@ -16018,6 +16036,13 @@ fn initialize_blob_schema(write: &redb::WriteTransaction) -> Result<(), StoreErr
         metadata.insert(field, 0)?;
     }
     initialize_blob_network_schema(write)?;
+    initialize_blob_stream_schema(write)?;
+    Ok(())
+}
+
+fn initialize_blob_stream_schema(write: &redb::WriteTransaction) -> Result<(), StoreError> {
+    let _ = write.open_table(BLOB_STREAM_RESERVATIONS)?;
+    let _ = write.open_table(BLOB_STREAM_OPERATIONS)?;
     Ok(())
 }
 
@@ -16057,6 +16082,13 @@ fn network_blob_table_names() -> [&'static str; 4] {
         BLOB_CARRIER_PREFIXES.name(),
         BLOB_NETWORK_METADATA.name(),
         BLOB_CARRIER_FETCH_CURSORS.name(),
+    ]
+}
+
+fn stream_blob_table_names() -> [&'static str; 2] {
+    [
+        BLOB_STREAM_RESERVATIONS.name(),
+        BLOB_STREAM_OPERATIONS.name(),
     ]
 }
 

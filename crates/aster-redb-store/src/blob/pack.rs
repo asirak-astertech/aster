@@ -77,7 +77,19 @@ impl BlobPackCheckpoint {
         &self.frontier
     }
 
-    fn encode(&self) -> Vec<u8> {
+    pub const fn open_digest(&self) -> &[u8; 32] {
+        &self.open_digest
+    }
+
+    pub const fn stream_id(&self) -> BlobPublicationStreamId {
+        self.stream_id
+    }
+
+    pub const fn total_len(&self) -> u64 {
+        self.total_len
+    }
+
+    pub(crate) fn encode(&self) -> Vec<u8> {
         let frontier = self.frontier.encode();
         let mut out = Vec::with_capacity(150 + frontier.len());
         out.extend_from_slice(CHECKPOINT_MAGIC);
@@ -96,7 +108,7 @@ impl BlobPackCheckpoint {
         out
     }
 
-    fn decode(bytes: &[u8]) -> Result<Self, BlobPackError> {
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, BlobPackError> {
         let minimum = 8 + 2 + 8 + 32 + 32 + 8 * 4 + 4 + 32;
         if bytes.len() < minimum || &bytes[..8] != CHECKPOINT_MAGIC {
             return Err(BlobPackError::Invalid("invalid Blob pack checkpoint"));
