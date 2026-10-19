@@ -167,6 +167,53 @@ Both roles reported the same roots as the resumed run. The receiver pack was 1,0
 
 All temporary binaries, secret test bundles, public Opens, source scratch, and receiver states created for this follow-up were removed from all three CM4s after evidence collection. No installed service or existing Aster state was changed.
 
+## Application RPC integration and exact 1 GiB CM4 validation
+
+The application-facing protocol was then changed from a whole-operation RPC to
+bidirectional `Metadata -> Accepted -> Data(offset) -> Checkpoint -> Finish ->
+Complete` streaming. The node writes the same independently authenticated
+1-MiB segments directly into the store-owned pack, and `ReadBlob` opens those
+pack records without decrypt/repackage/re-encrypt staging. The application
+protocol now has an explicit 8-GiB object ceiling, 512-KiB RPC frames, a
+64-MiB durable checkpoint batch, and a two-partition ordered crypto map stage.
+Blob CLI operations automatically request the bounded 15-minute attempt window;
+ordinary RPCs retain their 10-second default.
+
+The final ARM64 test artifact was 17,985,400 bytes with SHA-256
+`99351b9b834158f6b2e9fa3da1ecb1abe4d268bd2f2948d3ffcb095468f03727`.
+It was copied over the existing ZeroTier management path with 900-byte
+acknowledged datagrams because large SCP payloads stalled; the hash was checked
+on every device before execution. Aster data remained local loopback for this
+application-boundary isolation test. No network configuration or installed
+service was changed.
+
+All three CM4s published exactly 1 GiB of deterministic bytes, received 16
+monotonic durable checkpoints, then streamed and verified every byte through
+the public read RPC:
+
+| Device | Publish seconds | Publish MiB/s | Read seconds | Read MiB/s | Total seconds | Result |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| `rpi4-1` | 107.989960 | 9.482 | 93.253104 | 10.981 | 201.48 | pass |
+| `rpi4-2` | 106.673215 | 9.599 | 89.956990 | 11.383 | 196.89 | pass |
+| `rpi4-3` | 105.027791 | 9.750 | 90.271161 | 11.344 | 195.56 | pass |
+
+During steady-state mapping the processes used about 1.68–1.71 CPU cores and
+56–64 MiB RSS. The CM4 CPU flags contain no AES or SHA extensions, so the two
+independent segment workers are material rather than redundant. Relative to
+the original application integration on the same devices (5.24–5.42 MiB/s
+publish and 4.52–4.68 MiB/s read), the final minimum rates improved by 80.9%
+for publish and 134.5% for read. Both final paths are faster than the retained
+8.737-MiB/s raw WLAN baseline, so transport—not application serialization,
+durability, or crypto—is the slower stage for the validated route. The earlier
+1.5-MiB/s application result is improved by at least 6.3x.
+
+Focused evidence also covers exact completed-operation replay, restart from the
+store-authoritative 64-MiB checkpoint frontier, TTL reauthorization between
+read pages, legacy-page bounds, CLI frame validation, and the 8-GiB protocol
+admission boundary. The full local workspace suite was intentionally not run
+because prior attempts were killed by the host OS; focused tests and CI evidence
+remain the selected verification boundary.
+
 ## Qualification boundary
 
 This evidence establishes that:
@@ -175,6 +222,9 @@ This evidence establishes that:
 - the semantic-v9 transport state machine carries 1 GiB at approximately the raw WLAN rate; and
 - the composed encrypted-pack receiver remains transport-limited while authenticating, ordering, checkpointing, and settling 1 GiB; and
 - receiver lifecycle promotion and process-restart resume use the store-authoritative checkpoint without replaying the durable prefix; and
+- the public application Blob stream publishes and reads an exact 1 GiB on all three CM4s above the retained raw WLAN rate with bounded memory; and
 - the previous 1.5 MiB/s serial processing path is no longer the limiting design.
 
-It does not yet qualify production deployment. Application RPC integration, three-device fused-path fairness after the rpi4-3 connectivity issue is resolved, and CI/full-matrix evidence remain open.
+It does not yet qualify production deployment. Three-device fused-path fairness
+after the rpi4-3 connectivity issue is resolved and CI/full-matrix evidence
+remain open.
