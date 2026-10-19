@@ -15099,7 +15099,20 @@ impl BlobRetirementWake {
         self.timer.is_some()
     }
 
-    async fn elapsed(&mut self) {
+    async fn elapsed(
+        &mut self,
+        #[cfg(all(test, unix))] control: Option<&BlobRetirementDeadlineTestControl>,
+    ) {
+        #[cfg(all(test, unix))]
+        if let Some(control) = control {
+            // A persistent watch value remains open across select cancellation.
+            // Only handling is gated: the real Tokio timer keeps running.
+            let mut allowed = control.handling_allowed.clone();
+            allowed
+                .wait_for(|allowed| *allowed)
+                .await
+                .expect("deadline handling gate remains live");
+        }
         self.timer
             .as_mut()
             .expect("guarded Blob retirement wake")
@@ -15926,6 +15939,14 @@ struct BlobMaintenanceTestGate {
     worker_constructed: Arc<AtomicBool>,
     worker_reached: Option<mpsc::UnboundedSender<()>>,
     worker_release: Option<Arc<tokio::sync::Notify>>,
+    retirement_deadline: Option<BlobRetirementDeadlineTestControl>,
+}
+
+#[cfg(all(test, unix))]
+#[derive(Clone)]
+struct BlobRetirementDeadlineTestControl {
+    handling_allowed: tokio::sync::watch::Receiver<bool>,
+    hold_queued_application: bool,
 }
 
 #[cfg(all(test, unix))]
@@ -15938,6 +15959,10 @@ struct BlobMaintenanceTestBlockGate {
 #[cfg(all(test, unix))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BlobMaintenanceScheduleObservation {
+    DeadlineDeferred {
+        queued_application: bool,
+        blob_outstanding: usize,
+    },
     Deferred {
         queued_application: bool,
         blob_outstanding: usize,
@@ -17095,6 +17120,15 @@ async fn run_node_actor_inner(
 
     let mut ticker = tokio::time::interval(config.sync_interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    #[cfg(all(test, unix))]
+    if blob_maintenance_gate
+        .as_ref()
+        .is_some_and(|gate| gate.retirement_deadline.is_some())
+    {
+        // Deadline tests isolate the real retirement wake from the interval's
+        // immediate startup tick. Its next tick remains a full interval away.
+        ticker.tick().await;
+    }
     let stop = async move {
         if interrupt_seen {
             return;
@@ -17137,9 +17171,13 @@ async fn run_node_actor_inner(
     let mut blob_maintenance_priority_deferred = false;
     let mut blob_retirement_deadline_retry_pending = false;
     #[cfg(all(test, unix))]
-    let mut application_receive_held_for_maintenance_test = blob_maintenance_gate
-        .as_ref()
-        .is_some_and(BlobMaintenanceTestGate::observes_schedule);
+    let mut application_receive_held_for_maintenance_test =
+        blob_maintenance_gate.as_ref().is_some_and(|gate| {
+            gate.retirement_deadline.as_ref().map_or_else(
+                || gate.observes_schedule(),
+                |control| control.hold_queued_application,
+            )
+        });
     #[cfg(not(all(test, unix)))]
     let application_receive_held_for_maintenance_test = false;
     let mut event_contact_wake = EventContactWakeState::default();
@@ -17619,7 +17657,10 @@ async fn run_node_actor_inner(
                     control_yield_required = true;
                 }
             }
-            _ = blob_retirement_wake.elapsed(),
+            _ = blob_retirement_wake.elapsed(
+                #[cfg(all(test, unix))]
+                blob_maintenance_gate.as_ref().and_then(|gate| gate.retirement_deadline.as_ref()),
+            ),
                 if blob_retirement_wake.is_armed() && !application_tick_pending => {
                 blob_retirement_wake.clear();
                 blob_retirement_deadline_retry_pending = true;
@@ -17728,6 +17769,11 @@ async fn run_node_actor_inner(
                 if let Some(gate) = blob_maintenance_gate.as_ref() {
                     if start_blob_maintenance {
                         gate.observe_schedule(BlobMaintenanceScheduleObservation::Started);
+                    } else if blob_retirement_deadline_retry_pending {
+                        gate.observe_schedule(BlobMaintenanceScheduleObservation::DeadlineDeferred {
+                            queued_application,
+                            blob_outstanding,
+                        });
                     } else if application_receive_held_for_maintenance_test {
                         gate.observe_schedule(BlobMaintenanceScheduleObservation::Deferred {
                             queued_application,
@@ -31860,11 +31906,26 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn blob_retirement_deadline_wakes_before_sync_and_reschedules_after_reopen() {
-        // Break caught: periodic-only maintenance performs its immediate first
-        // turn, then leaves due retained evidence stranded until the much
-        // longer synchronization interval elapses.
-        let state = root("blob-retirement-deadline-wake");
+    async fn blob_retirement_deadline_defers_to_queued_request_and_resumes() {
+        assert_blob_retirement_deadline_priority(true).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blob_retirement_deadline_defers_to_worker_and_resumes() {
+        assert_blob_retirement_deadline_priority(false).await;
+    }
+
+    #[cfg(unix)]
+    async fn assert_blob_retirement_deadline_priority(queued_request: bool) {
+        // Break caught: cleanup must defer to this exact operational state,
+        // then resume from the real retirement deadline rather than leaving
+        // retained evidence until the much longer synchronization interval.
+        let state = root(if queued_request {
+            "blob-retirement-deadline-queued"
+        } else {
+            "blob-retirement-deadline-worker"
+        });
         fs::create_dir_all(&state).expect("retirement deadline state");
         let services = control_test_services([0xd8; 32]);
         let mut member = open_test_sealer(&services.member);
@@ -31969,12 +32030,6 @@ mod tests {
         let (application_sender, application_receiver) =
             mpsc::channel(APPLICATION_COMMAND_CAPACITY);
         let application_admission = Arc::new(AtomicBool::new(true));
-        let selected = SelectedBlobHandle::new(
-            application_sender.clone(),
-            application_admission.clone(),
-            services.member.identity(),
-            services.member.mission_authority_id(),
-        );
         let (_control_sender, control_receiver) = mpsc::channel(CONTROL_COMMAND_CAPACITY);
         let (shutdown_sender, shutdown_receiver) = mpsc::channel(1);
         let (ready_sender, ready_receiver) = oneshot::channel();
@@ -31986,6 +32041,7 @@ mod tests {
         let (schedule_sender, mut schedule_receiver) = mpsc::unbounded_channel();
         let (worker_reached_sender, mut worker_reached_receiver) = mpsc::unbounded_channel();
         let worker_release = Arc::new(tokio::sync::Notify::new());
+        let (deadline_release, deadline_allowed) = tokio::sync::watch::channel(false);
         let actor = tokio::spawn(run_node_actor_inner(
             NodeConfig {
                 state: state.clone(),
@@ -32036,6 +32092,10 @@ mod tests {
                         worker_constructed: Arc::new(AtomicBool::new(false)),
                         worker_reached: Some(worker_reached_sender),
                         worker_release: Some(worker_release.clone()),
+                        retirement_deadline: Some(BlobRetirementDeadlineTestControl {
+                            handling_allowed: deadline_allowed,
+                            hold_queued_application: queued_request,
+                        }),
                     }),
                     blob_final_read_gate: None,
                     event_group_execution_gate: None,
@@ -32056,68 +32116,76 @@ mod tests {
             ),
         }
         before_loop_reached.await.expect("deadline actor loop gate");
-        let operation_topic = services.topic.clone();
-        let operation_scope = services.scope.clone();
-        let mut blob_operation = tokio::spawn(async move {
-            selected
-                .subscribe(BlobSubscriptionRequest {
-                    operation_key: b"deadline-operational-priority".to_vec(),
-                    topic: operation_topic,
-                    scope: operation_scope,
-                    include_descendant_scopes: false,
-                })
-                .await
-        });
-        // Keep the actor gated until the request is actually queued. Spawning
-        // the caller alone does not order it ahead of an already-due timer.
-        timeout(Duration::from_secs(10), async {
-            while application_sender.capacity() == APPLICATION_COMMAND_CAPACITY {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("deadline Blob request queued before actor release");
-        // The injected clock starts at most 40 ms before the deadline. Make
-        // that wake due while still gated, exercising pre-dispatch deferral
-        // regardless of how quickly the test runner schedules the actor.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        let (response, blob_operation) = oneshot::channel();
+        // Awaiting send is the enqueue handshake. The actor is still at its
+        // loop gate, so it cannot consume this request before send completes.
+        application_sender
+            .send(SelectedApplicationCommand::Blob(
+                SelectedBlobCommand::Subscribe {
+                    request: BlobSubscriptionRequest {
+                        operation_key: b"deadline-operational-priority".to_vec(),
+                        topic: services.topic.clone(),
+                        scope: services.scope.clone(),
+                        include_descendant_scopes: false,
+                    },
+                    response,
+                },
+            ))
+            .await
+            .unwrap_or_else(|_| panic!("enqueue deadline Blob request"));
         before_loop_release
             .send(())
             .expect("release deadline actor loop");
-        timeout(Duration::from_secs(10), worker_reached_receiver.recv())
-            .await
-            .expect("deadline Blob worker permit deadline")
-            .expect("deadline Blob worker permit observation");
-        timeout(Duration::from_secs(2), async {
+        if !queued_request {
+            timeout(Duration::from_secs(10), worker_reached_receiver.recv())
+                .await
+                .expect("deadline Blob worker permit deadline")
+                .expect("deadline Blob worker permit observation");
+        }
+        // Queued case: receiving is held until the scheduling decision.
+        // Worker case: the worker has signaled that it holds its permit and
+        // remains blocked. Let the real deadline be handled in that state.
+        deadline_release
+            .send(true)
+            .expect("allow deadline handling");
+        let observation = timeout(Duration::from_secs(10), async {
             loop {
                 let observation = schedule_receiver
                     .recv()
                     .await
                     .expect("deadline maintenance schedule observation");
-                if matches!(
-                    observation,
-                    // A wake may defer before dispatch or while the worker
-                    // holds the request. Both give operational work priority.
-                    BlobMaintenanceScheduleObservation::Deferred {
-                        queued_application: true,
-                        ..
-                    } | BlobMaintenanceScheduleObservation::Deferred {
-                        blob_outstanding: 1,
-                        ..
+                match observation {
+                    BlobMaintenanceScheduleObservation::Deferred { .. } => {}
+                    BlobMaintenanceScheduleObservation::DeadlineDeferred { .. } => {
+                        break observation;
                     }
-                ) {
-                    break;
+                    BlobMaintenanceScheduleObservation::Started => {
+                        panic!("cleanup started before the deadline deferral");
+                    }
                 }
             }
         })
         .await
-        .expect("deadline wake must defer to the queued Blob request");
+        .expect("real deadline must defer before the 60-second sync interval");
+        assert_eq!(
+            observation,
+            BlobMaintenanceScheduleObservation::DeadlineDeferred {
+                queued_application: queued_request,
+                blob_outstanding: usize::from(!queued_request),
+            }
+        );
         assert_eq!(starts.load(Ordering::Acquire), 0);
+        if queued_request {
+            timeout(Duration::from_secs(10), worker_reached_receiver.recv())
+                .await
+                .expect("deferred queued request dispatch deadline")
+                .expect("deferred queued request reaches worker");
+        }
         worker_release.notify_one();
-        timeout(Duration::from_secs(10), &mut blob_operation)
+        timeout(Duration::from_secs(10), blob_operation)
             .await
             .expect("deadline Blob operation response deadline")
-            .expect("deadline Blob operation task")
+            .expect("deadline Blob operation response channel")
             .expect("deadline Blob operation succeeds");
 
         timeout(Duration::from_secs(2), async {
@@ -32215,6 +32283,7 @@ mod tests {
             worker_constructed: worker_constructed.clone(),
             worker_reached: None,
             worker_release: None,
+            retirement_deadline: None,
         };
         let actor = tokio::spawn(run_node_actor_inner(
             NodeConfig {
@@ -32352,6 +32421,7 @@ mod tests {
                         worker_constructed: Arc::new(AtomicBool::new(false)),
                         worker_reached: Some(worker_reached_sender),
                         worker_release: Some(worker_release.clone()),
+                        retirement_deadline: None,
                     }),
                     blob_final_read_gate: None,
                     event_group_execution_gate: None,
