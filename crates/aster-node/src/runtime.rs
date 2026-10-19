@@ -105,6 +105,7 @@ mod blob_progress_test;
 pub(crate) mod blob_ranges_stream;
 #[cfg(test)]
 mod blob_ranges_stream_test;
+pub(crate) mod blob_stream;
 #[cfg(test)]
 #[path = "runtime/convergence_test.rs"]
 mod convergence_test;

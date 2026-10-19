@@ -70,6 +70,9 @@ impl BlobPackCheckpoint {
     pub const fn pack_len(&self) -> u64 {
         self.pack_len
     }
+    pub const fn payload_len(&self) -> u64 {
+        self.pack_len - PACK_HEADER_LEN
+    }
     pub const fn frontier(&self) -> &BlobStreamCheckpoint {
         &self.frontier
     }

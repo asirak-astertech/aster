@@ -12,6 +12,8 @@ use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
 pub const BLOB_STREAM_SEGMENT_BYTES: usize = 1024 * 1024;
+pub const BLOB_STREAM_SEGMENT_ENCODED_OVERHEAD_BYTES: usize =
+    8 + 2 + 32 + 32 + 8 + 8 + 8 + 8 + 4 + 4 + 16;
 const FRONTIER_LEVELS: usize = 64;
 const BLOB_STREAM_FORMAT_VERSION: u16 = 2;
 const BLOB_STREAM_PACK_FORMAT_VERSION: u16 = 2;
@@ -559,7 +561,7 @@ pub struct EncryptedBlobStreamSegment {
 }
 
 impl EncryptedBlobStreamSegment {
-    const FIXED_ENCODED_BYTES: usize = 8 + 2 + 32 + 32 + 8 + 8 + 8 + 8 + 4 + 4;
+    const FIXED_ENCODED_BYTES: usize = BLOB_STREAM_SEGMENT_ENCODED_OVERHEAD_BYTES - 16;
 
     pub fn index(&self) -> u64 {
         self.index

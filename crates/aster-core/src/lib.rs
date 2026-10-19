@@ -168,10 +168,11 @@ pub use blob_custody_v2::{
 };
 #[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
 pub use blob_stream::{
-    BLOB_STREAM_SEGMENT_BYTES, BlobPublicationStreamId, BlobStreamCheckpoint,
-    BlobStreamFinalCommitment, BlobStreamFrontier, BlobStreamOpen, BlobStreamPlainPartition,
-    BlobStreamSegmentLeaves, BlobStreamSegmentOpener, BlobStreamSegmentSealer, BlobStreamSubtree,
-    EncryptedBlobStreamSegment, VerifiedBlobStreamFinalCommitment, VerifiedBlobStreamOpen,
+    BLOB_STREAM_SEGMENT_BYTES, BLOB_STREAM_SEGMENT_ENCODED_OVERHEAD_BYTES, BlobPublicationStreamId,
+    BlobStreamCheckpoint, BlobStreamFinalCommitment, BlobStreamFrontier, BlobStreamOpen,
+    BlobStreamPlainPartition, BlobStreamSegmentLeaves, BlobStreamSegmentOpener,
+    BlobStreamSegmentSealer, BlobStreamSubtree, EncryptedBlobStreamSegment,
+    VerifiedBlobStreamFinalCommitment, VerifiedBlobStreamOpen,
 };
 #[cfg(feature = "reference-session")]
 pub use bridge_adapter::{

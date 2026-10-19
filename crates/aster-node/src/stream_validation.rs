@@ -16,6 +16,41 @@ use sha2::{Digest, Sha256};
 use std::time::{Duration, Instant as StdInstant};
 use tokio::time::Instant;
 
+pub use crate::runtime::blob_stream::BlobNetworkReport;
+use aster_mesh::{BlobStreamOpen, BlobStreamSegmentOpener};
+use std::path::Path;
+
+pub fn completed_pack_wire_len(root: &Path, open: &BlobStreamOpen) -> Result<u64, String> {
+    crate::runtime::blob_stream::completed_pack_wire_len(root, open)
+}
+
+pub fn expected_pack_wire_len(plaintext_len: u64) -> Result<u64, String> {
+    crate::runtime::blob_stream::expected_pack_wire_len(plaintext_len)
+}
+
+pub async fn send_completed_pack(
+    connection: Connection,
+    open: &BlobStreamOpen,
+    root: &Path,
+    roots: ([u8; 32], [u8; 32]),
+) -> Result<BlobNetworkReport, String> {
+    crate::runtime::blob_stream::send_completed_pack(connection, open, root, roots).await
+}
+
+pub async fn receive_completed_pack(
+    connection: Connection,
+    open: &BlobStreamOpen,
+    opener: BlobStreamSegmentOpener,
+    root: &Path,
+    wire_len: u64,
+    limits: crate::stream_pipeline::PipelineLimits,
+) -> Result<BlobNetworkReport, String> {
+    crate::runtime::blob_stream::receive_completed_pack(
+        connection, open, opener, root, wire_len, limits,
+    )
+    .await
+}
+
 const EXTENT_BYTES: usize = 256 * 1024;
 const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 

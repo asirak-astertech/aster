@@ -3,11 +3,12 @@ use std::{
     error::Error,
     fmt::{self, Display, Formatter},
     future::Future,
+    pin::Pin,
     sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::{
-    sync::{OwnedSemaphorePermit, Semaphore},
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc},
     task::JoinSet,
 };
 
@@ -104,6 +105,10 @@ impl PipelineLimits {
             max_in_flight_bytes,
             max_reorder_items,
         })
+    }
+
+    pub const fn max_in_flight_items(&self) -> usize {
+        self.max_in_flight_items
     }
 }
 
@@ -202,15 +207,118 @@ fn add_observation(
         .saturating_add(elapsed.as_nanos().min(u128::from(u64::MAX)) as u64);
 }
 
+enum PartitionSourcePoll {
+    Ready(Result<Option<StreamPartition>, PipelineError>),
+    Pending,
+}
+
+trait PartitionSource {
+    fn try_next_partition(&mut self) -> PartitionSourcePoll;
+
+    fn next_partition(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<StreamPartition>, PipelineError>> + Send + '_>>;
+}
+
+struct IteratorPartitionSource<I> {
+    iterator: I,
+}
+
+impl<I> PartitionSource for IteratorPartitionSource<I>
+where
+    I: Iterator<Item = StreamPartition>,
+{
+    fn try_next_partition(&mut self) -> PartitionSourcePoll {
+        PartitionSourcePoll::Ready(Ok(self.iterator.next()))
+    }
+
+    fn next_partition(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<StreamPartition>, PipelineError>> + Send + '_>>
+    {
+        Box::pin(std::future::ready(Ok(self.iterator.next())))
+    }
+}
+
+struct ChannelPartitionSource {
+    receiver: mpsc::Receiver<Result<StreamPartition, PipelineError>>,
+}
+
+impl PartitionSource for ChannelPartitionSource {
+    fn try_next_partition(&mut self) -> PartitionSourcePoll {
+        match self.receiver.try_recv() {
+            Ok(partition) => PartitionSourcePoll::Ready(partition.map(Some)),
+            Err(mpsc::error::TryRecvError::Empty) => PartitionSourcePoll::Pending,
+            Err(mpsc::error::TryRecvError::Disconnected) => PartitionSourcePoll::Ready(Ok(None)),
+        }
+    }
+
+    fn next_partition(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<StreamPartition>, PipelineError>> + Send + '_>>
+    {
+        Box::pin(async move { self.receiver.recv().await.transpose() })
+    }
+}
+
 pub async fn run_ordered_pipeline<I, T, Map, Sink, SinkFuture>(
     job_id: StreamJobId,
     partitions: I,
     limits: PipelineLimits,
     map: Map,
-    mut sink: Sink,
+    sink: Sink,
 ) -> Result<PipelineReport, PipelineError>
 where
     I: IntoIterator<Item = StreamPartition>,
+    T: Send + 'static,
+    Map: Fn(StreamPartition) -> Result<T, PipelineError> + Send + Sync + 'static,
+    Sink: FnMut(MappedPartition<T>) -> SinkFuture,
+    SinkFuture: Future<Output = Result<(), PipelineError>>,
+{
+    run_ordered_pipeline_source(
+        job_id,
+        IteratorPartitionSource {
+            iterator: partitions.into_iter(),
+        },
+        limits,
+        map,
+        sink,
+    )
+    .await
+}
+
+pub async fn run_ordered_channel_pipeline<T, Map, Sink, SinkFuture>(
+    job_id: StreamJobId,
+    receiver: mpsc::Receiver<Result<StreamPartition, PipelineError>>,
+    limits: PipelineLimits,
+    map: Map,
+    sink: Sink,
+) -> Result<PipelineReport, PipelineError>
+where
+    T: Send + 'static,
+    Map: Fn(StreamPartition) -> Result<T, PipelineError> + Send + Sync + 'static,
+    Sink: FnMut(MappedPartition<T>) -> SinkFuture,
+    SinkFuture: Future<Output = Result<(), PipelineError>>,
+{
+    run_ordered_pipeline_source(
+        job_id,
+        ChannelPartitionSource { receiver },
+        limits,
+        map,
+        sink,
+    )
+    .await
+}
+
+async fn run_ordered_pipeline_source<Source, T, Map, Sink, SinkFuture>(
+    job_id: StreamJobId,
+    mut source: Source,
+    limits: PipelineLimits,
+    map: Map,
+    mut sink: Sink,
+) -> Result<PipelineReport, PipelineError>
+where
+    Source: PartitionSource,
     T: Send + 'static,
     Map: Fn(StreamPartition) -> Result<T, PipelineError> + Send + Sync + 'static,
     Sink: FnMut(MappedPartition<T>) -> SinkFuture,
@@ -228,14 +336,35 @@ where
     let mut peak_items = 0_usize;
     let mut peak_bytes = 0_usize;
     let mut peak_reorder = 0_usize;
-    let mut iterator = partitions.into_iter().peekable();
+    let mut next_partition = None;
+    let mut source_done = false;
 
     loop {
         while jobs.len() < limits.workers
             && jobs.len() + reorder.len() < limits.max_in_flight_items
             && jobs.len() + reorder.len() < limits.max_reorder_items
         {
-            let Some(next) = iterator.peek() else { break };
+            if next_partition.is_none() && !source_done {
+                let next = if jobs.is_empty() && reorder.is_empty() {
+                    source.next_partition().await
+                } else {
+                    match source.try_next_partition() {
+                        PartitionSourcePoll::Ready(next) => next,
+                        PartitionSourcePoll::Pending => break,
+                    }
+                };
+                match next {
+                    Ok(Some(partition)) => next_partition = Some(partition),
+                    Ok(None) => source_done = true,
+                    Err(error) => {
+                        abort_and_join(&mut jobs).await;
+                        return Err(error);
+                    }
+                }
+            }
+            let Some(next) = next_partition.as_ref() else {
+                break;
+            };
             if next.len() > limits.max_in_flight_bytes {
                 jobs.abort_all();
                 return Err(PipelineError::PartitionTooLarge);
@@ -243,9 +372,7 @@ where
             if next.len() > byte_budget.available_permits() {
                 break;
             }
-            let Some(partition) = iterator.next() else {
-                break;
-            };
+            let partition = next_partition.take().expect("buffered partition");
             let index = partition.index;
             if partition.is_empty() {
                 jobs.abort_all();
@@ -298,7 +425,7 @@ where
         }
 
         if jobs.is_empty() {
-            if iterator.peek().is_none() && reorder.is_empty() {
+            if source_done && next_partition.is_none() && reorder.is_empty() {
                 break;
             }
             if let Some(pending) = reorder.remove(&next_index) {
@@ -389,6 +516,74 @@ where
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn pipeline_accepts_async_partitions_and_preserves_order() {
+        let (sender, receiver) = tokio::sync::mpsc::channel(2);
+        let producer = tokio::spawn(async move {
+            for index in 0..8 {
+                sender
+                    .send(Ok(StreamPartition::new(index, vec![index as u8; 32])))
+                    .await
+                    .expect("pipeline remains open");
+            }
+        });
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let sink_observed = Arc::clone(&observed);
+        let report = run_ordered_channel_pipeline(
+            StreamJobId::from_bytes([6; 16]),
+            receiver,
+            PipelineLimits::new(4, 4, 128, 4).expect("limits"),
+            |partition| {
+                if partition.index() == 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Ok(partition.into_bytes())
+            },
+            move |mapped| {
+                sink_observed
+                    .lock()
+                    .expect("sink lock")
+                    .push(mapped.index());
+                std::future::ready(Ok(()))
+            },
+        )
+        .await
+        .expect("pipeline");
+        producer.await.expect("producer");
+
+        assert_eq!(
+            *observed.lock().expect("observed lock"),
+            (0..8).collect::<Vec<_>>()
+        );
+        assert_eq!(report.completed_items(), 8);
+        assert!(report.peak_in_flight_bytes() <= 128);
+    }
+
+    #[tokio::test]
+    async fn pipeline_propagates_async_source_failure_after_drain() {
+        let (sender, receiver) = tokio::sync::mpsc::channel(2);
+        sender
+            .send(Ok(StreamPartition::new(0, vec![0; 16])))
+            .await
+            .expect("partition");
+        sender
+            .send(Err(PipelineError::MapFailed("source".into())))
+            .await
+            .expect("failure");
+        drop(sender);
+
+        let result = run_ordered_channel_pipeline(
+            StreamJobId::from_bytes([5; 16]),
+            receiver,
+            PipelineLimits::new(1, 1, 16, 1).expect("limits"),
+            |partition| Ok(partition.into_bytes()),
+            |_| std::future::ready(Ok(())),
+        )
+        .await;
+
+        assert!(matches!(result, Err(PipelineError::MapFailed(message)) if message == "source"));
+    }
 
     #[tokio::test]
     async fn pipeline_reorders_shuffled_worker_results() {
