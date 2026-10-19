@@ -1734,33 +1734,40 @@ async fn numbered_sdk_recovers_its_committed_result_across_restart() {
         )
         .unwrap();
         sdk.recover().await.unwrap();
-        let sequences: Vec<_> = (0_u8..17)
-            .map(|suffix| {
-                sdk.journal_publication(api::PublishNumberedEventRequest {
-                    topic: "chat.events".to_owned(),
-                    scope: "mission/team/alpha".to_owned(),
-                    priority: api::Priority::Routine.into(),
-                    logical_key: vec![suffix],
-                    payload: vec![suffix],
-                    ..Default::default()
-                })
-                .unwrap()
-            })
-            .collect();
-        let results = sdk
-            .publish_journaled_pipeline(&sequences, 1)
-            .await
-            .expect("numbered native pipeline");
-        assert_eq!(
-            results
+        let suffixes: Vec<_> = (0_u8..17).collect();
+        let mut all_sequences = Vec::new();
+        for batch in suffixes.chunks(aster_agent::sdk::MAX_PUBLICATION_JOURNAL_ENTRIES) {
+            let sequences: Vec<_> = batch
                 .iter()
-                .map(|result| result.operation_sequence)
-                .collect::<Vec<_>>(),
-            sequences
-        );
-        for sequence in sequences {
-            sdk.acknowledge(sequence).await.unwrap();
+                .map(|&suffix| {
+                    sdk.journal_publication(api::PublishNumberedEventRequest {
+                        topic: "chat.events".to_owned(),
+                        scope: "mission/team/alpha".to_owned(),
+                        priority: api::Priority::Routine.into(),
+                        logical_key: vec![suffix],
+                        payload: vec![suffix],
+                        ..Default::default()
+                    })
+                    .unwrap()
+                })
+                .collect();
+            let results = sdk
+                .publish_journaled_pipeline(&sequences, 1)
+                .await
+                .expect("numbered native pipeline");
+            assert_eq!(
+                results
+                    .iter()
+                    .map(|result| result.operation_sequence)
+                    .collect::<Vec<_>>(),
+                sequences
+            );
+            for &sequence in &sequences {
+                sdk.acknowledge(sequence).await.unwrap();
+            }
+            all_sequences.extend(sequences);
         }
+        assert_eq!(all_sequences, (1..=17).collect::<Vec<u64>>());
         drop(sdk);
         let reopened = NumberedEventSdk::open(
             api::AsterApplicationServiceClient::new(HttpClient::plaintext(), config()),

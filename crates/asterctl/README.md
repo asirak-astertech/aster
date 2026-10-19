@@ -170,7 +170,12 @@ with Ctrl-D on an empty line, or cancel with Ctrl-C. Piped input, an explicit
 bytes are preserved, including NUL bytes and newlines from stdin; no newline is
 added to `MSG`. Use `--` before a message beginning with `-`. The complete
 encoded request, including space for the largest session and sequence fields,
-must fit within 1 MiB.
+must fit within 1 MiB. The journal-backed CLI additionally limits the payload
+to 65,536 bytes, matching the Rust and Go publication journals. Each journal
+retains at most eight entries within a 1 MiB logical serialized-state budget,
+including metadata and reserved result/recovery space. Apply committed results
+idempotently and use `publication-ack` to free journal capacity. The journal
+budget does not cap the physical database file size.
 
 Fresh publish JSON contains the numbered `result` and the service's transient
 `inserted` observation. Recovery/retry JSON contains the retained committed

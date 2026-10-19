@@ -206,6 +206,22 @@ another user, or group/other permissions. Existing journals with broader
 permissions must be restricted by their owner before opening. On other
 platforms, protect access through the directory and file ACLs.
 
+The Rust SDK retains at most **eight entries** and charges a **1 MiB logical
+serialized-state budget** across metadata, entry keys, intents, and saved
+results. Admission reserves 1,024 serialized bytes per result plus worst-case
+recovery-claim and counter metadata, so a full journal can still save current
+receipts, retire content, and recover. Event payloads are limited to 65,536
+bytes, matching the Go journal. These are local journal bounds; the independent
+eight-request network window limits only concurrent transmission. The byte
+budget does not cap redb's physical file size or allocator overhead.
+
+Checks run inside each journal write transaction. A rejected publication does
+not consume a sequence or change retained state. Pending intents and committed
+results awaiting acknowledgement both occupy slots; acknowledgement or
+confirmed abandonment/removal frees capacity. Opening rejects an existing
+journal above these limits without discarding its retained state. Preserve an
+incompatible journal for diagnosis rather than deleting or recreating it.
+
 Opening a missing, corrupt,
 already-open, or differently configured journal fails closed. Call `recover`
 once per SDK process incarnation before assigning work; transport reconnects

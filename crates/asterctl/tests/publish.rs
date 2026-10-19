@@ -343,26 +343,25 @@ fn invalid_publication_arguments_fail_before_rpc_or_stdin() {
 }
 
 #[test]
-fn publication_limit_includes_metadata_and_payload() {
-    let max = 1024 * 1024;
-    let template = api::PublishNumberedEventRequest {
-        client_id: b"asterctl-test".to_vec(),
-        session: u64::MAX,
-        operation_sequence: u64::MAX,
-        topic: "x".to_owned(),
-        scope: "x".to_owned(),
-        priority: api::Priority::Routine.into(),
-        payload: vec![42; max],
-        ..Default::default()
-    };
-    let overhead = template.encoded_len() as usize - max;
-    let payload = vec![42; max - overhead];
-    let args = ["publish", "--topic", "x", "--scope", "x"];
+fn publication_payload_limit_matches_sdk_and_rejects_before_contact() {
+    let max = aster_agent::sdk::MAX_PUBLICATION_JOURNAL_PAYLOAD_BYTES;
+    let payload = vec![42; max];
+    let logical_key = "x".repeat(4096);
+    let args = [
+        "publish",
+        "--topic",
+        "x",
+        "--scope",
+        "x",
+        "--logical-key",
+        &logical_key,
+    ];
     let (request, _) = publish(&args, Some(&payload), receipt(true, None));
     assert_eq!(request.payload, payload);
+    assert_eq!(request.logical_key, logical_key.as_bytes());
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
-    for length in [payload.len() + 1, 1024 * 1024 + 1] {
+    for length in [max + 1, 1024 * 1024 + 1] {
         let output = run(
             listener.local_addr().unwrap().port(),
             &args,
@@ -370,7 +369,7 @@ fn publication_limit_includes_metadata_and_payload() {
         );
         assert_eq!(output.status.code(), Some(1));
         assert!(output.stdout.is_empty());
-        assert!(String::from_utf8_lossy(&output.stderr).contains("1 MiB"));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("65536 bytes"));
         assert!(matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
     }
 }

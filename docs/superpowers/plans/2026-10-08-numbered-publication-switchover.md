@@ -248,3 +248,40 @@ and requirement evidence boundaries remain intact. The October 19 `mise run chec
 checkout: formatting, schemas, requirements trace (348 baseline IDs and 140
 exact selected mappings), retained receipts, policy, tool regressions, and
 dependency boundaries. The replacement merge signature also verifies locally.
+
+## 2026-10-19 Rust SDK journal bounds (P1)
+
+Bounded SDK maintenance now limits each Rust publication journal to eight
+retained entries and a 1 MiB logical serialized-state budget. Pending intents
+and committed results awaiting acknowledgement both occupy slots. Accounting
+includes metadata and entry keys, serialized intents/results, a 1,024-byte
+result reserve per row, and worst-case claim/counter metadata. Every mutation
+checks the complete post-update image inside the redb write transaction;
+capacity rejection preserves the sequence frontier and retained rows.
+Acknowledgement and confirmed removal reclaim capacity. Opening checks the
+same limits before marking recovery incomplete, and individual JSON
+encoding/decoding and recovery snapshots have bounded sizes. The logical
+budget does not cap redb's physical file size or allocator overhead.
+
+The SDK and CLI reject payloads above 65,536 bytes, matching the Go journal.
+CLI preflight rejects oversized stdin before contacting the agent or assigning
+an operation. Its complete encoded-request guard remains 1 MiB. The real
+Connect/gRPC integration test sends the same 17 operations in retained batches
+of eight, eight, and one, acknowledging each batch before assigning the next.
+The independent eight-request network window and server/wire semantics retain
+their existing boundaries.
+
+Validation passed on macOS: 32 focused SDK tests, 11 CLI publication tests,
+the real-agent restart/pipeline test, and `mise run check` in full. The complete
+gate passed strict workspace Clippy, 2,161 workspace tests (two platform skips),
+documentation, real playground/hello sessions, Go journal restart/exact-retry/
+conflict/acknowledgement/bounded-load checks, bindings, conformance, 203 lab
+tests, and generated-client reproduction. Seven supported codec fuzz targets
+passed 10,000 runs each; the systemd admin/backup targets require Linux. SDK
+journal and CLI boundaries are covered by deterministic regressions, including
+exact-cap/cap-plus-one admission, concurrent last-slot admission, sequence/row
+preservation, full-budget receipt/recovery/retirement, acknowledgement reuse,
+and oversized saved metadata, rows, payloads, and entry counts.
+
+This maintenance adds no requirement status, retained target observation,
+physical performance, Linux deployment, or production qualification credit.

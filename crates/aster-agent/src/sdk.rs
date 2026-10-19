@@ -12,7 +12,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use connectrpc::client::{ClientTransport, UnaryResponse};
-use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{
+    Database, Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::proto::aster::application::v1alpha1 as api;
@@ -24,6 +26,16 @@ const JOURNAL_ENTRIES: TableDefinition<u64, &[u8]> =
 const STATE_KEY: &str = "state";
 const JOURNAL_VERSION: u32 = 1;
 const CLAIM_NONCE_BYTES: usize = 32;
+/// Maximum retained intents, including committed results awaiting acknowledgement.
+pub const MAX_PUBLICATION_JOURNAL_ENTRIES: usize = 8;
+/// Logical serialized journal budget, including metadata and recovery/result reserves.
+/// This does not bound redb's physical pages, allocator overhead, or file size.
+pub const MAX_PUBLICATION_JOURNAL_BYTES: usize = 1 << 20;
+/// Maximum Event payload retained by the Rust and Go publication journals.
+pub const MAX_PUBLICATION_JOURNAL_PAYLOAD_BYTES: usize = 65_536;
+// Each row reserves this much serialized result space before any publication RPC.
+// Current fixed-size receipts and both retirement reasons fit within this bound.
+const JOURNAL_RESULT_RESERVE_BYTES: usize = 1_024;
 const PIPELINED_PUBLICATION_WINDOW: usize = 8;
 const PIPELINED_PUBLICATION_SESSION: Duration = Duration::from_secs(8);
 
@@ -503,6 +515,7 @@ impl PublicationJournal {
                 .map_err(|error| journal_error(&self.path, "open entries", error))?;
             update(&mut state, &mut entries)?;
             let encoded = encode_json(&state)?;
+            check_journal_limits(&state, encoded.len(), &entries, &self.path)?;
             meta.insert(STATE_KEY, encoded.as_slice())
                 .map_err(|error| journal_error(&self.path, "write metadata", error))?;
         }
@@ -534,6 +547,14 @@ impl PublicationJournal {
         let table = read
             .open_table(JOURNAL_ENTRIES)
             .map_err(|error| journal_error(&self.path, "open entries", error))?;
+        let meta = read
+            .open_table(JOURNAL_META)
+            .map_err(|error| journal_error(&self.path, "open metadata", error))?;
+        let encoded_state = meta
+            .get(STATE_KEY)
+            .map_err(|error| journal_error(&self.path, "get metadata", error))?
+            .ok_or_else(|| NumberedEventSdkError::Journal("metadata is missing".to_owned()))?;
+        check_journal_limits(state, encoded_state.value().len(), &table, &self.path)?;
         let iter = table
             .iter()
             .map_err(|error| journal_error(&self.path, "iterate entries", error))?;
@@ -685,6 +706,9 @@ where
             })
             .await?
             .into_owned();
+        if response.outstanding.len() > MAX_PUBLICATION_JOURNAL_ENTRIES {
+            return Err(journal_capacity_error());
+        }
         if claim.expected_session.checked_add(1) != Some(response.session)
             || response.allocated_through < state.allocated_through
             || response.snapshot_revision == 0
@@ -894,6 +918,14 @@ where
         let mut assigned = 0;
         self.journal.write(|state, entries| {
             require_recovered(state)?;
+            validate_journal_intent(&intent)?;
+            if entries
+                .len()
+                .map_err(|error| journal_error(self.journal.path(), "count entries", error))?
+                >= MAX_PUBLICATION_JOURNAL_ENTRIES as u64
+            {
+                return Err(journal_capacity_error());
+            }
             assigned = state.next_sequence.ok_or_else(|| {
                 NumberedEventSdkError::Protocol("operation sequence exhausted".to_owned())
             })?;
@@ -901,7 +933,7 @@ where
             intent.session = state.session;
             intent.operation_sequence = assigned;
             let entry = JournalEntry {
-                intent: intent.clone(),
+                intent,
                 result: None,
                 abandoned: false,
             };
@@ -941,6 +973,9 @@ where
     {
         let state = self.journal.read_state()?;
         require_recovered(&state)?;
+        if sequences.len() > MAX_PUBLICATION_JOURNAL_ENTRIES {
+            return Err(journal_capacity_error());
+        }
         let mut requests = Vec::with_capacity(sequences.len());
         let mut expected = state.allocated_through.checked_add(1);
         for &sequence in sequences {
@@ -1283,12 +1318,121 @@ fn validate_client_id(client_id: &[u8]) -> Result<()> {
     Ok(())
 }
 
+fn journal_capacity_error() -> NumberedEventSdkError {
+    NumberedEventSdkError::Journal(
+        "journal capacity exceeded: at most eight retained entries and 1 MiB including recovery and result reserves".to_owned(),
+    )
+}
+
+fn validate_journal_intent(intent: &api::PublishNumberedEventRequest) -> Result<()> {
+    if intent.payload.len() > MAX_PUBLICATION_JOURNAL_PAYLOAD_BYTES {
+        return Err(NumberedEventSdkError::Journal(
+            "publication payload exceeds the journal's 65536-byte limit".to_owned(),
+        ));
+    }
+    // Bound individual caller-owned fields before serialization (including any
+    // temporary base64 allocation). Complete serialized accounting follows in
+    // the same transaction; protocol admission still belongs to the agent.
+    if intent.topic.len() > MAX_PUBLICATION_JOURNAL_BYTES
+        || intent.scope.len() > MAX_PUBLICATION_JOURNAL_BYTES
+        || intent.logical_key.len() > MAX_PUBLICATION_JOURNAL_BYTES
+        || intent
+            .predecessor_id
+            .as_ref()
+            .is_some_and(|id| id.len() > MAX_PUBLICATION_JOURNAL_BYTES)
+    {
+        return Err(journal_capacity_error());
+    }
+    Ok(())
+}
+
+fn reserved_metadata_bytes(state: &JournalState) -> Result<usize> {
+    let mut reserved = state.clone();
+    reserved.session = u64::MAX;
+    reserved.allocated_through = u64::MAX;
+    reserved.snapshot_revision = u64::MAX;
+    reserved.next_sequence = Some(u64::MAX);
+    reserved.recovery_complete = false;
+    reserved.pending_claim = Some(PendingClaim {
+        expected_session: u64::MAX,
+        nonce: vec![u8::MAX; CLAIM_NONCE_BYTES],
+    });
+    Ok(encode_json(&reserved)?.len())
+}
+
+fn check_journal_limits(
+    state: &JournalState,
+    metadata_bytes: usize,
+    entries: &impl ReadableTable<u64, &'static [u8]>,
+    path: &Path,
+) -> Result<()> {
+    // Check the stored count before iterating or decoding an existing journal.
+    if entries
+        .len()
+        .map_err(|error| journal_error(path, "count entries", error))?
+        > MAX_PUBLICATION_JOURNAL_ENTRIES as u64
+    {
+        return Err(journal_capacity_error());
+    }
+    let mut charged = metadata_bytes.max(reserved_metadata_bytes(state)?) + STATE_KEY.len();
+    if charged > MAX_PUBLICATION_JOURNAL_BYTES {
+        return Err(journal_capacity_error());
+    }
+    for row in entries
+        .iter()
+        .map_err(|error| journal_error(path, "measure entries", error))?
+    {
+        let (_, value) = row.map_err(|error| journal_error(path, "measure entry", error))?;
+        let encoded = value.value();
+        let entry: JournalEntry = decode_json(encoded, "entry")?;
+        validate_journal_intent(&entry.intent)?;
+        let result_bytes = match &entry.result {
+            Some(result) => encode_json(result)?.len(),
+            None => 4, // The serialized `null` replaced by a returned result.
+        };
+        let reserve = JOURNAL_RESULT_RESERVE_BYTES
+            .checked_sub(result_bytes)
+            .ok_or_else(journal_capacity_error)?;
+        charged = charged
+            .checked_add(size_of::<u64>())
+            .and_then(|bytes| bytes.checked_add(encoded.len()))
+            .and_then(|bytes| bytes.checked_add(reserve))
+            .ok_or_else(journal_capacity_error)?;
+        if charged > MAX_PUBLICATION_JOURNAL_BYTES {
+            return Err(journal_capacity_error());
+        }
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct BoundedJournalEncoding(Vec<u8>);
+
+impl std::io::Write for BoundedJournalEncoding {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > MAX_PUBLICATION_JOURNAL_BYTES - self.0.len() {
+            return Err(std::io::Error::other("journal encoding exceeds 1 MiB"));
+        }
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 fn encode_json(value: &impl Serialize) -> Result<Vec<u8>> {
-    serde_json::to_vec(value)
-        .map_err(|error| NumberedEventSdkError::Journal(format!("encode state: {error}")))
+    let mut encoded = BoundedJournalEncoding::default();
+    serde_json::to_writer(&mut encoded, value)
+        .map_err(|error| NumberedEventSdkError::Journal(format!("encode state: {error}")))?;
+    Ok(encoded.0)
 }
 
 fn decode_json<T: for<'de> Deserialize<'de>>(bytes: &[u8], name: &str) -> Result<T> {
+    if bytes.len() > MAX_PUBLICATION_JOURNAL_BYTES {
+        return Err(journal_capacity_error());
+    }
     serde_json::from_slice(bytes).map_err(|error| {
         NumberedEventSdkError::Journal(format!("decode {name}; journal is corrupt: {error}"))
     })
@@ -1439,6 +1583,311 @@ mod tests {
         api::PublishNumberedEventRequest {
             payload: b"secret payload".to_vec(),
             ..Default::default()
+        }
+    }
+
+    fn bounded_sdk(name: &str, steps: Vec<Step>) -> (PathBuf, NumberedEventSdk<ScriptedTransport>) {
+        let path = journal_path(name);
+        PublicationJournal::initialize(&path, b"client").unwrap();
+        let (_, client) = scripted(steps);
+        let sdk = NumberedEventSdk::open(client, &path, b"client").unwrap();
+        sdk.journal
+            .update_state(|state| {
+                state.session = 1;
+                state.snapshot_revision = 1;
+                state.recovery_complete = true;
+                Ok(())
+            })
+            .unwrap();
+        (path, sdk)
+    }
+
+    fn journal_image(journal: &PublicationJournal) -> (Vec<u8>, Vec<(u64, Vec<u8>)>) {
+        let read = journal.database.begin_read().unwrap();
+        let meta = read.open_table(JOURNAL_META).unwrap();
+        let state = meta.get(STATE_KEY).unwrap().unwrap().value().to_vec();
+        let entries = read.open_table(JOURNAL_ENTRIES).unwrap();
+        let rows = entries
+            .iter()
+            .unwrap()
+            .map(|row| {
+                let (key, value) = row.unwrap();
+                (key.value(), value.value().to_vec())
+            })
+            .collect();
+        (state, rows)
+    }
+
+    #[tokio::test]
+    async fn journal_entry_limit_preserves_sequences_and_acknowledgement_frees_capacity() {
+        let (path, sdk) = bounded_sdk(
+            "entry-budget",
+            vec![
+                step(
+                    "/PublishNumberedEvent",
+                    api::PublishNumberedEventResponse {
+                        result: result(1).into(),
+                        ..Default::default()
+                    },
+                ),
+                step(
+                    "/AcknowledgeEventPublicationResult",
+                    api::AcknowledgeEventPublicationResultResponse::default(),
+                ),
+            ],
+        );
+        for sequence in 1..=8 {
+            assert_eq!(sdk.journal_publication(intent()).unwrap(), sequence);
+        }
+        let before = journal_image(&sdk.journal);
+        let error = sdk.journal_publication(intent()).unwrap_err();
+        assert!(error.to_string().contains("journal capacity exceeded"));
+        assert_eq!(journal_image(&sdk.journal), before);
+        sdk.publish_journaled(1).await.unwrap();
+        assert!(
+            sdk.journal_publication(intent()).is_err(),
+            "saved results still retain a slot"
+        );
+        sdk.acknowledge(1).await.unwrap();
+        assert_eq!(sdk.journal_publication(intent()).unwrap(), 9);
+        drop(sdk);
+        let (_, client) = scripted(vec![begin_revision(2, 1, 2, vec![]), complete()]);
+        let sdk = NumberedEventSdk::open(client, &path, b"client").unwrap();
+        let report = sdk.recover().await.unwrap();
+        assert_eq!(report.operations.len(), 8);
+        assert_eq!(report.operations.first().unwrap().sequence, 2);
+        assert_eq!(report.operations.last().unwrap().sequence, 9);
+        let before = journal_image(&sdk.journal);
+        assert!(sdk.journal_publication(intent()).is_err());
+        assert_eq!(journal_image(&sdk.journal), before);
+        drop(sdk);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn concurrent_publications_cannot_claim_the_same_last_journal_slot() {
+        let (path, sdk) = bounded_sdk("concurrent-entry-budget", vec![]);
+        for _ in 0..7 {
+            sdk.journal_publication(intent()).unwrap();
+        }
+        let outcomes = std::thread::scope(|scope| {
+            let first = scope.spawn(|| sdk.journal_publication(intent()));
+            let second = scope.spawn(|| sdk.journal_publication(intent()));
+            [first.join().unwrap(), second.join().unwrap()]
+        });
+        assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+        assert_eq!(outcomes.into_iter().find_map(Result::ok), Some(8));
+        assert_eq!(sdk.journal.read_state().unwrap().next_sequence, Some(9));
+        assert_eq!(journal_image(&sdk.journal).1.len(), 8);
+        drop(sdk);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn journal_byte_budget_reserves_results_and_recovery_and_reuses_acknowledged_space() {
+        let mut available = result(1);
+        available.receipt.as_option_mut().unwrap().acceptance_marker = u64::MAX;
+        let mut retired = available.clone();
+        retired.content = api::CommittedContentStatus::Retired.into();
+        retired.retirement_reason = Some(api::RetirementReason::QuotaPressure.into());
+        let (path, sdk) = bounded_sdk("byte-budget", vec![]);
+        // Size a boundary fixture with a valid-size payload and large metadata.
+        // Agent admission of that metadata is separate from local journal capacity.
+        let state = sdk.journal.read_state().unwrap();
+        let mut publication = intent();
+        publication.client_id = b"client".to_vec();
+        publication.session = 1;
+        publication.operation_sequence = 1;
+        publication.topic = "x".to_owned();
+        let row = JournalEntry {
+            intent: publication.clone(),
+            result: None,
+            abandoned: false,
+        };
+        let charged = reserved_metadata_bytes(&state).unwrap()
+            + STATE_KEY.len()
+            + size_of::<u64>()
+            + serde_json::to_vec(&row).unwrap().len()
+            + JOURNAL_RESULT_RESERVE_BYTES
+            - 4;
+        publication
+            .topic
+            .push_str(&"x".repeat(MAX_PUBLICATION_JOURNAL_BYTES - charged));
+        let mut over = publication.clone();
+        over.topic.push('x');
+        let before = journal_image(&sdk.journal);
+        assert!(
+            sdk.journal_publication(over).is_err(),
+            "cap plus one includes reserves"
+        );
+        assert_eq!(journal_image(&sdk.journal), before);
+        assert_eq!(
+            sdk.journal_publication(publication).unwrap(),
+            1,
+            "exact cap is accepted"
+        );
+        let before = journal_image(&sdk.journal);
+        assert!(sdk.journal_publication(intent()).is_err());
+        assert_eq!(journal_image(&sdk.journal), before);
+        sdk.save_publication_result(1, &available).unwrap();
+        drop(sdk);
+        let (_, client) = scripted(vec![
+            begin_revision(2, 1, u64::MAX, vec![retired.clone()]),
+            complete(),
+            step(
+                "/AcknowledgeEventPublicationResult",
+                api::AcknowledgeEventPublicationResultResponse::default(),
+            ),
+        ]);
+        let sdk = NumberedEventSdk::open(client, &path, b"client").unwrap();
+        let report = sdk.recover().await.unwrap();
+        assert_eq!(
+            report.operations[0].state,
+            RecoveredState::Committed(retired)
+        );
+        let before = journal_image(&sdk.journal);
+        assert!(sdk.journal_publication(intent()).is_err());
+        assert_eq!(journal_image(&sdk.journal), before);
+        sdk.acknowledge(1).await.unwrap();
+        assert_eq!(sdk.journal_publication(intent()).unwrap(), 2);
+        drop(sdk);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_payload_and_oversized_encoding_are_rejected_before_assignment() {
+        let (path, sdk) = bounded_sdk("payload-budget", vec![]);
+        let before = journal_image(&sdk.journal);
+        let mut publication = intent();
+        publication.payload = vec![0xff; MAX_PUBLICATION_JOURNAL_PAYLOAD_BYTES + 1];
+        let error = sdk.publish(publication).await.unwrap_err();
+        assert!(matches!(error, PublicationError::BeforeAssignment(_)));
+        assert_eq!(journal_image(&sdk.journal), before);
+        let mut publication = intent();
+        publication.payload = vec![0xff; MAX_PUBLICATION_JOURNAL_PAYLOAD_BYTES];
+        assert_eq!(sdk.journal_publication(publication).unwrap(), 1);
+        let before = journal_image(&sdk.journal);
+        let mut publication = intent();
+        publication.topic = "x".repeat(MAX_PUBLICATION_JOURNAL_BYTES);
+        assert!(sdk.journal_publication(publication).is_err());
+        assert_eq!(journal_image(&sdk.journal), before);
+        drop(sdk);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn opening_existing_journal_rejects_entry_byte_and_payload_limits_without_changing_saved_state()
+    {
+        for name in [
+            "entry-count",
+            "aggregate-bytes",
+            "row-bytes",
+            "metadata-bytes",
+            "payload-bytes",
+        ] {
+            let (path, sdk) = bounded_sdk(name, vec![]);
+            let mut state = sdk.journal.read_state().unwrap();
+            let count = match name {
+                "entry-count" => 9,
+                "aggregate-bytes" => 8,
+                _ => 1,
+            };
+            state.next_sequence = Some(count + 1);
+            let mut metadata = serde_json::to_vec(&state).unwrap();
+            if name == "metadata-bytes" {
+                metadata.resize(MAX_PUBLICATION_JOURNAL_BYTES + 1, b' ');
+            }
+            // Write legacy/untrusted fixtures below the guarded production seam.
+            let write = sdk.journal.database.begin_write().unwrap();
+            {
+                write
+                    .open_table(JOURNAL_META)
+                    .unwrap()
+                    .insert(STATE_KEY, metadata.as_slice())
+                    .unwrap();
+                let mut entries = write.open_table(JOURNAL_ENTRIES).unwrap();
+                for sequence in 1..=count {
+                    let mut publication = intent();
+                    publication.client_id = b"client".to_vec();
+                    publication.session = 1;
+                    publication.operation_sequence = sequence;
+                    match name {
+                        "aggregate-bytes" => {
+                            publication.topic = "x".repeat(MAX_PUBLICATION_JOURNAL_BYTES / 7)
+                        }
+                        "row-bytes" => {
+                            publication.topic = "x".repeat(MAX_PUBLICATION_JOURNAL_BYTES)
+                        }
+                        "payload-bytes" => {
+                            publication.payload = vec![0; MAX_PUBLICATION_JOURNAL_PAYLOAD_BYTES + 1]
+                        }
+                        _ => {}
+                    }
+                    let mut encoded = serde_json::to_vec(&JournalEntry {
+                        intent: publication,
+                        result: None,
+                        abandoned: false,
+                    })
+                    .unwrap();
+                    if name == "entry-count" {
+                        encoded = b"not json".to_vec();
+                    }
+                    entries.insert(sequence, encoded.as_slice()).unwrap();
+                }
+            }
+            write.commit().unwrap();
+            let before = journal_image(&sdk.journal);
+            drop(sdk);
+            let error = PublicationJournal::open(&path, b"client")
+                .err()
+                .expect(name);
+            if name == "entry-count" {
+                assert!(
+                    error.to_string().contains("capacity exceeded"),
+                    "count is checked before decoding"
+                );
+            }
+            let database = redb::Builder::new().open_read_only(&path).unwrap();
+            let read = database.begin_read().unwrap();
+            let meta = read.open_table(JOURNAL_META).unwrap();
+            let state = meta.get(STATE_KEY).unwrap().unwrap().value().to_vec();
+            let entries = read.open_table(JOURNAL_ENTRIES).unwrap();
+            let rows: Vec<_> = entries
+                .iter()
+                .unwrap()
+                .map(|row| {
+                    let (key, value) = row.unwrap();
+                    (key.value(), value.value().to_vec())
+                })
+                .collect();
+            assert!(
+                (state, rows) == before,
+                "{name}: rejected open changed durable state"
+            );
+            drop(read);
+            drop(database);
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn result_reserve_covers_maximum_receipts_and_every_content_state() {
+        for reason in [
+            None,
+            Some(api::RetirementReason::Expired),
+            Some(api::RetirementReason::QuotaPressure),
+        ] {
+            let mut result = result(u64::MAX);
+            let receipt = result.receipt.as_option_mut().unwrap();
+            receipt.transfer_id.fill(0xff);
+            receipt.event_id.fill(0xff);
+            receipt.acceptance_marker = u64::MAX;
+            if let Some(reason) = reason {
+                result.content = api::CommittedContentStatus::Retired.into();
+                result.retirement_reason = Some(reason.into());
+            }
+            validate_committed_result(&result).unwrap();
+            assert!(serde_json::to_vec(&result).unwrap().len() <= JOURNAL_RESULT_RESERVE_BYTES);
         }
     }
 

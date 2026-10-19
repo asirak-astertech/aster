@@ -7,6 +7,7 @@ pub const HELP: &str = "Usage: asterctl (--token TOKEN | --token-file PATH) [OPT
 
 Publish an Event through a running Aster agent.
 Use MSG as the payload, or read standard input until EOF.
+Payloads are limited to 65536 bytes.
 Terminal input shows instructions on stderr before reading.
 
 PUBLISH OPTIONS:
@@ -28,6 +29,8 @@ Use publication-recover after an uncertain outcome; acknowledge results explicit
 
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const SIZE_ERROR: &str = "publication request exceeds 1 MiB";
+const MAX_PAYLOAD_BYTES: usize = aster_agent::sdk::MAX_PUBLICATION_JOURNAL_PAYLOAD_BYTES;
+const PAYLOAD_SIZE_ERROR: &str = "publication payload exceeds 65536 bytes";
 
 #[derive(Debug, PartialEq)]
 pub struct Publication {
@@ -136,18 +139,19 @@ impl Publication {
             self.request.payload = message.into_bytes();
         } else if !self.request.tombstone {
             input
-                .take((MAX_REQUEST_BYTES + 1) as u64)
+                .take((MAX_PAYLOAD_BYTES + 1) as u64)
                 .read_to_end(&mut self.request.payload)
                 .map_err(|_| "cannot read payload from standard input")?;
+        }
+        if self.request.payload.len() > MAX_PAYLOAD_BYTES {
+            return Err(PAYLOAD_SIZE_ERROR);
         }
         // Reserve enough wire space for the stable identity and any future
         // positive session/sequence before assigning or sending the intent.
         self.request.client_id.clone_from(&self.identity.client_id);
         self.request.session = u64::MAX;
         self.request.operation_sequence = u64::MAX;
-        if self.request.payload.len() > MAX_REQUEST_BYTES
-            || self.request.encoded_len() as usize > MAX_REQUEST_BYTES
-        {
+        if self.request.encoded_len() as usize > MAX_REQUEST_BYTES {
             return Err(SIZE_ERROR);
         }
         self.request.session = 0;
