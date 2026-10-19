@@ -82,14 +82,32 @@ impl Read for PatternReader {
 }
 
 fn blob_fixture(
-    total_len: u64,
     fixture_path: &Path,
+    signed_open_path: &Path,
+    total_len: u64,
 ) -> Result<(Arc<ReferenceEnvelopeSealer>, VerifiedBlobStreamOpen), AnyError> {
-    let topic = Topic::new("imagery")?;
-    let scope = Scope::new("mission/validation")?;
     let provider = Arc::new(ReferenceEnvelopeSealer::open(
         ProvisioningBundle::from_bytes(&std::fs::read(fixture_path)?)?,
     )?);
+    let verified = provider.verify_blob_stream_open(&std::fs::read(signed_open_path)?)?;
+    if verified.open().total_len() != total_len {
+        return Err("signed Blob open length differs from requested validation length".into());
+    }
+    Ok((provider, verified))
+}
+
+fn create_signed_blob_open(
+    fixture_path: &Path,
+    signed_open_path: &Path,
+    total_len: u64,
+) -> Result<(), AnyError> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let topic = Topic::new("imagery")?;
+    let scope = Scope::new("mission/validation")?;
+    let provider = ReferenceEnvelopeSealer::open(ProvisioningBundle::from_bytes(&std::fs::read(
+        fixture_path,
+    )?)?)?;
     let open = BlobStreamOpen::new(
         BlobPublicationStreamId::from_bytes([0x12; 32]).expect("stream ID"),
         provider.identity(),
@@ -112,8 +130,23 @@ fn blob_fixture(
         [0x52; 32],
     )?;
     let signed = provider.seal_blob_stream_open(&open)?;
-    let verified = provider.verify_blob_stream_open(&signed)?;
-    Ok((provider, verified))
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o644)
+        .open(signed_open_path)?;
+    file.write_all(&signed)?;
+    file.sync_all()?;
+    println!(
+        "ASTER_BLOB_OPEN {{\"path\":\"{}\",\"bytes\":{},\"digest\":\"{}\"}}",
+        signed_open_path.display(),
+        signed.len(),
+        open.digest()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+    Ok(())
 }
 
 fn initialize_blob_fixture(path: &Path) -> Result<(), AnyError> {
@@ -178,11 +211,12 @@ fn print_pack_report(
 
 async fn pack_receive(
     fixture_path: PathBuf,
+    signed_open_path: PathBuf,
     bind: SocketAddr,
     plaintext_len: u64,
 ) -> Result<(), AnyError> {
     let root = TempPack::new("receive")?;
-    let (provider, verified) = blob_fixture(plaintext_len, &fixture_path)?;
+    let (provider, verified) = blob_fixture(&fixture_path, &signed_open_path, plaintext_len)?;
     let open = verified.open();
     let wire_len =
         stream_validation::expected_pack_wire_len(plaintext_len).map_err(std::io::Error::other)?;
@@ -223,13 +257,14 @@ async fn pack_receive(
 async fn pack_store_receive(
     state_root: PathBuf,
     fixture_path: PathBuf,
+    signed_open_path: PathBuf,
     bind: SocketAddr,
     plaintext_len: u64,
 ) -> Result<(), AnyError> {
     std::fs::create_dir_all(&state_root)?;
     let pack_root = state_root.join("pack");
     std::fs::create_dir_all(&pack_root)?;
-    let (provider, verified) = blob_fixture(plaintext_len, &fixture_path)?;
+    let (provider, verified) = blob_fixture(&fixture_path, &signed_open_path, plaintext_len)?;
     let wire_len =
         stream_validation::expected_pack_wire_len(plaintext_len).map_err(std::io::Error::other)?;
     let store = Arc::new(Store::open_for_mission(
@@ -249,7 +284,7 @@ async fn pack_store_receive(
         Arc::clone(&store),
         policy.clone(),
         verified.clone(),
-        provider.identity(),
+        verified.open().publisher(),
         verifier,
     )
     .map_err(std::io::Error::other)?;
@@ -297,12 +332,13 @@ async fn pack_store_receive(
 
 async fn pack_send(
     fixture_path: PathBuf,
+    signed_open_path: PathBuf,
     bind: SocketAddr,
     peer: SocketAddr,
     plaintext_len: u64,
 ) -> Result<(), AnyError> {
     let root = TempPack::new("send")?;
-    let (provider, verified) = blob_fixture(plaintext_len, &fixture_path)?;
+    let (provider, verified) = blob_fixture(&fixture_path, &signed_open_path, plaintext_len)?;
     let open = verified.open();
     let published = publish_blob_stream(
         PatternReader {
@@ -464,6 +500,11 @@ async fn main() -> Result<(), AnyError> {
         [_, role, fixture] if role == "fixture-init" => {
             initialize_blob_fixture(Path::new(fixture))
         }
+        [_, role, fixture, signed_open, bytes] if role == "open-init" => create_signed_blob_open(
+            Path::new(fixture),
+            Path::new(signed_open),
+            bytes.parse()?,
+        ),
         [_, role, bytes] if role == "loopback" => loopback(bytes.parse()?).await,
         [_, role, bind, bytes] if role == "receive" => {
             receive(bind.parse()?, bytes.parse()?).await
@@ -471,27 +512,37 @@ async fn main() -> Result<(), AnyError> {
         [_, role, bind, peer, bytes] if role == "send" => {
             send(bind.parse()?, peer.parse()?, bytes.parse()?).await
         }
-        [_, role, fixture, bind, bytes] if role == "pack-receive" => {
-            pack_receive(PathBuf::from(fixture), bind.parse()?, bytes.parse()?).await
-        }
-        [_, role, root, fixture, bind, bytes] if role == "pack-store-receive" => {
-            pack_store_receive(
-                PathBuf::from(root),
+        [_, role, fixture, signed_open, bind, bytes] if role == "pack-receive" => {
+            pack_receive(
                 PathBuf::from(fixture),
+                PathBuf::from(signed_open),
                 bind.parse()?,
                 bytes.parse()?,
             )
             .await
         }
-        [_, role, fixture, bind, peer, bytes] if role == "pack-send" => {
+        [_, role, root, fixture, signed_open, bind, bytes]
+            if role == "pack-store-receive" =>
+        {
+            pack_store_receive(
+                PathBuf::from(root),
+                PathBuf::from(fixture),
+                PathBuf::from(signed_open),
+                bind.parse()?,
+                bytes.parse()?,
+            )
+            .await
+        }
+        [_, role, fixture, signed_open, bind, peer, bytes] if role == "pack-send" => {
             pack_send(
                 PathBuf::from(fixture),
+                PathBuf::from(signed_open),
                 bind.parse()?,
                 peer.parse()?,
                 bytes.parse()?,
             )
             .await
         }
-        _ => Err("usage: blob_stream_transport_benchmark fixture-init FIXTURE | loopback BYTES | receive BIND BYTES | send BIND PEER BYTES | pack-receive FIXTURE BIND PLAINTEXT_BYTES | pack-store-receive STATE_ROOT FIXTURE BIND PLAINTEXT_BYTES | pack-send FIXTURE BIND PEER PLAINTEXT_BYTES".into()),
+        _ => Err("usage: blob_stream_transport_benchmark fixture-init FIXTURE | open-init FIXTURE SIGNED_OPEN PLAINTEXT_BYTES | loopback BYTES | receive BIND BYTES | send BIND PEER BYTES | pack-receive FIXTURE SIGNED_OPEN BIND PLAINTEXT_BYTES | pack-store-receive STATE_ROOT FIXTURE SIGNED_OPEN BIND PLAINTEXT_BYTES | pack-send FIXTURE SIGNED_OPEN BIND PEER PLAINTEXT_BYTES".into()),
     }
 }
