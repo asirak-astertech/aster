@@ -129,9 +129,12 @@ pub(crate) fn configured_service(
         .with_max_request_body_size(crate::MAX_AGENT_MESSAGE_BYTES)
         .with_max_message_size(crate::MAX_AGENT_MESSAGE_BYTES)
         .with_element_memory_limit(crate::MAX_AGENT_ELEMENT_MEMORY_BYTES);
+    // Large resumable streams must be able to outlive the ordinary RPC
+    // default. Admission and in-flight quotas remain bounded, and callers must
+    // explicitly request the longer whole-attempt window.
     let deadline = connectrpc::DeadlinePolicy::new()
         .with_min(Duration::from_millis(10))
-        .with_max(Duration::from_secs(30))
+        .with_max(Duration::from_secs(15 * 60))
         .with_default_timeout(Duration::from_secs(10))
         .with_enforce_on_streams(true);
     connectrpc::ConnectRpcService::new(router)

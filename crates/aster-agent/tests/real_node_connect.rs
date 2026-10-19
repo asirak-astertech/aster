@@ -19,7 +19,7 @@ use aster_agent::{
     sdk::{NumberedEventSdk, PipelinedEventPublisher, PublicationJournal, RecoveredState},
 };
 use aster_mesh::{ProvisioningAccess, ReferenceProvisioner, Scope, Topic};
-use aster_node::application::MAX_SELECTED_LIVE_BLOB_BYTES;
+use aster_node::application::MAX_SELECTED_BLOB_STREAM_BYTES;
 use aster_node::mission::UnprotectedReferenceMission;
 use aster_node::{MutableSourceInterests, NodeApplication, NodeConfig, start_node};
 use buffa::{Message as _, MessageName as _};
@@ -206,6 +206,7 @@ fn real_node_blob_bidi_stream_benchmark() {
                     .parse()
                     .expect("benchmark client URI"),
             )
+            .with_default_timeout(Duration::from_secs(15 * 60))
             .with_protocol(Protocol::Grpc)
             .with_default_header(
                 "authorization",
@@ -244,7 +245,7 @@ fn real_node_blob_bidi_stream_benchmark() {
         ));
         let (mut send, mut receive) = call.into_split();
         let sender = async move {
-            let frame = vec![0x5a; 64 * 1024];
+            let frame = vec![0x5a; aster_agent::BLOB_RPC_FRAME_BYTES];
             let mut offset = 0_u64;
             while offset < total_len {
                 let len = usize::try_from((total_len - offset).min(frame.len() as u64))
@@ -720,7 +721,7 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
                 "over-policy",
                 vec![metadata_frame(
                     b"real-node-blob-over-policy",
-                    MAX_SELECTED_LIVE_BLOB_BYTES + 1,
+                    MAX_SELECTED_BLOB_STREAM_BYTES + 1,
                 )],
                 ErrorCode::ResourceExhausted,
                 api::PublicErrorReason::ResourceExhaustion,

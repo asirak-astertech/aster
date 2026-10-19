@@ -12,6 +12,13 @@ use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
 pub const BLOB_STREAM_SEGMENT_BYTES: usize = 1024 * 1024;
+/// Maximum plaintext length of one independently segmented Blob stream (8 GiB).
+///
+/// This is intentionally distinct from the legacy profile-4 network Blob
+/// ceiling. Stream storage remains bounded separately by its aggregate durable
+/// reservation pool, while the fixed-width Merkle frontier and offsets do not
+/// grow with this value.
+pub const MAX_BLOB_STREAM_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 pub const BLOB_STREAM_SEGMENT_ENCODED_OVERHEAD_BYTES: usize =
     8 + 2 + 32 + 32 + 8 + 8 + 8 + 8 + 4 + 4 + 16;
 const FRONTIER_LEVELS: usize = 64;
@@ -91,6 +98,7 @@ impl BlobStreamOpen {
                 *counter == 0 || (*node == publisher && *counter >= publisher_counter)
             })
             || total_len == 0
+            || total_len > MAX_BLOB_STREAM_BYTES
             || content_epoch == 0
             || policy_revision == 0
             || authorization_digest == [0; 32]
@@ -1510,7 +1518,7 @@ mod tests {
         )
     }
 
-    fn open_with_metadata(metadata: BlobMetadata) -> BlobStreamOpen {
+    fn open_with_len(metadata: BlobMetadata, total_len: u64) -> Result<BlobStreamOpen, BlobError> {
         BlobStreamOpen::new(
             BlobPublicationStreamId::from_bytes([0x11; 32]).expect("stream ID"),
             [0x21; 32],
@@ -1524,13 +1532,27 @@ mod tests {
             Priority::Immediate,
             None,
             None,
-            BLOB_STREAM_SEGMENT_BYTES as u64,
+            total_len,
             7,
             9,
             [0x41; 32],
             [0x51; 32],
         )
-        .expect("open")
+    }
+
+    fn open_with_metadata(metadata: BlobMetadata) -> BlobStreamOpen {
+        open_with_len(metadata, BLOB_STREAM_SEGMENT_BYTES as u64).expect("open")
+    }
+
+    #[test]
+    fn blob_stream_open_has_a_distinct_multi_gibibyte_protocol_bound() {
+        let metadata = BlobMetadata::new(None, Vec::new()).expect("metadata");
+        assert!(open_with_len(metadata.clone(), 1024 * 1024 * 1024).is_ok());
+        assert!(open_with_len(metadata.clone(), MAX_BLOB_STREAM_BYTES).is_ok());
+        assert!(matches!(
+            open_with_len(metadata, MAX_BLOB_STREAM_BYTES + 1),
+            Err(BlobError::InvalidManifest)
+        ));
     }
 
     #[test]

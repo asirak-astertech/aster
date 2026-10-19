@@ -518,7 +518,7 @@ delivery. The canonical manifest is at most 1 MiB and is independently
 implementable from [envelope.md](envelope.md). The current durable Blob service
 can resume local chunk production and reading without whole-Blob RAM growth.
 
-The selected node's application profile fixes canonical chunks at 64 KiB. A
+The selected node's legacy application profile fixes canonical chunks at 64 KiB. A
 stopped `SelectedBlobNode` retains synchronous streaming, while
 `RunningNode::selected_blobs()` returns a cloneable live handle. Live publish
 takes ownership of a nonempty regular file positioned at byte zero and admits
@@ -533,6 +533,15 @@ decryption. A contradiction among durable rows, authenticated cache state,
 depot capability, or post-commit verification is `FatalBlobCoherence` and
 terminates the actor after closing application admission; it is not downgraded
 to an ordinary per-request error.
+
+The semantic-v9 application Blob stream is a distinct protocol path. It admits
+one nonempty object up to 8 GiB, carries offset-bearing 512-KiB RPC frames, and
+maps them into independently authenticated 1-MiB segments. Two bounded map
+workers may seal or open adjacent segments concurrently; an ordered merge is
+the sole authority that appends pack records or emits plaintext. The pack and
+redb projection checkpoint every 64 MiB, so restart advertises only the durable
+contiguous frontier and retransmits at most that bounded tail. These limits do
+not raise the legacy profile-4 64-MiB network Blob ceiling.
 
 Durable Blob lifecycle authority is local and wire-neutral. Permanent physical-
 lineage fences and accepted-publication replay fences are independently bounded

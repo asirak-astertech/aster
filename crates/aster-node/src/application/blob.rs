@@ -2,7 +2,7 @@
 //!
 //! The stopped facade preserves caller-owned streaming readers and writers.
 //! The live facade accepts only an already-open regular [`fs::File`] and
-//! returns at most one zeroize-on-drop 64 KiB page. Encrypted chunks remain in
+//! returns at most one zeroize-on-drop 512 KiB page. Encrypted chunks remain in
 //! the mission-bound depot; source-envelope bytes, manifest records, keys,
 //! nonces, and depot mechanics are never returned to applications. Both
 //! facades also expose a durable at-least-once metadata-notification queue.
@@ -12,7 +12,7 @@
 //! current route/content authority.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     fmt, fs,
     io::{Read, Seek, Write},
     path::Path,
@@ -27,8 +27,9 @@ use aster_mesh::{
     BlobMetadata as CoreBlobMetadata, BlobPublicationStreamId, BlobStreamFinalCommitment,
     BlobStreamFrontier, BlobStreamOpen, BlobStreamPlainPartition, BlobStreamSegmentOpener,
     BlobStreamSegmentSealer, ContentVerifiedBlobEnvelope, CustodySample, MAX_BLOB_MEDIA_TYPE_BYTES,
-    MAX_BLOB_SCHEMA_ID_BYTES, NodeId, PreparedBlob, Priority, ReferenceEnvelopeSealer,
-    SELECTED_BLOB_CHUNK_SIZE, Scope, Topic, VerifiedBlobStreamOpen, prepare_blob,
+    MAX_BLOB_SCHEMA_ID_BYTES, MAX_BLOB_STREAM_BYTES, NodeId, PreparedBlob, Priority,
+    ReferenceEnvelopeSealer, SELECTED_BLOB_CHUNK_SIZE, Scope, Topic, VerifiedBlobStreamOpen,
+    prepare_blob,
 };
 use aster_redb_store::pack::{BlobPackReader, BlobPackWriter, PinnedBlobPackRoot};
 #[cfg(test)]
@@ -265,11 +266,21 @@ impl Seek for AdmittedFile<'_> {
 /// Maximum plaintext accepted by one live Blob publication.
 pub const MAX_SELECTED_LIVE_BLOB_BYTES: u64 = MAX_NETWORK_BLOB_BYTES;
 
+/// Maximum plaintext accepted by the independently segmented streaming
+/// protocol. The legacy live-file/profile-4 path retains its 64 MiB ceiling.
+pub const MAX_SELECTED_BLOB_STREAM_BYTES: u64 = MAX_BLOB_STREAM_BYTES;
+
 /// Maximum canonical 64 KiB chunks accepted by one live Blob publication.
 pub const MAX_SELECTED_LIVE_BLOB_CHUNKS: u64 = MAX_NETWORK_BLOB_CHUNKS;
 
 /// Maximum plaintext returned by one live Blob page read.
-pub const MAX_SELECTED_BLOB_PAGE_BYTES: usize = SELECTED_BLOB_CHUNK_SIZE as usize;
+///
+/// Eight canonical 64-KiB chunks amortize application-protocol and policy
+/// checks while keeping each encoded agent response below its 1-MiB ceiling.
+pub const MAX_SELECTED_BLOB_PAGE_BYTES: usize = 8 * SELECTED_BLOB_CHUNK_SIZE as usize;
+const MAX_SELECTED_BLOB_PAGE_CHUNKS: u64 =
+    MAX_SELECTED_BLOB_PAGE_BYTES as u64 / SELECTED_BLOB_CHUNK_SIZE as u64 + 1;
+const BLOB_STREAM_CHECKPOINT_SEGMENTS: u64 = 64;
 
 /// Maximum number of immutable Blob publication notifications returned by one poll.
 pub const MAX_SELECTED_BLOB_DELIVERIES: usize = MAX_BLOB_POLL_DELIVERIES;
@@ -985,7 +996,7 @@ impl SelectedBlobHandle {
         request: BlobPublishStreamRequest,
     ) -> Result<SelectedBlobPublishStream, ApplicationError> {
         validate_live_publish_request(&request.publication)?;
-        if request.total_len == 0 || request.total_len > MAX_SELECTED_LIVE_BLOB_BYTES {
+        if request.total_len == 0 || request.total_len > MAX_SELECTED_BLOB_STREAM_BYTES {
             return Err(ApplicationError::new(
                 ApplicationErrorKind::ResourceLimit,
                 "blob stream open",
@@ -1374,6 +1385,7 @@ struct LocalBlobPublishStream {
     total_len: u64,
     accepted_offset: u64,
     pending: Zeroizing<Vec<u8>>,
+    unsealed: Vec<BlobStreamPlainPartition>,
     publisher_counter: u64,
 }
 
@@ -1381,8 +1393,45 @@ struct LocalBlobReadStream {
     publication: BlobStreamPublication,
     reader: BlobPackReader,
     opener: BlobStreamSegmentOpener,
-    segment_offset: u64,
-    segment: Zeroizing<Vec<u8>>,
+    segments: VecDeque<(u64, Zeroizing<Vec<u8>>)>,
+    last_request_offset: u64,
+}
+
+fn seal_ready_stream_partitions(
+    stream: &mut LocalBlobPublishStream,
+    force: bool,
+) -> Result<(), ApplicationError> {
+    if stream.unsealed.is_empty() || (!force && stream.unsealed.len() < 2) {
+        return Ok(());
+    }
+    let partitions = std::mem::take(&mut stream.unsealed);
+    let mapped = std::thread::scope(|scope| {
+        let workers = partitions
+            .into_iter()
+            .map(|partition| {
+                let sealer = stream.sealer.clone();
+                scope.spawn(move || sealer.seal(partition))
+            })
+            .collect::<Vec<_>>();
+        workers
+            .into_iter()
+            .map(|worker| {
+                worker
+                    .join()
+                    .map_err(|_| {
+                        ApplicationError::new(ApplicationErrorKind::Integrity, "blob stream write")
+                    })?
+                    .map_err(|error| blob_core_error("blob stream write", error))
+            })
+            .collect::<Result<Vec<_>, _>>()
+    })?;
+    for (segment, leaves) in mapped {
+        stream
+            .writer
+            .append(&segment, leaves)
+            .map_err(|error| blob_pack_application_error("blob stream write", error))?;
+    }
+    Ok(())
 }
 
 impl VerifiedBlobDeliveryMetadata {
@@ -1801,7 +1850,7 @@ impl SelectedBlobNode {
         request: BlobPublishStreamRequest,
     ) -> Result<OpenedBlobPublishStream, ApplicationError> {
         validate_live_publish_request(&request.publication)?;
-        if request.total_len == 0 || request.total_len > MAX_SELECTED_LIVE_BLOB_BYTES {
+        if request.total_len == 0 || request.total_len > MAX_SELECTED_BLOB_STREAM_BYTES {
             return Err(ApplicationError::new(
                 ApplicationErrorKind::ResourceLimit,
                 "blob stream open",
@@ -1854,6 +1903,7 @@ impl SelectedBlobNode {
                 )
                 .map_err(|error| application_error("blob stream open", error.into()))?;
             stream.pending.clear();
+            stream.unsealed.clear();
             stream.accepted_offset = stream.resume.durable_plaintext_offset();
             return Ok(OpenedBlobPublishStream {
                 token,
@@ -1983,6 +2033,7 @@ impl SelectedBlobNode {
                 total_len: request.total_len,
                 accepted_offset: durable_offset,
                 pending: Zeroizing::new(Vec::with_capacity(BLOB_STREAM_SEGMENT_BYTES)),
+                unsealed: Vec::with_capacity(2),
                 publisher_counter: causal.counter(),
             },
         );
@@ -2030,28 +2081,23 @@ impl SelectedBlobNode {
                 &mut stream.pending,
                 Zeroizing::new(Vec::with_capacity(BLOB_STREAM_SEGMENT_BYTES)),
             );
-            let (segment, leaves) = stream
-                .sealer
-                .seal(
-                    BlobStreamPlainPartition::new(
-                        *stream.open.open().stream_id().as_bytes(),
-                        stream.open.open().digest(),
-                        stream.open.open().content_epoch(),
-                        stream.writer.next_index(),
-                        segment_offset,
-                        stream.total_len,
-                        pending.to_vec(),
-                    )
-                    .map_err(|error| blob_core_error("blob stream write", error))?,
+            let index = stream.writer.next_index() + stream.unsealed.len() as u64;
+            stream.unsealed.push(
+                BlobStreamPlainPartition::new(
+                    *stream.open.open().stream_id().as_bytes(),
+                    stream.open.open().digest(),
+                    stream.open.open().content_epoch(),
+                    index,
+                    segment_offset,
+                    stream.total_len,
+                    pending.to_vec(),
                 )
-                .map_err(|error| blob_core_error("blob stream write", error))?;
-            stream
-                .writer
-                .append(&segment, leaves)
-                .map_err(|error| blob_pack_application_error("blob stream write", error))?;
+                .map_err(|error| blob_core_error("blob stream write", error))?,
+            );
+            seal_ready_stream_partitions(stream, end == stream.total_len)?;
         }
         if stream.writer.plaintext_offset() - stream.resume.durable_plaintext_offset()
-            >= 8 * BLOB_STREAM_SEGMENT_BYTES as u64
+            >= BLOB_STREAM_CHECKPOINT_SEGMENTS * BLOB_STREAM_SEGMENT_BYTES as u64
             || stream.writer.plaintext_offset() == stream.total_len
         {
             let checkpoint = stream
@@ -3494,13 +3540,6 @@ impl SelectedBlobNode {
         if live_blob_read_cancelled(admission, response) {
             return Err(actor_unavailable("blob read page"));
         }
-        self.store
-            .observe_blob_custody_sample(
-                self.custody_clock
-                    .sample()
-                    .map_err(|error| application_error("blob read page", error))?,
-            )
-            .map_err(|error| application_error("blob read page", error.into()))?;
         if request.max_bytes == 0 || request.max_bytes > MAX_SELECTED_BLOB_PAGE_BYTES {
             return Err(ApplicationError::new(
                 ApplicationErrorKind::InvalidRequest,
@@ -3519,6 +3558,28 @@ impl SelectedBlobNode {
                 "blob read page",
             ));
         }
+        if self.stream_read.as_ref().is_some_and(|cached| {
+            cached.publication.blob_id() == request.blob.id.into_core()
+                && cached.publication.open().topic() == &request.blob.topic
+                && cached.publication.open().scope() == &request.blob.scope
+        }) {
+            let policy = self.current_policy("blob stream read")?;
+            let epoch = self.active_epoch(&request.blob.scope, "blob stream read")?;
+            self.require_blob_grants(
+                &request.blob.topic,
+                &request.blob.scope,
+                epoch,
+                "blob stream read",
+            )?;
+            return self.read_stream_page(&policy, epoch, &request);
+        }
+        self.store
+            .observe_blob_custody_sample(
+                self.custody_clock
+                    .sample()
+                    .map_err(|error| application_error("blob read page", error))?,
+            )
+            .map_err(|error| application_error("blob read page", error.into()))?;
         let policy = self.current_policy("blob read page")?;
         let epoch = self.active_epoch(&request.blob.scope, "blob read page")?;
         self.require_blob_grants(
@@ -3621,7 +3682,7 @@ impl SelectedBlobNode {
         let range_chunk_count = last_chunk
             .checked_sub(first_chunk)
             .and_then(|span| span.checked_add(1))
-            .filter(|count| (1..=2).contains(count))
+            .filter(|count| (1..=MAX_SELECTED_BLOB_PAGE_CHUNKS).contains(count))
             .ok_or_else(|| {
                 ApplicationError::new(ApplicationErrorKind::Integrity, "blob read page")
             })?;
@@ -3653,7 +3714,7 @@ impl SelectedBlobNode {
                 .map_err(|error| blob_core_error("blob read page", error))?;
             if stats.plaintext_bytes != page_len as u64
                 || stats.verified_chunks != range_chunk_count
-                || !(1..=2).contains(&stats.verified_chunks)
+                || !(1..=MAX_SELECTED_BLOB_PAGE_CHUNKS).contains(&stats.verified_chunks)
             {
                 return Err(ApplicationError::new(
                     ApplicationErrorKind::Integrity,
@@ -3730,23 +3791,30 @@ impl SelectedBlobNode {
         current_epoch: u64,
         request: &BlobReadPageRequest,
     ) -> Result<BlobReadPage, ApplicationError> {
-        let publication = self
-            .store
-            .blob_stream_publications_with_policy(policy)
-            .map_err(|error| application_error("blob stream read", error.into()))?
-            .into_iter()
-            .rev()
-            .find(|publication| {
-                publication.blob_id() == request.blob.id.into_core()
-                    && publication.open().topic() == &request.blob.topic
-                    && publication.open().scope() == &request.blob.scope
-            })
-            .ok_or_else(|| {
-                application_error(
-                    "blob stream read",
-                    StoreError::Blob(BlobStoreError::NotFound).into(),
-                )
-            })?;
+        let publication = if let Some(cached) = self.stream_read.as_ref().filter(|cached| {
+            cached.publication.blob_id() == request.blob.id.into_core()
+                && cached.publication.open().topic() == &request.blob.topic
+                && cached.publication.open().scope() == &request.blob.scope
+        }) {
+            cached.publication.clone()
+        } else {
+            self.store
+                .blob_stream_publications_with_policy(policy)
+                .map_err(|error| application_error("blob stream read", error.into()))?
+                .into_iter()
+                .rev()
+                .find(|publication| {
+                    publication.blob_id() == request.blob.id.into_core()
+                        && publication.open().topic() == &request.blob.topic
+                        && publication.open().scope() == &request.blob.scope
+                })
+                .ok_or_else(|| {
+                    application_error(
+                        "blob stream read",
+                        StoreError::Blob(BlobStoreError::NotFound).into(),
+                    )
+                })?
+        };
         if publication.open().content_epoch() != current_epoch {
             return Err(ApplicationError::new(
                 ApplicationErrorKind::RequestRejected,
@@ -3780,7 +3848,7 @@ impl SelectedBlobNode {
         }
         let must_open = self.stream_read.as_ref().is_none_or(|cached| {
             cached.publication.stream_id() != publication.stream_id()
-                || request.offset < cached.segment_offset
+                || request.offset < cached.last_request_offset
         });
         if must_open {
             let verified_open = self
@@ -3833,8 +3901,8 @@ impl SelectedBlobNode {
                 publication: publication.clone(),
                 reader,
                 opener,
-                segment_offset: 0,
-                segment: Zeroizing::new(Vec::new()),
+                segments: VecDeque::with_capacity(2),
+                last_request_offset: 0,
             });
         }
         let page_len = usize::try_from((total_len - request.offset).min(
@@ -3851,38 +3919,78 @@ impl SelectedBlobNode {
         })?;
         while plaintext.len() < page_len {
             let cursor = request.offset + plaintext.len() as u64;
-            let segment_end = cached.segment_offset + cached.segment.len() as u64;
-            if cached.segment.is_empty() || cursor >= segment_end {
-                let encrypted = cached
-                    .reader
-                    .next_segment()
-                    .map_err(|error| blob_pack_application_error("blob stream read", error))?
-                    .ok_or_else(|| {
-                        ApplicationError::new(ApplicationErrorKind::Integrity, "blob stream read")
-                    })?;
-                let offset = encrypted.offset();
-                let (segment, _) = cached
-                    .opener
-                    .open(&encrypted)
-                    .map_err(|error| blob_core_error("blob stream read", error))?;
-                cached.segment_offset = offset;
-                cached.segment = segment;
+            while cached.segments.front().is_some_and(|(offset, segment)| {
+                cursor >= offset.saturating_add(segment.len() as u64)
+            }) {
+                cached.segments.pop_front();
+            }
+            if cached.segments.is_empty() {
+                let mut encrypted = Vec::with_capacity(2);
+                for _ in 0..2 {
+                    match cached
+                        .reader
+                        .next_segment()
+                        .map_err(|error| blob_pack_application_error("blob stream read", error))?
+                    {
+                        Some(segment) => encrypted.push(segment),
+                        None => break,
+                    }
+                }
+                if encrypted.is_empty() {
+                    return Err(ApplicationError::new(
+                        ApplicationErrorKind::Integrity,
+                        "blob stream read",
+                    ));
+                }
+                let opened = std::thread::scope(|scope| {
+                    let workers = encrypted
+                        .into_iter()
+                        .map(|encrypted| {
+                            let opener = cached.opener.clone();
+                            scope.spawn(move || {
+                                let offset = encrypted.offset();
+                                opener
+                                    .open(&encrypted)
+                                    .map(|(segment, _)| (offset, segment))
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    workers
+                        .into_iter()
+                        .map(|worker| {
+                            worker
+                                .join()
+                                .map_err(|_| {
+                                    ApplicationError::new(
+                                        ApplicationErrorKind::Integrity,
+                                        "blob stream read",
+                                    )
+                                })?
+                                .map_err(|error| blob_core_error("blob stream read", error))
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                })?;
+                cached.segments.extend(opened);
                 continue;
             }
-            if cursor < cached.segment_offset {
+            let (segment_offset, segment) = cached.segments.front().ok_or_else(|| {
+                ApplicationError::new(ApplicationErrorKind::Integrity, "blob stream read")
+            })?;
+            if cursor < *segment_offset {
                 return Err(ApplicationError::new(
                     ApplicationErrorKind::Integrity,
                     "blob stream read",
                 ));
             }
-            let start = usize::try_from(cursor - cached.segment_offset).map_err(|_| {
+            let start = usize::try_from(cursor - *segment_offset).map_err(|_| {
                 ApplicationError::new(ApplicationErrorKind::Integrity, "blob stream read")
             })?;
-            let available = cached.segment.len() - start;
+            let available = segment.len() - start;
             let take = available.min(page_len - plaintext.len());
-            plaintext.extend_from_slice(&cached.segment[start..start + take]);
+            plaintext.extend_from_slice(&segment[start..start + take]);
         }
         let next_offset = request.offset + plaintext.len() as u64;
+        cached.last_request_offset = next_offset;
         let metadata = publication.open().metadata();
         Ok(BlobReadPage {
             publication: BlobPublicationId::from_bytes(*publication.stream_id().as_bytes()),
@@ -5823,7 +5931,7 @@ mod tests {
     #[test]
     fn selected_blob_publish_stream_restarts_from_store_durable_frontier() {
         let root = TestRoot::new("selected-blob-publish-stream-resume");
-        let checkpoint_bytes = 8 * BLOB_STREAM_SEGMENT_BYTES;
+        let checkpoint_bytes = BLOB_STREAM_CHECKPOINT_SEGMENTS as usize * BLOB_STREAM_SEGMENT_BYTES;
         let total_len = checkpoint_bytes + 2 * 64 * 1024;
         let bytes = payload(total_len);
         let stream_request = BlobPublishStreamRequest {
@@ -6488,7 +6596,7 @@ mod tests {
     #[test]
     fn live_blob_page_is_bounded_exact_and_rejects_invalid_ranges() {
         let root = TestRoot::new("live-page");
-        let bytes = payload(2 * SELECTED_BLOB_CHUNK_SIZE as usize + 73);
+        let bytes = payload(MAX_SELECTED_BLOB_PAGE_BYTES + 73);
         let mut node = selected_node(&root);
         let published = node
             .publish(request(b"blob/live-page"), &mut Cursor::new(bytes.clone()))

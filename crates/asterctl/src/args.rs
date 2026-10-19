@@ -30,8 +30,9 @@ COMMANDS:
 OPTIONS:
   -h, --host IP          Loopback agent IP address (default: 127.0.0.1)
   -p, --port PORT        Aster node RPC port (default: 8181)
-      --timeout SECONDS Client RPC timeout, 1–86400 seconds (default: 10)
-                        Agent-side deadlines may be shorter (currently at most 30s)
+      --timeout SECONDS Client RPC timeout, 1–86400 seconds
+                        Default: 10; Blob publish/read: 900
+                        Agent-side deadlines may be shorter (currently at most 15m)
   -j, --json             Print output in JSON (when possible)
   -t, --token TOKEN      Aster node API token as plain text
       --token-file PATH  Read the agent API token from a file
@@ -77,6 +78,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
     let mut host = IpAddr::V4(Ipv4Addr::LOCALHOST);
     let mut port = 8181;
     let mut timeout = crate::client::DEFAULT_TIMEOUT;
+    let mut timeout_explicit = false;
     let mut json = false;
     let mut token = None;
     let mut status = false;
@@ -279,6 +281,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
                             .filter(|s| (1..=86400).contains(s))
                             .ok_or("timeout must be an integer from 1 to 86400 seconds")?;
                         timeout = Duration::from_secs(seconds);
+                        timeout_explicit = true;
                     }
                     _ => {
                         if token.is_some() {
@@ -403,6 +406,9 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
     if unsubscribe && subscription_id.is_none() {
         return Err("SUBSCRIPTION_ID is required; see unsubscribe --help".into());
     }
+    if !timeout_explicit && (blob_publication.is_some() || blob_read.is_some()) {
+        timeout = crate::client::BLOB_TRANSFER_DEFAULT_TIMEOUT;
+    }
     let options = Options {
         host,
         port,
@@ -498,6 +504,31 @@ mod tests {
                 }))
             );
         }
+    }
+
+    #[test]
+    fn blob_transfer_gets_a_long_bounded_default_but_honors_explicit_timeout() {
+        let parse_publish = |timeout: Option<&str>| {
+            let mut args = vec![
+                "blob-publish",
+                "--file=/tmp/blob",
+                "--topic=imagery.maps",
+                "--scope=mission/team/alpha",
+                "--operation-key=test",
+            ];
+            if let Some(timeout) = timeout {
+                args.extend(["--timeout", timeout]);
+            }
+            let Command::BlobPublish(options, _) = arguments(&args).unwrap() else {
+                panic!("Blob publish command")
+            };
+            options.timeout
+        };
+        assert_eq!(
+            parse_publish(None),
+            crate::client::BLOB_TRANSFER_DEFAULT_TIMEOUT
+        );
+        assert_eq!(parse_publish(Some("7")), Duration::from_secs(7));
     }
 
     #[test]

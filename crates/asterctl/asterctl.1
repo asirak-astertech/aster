@@ -79,9 +79,9 @@ Default: 8181.
 .TP
 .BI \-\-timeout " SECONDS"
 Set the client timeout for each RPC to an integer from 1 to 86400 seconds.
-Default: 10 seconds. Each query page gets its own deadline.
+Default: 10 seconds, or 15 minutes for Blob publish/read. Each query page gets its own deadline.
 The agent may enforce a shorter deadline; the current aster-agent caps each
-RPC at 30 seconds, even when the client requests more.
+RPC at 15 minutes, even when the client requests more.
 This does not limit time spent reading a publication payload from stdin.
 .TP
 .B \-\-help

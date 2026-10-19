@@ -4,7 +4,7 @@ use aster_mesh::{MAX_BLOB_MEDIA_TYPE_BYTES, MAX_BLOB_SCHEMA_ID_BYTES};
 use aster_node::application::{
     BlobId, BlobPublishOptions, BlobPublishRequest as NodeBlobPublishRequest, BlobPublishResult,
     BlobPublishStreamRequest, BlobReadPage, BlobReadPageRequest,
-    BlobReadRequest as NodeBlobReadRequest, MAX_SELECTED_LIVE_BLOB_BYTES, Priority, Scope,
+    BlobReadRequest as NodeBlobReadRequest, MAX_SELECTED_BLOB_STREAM_BYTES, Priority, Scope,
     SelectedBlobHandle, Topic,
 };
 use aster_redb_store::MAX_BLOB_OPERATION_KEY_BYTES;
@@ -159,7 +159,7 @@ impl UploadGrammar {
         if metadata.total_len == 0 {
             return Err(malformed(operation));
         }
-        if metadata.total_len > MAX_SELECTED_LIVE_BLOB_BYTES {
+        if metadata.total_len > MAX_SELECTED_BLOB_STREAM_BYTES {
             return Err(resource_exhausted(operation));
         }
         if metadata.operation_key.is_empty()
@@ -587,7 +587,7 @@ mod tests {
     use crate::api;
     #[cfg(target_os = "linux")]
     use aster_mesh::{ProvisioningAccess, ReferenceProvisioner};
-    use aster_node::application::{MAX_SELECTED_BLOB_PAGE_BYTES, MAX_SELECTED_LIVE_BLOB_BYTES};
+    use aster_node::application::{MAX_SELECTED_BLOB_PAGE_BYTES, MAX_SELECTED_BLOB_STREAM_BYTES};
     #[cfg(target_os = "linux")]
     use aster_node::mission::UnprotectedReferenceMission;
     #[cfg(target_os = "linux")]
@@ -703,7 +703,7 @@ mod tests {
             ErrorCode::InvalidArgument
         );
         assert_eq!(
-            UploadGrammar::start(metadata_frame(MAX_SELECTED_LIVE_BLOB_BYTES + 1, None))
+            UploadGrammar::start(metadata_frame(MAX_SELECTED_BLOB_STREAM_BYTES + 1, None))
                 .unwrap_err()
                 .code,
             ErrorCode::ResourceExhausted
@@ -799,7 +799,7 @@ mod tests {
 
     #[test]
     fn rpc_blob_frame_size_is_a_stable_agent_contract() {
-        assert_eq!(crate::BLOB_RPC_FRAME_BYTES, 64 * 1024);
+        assert_eq!(crate::BLOB_RPC_FRAME_BYTES, 512 * 1024);
     }
 
     #[cfg(target_os = "linux")]

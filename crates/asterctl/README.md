@@ -81,11 +81,11 @@ Bearer authorization header. Blob transfers use native gRPC over HTTP/2 so
 request and response pages remain bounded; the Event commands retain their
 existing Connect protocol behavior. The current agent accepts loopback
 listeners; `--host` does not change that server restriction. There is no TLS.
-Each RPC has a configurable timeout (10 seconds by default), a 4-MiB response
-limit and a 4-MiB decoded-element budget.
+Each RPC has a configurable timeout (10 seconds by default; Blob publish/read
+use 15 minutes by default), a 4-MiB response limit and a 4-MiB decoded-element budget.
 Use `--timeout 30` or `--timeout=30` before or after the command to change the
 client deadline. The agent may enforce a shorter deadline: the current
-`aster-agent` caps each RPC at 30 seconds, even when the client requests more.
+`aster-agent` caps each RPC at 15 minutes, even when the client requests more.
 Query applies a fresh deadline to each page request, not to the whole query.
 The RPC timeout does not limit time spent entering a payload on stdin.
 

@@ -33,7 +33,7 @@ The source file's contents and length must remain unchanged until the command ex
 ";
 
 /// Stable native gRPC Blob payload frame size owned by the CLI protocol layer.
-pub(crate) const RPC_FRAME_BYTES: usize = 64 * 1024;
+pub(crate) const RPC_FRAME_BYTES: usize = 512 * 1024;
 pub(crate) const CHUNK_BYTES: usize = RPC_FRAME_BYTES;
 const MAX_MEDIA_TYPE_BYTES: usize = 255;
 const MAX_SCHEMA_ID_BYTES: usize = 1024;

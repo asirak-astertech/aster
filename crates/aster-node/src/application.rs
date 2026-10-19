@@ -75,9 +75,10 @@ pub use blob::{
     BlobReadPageRequest, BlobReadRequest, BlobReadResult, BlobRetirementDelivery,
     BlobRetirementReason, BlobSubscription, BlobSubscriptionId, BlobSubscriptionRequest,
     BlobTransferPhase, BlobTransferStatus, BlobUnsubscribe, MAX_SELECTED_BLOB_DELIVERIES,
-    MAX_SELECTED_BLOB_PAGE_BYTES, MAX_SELECTED_BLOB_SUBSCRIPTION_SCAN,
-    MAX_SELECTED_LIVE_BLOB_BYTES, MAX_SELECTED_LIVE_BLOB_CHUNKS, PendingBlobTransferStatus,
-    SelectedBlobHandle, SelectedBlobNode, SelectedBlobOptions,
+    MAX_SELECTED_BLOB_PAGE_BYTES, MAX_SELECTED_BLOB_STREAM_BYTES,
+    MAX_SELECTED_BLOB_SUBSCRIPTION_SCAN, MAX_SELECTED_LIVE_BLOB_BYTES,
+    MAX_SELECTED_LIVE_BLOB_CHUNKS, PendingBlobTransferStatus, SelectedBlobHandle, SelectedBlobNode,
+    SelectedBlobOptions,
 };
 pub use blob_stream::{BlobPublishProgress, BlobPublishStreamRequest, SelectedBlobPublishStream};
 pub(crate) use record::SelectedRecordCommand;

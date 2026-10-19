@@ -81,11 +81,11 @@ loop {
 }
 ```
 
-The live publisher accepts a nonempty regular file of at most 64 MiB, with its
-cursor at exactly zero, and fixes the selected chunk size at 64 KiB. The file is
+The legacy live-file publisher accepts a nonempty regular file of at most 64 MiB,
+with its cursor at exactly zero, and fixes the selected chunk size at 64 KiB. The file is
 moved into a bounded, joined worker rather than cloned into the actor command.
-The 64-MiB ceiling is the current selected-backend policy, not a public RPC or
-wire-format guarantee.
+That 64-MiB ceiling belongs to the legacy profile-4 facade, not the resumable
+application streaming protocol described below.
 The returned publication is operation-key idempotent and echoes its original
 signed TTL (`None` means durable), never a remaining lifetime or deletion
 timestamp. `BlobPublishOptions::finite_ttl_ms(0)` returns `InvalidRequest` before
@@ -159,12 +159,12 @@ exactly `"ttlMs": "60000"`; durable JSON omits `ttlMs`. The value is the
 original authenticated lifetime, never a countdown or deletion time. Blob
 plaintext is written only to the requested output and is never printed.
 
-The RPC and CLI use checked `u64` lengths and bounded 64-KiB frames/pages; they
-do not promise a fixed total-size ceiling. The current selected backend rejects
-objects above 64 MiB. The shared agent deadline policy currently defaults to
-10 seconds and caps a stream at 30 seconds, even if `asterctl --timeout` asks
-for longer. These values describe this implementation, not durable RPC
-semantics, supported large-file behavior, or performance qualification.
+The RPC and CLI use checked `u64` lengths and bounded 512-KiB frames/pages over
+independently authenticated 1-MiB segments. The resumable stream protocol has
+an explicit 8-GiB per-object ceiling. Blob publish/read default to 15 minutes;
+an explicit `asterctl --timeout` may shorten that attempt, while the agent caps
+longer requests at 15 minutes. A timed-out upload is retried with the same
+operation key and resumes from the receiver's last durable checkpoint.
 
 `blob-read` currently requires Linux, a destination directory owned by the
 current user and not writable by group or other users, and a filesystem that

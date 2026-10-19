@@ -22,7 +22,7 @@ Blob bytes are written only to --output; stdout contains metadata only.
 ";
 
 /// Stable native gRPC Blob response-page size owned by the CLI protocol layer.
-pub(crate) const RPC_PAGE_BYTES: usize = 64 * 1024;
+pub(crate) const RPC_PAGE_BYTES: usize = 512 * 1024;
 const MAX_PAGE_BYTES: usize = RPC_PAGE_BYTES;
 const MAX_MEDIA_TYPE_BYTES: usize = 255;
 const MAX_SCHEMA_ID_BYTES: usize = 1024;
@@ -408,7 +408,7 @@ mod tests {
             scope: "mission/team/alpha".into(),
             priority: api::Priority::Immediate.into(),
             ttl_ms: Some(u64::MAX),
-            total_len: 65_537,
+            total_len: MAX_PAGE_BYTES as u64 + 1,
             media_type: Some("application/octet-stream".into()),
             schema_id: b"schema".to_vec(),
             acceptance_marker: 4,
@@ -425,13 +425,19 @@ mod tests {
         validator
             .accept(&page(0, vec![7; MAX_PAGE_BYTES], false))
             .unwrap();
-        assert!(validator.accept(&page(65_535, vec![8], true)).is_err());
+        assert!(
+            validator
+                .accept(&page(MAX_PAGE_BYTES as u64 - 1, vec![8], true))
+                .is_err()
+        );
 
         let mut validator = Validator::new(request());
         validator
             .accept(&page(0, vec![7; MAX_PAGE_BYTES], false))
             .unwrap();
-        validator.accept(&page(65_536, vec![8], true)).unwrap();
+        validator
+            .accept(&page(MAX_PAGE_BYTES as u64, vec![8], true))
+            .unwrap();
         assert_eq!(validator.finish().unwrap().ttl_ms, Some(u64::MAX));
     }
 
@@ -441,7 +447,7 @@ mod tests {
         validator
             .accept(&page(0, vec![7; MAX_PAGE_BYTES], false))
             .unwrap();
-        let mut changed = page(65_536, vec![8], true);
+        let mut changed = page(MAX_PAGE_BYTES as u64, vec![8], true);
         changed.ttl_ms = None;
         assert!(validator.accept(&changed).is_err());
 

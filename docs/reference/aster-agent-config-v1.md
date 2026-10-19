@@ -162,7 +162,7 @@ Unsigned integer fields use their JSON integer representation.
 
 The server also retains compiled, non-configurable bounds: 1 MiB encoded
 request/message, 4 MiB protobuf element memory, 2 MiB encoded protobuf
-response, RPC deadlines of 10 ms through 30 seconds (10-second default), 32
+response, RPC deadlines of 10 ms through 15 minutes (10-second default), 32
 HTTP/2 streams per connection, and streaming poll backoff of 100 through
 60,000 ms. Event query, delivery, and scan pages are each `1..=1024`.
 

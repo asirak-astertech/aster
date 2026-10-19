@@ -16,6 +16,7 @@ use std::{
 };
 
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+pub const BLOB_TRANSFER_DEFAULT_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 fn rpc_hint(code: connectrpc::ErrorCode) -> &'static str {
     use connectrpc::ErrorCode::*;

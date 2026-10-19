@@ -128,11 +128,12 @@ Text output renders the original signed TTL as exactly `TTL: durable` or
 `TTL: 60000 ms`. Finite JSON renders exactly `"ttlMs": "60000"`; durable JSON
 omits `ttlMs`. These values are the original lifetime, not remaining time.
 
-The CLI and wire fields use checked `u64` lengths and do not define a 64-MiB
-protocol maximum. The current selected backend nevertheless admits at most
-64 MiB, and the shared agent deadline policy currently defaults to 10 seconds
-and caps each stream at 30 seconds. Those are current implementation limits,
-not RPC compatibility guarantees or large-file performance claims.
+The CLI and wire fields use checked `u64` lengths. The resumable stream
+protocol admits at most 8 GiB per Blob and uses bounded 512-KiB application
+frames over independent 1-MiB authenticated segments. Blob commands default
+to a 15-minute deadline; other RPCs retain the 10-second default. The server
+caps an explicitly requested deadline at 15 minutes. These are current
+implementation limits, not RPC compatibility guarantees.
 
 `blob-read` currently requires Linux, an owner-controlled destination directory
 (owned by the current user and not writable by group or other users), and a
