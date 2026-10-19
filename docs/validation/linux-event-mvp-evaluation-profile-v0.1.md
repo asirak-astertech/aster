@@ -28,10 +28,8 @@ definition of done. This document remains the exact profile authority.
 
 ## Current API and historical qualification boundary
 
-This page includes explanatory notices added after v0.1 approval. Qualification
-continues to bind the [unchanged accepted profile bytes](linux-event-mvp-evaluation-profile-v0.1-frozen.md)
-with SHA-256 `7c42a40802b89a121282f05d8cf99f67c82d33d29c82c565acaeaa1a08cb5750`.
-The frozen copy retains the original relative links and section anchors.
+The qualification validator's `PROFILE_DIGEST` binds the exact bytes of this
+canonical document, including the publication API clarifications below.
 
 The accepted v0.1 publication contract below predates the numbered-only
 switchover. Its `PublishEvent` method, caller-chosen operation keys, and
@@ -50,8 +48,8 @@ profile amendment covering the changed API, client/server capacity and recovery
 lifecycle, and qualification evidence bound to the exact build and artifacts.
 The original operation-key limits must not be translated into numbered-client
 or result limits without that review. This notice preserves the accepted
-profile, its other constraints, and its evidence; it grants no new approval or
-requirement credit.
+profile's other constraints and historical evidence boundaries; it grants no
+new approval or requirement credit.
 
 ## Summary
 
