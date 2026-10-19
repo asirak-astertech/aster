@@ -56,6 +56,10 @@ const MAX_SOFTWARE_ERASURE_PATH_BYTES: usize =
     MAX_SOFTWARE_ERASURE_DESCRIPTOR_BYTES - SOFTWARE_ERASURE_DESCRIPTOR_HEADER_BYTES;
 const ERASE_BUFFER_BYTES: usize = 8 * 1024;
 const CLASSICAL_CHANNEL_BINDING_CONTEXT_MAGIC: &[u8; 8] = b"ASTRCB01";
+// The selected contact runtime below implements the legacy fixed lanes and the
+// v7/v8 BlobRangesStreamV1 lane. The separate profile-5 Blob DAG must not be
+// advertised here until it is dispatched by this contact owner.
+const SELECTED_CONTACT_SEMANTIC_CEILING: u16 = 8;
 /// Exact bytes in a canonical carrier-bound classical mission context.
 pub const CLASSICAL_CHANNEL_BINDING_CONTEXT_BYTES: usize = 8 + 2 + 8 + 32 * 6;
 
@@ -1698,7 +1702,10 @@ impl MissionSessionInitiator {
         bundle: ProvisioningBundle,
         admission: HybridPeerAdmission,
     ) -> Result<(Self, MissionHandshakeFlight), MissionSessionError> {
-        let (inner, flight) = ReferenceSessionInitiator::start(bundle)?;
+        let (inner, flight) = ReferenceSessionInitiator::start_with_semantic_ceiling(
+            bundle,
+            SELECTED_CONTACT_SEMANTIC_CEILING,
+        )?;
         Ok((
             Self { inner, admission },
             MissionHandshakeFlight::new(flight),
@@ -1857,6 +1864,19 @@ impl MissionSessionResponder {
         Self::open_with_admission(bundle, HybridPeerAdmission::exact(peer, observed_carrier)?)
     }
 
+    #[cfg(test)]
+    fn open_with_semantic_ceiling_for_test(
+        bundle: ProvisioningBundle,
+        peer: MissionPeerBinding,
+        observed_carrier: EndpointId,
+        semantic_ceiling: u16,
+    ) -> Result<Self, MissionSessionError> {
+        Ok(Self {
+            inner: ReferenceSessionResponder::open_with_semantic_ceiling(bundle, semantic_ceiling)?,
+            admission: HybridPeerAdmission::exact(peer, observed_carrier)?,
+        })
+    }
+
     fn open_discovered(
         bundle: ProvisioningBundle,
         observed_carrier: EndpointId,
@@ -1869,7 +1889,10 @@ impl MissionSessionResponder {
         admission: HybridPeerAdmission,
     ) -> Result<Self, MissionSessionError> {
         Ok(Self {
-            inner: ReferenceSessionResponder::open(bundle)?,
+            inner: ReferenceSessionResponder::open_with_semantic_ceiling(
+                bundle,
+                SELECTED_CONTACT_SEMANTIC_CEILING,
+            )?,
             admission,
         })
     }
@@ -2963,10 +2986,11 @@ mod tests {
                 responder.carrier,
                 vec![semantic_version],
             )?;
-        let responder_state = MissionSessionResponder::open(
+        let responder_state = MissionSessionResponder::open_with_semantic_ceiling_for_test(
             responder.bundle(),
             binding(initiator),
             initiator.carrier,
+            semantic_version,
         )?;
         let (responder_pending, second) = responder_state.receive_client(first.as_bytes())?;
         let (initiator_pending, third) = initiator_state.receive_server(second.as_bytes())?;

@@ -4575,6 +4575,21 @@ impl ReferenceSessionInitiator {
         )
     }
 
+    /// Starts a session for an adapter that fully implements semantic versions
+    /// only through `semantic_ceiling`.
+    ///
+    /// This declares implementation capability; it is not an application
+    /// protocol preference or an in-session downgrade mechanism.
+    pub fn start_with_semantic_ceiling(
+        bundle: ProvisioningBundle,
+        semantic_ceiling: u16,
+    ) -> Result<(Self, Vec<u8>), EnvelopeError> {
+        if semantic_ceiling == 0 || semantic_ceiling > super::SEMANTIC_PROTOCOL_V9 {
+            return Err(invalid_envelope());
+        }
+        Self::start_with_semantic_versions(bundle, (1..=semantic_ceiling).rev().collect())
+    }
+
     /// Compatibility-only constructor for downstream authenticated transport
     /// tests representing an older implementation. This symbol is absent
     /// unless the non-default `test-utils` feature is selected.
@@ -4745,6 +4760,7 @@ impl ReferenceSessionAwaitingFinished {
 /// Initial responder state for the four-flight authenticated session.
 pub struct ReferenceSessionResponder {
     endpoint: SessionEndpoint,
+    supported_versions: Vec<u16>,
 }
 
 impl fmt::Debug for ReferenceSessionResponder {
@@ -4760,8 +4776,34 @@ impl fmt::Debug for ReferenceSessionResponder {
 impl ReferenceSessionResponder {
     /// Opens a responder from an opaque provisioning package.
     pub fn open(bundle: ProvisioningBundle) -> Result<Self, EnvelopeError> {
+        Self::open_with_semantic_versions(
+            bundle,
+            super::SUPPORTED_SEMANTIC_PROTOCOL_VERSIONS.to_vec(),
+        )
+    }
+
+    /// Opens a responder for an adapter that fully implements semantic
+    /// versions only through `semantic_ceiling`.
+    ///
+    /// See [`ReferenceSessionInitiator::start_with_semantic_ceiling`].
+    pub fn open_with_semantic_ceiling(
+        bundle: ProvisioningBundle,
+        semantic_ceiling: u16,
+    ) -> Result<Self, EnvelopeError> {
+        if semantic_ceiling == 0 || semantic_ceiling > super::SEMANTIC_PROTOCOL_V9 {
+            return Err(invalid_envelope());
+        }
+        Self::open_with_semantic_versions(bundle, (1..=semantic_ceiling).rev().collect())
+    }
+
+    pub(crate) fn open_with_semantic_versions(
+        bundle: ProvisioningBundle,
+        supported_versions: Vec<u16>,
+    ) -> Result<Self, EnvelopeError> {
+        super::validate_version_offer(&supported_versions).map_err(handshake_error)?;
         Ok(Self {
             endpoint: SessionEndpoint::open(bundle)?,
+            supported_versions,
         })
     }
 
@@ -4801,11 +4843,14 @@ impl ReferenceSessionResponder {
             };
         // Mission proof verification deliberately precedes P-256 agreement and ML-KEM
         // encapsulation so unauthenticated probes cannot trigger the expensive response.
-        let prepared =
-            match ResponderHandshakePrepared::respond(&mut self.endpoint.provider, &hello) {
-                Ok(prepared) => prepared,
-                Err(error) => return Err((self, handshake_error(error))),
-            };
+        let prepared = match ResponderHandshakePrepared::respond_with_supported_versions(
+            &mut self.endpoint.provider,
+            &hello,
+            &self.supported_versions,
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => return Err((self, handshake_error(error))),
+        };
         let (handshake, server_hello) = match prepared.seal_server_auth(
             &mut self.endpoint.provider,
             &self.endpoint.signing_key,
@@ -10562,6 +10607,7 @@ mod tests {
             SEMANTIC_PROTOCOL_V6,
             SEMANTIC_PROTOCOL_V7,
             SEMANTIC_PROTOCOL_V8,
+            SEMANTIC_PROTOCOL_V9,
         ] {
             let mut provisioner = ReferenceProvisioner::from_seed([0x40 + version as u8; 32])
                 .unwrap_or_else(|error| panic!("v{version} provisioner failed: {error}"));
@@ -10577,7 +10623,7 @@ mod tests {
             assert_eq!(responder.semantic_version(), version);
         }
 
-        for unsupported in [0, SEMANTIC_PROTOCOL_V8 + 1] {
+        for unsupported in [0, SEMANTIC_PROTOCOL_V9 + 1] {
             let mut provisioner = ReferenceProvisioner::from_seed([0x50 + unsupported as u8; 32])
                 .unwrap_or_else(|error| panic!("v{unsupported} provisioner failed: {error}"));
             let initiator_bundle = provisioner
@@ -10639,7 +10685,7 @@ mod tests {
     }
 
     #[test]
-    fn mission_proof_rejects_stripping_v8_from_the_default_offer() {
+    fn mission_proof_rejects_stripping_v9_from_the_default_offer() {
         let mut provisioner = ReferenceProvisioner::from_seed([0x74; 32])
             .unwrap_or_else(|error| panic!("provisioner failed: {error}"));
         let initiator_bundle = provisioner
@@ -10655,6 +10701,7 @@ mod tests {
         assert_eq!(
             hello.supported_versions,
             vec![
+                SEMANTIC_PROTOCOL_V9,
                 SEMANTIC_PROTOCOL_V8,
                 SEMANTIC_PROTOCOL_V7,
                 SEMANTIC_PROTOCOL_V6,
@@ -10669,6 +10716,7 @@ mod tests {
         assert_eq!(
             hello.supported_versions,
             vec![
+                SEMANTIC_PROTOCOL_V8,
                 SEMANTIC_PROTOCOL_V7,
                 SEMANTIC_PROTOCOL_V6,
                 SEMANTIC_PROTOCOL_V5,
@@ -10703,6 +10751,7 @@ mod tests {
         assert_eq!(
             default_hello.supported_versions,
             vec![
+                SEMANTIC_PROTOCOL_V9,
                 SEMANTIC_PROTOCOL_V8,
                 SEMANTIC_PROTOCOL_V7,
                 SEMANTIC_PROTOCOL_V6,
@@ -10731,8 +10780,8 @@ mod tests {
             .unwrap_or_else(|error| panic!("server finished failed: {error}"));
         assert_eq!(initiator_session.peer_identity(), responder_id);
         assert_eq!(responder_session.peer_identity(), initiator_id);
-        assert_eq!(initiator_session.semantic_version(), SEMANTIC_PROTOCOL_V8);
-        assert_eq!(responder_session.semantic_version(), SEMANTIC_PROTOCOL_V8);
+        assert_eq!(initiator_session.semantic_version(), SEMANTIC_PROTOCOL_V9);
+        assert_eq!(responder_session.semantic_version(), SEMANTIC_PROTOCOL_V9);
 
         let frame = initiator_session
             .seal_frame(b"opaque replication frame")
@@ -13532,7 +13581,7 @@ mod tests {
     }
 
     #[test]
-    fn on_path_rewrite_of_an_offered_v7_selection_to_v5_fails_authentication() {
+    fn on_path_rewrite_of_an_offered_v9_selection_to_v5_fails_authentication() {
         let mut provisioner = ReferenceProvisioner::from_seed([0x8e; 32])
             .unwrap_or_else(|error| panic!("provisioner failed: {error}"));
         let initiator_bundle = provisioner
@@ -13549,6 +13598,7 @@ mod tests {
         assert_eq!(
             hello.supported_versions,
             vec![
+                SEMANTIC_PROTOCOL_V9,
                 SEMANTIC_PROTOCOL_V8,
                 SEMANTIC_PROTOCOL_V7,
                 SEMANTIC_PROTOCOL_V6,
@@ -13566,7 +13616,7 @@ mod tests {
             .unwrap_or_else(|error| panic!("client flight failed: {error}"));
         let mut server_hello = decode_server_flight(&second_flight)
             .unwrap_or_else(|error| panic!("server flight decode failed: {error}"));
-        assert_eq!(server_hello.selected_version, SEMANTIC_PROTOCOL_V8);
+        assert_eq!(server_hello.selected_version, SEMANTIC_PROTOCOL_V9);
 
         // Version 5 was genuinely offered, so membership checks alone would
         // accept it. The rewrite must still fail because selection is bound

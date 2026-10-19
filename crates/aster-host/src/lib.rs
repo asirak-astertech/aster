@@ -74,6 +74,10 @@ use std::time::Instant;
 const MAX_FILTER_NAMES: usize = 256;
 const MAX_CONFIGURED_CARRIERS: usize = 256;
 const MAX_CARRIERS_PER_PEER: usize = 16;
+// This compatibility host owns the v7/v8 BlobRangesStreamV1 lane. Semantic v9
+// selects the distinct BlobStreamV1 runtime implemented by `aster-node` and
+// deliberately has no profile-4 fallback.
+const LEGACY_HOST_SEMANTIC_CEILING: u16 = 8;
 
 type DurableBackend = ReferenceSemanticRuntimeBackend;
 type ContactDriver = RuntimeDriver<PeerBoundBackend>;
@@ -790,9 +794,23 @@ impl MeshService {
             inner: *backend,
         };
         let driver = if self.identity < peer {
-            RuntimeDriver::initiator(bundle, sync, bound, start, Some(peer))
+            RuntimeDriver::initiator_with_semantic_ceiling(
+                bundle,
+                sync,
+                bound,
+                start,
+                Some(peer),
+                LEGACY_HOST_SEMANTIC_CEILING,
+            )
         } else {
-            RuntimeDriver::responder_with_start(bundle, sync, bound, start, Some(peer))
+            RuntimeDriver::responder_with_start_and_semantic_ceiling(
+                bundle,
+                sync,
+                bound,
+                start,
+                Some(peer),
+                LEGACY_HOST_SEMANTIC_CEILING,
+            )
         };
         match driver {
             Ok(driver) => {

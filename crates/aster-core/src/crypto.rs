@@ -1685,15 +1685,26 @@ pub(crate) struct ResponderHandshakePrepared {
 }
 
 impl ResponderHandshakePrepared {
+    #[cfg(test)]
     pub(crate) fn respond<P: CryptoProvider>(
         provider: &mut P,
         client_hello: &ClientHello,
     ) -> Result<Self, CryptoError> {
-        validate_client_hello(client_hello)?;
-        let selected_version = select_highest_common_version(
-            &client_hello.supported_versions,
+        Self::respond_with_supported_versions(
+            provider,
+            client_hello,
             SUPPORTED_SEMANTIC_PROTOCOL_VERSIONS,
-        )?;
+        )
+    }
+
+    pub(crate) fn respond_with_supported_versions<P: CryptoProvider>(
+        provider: &mut P,
+        client_hello: &ClientHello,
+        supported_versions: &[u16],
+    ) -> Result<Self, CryptoError> {
+        validate_client_hello(client_hello)?;
+        let selected_version =
+            select_highest_common_version(&client_hello.supported_versions, supported_versions)?;
         let selected_suite =
             select_preferred_common_suite(&client_hello.offered_suites, SUPPORTED_HYBRID_SUITES)?;
         // Parse/validate the classical key before performing expensive post-quantum work.
@@ -2690,6 +2701,7 @@ mod tests {
             assert_eq!(
                 stripped_hello.supported_versions,
                 vec![
+                    SEMANTIC_PROTOCOL_V9,
                     SEMANTIC_PROTOCOL_V8,
                     SEMANTIC_PROTOCOL_V7,
                     SEMANTIC_PROTOCOL_V6,
