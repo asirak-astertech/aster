@@ -805,6 +805,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn lazy_read_reauthenticates_expiry_between_pages() {
+        let ttl = std::time::Duration::from_secs(5);
         let fixture = StagingTestRoot::new();
         let state_root = fixture.0.join("state");
         fs::create_dir(&state_root).unwrap();
@@ -849,7 +850,10 @@ mod tests {
                     media_type: None,
                     schema_id: Vec::new(),
                 },
-                BlobPublishOptions::finite_ttl_ms(1_000).unwrap(),
+                BlobPublishOptions::finite_ttl_ms(
+                    u64::try_from(ttl.as_millis()).expect("test TTL fits u64"),
+                )
+                .unwrap(),
                 fs::File::open(source_path).unwrap(),
             )
             .await
@@ -870,7 +874,7 @@ mod tests {
         assert_eq!(first.chunk.len(), MAX_SELECTED_BLOB_PAGE_BYTES);
         assert!(!first.complete);
 
-        tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+        tokio::time::sleep(ttl + std::time::Duration::from_millis(100)).await;
         let expired = stream.next().await.unwrap().unwrap_err();
         assert_eq!(expired.code, ErrorCode::NotFound);
         assert_eq!(

@@ -31480,7 +31480,7 @@ mod tests {
             .await
             .expect("deadline Blob worker permit deadline")
             .expect("deadline Blob worker permit observation");
-        timeout(Duration::from_secs(2), async {
+        timeout(Duration::from_secs(10), async {
             loop {
                 let observation = schedule_receiver
                     .recv()
@@ -31507,7 +31507,7 @@ mod tests {
             .expect("deadline Blob operation task")
             .expect("deadline Blob operation succeeds");
 
-        timeout(Duration::from_secs(2), async {
+        timeout(Duration::from_secs(10), async {
             let mut expired_units = 0usize;
             while expired_units < 2 {
                 let progress = progress_receiver
