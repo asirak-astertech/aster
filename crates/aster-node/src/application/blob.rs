@@ -25,11 +25,11 @@ use std::{
 use aster_mesh::{
     BLOB_STREAM_SEGMENT_BYTES, BlobContentVerification, BlobError, BlobId as CoreBlobId,
     BlobMetadata as CoreBlobMetadata, BlobPublicationStreamId, BlobStreamFinalCommitment,
-    BlobStreamFrontier, BlobStreamOpen, BlobStreamPlainPartition, BlobStreamSegmentOpener,
-    BlobStreamSegmentSealer, ContentVerifiedBlobEnvelope, CustodySample, MAX_BLOB_MEDIA_TYPE_BYTES,
-    MAX_BLOB_SCHEMA_ID_BYTES, MAX_BLOB_STREAM_BYTES, NodeId, PreparedBlob, Priority,
-    ReferenceEnvelopeSealer, SELECTED_BLOB_CHUNK_SIZE, Scope, Topic, VerifiedBlobStreamOpen,
-    prepare_blob,
+    BlobStreamFrontier, BlobStreamOpen, BlobStreamPlainPartition, BlobStreamSegmentLeaves,
+    BlobStreamSegmentOpener, BlobStreamSegmentSealer, ContentVerifiedBlobEnvelope, CustodySample,
+    EncryptedBlobStreamSegment, MAX_BLOB_MEDIA_TYPE_BYTES, MAX_BLOB_SCHEMA_ID_BYTES,
+    MAX_BLOB_STREAM_BYTES, NodeId, PreparedBlob, Priority, ReferenceEnvelopeSealer,
+    SELECTED_BLOB_CHUNK_SIZE, Scope, Topic, VerifiedBlobStreamOpen, prepare_blob,
 };
 use aster_redb_store::pack::{BlobPackReader, BlobPackWriter, PinnedBlobPackRoot};
 #[cfg(test)]
@@ -71,6 +71,7 @@ use crate::{
         open_startup_event_verifier_and_cache, recover_local_blob_capacity_after_cleanup,
         refresh_application_policy,
     },
+    stream_pipeline::{FixedPartitionMapPool, MappedPartition, PipelineError, StreamPartition},
 };
 
 #[derive(Clone, Eq, PartialEq)]
@@ -281,6 +282,8 @@ pub const MAX_SELECTED_BLOB_PAGE_BYTES: usize = 8 * SELECTED_BLOB_CHUNK_SIZE as 
 const MAX_SELECTED_BLOB_PAGE_CHUNKS: u64 =
     MAX_SELECTED_BLOB_PAGE_BYTES as u64 / SELECTED_BLOB_CHUNK_SIZE as u64 + 1;
 const BLOB_STREAM_CHECKPOINT_SEGMENTS: u64 = 64;
+const BLOB_STREAM_MAP_WORKERS: usize = 4;
+const BLOB_STREAM_MAP_QUEUE_ITEMS: usize = 8;
 
 /// Maximum number of immutable Blob publication notifications returned by one poll.
 pub const MAX_SELECTED_BLOB_DELIVERIES: usize = MAX_BLOB_POLL_DELIVERIES;
@@ -1385,9 +1388,15 @@ struct LocalBlobPublishStream {
     total_len: u64,
     accepted_offset: u64,
     pending: Zeroizing<Vec<u8>>,
-    unsealed: Vec<BlobStreamPlainPartition>,
+    map_pool: Option<FixedPartitionMapPool<SealedBlobStreamPartition>>,
+    mapped: BTreeMap<u64, MappedPartition<SealedBlobStreamPartition>>,
+    next_map_index: u64,
+    next_sink_index: u64,
+    mapped_segments: u64,
     publisher_counter: u64,
 }
+
+type SealedBlobStreamPartition = (EncryptedBlobStreamSegment, BlobStreamSegmentLeaves);
 
 struct LocalBlobReadStream {
     publication: BlobStreamPublication,
@@ -1401,39 +1410,88 @@ fn take_zeroizing_bytes(mut bytes: Zeroizing<Vec<u8>>) -> Vec<u8> {
     std::mem::take(&mut *bytes)
 }
 
-fn seal_ready_stream_partitions(
+fn blob_stream_map_pool(
+    open: &VerifiedBlobStreamOpen,
+    sealer: &BlobStreamSegmentSealer,
+    total_len: u64,
+) -> Result<FixedPartitionMapPool<SealedBlobStreamPartition>, ApplicationError> {
+    let stream_id = *open.open().stream_id().as_bytes();
+    let open_digest = open.open().digest();
+    let content_epoch = open.open().content_epoch();
+    let sealer = sealer.clone();
+    FixedPartitionMapPool::new(
+        BLOB_STREAM_MAP_WORKERS,
+        BLOB_STREAM_MAP_QUEUE_ITEMS,
+        move |partition| {
+            let index = partition.index();
+            let offset = index.checked_mul(BLOB_STREAM_SEGMENT_BYTES as u64).ok_or(
+                PipelineError::MapFailed("blob stream offset overflow".into()),
+            )?;
+            let partition = BlobStreamPlainPartition::new(
+                stream_id,
+                open_digest,
+                content_epoch,
+                index,
+                offset,
+                total_len,
+                partition.into_bytes(),
+            )
+            .map_err(|error| PipelineError::MapFailed(error.to_string()))?;
+            sealer
+                .seal(partition)
+                .map_err(|error| PipelineError::MapFailed(error.to_string()))
+        },
+    )
+    .map_err(blob_stream_pipeline_error)
+}
+
+fn blob_stream_pipeline_error(_error: PipelineError) -> ApplicationError {
+    ApplicationError::new(ApplicationErrorKind::Integrity, "blob stream pipeline")
+}
+
+fn sink_mapped_stream_partitions(
     stream: &mut LocalBlobPublishStream,
-    force: bool,
+    wait_for_all: bool,
 ) -> Result<(), ApplicationError> {
-    if stream.unsealed.is_empty() || (!force && stream.unsealed.len() < 2) {
-        return Ok(());
-    }
-    let partitions = std::mem::take(&mut stream.unsealed);
-    let mapped = std::thread::scope(|scope| {
-        let workers = partitions
-            .into_iter()
-            .map(|partition| {
-                let sealer = stream.sealer.clone();
-                scope.spawn(move || sealer.seal(partition))
-            })
-            .collect::<Vec<_>>();
-        workers
-            .into_iter()
-            .map(|worker| {
-                worker
-                    .join()
-                    .map_err(|_| {
-                        ApplicationError::new(ApplicationErrorKind::Integrity, "blob stream write")
-                    })?
-                    .map_err(|error| blob_core_error("blob stream write", error))
-            })
-            .collect::<Result<Vec<_>, _>>()
-    })?;
-    for (segment, leaves) in mapped {
-        stream
-            .writer
-            .append(&segment, leaves)
-            .map_err(|error| blob_pack_application_error("blob stream write", error))?;
+    loop {
+        let mapped = if wait_for_all && stream.mapped_segments < stream.next_map_index {
+            Some(
+                stream
+                    .map_pool
+                    .as_mut()
+                    .expect("open stream map pool")
+                    .recv_mapped_blocking()
+                    .map_err(blob_stream_pipeline_error)?,
+            )
+        } else {
+            stream
+                .map_pool
+                .as_mut()
+                .expect("open stream map pool")
+                .try_recv_mapped()
+                .map_err(blob_stream_pipeline_error)?
+        };
+        let Some(mapped) = mapped else {
+            break;
+        };
+        let index = mapped.index();
+        if stream.mapped.insert(index, mapped).is_some() {
+            return Err(blob_stream_pipeline_error(
+                PipelineError::NonContiguousIndex {
+                    expected: stream.next_sink_index,
+                    actual: index,
+                },
+            ));
+        }
+        stream.mapped_segments += 1;
+        while let Some(mapped) = stream.mapped.remove(&stream.next_sink_index) {
+            let (segment, leaves) = mapped.into_value();
+            stream
+                .writer
+                .append(&segment, leaves)
+                .map_err(|error| blob_pack_application_error("blob stream write", error))?;
+            stream.next_sink_index += 1;
+        }
     }
     Ok(())
 }
@@ -1906,9 +1964,20 @@ impl SelectedBlobNode {
                     &stream.open,
                 )
                 .map_err(|error| application_error("blob stream open", error.into()))?;
+            if let Some(map_pool) = stream.map_pool.take() {
+                map_pool.shutdown().map_err(blob_stream_pipeline_error)?;
+            }
             stream.pending.clear();
-            stream.unsealed.clear();
+            stream.mapped.clear();
             stream.accepted_offset = stream.resume.durable_plaintext_offset();
+            stream.next_map_index = stream.resume.next_segment_index();
+            stream.next_sink_index = stream.resume.next_segment_index();
+            stream.mapped_segments = stream.resume.next_segment_index();
+            stream.map_pool = Some(blob_stream_map_pool(
+                &stream.open,
+                &stream.sealer,
+                stream.total_len,
+            )?);
             return Ok(OpenedBlobPublishStream {
                 token,
                 progress: BlobPublishProgress {
@@ -2024,6 +2093,8 @@ impl SelectedBlobNode {
             .blob_stream_segment_sealer(&open)
             .map_err(|error| application_error("blob stream open", error.into()))?;
         let durable_offset = resume.durable_plaintext_offset();
+        let next_segment_index = resume.next_segment_index();
+        let map_pool = blob_stream_map_pool(&open, &sealer, request.total_len)?;
         self.publish_streams.insert(
             token,
             LocalBlobPublishStream {
@@ -2037,7 +2108,11 @@ impl SelectedBlobNode {
                 total_len: request.total_len,
                 accepted_offset: durable_offset,
                 pending: Zeroizing::new(Vec::with_capacity(BLOB_STREAM_SEGMENT_BYTES)),
-                unsealed: Vec::with_capacity(2),
+                map_pool: Some(map_pool),
+                mapped: BTreeMap::new(),
+                next_map_index: next_segment_index,
+                next_sink_index: next_segment_index,
+                mapped_segments: next_segment_index,
                 publisher_counter: causal.counter(),
             },
         );
@@ -2060,6 +2135,7 @@ impl SelectedBlobNode {
         let stream = self.publish_streams.get_mut(&token).ok_or_else(|| {
             ApplicationError::new(ApplicationErrorKind::NotFound, "blob stream write")
         })?;
+        sink_mapped_stream_partitions(stream, false)?;
         let byte_len = u64::try_from(bytes.len()).map_err(|_| {
             ApplicationError::new(ApplicationErrorKind::InvalidRequest, "blob stream write")
         })?;
@@ -2080,25 +2156,25 @@ impl SelectedBlobNode {
         stream.pending.extend_from_slice(&bytes);
         stream.accepted_offset = end;
         if stream.pending.len() == BLOB_STREAM_SEGMENT_BYTES || end == stream.total_len {
-            let segment_offset = end - stream.pending.len() as u64;
             let pending = std::mem::replace(
                 &mut stream.pending,
                 Zeroizing::new(Vec::with_capacity(BLOB_STREAM_SEGMENT_BYTES)),
             );
-            let index = stream.writer.next_index() + stream.unsealed.len() as u64;
-            stream.unsealed.push(
-                BlobStreamPlainPartition::new(
-                    *stream.open.open().stream_id().as_bytes(),
-                    stream.open.open().digest(),
-                    stream.open.open().content_epoch(),
-                    index,
-                    segment_offset,
-                    stream.total_len,
+            stream
+                .map_pool
+                .as_ref()
+                .expect("open stream map pool")
+                .submit_unbudgeted(StreamPartition::new(
+                    stream.next_map_index,
                     take_zeroizing_bytes(pending),
-                )
-                .map_err(|error| blob_core_error("blob stream write", error))?,
-            );
-            seal_ready_stream_partitions(stream, end == stream.total_len)?;
+                ))
+                .map_err(blob_stream_pipeline_error)?;
+            stream.next_map_index += 1;
+            let checkpoint_due = stream
+                .next_map_index
+                .saturating_sub(stream.resume.next_segment_index())
+                >= BLOB_STREAM_CHECKPOINT_SEGMENTS;
+            sink_mapped_stream_partitions(stream, end == stream.total_len || checkpoint_due)?;
         }
         if stream.writer.plaintext_offset() - stream.resume.durable_plaintext_offset()
             >= BLOB_STREAM_CHECKPOINT_SEGMENTS * BLOB_STREAM_SEGMENT_BYTES as u64
@@ -2126,9 +2202,10 @@ impl SelectedBlobNode {
         if let Some(result) = self.completed_publish_streams.remove(&token) {
             return Ok(result);
         }
-        let stream = self.publish_streams.remove(&token).ok_or_else(|| {
+        let mut stream = self.publish_streams.remove(&token).ok_or_else(|| {
             ApplicationError::new(ApplicationErrorKind::NotFound, "blob stream finish")
         })?;
+        sink_mapped_stream_partitions(&mut stream, true)?;
         if stream.accepted_offset != stream.total_len
             || !stream.pending.is_empty()
             || stream.resume.durable_plaintext_offset() != stream.total_len
@@ -2139,6 +2216,12 @@ impl SelectedBlobNode {
                 "blob stream finish",
             ));
         }
+        stream
+            .map_pool
+            .take()
+            .expect("open stream map pool")
+            .shutdown()
+            .map_err(blob_stream_pipeline_error)?;
         let policy = self.current_policy("blob stream finish")?;
         let roots = stream
             .writer

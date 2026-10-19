@@ -11,10 +11,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tokio::{
-    sync::{OwnedSemaphorePermit, Semaphore, mpsc},
-    task::JoinHandle,
-};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct StreamJobId([u8; 16]);
@@ -196,29 +193,197 @@ struct Pending<T> {
     queue_wait: Duration,
     map_time: Duration,
     mapped_at: Instant,
-    _item_permit: OwnedSemaphorePermit,
-    _byte_permit: OwnedSemaphorePermit,
+    _item_permit: Option<OwnedSemaphorePermit>,
+    _byte_permit: Option<OwnedSemaphorePermit>,
 }
 
 struct Work {
     partition: StreamPartition,
     queued_at: Instant,
-    item_permit: OwnedSemaphorePermit,
-    byte_permit: OwnedSemaphorePermit,
+    item_permit: Option<OwnedSemaphorePermit>,
+    byte_permit: Option<OwnedSemaphorePermit>,
 }
 
-async fn stop_workers(
-    work_sender: std_mpsc::Sender<Work>,
+pub(crate) struct FixedPartitionMapPool<T> {
+    work_sender: Option<std_mpsc::SyncSender<Work>>,
+    result_receiver: mpsc::UnboundedReceiver<Result<Pending<T>, PipelineError>>,
     cancelled: Arc<AtomicBool>,
-    workers: Vec<JoinHandle<()>>,
-) -> bool {
-    cancelled.store(true, Ordering::Release);
-    drop(work_sender);
-    let mut panicked = false;
-    for worker in workers {
-        panicked |= worker.await.is_err();
+    workers: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl<T: Send + 'static> FixedPartitionMapPool<T> {
+    pub(crate) fn new<Map>(
+        worker_count: usize,
+        queue_capacity: usize,
+        map: Map,
+    ) -> Result<Self, PipelineError>
+    where
+        Map: Fn(StreamPartition) -> Result<T, PipelineError> + Send + Sync + 'static,
+    {
+        if worker_count == 0 || queue_capacity == 0 {
+            return Err(PipelineError::InvalidLimits);
+        }
+        let map = Arc::new(map);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (work_sender, work_receiver) = std_mpsc::sync_channel::<Work>(queue_capacity);
+        let work_receiver = Arc::new(Mutex::new(work_receiver));
+        let (result_sender, result_receiver) = mpsc::unbounded_channel();
+        let mut workers = Vec::with_capacity(worker_count);
+        for worker_index in 0..worker_count {
+            let receiver = Arc::clone(&work_receiver);
+            let results = result_sender.clone();
+            let map = Arc::clone(&map);
+            let cancelled = Arc::clone(&cancelled);
+            let worker = std::thread::Builder::new()
+                .name(format!("aster-stream-map-{worker_index}"))
+                .spawn(move || {
+                    loop {
+                        if cancelled.load(Ordering::Acquire) {
+                            break;
+                        }
+                        let work = match receiver.lock() {
+                            Ok(receiver) => receiver.recv(),
+                            Err(_) => {
+                                _ = results.send(Err(PipelineError::WorkerPanicked));
+                                break;
+                            }
+                        };
+                        let Ok(work) = work else {
+                            break;
+                        };
+                        if cancelled.load(Ordering::Acquire) {
+                            break;
+                        }
+                        let started = Instant::now();
+                        let queue_wait = started.saturating_duration_since(work.queued_at);
+                        let index = work.partition.index;
+                        let bytes = work.partition.len();
+                        let mapped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            map(work.partition)
+                        }));
+                        let result = match mapped {
+                            Ok(Ok(value)) => Ok(Pending {
+                                mapped: MappedPartition {
+                                    index,
+                                    input_bytes: bytes,
+                                    value,
+                                },
+                                queue_wait,
+                                map_time: started.elapsed(),
+                                mapped_at: Instant::now(),
+                                _item_permit: work.item_permit,
+                                _byte_permit: work.byte_permit,
+                            }),
+                            Ok(Err(error)) => Err(error),
+                            Err(_) => Err(PipelineError::WorkerPanicked),
+                        };
+                        let terminal = result.is_err();
+                        if results.send(result).is_err() || terminal {
+                            break;
+                        }
+                    }
+                })
+                .map_err(|_| PipelineError::WorkerPanicked)?;
+            workers.push(worker);
+        }
+        drop(result_sender);
+        Ok(Self {
+            work_sender: Some(work_sender),
+            result_receiver,
+            cancelled,
+            workers,
+        })
     }
-    panicked
+
+    fn submit(
+        &self,
+        partition: StreamPartition,
+        item_permit: OwnedSemaphorePermit,
+        byte_permit: OwnedSemaphorePermit,
+    ) -> Result<(), PipelineError> {
+        self.submit_work(Work {
+            partition,
+            queued_at: Instant::now(),
+            item_permit: Some(item_permit),
+            byte_permit: Some(byte_permit),
+        })
+    }
+
+    fn submit_work(&self, work: Work) -> Result<(), PipelineError> {
+        self.work_sender
+            .as_ref()
+            .ok_or(PipelineError::WorkerPanicked)?
+            .send(work)
+            .map_err(|_| PipelineError::WorkerPanicked)
+    }
+
+    async fn recv(&mut self) -> Result<Pending<T>, PipelineError> {
+        self.result_receiver
+            .recv()
+            .await
+            .ok_or(PipelineError::WorkerPanicked)?
+    }
+
+    pub(crate) fn submit_unbudgeted(
+        &self,
+        partition: StreamPartition,
+    ) -> Result<(), PipelineError> {
+        self.submit_work(Work {
+            partition,
+            queued_at: Instant::now(),
+            item_permit: None,
+            byte_permit: None,
+        })
+    }
+
+    pub(crate) fn try_recv_mapped(&mut self) -> Result<Option<MappedPartition<T>>, PipelineError> {
+        match self.result_receiver.try_recv() {
+            Ok(result) => result.map(|pending| Some(pending.mapped)),
+            Err(mpsc::error::TryRecvError::Empty) => Ok(None),
+            Err(mpsc::error::TryRecvError::Disconnected) => Err(PipelineError::WorkerPanicked),
+        }
+    }
+
+    pub(crate) fn recv_mapped_blocking(&mut self) -> Result<MappedPartition<T>, PipelineError> {
+        self.result_receiver
+            .blocking_recv()
+            .ok_or(PipelineError::WorkerPanicked)?
+            .map(|pending| pending.mapped)
+    }
+
+    pub(crate) fn shutdown(mut self) -> Result<(), PipelineError> {
+        self.cancelled.store(true, Ordering::Release);
+        drop(self.work_sender.take());
+        let mut panicked = false;
+        for worker in self.workers.drain(..) {
+            panicked |= worker.join().is_err();
+        }
+        if panicked {
+            Err(PipelineError::WorkerPanicked)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+async fn stop_workers<T: Send + 'static>(pool: FixedPartitionMapPool<T>) -> bool {
+    tokio::task::spawn_blocking(move || pool.shutdown().is_err())
+        .await
+        .unwrap_or(true)
+}
+
+impl<T> Drop for FixedPartitionMapPool<T> {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+        drop(self.work_sender.take());
+        // Normal paths call shutdown. On cancellation, joining here guarantees
+        // map workers never outlive the job whose plaintext they own.
+        let mut panicked = false;
+        for worker in self.workers.drain(..) {
+            panicked |= worker.join().is_err();
+        }
+        let _ = panicked;
+    }
 }
 
 fn add_observation(
@@ -382,65 +547,7 @@ where
 {
     let item_budget = Arc::new(Semaphore::new(limits.max_in_flight_items));
     let byte_budget = Arc::new(Semaphore::new(limits.max_in_flight_bytes));
-    let map = Arc::new(map);
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let (work_sender, work_receiver) = std_mpsc::channel::<Work>();
-    let work_receiver = Arc::new(Mutex::new(work_receiver));
-    let (result_sender, mut result_receiver) = mpsc::unbounded_channel();
-    let mut workers = Vec::with_capacity(limits.workers);
-    for _ in 0..limits.workers {
-        let receiver = Arc::clone(&work_receiver);
-        let results = result_sender.clone();
-        let map = Arc::clone(&map);
-        let cancelled = Arc::clone(&cancelled);
-        workers.push(tokio::task::spawn_blocking(move || {
-            loop {
-                if cancelled.load(Ordering::Acquire) {
-                    break;
-                }
-                let work = match receiver.lock() {
-                    Ok(receiver) => receiver.recv(),
-                    Err(_) => {
-                        _ = results.send(Err(PipelineError::WorkerPanicked));
-                        break;
-                    }
-                };
-                let Ok(work) = work else {
-                    break;
-                };
-                if cancelled.load(Ordering::Acquire) {
-                    break;
-                }
-                let started = Instant::now();
-                let queue_wait = started.saturating_duration_since(work.queued_at);
-                let index = work.partition.index;
-                let bytes = work.partition.len();
-                let mapped =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| map(work.partition)));
-                let result = match mapped {
-                    Ok(Ok(value)) => Ok(Pending {
-                        mapped: MappedPartition {
-                            index,
-                            input_bytes: bytes,
-                            value,
-                        },
-                        queue_wait,
-                        map_time: started.elapsed(),
-                        mapped_at: Instant::now(),
-                        _item_permit: work.item_permit,
-                        _byte_permit: work.byte_permit,
-                    }),
-                    Ok(Err(error)) => Err(error),
-                    Err(_) => Err(PipelineError::WorkerPanicked),
-                };
-                let terminal = result.is_err();
-                if results.send(result).is_err() || terminal {
-                    break;
-                }
-            }
-        }));
-    }
-    drop(result_sender);
+    let mut map_pool = FixedPartitionMapPool::new(limits.workers, limits.max_in_flight_items, map)?;
 
     let outcome = async {
         let mut reorder = BTreeMap::<u64, Pending<T>>::new();
@@ -523,14 +630,7 @@ where
                 let in_flight_bytes = limits.max_in_flight_bytes - byte_budget.available_permits();
                 peak_items = peak_items.max(current_items);
                 peak_bytes = peak_bytes.max(in_flight_bytes);
-                work_sender
-                    .send(Work {
-                        partition,
-                        queued_at: Instant::now(),
-                        item_permit,
-                        byte_permit,
-                    })
-                    .map_err(|_| PipelineError::WorkerPanicked)?;
+                map_pool.submit(partition, item_permit, byte_permit)?;
                 in_flight_items = limits.max_in_flight_items - item_budget.available_permits();
             }
 
@@ -542,10 +642,7 @@ where
                 continue;
             }
 
-            let pending = result_receiver
-                .recv()
-                .await
-                .ok_or(PipelineError::WorkerPanicked)??;
+            let pending = map_pool.recv().await?;
             let reorder_started = Instant::now();
             let index = pending.mapped.index;
             let bytes = pending.mapped.input_bytes;
@@ -605,7 +702,7 @@ where
     }
     .await;
 
-    let worker_panicked = stop_workers(work_sender, cancelled, workers).await;
+    let worker_panicked = stop_workers(map_pool).await;
     if worker_panicked && outcome.is_ok() {
         Err(PipelineError::WorkerPanicked)
     } else {
@@ -771,6 +868,35 @@ mod tests {
 
         assert_eq!(report.worker_count(), 2);
         assert!(threads.lock().expect("thread set").len() <= 2);
+    }
+
+    #[test]
+    fn fixed_pool_admission_does_not_wait_for_an_active_map() {
+        let map_started = Arc::new(std::sync::Barrier::new(2));
+        let release_map = Arc::new(std::sync::Barrier::new(2));
+        let started = Arc::clone(&map_started);
+        let release = Arc::clone(&release_map);
+        let mut pool = FixedPartitionMapPool::new(1, 1, move |partition| {
+            if partition.index() == 0 {
+                started.wait();
+                release.wait();
+            }
+            Ok(partition.into_bytes())
+        })
+        .expect("pool");
+
+        pool.submit_unbudgeted(StreamPartition::new(0, vec![0; 16]))
+            .expect("first partition");
+        map_started.wait();
+        let submitted = Instant::now();
+        pool.submit_unbudgeted(StreamPartition::new(1, vec![1; 16]))
+            .expect("queued partition");
+        assert!(submitted.elapsed() < Duration::from_millis(100));
+
+        release_map.wait();
+        assert_eq!(pool.recv_mapped_blocking().expect("first map").index(), 0);
+        assert_eq!(pool.recv_mapped_blocking().expect("second map").index(), 1);
+        pool.shutdown().expect("joined pool");
     }
 
     #[tokio::test]
