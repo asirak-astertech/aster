@@ -1201,7 +1201,7 @@ mod tests {
         .await;
         assert_eq!(
             rejected.describe("PublishBlob", &key),
-            "PublishBlob failed: resource_exhausted\nretry the identical request with --operation-key=blob-key"
+            "PublishBlob outcome unknown: resource_exhausted\nretry the identical request with --operation-key=blob-key"
         );
 
         let malformed = publish_error(

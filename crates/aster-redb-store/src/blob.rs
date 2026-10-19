@@ -29709,6 +29709,18 @@ mod tests {
                 .delete_table(BLOB_CARRIER_FETCH_CURSORS)
                 .expect("delete predecessor cursor table");
             write
+                .delete_table(BLOB_STREAM_CHECKPOINTS)
+                .expect("delete predecessor stream checkpoints");
+            write
+                .delete_table(BLOB_STREAM_RESERVATIONS)
+                .expect("delete predecessor stream reservations");
+            write
+                .delete_table(BLOB_STREAM_OPERATIONS)
+                .expect("delete predecessor stream operations");
+            write
+                .delete_table(BLOB_STREAM_PUBLICATIONS)
+                .expect("delete predecessor stream publications");
+            write
                 .delete_table(pressure::BLOB_PRESSURE_METADATA)
                 .expect("delete predecessor pressure metadata");
             for table in [
@@ -29769,7 +29781,7 @@ mod tests {
             network_blob_table_names()
                 .iter()
                 .all(|table| migrated_names.contains(*table)),
-            "writable migration must install all four additive network tables"
+            "writable migration must install all eight additive network tables"
         );
 
         let populated = BlobTestRoot::new("predecessor-populated-owner-token");
