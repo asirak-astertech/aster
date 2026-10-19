@@ -8064,9 +8064,8 @@ mod tests {
                     )
                     .expect_err("live tiny depot remains exhausted");
                 assert_eq!(
-                    node.last_live_publish_source_bytes_read,
-                    2 * u64::try_from(plaintext.len()).expect("source length"),
-                    "one failed attempt performs exactly prepare/encrypt",
+                    node.last_live_publish_source_bytes_read, 0,
+                    "live publication rejects a source beyond the configured depot before reading",
                 );
                 error
             } else {
@@ -8085,9 +8084,15 @@ mod tests {
                 error
             };
             assert_eq!(error.kind(), ApplicationErrorKind::ResourceLimit);
-            assert_eq!(node.capacity_gc_attempts, 1);
-            assert_eq!(node.capacity_gc_targets, [BlobCapacityGcTarget::Depot]);
-            assert_eq!(node.publish_attempts, 1);
+            if live {
+                assert_eq!(node.capacity_gc_attempts, 0);
+                assert!(node.capacity_gc_targets.is_empty());
+                assert_eq!(node.publish_attempts, 0);
+            } else {
+                assert_eq!(node.capacity_gc_attempts, 1);
+                assert_eq!(node.capacity_gc_targets, [BlobCapacityGcTarget::Depot]);
+                assert_eq!(node.publish_attempts, 1);
+            }
         }
     }
 
@@ -8534,6 +8539,10 @@ mod tests {
             .expect_err("growth past live ceiling must fail before hashing");
         assert_eq!(error.kind(), std::io::ErrorKind::FileTooLarge);
         drop(admitted);
+        let (configured_max, _) = configured_live_blob_limits(&node.store);
+        grower
+            .set_len(configured_max + 1)
+            .expect("grow sparse source past configured depot ceiling");
         let oversized = fs::File::open(&source_path).expect("reopen oversized live source");
         let error = node
             .publish_live(request(b"blob/live-oversized"), oversized)

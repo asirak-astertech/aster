@@ -39308,37 +39308,67 @@ mod tests {
                 0,
             )
             .unwrap();
-            let blob_contact_mode = if mission.semantic_version() == SEMANTIC_PROTOCOL_V8 {
-                BlobContactMode::CustodyV1
+            if mission.semantic_version() == SEMANTIC_PROTOCOL_V9 {
+                assert!(
+                    request_completed_pack_publication(
+                        connection,
+                        mission,
+                        EventDirection::ToSessionResponder,
+                        None,
+                        receipt,
+                    )
+                    .await
+                    .unwrap()
+                    .is_none()
+                );
+                assert!(
+                    respond_completed_pack_publication(
+                        &store,
+                        connection,
+                        mission,
+                        &verifier,
+                        &guard,
+                        EventDirection::ToSessionInitiator,
+                        &BlobInterest::empty(),
+                        receipt,
+                    )
+                    .await
+                    .unwrap()
+                    .is_none()
+                );
             } else {
-                BlobContactMode::DurableOnly
-            };
-            blob_ranges_stream::send(
-                &store,
-                connection,
-                mission,
-                &mut verifier,
-                &guard,
-                blob_contact_mode,
-                EventDirection::ToSessionResponder,
-                &BlobInterest::empty(),
-                receipt,
-            )
-            .await
-            .unwrap();
-            blob_ranges_stream::receive(
-                &store,
-                connection,
-                mission,
-                &mut verifier,
-                &guard,
-                blob_contact_mode,
-                EventDirection::ToSessionInitiator,
-                &BlobInterest::empty(),
-                receipt,
-            )
-            .await
-            .unwrap();
+                let blob_contact_mode = if mission.semantic_version() == SEMANTIC_PROTOCOL_V8 {
+                    BlobContactMode::CustodyV1
+                } else {
+                    BlobContactMode::DurableOnly
+                };
+                blob_ranges_stream::send(
+                    &store,
+                    connection,
+                    mission,
+                    &mut verifier,
+                    &guard,
+                    blob_contact_mode,
+                    EventDirection::ToSessionResponder,
+                    &BlobInterest::empty(),
+                    receipt,
+                )
+                .await
+                .unwrap();
+                blob_ranges_stream::receive(
+                    &store,
+                    connection,
+                    mission,
+                    &mut verifier,
+                    &guard,
+                    blob_contact_mode,
+                    EventDirection::ToSessionInitiator,
+                    &BlobInterest::empty(),
+                    receipt,
+                )
+                .await
+                .unwrap();
+            }
             drop(guard);
             drop(store);
             fs::remove_dir_all(state).unwrap();
@@ -50021,16 +50051,15 @@ mod tests {
     async fn live_blob_contact_coherence_faults_send_no_result_and_close_the_actor() {
         use crate::application::ApplicationErrorKind;
 
+        // This current-protocol actor test covers transitions shared by the
+        // v9 stream path. Profile-4-only promotion, range-read, completion,
+        // and append injection sites cannot fire after v9 selects BlobStreamV1.
         for fault in [
             TestBlobContactFault::PostStage,
-            TestBlobContactFault::PostPromotion,
             TestBlobContactFault::PostAbort,
             TestBlobContactFault::SenderProjectionMismatch,
             TestBlobContactFault::SenderSealedMismatch,
-            TestBlobContactFault::RangePostcheck,
-            TestBlobContactFault::PendingCompletion,
             TestBlobContactFault::StageCoherence,
-            TestBlobContactFault::AppendCoherence,
         ] {
             let root = root(&format!("live-blob-contact-fatal-{fault:?}"));
             let source_state = root.join("source");
