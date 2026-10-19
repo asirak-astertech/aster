@@ -111,6 +111,40 @@ pub struct BlobStreamPublication {
     pack_len: u64,
 }
 
+impl BlobStreamPublication {
+    pub const fn stream_id(&self) -> BlobPublicationStreamId {
+        self.open.stream_id()
+    }
+
+    pub const fn blob_id(&self) -> BlobId {
+        self.commitment.blob_id()
+    }
+
+    pub const fn open(&self) -> &BlobStreamOpen {
+        &self.open
+    }
+
+    pub const fn commitment(&self) -> &BlobStreamFinalCommitment {
+        &self.commitment
+    }
+
+    pub fn authenticated_open(&self) -> &[u8] {
+        &self.authenticated_open
+    }
+
+    pub fn authenticated_commitment(&self) -> &[u8] {
+        &self.authenticated_commitment
+    }
+
+    pub const fn acceptance_marker(&self) -> u64 {
+        self.acceptance_marker
+    }
+
+    pub const fn pack_len(&self) -> u64 {
+        self.pack_len
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BlobStreamConflictEvidence {
     stream_id: BlobPublicationStreamId,
@@ -170,19 +204,6 @@ impl BlobStreamConflictEvidence {
 }
 
 impl BlobStreamPublication {
-    pub const fn stream_id(&self) -> BlobPublicationStreamId {
-        self.open.stream_id()
-    }
-    pub const fn blob_id(&self) -> BlobId {
-        self.commitment.blob_id()
-    }
-    pub const fn acceptance_marker(&self) -> u64 {
-        self.acceptance_marker
-    }
-    pub const fn pack_len(&self) -> u64 {
-        self.pack_len
-    }
-
     fn encode(&self) -> Result<Vec<u8>, StoreError> {
         let open = self.open.encode();
         let commitment = self.commitment.encode();

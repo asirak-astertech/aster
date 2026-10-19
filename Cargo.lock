@@ -480,6 +480,7 @@ dependencies = [
  "bytes",
  "connectrpc",
  "connectrpc-build",
+ "futures",
  "getrandom 0.4.3",
  "http",
  "libc",
