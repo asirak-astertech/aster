@@ -10,7 +10,7 @@ use aster_node::{application::blob_stream::publish_blob_stream, stream_pipeline:
 use std::{
     collections::BTreeSet,
     error::Error,
-    io::Read,
+    io::{Read, Write as _},
     net::SocketAddr,
     path::PathBuf,
     time::{Duration, Instant},
@@ -201,6 +201,11 @@ async fn pack_send(bind: SocketAddr, peer: SocketAddr, plaintext_len: u64) -> Re
     )
     .await?;
     let roots = (published.plaintext_root, published.ciphertext_root);
+    println!(
+        "ASTER_BLOB_PACK_READY {{\"plaintext_bytes\":{plaintext_len},\"segments\":{}}}",
+        published.segment_count
+    );
+    std::io::stdout().flush()?;
     let endpoint = Endpoint::bind_with_security_profile(
         SecretKey::from_bytes(&[0x72; 32]),
         config(bind),
