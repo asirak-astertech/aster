@@ -83,6 +83,8 @@ pub(crate) const BLOB_STREAM_RESERVATIONS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.blob-stream-reservations.v2");
 pub(crate) const BLOB_STREAM_OPERATIONS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.blob-stream-operations.v2");
+pub(crate) const BLOB_STREAM_PUBLICATIONS: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("aster.blob-stream-publications.v2");
 
 pub(crate) const BLOB_ITEM_COUNT: &str = "semantic_blob_item_count";
 pub(crate) const BLOB_TOTAL_BYTES: &str = "semantic_blob_total_bytes";
@@ -14845,7 +14847,7 @@ pub(crate) fn blob_schema_present_write(
     }
     if legacy_present != legacy.len()
         || !matches!(network_present, 0 | 4)
-        || !matches!(stream_present, 0 | 2)
+        || !matches!(stream_present, 0 | 3)
         || global_present.iter().any(|present| !present)
     {
         return Err(blob_error(BlobStoreError::SchemaInvariant(
@@ -15349,7 +15351,14 @@ pub(crate) fn audit_blob_tables_write(
     stats.carrier_prefixes = network.carrier_prefixes;
     stats.network_staging_bytes = network.staging.bytes;
     stats.carrier_fetch_cursors = network.carrier_cursors;
-    stream::audit_blob_stream_tables_write(write, read_mission_binding(write)?)?;
+    stream::audit_blob_stream_tables_write(
+        write,
+        read_mission_binding(write)?,
+        &accepted_dots,
+        &publisher_high,
+        &frontier,
+        shared,
+    )?;
     let mut metadata = write.open_table(METADATA)?;
     audit_or_initialize_counter(&mut metadata, BLOB_ITEM_COUNT, stats.publications)?;
     audit_or_initialize_counter(&mut metadata, BLOB_TOTAL_BYTES, stats.total_sealed_bytes)?;
@@ -16043,6 +16052,7 @@ fn initialize_blob_schema(write: &redb::WriteTransaction) -> Result<(), StoreErr
 fn initialize_blob_stream_schema(write: &redb::WriteTransaction) -> Result<(), StoreError> {
     let _ = write.open_table(BLOB_STREAM_RESERVATIONS)?;
     let _ = write.open_table(BLOB_STREAM_OPERATIONS)?;
+    let _ = write.open_table(BLOB_STREAM_PUBLICATIONS)?;
     Ok(())
 }
 
@@ -16085,10 +16095,11 @@ fn network_blob_table_names() -> [&'static str; 4] {
     ]
 }
 
-fn stream_blob_table_names() -> [&'static str; 2] {
+fn stream_blob_table_names() -> [&'static str; 3] {
     [
         BLOB_STREAM_RESERVATIONS.name(),
         BLOB_STREAM_OPERATIONS.name(),
+        BLOB_STREAM_PUBLICATIONS.name(),
     ]
 }
 

@@ -392,6 +392,15 @@ impl BlobStreamFinalCommitment {
     pub const fn ciphertext_root(&self) -> &[u8; 32] {
         &self.ciphertext_root
     }
+    pub const fn content_epoch(&self) -> u64 {
+        self.content_epoch
+    }
+    pub const fn ttl_ms(&self) -> Option<u64> {
+        self.ttl_ms
+    }
+    pub const fn final_custody(&self) -> Option<CustodySample> {
+        self.final_custody
+    }
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(256);
         out.extend_from_slice(BLOB_STREAM_COMMITMENT_MAGIC);

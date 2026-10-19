@@ -1,25 +1,28 @@
 //! Durable provisional authority for pack-backed Blob streams.
 
 use super::{
-    BLOB_STREAM_OPERATIONS, BLOB_STREAM_RESERVATIONS, BlobOperationKey, BlobStoreError,
-    MAX_BLOB_OPERATION_KEY_BYTES, Store, blob_content_prefix_upper_bound, blob_error,
-    synchronize_blob_policy_generation_write,
+    BLOB_STREAM_OPERATIONS, BLOB_STREAM_PUBLICATIONS, BLOB_STREAM_RESERVATIONS, BlobOperationKey,
+    BlobStoreError, MAX_BLOB_OPERATION_KEY_BYTES, Store, blob_content_prefix_upper_bound,
+    blob_error, synchronize_blob_policy_generation_write,
 };
 use crate::{
-    CAUSAL_FRONTIER, CONTROL_SCOPE_EPOCHS, ControlPolicySnapshot, Dot, PUBLISHER_HIGH_WATER,
-    SemanticDataClass, StoreError, VersionVector, control_principal_revoked_write,
+    ACCEPTED_DOTS, CAUSAL_FRONTIER, CONTROL_SCOPE_EPOCHS, ControlPolicySnapshot, Dot,
+    PUBLISHER_HIGH_WATER, SemanticDataClass, StateAuditSnapshot, StoreError, VersionVector,
+    accepted_dot_key, causal_frontier_key, control_principal_revoked_write,
     decode_scope_epoch_index, enforce_live_write, ensure_frontier_capacity, event_domain_prefix,
-    require_control_policy_write,
+    require_control_policy_read, require_control_policy_write, update_causal_high_water,
 };
 use aster_mesh::{
-    BLOB_STREAM_SEGMENT_BYTES, BLOB_STREAM_SEGMENT_ENCODED_OVERHEAD_BYTES, BlobPublicationStreamId,
-    BlobStreamOpen, NodeId, VerifiedBlobStreamOpen,
+    BLOB_STREAM_SEGMENT_BYTES, BLOB_STREAM_SEGMENT_ENCODED_OVERHEAD_BYTES, BlobId,
+    BlobPublicationStreamId, BlobStreamFinalCommitment, BlobStreamFrontier, BlobStreamOpen, NodeId,
+    VerifiedBlobStreamFinalCommitment, VerifiedBlobStreamOpen,
 };
 use redb::{Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata};
 
 use super::pack::{BlobPackCheckpoint, BlobPackError};
 
 const PROVISIONAL_MAGIC: &[u8; 8] = b"ASTRPR02";
+const PUBLICATION_MAGIC: &[u8; 8] = b"ASTRPB02";
 const PROVISIONAL_VERSION: u8 = 1;
 const MAX_PROVISIONAL_STREAMS: u64 = 64;
 const MAX_PROVISIONAL_STREAM_BYTES: u64 = 16 * 1024 * 1024 * 1024;
@@ -68,6 +71,130 @@ pub struct BlobStreamResume {
     next_segment_index: u64,
     durable_plaintext_offset: u64,
     durable_pack_len: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlobStreamPromotion {
+    stream_id: BlobPublicationStreamId,
+    blob_id: BlobId,
+    acceptance_marker: u64,
+    duplicate: bool,
+}
+
+impl BlobStreamPromotion {
+    pub const fn stream_id(self) -> BlobPublicationStreamId {
+        self.stream_id
+    }
+    pub const fn blob_id(self) -> BlobId {
+        self.blob_id
+    }
+    pub const fn acceptance_marker(self) -> u64 {
+        self.acceptance_marker
+    }
+    pub const fn duplicate(self) -> bool {
+        self.duplicate
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlobStreamPublication {
+    open: BlobStreamOpen,
+    commitment: BlobStreamFinalCommitment,
+    authenticated_open: Vec<u8>,
+    authenticated_commitment: Vec<u8>,
+    acceptance_marker: u64,
+    pack_len: u64,
+}
+
+impl BlobStreamPublication {
+    pub const fn stream_id(&self) -> BlobPublicationStreamId {
+        self.open.stream_id()
+    }
+    pub const fn blob_id(&self) -> BlobId {
+        self.commitment.blob_id()
+    }
+    pub const fn acceptance_marker(&self) -> u64 {
+        self.acceptance_marker
+    }
+    pub const fn pack_len(&self) -> u64 {
+        self.pack_len
+    }
+
+    fn encode(&self) -> Result<Vec<u8>, StoreError> {
+        let open = self.open.encode();
+        let commitment = self.commitment.encode();
+        let lengths = [
+            open.len(),
+            commitment.len(),
+            self.authenticated_open.len(),
+            self.authenticated_commitment.len(),
+        ]
+        .map(|len| u32::try_from(len).map_err(|_| schema_error()))
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(PUBLICATION_MAGIC);
+        encoded.push(PROVISIONAL_VERSION);
+        encoded.extend_from_slice(&self.acceptance_marker.to_be_bytes());
+        encoded.extend_from_slice(&self.pack_len.to_be_bytes());
+        for (bytes, len) in [
+            open.as_slice(),
+            commitment.as_slice(),
+            self.authenticated_open.as_slice(),
+            self.authenticated_commitment.as_slice(),
+        ]
+        .into_iter()
+        .zip(lengths)
+        {
+            encoded.extend_from_slice(&len.to_be_bytes());
+            encoded.extend_from_slice(bytes);
+        }
+        Ok(encoded)
+    }
+
+    fn decode(encoded: &[u8]) -> Result<Self, StoreError> {
+        if encoded.len() < 41
+            || &encoded[..8] != PUBLICATION_MAGIC
+            || encoded[8] != PROVISIONAL_VERSION
+        {
+            return Err(schema_error());
+        }
+        let acceptance_marker = read_u64(encoded, 9)?;
+        let pack_len = read_u64(encoded, 17)?;
+        let mut offset = 25_usize;
+        let mut fields = Vec::with_capacity(4);
+        for _ in 0..4 {
+            let len = read_u32(encoded, offset)? as usize;
+            offset = offset.checked_add(4).ok_or_else(schema_error)?;
+            let end = offset.checked_add(len).ok_or_else(schema_error)?;
+            fields.push(encoded.get(offset..end).ok_or_else(schema_error)?);
+            offset = end;
+        }
+        if offset != encoded.len() || acceptance_marker == 0 || pack_len == 0 {
+            return Err(schema_error());
+        }
+        let open = BlobStreamOpen::decode(fields[0]).map_err(|_| schema_error())?;
+        let commitment =
+            BlobStreamFinalCommitment::decode(fields[1]).map_err(|_| schema_error())?;
+        if fields[2].is_empty()
+            || fields[3].is_empty()
+            || commitment.stream_id() != open.stream_id()
+            || commitment.open_digest() != &open.digest()
+            || commitment.total_len() != open.total_len()
+            || commitment.content_epoch() != open.content_epoch()
+            || commitment.ttl_ms() != open.ttl_ms()
+        {
+            return Err(schema_error());
+        }
+        Ok(Self {
+            open,
+            commitment,
+            authenticated_open: fields[2].to_vec(),
+            authenticated_commitment: fields[3].to_vec(),
+            acceptance_marker,
+            pack_len,
+        })
+    }
 }
 
 impl BlobStreamResume {
@@ -254,13 +381,22 @@ fn reserved_pack_bytes(total_len: u64) -> Result<u64, StoreError> {
 pub(super) fn audit_blob_stream_tables_write(
     write: &redb::WriteTransaction,
     mission_authority: Option<NodeId>,
+    accepted_dots: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    publisher_high: &impl ReadableTable<&'static [u8], u64>,
+    frontier: &impl ReadableTable<&'static [u8], u64>,
+    shared: &mut StateAuditSnapshot,
 ) -> Result<(), StoreError> {
     let reservations = write.open_table(BLOB_STREAM_RESERVATIONS)?;
     let operations = write.open_table(BLOB_STREAM_OPERATIONS)?;
-    if reservations.len()? != operations.len()? || reservations.len()? > MAX_PROVISIONAL_STREAMS {
+    let publications = write.open_table(BLOB_STREAM_PUBLICATIONS)?;
+    let authority_rows = reservations
+        .len()?
+        .checked_add(publications.len()?)
+        .ok_or(StoreError::ItemCountAccountingOverflow)?;
+    if authority_rows != operations.len()? || reservations.len()? > MAX_PROVISIONAL_STREAMS {
         return Err(schema_error());
     }
-    let authority = if reservations.is_empty()? {
+    let authority = if authority_rows == 0 {
         mission_authority.unwrap_or([0; 32])
     } else {
         mission_authority.ok_or(StoreError::MissionNotBound)?
@@ -284,12 +420,75 @@ pub(super) fn audit_blob_stream_tables_write(
     if reserved > MAX_PROVISIONAL_STREAM_BYTES {
         return Err(schema_error());
     }
+    let mut markers = std::collections::BTreeSet::new();
+    for row in publications.iter()? {
+        let (key, value) = row?;
+        let publication = BlobStreamPublication::decode(value.value())?;
+        if key.value() != publication.stream_id().as_bytes().as_slice()
+            || publication.open.mission_id() != &authority
+            || !markers.insert(publication.acceptance_marker)
+            || operations
+                .get(publication.open.operation_key())?
+                .is_none_or(|bound| bound.value() != key.value())
+        {
+            return Err(schema_error());
+        }
+        let dot = Dot {
+            publisher: publication.open.publisher(),
+            counter: publication.open.publisher_counter(),
+        };
+        let dot_key = accepted_dot_key(dot).to_vec();
+        let semantic_id = publication.open.digest();
+        if shared
+            .expected_dots
+            .insert(dot_key.clone(), semantic_id)
+            .is_some()
+            || accepted_dots
+                .get(dot_key.as_slice())?
+                .is_none_or(|accepted| accepted.value() != semantic_id)
+            || publisher_high
+                .get(dot.publisher.as_slice())?
+                .is_none_or(|high| high.value() < dot.counter)
+        {
+            return Err(schema_error());
+        }
+        shared
+            .expected_publisher_high
+            .entry(dot.publisher.to_vec())
+            .and_modify(|current| *current = (*current).max(dot.counter))
+            .or_insert(dot.counter);
+        let frontier_key = causal_frontier_key(
+            publication.open.topic(),
+            publication.open.scope(),
+            dot.publisher,
+        )?;
+        if frontier
+            .get(frontier_key.as_slice())?
+            .is_none_or(|high| high.value() < dot.counter)
+        {
+            return Err(schema_error());
+        }
+        shared
+            .expected_frontier
+            .entry(frontier_key)
+            .and_modify(|current| *current = (*current).max(dot.counter))
+            .or_insert(dot.counter);
+        shared
+            .domain_publishers
+            .entry(event_domain_prefix(
+                publication.open.topic(),
+                publication.open.scope(),
+            )?)
+            .or_default()
+            .insert(dot.publisher);
+    }
     for row in operations.iter()? {
         let (operation, stream) = row?;
         if operation.value().is_empty()
             || operation.value().len() > MAX_BLOB_OPERATION_KEY_BYTES
             || stream.value().len() != 32
-            || reservations.get(stream.value())?.is_none()
+            || (reservations.get(stream.value())?.is_none()
+                && publications.get(stream.value())?.is_none())
         {
             return Err(schema_error());
         }
@@ -383,6 +582,29 @@ fn require_local_causal_write(
 }
 
 impl Store {
+    pub fn blob_stream_publications_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+    ) -> Result<Vec<BlobStreamPublication>, StoreError> {
+        self.require_live()?;
+        let authority = self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        require_control_policy_read(&read, authority, policy)?;
+        let table = read.open_table(BLOB_STREAM_PUBLICATIONS)?;
+        let mut publications = Vec::with_capacity(
+            usize::try_from(table.len()?).map_err(|_| StoreError::ItemCountAccountingOverflow)?,
+        );
+        for row in table.iter()? {
+            let publication = BlobStreamPublication::decode(row?.1.value())?;
+            if publication.open.mission_id() != &authority {
+                return Err(schema_error());
+            }
+            publications.push(publication);
+        }
+        publications.sort_unstable_by_key(BlobStreamPublication::acceptance_marker);
+        Ok(publications)
+    }
+
     pub fn reserve_blob_stream_with_policy(
         &self,
         policy: &ControlPolicySnapshot,
@@ -569,6 +791,151 @@ impl Store {
         Ok(progress)
     }
 
+    pub fn promote_blob_stream_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        reservation: &BlobStreamReservation,
+        verified: &VerifiedBlobStreamFinalCommitment,
+    ) -> Result<BlobStreamPromotion, StoreError> {
+        self.require_live()?;
+        let authority = self.require_bound_mission()?;
+        let commitment = verified.commitment();
+        let key = reservation.stream_id.as_bytes().as_slice();
+        let mut write = self.database.begin_write()?;
+        write.set_durability(Durability::Immediate)?;
+        enforce_live_write(&write)?;
+        synchronize_blob_policy_generation_write(&write)?;
+        require_control_policy_write(&write, authority, policy)?;
+
+        if let Some(encoded) = write
+            .open_table(BLOB_STREAM_PUBLICATIONS)?
+            .get(key)?
+            .map(|row| row.value().to_vec())
+        {
+            let existing = BlobStreamPublication::decode(&encoded)?;
+            if existing.open != reservation.open
+                || existing.authenticated_open != reservation.authenticated_open
+                || existing.commitment != *commitment
+                || existing.authenticated_commitment != verified.authenticated_bytes()
+            {
+                return Err(blob_error(BlobStoreError::OperationConflict));
+            }
+            return Ok(BlobStreamPromotion {
+                stream_id: reservation.stream_id,
+                blob_id: commitment.blob_id(),
+                acceptance_marker: existing.acceptance_marker,
+                duplicate: true,
+            });
+        }
+
+        let encoded = write
+            .open_table(BLOB_STREAM_RESERVATIONS)?
+            .get(key)?
+            .map(|row| row.value().to_vec())
+            .ok_or_else(|| blob_error(BlobStoreError::ReservationChanged))?;
+        let provisional = ProvisionalBlobStream::decode(&encoded)?;
+        require_stream_policy_write(&write, authority, policy, &provisional.reservation.open)?;
+        let checkpoint = provisional
+            .checkpoint
+            .as_ref()
+            .ok_or_else(|| blob_error(BlobStoreError::CompletionMismatch))?;
+        let roots = BlobStreamFrontier::restore(checkpoint.frontier().clone())
+            .and_then(|frontier| frontier.finish(provisional.reservation.open.total_len()))
+            .map_err(|_| blob_error(BlobStoreError::CompletionMismatch))?;
+        if provisional.reservation != *reservation
+            || commitment.open_digest() != &reservation.open_digest
+            || commitment.stream_id() != reservation.stream_id
+            || commitment.total_len() != reservation.open.total_len()
+            || commitment.content_epoch() != reservation.open.content_epoch()
+            || commitment.ttl_ms() != reservation.open.ttl_ms()
+            || checkpoint.next_index() != commitment.segment_count()
+            || checkpoint.plaintext_offset() != commitment.total_len()
+            || commitment.plaintext_root() != &roots.0
+            || commitment.ciphertext_root() != &roots.1
+        {
+            return Err(blob_error(BlobStoreError::CompletionMismatch));
+        }
+        match (
+            reservation.open.ttl_ms(),
+            reservation.open.initial_custody(),
+            commitment.final_custody(),
+        ) {
+            (None, None, None) => {}
+            (Some(ttl), Some(initial), Some(final_sample))
+                if initial.clock_id == final_sample.clock_id
+                    && final_sample.tick_ms >= initial.tick_ms
+                    && final_sample.tick_ms - initial.tick_ms < ttl => {}
+            (Some(_), Some(_), Some(_)) => {
+                return Err(blob_error(BlobStoreError::ExpiredOrRetired));
+            }
+            _ => return Err(blob_error(BlobStoreError::CompletionMismatch)),
+        }
+
+        let acceptance_marker = {
+            let table = write.open_table(BLOB_STREAM_PUBLICATIONS)?;
+            table
+                .iter()?
+                .try_fold(0_u64, |current, row| {
+                    Ok::<_, StoreError>(
+                        current
+                            .max(BlobStreamPublication::decode(row?.1.value())?.acceptance_marker),
+                    )
+                })?
+                .checked_add(1)
+                .ok_or(StoreError::AcceptanceMarkerExhausted)?
+        };
+        let publication = BlobStreamPublication {
+            open: reservation.open.clone(),
+            commitment: commitment.clone(),
+            authenticated_open: reservation.authenticated_open.clone(),
+            authenticated_commitment: verified.authenticated_bytes().to_vec(),
+            acceptance_marker,
+            pack_len: checkpoint.pack_len(),
+        };
+        let dot = Dot {
+            publisher: reservation.open.publisher(),
+            counter: reservation.open.publisher_counter(),
+        };
+        let dot_key = accepted_dot_key(dot);
+        if let Some(accepted) = write.open_table(ACCEPTED_DOTS)?.get(dot_key.as_slice())? {
+            if accepted.value() != reservation.open_digest {
+                return Err(StoreError::CausalEquivocation {
+                    publisher: dot.publisher,
+                    counter: dot.counter,
+                });
+            }
+            return Err(schema_error());
+        }
+        ensure_frontier_capacity(
+            &write,
+            reservation.open.topic(),
+            reservation.open.scope(),
+            dot.publisher,
+            SemanticDataClass::Blob,
+        )?;
+        write
+            .open_table(BLOB_STREAM_PUBLICATIONS)?
+            .insert(key, publication.encode()?.as_slice())?;
+        write
+            .open_table(ACCEPTED_DOTS)?
+            .insert(dot_key.as_slice(), reservation.open_digest.as_slice())?;
+        update_causal_high_water(
+            &write,
+            dot.publisher,
+            reservation.open.topic(),
+            reservation.open.scope(),
+            dot.counter,
+        )?;
+        write.open_table(BLOB_STREAM_RESERVATIONS)?.remove(key)?;
+        write.commit()?;
+        Ok(BlobStreamPromotion {
+            stream_id: reservation.stream_id,
+            blob_id: commitment.blob_id(),
+            acceptance_marker,
+            duplicate: false,
+        })
+    }
+
     /// Atomically releases one exact provisional authority and its idempotent
     /// operation binding. Pack-file removal is deliberately a separate,
     /// retryable filesystem cleanup after this durable authority transition.
@@ -642,8 +1009,9 @@ mod tests {
         }
     }
 
-    fn fixture(
+    fn fixture_with_len(
         seed: u8,
+        total_len: u64,
     ) -> (
         TestRoot,
         Store,
@@ -674,7 +1042,7 @@ mod tests {
             Priority::Immediate,
             None,
             None,
-            1024 * 1024 * 1024,
+            total_len,
             1,
             1,
             publisher
@@ -695,6 +1063,18 @@ mod tests {
             Store::open_for_mission(root.0.join("state.redb"), publisher.mission_authority_id())
                 .unwrap();
         (root, store, publisher, operation, open)
+    }
+
+    fn fixture(
+        seed: u8,
+    ) -> (
+        TestRoot,
+        Store,
+        ReferenceEnvelopeSealer,
+        BlobOperationKey,
+        aster_mesh::VerifiedBlobStreamOpen,
+    ) {
+        fixture_with_len(seed, 1024 * 1024 * 1024)
     }
 
     #[test]
@@ -795,5 +1175,88 @@ mod tests {
             .reserve_blob_stream_with_policy(&policy, request, &open)
             .unwrap();
         assert_eq!(replacement.0, reservation);
+    }
+
+    #[test]
+    fn blob_stream_promotion_is_atomic_visible_idempotent_and_restart_safe() {
+        let total_len = aster_mesh::BLOB_STREAM_SEGMENT_BYTES as u64;
+        let (root, store, publisher, operation, open) = fixture_with_len(0x74, total_len);
+        let policy = store.control_policy_snapshot().unwrap();
+        let request = BlobStreamReservationRequest {
+            operation: &operation,
+            source: BlobStreamSource::LocalApplication,
+        };
+        let (reservation, initial) = store
+            .reserve_blob_stream_with_policy(&policy, request, &open)
+            .unwrap();
+        let pack_root = root.0.join("pack");
+        let mut writer = BlobPackWriter::create(&pack_root, open.open()).unwrap();
+        let sealer = publisher.blob_stream_segment_sealer(&open).unwrap();
+        let (segment, leaves) = sealer
+            .seal(
+                BlobStreamPlainPartition::new(
+                    *open.open().stream_id().as_bytes(),
+                    open.open().digest(),
+                    open.open().content_epoch(),
+                    0,
+                    0,
+                    total_len,
+                    vec![0x41; total_len as usize],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        writer.append(&segment, leaves).unwrap();
+        let durable = writer.checkpoint().unwrap();
+        store
+            .checkpoint_blob_stream(&policy, &reservation, initial, durable.clone())
+            .unwrap();
+        let roots = aster_mesh::BlobStreamFrontier::restore(durable.frontier().clone())
+            .unwrap()
+            .finish(total_len)
+            .unwrap();
+        let commitment =
+            aster_mesh::BlobStreamFinalCommitment::new(&open, roots.0, roots.1, 1, None).unwrap();
+        let signed = publisher.seal_blob_stream_commitment(&commitment).unwrap();
+        let commitment = publisher
+            .verify_blob_stream_commitment(&open, &signed)
+            .unwrap();
+
+        let promoted = store
+            .promote_blob_stream_with_policy(&policy, &reservation, &commitment)
+            .unwrap();
+        assert!(!promoted.duplicate());
+        assert_eq!(promoted.blob_id(), commitment.commitment().blob_id());
+        assert!(store.blob_stream_resume(&reservation).is_err());
+        let publications = store.blob_stream_publications_with_policy(&policy).unwrap();
+        assert_eq!(publications.len(), 1);
+        assert_eq!(publications[0].blob_id(), promoted.blob_id());
+        assert_eq!(publications[0].pack_len(), durable.pack_len());
+        let next = store
+            .reserve_blob_with_policy(
+                &policy,
+                open.open().publisher(),
+                open.open().topic(),
+                open.open().scope(),
+            )
+            .unwrap();
+        assert_eq!(next.counter(), 2);
+        assert_eq!(next.context().counter(&open.open().publisher()), 1);
+
+        let duplicate = store
+            .promote_blob_stream_with_policy(&policy, &reservation, &commitment)
+            .unwrap();
+        assert!(duplicate.duplicate());
+        assert_eq!(duplicate.acceptance_marker(), promoted.acceptance_marker());
+
+        let mission = publisher.mission_authority_id();
+        drop(store);
+        let reopened = Store::open_for_mission(root.0.join("state.redb"), mission).unwrap();
+        assert_eq!(
+            reopened
+                .blob_stream_publications_with_policy(&policy)
+                .unwrap(),
+            publications
+        );
     }
 }
