@@ -16,6 +16,7 @@ const BLOB_STREAM_FORMAT_VERSION: u16 = 2;
 const BLOB_STREAM_PACK_FORMAT_VERSION: u16 = 2;
 const BLOB_STREAM_OPEN_MAGIC: &[u8; 8] = b"ASTRBO02";
 const BLOB_STREAM_COMMITMENT_MAGIC: &[u8; 8] = b"ASTRBF02";
+const BLOB_STREAM_SEGMENT_MAGIC: &[u8; 8] = b"ASTRBS02";
 const MAX_BLOB_STREAM_OPERATION_KEY_BYTES: usize = 256;
 const MAX_BLOB_STREAM_OPEN_BYTES: usize = 2048 + 40 * MAX_CAUSAL_CONTEXT_ENTRIES;
 
@@ -467,8 +468,98 @@ pub struct EncryptedBlobStreamSegment {
 }
 
 impl EncryptedBlobStreamSegment {
+    const FIXED_ENCODED_BYTES: usize = 8 + 2 + 32 + 32 + 8 + 8 + 8 + 8 + 4 + 4;
+
     pub fn index(&self) -> u64 {
         self.index
+    }
+
+    pub const fn stream_id(&self) -> &[u8; 32] {
+        &self.stream_id
+    }
+
+    pub const fn open_digest(&self) -> &[u8; 32] {
+        &self.open_digest
+    }
+
+    pub const fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    pub const fn plaintext_len(&self) -> u32 {
+        self.plaintext_len
+    }
+
+    pub const fn total_len(&self) -> u64 {
+        self.total_len
+    }
+
+    pub fn ciphertext(&self) -> &[u8] {
+        &self.ciphertext
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(Self::FIXED_ENCODED_BYTES + self.ciphertext.len());
+        out.extend_from_slice(BLOB_STREAM_SEGMENT_MAGIC);
+        out.extend_from_slice(&BLOB_STREAM_FORMAT_VERSION.to_be_bytes());
+        out.extend_from_slice(&self.stream_id);
+        out.extend_from_slice(&self.open_digest);
+        out.extend_from_slice(&self.content_epoch.to_be_bytes());
+        out.extend_from_slice(&self.index.to_be_bytes());
+        out.extend_from_slice(&self.offset.to_be_bytes());
+        out.extend_from_slice(&self.total_len.to_be_bytes());
+        out.extend_from_slice(&self.plaintext_len.to_be_bytes());
+        out.extend_from_slice(&(self.ciphertext.len() as u32).to_be_bytes());
+        out.extend_from_slice(&self.ciphertext);
+        out
+    }
+
+    pub fn decode(encoded: &[u8]) -> Result<Self, BlobError> {
+        let mut reader = StreamReader::new(encoded);
+        if reader.take(8)? != BLOB_STREAM_SEGMENT_MAGIC
+            || reader.u16()? != BLOB_STREAM_FORMAT_VERSION
+        {
+            return Err(BlobError::InvalidManifest);
+        }
+        let stream_id = reader.array()?;
+        let open_digest = reader.array()?;
+        let content_epoch = reader.u64()?;
+        let index = reader.u64()?;
+        let offset = reader.u64()?;
+        let total_len = reader.u64()?;
+        let plaintext_len = reader.u32()?;
+        let ciphertext_len = reader.u32()? as usize;
+        let end = offset
+            .checked_add(u64::from(plaintext_len))
+            .ok_or(BlobError::LengthOverflow)?;
+        if stream_id == [0; 32]
+            || open_digest == [0; 32]
+            || content_epoch == 0
+            || total_len == 0
+            || plaintext_len == 0
+            || plaintext_len as usize > BLOB_STREAM_SEGMENT_BYTES
+            || ciphertext_len != plaintext_len as usize + 16
+            || offset
+                != index
+                    .checked_mul(BLOB_STREAM_SEGMENT_BYTES as u64)
+                    .ok_or(BlobError::LengthOverflow)?
+            || end > total_len
+            || (end < total_len && plaintext_len as usize != BLOB_STREAM_SEGMENT_BYTES)
+        {
+            return Err(BlobError::InvalidManifest);
+        }
+        let ciphertext = reader.take(ciphertext_len)?.to_vec();
+        reader.finish()?;
+        Ok(Self {
+            stream_id,
+            open_digest,
+            content_epoch,
+            index,
+            offset,
+            total_len,
+            plaintext_len,
+            ciphertext,
+        })
     }
 
     #[cfg(test)]
@@ -783,6 +874,104 @@ pub struct BlobStreamCheckpoint {
     levels: [Option<BlobStreamSubtree>; FRONTIER_LEVELS],
 }
 
+impl BlobStreamCheckpoint {
+    const SUBTREE_BYTES: usize = 8 * 4 + 32 * 2;
+    pub const ENCODED_LEN: usize = 8 + 2 + 8 * 3 + FRONTIER_LEVELS * (1 + Self::SUBTREE_BYTES);
+
+    pub const fn next_index(&self) -> u64 {
+        self.next_index
+    }
+
+    pub const fn plaintext_len(&self) -> u64 {
+        self.plaintext_len
+    }
+
+    pub const fn ciphertext_len(&self) -> u64 {
+        self.ciphertext_len
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(Self::ENCODED_LEN);
+        out.extend_from_slice(b"ASTRCK02");
+        out.extend_from_slice(&BLOB_STREAM_FORMAT_VERSION.to_be_bytes());
+        out.extend_from_slice(&self.next_index.to_be_bytes());
+        out.extend_from_slice(&self.plaintext_len.to_be_bytes());
+        out.extend_from_slice(&self.ciphertext_len.to_be_bytes());
+        for subtree in self.levels {
+            match subtree {
+                None => {
+                    out.push(0);
+                    out.resize(out.len() + Self::SUBTREE_BYTES, 0);
+                }
+                Some(subtree) => {
+                    out.push(1);
+                    out.extend_from_slice(&subtree.first_index.to_be_bytes());
+                    out.extend_from_slice(&subtree.count.to_be_bytes());
+                    out.extend_from_slice(&subtree.plaintext_len.to_be_bytes());
+                    out.extend_from_slice(&subtree.ciphertext_len.to_be_bytes());
+                    out.extend_from_slice(&subtree.plaintext_root);
+                    out.extend_from_slice(&subtree.ciphertext_root);
+                }
+            }
+        }
+        out
+    }
+
+    pub fn decode(encoded: &[u8]) -> Result<Self, BlobError> {
+        if encoded.len() != Self::ENCODED_LEN {
+            return Err(BlobError::InvalidManifest);
+        }
+        let mut reader = StreamReader::new(encoded);
+        if reader.take(8)? != b"ASTRCK02" || reader.u16()? != BLOB_STREAM_FORMAT_VERSION {
+            return Err(BlobError::InvalidManifest);
+        }
+        let next_index = reader.u64()?;
+        let plaintext_len = reader.u64()?;
+        let ciphertext_len = reader.u64()?;
+        let mut levels = [None; FRONTIER_LEVELS];
+        for (level, target) in levels.iter_mut().enumerate() {
+            match reader.u8()? {
+                0 => {
+                    if reader
+                        .take(Self::SUBTREE_BYTES)?
+                        .iter()
+                        .any(|byte| *byte != 0)
+                    {
+                        return Err(BlobError::InvalidManifest);
+                    }
+                }
+                1 => {
+                    let subtree = BlobStreamSubtree {
+                        first_index: reader.u64()?,
+                        count: reader.u64()?,
+                        plaintext_len: reader.u64()?,
+                        ciphertext_len: reader.u64()?,
+                        plaintext_root: reader.array()?,
+                        ciphertext_root: reader.array()?,
+                    };
+                    if subtree.count != 1_u64.checked_shl(level as u32).unwrap_or(0)
+                        || subtree.plaintext_root == [0; 32]
+                        || subtree.ciphertext_root == [0; 32]
+                    {
+                        return Err(BlobError::InvalidManifest);
+                    }
+                    *target = Some(subtree);
+                }
+                _ => return Err(BlobError::InvalidManifest),
+            }
+        }
+        reader.finish()?;
+        let checkpoint = Self {
+            next_index,
+            plaintext_len,
+            ciphertext_len,
+            levels,
+        };
+        BlobStreamFrontier::restore(checkpoint.clone())?;
+        Ok(checkpoint)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BlobStreamFrontier {
     checkpoint: BlobStreamCheckpoint,
@@ -859,9 +1048,29 @@ impl BlobStreamFrontier {
             .flatten()
             .try_fold(0_u64, |sum, subtree| sum.checked_add(subtree.count))
             .ok_or(BlobError::LengthOverflow)?;
+        let mut subtrees = checkpoint
+            .levels
+            .iter()
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        subtrees.sort_by_key(|subtree| subtree.first_index);
+        let mut cursor = 0_u64;
+        for subtree in subtrees {
+            if subtree.first_index != cursor
+                || subtree.count == 0
+                || !subtree.count.is_power_of_two()
+            {
+                return Err(BlobError::InvalidManifest);
+            }
+            cursor = cursor
+                .checked_add(subtree.count)
+                .ok_or(BlobError::LengthOverflow)?;
+        }
         if rebuilt_plain != checkpoint.plaintext_len
             || rebuilt_cipher != checkpoint.ciphertext_len
             || rebuilt_count != checkpoint.next_index
+            || cursor != checkpoint.next_index
         {
             return Err(BlobError::InvalidManifest);
         }
@@ -1235,6 +1444,28 @@ mod tests {
     }
 
     #[test]
+    fn blob_stream_checkpoint_round_trips_fixed_width() {
+        let (sealer, _) = contexts();
+        let mut frontier = BlobStreamFrontier::new();
+        for index in 0..3 {
+            let leaves = sealer
+                .seal(partition(index, index as u8 + 1))
+                .expect("seal")
+                .1;
+            frontier
+                .append(BlobStreamSubtree::leaf(index, leaves))
+                .expect("append");
+        }
+        let checkpoint = frontier.checkpoint();
+        let encoded = checkpoint.encode();
+        assert_eq!(encoded.len(), BlobStreamCheckpoint::ENCODED_LEN);
+        assert_eq!(
+            BlobStreamCheckpoint::decode(&encoded).expect("decode"),
+            checkpoint
+        );
+    }
+
+    #[test]
     fn blob_stream_frontier_finishes_non_power_of_two_segment_counts() {
         let (sealer, _) = contexts();
         let mut frontier = BlobStreamFrontier::new();
@@ -1261,5 +1492,14 @@ mod tests {
         for changed in segment.identity_mutations_for_test() {
             assert!(opener.open(&changed).is_err());
         }
+    }
+
+    #[test]
+    fn blob_stream_segment_round_trips_canonically() {
+        let (sealer, opener) = contexts();
+        let (segment, expected_leaves) = sealer.seal(partition(0, 9)).expect("seal");
+        let decoded = EncryptedBlobStreamSegment::decode(&segment.encode()).expect("decode");
+        assert_eq!(decoded, segment);
+        assert_eq!(opener.open(&decoded).expect("open").1, expected_leaves);
     }
 }
