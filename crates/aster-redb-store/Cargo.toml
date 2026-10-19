@@ -18,5 +18,8 @@ redb.workspace = true
 rustix.workspace = true
 sha2.workspace = true
 
+[dev-dependencies]
+aster-mesh = { package = "aster-core", path = "../aster-core", default-features = false, features = ["reference-session", "test-utils"] }
+
 [lints]
 workspace = true

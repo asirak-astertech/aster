@@ -14,6 +14,7 @@ pub(crate) mod depot;
 pub(crate) mod lease;
 #[allow(dead_code)] // Lifecycle authority becomes active in Tasks 2-4.
 pub(crate) mod lifecycle;
+pub mod pack;
 #[allow(dead_code)]
 pub(crate) mod pressure;
 

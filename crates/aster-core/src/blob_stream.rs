@@ -717,6 +717,18 @@ impl BlobStreamSegmentSealer {
         }
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn from_test_key(
+        stream_id: [u8; 32],
+        open_digest: [u8; 32],
+        content_epoch: u64,
+        key: [u8; 32],
+        base_nonce: [u8; 12],
+    ) -> Self {
+        Self::new(stream_id, open_digest, content_epoch, key, base_nonce)
+    }
+
     pub(crate) fn from_provider(
         open: &VerifiedBlobStreamOpen,
         content_grant_seed: [u8; 32],
