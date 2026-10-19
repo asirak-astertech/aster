@@ -580,6 +580,42 @@ pub struct EncryptedBlobStreamSegment {
     ciphertext: Vec<u8>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EncryptedBlobStreamSegmentHeader {
+    stream_id: [u8; 32],
+    open_digest: [u8; 32],
+    content_epoch: u64,
+    index: u64,
+    offset: u64,
+    total_len: u64,
+    plaintext_len: u32,
+    ciphertext_len: u32,
+}
+
+impl EncryptedBlobStreamSegmentHeader {
+    pub const fn stream_id(&self) -> &[u8; 32] {
+        &self.stream_id
+    }
+    pub const fn open_digest(&self) -> &[u8; 32] {
+        &self.open_digest
+    }
+    pub const fn index(&self) -> u64 {
+        self.index
+    }
+    pub const fn offset(&self) -> u64 {
+        self.offset
+    }
+    pub const fn total_len(&self) -> u64 {
+        self.total_len
+    }
+    pub const fn plaintext_len(&self) -> u32 {
+        self.plaintext_len
+    }
+    pub const fn ciphertext_len(&self) -> u32 {
+        self.ciphertext_len
+    }
+}
+
 impl EncryptedBlobStreamSegment {
     const FIXED_ENCODED_BYTES: usize = BLOB_STREAM_SEGMENT_ENCODED_OVERHEAD_BYTES - 16;
 
@@ -611,6 +647,19 @@ impl EncryptedBlobStreamSegment {
         &self.ciphertext
     }
 
+    pub fn header(&self) -> EncryptedBlobStreamSegmentHeader {
+        EncryptedBlobStreamSegmentHeader {
+            stream_id: self.stream_id,
+            open_digest: self.open_digest,
+            content_epoch: self.content_epoch,
+            index: self.index,
+            offset: self.offset,
+            total_len: self.total_len,
+            plaintext_len: self.plaintext_len,
+            ciphertext_len: self.ciphertext.len() as u32,
+        }
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(Self::FIXED_ENCODED_BYTES + self.ciphertext.len());
         out.extend_from_slice(BLOB_STREAM_SEGMENT_MAGIC);
@@ -628,6 +677,26 @@ impl EncryptedBlobStreamSegment {
     }
 
     pub fn decode(encoded: &[u8]) -> Result<Self, BlobError> {
+        let (header, ciphertext) = Self::decode_borrowed(encoded)?;
+        Ok(Self {
+            stream_id: header.stream_id,
+            open_digest: header.open_digest,
+            content_epoch: header.content_epoch,
+            index: header.index,
+            offset: header.offset,
+            total_len: header.total_len,
+            plaintext_len: header.plaintext_len,
+            ciphertext: ciphertext.to_vec(),
+        })
+    }
+
+    pub fn inspect_encoded(encoded: &[u8]) -> Result<EncryptedBlobStreamSegmentHeader, BlobError> {
+        Self::decode_borrowed(encoded).map(|(header, _)| header)
+    }
+
+    fn decode_borrowed(
+        encoded: &[u8],
+    ) -> Result<(EncryptedBlobStreamSegmentHeader, &[u8]), BlobError> {
         let mut reader = StreamReader::new(encoded);
         if reader.take(8)? != BLOB_STREAM_SEGMENT_MAGIC
             || reader.u16()? != BLOB_STREAM_FORMAT_VERSION
@@ -661,18 +730,21 @@ impl EncryptedBlobStreamSegment {
         {
             return Err(BlobError::InvalidManifest);
         }
-        let ciphertext = reader.take(ciphertext_len)?.to_vec();
+        let ciphertext = reader.take(ciphertext_len)?;
         reader.finish()?;
-        Ok(Self {
-            stream_id,
-            open_digest,
-            content_epoch,
-            index,
-            offset,
-            total_len,
-            plaintext_len,
+        Ok((
+            EncryptedBlobStreamSegmentHeader {
+                stream_id,
+                open_digest,
+                content_epoch,
+                index,
+                offset,
+                total_len,
+                plaintext_len,
+                ciphertext_len: ciphertext_len as u32,
+            },
             ciphertext,
-        })
+        ))
     }
 
     #[cfg(test)]
@@ -869,58 +941,78 @@ impl BlobStreamSegmentOpener {
         &self,
         segment: &EncryptedBlobStreamSegment,
     ) -> Result<(Zeroizing<Vec<u8>>, BlobStreamSegmentLeaves), BlobError> {
-        if segment.stream_id != self.0.stream_id
-            || segment.open_digest != self.0.open_digest
-            || segment.content_epoch != self.0.content_epoch
-            || segment.plaintext_len == 0
-            || segment.plaintext_len as usize > BLOB_STREAM_SEGMENT_BYTES
-            || segment.offset
-                != segment
-                    .index
-                    .checked_mul(BLOB_STREAM_SEGMENT_BYTES as u64)
-                    .ok_or(BlobError::LengthOverflow)?
-            || segment
-                .offset
-                .checked_add(u64::from(segment.plaintext_len))
-                .ok_or(BlobError::LengthOverflow)?
-                > segment.total_len
+        self.open_borrowed(segment.header(), &segment.ciphertext)
+        .map(|(_, plaintext, leaves)| (plaintext, leaves))
+    }
+
+    pub fn open_encoded(
+        &self,
+        encoded: &[u8],
+    ) -> Result<
+        (
+            EncryptedBlobStreamSegmentHeader,
+            Zeroizing<Vec<u8>>,
+            BlobStreamSegmentLeaves,
+        ),
+        BlobError,
+    > {
+        let (header, ciphertext) = EncryptedBlobStreamSegment::decode_borrowed(encoded)?;
+        self.open_borrowed(header, ciphertext)
+    }
+
+    fn open_borrowed(
+        &self,
+        header: EncryptedBlobStreamSegmentHeader,
+        ciphertext: &[u8],
+    ) -> Result<
+        (
+            EncryptedBlobStreamSegmentHeader,
+            Zeroizing<Vec<u8>>,
+            BlobStreamSegmentLeaves,
+        ),
+        BlobError,
+    > {
+        if header.stream_id != self.0.stream_id
+            || header.open_digest != self.0.open_digest
+            || header.content_epoch != self.0.content_epoch
+            || ciphertext.len() != header.ciphertext_len as usize
         {
             return Err(BlobError::AuthenticationFailed);
         }
         let aad = segment_aad(
-            segment.stream_id,
-            segment.open_digest,
-            segment.content_epoch,
-            segment.index,
-            segment.offset,
-            segment.total_len,
-            segment.plaintext_len,
+            header.stream_id,
+            header.open_digest,
+            header.content_epoch,
+            header.index,
+            header.offset,
+            header.total_len,
+            header.plaintext_len,
         );
         let cipher = Aes256Gcm::new(&Array(self.0.key));
-        let nonce = Array(segment_nonce(self.0.base_nonce, segment.index)?);
+        let nonce = Array(segment_nonce(self.0.base_nonce, header.index)?);
         let plaintext = Zeroizing::new(
             cipher
                 .decrypt(
                     &nonce,
                     Payload {
-                        msg: &segment.ciphertext,
+                        msg: ciphertext,
                         aad: &aad,
                     },
                 )
                 .map_err(|_| BlobError::AuthenticationFailed)?,
         );
-        if plaintext.len() != segment.plaintext_len as usize {
+        if plaintext.len() != header.plaintext_len as usize {
             return Err(BlobError::AuthenticationFailed);
         }
         let leaves = segment_leaves(
-            segment.index,
-            segment.offset,
-            segment.total_len,
+            header.index,
+            header.offset,
+            header.total_len,
             &aad,
             &plaintext,
-            &segment.ciphertext,
+            ciphertext,
         );
-        Ok((plaintext, leaves))
+        Ok((header, plaintext, leaves))
     }
 }
 
@@ -1783,8 +1875,13 @@ mod tests {
     fn blob_stream_segment_round_trips_canonically() {
         let (sealer, opener) = contexts();
         let (segment, expected_leaves) = sealer.seal(partition(0, 9)).expect("seal");
-        let decoded = EncryptedBlobStreamSegment::decode(&segment.encode()).expect("decode");
+        let encoded = segment.encode();
+        let decoded = EncryptedBlobStreamSegment::decode(&encoded).expect("decode");
         assert_eq!(decoded, segment);
         assert_eq!(opener.open(&decoded).expect("open").1, expected_leaves);
+        let (header, plaintext, leaves) = opener.open_encoded(&encoded).expect("open encoded");
+        assert_eq!(header, segment.header());
+        assert_eq!(plaintext[0], 9);
+        assert_eq!(leaves, expected_leaves);
     }
 }

@@ -25,16 +25,33 @@ impl StreamJobId {
 #[derive(Debug)]
 pub struct StreamPartition {
     index: u64,
+    source_end: u64,
     bytes: Vec<u8>,
 }
 
 impl StreamPartition {
     pub fn new(index: u64, bytes: Vec<u8>) -> Self {
-        Self { index, bytes }
+        Self {
+            index,
+            source_end: 0,
+            bytes,
+        }
+    }
+
+    pub fn new_at(index: u64, source_end: u64, bytes: Vec<u8>) -> Self {
+        Self {
+            index,
+            source_end,
+            bytes,
+        }
     }
 
     pub const fn index(&self) -> u64 {
         self.index
+    }
+
+    pub const fn source_end(&self) -> u64 {
+        self.source_end
     }
 
     pub fn len(&self) -> usize {

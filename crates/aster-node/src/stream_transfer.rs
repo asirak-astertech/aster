@@ -2,12 +2,45 @@ use std::fmt::{self, Display, Formatter};
 
 const MAGIC: &[u8; 4] = b"ASM\x01";
 pub(crate) const MAX_STREAM_EXTENT_BYTES: usize = 1_048_576;
+pub(crate) const PROFILE5_EXTENT_BYTES: usize = 256 * 1024;
 pub(crate) const MAX_STREAM_CHECKPOINT_BATCH_BYTES: u32 = 8 * 1_048_576;
 pub(crate) const STREAM_DATA_FIXED_BYTES: usize = 89;
 pub(crate) const MAX_STREAM_DATA_FRAME_BYTES: usize =
     STREAM_DATA_FIXED_BYTES + MAX_STREAM_EXTENT_BYTES;
 pub(crate) const MAX_STREAM_SEMANTIC_COMMITMENT_BYTES: usize = 64 * 1024;
 pub(crate) const STREAM_TAGS: std::ops::RangeInclusive<u8> = 0xd6..=0xdc;
+
+pub(crate) fn profile5_attempt_bounds(bytes: u64) -> Result<(usize, usize), StreamError> {
+    let extents = bytes.div_ceil(PROFILE5_EXTENT_BYTES as u64);
+    let checkpoints = bytes.div_ceil(u64::from(MAX_STREAM_CHECKPOINT_BATCH_BYTES));
+    let data = usize::try_from(bytes)
+        .ok()
+        .and_then(|value| {
+            usize::try_from(extents)
+                .ok()
+                .and_then(|count| count.checked_mul(128))
+                .and_then(|overhead| value.checked_add(overhead))
+        })
+        .and_then(|value| value.checked_add(MAX_STREAM_SEMANTIC_COMMITMENT_BYTES + 4096))
+        .ok_or_else(|| StreamError::invalid("data stream bound overflow"))?;
+    let control = usize::try_from(checkpoints)
+        .ok()
+        .and_then(|count| count.checked_mul(192))
+        .and_then(|value| value.checked_add(8192))
+        .ok_or_else(|| StreamError::invalid("control stream bound overflow"))?;
+    Ok((data, control))
+}
+
+pub(crate) fn blob_pack_wire_len(plaintext_len: u64) -> Result<u64, StreamError> {
+    let segments = plaintext_len.div_ceil(aster_mesh::BLOB_STREAM_SEGMENT_BYTES as u64);
+    plaintext_len
+        .checked_add(
+            segments
+                .checked_mul(4 + aster_mesh::BLOB_STREAM_SEGMENT_ENCODED_OVERHEAD_BYTES as u64)
+                .ok_or_else(|| StreamError::invalid("wire length overflow"))?,
+        )
+        .ok_or_else(|| StreamError::invalid("wire length overflow"))
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StreamError(String);
@@ -509,6 +542,12 @@ pub(crate) enum StreamAction {
     Terminal(StreamResultCode),
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum StreamExtentAction {
+    Send(StreamDataV1),
+    Retry { reason: StreamRetry, bytes: Vec<u8> },
+}
+
 #[derive(Debug)]
 pub(crate) struct StreamSenderState {
     transfer_id: [u8; 32],
@@ -561,7 +600,10 @@ impl StreamSenderState {
         self.control_sequence = 1;
         Ok(())
     }
-    pub(crate) fn send_extent(&mut self, bytes: Vec<u8>) -> Result<StreamAction, StreamError> {
+    pub(crate) fn send_extent(
+        &mut self,
+        bytes: Vec<u8>,
+    ) -> Result<StreamExtentAction, StreamError> {
         let len =
             u32::try_from(bytes.len()).map_err(|_| StreamError::invalid("extent overflow"))?;
         extent(len)?;
@@ -573,7 +615,10 @@ impl StreamSenderState {
             .checked_add(len.into())
             .ok_or_else(|| StreamError::invalid("offset overflow"))?;
         if end > self.limit {
-            return Ok(StreamAction::Retry(StreamRetry::CreditBlocked));
+            return Ok(StreamExtentAction::Retry {
+                reason: StreamRetry::CreditBlocked,
+                bytes,
+            });
         }
         if end > self.total {
             return Err(StreamError::invalid("data exceeds declared length"));
@@ -587,7 +632,7 @@ impl StreamSenderState {
         };
         self.send_sequence += 1;
         self.next = end;
-        Ok(StreamAction::Send(StreamFrame::Data(f)))
+        Ok(StreamExtentAction::Send(f))
     }
     pub(crate) fn checkpoint(&mut self, x: StreamCheckpointV1) -> Result<(), StreamError> {
         self.identity(&x.transfer_id, &x.attempt_nonce)?;
@@ -746,7 +791,7 @@ impl StreamReceiverState {
         self.send_sequence += 1;
         Ok(StreamAction::Send(StreamFrame::Accept(f)))
     }
-    pub(crate) fn data(&mut self, x: StreamDataV1) -> Result<StreamAction, StreamError> {
+    pub(crate) fn data(&mut self, x: &StreamDataV1) -> Result<StreamAction, StreamError> {
         self.identity(&x.transfer_id, &x.attempt_nonce)?;
         if x.sequence != self.receive_sequence {
             return Err(StreamError::invalid("stream data sequence differs"));
@@ -1015,7 +1060,7 @@ pub(crate) fn fuzz_decode(input: &[u8]) {
             custody_digest: None,
         };
         if let Ok(mut receiver) = StreamReceiverState::new(&open, 0, 0, 1, 1) {
-            let _ = receiver.data(data);
+            let _ = receiver.data(&data);
         }
     }
 }
@@ -1307,16 +1352,20 @@ mod stream_state {
             .unwrap();
         assert!(matches!(
             sender.send_extent(vec![3; 16]).unwrap(),
-            StreamAction::Send(_)
+            StreamExtentAction::Send(_)
         ));
         assert!(matches!(
             sender.send_extent(vec![4; 16]).unwrap(),
-            StreamAction::Send(_)
+            StreamExtentAction::Send(_)
         ));
-        assert_eq!(
-            sender.send_extent(vec![5]),
-            Ok(StreamAction::Retry(StreamRetry::CreditBlocked))
-        );
+        let rejected = vec![5];
+        let allocation = rejected.as_ptr();
+        let StreamExtentAction::Retry { reason, bytes } = sender.send_extent(rejected).unwrap()
+        else {
+            panic!("extent exceeded credit")
+        };
+        assert_eq!(reason, StreamRetry::CreditBlocked);
+        assert_eq!(bytes.as_ptr(), allocation, "credit retry copied the extent");
         sender
             .checkpoint(StreamCheckpointV1 {
                 transfer_id: [1; 32],
@@ -1339,7 +1388,7 @@ mod stream_state {
             .unwrap();
         assert!(matches!(
             sender.send_extent(vec![5; 16]).unwrap(),
-            StreamAction::Send(_)
+            StreamExtentAction::Send(_)
         ));
     }
 
@@ -1358,12 +1407,12 @@ mod stream_state {
             bytes: vec![9; 16],
         };
         assert_eq!(
-            receiver.data(data(0, 0, [2; 32])),
+            receiver.data(&data(0, 0, [2; 32])),
             Ok(StreamAction::Persist { through: 16 })
         );
-        assert!(receiver.data(data(1, 17, [2; 32])).is_err(), "gap");
+        assert!(receiver.data(&data(1, 17, [2; 32])).is_err(), "gap");
         assert!(
-            receiver.data(data(1, 16, [8; 32])).is_err(),
+            receiver.data(&data(1, 16, [8; 32])).is_err(),
             "attempt replay"
         );
         assert_eq!(
@@ -1378,11 +1427,11 @@ mod stream_state {
             }))
         );
         assert_eq!(
-            receiver.data(data(1, 16, [2; 32])),
+            receiver.data(&data(1, 16, [2; 32])),
             Ok(StreamAction::Persist { through: 32 })
         );
         assert!(
-            receiver.data(data(2, 32, [2; 32])).is_err(),
+            receiver.data(&data(2, 32, [2; 32])).is_err(),
             "credit violation"
         );
     }
@@ -1491,7 +1540,7 @@ mod stream_state {
 
         let mut receiver = StreamReceiverState::new(&open(32, [2; 32]), 0, 1, 32, 16).unwrap();
         receiver
-            .data(StreamDataV1 {
+            .data(&StreamDataV1 {
                 transfer_id: [1; 32],
                 attempt_nonce: [2; 32],
                 sequence: 0,
@@ -1567,10 +1616,13 @@ mod stream_state {
                 checkpoint_batch_bytes: 16,
             })
             .unwrap();
-        assert_eq!(
+        assert!(matches!(
             sender.send_extent(vec![1]),
-            Ok(StreamAction::Retry(StreamRetry::CreditBlocked))
-        );
+            Ok(StreamExtentAction::Retry {
+                reason: StreamRetry::CreditBlocked,
+                ..
+            })
+        ));
         assert_eq!(
             sender.transport_lost(),
             StreamAction::Retry(StreamRetry::TransportLost)
@@ -1581,7 +1633,7 @@ mod stream_state {
     fn duplicate_data_below_durable_checkpoint_is_discarded_after_binding_checks() {
         let mut receiver = StreamReceiverState::new(&open(64, [2; 32]), 16, 2, 32, 16).unwrap();
         assert_eq!(
-            receiver.data(StreamDataV1 {
+            receiver.data(&StreamDataV1 {
                 transfer_id: [1; 32],
                 attempt_nonce: [2; 32],
                 sequence: 0,

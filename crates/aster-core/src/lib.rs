@@ -171,8 +171,9 @@ pub use blob_stream::{
     BLOB_STREAM_SEGMENT_BYTES, BLOB_STREAM_SEGMENT_ENCODED_OVERHEAD_BYTES, BlobPublicationStreamId,
     BlobStreamCheckpoint, BlobStreamFinalCommitment, BlobStreamFrontier, BlobStreamOpen,
     BlobStreamPlainPartition, BlobStreamSegmentLeaves, BlobStreamSegmentOpener,
-    BlobStreamSegmentSealer, BlobStreamSubtree, EncryptedBlobStreamSegment, MAX_BLOB_STREAM_BYTES,
-    VerifiedBlobStreamFinalCommitment, VerifiedBlobStreamOpen,
+    BlobStreamSegmentSealer, BlobStreamSubtree, EncryptedBlobStreamSegment,
+    EncryptedBlobStreamSegmentHeader, MAX_BLOB_STREAM_BYTES, VerifiedBlobStreamFinalCommitment,
+    VerifiedBlobStreamOpen,
 };
 #[cfg(feature = "reference-session")]
 pub use bridge_adapter::{

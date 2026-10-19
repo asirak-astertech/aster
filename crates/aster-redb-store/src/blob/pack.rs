@@ -449,31 +449,50 @@ impl BlobPackWriter {
         segment: &EncryptedBlobStreamSegment,
         leaves: BlobStreamSegmentLeaves,
     ) -> Result<(), BlobPackError> {
-        if segment.index() != self.next_index
-            || segment.stream_id() != self.stream_id.as_bytes()
-            || segment.open_digest() != &self.open_digest
-            || segment.offset() != self.plaintext_offset
-            || segment.total_len() != self.total_len
+        let encoded = segment.encode();
+        self.append_encoded(&encoded, segment.header(), leaves)
+    }
+
+    pub fn append_record(
+        &mut self,
+        encoded: &[u8],
+        leaves: BlobStreamSegmentLeaves,
+    ) -> Result<(), BlobPackError> {
+        let header = EncryptedBlobStreamSegment::inspect_encoded(encoded)
+            .map_err(|_| BlobPackError::Invalid("invalid Blob pack segment"))?;
+        self.append_encoded(encoded, header, leaves)
+    }
+
+    fn append_encoded(
+        &mut self,
+        encoded: &[u8],
+        header: aster_mesh::EncryptedBlobStreamSegmentHeader,
+        leaves: BlobStreamSegmentLeaves,
+    ) -> Result<(), BlobPackError> {
+        if header.index() != self.next_index
+            || header.stream_id() != self.stream_id.as_bytes()
+            || header.open_digest() != &self.open_digest
+            || header.offset() != self.plaintext_offset
+            || header.total_len() != self.total_len
         {
             return Err(BlobPackError::Invalid(
                 "Blob segment is outside pack sequence",
             ));
         }
-        let encoded = segment.encode();
         if encoded.len() > MAX_RECORD_BYTES {
             return Err(BlobPackError::Invalid(
                 "Blob segment record exceeds pack bound",
             ));
         }
         self.data.write_all(&(encoded.len() as u32).to_be_bytes())?;
-        self.data.write_all(&encoded)?;
+        self.data.write_all(encoded)?;
         self.frontier
             .append(BlobStreamSubtree::leaf(self.next_index, leaves))
             .map_err(|_| BlobPackError::Invalid("invalid Blob segment frontier"))?;
         self.next_index += 1;
         self.plaintext_offset = self
             .plaintext_offset
-            .checked_add(u64::from(segment.plaintext_len()))
+            .checked_add(u64::from(header.plaintext_len()))
             .ok_or(BlobPackError::Invalid("Blob pack offset overflow"))?;
         self.pack_len = self
             .pack_len
@@ -523,6 +542,23 @@ pub struct BlobPackReader {
     data: File,
     checkpoint: BlobPackCheckpoint,
     next_index: u64,
+}
+
+/// One structurally validated canonical pack record, including its four-byte
+/// length prefix. Ownership can move directly into transport framing without
+/// decoding and re-encoding the encrypted segment.
+pub struct BlobPackRecord {
+    bytes: Vec<u8>,
+}
+
+impl BlobPackRecord {
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
 }
 
 impl BlobPackReader {
@@ -577,6 +613,15 @@ impl BlobPackReader {
     }
 
     pub fn next_segment(&mut self) -> Result<Option<EncryptedBlobStreamSegment>, BlobPackError> {
+        let Some(record) = self.next_record()? else {
+            return Ok(None);
+        };
+        EncryptedBlobStreamSegment::decode(&record.as_bytes()[4..])
+            .map(Some)
+            .map_err(|_| BlobPackError::Invalid("invalid Blob pack segment"))
+    }
+
+    pub fn next_record(&mut self) -> Result<Option<BlobPackRecord>, BlobPackError> {
         if self.next_index >= self.checkpoint.next_index {
             return Ok(None);
         }
@@ -586,19 +631,31 @@ impl BlobPackReader {
         if len == 0 || len > MAX_RECORD_BYTES {
             return Err(BlobPackError::Invalid("invalid Blob pack record length"));
         }
-        let mut encoded = vec![0; len];
-        self.data.read_exact(&mut encoded)?;
-        let segment = EncryptedBlobStreamSegment::decode(&encoded)
+        let mut bytes = vec![0; 4 + len];
+        bytes[..4].copy_from_slice(&(len as u32).to_be_bytes());
+        self.data.read_exact(&mut bytes[4..])?;
+        let header = EncryptedBlobStreamSegment::inspect_encoded(&bytes[4..])
             .map_err(|_| BlobPackError::Invalid("invalid Blob pack segment"))?;
-        if segment.index() != self.next_index {
+        if header.index() != self.next_index
+            || header.stream_id() != self.checkpoint.stream_id.as_bytes()
+            || header.open_digest() != &self.checkpoint.open_digest
+            || header.offset() != self.checkpoint_segment_offset(self.next_index)?
+            || header.total_len() != self.checkpoint.total_len
+        {
             return Err(BlobPackError::Invalid("non-contiguous Blob pack segment"));
         }
         self.next_index += 1;
-        Ok(Some(segment))
+        Ok(Some(BlobPackRecord { bytes }))
     }
 
     pub const fn checkpoint(&self) -> &BlobPackCheckpoint {
         &self.checkpoint
+    }
+
+    fn checkpoint_segment_offset(&self, index: u64) -> Result<u64, BlobPackError> {
+        index
+            .checked_mul(aster_mesh::BLOB_STREAM_SEGMENT_BYTES as u64)
+            .ok_or(BlobPackError::Invalid("Blob pack segment offset overflow"))
     }
 }
 
@@ -852,6 +909,27 @@ mod tests {
                 .index(),
             1
         );
+    }
+
+    #[test]
+    fn blob_pack_raw_reader_preserves_the_canonical_record() {
+        let root = TempRoot::new();
+        let open = open(BLOB_STREAM_SEGMENT_BYTES as u64);
+        let segments = segments(&open, 1);
+        let mut writer = BlobPackWriter::create(&root.0, &open).expect("create");
+        writer
+            .append(&segments[0].0, segments[0].1)
+            .expect("append");
+        writer.finish().expect("finish");
+
+        let encoded = segments[0].0.encode();
+        let mut expected = Vec::with_capacity(4 + encoded.len());
+        expected.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
+        expected.extend_from_slice(&encoded);
+        let mut reader = BlobPackReader::open(&root.0, &open).expect("reader");
+        let record = reader.next_record().expect("read").expect("record");
+        assert_eq!(record.as_bytes(), expected);
+        assert!(reader.next_record().expect("eof").is_none());
     }
 
     #[test]

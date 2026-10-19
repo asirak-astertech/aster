@@ -6,8 +6,9 @@
 
 use crate::{
     stream_transfer::{
-        MAX_STREAM_CHECKPOINT_BATCH_BYTES, StreamAction, StreamClass, StreamDirection, StreamFrame,
-        StreamOpenV1, StreamReceiverState, StreamResultCode, StreamSenderState,
+        MAX_STREAM_CHECKPOINT_BATCH_BYTES, PROFILE5_EXTENT_BYTES, StreamAction, StreamClass,
+        StreamDirection, StreamExtentAction, StreamFrame, StreamOpenV1, StreamReceiverState,
+        StreamResultCode, StreamSenderState, profile5_attempt_bounds,
     },
     stream_transport::{AttemptOpenRequest, IrohQuicV1Adapter, StreamTransportAdapter},
 };
@@ -75,7 +76,6 @@ pub async fn receive_completed_pack_with_store(
     .await
 }
 
-const EXTENT_BYTES: usize = 256 * 1024;
 const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Clone, Debug, PartialEq)]
@@ -88,33 +88,12 @@ pub struct StreamValidationReport {
 }
 
 fn payload(offset: u64, len: usize) -> Vec<u8> {
-    let extent = offset / EXTENT_BYTES as u64;
+    let extent = offset / PROFILE5_EXTENT_BYTES as u64;
     vec![(extent as u8).wrapping_mul(31).wrapping_add(0x5a); len]
 }
 
 fn rate(bytes: u64, elapsed_ns: u128) -> f64 {
     bytes as f64 / (1024.0 * 1024.0) / (elapsed_ns as f64 / 1_000_000_000.0)
-}
-
-fn attempt_bounds(bytes: u64) -> Result<(usize, usize), String> {
-    let extents = bytes.div_ceil(EXTENT_BYTES as u64);
-    let checkpoints = bytes.div_ceil(u64::from(MAX_STREAM_CHECKPOINT_BATCH_BYTES));
-    let data = usize::try_from(bytes)
-        .ok()
-        .and_then(|value| {
-            usize::try_from(extents)
-                .ok()
-                .and_then(|count| count.checked_mul(128))
-                .and_then(|overhead| value.checked_add(overhead))
-        })
-        .and_then(|value| value.checked_add(4096))
-        .ok_or("data stream bound overflow")?;
-    let control = usize::try_from(checkpoints)
-        .ok()
-        .and_then(|count| count.checked_mul(192))
-        .and_then(|value| value.checked_add(4096))
-        .ok_or("control stream bound overflow")?;
-    Ok((data, control))
 }
 
 fn encoded(frame: StreamFrame) -> Result<Vec<u8>, String> {
@@ -131,7 +110,8 @@ pub async fn send(connection: Connection, bytes: u64) -> Result<StreamValidation
     if bytes == 0 {
         return Err("validation payload must be nonempty".into());
     }
-    let (max_data_bytes, max_control_bytes) = attempt_bounds(bytes)?;
+    let (max_data_bytes, max_control_bytes) =
+        profile5_attempt_bounds(bytes).map_err(|error| error.to_string())?;
     let adapter = IrohQuicV1Adapter::new(connection);
     let attempt = adapter
         .open_attempt(AttemptOpenRequest {
@@ -175,22 +155,27 @@ pub async fn send(connection: Connection, bytes: u64) -> Result<StreamValidation
     let mut offset = 0_u64;
     let mut checkpoints = 0_u64;
     let mut hasher = Sha256::new();
+    let mut pending = None;
     while offset < bytes {
-        let len = (bytes - offset).min(EXTENT_BYTES as u64) as usize;
-        let extent = payload(offset, len);
+        let len = (bytes - offset).min(PROFILE5_EXTENT_BYTES as u64) as usize;
+        let extent = pending.take().unwrap_or_else(|| payload(offset, len));
         match state
-            .send_extent(extent.clone())
+            .send_extent(extent)
             .map_err(|error| error.to_string())?
         {
-            StreamAction::Send(frame) => {
+            StreamExtentAction::Send(data) => {
+                hasher.update(&data.bytes);
                 attempt
-                    .send_data(&encoded(frame)?)
+                    .send_data(&encoded(StreamFrame::Data(data))?)
                     .await
                     .map_err(|error| format!("send data: {error:?}"))?;
-                hasher.update(&extent);
                 offset += len as u64;
             }
-            StreamAction::Retry(crate::stream_transfer::StreamRetry::CreditBlocked) => {
+            StreamExtentAction::Retry {
+                reason: crate::stream_transfer::StreamRetry::CreditBlocked,
+                bytes,
+            } => {
+                pending = Some(bytes);
                 let checkpoint = attempt
                     .receive_control()
                     .await
@@ -204,7 +189,9 @@ pub async fn send(connection: Connection, bytes: u64) -> Result<StreamValidation
                     .map_err(|error| error.to_string())?;
                 checkpoints += 1;
             }
-            _ => return Err("sender produced an invalid data action".into()),
+            StreamExtentAction::Retry { .. } => {
+                return Err("sender produced an invalid extent retry".into());
+            }
         }
     }
     // The receiver always makes the final byte durable before accepting Finish.
@@ -279,7 +266,8 @@ pub async fn receive(
     connection: Connection,
     expected_bytes: u64,
 ) -> Result<StreamValidationReport, String> {
-    let (max_data_bytes, max_control_bytes) = attempt_bounds(expected_bytes)?;
+    let (max_data_bytes, max_control_bytes) =
+        profile5_attempt_bounds(expected_bytes).map_err(|error| error.to_string())?;
     let adapter = IrohQuicV1Adapter::new(connection);
     let attempt = adapter
         .accept_attempt(AttemptOpenRequest {
@@ -301,9 +289,14 @@ pub async fn receive(
         return Err("stream open differs from expected Blob transfer".into());
     }
     let batch = u64::from(MAX_STREAM_CHECKPOINT_BATCH_BYTES);
-    let mut state =
-        StreamReceiverState::new(&open, 0, 0, expected_bytes.min(batch), EXTENT_BYTES as u32)
-            .map_err(|error| error.to_string())?;
+    let mut state = StreamReceiverState::new(
+        &open,
+        0,
+        0,
+        expected_bytes.min(batch),
+        PROFILE5_EXTENT_BYTES as u32,
+    )
+    .map_err(|error| error.to_string())?;
     let StreamAction::Send(accept) = state
         .accept(MAX_STREAM_CHECKPOINT_BATCH_BYTES)
         .map_err(|error| error.to_string())?
@@ -328,9 +321,8 @@ pub async fn receive(
         match decoded(&bytes)? {
             StreamFrame::Data(data) => {
                 let through = data.offset + data.bytes.len() as u64;
-                let StreamAction::Persist { through: accepted } = state
-                    .data(data.clone())
-                    .map_err(|error| error.to_string())?
+                let StreamAction::Persist { through: accepted } =
+                    state.data(&data).map_err(|error| error.to_string())?
                 else {
                     return Err("receiver did not persist new data".into());
                 };

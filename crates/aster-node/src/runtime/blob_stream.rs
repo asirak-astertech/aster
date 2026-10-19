@@ -6,16 +6,16 @@ use crate::{
         StreamPartition, run_ordered_channel_pipeline_from,
     },
     stream_transfer::{
-        MAX_STREAM_CHECKPOINT_BATCH_BYTES, MAX_STREAM_SEMANTIC_COMMITMENT_BYTES, StreamAction,
-        StreamClass, StreamDirection, StreamFrame, StreamOpenV1, StreamReceiverState,
-        StreamResultCode, StreamSenderState,
+        MAX_STREAM_CHECKPOINT_BATCH_BYTES, PROFILE5_EXTENT_BYTES, StreamAction, StreamClass,
+        StreamDirection, StreamExtentAction, StreamFrame, StreamOpenV1, StreamReceiverState,
+        StreamResultCode, StreamSenderState, blob_pack_wire_len, profile5_attempt_bounds,
     },
     stream_transport::{AttemptOpenRequest, IrohQuicV1Adapter, StreamTransportAdapter},
 };
 use aster_iroh::Connection;
 use aster_mesh::{
-    BlobStreamOpen, BlobStreamSegmentOpener, EncryptedBlobStreamSegment, NodeId,
-    VerifiedBlobStreamFinalCommitment, VerifiedBlobStreamOpen,
+    BlobStreamOpen, BlobStreamSegmentOpener, NodeId, VerifiedBlobStreamFinalCommitment,
+    VerifiedBlobStreamOpen,
 };
 use aster_redb_store::{
     BlobOperationKey, BlobStreamReservation, BlobStreamReservationRequest, BlobStreamResume,
@@ -26,7 +26,6 @@ use sha2::{Digest, Sha256};
 use std::{path::Path, sync::Arc, time::Duration};
 use tokio::{sync::mpsc, time::Instant};
 
-const EXTENT_BYTES: usize = 256 * 1024;
 const MAX_RECORD_BYTES: usize = 2 * 1024 * 1024;
 const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
@@ -129,41 +128,13 @@ async fn finish_receiver_attempt(
         .map_err(|error| failure("finish control stream", format!("{error:?}")))
 }
 
-fn attempt_bounds(bytes: u64) -> Result<(usize, usize), String> {
-    let extents = bytes.div_ceil(EXTENT_BYTES as u64);
-    let checkpoints = bytes.div_ceil(u64::from(MAX_STREAM_CHECKPOINT_BATCH_BYTES));
-    let data = usize::try_from(bytes)
-        .ok()
-        .and_then(|value| {
-            usize::try_from(extents)
-                .ok()
-                .and_then(|count| count.checked_mul(128))
-                .and_then(|overhead| value.checked_add(overhead))
-        })
-        .and_then(|value| value.checked_add(MAX_STREAM_SEMANTIC_COMMITMENT_BYTES + 4096))
-        .ok_or("data stream bound overflow")?;
-    let control = usize::try_from(checkpoints)
-        .ok()
-        .and_then(|count| count.checked_mul(192))
-        .and_then(|value| value.checked_add(8192))
-        .ok_or("control stream bound overflow")?;
-    Ok((data, control))
-}
-
 pub fn completed_pack_wire_len(root: &Path, open: &BlobStreamOpen) -> Result<u64, String> {
     let reader = BlobPackReader::open(root, open).map_err(|error| failure("open pack", error))?;
     Ok(reader.checkpoint().payload_len())
 }
 
 pub fn expected_pack_wire_len(plaintext_len: u64) -> Result<u64, String> {
-    let segments = plaintext_len.div_ceil(aster_mesh::BLOB_STREAM_SEGMENT_BYTES as u64);
-    plaintext_len
-        .checked_add(
-            segments
-                .checked_mul(4 + aster_mesh::BLOB_STREAM_SEGMENT_ENCODED_OVERHEAD_BYTES as u64)
-                .ok_or("wire length overflow")?,
-        )
-        .ok_or_else(|| "wire length overflow".into())
+    blob_pack_wire_len(plaintext_len).map_err(|error| error.to_string())
 }
 
 struct PackExtentSource {
@@ -214,21 +185,17 @@ impl PackExtentSource {
 
     fn next_extent(&mut self) -> Result<Option<Vec<u8>>, String> {
         if self.cursor == self.record.len() {
-            let Some(segment) = self
+            let Some(record) = self
                 .reader
-                .next_segment()
-                .map_err(|error| failure("read source segment", error))?
+                .next_record()
+                .map_err(|error| failure("read source record", error))?
             else {
                 return Ok(None);
             };
-            let encoded = segment.encode();
-            self.record.clear();
-            self.record
-                .extend_from_slice(&(encoded.len() as u32).to_be_bytes());
-            self.record.extend_from_slice(&encoded);
+            self.record = record.into_bytes();
             self.cursor = 0;
         }
-        let end = self.record.len().min(self.cursor + EXTENT_BYTES);
+        let end = self.record.len().min(self.cursor + PROFILE5_EXTENT_BYTES);
         let extent = self.record[self.cursor..end].to_vec();
         self.cursor = end;
         Ok(Some(extent))
@@ -263,7 +230,8 @@ pub async fn send_completed_pack(
     if wire_len != expected_pack_wire_len(open.total_len())? {
         return Err("completed pack wire length differs from canonical segment framing".into());
     }
-    let (max_data_bytes, max_control_bytes) = attempt_bounds(wire_len)?;
+    let (max_data_bytes, max_control_bytes) =
+        profile5_attempt_bounds(wire_len).map_err(|error| error.to_string())?;
     let attempt = IrohQuicV1Adapter::new(connection)
         .open_attempt(AttemptOpenRequest {
             deadline: Instant::now() + ATTEMPT_TIMEOUT,
@@ -295,17 +263,20 @@ pub async fn send_completed_pack(
     let mut checkpoints = 0;
     while let Some(extent) = pending.take() {
         match state
-            .send_extent(extent.clone())
+            .send_extent(extent)
             .map_err(|error| error.to_string())?
         {
-            StreamAction::Send(frame) => {
+            StreamExtentAction::Send(data) => {
                 attempt
-                    .send_data(&encoded(frame)?)
+                    .send_data(&encoded(StreamFrame::Data(data))?)
                     .await
                     .map_err(|error| failure("send data", format!("{error:?}")))?;
                 pending = source.next_extent()?;
             }
-            StreamAction::Retry(_) => {
+            StreamExtentAction::Retry {
+                reason: crate::stream_transfer::StreamRetry::CreditBlocked,
+                bytes,
+            } => {
                 let checkpoint = attempt
                     .receive_control()
                     .await
@@ -318,9 +289,11 @@ pub async fn send_completed_pack(
                     .checkpoint(checkpoint)
                     .map_err(|error| error.to_string())?;
                 checkpoints += 1;
-                pending = Some(extent);
+                pending = Some(bytes);
             }
-            _ => return Err("sender produced an invalid data action".into()),
+            StreamExtentAction::Retry { .. } => {
+                return Err("sender produced an invalid extent retry".into());
+            }
         }
     }
     let checkpoint = attempt
@@ -412,10 +385,14 @@ impl RecordParser {
 
     async fn push(
         &mut self,
-        bytes: &[u8],
+        bytes: Vec<u8>,
         sender: &mpsc::Sender<Result<StreamPartition, PipelineError>>,
     ) -> Result<(), String> {
-        self.buffer.extend_from_slice(bytes);
+        if self.buffer.is_empty() {
+            self.buffer = bytes;
+        } else {
+            self.buffer.extend_from_slice(&bytes);
+        }
         loop {
             if self.buffer.len() < 4 {
                 return Ok(());
@@ -433,14 +410,16 @@ impl RecordParser {
                 .consumed
                 .checked_add(record_len as u64)
                 .ok_or("wire offset overflow")?;
-            let mut partition = Vec::with_capacity(8 + len);
-            partition.extend_from_slice(&wire_end.to_be_bytes());
-            partition.extend_from_slice(&self.buffer[4..record_len]);
+            let remainder = self.buffer.split_off(record_len);
+            let record = std::mem::replace(&mut self.buffer, remainder);
             sender
-                .send(Ok(StreamPartition::new(self.next_index, partition)))
+                .send(Ok(StreamPartition::new_at(
+                    self.next_index,
+                    wire_end,
+                    record,
+                )))
                 .await
                 .map_err(|_| "verification pipeline closed")?;
-            self.buffer.drain(..record_len);
             self.next_index += 1;
             self.consumed = wire_end;
         }
@@ -529,7 +508,8 @@ async fn receive_completed_pack_inner(
     limits: PipelineLimits,
     store_session: Option<BlobReceiveStoreSession>,
 ) -> Result<BlobNetworkReport, String> {
-    let (max_data_bytes, max_control_bytes) = attempt_bounds(wire_len)?;
+    let (max_data_bytes, max_control_bytes) =
+        profile5_attempt_bounds(wire_len).map_err(|error| error.to_string())?;
     let attempt = IrohQuicV1Adapter::new(connection)
         .accept_attempt(AttemptOpenRequest {
             deadline: Instant::now() + ATTEMPT_TIMEOUT,
@@ -579,7 +559,7 @@ async fn receive_completed_pack_inner(
         durable_wire,
         resume.generation(),
         current_limit,
-        EXTENT_BYTES as u32,
+        PROFILE5_EXTENT_BYTES as u32,
     )
     .map_err(|error| error.to_string())?;
     let StreamAction::Send(accept) = state
@@ -610,27 +590,21 @@ async fn receive_completed_pack_inner(
             limits,
             move |partition| {
                 let index = partition.index();
+                let wire_end = partition.source_end();
                 let bytes = partition.into_bytes();
-                let wire_end = u64::from_be_bytes(
-                    bytes[..8]
-                        .try_into()
-                        .map_err(|_| PipelineError::MapFailed("missing wire offset".into()))?,
-                );
-                let segment = EncryptedBlobStreamSegment::decode(&bytes[8..])
+                let (header, _plaintext, leaves) = opener
+                    .open_encoded(&bytes[4..])
                     .map_err(|error| PipelineError::MapFailed(error.to_string()))?;
-                if segment.index() != index {
+                if header.index() != index {
                     return Err(PipelineError::MapFailed("segment index differs".into()));
                 }
-                let (_, leaves) = opener
-                    .open(&segment)
-                    .map_err(|error| PipelineError::MapFailed(error.to_string()))?;
-                Ok((segment, leaves, wire_end))
+                Ok((bytes, header, leaves, wire_end))
             },
             |mapped: MappedPartition<_>| {
-                let (segment, leaves, wire_end) = mapped.into_value();
-                let plaintext_end = segment.offset() + u64::from(segment.plaintext_len());
+                let (record, header, leaves, wire_end) = mapped.into_value();
+                let plaintext_end = header.offset() + u64::from(header.plaintext_len());
                 let result = writer
-                    .append(&segment, leaves)
+                    .append_record(&record[4..], leaves)
                     .map_err(|error| PipelineError::SinkFailed(error.to_string()))
                     .and_then(|()| {
                         if wire_end - last_checkpoint_wire
@@ -675,13 +649,12 @@ async fn receive_completed_pack_inner(
         let StreamFrame::Data(data) = decoded(&frame)? else {
             return Err("non-data frame before complete payload".into());
         };
-        let StreamAction::Persist { through } = state
-            .data(data.clone())
-            .map_err(|error| error.to_string())?
+        let StreamAction::Persist { through } =
+            state.data(&data).map_err(|error| error.to_string())?
         else {
             return Err("receiver did not accept new data".into());
         };
-        parser.push(&data.bytes, &partition_tx).await?;
+        parser.push(data.bytes, &partition_tx).await?;
         received = through;
         if parser.consumed - durable_wire >= u64::from(MAX_STREAM_CHECKPOINT_BATCH_BYTES)
             || parser.consumed == wire_len
