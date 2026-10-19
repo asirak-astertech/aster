@@ -40,6 +40,7 @@ mod frame;
 mod identity;
 pub mod mission;
 mod runtime;
+pub mod stream_pipeline;
 
 pub use aster_redb_store::{BlobDepotLimits, CustodyQuota, StoreLimits};
 pub use control_admin::{
