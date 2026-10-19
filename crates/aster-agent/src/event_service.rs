@@ -1392,9 +1392,9 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "client", feature = "server", not(target_os = "linux")))]
+    #[cfg(all(feature = "client", feature = "server"))]
     #[tokio::test]
-    async fn combined_handler_keeps_event_status_and_rejects_blob_before_inbound_poll() {
+    async fn combined_handler_keeps_event_status_and_validates_empty_blob_stream() {
         use std::task::Poll;
 
         use buffa::view::HasMessageView as _;
@@ -1470,7 +1470,7 @@ mod tests {
                     Option<
                         Result<connectrpc::StreamMessage<api::PublishBlobRequest>, ConnectError>,
                     >,
-                >::Pending
+                >::Ready(None)
             }));
         let result = api::AsterApplicationService::publish_blob(
             &service,
@@ -1479,18 +1479,18 @@ mod tests {
         )
         .await;
         let error = match result {
-            Ok(_) => panic!("unsupported publish must fail at the handler boundary"),
+            Ok(_) => panic!("empty publish stream must fail protocol validation"),
             Err(error) => error,
         };
         assert_public_detail(
             &error,
             "aster.application.v1alpha1.PublicErrorDetail",
-            ErrorCode::Unimplemented,
-            api::PublicErrorReason::UnsupportedValue,
+            ErrorCode::InvalidArgument,
+            api::PublicErrorReason::MalformedInput,
             "publish_blob",
             false,
         );
-        assert_eq!(polls.load(Ordering::Relaxed), 0);
+        assert_eq!(polls.load(Ordering::Relaxed), 1);
 
         node.shutdown().await.expect("node shutdown");
     }
