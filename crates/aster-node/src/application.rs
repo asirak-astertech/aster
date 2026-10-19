@@ -60,6 +60,7 @@ use crate::{
 };
 
 mod blob;
+pub mod blob_stream;
 #[cfg(test)]
 #[path = "application/operation_capacity_test.rs"]
 mod operation_capacity_test;

@@ -202,14 +202,15 @@ fn add_observation(
         .saturating_add(elapsed.as_nanos().min(u128::from(u64::MAX)) as u64);
 }
 
-pub async fn run_ordered_pipeline<T, Map, Sink, SinkFuture>(
+pub async fn run_ordered_pipeline<I, T, Map, Sink, SinkFuture>(
     job_id: StreamJobId,
-    partitions: Vec<StreamPartition>,
+    partitions: I,
     limits: PipelineLimits,
     map: Map,
     mut sink: Sink,
 ) -> Result<PipelineReport, PipelineError>
 where
+    I: IntoIterator<Item = StreamPartition>,
     T: Send + 'static,
     Map: Fn(StreamPartition) -> Result<T, PipelineError> + Send + Sync + 'static,
     Sink: FnMut(MappedPartition<T>) -> SinkFuture,
@@ -462,7 +463,7 @@ mod tests {
             StreamJobId::from_bytes([10; 16]),
             (0..12)
                 .map(|index| StreamPartition::new(index, vec![0; 16]))
-                .collect(),
+                .collect::<Vec<_>>(),
             PipelineLimits::new(4, 4, 64, 2).expect("limits"),
             |partition| {
                 if partition.index() == 0 {
@@ -485,7 +486,7 @@ mod tests {
             StreamJobId::from_bytes([11; 16]),
             (0..4)
                 .map(|index| StreamPartition::new(index, vec![0; 16]))
-                .collect(),
+                .collect::<Vec<_>>(),
             PipelineLimits::new(4, 4, 64, 4).expect("limits"),
             |partition| {
                 if partition.index() != 0 {
