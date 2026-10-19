@@ -15602,12 +15602,15 @@ async fn start_node_with_shutdown_ownership(
         mission_authority,
     );
     let blob_depot_limits = forwarding.blob_depot_limits();
-    let max_publish_bytes = blob_depot_limits.max_bytes().min(
-        blob_depot_limits
-            .max_chunks()
-            .min(MAX_SELECTED_BLOB_CHUNKS)
-            .saturating_mul(u64::from(aster_mesh::SELECTED_BLOB_CHUNK_SIZE)),
-    );
+    let max_publish_bytes = blob_depot_limits
+        .max_bytes()
+        .min(MAX_NETWORK_BLOB_BYTES)
+        .min(
+            blob_depot_limits
+                .max_chunks()
+                .min(MAX_SELECTED_BLOB_CHUNKS)
+                .saturating_mul(u64::from(aster_mesh::SELECTED_BLOB_CHUNK_SIZE)),
+        );
     let selected_blobs = SelectedBlobHandle::new(
         application_sender,
         application_admission.clone(),

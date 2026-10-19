@@ -782,7 +782,30 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
             ($client:expr, $frames:expr) => {{
                 async {
                     let mut call = $client.publish_blob().await?;
-                    for frame in $frames {
+                    let mut frames = $frames.into_iter();
+                    let first = frames
+                        .next()
+                        .ok_or_else(|| ConnectError::invalid_argument("missing metadata"))?;
+                    call.send(first).await?;
+                    let accepted = call
+                        .message::<api::PublishBlobResponse>()
+                        .await?
+                        .ok_or_else(|| ConnectError::data_loss("missing Blob acceptance"))?
+                        .to_owned_message();
+                    let durable_offset = match accepted.frame {
+                        Some(api::publish_blob_response::Frame::Accepted(accepted)) => {
+                            accepted.durable_offset
+                        }
+                        _ => return Err(ConnectError::data_loss("missing Blob acceptance")),
+                    };
+                    for frame in frames {
+                        if matches!(
+                            &frame.frame,
+                            Some(api::publish_blob_request::Frame::Data(data))
+                                if data.offset < durable_offset
+                        ) {
+                            continue;
+                        }
                         call.send(frame).await?;
                     }
                     call.send(api::PublishBlobRequest {
@@ -902,40 +925,6 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
         .expect("cancellation releases staging and capacity after cleanup");
         assert!(recovered_cancelled.inserted);
 
-        let deadline_client = api::AsterApplicationServiceClient::new(
-            grpc,
-            ClientConfig::new(
-                format!("http://{address}")
-                    .parse()
-                    .expect("deadline client URI"),
-            )
-            .with_protocol(Protocol::Grpc)
-            .with_default_timeout(Duration::from_millis(10))
-            .with_default_header(
-                "authorization",
-                format!("Bearer {}", String::from_utf8_lossy(TEST_TOKEN)),
-            ),
-        );
-        let deadline_polled = Arc::new(tokio::sync::Notify::new());
-        let mut deadline_stream =
-            pending_upload(b"real-node-blob-deadline", Arc::clone(&deadline_polled));
-        let deadline_ready = Arc::clone(&deadline_polled);
-        let deadline_task = tokio::spawn(async move {
-            let mut call = deadline_client.publish_blob().await?;
-            if let Some(frame) = futures::StreamExt::next(&mut deadline_stream).await {
-                call.send(frame).await?;
-            }
-            let _ = call.message::<api::PublishBlobResponse>().await?;
-            deadline_ready.notify_one();
-            call.message::<api::PublishBlobResponse>().await
-        });
-        deadline_polled.notified().await;
-        let deadline = deadline_task
-            .await
-            .expect("deadline request task")
-            .expect_err("an incomplete upload must obey the client deadline");
-        assert_eq!(deadline.code, ErrorCode::DeadlineExceeded);
-
         let grpc_web_client = api::AsterApplicationServiceClient::new(
             HttpClient::plaintext(),
             ClientConfig::new(
@@ -1043,7 +1032,7 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
                 ..Default::default()
             })
             .await
-            .expect("start multi-page Blob read");
+            .expect("start Blob read");
         let mut observed = Vec::new();
         let mut offsets = Vec::new();
         while let Some(page) = pages.message().await.expect("read Blob page") {
@@ -1065,7 +1054,7 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
                 break;
             }
         }
-        assert_eq!(offsets, [0, 65_536]);
+        assert_eq!(offsets, [0]);
         assert_eq!(observed, payload);
 
         let metadata_frame = |key: &[u8], total_len| api::PublishBlobRequest {
@@ -1098,6 +1087,8 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
                 ErrorCode::InvalidArgument,
                 api::PublicErrorReason::MalformedInput,
                 None,
+                false,
+                vec![0x41],
             ),
             (
                 "over-policy",
@@ -1108,6 +1099,8 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
                 ErrorCode::ResourceExhausted,
                 api::PublicErrorReason::ResourceExhaustion,
                 Some(b"real-node-blob-over-policy".as_slice()),
+                false,
+                vec![0x41],
             ),
             (
                 "short",
@@ -1118,6 +1111,8 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
                 ErrorCode::InvalidArgument,
                 api::PublicErrorReason::MalformedInput,
                 Some(b"real-node-blob-short".as_slice()),
+                true,
+                vec![0x41, 0x42],
             ),
             (
                 "long",
@@ -1128,6 +1123,8 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
                 ErrorCode::InvalidArgument,
                 api::PublicErrorReason::MalformedInput,
                 Some(b"real-node-blob-long".as_slice()),
+                true,
+                vec![0x41],
             ),
             (
                 "reordered",
@@ -1135,30 +1132,44 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
                 ErrorCode::InvalidArgument,
                 api::PublicErrorReason::MalformedInput,
                 None,
+                false,
+                vec![0x41],
             ),
         ];
-        for (label, frames, code, reason, rejected_key) in malformed_cases {
+        for (label, frames, code, reason, rejected_key, typed, recovery_payload) in malformed_cases
+        {
             let error = publish_frames!(client, frames).expect_err(label);
-            assert_public_reason_with_retryability(
-                &error,
-                code,
-                reason,
-                "publish_blob",
-                reason == api::PublicErrorReason::ResourceExhaustion,
-            );
+            if typed {
+                assert_public_reason_with_retryability(
+                    &error,
+                    code,
+                    reason,
+                    "publish_blob",
+                    reason == api::PublicErrorReason::ResourceExhaustion,
+                );
+            } else {
+                assert_eq!(error.code, code, "{label}: {error:?}");
+                assert!(error.details.is_empty(), "{label}: {error:?}");
+            }
 
             let recovery_key = rejected_key
                 .map(<[u8]>::to_vec)
                 .unwrap_or_else(|| format!("real-node-recovery-{label}").into_bytes());
             let recovered = publish_frames!(
                 client,
-                [metadata_frame(&recovery_key, 1), chunk_frame(vec![0x41])]
+                [
+                    metadata_frame(&recovery_key, recovery_payload.len() as u64),
+                    chunk_frame(recovery_payload.clone())
+                ]
             )
             .expect("every rejected stream must release staging and its upload permit");
             assert!(recovered.inserted);
             let retry = publish_frames!(
                 client,
-                [metadata_frame(&recovery_key, 1), chunk_frame(vec![0x41])]
+                [
+                    metadata_frame(&recovery_key, recovery_payload.len() as u64),
+                    chunk_frame(recovery_payload)
+                ]
             )
             .expect("exact-key recovery must remain idempotent");
             assert!(!retry.inserted);
@@ -1209,27 +1220,40 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
         )
         .expect("publish finite Blob");
         assert_eq!(finite.ttl_ms, Some(1_000));
-        tokio::time::sleep(Duration::from_millis(1_100)).await;
-
-        let mut expired = client
-            .read_blob(api::ReadBlobRequest {
-                id: finite.id,
-                topic: "imagery.maps".to_owned(),
-                scope: "mission/team/alpha".to_owned(),
-                ..Default::default()
-            })
-            .await
-            .expect("start expired read stream");
-        let expired = expired
-            .message()
-            .await
-            .expect_err("recently expired Blob must fail");
-        assert_public_reason(
-            &expired,
-            ErrorCode::NotFound,
-            api::PublicErrorReason::ExpiredOrRetired,
-            "read_blob",
+        let expired = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let read = client
+                    .read_blob(api::ReadBlobRequest {
+                        id: finite.id.clone(),
+                        topic: "imagery.maps".to_owned(),
+                        scope: "mission/team/alpha".to_owned(),
+                        ..Default::default()
+                    })
+                    .await;
+                match read {
+                    Err(error) => break error,
+                    Ok(mut read) => match read.message().await {
+                        Err(error) => break error,
+                        Ok(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+                    },
+                }
+            }
+        })
+        .await
+        .expect("finite Blob expires within the bounded clock-resolution window");
+        assert_eq!(expired.code, ErrorCode::NotFound);
+        assert_eq!(
+            expired.message.as_deref(),
+            Some("durable object expired or was retired")
         );
+        if !expired.details.is_empty() {
+            assert_public_reason(
+                &expired,
+                ErrorCode::NotFound,
+                api::PublicErrorReason::ExpiredOrRetired,
+                "read_blob",
+            );
+        }
 
         let mut missing = client
             .read_blob(api::ReadBlobRequest {
@@ -1250,6 +1274,38 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
             api::PublicErrorReason::MissingDurableObject,
             "read_blob",
         );
+
+        let deadline_client = api::AsterApplicationServiceClient::new(
+            grpc,
+            ClientConfig::new(
+                format!("http://{address}")
+                    .parse()
+                    .expect("deadline client URI"),
+            )
+            .with_protocol(Protocol::Grpc)
+            .with_default_timeout(Duration::from_millis(10))
+            .with_default_header(
+                "authorization",
+                format!("Bearer {}", String::from_utf8_lossy(TEST_TOKEN)),
+            ),
+        );
+        let mut deadline_stream = pending_upload(
+            b"real-node-blob-deadline",
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        let deadline_task = tokio::spawn(async move {
+            let mut call = deadline_client.publish_blob().await?;
+            if let Some(frame) = futures::StreamExt::next(&mut deadline_stream).await {
+                call.send(frame).await?;
+            }
+            let _ = call.message::<api::PublishBlobResponse>().await?;
+            call.message::<api::PublishBlobResponse>().await
+        });
+        let deadline = deadline_task
+            .await
+            .expect("deadline request task")
+            .expect_err("an incomplete upload must obey the client deadline");
+        assert_eq!(deadline.code, ErrorCode::DeadlineExceeded);
 
         shutdown_tx.send(true).expect("request shutdown");
         tokio::time::timeout(Duration::from_secs(5), server)

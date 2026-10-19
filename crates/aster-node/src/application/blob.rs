@@ -26,9 +26,10 @@ use aster_mesh::{
     BLOB_STREAM_SEGMENT_BYTES, BlobContentVerification, BlobError, BlobId as CoreBlobId,
     BlobMetadata as CoreBlobMetadata, BlobPublicationStreamId, BlobStreamDecryptor,
     BlobStreamEncryptor, BlobStreamFinalCommitment, BlobStreamOpen, ContentVerifiedBlobEnvelope,
-    CustodySample, EncryptedBlobStreamSegment, MAX_BLOB_MEDIA_TYPE_BYTES, MAX_BLOB_SCHEMA_ID_BYTES,
-    NodeId, PreparedBlob, Priority, ReferenceEnvelopeSealer, SELECTED_BLOB_CHUNK_SIZE, Scope,
-    Topic, VerifiedBlobStreamOpen, prepare_blob,
+    CustodyAge, CustodyDisposition, CustodySample, EncryptedBlobStreamSegment,
+    MAX_BLOB_MEDIA_TYPE_BYTES, MAX_BLOB_SCHEMA_ID_BYTES, NodeId, PreparedBlob, Priority,
+    ReferenceEnvelopeSealer, SELECTED_BLOB_CHUNK_SIZE, Scope, Topic, VerifiedBlobStreamOpen,
+    evaluate_custody, prepare_blob,
 };
 #[cfg(test)]
 use aster_redb_store::{BlobCapacityGcTarget, BlobMaintenanceBudget};
@@ -2302,6 +2303,46 @@ impl SelectedBlobNode {
                 ApplicationErrorKind::Integrity,
                 "blob stream read open",
             ));
+        }
+        if let Some(ttl_ms) = open.open().ttl_ms() {
+            let initial = open.open().initial_custody().ok_or_else(|| {
+                ApplicationError::new(ApplicationErrorKind::Integrity, "blob stream read open")
+            })?;
+            let final_sample = commitment.commitment().final_custody().ok_or_else(|| {
+                ApplicationError::new(ApplicationErrorKind::Integrity, "blob stream read open")
+            })?;
+            let cumulative_age_ms = final_sample
+                .tick_ms
+                .checked_sub(initial.tick_ms)
+                .ok_or_else(|| {
+                    ApplicationError::new(ApplicationErrorKind::Integrity, "blob stream read open")
+                })?;
+            let current = self
+                .custody_clock
+                .sample()
+                .map_err(|error| application_error("blob stream read open", error))?;
+            let mut age = CustodyAge::new(cumulative_age_ms, final_sample);
+            match evaluate_custody(Some(ttl_ms), false, &mut age, Some(current)) {
+                CustodyDisposition::LiveFinite { .. } => {}
+                CustodyDisposition::Expired { .. } => {
+                    return Err(ApplicationError::new(
+                        ApplicationErrorKind::ExpiredOrRetired,
+                        "blob stream read open",
+                    ));
+                }
+                CustodyDisposition::Indeterminate => {
+                    return Err(ApplicationError::new(
+                        ApplicationErrorKind::StateUnavailable,
+                        "blob stream read open",
+                    ));
+                }
+                CustodyDisposition::Durable => {
+                    return Err(ApplicationError::new(
+                        ApplicationErrorKind::Integrity,
+                        "blob stream read open",
+                    ));
+                }
+            }
         }
         let reader = self
             .store

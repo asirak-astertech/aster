@@ -1471,7 +1471,7 @@ mod tests {
 
     #[cfg(all(feature = "client", feature = "server", not(target_os = "linux")))]
     #[tokio::test]
-    async fn combined_handler_keeps_event_status_and_rejects_blob_before_inbound_poll() {
+    async fn event_only_handler_keeps_event_status_and_rejects_blob_before_inbound_poll() {
         use std::task::Poll;
 
         use buffa::view::HasMessageView as _;
@@ -1500,9 +1500,7 @@ mod tests {
             EventEmissionPolicy::Normal,
             None,
             shutdown,
-        )
-        .with_blobs(node.selected_blobs(), node.state_root())
-        .expect("construct combined service without Linux staging");
+        );
 
         let status_message = api::GetStatusRequest::default();
         let status_body = bytes::Bytes::from(status_message.encode_to_vec());
