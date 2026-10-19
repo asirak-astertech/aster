@@ -2,13 +2,15 @@
 
 ## Scope and build identity
 
-This evidence covers three measured parts of the unreleased semantic-v9/profile-5 design:
+This evidence covers five measured parts of the unreleased semantic-v9/profile-5 design:
 
 1. the authenticated Blob map/reduce and sequential-pack pipeline on each of the three CM4s; and
 2. the complete v9 stream state machine over the selected Iroh transport between two CM4s; and
-3. the composed completed-pack network DAG, including incremental record parsing, parallel segment authentication, ordered pack append, durable checkpoint credit, Merkle-root settlement, and half-close.
+3. the composed completed-pack network DAG, including incremental record parsing, parallel segment authentication, ordered pack append, durable checkpoint credit, Merkle-root settlement, and half-close;
+4. receiver-owned provisional lifecycle reservation, checkpoint projection, signed-finish verification, and atomic inventory promotion; and
+5. interrupted cross-process resume from store-authoritative byte progress.
 
-It does **not** qualify production deployment. Provisional lifecycle reservation and atomic inventory promotion, resume/fault injection, and the application RPC remain implementation tasks.
+It does **not** qualify production deployment. Application RPC integration, CI/full-matrix evidence, and three-device fused-path fairness remain open.
 
 All device binaries were cross-built from signed local branch `perf/data-mesh-stream-pipeline`. The relevant signed commits are:
 
@@ -17,7 +19,11 @@ All device binaries were cross-built from signed local branch `perf/data-mesh-st
 - `7a7f8a4dffb40063524bc2bfdd29eccdf90e684a` — transport-only validation source without synthetic CPU cost;
 - `b87954ba` — verified encrypted-pack network DAG;
 - `77f0efcb` — terminal half-close synchronization; and
-- `e628c767` — device pack-readiness instrumentation.
+- `e628c767` — device pack-readiness instrumentation;
+- `c73e0d7e` — store-authoritative durable resume;
+- `1c1b58f3` — cross-process resume measurement;
+- `4dcd28a1` — per-device secret isolation for validation; and
+- `aa0f47ca` — complete receiver-side stream settlement.
 
 ARM64 artifact identities:
 
@@ -26,6 +32,7 @@ ARM64 artifact identities:
 | Blob pipeline benchmark | `2e7558bfc74f052bf0d3038b403d96201c9b9f574edcd49fd4b1aa627a5bd6e3` |
 | v9 network benchmark | `ace6abbdfa91e07238b4ccf8e7cbd3025f033c7634aa2982a0b22e8228714222` |
 | encrypted-pack network DAG benchmark | `95f9a116d06fe5ac68d8f586f1ddc62fc50ab72e409e7344498693074189701a` |
+| lifecycle/resume network DAG benchmark (`aa0f47ca`) | `5bda5a3a4bcaa690900ccd7d5ffd0db5d3e778cc21426e7fad921addecf5792f` |
 
 ## Device inventory
 
@@ -133,11 +140,32 @@ The workstation-to-CM4 ZeroTier path has a repeatable MTU/fragmentation symptom:
 
 After the local three-device matrix, `rpi4-2` continued answering ZeroTier ICMP (92–276 ms in one five-packet sample) but could not complete a small SSH command within 20 seconds. It therefore did not participate in the final network pair. Its local 64 MiB through 1 GiB authenticated pipeline results remain valid.
 
+During the later signed-head validation, rpi4-2 and rpi4-3 had direct `/24` WLAN routes and rpi4-2 reached rpi4-3 with 0% ICMP loss (6.66–10.1 ms), but an Iroh connection to an already listening rpi4-3 endpoint timed out before transfer. The same signed artifact immediately completed on rpi4-2 -> rpi4-1. No network configuration was changed; rpi4-3 fused-path participation remains a separate device/network task.
+
 ## Local cross-process durable-resume rehearsal
 
 After receiver lifecycle promotion and durable resume were integrated, the persistent benchmark receiver was exercised across actual process termination on loopback before a new ARM64 deployment. The first 1 GiB attempt was terminated after the receiver had projected byte `604,056,960`. A fresh receiver and sender process reopened the same authenticated fixture, redb authority, and pack directory. Both roles accepted that exact offset, transferred only the remaining `469,822,080` wire bytes (448 segments), reproduced the original plaintext and ciphertext Merkle roots, and exposed exactly one final publication. The resumed suffix ran at 97.849 MiB/s sender and 97.931 MiB/s receiver on loopback.
 
-The benchmark reports `wire_bytes`, `resumed_from`, and `attempt_bytes` separately so a suffix duration cannot be misreported as full-object throughput. This is local implementation evidence only; an interrupted exact 1 GiB run on the CM4 WLAN path remains required.
+The benchmark reports `wire_bytes`, `resumed_from`, and `attempt_bytes` separately so a suffix duration cannot be misreported as full-object throughput.
+
+## CM4 lifecycle, resume, and signed-head qualification
+
+The store-owned receiver was then run on rpi4-1 (`192.168.60.79`) with rpi4-2 (`192.168.60.80`) as sender. ZeroTier remained enabled for SSH control only; both Aster endpoints explicitly bound WLAN addresses and reported `Direct`.
+
+An exact 1 GiB attempt was terminated during steady-state transfer. The retained receiver pack was 547,426,702 bytes. Fresh processes reopened the same redb and pack roots, accepted durable wire offset `545,329,200`, and transferred only the remaining `528,549,840` bytes/504 segments with 63 new checkpoints. The receiver completed in 70.854 seconds at 7.114 MiB/s, reproduced plaintext root `d9de26cb30ee248f1134710adb690d098eca0d29860722d9c31a9bae2852a857` and ciphertext root `34d0e5e7484fa82ca38bce797a595b17b3d4687541ef9da3265dc8add930277c`, and atomically exposed exactly one publication.
+
+That run exposed a post-promotion terminal race: the receiver returned after `ResultAck` and closed the QUIC connection before consuming the sender's data FIN. Signed commit `aa0f47ca` changed the terminal order to `ResultAck -> data EOF -> control FIN`; a focused mock-order regression plus all three real runtime Blob tests pass. The fixed ARM64 artifact then settled cleanly in a 64 MiB WLAN run on both roles.
+
+Finally, the exact fixed artifact from `aa0f47ca` transferred a fresh 1 GiB publication from rpi4-2 to rpi4-1:
+
+| Role | Wire bytes | Elapsed | Throughput | Segments | Durable checkpoints | Publications | Path |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| send | 1,073,879,040 | 140.1486 s | 7.307 MiB/s | pack source | 128 | n/a | Direct |
+| store receive | 1,073,879,040 | 140.1460 s | 7.308 MiB/s | 1,024 | 128 | 1 | Direct |
+
+Both roles reported the same roots as the resumed run. The receiver pack was 1,073,879,122 bytes, its redb authority was 1,056,768 bytes, and both alternating journals were 6,392 bytes. The sender's temporary source pack self-cleaned after settlement. At 83.6% of the retained 8.737 MiB/s raw WLAN baseline, the signed-head store-owned path passes the 80% end-to-end threshold. The isolated 24.2–26.8 MiB/s processing results remain at least 277% of raw and pass the 125% non-transport threshold.
+
+All temporary binaries, secret test bundles, public Opens, source scratch, and receiver states created for this follow-up were removed from all three CM4s after evidence collection. No installed service or existing Aster state was changed.
 
 ## Qualification boundary
 
@@ -146,6 +174,7 @@ This evidence establishes that:
 - the independent authenticated Blob pipeline is bounded and fast enough that the tested WLAN is slower;
 - the semantic-v9 transport state machine carries 1 GiB at approximately the raw WLAN rate; and
 - the composed encrypted-pack receiver remains transport-limited while authenticating, ordering, checkpointing, and settling 1 GiB; and
+- receiver lifecycle promotion and process-restart resume use the store-authoritative checkpoint without replaying the durable prefix; and
 - the previous 1.5 MiB/s serial processing path is no longer the limiting design.
 
-It does not yet qualify production deployment. Receiver-side provisional lifecycle reservation, atomic promotion, and cross-process resume now have focused/local evidence. Remaining implementation and evidence include application RPC integration, interrupted 1 GiB resume on the CM4 WLAN path, three-device fairness for the fused path, and CI/full-matrix evidence.
+It does not yet qualify production deployment. Application RPC integration, three-device fused-path fairness after the rpi4-3 connectivity issue is resolved, and CI/full-matrix evidence remain open.
