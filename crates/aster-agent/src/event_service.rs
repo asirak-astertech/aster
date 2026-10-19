@@ -1472,13 +1472,16 @@ mod tests {
                     >,
                 >::Pending
             }));
-        let error = api::AsterApplicationService::publish_blob(
+        let result = api::AsterApplicationService::publish_blob(
             &service,
             RequestContext::default(),
             inbound,
         )
-        .await
-        .expect_err("unsupported publish fails at the handler boundary");
+        .await;
+        let error = match result {
+            Ok(_) => panic!("unsupported publish must fail at the handler boundary"),
+            Err(error) => error,
+        };
         assert_public_detail(
             &error,
             "aster.application.v1alpha1.PublicErrorDetail",
