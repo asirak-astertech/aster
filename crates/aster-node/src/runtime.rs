@@ -14829,7 +14829,7 @@ async fn run_blob_maintenance_turn_background(
 }
 
 async fn run_selected_blob_worker(
-    mut application: SelectedBlobNode,
+    application: SelectedBlobNode,
     mut commands: mpsc::Receiver<BlobWorkerCommand>,
     admission: Arc<AtomicBool>,
     inject_fatal_on_shutdown: bool,
@@ -14845,62 +14845,59 @@ async fn run_selected_blob_worker(
     // before returning plaintext. The selected runtime makes no bounded-
     // latency claim for non-local/non-regular File providers; it never detaches
     // the worker or erases key-bearing state while that ownership remains live.
-    while let Some(command) = commands.recv().await {
-        if !admission.load(Ordering::Acquire) {
-            command.reject();
-            continue;
-        }
-        #[cfg(all(test, unix))]
-        if let Some(gate) = test_gate.as_ref() {
-            gate.enter_worker().await;
-        }
-        // A queued Blob command carries no actor policy guard. The facade
-        // replays the latest policy immediately before durable work and
-        // rechecks it before success, so controls can linearize during File or
-        // decryption work without disclosing stale-policy results.
-        let operation_admission = Arc::clone(&admission);
-        let joined = tokio::task::spawn_blocking(move || {
+    #[cfg(all(test, unix))]
+    let runtime = tokio::runtime::Handle::current();
+    let worker_admission = Arc::clone(&admission);
+    let joined = tokio::task::spawn_blocking(move || {
+        let mut application = application;
+        while let Some(command) = commands.blocking_recv() {
+            if !worker_admission.load(Ordering::Acquire) {
+                command.reject();
+                continue;
+            }
+            #[cfg(all(test, unix))]
+            if let Some(gate) = test_gate.as_ref() {
+                runtime.block_on(gate.enter_worker());
+            }
+            // A queued Blob command carries no actor policy guard. The facade
+            // replays the latest policy immediately before durable work and
+            // rechecks it before success, so controls can linearize during
+            // File or decryption work without disclosing stale-policy results.
             let BlobWorkerCommand {
                 command,
                 _permit: permit,
             } = command;
-            let result = application.execute_live(command, &operation_admission);
+            let result = application.execute_live(command, &worker_admission);
             drop(permit);
-            (application, result)
-        })
-        .await;
-        let (returned, result) = match joined {
-            Ok(completed) => completed,
-            Err(error) => {
-                admission.store(false, Ordering::Release);
+            if let Err(error) = result {
+                // `execute_live` returns a raw NodeError only for fatal internal
+                // coherence after a durable commit. Ordinary application
+                // errors have already been returned through the response.
+                worker_admission.store(false, Ordering::Release);
                 commands.close();
                 while let Ok(command) = commands.try_recv() {
                     command.reject();
                 }
-                return Err(NodeError::Protocol(format!(
-                    "live Blob worker stopped unexpectedly: {error}"
-                )));
+                return Err(error);
             }
-        };
-        application = returned;
-        if let Err(error) = result {
-            // `execute_live` returns a raw NodeError only for fatal internal
-            // coherence after a durable commit. Ordinary application errors
-            // have already been returned through the command response.
+        }
+        if inject_fatal_on_shutdown {
+            return Err(NodeError::FatalBlobCoherence(
+                "injected worker failure during joined shutdown".into(),
+            ));
+        }
+        Ok(())
+    })
+    .await;
+    match joined {
+        Ok(result) => result,
+        Err(error) => {
             admission.store(false, Ordering::Release);
-            commands.close();
-            while let Ok(command) = commands.try_recv() {
-                command.reject();
-            }
-            return Err(error);
+            Err(NodeError::Protocol(format!(
+                "live Blob worker stopped unexpectedly: {error}"
+            )))
         }
     }
-    if inject_fatal_on_shutdown {
-        return Err(NodeError::FatalBlobCoherence(
-            "injected worker failure during joined shutdown".into(),
-        ));
-    }
-    Ok(())
 }
 
 struct PendingEventPublication {

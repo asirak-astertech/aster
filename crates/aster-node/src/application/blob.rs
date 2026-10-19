@@ -1397,6 +1397,10 @@ struct LocalBlobReadStream {
     last_request_offset: u64,
 }
 
+fn take_zeroizing_bytes(mut bytes: Zeroizing<Vec<u8>>) -> Vec<u8> {
+    std::mem::take(&mut *bytes)
+}
+
 fn seal_ready_stream_partitions(
     stream: &mut LocalBlobPublishStream,
     force: bool,
@@ -2090,7 +2094,7 @@ impl SelectedBlobNode {
                     index,
                     segment_offset,
                     stream.total_len,
-                    pending.to_vec(),
+                    take_zeroizing_bytes(pending),
                 )
                 .map_err(|error| blob_core_error("blob stream write", error))?,
             );
@@ -4985,6 +4989,16 @@ mod tests {
     use crate::application::SelectedEventNode;
 
     static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn stream_partition_moves_the_zeroizing_plaintext_allocation() {
+        let plaintext = Zeroizing::new(vec![0x5a; BLOB_STREAM_SEGMENT_BYTES]);
+        let allocation = plaintext.as_ptr();
+        let moved = take_zeroizing_bytes(plaintext);
+
+        assert_eq!(moved.as_ptr(), allocation);
+        assert_eq!(moved.len(), BLOB_STREAM_SEGMENT_BYTES);
+    }
 
     fn content_delivery(item: &BlobDeliveryItem) -> &BlobDelivery {
         item.content().expect("content Blob delivery")
