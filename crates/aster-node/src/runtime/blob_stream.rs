@@ -112,6 +112,23 @@ fn result_digest(open: &BlobStreamOpen, roots: ([u8; 32], [u8; 32])) -> [u8; 32]
     hasher.finalize().into()
 }
 
+async fn finish_receiver_attempt(
+    attempt: Arc<dyn crate::stream_transport::StreamReceiveAttempt>,
+) -> Result<(), String> {
+    if attempt
+        .receive_data()
+        .await
+        .map_err(|error| failure("receive data EOF", format!("{error:?}")))?
+        .is_some()
+    {
+        return Err("data stream contained a frame after result acknowledgement".into());
+    }
+    attempt
+        .finish_control()
+        .await
+        .map_err(|error| failure("finish control stream", format!("{error:?}")))
+}
+
 fn attempt_bounds(bytes: u64) -> Result<(usize, usize), String> {
     let extents = bytes.div_ceil(EXTENT_BYTES as u64);
     let checkpoints = bytes.div_ceil(u64::from(MAX_STREAM_CHECKPOINT_BATCH_BYTES));
@@ -761,10 +778,7 @@ async fn receive_completed_pack_inner(
     if settled != result_code {
         return Err("receiver settled a different result code".into());
     }
-    attempt
-        .finish_control()
-        .await
-        .map_err(|error| failure("finish control stream", format!("{error:?}")))?;
+    finish_receiver_attempt(attempt).await?;
     Ok(BlobNetworkReport {
         wire_bytes: wire_len,
         resumed_from,
@@ -778,6 +792,7 @@ async fn receive_completed_pack_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stream_transport::{AdapterFuture, StreamReceiveAttempt, StreamTransportError};
     use crate::{application::blob_stream::publish_blob_stream, stream_pipeline::PipelineLimits};
     use aster_iroh::{CarrierSecurityProfile, Endpoint, EndpointConfig, ExpectedPeer, SecretKey};
     use aster_mesh::{
@@ -795,6 +810,44 @@ mod tests {
     };
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+    struct TerminalReceiveAttempt {
+        events: std::sync::Mutex<Vec<&'static str>>,
+    }
+
+    impl StreamReceiveAttempt for TerminalReceiveAttempt {
+        fn receive_data(&self) -> AdapterFuture<'_, Option<Vec<u8>>> {
+            Box::pin(async move {
+                self.events.lock().unwrap().push("data-eof");
+                Ok(None)
+            })
+        }
+
+        fn send_control<'a>(&'a self, _frame: &'a [u8]) -> AdapterFuture<'a, ()> {
+            Box::pin(async { Err(StreamTransportError::Closed) })
+        }
+
+        fn finish_control(&self) -> AdapterFuture<'_, ()> {
+            Box::pin(async move {
+                let mut events = self.events.lock().unwrap();
+                assert_eq!(events.as_slice(), ["data-eof"]);
+                events.push("control-fin");
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn receiver_consumes_data_eof_before_finishing_control() {
+        let attempt = Arc::new(TerminalReceiveAttempt {
+            events: std::sync::Mutex::new(Vec::new()),
+        });
+        finish_receiver_attempt(attempt.clone()).await.unwrap();
+        assert_eq!(
+            attempt.events.lock().unwrap().as_slice(),
+            ["data-eof", "control-fin"]
+        );
+    }
 
     struct TempRoot(std::path::PathBuf);
     impl TempRoot {
@@ -902,8 +955,8 @@ mod tests {
             let root = receiver_root.0.clone();
             async move {
                 let connection = server.accept(&allowed).await.expect("accept");
-                receive_completed_pack(
-                    connection,
+                let report = receive_completed_pack(
+                    connection.clone(),
                     &open,
                     BlobStreamSegmentOpener::from_test_key(
                         *open.stream_id().as_bytes(),
@@ -917,7 +970,9 @@ mod tests {
                     limits,
                 )
                 .await
-                .expect("receive")
+                .expect("receive");
+                connection.close();
+                report
             }
         });
         let connection = client

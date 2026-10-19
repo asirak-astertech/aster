@@ -298,7 +298,7 @@ pub(crate) enum StreamTransportError {
     Bounds,
 }
 
-type AdapterFuture<'a, T> =
+pub(crate) type AdapterFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, StreamTransportError>> + Send + 'a>>;
 
 pub(crate) trait StreamAttempt: Send + Sync {
