@@ -401,6 +401,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn blob_publish_seeks_to_the_store_authoritative_resume_offset() {
+        use connectrpc::client::Stream as _;
+        use std::{fs, future::poll_fn};
+
+        let path =
+            std::env::temp_dir().join(format!("asterctl-blob-resume-{}", std::process::id()));
+        let bytes = vec![0x5a; CHUNK_BYTES + 3];
+        fs::write(&path, &bytes).unwrap();
+        let file = File::open(&path).unwrap();
+        let (mut frames, reader) = stream_file(file, bytes.len() as u64, CHUNK_BYTES as u64);
+        let frame = poll_fn(|context| Pin::new(&mut frames).poll_next(context))
+            .await
+            .unwrap();
+        reader.await.unwrap().unwrap();
+        fs::remove_file(path).unwrap();
+        let api::publish_blob_request::Frame::Data(chunk) = frame.frame.unwrap() else {
+            panic!("expected resumed chunk")
+        };
+        assert_eq!(chunk.offset, CHUNK_BYTES as u64);
+        assert_eq!(chunk.bytes, vec![0x5a; 3]);
+    }
+
+    #[tokio::test]
     async fn blob_publish_detects_source_size_changes_after_preflight() {
         use connectrpc::client::Stream as _;
         use std::{fs, future::poll_fn};

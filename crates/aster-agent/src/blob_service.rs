@@ -920,6 +920,18 @@ mod tests {
     }
 
     #[test]
+    fn blob_upload_resumes_only_from_canonical_durable_offsets() {
+        let total = BLOB_RPC_FRAME_BYTES as u64 * 2 + 1;
+        let (_, grammar) = UploadGrammar::start(metadata_frame(total, None)).unwrap();
+        let grammar = grammar.resume(BLOB_RPC_FRAME_BYTES as u64).unwrap();
+        assert_eq!(grammar.received, BLOB_RPC_FRAME_BYTES as u64);
+        assert_eq!(grammar.frames, 1);
+
+        let (_, grammar) = UploadGrammar::start(metadata_frame(total, None)).unwrap();
+        assert_eq!(grammar.resume(1).unwrap_err().code, ErrorCode::DataLoss);
+    }
+
+    #[test]
     fn blob_upload_derives_frame_bound_from_declared_u64_length() {
         let declared = MAX_SELECTED_BLOB_PAGE_BYTES as u64 * 1_025;
         assert_eq!(maximum_chunk_frames_for_len(declared).unwrap(), 1_025);
