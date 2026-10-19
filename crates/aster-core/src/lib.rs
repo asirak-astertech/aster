@@ -49,6 +49,8 @@ mod blob;
 mod blob;
 #[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
 mod blob_custody;
+#[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
+mod blob_stream;
 #[cfg(all(feature = "sqlite-store", feature = "adapter-sdk"))]
 pub mod causal;
 #[cfg(all(feature = "sqlite-store", not(feature = "adapter-sdk")))]
