@@ -3,7 +3,7 @@
 use crate::{
     stream_pipeline::{
         MappedPartition, PipelineError, PipelineLimits, PipelineReport, StreamJobId,
-        StreamPartition, run_ordered_channel_pipeline,
+        StreamPartition, run_ordered_channel_pipeline_from,
     },
     stream_transfer::{
         MAX_STREAM_CHECKPOINT_BATCH_BYTES, MAX_STREAM_SEMANTIC_COMMITMENT_BYTES, StreamAction,
@@ -163,6 +163,36 @@ impl PackExtentSource {
         })
     }
 
+    fn new_at(root: &Path, open: &BlobStreamOpen, wire_offset: u64) -> Result<Self, String> {
+        if wire_offset == 0 {
+            return Self::new(root, open);
+        }
+        let full_record = 4_u64
+            .checked_add(aster_mesh::BLOB_STREAM_SEGMENT_BYTES as u64)
+            .and_then(|value| {
+                value.checked_add(aster_mesh::BLOB_STREAM_SEGMENT_ENCODED_OVERHEAD_BYTES as u64)
+            })
+            .ok_or("Blob record length overflow")?;
+        let full_segments = open.total_len() / aster_mesh::BLOB_STREAM_SEGMENT_BYTES as u64;
+        let full_prefix = full_segments
+            .checked_mul(full_record)
+            .ok_or("Blob resume prefix overflow")?;
+        let next_index = if wire_offset <= full_prefix && wire_offset % full_record == 0 {
+            wire_offset / full_record
+        } else if wire_offset == expected_pack_wire_len(open.total_len())? {
+            open.total_len()
+                .div_ceil(aster_mesh::BLOB_STREAM_SEGMENT_BYTES as u64)
+        } else {
+            return Err("resume offset is not a canonical Blob record boundary".into());
+        };
+        Ok(Self {
+            reader: BlobPackReader::open_at_payload_offset(root, open, next_index, wire_offset)
+                .map_err(|error| failure("open resumed source pack", error))?,
+            record: Vec::new(),
+            cursor: 0,
+        })
+    }
+
     fn next_extent(&mut self) -> Result<Option<Vec<u8>>, String> {
         if self.cursor == self.record.len() {
             let Some(segment) = self
@@ -238,9 +268,10 @@ pub async fn send_completed_pack(
     let StreamFrame::Accept(accept) = decoded(&accept)? else {
         return Err("first control frame was not accept".into());
     };
+    let resume_offset = accept.durable_offset;
     let mut state = StreamSenderState::new(transfer_open.transfer_id, attempt_nonce, wire_len);
     state.accept(accept).map_err(|error| error.to_string())?;
-    let mut source = PackExtentSource::new(root, open)?;
+    let mut source = PackExtentSource::new_at(root, open, resume_offset)?;
     let mut pending = source.next_extent()?;
     let mut checkpoints = 0;
     while let Some(extent) = pending.take() {
@@ -350,11 +381,11 @@ struct RecordParser {
 }
 
 impl RecordParser {
-    fn new() -> Self {
+    fn new(next_index: u64, consumed: u64) -> Self {
         Self {
             buffer: Vec::new(),
-            next_index: 0,
-            consumed: 0,
+            next_index,
+            consumed,
         }
     }
 
@@ -505,11 +536,30 @@ async fn receive_completed_pack_inner(
         .as_ref()
         .map(BlobReceiveStoreSession::reserve)
         .transpose()?;
+    let resume = store_state
+        .as_ref()
+        .map_or_else(BlobStreamResume::default, |(_, resume)| *resume);
+    let durable_wire = resume.durable_wire_offset();
+    let mut writer = BlobPackWriter::open_projected(
+        root,
+        open,
+        resume.generation(),
+        resume.next_segment_index(),
+        resume.durable_plaintext_offset(),
+        resume.durable_pack_len(),
+        resume.durable_wire_offset(),
+    )
+    .map_err(|error| failure("open receiver pack", error))?;
     let window = u64::from(MAX_STREAM_CHECKPOINT_BATCH_BYTES) + MAX_RECORD_BYTES as u64;
-    let mut current_limit = wire_len.min(window);
-    let mut state =
-        StreamReceiverState::new(&transfer_open, 0, 0, current_limit, EXTENT_BYTES as u32)
-            .map_err(|error| error.to_string())?;
+    let mut current_limit = wire_len.min(durable_wire.saturating_add(window));
+    let mut state = StreamReceiverState::new(
+        &transfer_open,
+        durable_wire,
+        resume.generation(),
+        current_limit,
+        EXTENT_BYTES as u32,
+    )
+    .map_err(|error| error.to_string())?;
     let StreamAction::Send(accept) = state
         .accept(MAX_STREAM_CHECKPOINT_BATCH_BYTES)
         .map_err(|error| error.to_string())?
@@ -529,15 +579,12 @@ async fn receive_completed_pack_inner(
             .try_into()
             .expect("job ID"),
     );
-    let root = root.to_owned();
-    let open_owned = open.clone();
     let pipeline_task = tokio::spawn(async move {
-        let mut writer = BlobPackWriter::create(&root, &open_owned)
-            .map_err(|error| PipelineError::SinkFailed(error.to_string()))?;
-        let mut last_checkpoint_wire = 0_u64;
-        let report = run_ordered_channel_pipeline(
+        let mut last_checkpoint_wire = resume.durable_wire_offset();
+        let report = run_ordered_channel_pipeline_from(
             stream_job,
             partition_rx,
+            resume.next_segment_index(),
             limits,
             move |partition| {
                 let index = partition.index();
@@ -593,9 +640,9 @@ async fn receive_completed_pack_inner(
         Ok::<_, PipelineError>((report, roots))
     });
 
-    let mut parser = RecordParser::new();
-    let mut received = 0_u64;
-    let mut durable_wire = 0_u64;
+    let mut parser = RecordParser::new(resume.next_segment_index(), durable_wire);
+    let mut received = durable_wire;
+    let mut durable_wire = durable_wire;
     let mut checkpoints = 0_u64;
     while received < wire_len {
         let frame = attempt
@@ -970,6 +1017,50 @@ mod tests {
             .unwrap(),
         );
         let policy = store.control_policy_snapshot().unwrap();
+        let receiver_pack = receiver_root.0.join("pack");
+        let operation =
+            BlobOperationKey::new(verified_open.open().operation_key().to_vec()).unwrap();
+        let (reservation, initial) = store
+            .reserve_blob_stream_with_policy(
+                &policy,
+                BlobStreamReservationRequest {
+                    operation: &operation,
+                    source: BlobStreamSource::AuthenticatedPeer(provider.identity()),
+                },
+                &verified_open,
+            )
+            .unwrap();
+        let mut source_reader = BlobPackReader::open(&source_root.0, verified_open.open()).unwrap();
+        let first_segment = source_reader.next_segment().unwrap().unwrap();
+        let (_, first_leaves) = provider
+            .blob_stream_segment_opener(&verified_open)
+            .unwrap()
+            .open(&first_segment)
+            .unwrap();
+        let mut partial_writer =
+            BlobPackWriter::create(&receiver_pack, verified_open.open()).unwrap();
+        partial_writer.append(&first_segment, first_leaves).unwrap();
+        let partial_checkpoint = partial_writer.checkpoint().unwrap();
+        let partial_resume = store
+            .checkpoint_blob_stream(&policy, &reservation, initial, partial_checkpoint.clone())
+            .unwrap();
+        assert_eq!(partial_resume.next_segment_index(), 1);
+        assert_eq!(
+            partial_resume.durable_wire_offset(),
+            partial_checkpoint.payload_len()
+        );
+        let second_segment = source_reader.next_segment().unwrap().unwrap();
+        let (_, second_leaves) = provider
+            .blob_stream_segment_opener(&verified_open)
+            .unwrap()
+            .open(&second_segment)
+            .unwrap();
+        partial_writer
+            .append(&second_segment, second_leaves)
+            .unwrap();
+        let unprojected_checkpoint = partial_writer.checkpoint().unwrap();
+        assert!(unprojected_checkpoint.generation() > partial_resume.generation());
+        drop(partial_writer);
         let verifier = {
             let provider = Arc::clone(&provider);
             Arc::new(move |open: &VerifiedBlobStreamOpen, bytes: &[u8]| {
@@ -1010,7 +1101,7 @@ mod tests {
         let receiver = tokio::spawn({
             let server = server.clone();
             let allowed = BTreeSet::from([client.id()]);
-            let root = receiver_root.0.join("pack");
+            let root = receiver_pack;
             let opener = provider.blob_stream_segment_opener(&verified_open).unwrap();
             async move {
                 let connection = server.accept(&allowed).await.unwrap();
@@ -1040,6 +1131,10 @@ mod tests {
 
         assert_eq!(sent.roots, roots);
         assert_eq!(received.roots, roots);
+        assert_eq!(
+            received.pipeline.as_ref().unwrap().completed_items(),
+            published.segment_count - 1
+        );
         let publications = store.blob_stream_publications_with_policy(&policy).unwrap();
         assert_eq!(publications.len(), 1);
         assert_eq!(publications[0].blob_id(), commitment.blob_id());

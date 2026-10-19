@@ -280,6 +280,7 @@ where
         IteratorPartitionSource {
             iterator: partitions.into_iter(),
         },
+        0,
         limits,
         map,
         sink,
@@ -300,9 +301,27 @@ where
     Sink: FnMut(MappedPartition<T>) -> SinkFuture,
     SinkFuture: Future<Output = Result<(), PipelineError>>,
 {
+    run_ordered_channel_pipeline_from(job_id, receiver, 0, limits, map, sink).await
+}
+
+pub async fn run_ordered_channel_pipeline_from<T, Map, Sink, SinkFuture>(
+    job_id: StreamJobId,
+    receiver: mpsc::Receiver<Result<StreamPartition, PipelineError>>,
+    initial_index: u64,
+    limits: PipelineLimits,
+    map: Map,
+    sink: Sink,
+) -> Result<PipelineReport, PipelineError>
+where
+    T: Send + 'static,
+    Map: Fn(StreamPartition) -> Result<T, PipelineError> + Send + Sync + 'static,
+    Sink: FnMut(MappedPartition<T>) -> SinkFuture,
+    SinkFuture: Future<Output = Result<(), PipelineError>>,
+{
     run_ordered_pipeline_source(
         job_id,
         ChannelPartitionSource { receiver },
+        initial_index,
         limits,
         map,
         sink,
@@ -313,6 +332,7 @@ where
 async fn run_ordered_pipeline_source<Source, T, Map, Sink, SinkFuture>(
     job_id: StreamJobId,
     mut source: Source,
+    initial_index: u64,
     limits: PipelineLimits,
     map: Map,
     mut sink: Sink,
@@ -332,7 +352,7 @@ where
     let mut stages = [StageObservation::default(); PIPELINE_STAGE_COUNT];
     let mut accepted_items = 0_u64;
     let mut completed_items = 0_u64;
-    let mut next_index = 0_u64;
+    let mut next_index = initial_index;
     let mut peak_items = 0_usize;
     let mut peak_bytes = 0_usize;
     let mut peak_reorder = 0_usize;
@@ -378,7 +398,12 @@ where
                 jobs.abort_all();
                 return Err(PipelineError::EmptyPartition);
             }
-            let expected = accepted_items;
+            let expected = initial_index.checked_add(accepted_items).ok_or(
+                PipelineError::NonContiguousIndex {
+                    expected: u64::MAX,
+                    actual: index,
+                },
+            )?;
             if index != expected {
                 jobs.abort_all();
                 return Err(PipelineError::NonContiguousIndex {
@@ -694,5 +719,36 @@ mod tests {
         .await;
         assert!(matches!(result, Err(PipelineError::SinkFailed(_))));
         assert!(started.elapsed() >= std::time::Duration::from_millis(10));
+    }
+
+    #[tokio::test]
+    async fn resumed_channel_pipeline_starts_at_durable_partition_index() {
+        let (sender, receiver) = mpsc::channel(2);
+        sender
+            .send(Ok(StreamPartition::new(7, vec![7])))
+            .await
+            .unwrap();
+        sender
+            .send(Ok(StreamPartition::new(8, vec![8])))
+            .await
+            .unwrap();
+        drop(sender);
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let sink_observed = Arc::clone(&observed);
+        let report = run_ordered_channel_pipeline_from(
+            StreamJobId::from_bytes([12; 16]),
+            receiver,
+            7,
+            PipelineLimits::new(2, 2, 2, 2).unwrap(),
+            |partition| Ok(partition.into_bytes()),
+            move |mapped| {
+                sink_observed.lock().unwrap().push(mapped.index());
+                std::future::ready(Ok(()))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(*observed.lock().unwrap(), vec![7, 8]);
+        assert_eq!(report.completed_items(), 2);
     }
 }

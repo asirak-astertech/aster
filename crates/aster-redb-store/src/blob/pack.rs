@@ -209,7 +209,72 @@ impl BlobPackWriter {
             .open(root.join(PACK_FILE))?;
         validate_header(&mut data, open)?;
         let checkpoint = recover_checkpoint(root, open, data.metadata()?.len())?;
+        Self::restore(root, open, data, checkpoint)
+    }
+
+    /// Opens the pack at the exact checkpoint already projected into the store.
+    ///
+    /// A pack checkpoint is made durable before its store projection. After a
+    /// crash, the newest pack journal can therefore contain unacknowledged data.
+    /// This method deliberately selects the store-authoritative journal instead
+    /// of the newest journal and truncates any later tail.
+    pub fn open_projected(
+        root: &Path,
+        open: &BlobStreamOpen,
+        generation: u64,
+        next_index: u64,
+        plaintext_offset: u64,
+        pack_len: u64,
+        payload_len: u64,
+    ) -> Result<Self, BlobPackError> {
+        let mut data = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(root.join(PACK_FILE))
+        {
+            Ok(data) => data,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && generation == 0 => {
+                if next_index != 0 || plaintext_offset != 0 || pack_len != 0 || payload_len != 0 {
+                    return Err(BlobPackError::Invalid(
+                        "non-empty Blob projection has zero generation",
+                    ));
+                }
+                return Self::create(root, open);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        validate_header(&mut data, open)?;
+        let data_len = data.metadata()?.len();
+        let checkpoint = recover_checkpoints(root, open, data_len)?
+            .into_iter()
+            .filter(|checkpoint| {
+                if generation == 0 {
+                    checkpoint.next_index == 0
+                        && checkpoint.plaintext_offset == 0
+                        && checkpoint.payload_len() == 0
+                } else {
+                    checkpoint.generation == generation
+                        && checkpoint.next_index == next_index
+                        && checkpoint.plaintext_offset == plaintext_offset
+                        && checkpoint.pack_len == pack_len
+                        && checkpoint.payload_len() == payload_len
+                }
+            })
+            .max_by_key(|checkpoint| checkpoint.generation)
+            .ok_or(BlobPackError::Invalid(
+                "store-projected Blob pack checkpoint is unavailable",
+            ))?;
+        Self::restore(root, open, data, checkpoint)
+    }
+
+    fn restore(
+        root: &Path,
+        open: &BlobStreamOpen,
+        mut data: File,
+        checkpoint: BlobPackCheckpoint,
+    ) -> Result<Self, BlobPackError> {
         data.set_len(checkpoint.pack_len)?;
+        data.sync_data()?;
         data.seek(SeekFrom::Start(checkpoint.pack_len))?;
         Ok(Self {
             root: root.to_owned(),
@@ -326,6 +391,31 @@ impl BlobPackReader {
         })
     }
 
+    pub fn open_at_payload_offset(
+        root: &Path,
+        open: &BlobStreamOpen,
+        next_index: u64,
+        payload_offset: u64,
+    ) -> Result<Self, BlobPackError> {
+        let mut reader = Self::open(root, open)?;
+        if next_index > reader.checkpoint.next_index
+            || payload_offset > reader.checkpoint.payload_len()
+            || (next_index == 0) != (payload_offset == 0)
+            || (next_index == reader.checkpoint.next_index)
+                != (payload_offset == reader.checkpoint.payload_len())
+        {
+            return Err(BlobPackError::Invalid(
+                "Blob pack resume position is outside its durable checkpoint",
+            ));
+        }
+        let position = PACK_HEADER_LEN
+            .checked_add(payload_offset)
+            .ok_or(BlobPackError::Invalid("Blob pack resume offset overflow"))?;
+        reader.data.seek(SeekFrom::Start(position))?;
+        reader.next_index = next_index;
+        Ok(reader)
+    }
+
     pub fn next_segment(&mut self) -> Result<Option<EncryptedBlobStreamSegment>, BlobPackError> {
         if self.next_index >= self.checkpoint.next_index {
             return Ok(None);
@@ -372,6 +462,17 @@ fn recover_checkpoint(
     open: &BlobStreamOpen,
     data_len: u64,
 ) -> Result<BlobPackCheckpoint, BlobPackError> {
+    recover_checkpoints(root, open, data_len)?
+        .into_iter()
+        .max_by_key(|checkpoint| checkpoint.generation)
+        .ok_or(BlobPackError::Invalid("no valid Blob pack checkpoint"))
+}
+
+fn recover_checkpoints(
+    root: &Path,
+    open: &BlobStreamOpen,
+    data_len: u64,
+) -> Result<Vec<BlobPackCheckpoint>, BlobPackError> {
     let mut valid = Vec::new();
     for name in [CHECKPOINT_ZERO, CHECKPOINT_ONE] {
         let Ok(bytes) = fs::read(root.join(name)) else {
@@ -388,10 +489,11 @@ fn recover_checkpoint(
             valid.push(checkpoint);
         }
     }
-    valid
-        .into_iter()
-        .max_by_key(|checkpoint| checkpoint.generation)
-        .ok_or(BlobPackError::Invalid("no valid Blob pack checkpoint"))
+    if valid.is_empty() {
+        Err(BlobPackError::Invalid("no valid Blob pack checkpoint"))
+    } else {
+        Ok(valid)
+    }
 }
 
 struct Reader<'a> {
@@ -569,6 +671,17 @@ mod tests {
             );
         }
         assert!(reader.next_segment().expect("eof").is_none());
+        let mut resumed_reader =
+            BlobPackReader::open_at_payload_offset(&root.0, &open, 1, durable.payload_len())
+                .expect("resume reader");
+        assert_eq!(
+            resumed_reader
+                .next_segment()
+                .expect("read resumed")
+                .expect("resumed segment")
+                .index(),
+            1
+        );
     }
 
     #[test]
@@ -600,5 +713,64 @@ mod tests {
         assert_eq!(resumed.generation, older.generation());
         assert_eq!(resumed.next_index, older.next_index());
         assert_eq!(resumed.pack_len, older.pack_len());
+    }
+
+    #[test]
+    fn blob_pack_resumes_from_store_projected_checkpoint_not_newest_journal() {
+        let root = TempRoot::new();
+        let total_len = BLOB_STREAM_SEGMENT_BYTES as u64 * 2;
+        let open = open(total_len);
+        let segments = segments(&open, 2);
+        let mut writer = BlobPackWriter::create(&root.0, &open).expect("create");
+        writer
+            .append(&segments[0].0, segments[0].1)
+            .expect("append 0");
+        let projected = writer.checkpoint().expect("projected checkpoint");
+        writer
+            .append(&segments[1].0, segments[1].1)
+            .expect("append 1");
+        let unprojected = writer.checkpoint().expect("unprojected checkpoint");
+        assert!(unprojected.generation() > projected.generation());
+        drop(writer);
+
+        let mut resumed = BlobPackWriter::open_projected(
+            &root.0,
+            &open,
+            projected.generation(),
+            projected.next_index(),
+            projected.plaintext_offset(),
+            projected.pack_len(),
+            projected.payload_len(),
+        )
+        .expect("resume projected");
+        assert_eq!(resumed.generation, projected.generation());
+        assert_eq!(resumed.next_index, 1);
+        assert_eq!(resumed.pack_len, projected.pack_len());
+        resumed
+            .append(&segments[1].0, segments[1].1)
+            .expect("replace unprojected segment");
+    }
+
+    #[test]
+    fn blob_pack_resumes_empty_projection_over_existing_unprojected_pack() {
+        let root = TempRoot::new();
+        let total_len = BLOB_STREAM_SEGMENT_BYTES as u64;
+        let open = open(total_len);
+        let segments = segments(&open, 1);
+        let mut writer = BlobPackWriter::create(&root.0, &open).expect("create");
+        writer
+            .append(&segments[0].0, segments[0].1)
+            .expect("append 0");
+        writer.checkpoint().expect("unprojected checkpoint");
+        drop(writer);
+
+        let mut resumed =
+            BlobPackWriter::open_projected(&root.0, &open, 0, 0, 0, 0, 0).expect("resume empty");
+        assert_eq!(resumed.next_index, 0);
+        assert_eq!(resumed.plaintext_offset, 0);
+        assert_eq!(resumed.pack_len, PACK_HEADER_LEN);
+        resumed
+            .append(&segments[0].0, segments[0].1)
+            .expect("replace unprojected segment");
     }
 }

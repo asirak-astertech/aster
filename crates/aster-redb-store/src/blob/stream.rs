@@ -75,6 +75,7 @@ pub struct BlobStreamResume {
     next_segment_index: u64,
     durable_plaintext_offset: u64,
     durable_pack_len: u64,
+    durable_wire_offset: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -275,6 +276,10 @@ impl BlobStreamResume {
     pub const fn durable_pack_len(self) -> u64 {
         self.durable_pack_len
     }
+
+    pub const fn durable_wire_offset(self) -> u64 {
+        self.durable_wire_offset
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -292,6 +297,7 @@ impl ProvisionalBlobStream {
                 next_segment_index: checkpoint.next_index(),
                 durable_plaintext_offset: checkpoint.plaintext_offset(),
                 durable_pack_len: checkpoint.pack_len(),
+                durable_wire_offset: checkpoint.payload_len(),
             })
     }
 
