@@ -1125,12 +1125,12 @@ mod tests {
                 move |_ctx, _requests: connectrpc::ServiceStream<api::PublishBlobRequest>| {
                     let error = error.clone();
                     async move {
-                        Err::<
-                            connectrpc::Response<
-                                connectrpc::ServiceStream<api::PublishBlobResponse>,
-                            >,
+                        connectrpc::Response::stream_ok(connectrpc::stream_iter([Err::<
+                            api::PublishBlobResponse,
                             _,
-                        >(error)
+                        >(
+                            error
+                        )]))
                     }
                 },
             ),

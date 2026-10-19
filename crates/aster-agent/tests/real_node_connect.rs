@@ -604,7 +604,8 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
         .expect("gRPC-Web rejection must release upload capacity");
         assert!(after_grpc_web.inserted);
 
-        let payload = vec![0x5a; 65_536 + 3];
+        let frame_bytes = aster_agent::BLOB_RPC_FRAME_BYTES;
+        let payload = vec![0x5a; frame_bytes + 3];
         let metadata = api::PublishBlobMetadata {
             operation_key: b"real-node-blob-durable".to_vec(),
             topic: "imagery.maps".to_owned(),
@@ -627,7 +628,7 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
                 frame: Some(api::publish_blob_request::Frame::Data(Box::new(
                     api::PublishBlobData {
                         offset: 0,
-                        bytes: payload[..65_536].to_vec(),
+                        bytes: payload[..frame_bytes].to_vec(),
                         ..Default::default()
                     },
                 ))),
@@ -636,8 +637,8 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
             api::PublishBlobRequest {
                 frame: Some(api::publish_blob_request::Frame::Data(Box::new(
                     api::PublishBlobData {
-                        offset: 65_536,
-                        bytes: payload[65_536..].to_vec(),
+                        offset: frame_bytes as u64,
+                        bytes: payload[frame_bytes..].to_vec(),
                         ..Default::default()
                     },
                 ))),
@@ -683,7 +684,7 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
                 break;
             }
         }
-        assert_eq!(offsets, [0, 65_536]);
+        assert_eq!(offsets, [0, frame_bytes as u64]);
         assert_eq!(observed, payload);
 
         let metadata_frame = |key: &[u8], total_len| api::PublishBlobRequest {

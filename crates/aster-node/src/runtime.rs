@@ -40441,7 +40441,10 @@ mod tests {
                     }
                     Err(error) => {
                         successes += 1;
-                        assert_eq!(error.operation(), "blob read page");
+                        assert!(matches!(
+                            error.operation(),
+                            "blob read page" | "blob stream read"
+                        ));
                         assert!(matches!(
                             error.kind(),
                             ApplicationErrorKind::NotFound

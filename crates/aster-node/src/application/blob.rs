@@ -5260,7 +5260,7 @@ mod tests {
         let root = TestRoot::new("finite-read-page-boundary");
         let mut node = selected_node(&root);
         node.custody_clock = NodeCustodyClock::injected([0xd2; 16], 100, 1);
-        let bytes = payload(2 * SELECTED_BLOB_CHUNK_SIZE as usize + 11);
+        let bytes = payload(MAX_SELECTED_BLOB_PAGE_BYTES + 11);
         let published = node
             .publish_with_options(
                 request(b"blob/finite-read-page-boundary"),
@@ -5280,7 +5280,7 @@ mod tests {
             )
             .expect_err("later page must not open at the exact TTL boundary");
         assert_eq!(error.kind(), ApplicationErrorKind::ExpiredOrRetired);
-        assert_eq!(output.len(), SELECTED_BLOB_CHUNK_SIZE as usize);
+        assert_eq!(output.len(), MAX_SELECTED_BLOB_PAGE_BYTES);
     }
 
     #[test]
@@ -6523,7 +6523,7 @@ mod tests {
             .await
             .expect("read finite live page");
         assert_eq!(page.ttl_ms, Some(60_000));
-        assert_eq!(page.as_bytes(), &bytes[..MAX_SELECTED_BLOB_PAGE_BYTES]);
+        assert_eq!(page.as_bytes(), bytes.as_slice());
         drop(handle);
         worker.await.expect("join finite live worker");
     }
@@ -8359,10 +8359,13 @@ mod tests {
             assert_eq!(output, bytes);
             assert_eq!(read.id, first.id);
             assert_eq!(read.total_len, bytes.len() as u64);
-            assert_eq!(read.verified_chunks, 5);
+            assert_eq!(
+                read.verified_chunks,
+                bytes.len().div_ceil(MAX_SELECTED_BLOB_PAGE_BYTES) as u64
+            );
             assert!(
-                read.peak_working_buffer_bytes <= SELECTED_BLOB_CHUNK_SIZE as usize + 16,
-                "core Blob reader exceeded its chunk-sized buffer bound"
+                read.peak_working_buffer_bytes <= MAX_SELECTED_BLOB_PAGE_BYTES,
+                "Blob reader exceeded its application-page buffer bound"
             );
             assert_eq!(read.media_type, first.media_type);
             assert_eq!(read.schema_id, first.schema_id);
