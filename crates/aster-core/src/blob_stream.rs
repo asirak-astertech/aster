@@ -347,6 +347,13 @@ impl BlobStreamSubtree {
         {
             return Err(BlobError::InvalidManifest);
         }
+        Self::combine_adjacent(left, right)
+    }
+
+    fn combine_adjacent(left: Self, right: Self) -> Result<Self, BlobError> {
+        if left.first_index.checked_add(left.count) != Some(right.first_index) {
+            return Err(BlobError::InvalidManifest);
+        }
         let count = left
             .count
             .checked_add(right.count)
@@ -480,10 +487,17 @@ impl BlobStreamFrontier {
         if self.checkpoint.next_index == 0 || self.checkpoint.plaintext_len != total_len {
             return Err(BlobError::InvalidManifest);
         }
-        let mut roots = self.checkpoint.levels.into_iter().flatten();
-        let root = roots.next().ok_or(BlobError::InvalidManifest)?;
-        if roots.next().is_some() {
-            return Err(BlobError::InvalidManifest);
+        let mut roots = self
+            .checkpoint
+            .levels
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        roots.sort_by_key(|subtree| subtree.first_index);
+        let mut roots = roots.into_iter();
+        let mut root = roots.next().ok_or(BlobError::InvalidManifest)?;
+        for right in roots {
+            root = BlobStreamSubtree::combine_adjacent(root, right)?;
         }
         let final_fields = [
             total_len.to_be_bytes(),
@@ -622,6 +636,26 @@ mod tests {
                 .expect("finish"),
             roots_for_order(&[0, 1, 2, 3])
         );
+    }
+
+    #[test]
+    fn blob_stream_frontier_finishes_non_power_of_two_segment_counts() {
+        let (sealer, _) = contexts();
+        let mut frontier = BlobStreamFrontier::new();
+        for index in 0..3 {
+            let leaves = sealer
+                .seal(partition(index, index as u8 + 1))
+                .expect("seal")
+                .1;
+            frontier
+                .append(BlobStreamSubtree::leaf(index, leaves))
+                .expect("append");
+        }
+        let roots = frontier
+            .finish(3 * BLOB_STREAM_SEGMENT_BYTES as u64)
+            .expect("three-segment root");
+        assert_ne!(roots.0, [0; 32]);
+        assert_ne!(roots.1, [0; 32]);
     }
 
     #[test]
