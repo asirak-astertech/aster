@@ -196,7 +196,7 @@ impl PackExtentSource {
         let full_prefix = full_segments
             .checked_mul(full_record)
             .ok_or("Blob resume prefix overflow")?;
-        let next_index = if wire_offset <= full_prefix && wire_offset % full_record == 0 {
+        let next_index = if wire_offset <= full_prefix && wire_offset.is_multiple_of(full_record) {
             wire_offset / full_record
         } else if wire_offset == expected_pack_wire_len(open.total_len())? {
             open.total_len()

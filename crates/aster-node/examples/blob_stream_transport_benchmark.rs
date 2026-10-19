@@ -240,7 +240,7 @@ async fn pack_receive(
     let started = Instant::now();
     let report = stream_validation::receive_completed_pack(
         connection.clone(),
-        &open,
+        open,
         provider.blob_stream_segment_opener(&verified)?,
         &root.0,
         wire_len,
@@ -282,7 +282,7 @@ async fn pack_store_receive(
     };
     let session = stream_validation::BlobReceiveStoreSession::new(
         Arc::clone(&store),
-        policy.clone(),
+        policy,
         verified.clone(),
         verified.open().publisher(),
         verifier,
@@ -345,7 +345,7 @@ async fn pack_send(
             offset: 0,
             total: plaintext_len,
         },
-        &open,
+        open,
         provider.blob_stream_segment_sealer(&verified)?,
         &root.0,
         pack_limits(),
@@ -376,7 +376,7 @@ async fn pack_send(
     let started = Instant::now();
     let report = stream_validation::send_completed_pack(
         connection.clone(),
-        &open,
+        open,
         &root.0,
         roots,
         signed_commitment,

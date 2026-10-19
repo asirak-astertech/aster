@@ -871,7 +871,7 @@ mod tests {
         let newest = writer.checkpoint().expect("newest checkpoint");
         assert!(newest.generation() > older.generation());
         drop(writer);
-        let newest_path = root.0.join(if newest.generation() % 2 == 0 {
+        let newest_path = root.0.join(if newest.generation().is_multiple_of(2) {
             CHECKPOINT_ZERO
         } else {
             CHECKPOINT_ONE

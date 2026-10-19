@@ -498,6 +498,9 @@ pub(crate) enum StreamRetry {
     SettlementPending,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
+// Frames remain inline deliberately: actions are transient state-machine
+// results, and boxing every data/control frame would add a hot-path allocation.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum StreamAction {
     Send(StreamFrame),
     Persist { through: u64 },
