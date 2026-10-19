@@ -142,6 +142,11 @@ remain outside this surface.
 
 ### Pipelined durable Event publication
 
+Shipped Event publication is numbered-only. `PublishEvent`, `PublishEvents`,
+and the ordinary-publication SDK helpers have been removed. Both unary and
+pipelined publishers require a stable client ID, an explicitly initialized
+journal, and recovery before assigning new work.
+
 Native Connect and gRPC over HTTP/2 use `PublishNumberedEvents`. The SDK journals
 complete intents before sending, persists each ordered result before freeing a
 window slot, and replays the exact unanswered sequences after a disconnect.
@@ -256,8 +261,12 @@ intent. A rejected input stops this SDK pipeline and remains journaled, along
 with unresolved later inputs, for explicit repair or abandonment. Successful
 receipts already saved before a later error are available through recovery.
 The service returns ordered per-input numbered outcomes and rejects gRPC-Web
-request streaming; numbered unary calls remain available there. This addition
-does not migrate existing ordinary publishers or remove their public path.
+request streaming; numbered unary calls remain available there. Migrate
+ordinary publishers to this journaled lifecycle and regenerate clients against
+the current service schema. Nonempty legacy Event publication ledgers are
+refused at startup; preserve them for read-only inspection and explicitly
+provision fresh state. See the
+[numbered-publication migration guide](../../docs/quickstart/connect-agent.md#use-crash-safe-numbered-publication).
 
 ### Serving a live node for development or migration
 

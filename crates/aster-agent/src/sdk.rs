@@ -1,10 +1,13 @@
-//! Client support for pipelined ordinary and crash-safe numbered Event publication.
+//! Client support for crash-safe numbered-only Event publication.
 //!
-//! Ordinary publications use bounded native HTTP/2 sessions and replay only
-//! sent-but-unanswered operation keys. The numbered publication journal is
-//! protocol state rather than a cache. It must be explicitly initialized once
-//! and is then opened exclusively. Opening never creates or repairs a missing
-//! or corrupt journal.
+//! Unary `PublishNumberedEvent` and native HTTP/2 `PublishNumberedEvents`
+//! use a stable client identity, fenced session, and operation sequence.
+//! The journal stores complete intents before sending and results before
+//! exposing them; recovery and exact replay resolve uncertain outcomes.
+//! It is protocol state rather than a cache: initialize it explicitly once,
+//! open it exclusively, and recover before assigning new work. Opening never
+//! creates or repairs a missing or corrupt journal. Ordinary `PublishEvent`
+//! and `PublishEvents` RPCs and their SDK helpers are removed.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;

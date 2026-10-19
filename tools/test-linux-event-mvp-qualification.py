@@ -77,7 +77,7 @@ class MachineSchemaTests(unittest.TestCase):
         )
         self.assertRegex(machine_schema_digest(), r"\Asha256:[0-9a-f]{64}\Z")
         profile_path = (
-            SCHEMA_PATH.parent.parent / "linux-event-mvp-evaluation-profile-v0.1.md"
+            SCHEMA_PATH.parent.parent / "linux-event-mvp-evaluation-profile-v0.1-frozen.md"
         )
         self.assertEqual(
             PROFILE_DIGEST,
