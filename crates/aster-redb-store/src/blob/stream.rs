@@ -568,6 +568,53 @@ impl Store {
         write.commit()?;
         Ok(progress)
     }
+
+    /// Atomically releases one exact provisional authority and its idempotent
+    /// operation binding. Pack-file removal is deliberately a separate,
+    /// retryable filesystem cleanup after this durable authority transition.
+    pub fn abort_blob_stream(
+        &self,
+        reservation: &BlobStreamReservation,
+    ) -> Result<bool, StoreError> {
+        self.require_live()?;
+        let mut write = self.database.begin_write()?;
+        write.set_durability(Durability::Immediate)?;
+        enforce_live_write(&write)?;
+        let key = reservation.stream_id.as_bytes().as_slice();
+        let encoded = write
+            .open_table(BLOB_STREAM_RESERVATIONS)?
+            .get(key)?
+            .map(|row| row.value().to_vec());
+        let Some(encoded) = encoded else {
+            if write
+                .open_table(BLOB_STREAM_OPERATIONS)?
+                .get(reservation.operation.as_slice())?
+                .is_some_and(|bound| bound.value() == key)
+            {
+                return Err(schema_error());
+            }
+            return Ok(false);
+        };
+        let provisional = ProvisionalBlobStream::decode(&encoded)?;
+        if provisional.reservation != *reservation {
+            return Err(blob_error(BlobStoreError::ReservationChanged));
+        }
+        {
+            let operations = write.open_table(BLOB_STREAM_OPERATIONS)?;
+            if operations
+                .get(reservation.operation.as_slice())?
+                .is_none_or(|bound| bound.value() != key)
+            {
+                return Err(schema_error());
+            }
+        }
+        write.open_table(BLOB_STREAM_RESERVATIONS)?.remove(key)?;
+        write
+            .open_table(BLOB_STREAM_OPERATIONS)?
+            .remove(reservation.operation.as_slice())?;
+        write.commit()?;
+        Ok(true)
+    }
 }
 
 #[cfg(test)]
@@ -726,5 +773,27 @@ mod tests {
             projected
         );
         assert!(reopened.blob_inventory().unwrap().is_empty());
+    }
+
+    #[test]
+    fn blob_stream_abort_atomically_releases_reservation_and_operation() {
+        let (_root, store, _publisher, operation, open) = fixture(0x73);
+        let policy = store.control_policy_snapshot().unwrap();
+        let request = BlobStreamReservationRequest {
+            operation: &operation,
+            source: BlobStreamSource::LocalApplication,
+        };
+        let (reservation, _) = store
+            .reserve_blob_stream_with_policy(&policy, request, &open)
+            .unwrap();
+
+        assert!(store.abort_blob_stream(&reservation).unwrap());
+        assert!(!store.abort_blob_stream(&reservation).unwrap());
+        assert!(store.blob_stream_resume(&reservation).is_err());
+
+        let replacement = store
+            .reserve_blob_stream_with_policy(&policy, request, &open)
+            .unwrap();
+        assert_eq!(replacement.0, reservation);
     }
 }
