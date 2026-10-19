@@ -2,18 +2,22 @@
 
 ## Scope and build identity
 
-This evidence covers two independently measured parts of the unreleased semantic-v9/profile-5 design:
+This evidence covers three measured parts of the unreleased semantic-v9/profile-5 design:
 
 1. the authenticated Blob map/reduce and sequential-pack pipeline on each of the three CM4s; and
-2. the complete v9 stream state machine over the selected Iroh transport between two CM4s.
+2. the complete v9 stream state machine over the selected Iroh transport between two CM4s; and
+3. the composed completed-pack network DAG, including incremental record parsing, parallel segment authentication, ordered pack append, durable checkpoint credit, Merkle-root settlement, and half-close.
 
-It does **not** yet claim that the runtime composes those parts into one encrypted network Blob operation. The product runtime/lifecycle adapter remains an implementation task.
+It does **not** qualify production deployment. Provisional lifecycle reservation and atomic inventory promotion, resume/fault injection, and the application RPC remain implementation tasks.
 
 All device binaries were cross-built from signed local branch `perf/data-mesh-stream-pipeline`. The relevant signed commits are:
 
 - `cbbfabbe8c2f569c67bf9de06637b6d819244b9e` — stable content-addressed plaintext roots;
 - `47d0a11769434e9c7b058bb92796040a00b02295` — end-to-end v9 transfer driver; and
-- `7a7f8a4dffb40063524bc2bfdd29eccdf90e684a` — transport-only validation source without synthetic CPU cost.
+- `7a7f8a4dffb40063524bc2bfdd29eccdf90e684a` — transport-only validation source without synthetic CPU cost;
+- `b87954ba` — verified encrypted-pack network DAG;
+- `77f0efcb` — terminal half-close synchronization; and
+- `e628c767` — device pack-readiness instrumentation.
 
 ARM64 artifact identities:
 
@@ -21,6 +25,7 @@ ARM64 artifact identities:
 | --- | --- |
 | Blob pipeline benchmark | `2e7558bfc74f052bf0d3038b403d96201c9b9f574edcd49fd4b1aa627a5bd6e3` |
 | v9 network benchmark | `ace6abbdfa91e07238b4ccf8e7cbd3025f033c7634aa2982a0b22e8228714222` |
+| encrypted-pack network DAG benchmark | `95f9a116d06fe5ac68d8f586f1ddc62fc50ab72e409e7344498693074189701a` |
 
 ## Device inventory
 
@@ -89,6 +94,39 @@ Interface counters around only this run changed as follows:
 
 The payload-sized WLAN deltas, explicit WLAN binds, and `Direct` Iroh witness establish the data path. ZeroTier remained enabled for remote management.
 
+## Composed encrypted-pack network DAG
+
+The completed-pack adapter was then validated from `rpi4-2` to `rpi4-1`. The sender read canonical encrypted segment records directly from its durable pack. The receiver incrementally parsed length-delimited records, authenticated/decrypted them on two fixed workers, restored canonical order, appended the encrypted records to a new pack, synchronized alternating checkpoints, and replenished v9 credit only after each checkpoint. Settlement bound the plaintext and ciphertext Merkle roots.
+
+The endpoints were explicitly bound to WLAN:
+
+- sender: `rpi4-2`, `192.168.60.80`;
+- receiver: `rpi4-1`, `192.168.60.79`.
+
+The corrected 64 MiB warm-up produced:
+
+| Role | Wire bytes | Elapsed | Throughput | Segments | Durable checkpoints | Path |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| send | 67,117,440 | 7.9747 s | 8.026 MiB/s | pack source | 8 | Direct |
+| receive | 67,117,440 | 7.9708 s | 8.030 MiB/s | 64 | 8 | Direct |
+
+Both roles reported plaintext root `abea1994134339a9c1c2a0b5ff25fa6c4a52d1f756759e3ddc09ad83289b37b9` and ciphertext root `cc9191bdcf6e29fabf9ce93d5f5410758a9bebb89896306b786b0aa4f1c7b80e`.
+
+The exact 1 GiB run produced:
+
+| Role | Wire bytes | Elapsed | Throughput | Segments | Durable checkpoints | Path |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| send | 1,073,879,040 | 138.4877 s | 7.395 MiB/s | pack source | 128 | Direct |
+| receive | 1,073,879,040 | 138.4886 s | 7.395 MiB/s | 1,024 | 128 | Direct |
+
+Both roles reported plaintext root `d9de26cb30ee248f1134710adb690d098eca0d29860722d9c31a9bae2852a857` and ciphertext root `73306a8da550d174ea3f69b2cf398b9e72ee8c33e1698bf2f48e40816c34b50d`. This is about 2 minutes 18.5 seconds for the full network operation, compared with the customer's unfinished 107-minute observation.
+
+The fused 1 GiB result is 84.6% of the 8.737 MiB/s same-path raw baseline, above the design's 80% acceptance floor. The isolated CM4 authenticated-pack stages sustain 24.2–26.8 MiB/s, at least 277% of the raw baseline and above the 125% non-transport threshold. On this pair, transport is therefore the measured limiting stage.
+
+Interface counters spanning the 1 GiB run and its control coordination showed payload-scale WLAN changes: `rpi4-2 wlan0` TX increased by 1,159,816,568 bytes and `rpi4-1 wlan0` RX by 1,359,982,687 bytes. Explicit WLAN binds and the `Direct` witnesses establish the data path. The same wider counter interval included ZeroTier SSH/control traffic and unrelated background receive traffic, so its overlay deltas are not used as protocol-throughput evidence.
+
+One warm-up exposed a terminal half-close race: the sender closed its connection after `ResultAck` without waiting for receiver control EOF. Signed commit `77f0efcb` added that wait. The repeated 64 MiB run and exact 1 GiB run both settled cleanly on both roles.
+
 ## Network issues observed
 
 The workstation-to-CM4 ZeroTier path has a repeatable MTU/fragmentation symptom: SSH stdin payloads up to 1,024 bytes completed, while 1,200 bytes and larger stalled. HTTP and SCP requests connected but delivered zero body bytes. A bounded 900-byte acknowledged UDP artifact transfer succeeded. This affects deployment/control and is not the measured Aster WLAN path.
@@ -101,6 +139,7 @@ This evidence establishes that:
 
 - the independent authenticated Blob pipeline is bounded and fast enough that the tested WLAN is slower;
 - the semantic-v9 transport state machine carries 1 GiB at approximately the raw WLAN rate; and
+- the composed encrypted-pack receiver remains transport-limited while authenticating, ordering, checkpointing, and settling 1 GiB; and
 - the previous 1.5 MiB/s serial processing path is no longer the limiting design.
 
-It does not yet qualify production deployment. Remaining implementation includes the runtime adapter that feeds encrypted segment records from the parallel pipeline into the v9 driver, receiver-side provisional lifecycle/promotion, application RPC streaming, resume/fault injection, and CI/full-matrix evidence.
+It does not yet qualify production deployment. Remaining implementation includes receiver-side provisional lifecycle reservation and atomic promotion, application RPC streaming, resume/fault injection, three-device fairness for the fused path, and CI/full-matrix evidence.
