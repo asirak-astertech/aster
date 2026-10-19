@@ -285,3 +285,23 @@ and oversized saved metadata, rows, payloads, and entry counts.
 
 This maintenance adds no requirement status, retained target observation,
 physical performance, Linux deployment, or production qualification credit.
+
+## 2026-10-19 Rust SDK initialization parent sync (P2)
+
+Rust SDK journal initialization now synchronizes the parent directory after
+committing the initial redb transaction with immediate durability, matching the
+Go and native journal behavior. Parent open/sync errors propagate without
+removing or replacing the initialized journal. Bare filenames use the current
+directory. Parent lookup remains pathname-based; retaining the directory handle
+used for creation against concurrent renames or path replacement is separate
+hardening tracked in [issue #111](https://github.com/defenseunicorns/aster/issues/111).
+
+Validation passed on macOS: all 35 SDK tests, including three new regressions
+for committed initial state before the sync boundary, parent-sync failure with
+retained/reopenable state, and bare-filename initialization. The complete
+`mise run check` gate passed strict Clippy, 2,164 workspace tests (two platform
+skips), documentation, real-client smoke checks, conformance, 203 lab tests,
+bindings, and generated-client reproduction. No parser, framing, or envelope
+behavior changed, so the P1 fuzz campaigns above were not rerun for this fix.
+This maintenance adds no requirement-status or physical power-loss
+qualification credit.

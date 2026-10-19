@@ -395,9 +395,19 @@ pub struct PublicationJournal {
 
 impl PublicationJournal {
     /// Creates a new journal. Existing paths are refused instead of reused.
+    /// Success requires both the initial transaction and parent directory to be
+    /// synchronized. If directory synchronization fails, the journal is retained;
+    /// initialization must not be retried by deleting or replacing that state.
     pub fn initialize(path: impl AsRef<Path>, client_id: &[u8]) -> Result<()> {
+        Self::initialize_with_parent_sync(path.as_ref(), client_id, sync_journal_parent)
+    }
+
+    fn initialize_with_parent_sync(
+        path: &Path,
+        client_id: &[u8],
+        sync_parent: impl FnOnce(&Path) -> Result<()>,
+    ) -> Result<()> {
         validate_client_id(client_id)?;
-        let path = path.as_ref();
         let file = open_journal_file(path, true)?;
         let database = redb::Builder::new()
             .create_file(file)
@@ -431,7 +441,8 @@ impl PublicationJournal {
         }
         write
             .commit()
-            .map_err(|error| journal_error(path, "commit initialization", error))
+            .map_err(|error| journal_error(path, "commit initialization", error))?;
+        sync_parent(path)
     }
 
     /// Opens an existing journal and acquires redb's exclusive writer lock.
@@ -595,6 +606,18 @@ impl PublicationJournal {
             .map(|value| decode_json(value.value(), "entry"))
             .transpose()
     }
+}
+
+// Like the Go and native journals, resolve the parent by pathname here.
+// Retaining the exact directory used for creation is separate hardening.
+fn sync_journal_parent(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| journal_error(path, "sync parent directory", error))
 }
 
 fn open_journal_file(path: &Path, create: bool) -> Result<std::fs::File> {
@@ -3205,6 +3228,61 @@ mod tests {
             std::process::id(),
             std::thread::current().id()
         ))
+    }
+
+    #[test]
+    fn journal_initialization_syncs_parent_after_writing_state() {
+        let path = journal_path("parent-sync");
+        let _ = std::fs::remove_file(&path);
+        let mut synced = false;
+        PublicationJournal::initialize_with_parent_sync(&path, b"client", |created| {
+            assert_eq!(created, path);
+            // Inspect a separate copy while initialization still holds its
+            // writer lock: the initial transaction must already be committed.
+            let snapshot = journal_path("parent-sync-snapshot");
+            std::fs::copy(created, &snapshot).unwrap();
+            let journal = PublicationJournal::open(&snapshot, b"client").unwrap();
+            assert_eq!(journal.read_state().unwrap().next_sequence, Some(1));
+            drop(journal);
+            std::fs::remove_file(snapshot).unwrap();
+            sync_journal_parent(created)?;
+            synced = true;
+            Ok(())
+        })
+        .unwrap();
+        assert!(synced);
+        let journal = PublicationJournal::open(&path, b"client").unwrap();
+        assert_eq!(journal.read_state().unwrap().next_sequence, Some(1));
+        drop(journal);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn journal_initialization_propagates_parent_sync_failure_and_retains_state() {
+        let path = journal_path("parent-sync-failure");
+        let _ = std::fs::remove_file(&path);
+        let error = PublicationJournal::initialize_with_parent_sync(&path, b"client", |created| {
+            // A file cannot be opened as a directory parent. Exercise the real
+            // helper's I/O error mapping without changing process permissions.
+            sync_journal_parent(&created.join("not-a-directory/child"))
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("sync parent directory"));
+        assert!(PublicationJournal::initialize(&path, b"client").is_err());
+        let journal = PublicationJournal::open(&path, b"client").unwrap();
+        assert_eq!(journal.read_state().unwrap().next_sequence, Some(1));
+        drop(journal);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn journal_initialization_syncs_current_directory_for_bare_filename() {
+        let path = PathBuf::from(journal_path("relative-parent").file_name().unwrap());
+        let _ = std::fs::remove_file(&path);
+        PublicationJournal::initialize(&path, b"client").unwrap();
+        let journal = PublicationJournal::open(&path, b"client").unwrap();
+        drop(journal);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

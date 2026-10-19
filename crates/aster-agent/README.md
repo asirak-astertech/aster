@@ -205,6 +205,13 @@ mode `0600`, and opening rejects symlinks, non-regular files, files owned by
 another user, or group/other permissions. Existing journals with broader
 permissions must be restricted by their owner before opening. On other
 platforms, protect access through the directory and file ACLs.
+Initialization commits the initial state with immediate durability, then opens
+and synchronizes the parent directory before reporting success, matching the
+Go and native journals. A directory-sync failure returns an error and retains
+the journal; preserve that state rather than deleting or reinitializing it.
+Parent lookup currently uses the pathname; retaining the exact creation-directory
+handle against concurrent renames or replacement is tracked in
+[issue #111](https://github.com/defenseunicorns/aster/issues/111).
 
 The Rust SDK retains at most **eight entries** and charges a **1 MiB logical
 serialized-state budget** across metadata, entry keys, intents, and saved
