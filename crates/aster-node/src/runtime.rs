@@ -31970,7 +31970,7 @@ mod tests {
             mpsc::channel(APPLICATION_COMMAND_CAPACITY);
         let application_admission = Arc::new(AtomicBool::new(true));
         let selected = SelectedBlobHandle::new(
-            application_sender,
+            application_sender.clone(),
             application_admission.clone(),
             services.member.identity(),
             services.member.mission_authority_id(),
@@ -32056,10 +32056,6 @@ mod tests {
             ),
         }
         before_loop_reached.await.expect("deadline actor loop gate");
-        before_loop_release
-            .send(())
-            .expect("release deadline actor loop");
-
         let operation_topic = services.topic.clone();
         let operation_scope = services.scope.clone();
         let mut blob_operation = tokio::spawn(async move {
@@ -32072,6 +32068,22 @@ mod tests {
                 })
                 .await
         });
+        // Keep the actor gated until the request is actually queued. Spawning
+        // the caller alone does not order it ahead of an already-due timer.
+        timeout(Duration::from_secs(10), async {
+            while application_sender.capacity() == APPLICATION_COMMAND_CAPACITY {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("deadline Blob request queued before actor release");
+        // The injected clock starts at most 40 ms before the deadline. Make
+        // that wake due while still gated, exercising pre-dispatch deferral
+        // regardless of how quickly the test runner schedules the actor.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        before_loop_release
+            .send(())
+            .expect("release deadline actor loop");
         timeout(Duration::from_secs(10), worker_reached_receiver.recv())
             .await
             .expect("deadline Blob worker permit deadline")
@@ -32084,7 +32096,12 @@ mod tests {
                     .expect("deadline maintenance schedule observation");
                 if matches!(
                     observation,
+                    // A wake may defer before dispatch or while the worker
+                    // holds the request. Both give operational work priority.
                     BlobMaintenanceScheduleObservation::Deferred {
+                        queued_application: true,
+                        ..
+                    } | BlobMaintenanceScheduleObservation::Deferred {
                         blob_outstanding: 1,
                         ..
                     }
