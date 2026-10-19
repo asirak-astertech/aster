@@ -214,6 +214,59 @@ admission boundary. The full local workspace suite was intentionally not run
 because prior attempts were killed by the host OS; focused tests and CI evidence
 remain the selected verification boundary.
 
+## Composite source-publish to receiver-promotion validation
+
+A final exact 1-GiB composite run used `rpi4-2` as the source and `rpi4-1` as
+the receiver. The source generated the authenticated 1,024-segment encrypted
+pack and then sent that same pack through the semantic-v9 completed-pack path.
+The receiver authenticated every segment, restored order, synchronized 128
+durable checkpoints, verified the final commitment, and atomically exposed one
+publication. Both Aster endpoints explicitly bound their WLAN addresses and
+reported `Direct`; ZeroTier was used only for test control.
+
+The current-tree ARM64 validation artifact was 10,774,984 bytes with SHA-256
+`ae104af73021ff29dc270fe873e1ede3f26e7dffaf6523bfb488bd12fc808cc0`.
+This was a local, uncommitted validation build and was not installed as a
+service or deployed to production.
+
+| Phase | Elapsed | Throughput/result |
+| --- | ---: | --- |
+| Source authenticated pack production and connection setup | 99.5462 s | 1,024 segments ready |
+| WLAN send | 142.4661 s | 7.189 MiB/s |
+| WLAN receive, verify, checkpoint, and promote | 142.4624 s | 7.189 MiB/s |
+| Sender start through receiver settlement acknowledgement | **242.0123 s** | **4 min 2.01 s** |
+
+The roles agreed on plaintext root
+`d9de26cb30ee248f1134710adb690d098eca0d29860722d9c31a9bae2852a857`
+and ciphertext root
+`81def18feea4d8c62db14ea2ec42c2bb0dcf5ba0520b5ed4e4b00dd56f1713a5`.
+The retained receiver pack was 1,073,879,122 bytes, the redb authority was
+1,056,768 bytes, and each alternating checkpoint journal was 6,392 bytes.
+
+The run also exposed a benchmark/integration UX gap, not a requirement for the
+wire protocol to coordinate local publication with a destination. The one-shot
+validation receiver applies its 30-second accept timer while the combined
+sender driver is still spending roughly 78--100 seconds producing its durable
+local pack. A naively started validation receiver therefore exits with
+`Timeout("accept")` before the sender tries to connect, after which the sender
+reports only `Timeout("connect")`. Three zero-byte attempts reproduced this
+behavior. Starting the one-shot receiver after the driver's
+`ASTER_BLOB_PACK_READY` boundary completed the next attempt.
+
+Operationally, local publication must remain independent: publish and durably
+commit locally, then let the sync scheduler open a bounded transfer attempt
+only when a destination contact is available or the data is requested. The
+destination contact listener is node-lifetime infrastructure; its lifetime is
+not the lifetime of one Blob attempt. An unavailable destination therefore
+does not delay or fail local publication, and a later attempt resumes from
+durable state. The benchmark should model these separate lifecycles and its
+errors should identify the expired phase.
+
+This composite measures source authenticated-pack creation through durable
+receiver publication promotion. It does not include a receiver application
+RPC read; that boundary remains represented by the separate exact 1-GiB RPC
+measurements above.
+
 ## Qualification boundary
 
 This evidence establishes that:
