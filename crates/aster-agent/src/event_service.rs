@@ -1512,7 +1512,7 @@ mod tests {
             status_request,
         )
         .await
-        .expect("combined status handler");
+        .expect("event-only status handler");
         assert_eq!(status.body.identity.len(), 32);
 
         let event_message = api::PublishEventRequest {
@@ -1533,7 +1533,7 @@ mod tests {
             event_request,
         )
         .await
-        .expect("combined Event handler");
+        .expect("event-only Event handler");
         assert!(event.body.inserted);
 
         let polls = Arc::new(AtomicU64::new(0));
@@ -1560,8 +1560,8 @@ mod tests {
         assert_public_detail(
             &error,
             "aster.application.v1alpha1.PublicErrorDetail",
-            ErrorCode::Unimplemented,
-            api::PublicErrorReason::UnsupportedValue,
+            ErrorCode::FailedPrecondition,
+            api::PublicErrorReason::FailedPrecondition,
             "publish_blob",
             false,
         );
