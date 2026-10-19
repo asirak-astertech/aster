@@ -1,4 +1,8 @@
-use crate::blob::BlobError;
+use crate::{
+    blob::{BlobError, BlobId, BlobMetadata},
+    custody::CustodySample,
+    model::{Dot, MAX_CAUSAL_CONTEXT_ENTRIES, NodeId, Priority, Scope, Topic, VersionVector},
+};
 use aes_gcm::{
     Aes256Gcm,
     aead::{Aead, KeyInit, Payload, array::Array},
@@ -8,6 +12,387 @@ use zeroize::{Zeroize, Zeroizing};
 
 pub const BLOB_STREAM_SEGMENT_BYTES: usize = 1024 * 1024;
 const FRONTIER_LEVELS: usize = 64;
+const BLOB_STREAM_FORMAT_VERSION: u16 = 2;
+const BLOB_STREAM_PACK_FORMAT_VERSION: u16 = 2;
+const BLOB_STREAM_OPEN_MAGIC: &[u8; 8] = b"ASTRBO02";
+const BLOB_STREAM_COMMITMENT_MAGIC: &[u8; 8] = b"ASTRBF02";
+const MAX_BLOB_STREAM_OPERATION_KEY_BYTES: usize = 256;
+const MAX_BLOB_STREAM_OPEN_BYTES: usize = 2048 + 40 * MAX_CAUSAL_CONTEXT_ENTRIES;
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct BlobPublicationStreamId([u8; 32]);
+
+impl BlobPublicationStreamId {
+    pub fn from_bytes(bytes: [u8; 32]) -> Result<Self, BlobError> {
+        if bytes == [0; 32] {
+            return Err(BlobError::InvalidManifest);
+        }
+        Ok(Self(bytes))
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlobStreamOpen {
+    stream_id: BlobPublicationStreamId,
+    publisher: NodeId,
+    operation_key: Vec<u8>,
+    mission_id: [u8; 32],
+    publisher_counter: u64,
+    causal_context: VersionVector,
+    topic: Topic,
+    scope: Scope,
+    metadata: BlobMetadata,
+    priority: Priority,
+    ttl_ms: Option<u64>,
+    initial_custody: Option<CustodySample>,
+    total_len: u64,
+    content_epoch: u64,
+    policy_revision: u64,
+    authorization_digest: [u8; 32],
+    publication_salt: [u8; 32],
+}
+
+impl BlobStreamOpen {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        stream_id: BlobPublicationStreamId,
+        publisher: NodeId,
+        operation_key: Vec<u8>,
+        mission_id: [u8; 32],
+        publisher_counter: u64,
+        causal_context: VersionVector,
+        topic: Topic,
+        scope: Scope,
+        metadata: BlobMetadata,
+        priority: Priority,
+        ttl_ms: Option<u64>,
+        initial_custody: Option<CustodySample>,
+        total_len: u64,
+        content_epoch: u64,
+        policy_revision: u64,
+        authorization_digest: [u8; 32],
+        publication_salt: [u8; 32],
+    ) -> Result<Self, BlobError> {
+        if publisher == [0; 32]
+            || operation_key.is_empty()
+            || operation_key.len() > MAX_BLOB_STREAM_OPERATION_KEY_BYTES
+            || mission_id == [0; 32]
+            || publisher_counter == 0
+            || causal_context.len() > MAX_CAUSAL_CONTEXT_ENTRIES
+            || causal_context.iter().any(|(node, counter)| {
+                *counter == 0 || (*node == publisher && *counter >= publisher_counter)
+            })
+            || total_len == 0
+            || content_epoch == 0
+            || policy_revision == 0
+            || authorization_digest == [0; 32]
+            || publication_salt == [0; 32]
+            || ttl_ms == Some(0)
+            || ttl_ms.is_some() != initial_custody.is_some()
+        {
+            return Err(BlobError::InvalidManifest);
+        }
+        Ok(Self {
+            stream_id,
+            publisher,
+            operation_key,
+            mission_id,
+            publisher_counter,
+            causal_context,
+            topic,
+            scope,
+            metadata,
+            priority,
+            ttl_ms,
+            initial_custody,
+            total_len,
+            content_epoch,
+            policy_revision,
+            authorization_digest,
+            publication_salt,
+        })
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(512);
+        out.extend_from_slice(BLOB_STREAM_OPEN_MAGIC);
+        out.extend_from_slice(&BLOB_STREAM_FORMAT_VERSION.to_be_bytes());
+        out.extend_from_slice(&BLOB_STREAM_PACK_FORMAT_VERSION.to_be_bytes());
+        out.extend_from_slice(self.stream_id.as_bytes());
+        out.extend_from_slice(&self.publisher);
+        push_u16_bytes(&mut out, &self.operation_key).expect("validated operation key");
+        out.extend_from_slice(&self.mission_id);
+        out.extend_from_slice(&self.publisher_counter.to_be_bytes());
+        out.extend_from_slice(&(self.causal_context.len() as u32).to_be_bytes());
+        for (publisher, counter) in self.causal_context.iter() {
+            out.extend_from_slice(publisher);
+            out.extend_from_slice(&counter.to_be_bytes());
+        }
+        push_u16_bytes(&mut out, self.topic.as_str().as_bytes()).expect("validated topic");
+        push_u16_bytes(&mut out, self.scope.as_str().as_bytes()).expect("validated scope");
+        encode_metadata(&mut out, &self.metadata).expect("validated metadata");
+        out.push(self.priority as u8);
+        encode_optional_u64(&mut out, self.ttl_ms);
+        encode_optional_custody(&mut out, self.initial_custody);
+        out.extend_from_slice(&self.total_len.to_be_bytes());
+        out.extend_from_slice(&self.content_epoch.to_be_bytes());
+        out.extend_from_slice(&self.policy_revision.to_be_bytes());
+        out.extend_from_slice(&self.authorization_digest);
+        out.extend_from_slice(&self.publication_salt);
+        out
+    }
+
+    pub fn decode(encoded: &[u8]) -> Result<Self, BlobError> {
+        if encoded.len() > MAX_BLOB_STREAM_OPEN_BYTES {
+            return Err(BlobError::InvalidManifest);
+        }
+        let mut reader = StreamReader::new(encoded);
+        if reader.take(8)? != BLOB_STREAM_OPEN_MAGIC
+            || reader.u16()? != BLOB_STREAM_FORMAT_VERSION
+            || reader.u16()? != BLOB_STREAM_PACK_FORMAT_VERSION
+        {
+            return Err(BlobError::InvalidManifest);
+        }
+        let stream_id = BlobPublicationStreamId::from_bytes(reader.array()?)?;
+        let publisher = reader.array()?;
+        let operation_key = reader
+            .u16_bytes(MAX_BLOB_STREAM_OPERATION_KEY_BYTES)?
+            .to_vec();
+        let mission_id = reader.array()?;
+        let publisher_counter = reader.u64()?;
+        let context_len = reader.u32()? as usize;
+        if context_len > MAX_CAUSAL_CONTEXT_ENTRIES {
+            return Err(BlobError::InvalidManifest);
+        }
+        let mut causal_context = VersionVector::default();
+        for _ in 0..context_len {
+            let node = reader.array()?;
+            let counter = reader.u64()?;
+            if counter == 0 || causal_context.counter(&node) != 0 {
+                return Err(BlobError::InvalidManifest);
+            }
+            causal_context.observe(Dot {
+                publisher: node,
+                counter,
+            });
+        }
+        let topic = Topic::new(reader.u16_string(128)?).map_err(|_| BlobError::InvalidManifest)?;
+        let scope = Scope::new(reader.u16_string(128)?).map_err(|_| BlobError::InvalidManifest)?;
+        let metadata = decode_metadata(&mut reader)?;
+        let priority = Priority::from_wire(reader.u8()?).ok_or(BlobError::InvalidManifest)?;
+        let ttl_ms = decode_optional_u64(&mut reader)?;
+        let initial_custody = decode_optional_custody(&mut reader)?;
+        let total_len = reader.u64()?;
+        let content_epoch = reader.u64()?;
+        let policy_revision = reader.u64()?;
+        let authorization_digest = reader.array()?;
+        let publication_salt = reader.array()?;
+        reader.finish()?;
+        Self::new(
+            stream_id,
+            publisher,
+            operation_key,
+            mission_id,
+            publisher_counter,
+            causal_context,
+            topic,
+            scope,
+            metadata,
+            priority,
+            ttl_ms,
+            initial_custody,
+            total_len,
+            content_epoch,
+            policy_revision,
+            authorization_digest,
+            publication_salt,
+        )
+    }
+
+    pub fn digest(&self) -> [u8; 32] {
+        hash_parts(b"ASTER/blob-stream/open/v2\0", &[&self.encode()])
+    }
+    pub const fn stream_id(&self) -> BlobPublicationStreamId {
+        self.stream_id
+    }
+    pub const fn total_len(&self) -> u64 {
+        self.total_len
+    }
+    pub const fn content_epoch(&self) -> u64 {
+        self.content_epoch
+    }
+    pub const fn metadata(&self) -> &BlobMetadata {
+        &self.metadata
+    }
+    pub const fn ttl_ms(&self) -> Option<u64> {
+        self.ttl_ms
+    }
+    pub const fn initial_custody(&self) -> Option<CustodySample> {
+        self.initial_custody
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedBlobStreamOpen {
+    open: BlobStreamOpen,
+    authenticated_bytes: Vec<u8>,
+}
+
+impl VerifiedBlobStreamOpen {
+    pub const fn open(&self) -> &BlobStreamOpen {
+        &self.open
+    }
+    pub fn authenticated_bytes(&self) -> &[u8] {
+        &self.authenticated_bytes
+    }
+
+    #[cfg(test)]
+    fn for_test(open: BlobStreamOpen) -> Self {
+        let authenticated_bytes = open.encode();
+        Self {
+            open,
+            authenticated_bytes,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlobStreamFinalCommitment {
+    open_digest: [u8; 32],
+    stream_id: BlobPublicationStreamId,
+    total_len: u64,
+    segment_count: u64,
+    plaintext_root: [u8; 32],
+    ciphertext_root: [u8; 32],
+    blob_id: BlobId,
+    metadata_commitment: [u8; 32],
+    content_epoch: u64,
+    ttl_ms: Option<u64>,
+    final_custody: Option<CustodySample>,
+}
+
+impl BlobStreamFinalCommitment {
+    pub fn new(
+        open: &VerifiedBlobStreamOpen,
+        plaintext_root: [u8; 32],
+        ciphertext_root: [u8; 32],
+        segment_count: u64,
+        final_custody: Option<CustodySample>,
+    ) -> Result<Self, BlobError> {
+        let open = open.open();
+        let expected = open
+            .total_len
+            .checked_add(BLOB_STREAM_SEGMENT_BYTES as u64 - 1)
+            .ok_or(BlobError::LengthOverflow)?
+            / BLOB_STREAM_SEGMENT_BYTES as u64;
+        let custody_valid = match (open.ttl_ms, open.initial_custody, final_custody) {
+            (None, None, None) => true,
+            (Some(_), Some(initial), Some(final_sample)) => {
+                initial.clock_id == final_sample.clock_id && final_sample.tick_ms >= initial.tick_ms
+            }
+            _ => false,
+        };
+        if plaintext_root == [0; 32]
+            || ciphertext_root == [0; 32]
+            || segment_count != expected
+            || !custody_valid
+        {
+            return Err(BlobError::InvalidManifest);
+        }
+        let metadata_commitment = metadata_commitment(&open.metadata);
+        let blob_id = derive_stream_blob_id(plaintext_root, open.total_len, metadata_commitment);
+        Ok(Self {
+            open_digest: open.digest(),
+            stream_id: open.stream_id,
+            total_len: open.total_len,
+            segment_count,
+            plaintext_root,
+            ciphertext_root,
+            blob_id,
+            metadata_commitment,
+            content_epoch: open.content_epoch,
+            ttl_ms: open.ttl_ms,
+            final_custody,
+        })
+    }
+
+    pub const fn blob_id(&self) -> BlobId {
+        self.blob_id
+    }
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(256);
+        out.extend_from_slice(BLOB_STREAM_COMMITMENT_MAGIC);
+        out.extend_from_slice(&BLOB_STREAM_FORMAT_VERSION.to_be_bytes());
+        out.extend_from_slice(&BLOB_STREAM_PACK_FORMAT_VERSION.to_be_bytes());
+        out.extend_from_slice(&self.open_digest);
+        out.extend_from_slice(self.stream_id.as_bytes());
+        out.extend_from_slice(&self.total_len.to_be_bytes());
+        out.extend_from_slice(&self.segment_count.to_be_bytes());
+        out.extend_from_slice(&self.plaintext_root);
+        out.extend_from_slice(&self.ciphertext_root);
+        out.extend_from_slice(self.blob_id.as_bytes());
+        out.extend_from_slice(&self.metadata_commitment);
+        out.extend_from_slice(&self.content_epoch.to_be_bytes());
+        encode_optional_u64(&mut out, self.ttl_ms);
+        encode_optional_custody(&mut out, self.final_custody);
+        out
+    }
+
+    pub fn decode(encoded: &[u8]) -> Result<Self, BlobError> {
+        let mut reader = StreamReader::new(encoded);
+        if reader.take(8)? != BLOB_STREAM_COMMITMENT_MAGIC
+            || reader.u16()? != BLOB_STREAM_FORMAT_VERSION
+            || reader.u16()? != BLOB_STREAM_PACK_FORMAT_VERSION
+        {
+            return Err(BlobError::InvalidManifest);
+        }
+        let open_digest = reader.array()?;
+        let stream_id = BlobPublicationStreamId::from_bytes(reader.array()?)?;
+        let total_len = reader.u64()?;
+        let segment_count = reader.u64()?;
+        let plaintext_root = reader.array()?;
+        let ciphertext_root = reader.array()?;
+        let blob_id = BlobId::from_bytes(reader.array()?);
+        let metadata_commitment = reader.array()?;
+        let content_epoch = reader.u64()?;
+        let ttl_ms = decode_optional_u64(&mut reader)?;
+        let final_custody = decode_optional_custody(&mut reader)?;
+        reader.finish()?;
+        let expected = total_len
+            .checked_add(BLOB_STREAM_SEGMENT_BYTES as u64 - 1)
+            .ok_or(BlobError::LengthOverflow)?
+            / BLOB_STREAM_SEGMENT_BYTES as u64;
+        if total_len == 0
+            || segment_count != expected
+            || open_digest == [0; 32]
+            || plaintext_root == [0; 32]
+            || ciphertext_root == [0; 32]
+            || content_epoch == 0
+            || ttl_ms == Some(0)
+            || ttl_ms.is_some() != final_custody.is_some()
+            || blob_id != derive_stream_blob_id(plaintext_root, total_len, metadata_commitment)
+        {
+            return Err(BlobError::InvalidManifest);
+        }
+        Ok(Self {
+            open_digest,
+            stream_id,
+            total_len,
+            segment_count,
+            plaintext_root,
+            ciphertext_root,
+            blob_id,
+            metadata_commitment,
+            content_epoch,
+            ttl_ms,
+            final_custody,
+        })
+    }
+}
 
 #[derive(Debug)]
 pub struct BlobStreamPlainPartition {
@@ -524,9 +909,155 @@ impl Default for BlobStreamFrontier {
     }
 }
 
+fn metadata_commitment(metadata: &BlobMetadata) -> [u8; 32] {
+    let mut encoded = Vec::new();
+    encode_metadata(&mut encoded, metadata).expect("validated metadata");
+    hash_parts(b"ASTER/blob-stream/metadata/v2\0", &[&encoded])
+}
+
+fn derive_stream_blob_id(plaintext_root: [u8; 32], total_len: u64, metadata: [u8; 32]) -> BlobId {
+    BlobId::from_bytes(hash_parts(
+        b"ASTER/blob-stream/blob-id/v2\0",
+        &[
+            &BLOB_STREAM_FORMAT_VERSION.to_be_bytes(),
+            &total_len.to_be_bytes(),
+            &plaintext_root,
+            &metadata,
+        ],
+    ))
+}
+
+fn push_u16_bytes(output: &mut Vec<u8>, bytes: &[u8]) -> Result<(), BlobError> {
+    let len = u16::try_from(bytes.len()).map_err(|_| BlobError::LengthOverflow)?;
+    output.extend_from_slice(&len.to_be_bytes());
+    output.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn encode_metadata(output: &mut Vec<u8>, metadata: &BlobMetadata) -> Result<(), BlobError> {
+    match metadata.media_type() {
+        None => output.push(0),
+        Some(media_type) => {
+            output.push(1);
+            push_u16_bytes(output, media_type.as_bytes())?;
+        }
+    }
+    push_u16_bytes(output, metadata.schema_id())
+}
+
+fn decode_metadata(reader: &mut StreamReader<'_>) -> Result<BlobMetadata, BlobError> {
+    let media_type = match reader.u8()? {
+        0 => None,
+        1 => Some(reader.u16_string(crate::MAX_BLOB_MEDIA_TYPE_BYTES)?),
+        _ => return Err(BlobError::InvalidMetadata),
+    };
+    let schema_id = reader.u16_bytes(crate::MAX_BLOB_SCHEMA_ID_BYTES)?.to_vec();
+    BlobMetadata::new(media_type, schema_id)
+}
+
+fn encode_optional_u64(output: &mut Vec<u8>, value: Option<u64>) {
+    match value {
+        None => output.push(0),
+        Some(value) => {
+            output.push(1);
+            output.extend_from_slice(&value.to_be_bytes());
+        }
+    }
+}
+
+fn decode_optional_u64(reader: &mut StreamReader<'_>) -> Result<Option<u64>, BlobError> {
+    match reader.u8()? {
+        0 => Ok(None),
+        1 => Ok(Some(reader.u64()?)),
+        _ => Err(BlobError::InvalidManifest),
+    }
+}
+
+fn encode_optional_custody(output: &mut Vec<u8>, value: Option<CustodySample>) {
+    match value {
+        None => output.push(0),
+        Some(value) => {
+            output.push(1);
+            output.extend_from_slice(&value.clock_id);
+            output.extend_from_slice(&value.tick_ms.to_be_bytes());
+        }
+    }
+}
+
+fn decode_optional_custody(
+    reader: &mut StreamReader<'_>,
+) -> Result<Option<CustodySample>, BlobError> {
+    match reader.u8()? {
+        0 => Ok(None),
+        1 => Ok(Some(CustodySample {
+            clock_id: reader.array()?,
+            tick_ms: reader.u64()?,
+        })),
+        _ => Err(BlobError::InvalidManifest),
+    }
+}
+
+struct StreamReader<'a> {
+    bytes: &'a [u8],
+    position: usize,
+}
+
+impl<'a> StreamReader<'a> {
+    const fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, position: 0 }
+    }
+    fn take(&mut self, len: usize) -> Result<&'a [u8], BlobError> {
+        let end = self
+            .position
+            .checked_add(len)
+            .ok_or(BlobError::LengthOverflow)?;
+        let value = self
+            .bytes
+            .get(self.position..end)
+            .ok_or(BlobError::InvalidManifest)?;
+        self.position = end;
+        Ok(value)
+    }
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], BlobError> {
+        self.take(N)?
+            .try_into()
+            .map_err(|_| BlobError::InvalidManifest)
+    }
+    fn u8(&mut self) -> Result<u8, BlobError> {
+        Ok(self.take(1)?[0])
+    }
+    fn u16(&mut self) -> Result<u16, BlobError> {
+        Ok(u16::from_be_bytes(self.array()?))
+    }
+    fn u32(&mut self) -> Result<u32, BlobError> {
+        Ok(u32::from_be_bytes(self.array()?))
+    }
+    fn u64(&mut self) -> Result<u64, BlobError> {
+        Ok(u64::from_be_bytes(self.array()?))
+    }
+    fn u16_bytes(&mut self, max: usize) -> Result<&'a [u8], BlobError> {
+        let len = usize::from(self.u16()?);
+        if len > max {
+            return Err(BlobError::InvalidManifest);
+        }
+        self.take(len)
+    }
+    fn u16_string(&mut self, max: usize) -> Result<String, BlobError> {
+        String::from_utf8(self.u16_bytes(max)?.to_vec()).map_err(|_| BlobError::InvalidManifest)
+    }
+    fn finish(self) -> Result<(), BlobError> {
+        if self.position == self.bytes.len() {
+            Ok(())
+        } else {
+            Err(BlobError::InvalidManifest)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{BlobMetadata, Priority, Scope, Topic, VersionVector};
 
     fn identities() -> ([u8; 32], [u8; 32], [u8; 32], [u8; 12]) {
         ([0x11; 32], [0x22; 32], [0x33; 32], [0x44; 12])
@@ -552,6 +1083,71 @@ mod tests {
             BlobStreamSegmentSealer::new(stream_id, open_digest, 7, key, nonce),
             BlobStreamSegmentOpener::new(stream_id, open_digest, 7, key, nonce),
         )
+    }
+
+    fn open_with_metadata(metadata: BlobMetadata) -> BlobStreamOpen {
+        BlobStreamOpen::new(
+            BlobPublicationStreamId::from_bytes([0x11; 32]).expect("stream ID"),
+            [0x21; 32],
+            b"operation-1".to_vec(),
+            [0x31; 32],
+            1,
+            VersionVector::default(),
+            Topic::new("imagery").expect("topic"),
+            Scope::new("mission/alpha").expect("scope"),
+            metadata,
+            Priority::Immediate,
+            None,
+            None,
+            BLOB_STREAM_SEGMENT_BYTES as u64,
+            7,
+            9,
+            [0x41; 32],
+            [0x51; 32],
+        )
+        .expect("open")
+    }
+
+    #[test]
+    fn blob_stream_open_and_final_commitment_round_trip_canonically() {
+        let open = open_with_metadata(
+            BlobMetadata::new(Some("image/tiff".to_owned()), b"geo".to_vec()).expect("metadata"),
+        );
+        assert_eq!(
+            BlobStreamOpen::decode(&open.encode()).expect("decode"),
+            open
+        );
+        let verified = VerifiedBlobStreamOpen::for_test(open.clone());
+        let commitment = BlobStreamFinalCommitment::new(&verified, [0x61; 32], [0x71; 32], 1, None)
+            .expect("commitment");
+        assert_eq!(
+            BlobStreamFinalCommitment::decode(&commitment.encode()).expect("decode commitment"),
+            commitment
+        );
+    }
+
+    #[test]
+    fn blob_stream_final_identity_binds_metadata_and_both_roots() {
+        let first = VerifiedBlobStreamOpen::for_test(open_with_metadata(
+            BlobMetadata::new(Some("image/tiff".to_owned()), b"geo".to_vec()).expect("metadata"),
+        ));
+        let second = VerifiedBlobStreamOpen::for_test(open_with_metadata(
+            BlobMetadata::new(Some("image/png".to_owned()), b"geo".to_vec()).expect("metadata"),
+        ));
+        let a =
+            BlobStreamFinalCommitment::new(&first, [0x61; 32], [0x71; 32], 1, None).expect("first");
+        let metadata_changed =
+            BlobStreamFinalCommitment::new(&second, [0x61; 32], [0x71; 32], 1, None)
+                .expect("metadata changed");
+        let plaintext_changed =
+            BlobStreamFinalCommitment::new(&first, [0x62; 32], [0x71; 32], 1, None)
+                .expect("plaintext changed");
+        let ciphertext_changed =
+            BlobStreamFinalCommitment::new(&first, [0x61; 32], [0x72; 32], 1, None)
+                .expect("ciphertext changed");
+        assert_ne!(a.blob_id(), metadata_changed.blob_id());
+        assert_ne!(a.blob_id(), plaintext_changed.blob_id());
+        assert_ne!(a.encode(), ciphertext_changed.encode());
     }
 
     #[test]
