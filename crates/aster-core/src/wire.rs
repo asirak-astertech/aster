@@ -120,6 +120,7 @@ pub(crate) const SEMANTIC_PROTOCOL_V5: u16 = 5;
 pub(crate) const SEMANTIC_PROTOCOL_V6: u16 = 6;
 pub(crate) const SEMANTIC_PROTOCOL_V7: u16 = 7;
 pub(crate) const SEMANTIC_PROTOCOL_V8: u16 = 8;
+pub(crate) const SEMANTIC_PROTOCOL_V9: u16 = 9;
 
 /// Typed identity in the reconciliation and ranged-transfer namespace.
 ///
@@ -1390,7 +1391,7 @@ pub(crate) fn validate_semantic_version(semantic_version: u16) -> Result<(), Wir
     match semantic_version {
         SEMANTIC_PROTOCOL_V1 | SEMANTIC_PROTOCOL_V2 | SEMANTIC_PROTOCOL_V3
         | SEMANTIC_PROTOCOL_V4 | SEMANTIC_PROTOCOL_V5 | SEMANTIC_PROTOCOL_V6
-        | SEMANTIC_PROTOCOL_V7 | SEMANTIC_PROTOCOL_V8 => Ok(()),
+        | SEMANTIC_PROTOCOL_V7 | SEMANTIC_PROTOCOL_V8 | SEMANTIC_PROTOCOL_V9 => Ok(()),
         _ => Err(WireError::UnsupportedSemanticVersion(semantic_version)),
     }
 }

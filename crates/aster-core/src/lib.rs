@@ -158,6 +158,13 @@ pub use blob_custody::{
     BLOB_CUSTODY_CLAIM_V1_BYTES, BlobCustodyClaimV1, BlobCustodyDirectionV1, BlobCustodyError,
     BlobCustodyTransferId, OpenedBlobSourceFrameV1, VerifiedBlobCustodyClaimV1,
 };
+#[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
+pub use blob_stream::{
+    BLOB_STREAM_SEGMENT_BYTES, BlobPublicationStreamId, BlobStreamCheckpoint,
+    BlobStreamFinalCommitment, BlobStreamFrontier, BlobStreamOpen, BlobStreamPlainPartition,
+    BlobStreamSegmentLeaves, BlobStreamSegmentOpener, BlobStreamSegmentSealer, BlobStreamSubtree,
+    EncryptedBlobStreamSegment, VerifiedBlobStreamFinalCommitment, VerifiedBlobStreamOpen,
+};
 #[cfg(feature = "reference-session")]
 pub use bridge_adapter::{
     BridgeAuthorizationLink, MAX_SELECTED_BRIDGE_WRAPPER_BYTES, SelectedBridgeAuthorizationPolicy,
@@ -266,10 +273,10 @@ pub const REPLICATION_WIRE_VERSION: u16 = 1;
 pub const PROTOCOL_VERSION: u16 = REPLICATION_WIRE_VERSION;
 
 /// Semantic replication version offered first by a default initiator.
-pub const DEFAULT_SEMANTIC_VERSION: u16 = 8;
+pub const DEFAULT_SEMANTIC_VERSION: u16 = 9;
 
 /// Highest semantic replication version implemented by this build.
-pub const HIGHEST_SUPPORTED_SEMANTIC_VERSION: u16 = 8;
+pub const HIGHEST_SUPPORTED_SEMANTIC_VERSION: u16 = 9;
 
 #[cfg(feature = "sqlite-store")]
 const _: () = assert!(batch::DATA_CLASS_EVENT == model::DataClass::Event as u8);
@@ -284,9 +291,9 @@ mod version_surface_tests {
         #[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
         assert_eq!(
             crypto::SUPPORTED_SEMANTIC_PROTOCOL_VERSIONS,
-            &[8, 7, 6, 5, 4, 3, 2, 1]
+            &[9, 8, 7, 6, 5, 4, 3, 2, 1]
         );
-        assert_eq!(DEFAULT_SEMANTIC_VERSION, 8);
+        assert_eq!(DEFAULT_SEMANTIC_VERSION, 9);
         assert_eq!(HIGHEST_SUPPORTED_SEMANTIC_VERSION, DEFAULT_SEMANTIC_VERSION);
         #[cfg(feature = "sqlite-store")]
         assert_eq!(batch::DATA_CLASS_EVENT, DataClass::Event as u8);

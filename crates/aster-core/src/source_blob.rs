@@ -13,6 +13,10 @@ use crate::{
         VerifiedBlobManifest, VerifiedBlobTransferPlan, content_group_id,
         inspect_selected_blob_manifest, verify_source_authenticated_store_completion,
     },
+    blob_stream::{
+        BlobStreamFinalCommitment, BlobStreamOpen, BlobStreamSegmentOpener,
+        BlobStreamSegmentSealer, VerifiedBlobStreamFinalCommitment, VerifiedBlobStreamOpen,
+    },
     crypto::ReferenceEnvelopeSealer,
     envelope::{EnvelopeError, EnvelopeHeader, EnvelopeSealer, SealRequest, SealedEnvelope},
     model::{DataClass, Dot, ItemId, NodeId, Priority, Scope, Topic, VersionVector},
@@ -21,6 +25,14 @@ use crate::{
 };
 use sha2::{Digest, Sha256};
 use std::io;
+
+/// Unforgeable module-private witness for provider-authenticated stream capabilities.
+pub(crate) struct BlobStreamProviderSeal(pub(crate) ());
+
+const BLOB_STREAM_OPEN_SIGNATURE_DOMAIN: &[u8] = b"ASTER/blob-stream/signed-open/v2\0";
+const BLOB_STREAM_COMMITMENT_SIGNATURE_DOMAIN: &[u8] = b"ASTER/blob-stream/signed-commitment/v2\0";
+const MAX_BLOB_STREAM_OPEN_BODY_BYTES: usize = 2048 + 40 * crate::MAX_CAUSAL_CONTEXT_ENTRIES;
+const MAX_BLOB_STREAM_COMMITMENT_BODY_BYTES: usize = 512;
 
 /// Route- and source-authenticated metadata for one exact selected Blob envelope.
 ///
@@ -513,6 +525,138 @@ impl std::fmt::Debug for BlobContentVerification {
 }
 
 impl ReferenceEnvelopeSealer {
+    pub fn blob_stream_authorization_digest(
+        &self,
+        scope: &Scope,
+        content_epoch: u64,
+    ) -> Option<[u8; 32]> {
+        self.current_source_route_grant_commitment(scope, content_epoch)
+    }
+
+    pub fn seal_blob_stream_open(&self, open: &BlobStreamOpen) -> Result<Vec<u8>, EnvelopeError> {
+        if open.publisher() != self.identity()
+            || open.mission_id() != &self.mission_authority_id()
+            || self.current_source_route_grant_commitment(open.scope(), open.content_epoch())
+                != Some(*open.authorization_digest())
+        {
+            return Err(EnvelopeError(
+                "Blob stream open is outside the current source authority".into(),
+            ));
+        }
+        self.seal_source_protocol_object(
+            BLOB_STREAM_OPEN_SIGNATURE_DOMAIN,
+            &open.encode(),
+            MAX_BLOB_STREAM_OPEN_BODY_BYTES,
+        )
+    }
+
+    pub fn verify_blob_stream_open(
+        &self,
+        signed_open: &[u8],
+    ) -> Result<VerifiedBlobStreamOpen, EnvelopeError> {
+        let (publisher, encoded) = self.verify_source_protocol_object(
+            BLOB_STREAM_OPEN_SIGNATURE_DOMAIN,
+            signed_open,
+            MAX_BLOB_STREAM_OPEN_BODY_BYTES,
+        )?;
+        let open = BlobStreamOpen::decode(&encoded).map_err(blob_stream_authentication_error)?;
+        if open.publisher() != publisher
+            || open.mission_id() != &self.mission_authority_id()
+            || self.current_source_route_grant_commitment(open.scope(), open.content_epoch())
+                != Some(*open.authorization_digest())
+        {
+            return Err(blob_stream_authentication_error(
+                BlobError::AuthenticationFailed,
+            ));
+        }
+        Ok(VerifiedBlobStreamOpen::from_provider(
+            open,
+            self.mission_authority_id(),
+            signed_open.to_vec(),
+            BlobStreamProviderSeal(()),
+        ))
+    }
+
+    pub fn seal_blob_stream_commitment(
+        &self,
+        commitment: &BlobStreamFinalCommitment,
+    ) -> Result<Vec<u8>, EnvelopeError> {
+        self.seal_source_protocol_object(
+            BLOB_STREAM_COMMITMENT_SIGNATURE_DOMAIN,
+            &commitment.encode(),
+            MAX_BLOB_STREAM_COMMITMENT_BODY_BYTES,
+        )
+    }
+
+    pub fn verify_blob_stream_commitment(
+        &self,
+        open: &VerifiedBlobStreamOpen,
+        signed_commitment: &[u8],
+    ) -> Result<VerifiedBlobStreamFinalCommitment, EnvelopeError> {
+        let (publisher, encoded) = self.verify_source_protocol_object(
+            BLOB_STREAM_COMMITMENT_SIGNATURE_DOMAIN,
+            signed_commitment,
+            MAX_BLOB_STREAM_COMMITMENT_BODY_BYTES,
+        )?;
+        let commitment = BlobStreamFinalCommitment::decode(&encoded)
+            .map_err(blob_stream_authentication_error)?;
+        if publisher != open.open().publisher()
+            || commitment.open_digest() != &open.open().digest()
+            || commitment.stream_id() != open.open().stream_id()
+        {
+            return Err(blob_stream_authentication_error(
+                BlobError::AuthenticationFailed,
+            ));
+        }
+        Ok(VerifiedBlobStreamFinalCommitment::from_provider(
+            commitment,
+            signed_commitment.to_vec(),
+            BlobStreamProviderSeal(()),
+        ))
+    }
+
+    pub fn blob_stream_segment_sealer(
+        &self,
+        open: &VerifiedBlobStreamOpen,
+    ) -> Result<BlobStreamSegmentSealer, EnvelopeError> {
+        if open.open().publisher() != self.identity()
+            || open.mission_authority_id() != self.mission_authority_id()
+        {
+            return Err(blob_stream_authentication_error(
+                BlobError::AuthenticationFailed,
+            ));
+        }
+        let seed = self
+            .blob_stream_content_grant_seed(
+                open.open().scope(),
+                open.open().topic(),
+                open.open().content_epoch(),
+            )
+            .ok_or_else(|| blob_stream_authentication_error(BlobError::AuthenticationFailed))?;
+        BlobStreamSegmentSealer::from_provider(open, seed, BlobStreamProviderSeal(()))
+            .map_err(blob_stream_authentication_error)
+    }
+
+    pub fn blob_stream_segment_opener(
+        &self,
+        open: &VerifiedBlobStreamOpen,
+    ) -> Result<BlobStreamSegmentOpener, EnvelopeError> {
+        if open.mission_authority_id() != self.mission_authority_id() {
+            return Err(blob_stream_authentication_error(
+                BlobError::AuthenticationFailed,
+            ));
+        }
+        let seed = self
+            .blob_stream_content_grant_seed(
+                open.open().scope(),
+                open.open().topic(),
+                open.open().content_epoch(),
+            )
+            .ok_or_else(|| blob_stream_authentication_error(BlobError::AuthenticationFailed))?;
+        BlobStreamSegmentOpener::from_provider(open, seed, BlobStreamProviderSeal(()))
+            .map_err(blob_stream_authentication_error)
+    }
+
     /// Reports whether this node owns the exact route capability for a Blob scope epoch.
     pub fn can_route_blob(&self, scope: &Scope, epoch: u64) -> bool {
         self.can_route_event(scope, epoch)
@@ -704,6 +848,10 @@ impl ReferenceEnvelopeSealer {
             manifest_digest: *blob.manifest_digest(),
         })
     }
+}
+
+fn blob_stream_authentication_error(_error: BlobError) -> EnvelopeError {
+    EnvelopeError("Blob stream authentication failed".into())
 }
 
 impl<S: BlobStore> ReferenceBlobService<S> {
@@ -1071,6 +1219,81 @@ mod tests {
             .issue_node(1, &[full_access()])
             .and_then(ReferenceEnvelopeSealer::open)
             .expect("wrong mission reader")
+    }
+
+    #[test]
+    fn blob_stream_provider_authenticates_open_segments_and_finish() {
+        let Services {
+            publisher,
+            reader,
+            relay,
+            ..
+        } = services();
+        let authorization = publisher
+            .blob_stream_authorization_digest(&scope(), 1)
+            .expect("authorization");
+        let open = BlobStreamOpen::new(
+            crate::blob_stream::BlobPublicationStreamId::from_bytes([0x11; 32]).expect("stream ID"),
+            publisher.identity(),
+            b"provider-test".to_vec(),
+            publisher.mission_authority_id(),
+            1,
+            VersionVector::default(),
+            topic(),
+            scope(),
+            BlobMetadata::new(Some("application/octet-stream".into()), b"schema".to_vec())
+                .expect("metadata"),
+            Priority::Immediate,
+            None,
+            None,
+            7,
+            1,
+            1,
+            authorization,
+            [0x66; 32],
+        )
+        .expect("open");
+        let signed_open = publisher.seal_blob_stream_open(&open).expect("sign open");
+        let verified = reader
+            .verify_blob_stream_open(&signed_open)
+            .expect("verify open");
+        let sealer = publisher
+            .blob_stream_segment_sealer(&verified)
+            .expect("segment sealer");
+        let opener = reader
+            .blob_stream_segment_opener(&verified)
+            .expect("segment opener");
+        assert!(relay.blob_stream_segment_opener(&verified).is_err());
+        let partition = crate::blob_stream::BlobStreamPlainPartition::new(
+            [0x11; 32],
+            open.digest(),
+            1,
+            0,
+            0,
+            7,
+            b"payload".to_vec(),
+        )
+        .expect("partition");
+        let (encrypted, _) = sealer.seal(partition).expect("seal segment");
+        assert_eq!(
+            opener.open(&encrypted).expect("open segment").0.as_slice(),
+            b"payload"
+        );
+        let commitment = BlobStreamFinalCommitment::new(&verified, [0x71; 32], [0x72; 32], 1, None)
+            .expect("commitment");
+        let signed_finish = publisher
+            .seal_blob_stream_commitment(&commitment)
+            .expect("sign finish");
+        reader
+            .verify_blob_stream_commitment(&verified, &signed_finish)
+            .expect("verify finish");
+        let mut tampered = signed_finish;
+        *tampered.last_mut().expect("signed byte") ^= 1;
+        assert!(
+            reader
+                .verify_blob_stream_commitment(&verified, &tampered)
+                .is_err()
+        );
     }
 
     struct Fixture {

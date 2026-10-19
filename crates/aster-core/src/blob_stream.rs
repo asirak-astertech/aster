@@ -7,6 +7,7 @@ use aes_gcm::{
     Aes256Gcm,
     aead::{Aead, KeyInit, Payload, array::Array},
 };
+use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -235,11 +236,42 @@ impl BlobStreamOpen {
     pub const fn initial_custody(&self) -> Option<CustodySample> {
         self.initial_custody
     }
+    pub const fn publisher(&self) -> NodeId {
+        self.publisher
+    }
+    pub fn operation_key(&self) -> &[u8] {
+        &self.operation_key
+    }
+    pub const fn mission_id(&self) -> &[u8; 32] {
+        &self.mission_id
+    }
+    pub const fn publisher_counter(&self) -> u64 {
+        self.publisher_counter
+    }
+    pub const fn causal_context(&self) -> &VersionVector {
+        &self.causal_context
+    }
+    pub fn topic(&self) -> &Topic {
+        &self.topic
+    }
+    pub fn scope(&self) -> &Scope {
+        &self.scope
+    }
+    pub const fn priority(&self) -> Priority {
+        self.priority
+    }
+    pub const fn policy_revision(&self) -> u64 {
+        self.policy_revision
+    }
+    pub const fn authorization_digest(&self) -> &[u8; 32] {
+        &self.authorization_digest
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VerifiedBlobStreamOpen {
     open: BlobStreamOpen,
+    mission_authority_id: NodeId,
     authenticated_bytes: Vec<u8>,
 }
 
@@ -250,11 +282,27 @@ impl VerifiedBlobStreamOpen {
     pub fn authenticated_bytes(&self) -> &[u8] {
         &self.authenticated_bytes
     }
+    pub(crate) fn from_provider(
+        open: BlobStreamOpen,
+        mission_authority_id: NodeId,
+        authenticated_bytes: Vec<u8>,
+        _seal: crate::source_blob::BlobStreamProviderSeal,
+    ) -> Self {
+        Self {
+            open,
+            mission_authority_id,
+            authenticated_bytes,
+        }
+    }
+    pub(crate) const fn mission_authority_id(&self) -> NodeId {
+        self.mission_authority_id
+    }
 
     #[cfg(test)]
     fn for_test(open: BlobStreamOpen) -> Self {
         let authenticated_bytes = open.encode();
         Self {
+            mission_authority_id: open.mission_id,
             open,
             authenticated_bytes,
         }
@@ -324,6 +372,24 @@ impl BlobStreamFinalCommitment {
     pub const fn blob_id(&self) -> BlobId {
         self.blob_id
     }
+    pub const fn open_digest(&self) -> &[u8; 32] {
+        &self.open_digest
+    }
+    pub const fn stream_id(&self) -> BlobPublicationStreamId {
+        self.stream_id
+    }
+    pub const fn total_len(&self) -> u64 {
+        self.total_len
+    }
+    pub const fn segment_count(&self) -> u64 {
+        self.segment_count
+    }
+    pub const fn plaintext_root(&self) -> &[u8; 32] {
+        &self.plaintext_root
+    }
+    pub const fn ciphertext_root(&self) -> &[u8; 32] {
+        &self.ciphertext_root
+    }
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(256);
         out.extend_from_slice(BLOB_STREAM_COMMITMENT_MAGIC);
@@ -392,6 +458,31 @@ impl BlobStreamFinalCommitment {
             ttl_ms,
             final_custody,
         })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedBlobStreamFinalCommitment {
+    commitment: BlobStreamFinalCommitment,
+    authenticated_bytes: Vec<u8>,
+}
+
+impl VerifiedBlobStreamFinalCommitment {
+    pub(crate) fn from_provider(
+        commitment: BlobStreamFinalCommitment,
+        authenticated_bytes: Vec<u8>,
+        _seal: crate::source_blob::BlobStreamProviderSeal,
+    ) -> Self {
+        Self {
+            commitment,
+            authenticated_bytes,
+        }
+    }
+    pub const fn commitment(&self) -> &BlobStreamFinalCommitment {
+        &self.commitment
+    }
+    pub fn authenticated_bytes(&self) -> &[u8] {
+        &self.authenticated_bytes
     }
 }
 
@@ -626,6 +717,23 @@ impl BlobStreamSegmentSealer {
         }
     }
 
+    pub(crate) fn from_provider(
+        open: &VerifiedBlobStreamOpen,
+        content_grant_seed: [u8; 32],
+        _seal: crate::source_blob::BlobStreamProviderSeal,
+    ) -> Result<Self, BlobError> {
+        let mut seed = Zeroizing::new(content_grant_seed);
+        let (key, nonce) = derive_stream_key(&seed, open.open())?;
+        seed.zeroize();
+        Ok(Self::new(
+            *open.open().stream_id().as_bytes(),
+            open.open().digest(),
+            open.open().content_epoch(),
+            key,
+            nonce,
+        ))
+    }
+
     pub fn seal(
         &self,
         partition: BlobStreamPlainPartition,
@@ -692,6 +800,18 @@ impl BlobStreamSegmentOpener {
         ))
     }
 
+    pub(crate) fn from_provider(
+        open: &VerifiedBlobStreamOpen,
+        content_grant_seed: [u8; 32],
+        seal: crate::source_blob::BlobStreamProviderSeal,
+    ) -> Result<Self, BlobError> {
+        Ok(Self(BlobStreamSegmentSealer::from_provider(
+            open,
+            content_grant_seed,
+            seal,
+        )?))
+    }
+
     pub fn open(
         &self,
         segment: &EncryptedBlobStreamSegment,
@@ -749,6 +869,30 @@ fn segment_nonce(mut base: [u8; 12], index: u64) -> Result<[u8; 12], BlobError> 
     let value = start.checked_add(index).ok_or(BlobError::LengthOverflow)?;
     base[4..].copy_from_slice(&value.to_be_bytes());
     Ok(base)
+}
+
+fn derive_stream_key(
+    content_grant_seed: &[u8; 32],
+    open: &BlobStreamOpen,
+) -> Result<([u8; 32], [u8; 12]), BlobError> {
+    let mut salt = Vec::with_capacity(64);
+    salt.extend_from_slice(b"ASTER/blob-stream/key/v2\0");
+    salt.extend_from_slice(&open.publication_salt);
+    let hkdf = Hkdf::<Sha256>::new(Some(&salt), content_grant_seed);
+    let digest = open.digest();
+    let mut key = [0; 32];
+    let mut key_info = Vec::with_capacity(64);
+    key_info.extend_from_slice(b"ASTER/blob-stream/aead-key/v2\0");
+    key_info.extend_from_slice(&digest);
+    hkdf.expand(&key_info, &mut key)
+        .map_err(|_| BlobError::AuthenticationFailed)?;
+    let mut nonce = [0; 12];
+    let mut nonce_info = Vec::with_capacity(64);
+    nonce_info.extend_from_slice(b"ASTER/blob-stream/base-nonce/v2\0");
+    nonce_info.extend_from_slice(&digest);
+    hkdf.expand(&nonce_info, &mut nonce)
+        .map_err(|_| BlobError::AuthenticationFailed)?;
+    Ok((key, nonce))
 }
 
 fn segment_aad(
