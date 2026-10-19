@@ -259,6 +259,9 @@ impl BlobStreamOpen {
     pub fn scope(&self) -> &Scope {
         &self.scope
     }
+    pub fn content_group(&self) -> [u8; 32] {
+        crate::blob::content_group_id(&self.scope, &self.topic)
+    }
     pub const fn priority(&self) -> Priority {
         self.priority
     }
@@ -1538,6 +1541,10 @@ mod tests {
         assert_eq!(
             BlobStreamOpen::decode(&open.encode()).expect("decode"),
             open
+        );
+        assert_eq!(
+            open.content_group(),
+            crate::blob::content_group_id(open.scope(), open.topic())
         );
         let verified = VerifiedBlobStreamOpen::for_test(open.clone());
         let commitment = BlobStreamFinalCommitment::new(&verified, [0x61; 32], [0x71; 32], 1, None)

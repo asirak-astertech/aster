@@ -2,8 +2,9 @@
 
 use super::{
     BLOB_STREAM_CONFLICTS, BLOB_STREAM_OPERATIONS, BLOB_STREAM_PUBLICATIONS,
-    BLOB_STREAM_RESERVATIONS, BlobOperationKey, BlobStoreError, MAX_BLOB_OPERATION_KEY_BYTES,
-    Store, blob_content_prefix_upper_bound, blob_error, synchronize_blob_policy_generation_write,
+    BLOB_STREAM_RESERVATIONS, BLOB_STREAM_VARIANTS, BlobOperationKey, BlobStoreError,
+    BlobVariantId, MAX_BLOB_OPERATION_KEY_BYTES, Store, blob_content_prefix_upper_bound,
+    blob_error, blob_variant_id, synchronize_blob_policy_generation_write,
 };
 use crate::{
     ACCEPTED_DOTS, CAUSAL_FRONTIER, CONTROL_SCOPE_EPOCHS, ControlPolicySnapshot, Dot,
@@ -485,6 +486,105 @@ fn record_stream_conflict(
     Ok(())
 }
 
+fn release_provisional_stream_authority(
+    write: &redb::WriteTransaction,
+    reservation: &BlobStreamReservation,
+) -> Result<(), StoreError> {
+    let key = reservation.stream_id.as_bytes().as_slice();
+    write.open_table(BLOB_STREAM_RESERVATIONS)?.remove(key)?;
+    write
+        .open_table(BLOB_STREAM_OPERATIONS)?
+        .remove(reservation.operation.as_slice())?;
+    write.open_table(BLOB_STREAM_CONFLICTS)?.remove(key)?;
+    Ok(())
+}
+
+fn publication_variant(publication: &BlobStreamPublication) -> BlobVariantId {
+    blob_variant_id(
+        publication.commitment.blob_id(),
+        &publication.open.content_group(),
+        publication.open.content_epoch(),
+    )
+}
+
+fn stream_variant_key(variant: BlobVariantId, stream_id: BlobPublicationStreamId) -> [u8; 64] {
+    let mut key = [0_u8; 64];
+    key[..32].copy_from_slice(variant.as_bytes());
+    key[32..].copy_from_slice(stream_id.as_bytes());
+    key
+}
+
+fn require_stream_variant_reference(
+    write: &redb::WriteTransaction,
+    publication: &BlobStreamPublication,
+) -> Result<(), StoreError> {
+    let key = stream_variant_key(publication_variant(publication), publication.stream_id());
+    let value = write
+        .open_table(BLOB_STREAM_VARIANTS)?
+        .get(key.as_slice())?
+        .map(|value| value.value().to_vec())
+        .ok_or_else(schema_error)?;
+    if !value.is_empty() {
+        return Err(schema_error());
+    }
+    Ok(())
+}
+
+pub(super) fn migrate_blob_stream_variant_index_write(
+    write: &redb::WriteTransaction,
+) -> Result<(), StoreError> {
+    let publications = write.open_table(BLOB_STREAM_PUBLICATIONS)?;
+    let mut rows = Vec::with_capacity(
+        usize::try_from(publications.len()?)
+            .map_err(|_| StoreError::ItemCountAccountingOverflow)?,
+    );
+    for row in publications.iter()? {
+        let publication = BlobStreamPublication::decode(row?.1.value())?;
+        rows.push(stream_variant_key(
+            publication_variant(&publication),
+            publication.stream_id(),
+        ));
+    }
+    drop(publications);
+    let mut variants = write.open_table(BLOB_STREAM_VARIANTS)?;
+    for key in rows {
+        variants.insert(key.as_slice(), &[][..])?;
+    }
+    Ok(())
+}
+
+pub(super) fn variant_has_publication_write(
+    write: &redb::WriteTransaction,
+    variant: BlobVariantId,
+) -> Result<bool, StoreError> {
+    let variants = write.open_table(BLOB_STREAM_VARIANTS)?;
+    let Some((key, value)) = variants
+        .range::<&[u8]>(variant.as_bytes().as_slice()..)?
+        .next()
+        .transpose()?
+    else {
+        return Ok(false);
+    };
+    if !key.value().starts_with(variant.as_bytes()) {
+        return Ok(false);
+    }
+    if key.value().len() != 64 || !value.value().is_empty() {
+        return Err(schema_error());
+    }
+    let stream_id = BlobPublicationStreamId::from_bytes(read_array(key.value(), 32)?)
+        .map_err(|_| schema_error())?;
+    let publication = write
+        .open_table(BLOB_STREAM_PUBLICATIONS)?
+        .get(stream_id.as_bytes().as_slice())?
+        .map(|row| BlobStreamPublication::decode(row.value()))
+        .transpose()?
+        .ok_or_else(schema_error)?;
+    if publication_variant(&publication) != variant {
+        return Err(schema_error());
+    }
+    Ok(true)
+}
+
 pub(super) fn audit_blob_stream_tables_write(
     write: &redb::WriteTransaction,
     mission_authority: Option<NodeId>,
@@ -497,6 +597,7 @@ pub(super) fn audit_blob_stream_tables_write(
     let operations = write.open_table(BLOB_STREAM_OPERATIONS)?;
     let publications = write.open_table(BLOB_STREAM_PUBLICATIONS)?;
     let conflicts = write.open_table(BLOB_STREAM_CONFLICTS)?;
+    let variants = write.open_table(BLOB_STREAM_VARIANTS)?;
     let authority_rows = reservations
         .len()?
         .checked_add(publications.len()?)
@@ -541,6 +642,14 @@ pub(super) fn audit_blob_stream_tables_write(
             || operations
                 .get(publication.open.operation_key())?
                 .is_none_or(|bound| bound.value() != key.value())
+        {
+            return Err(schema_error());
+        }
+        let variant_key =
+            stream_variant_key(publication_variant(&publication), publication.stream_id());
+        if variants
+            .get(variant_key.as_slice())?
+            .is_none_or(|value| !value.value().is_empty())
         {
             return Err(schema_error());
         }
@@ -621,6 +730,25 @@ pub(super) fn audit_blob_stream_tables_write(
             .or_else(|| publication.as_ref().map(|value| value.open.digest()));
         if key.value() != evidence.stream_id.as_bytes().as_slice()
             || open_digest != Some(evidence.open_digest)
+        {
+            return Err(schema_error());
+        }
+    }
+    for row in variants.iter()? {
+        let (key, value) = row?;
+        if key.value().len() != 64 || !value.value().is_empty() {
+            return Err(schema_error());
+        }
+        let variant = BlobVariantId::from_bytes(read_array(key.value(), 0)?);
+        let stream_id = BlobPublicationStreamId::from_bytes(read_array(key.value(), 32)?)
+            .map_err(|_| schema_error())?;
+        let publication = publications
+            .get(stream_id.as_bytes().as_slice())?
+            .map(|value| BlobStreamPublication::decode(value.value()))
+            .transpose()?
+            .ok_or_else(schema_error)?;
+        if publication_variant(&publication) != variant
+            || super::deletion::variant_has_deletion_manifest_write(write, variant)?
         {
             return Err(schema_error());
         }
@@ -908,7 +1036,20 @@ impl Store {
             .map(|row| row.value().to_vec())
             .ok_or_else(|| blob_error(BlobStoreError::ReservationChanged))?;
         let mut provisional = ProvisionalBlobStream::decode(&encoded)?;
-        require_stream_policy_write(&write, authority, policy, &provisional.reservation.open)?;
+        if let Err(error) =
+            require_stream_policy_write(&write, authority, policy, &provisional.reservation.open)
+        {
+            if matches!(
+                error,
+                StoreError::Blob(
+                    BlobStoreError::PublisherRevoked(_) | BlobStoreError::KeyEpochStale { .. }
+                )
+            ) {
+                release_provisional_stream_authority(&write, &provisional.reservation)?;
+                write.commit()?;
+            }
+            return Err(error);
+        }
         if provisional.reservation != *reservation
             || provisional.progress() != expected
             || checkpoint.stream_id() != reservation.stream_id
@@ -978,6 +1119,7 @@ impl Store {
                 write.commit()?;
                 return Err(blob_error(BlobStoreError::OperationConflict));
             }
+            require_stream_variant_reference(&write, &existing)?;
             return Ok(BlobStreamPromotion {
                 stream_id: reservation.stream_id,
                 blob_id: commitment.blob_id(),
@@ -992,7 +1134,20 @@ impl Store {
             .map(|row| row.value().to_vec())
             .ok_or_else(|| blob_error(BlobStoreError::ReservationChanged))?;
         let provisional = ProvisionalBlobStream::decode(&encoded)?;
-        require_stream_policy_write(&write, authority, policy, &provisional.reservation.open)?;
+        if let Err(error) =
+            require_stream_policy_write(&write, authority, policy, &provisional.reservation.open)
+        {
+            if matches!(
+                error,
+                StoreError::Blob(
+                    BlobStoreError::PublisherRevoked(_) | BlobStoreError::KeyEpochStale { .. }
+                )
+            ) {
+                release_provisional_stream_authority(&write, &provisional.reservation)?;
+                write.commit()?;
+            }
+            return Err(error);
+        }
         let checkpoint = provisional
             .checkpoint
             .as_ref()
@@ -1031,11 +1186,7 @@ impl Store {
                     && final_sample.tick_ms >= initial.tick_ms
                     && final_sample.tick_ms - initial.tick_ms < ttl => {}
             (Some(_), Some(_), Some(_)) => {
-                write.open_table(BLOB_STREAM_RESERVATIONS)?.remove(key)?;
-                write
-                    .open_table(BLOB_STREAM_OPERATIONS)?
-                    .remove(reservation.operation.as_slice())?;
-                write.open_table(BLOB_STREAM_CONFLICTS)?.remove(key)?;
+                release_provisional_stream_authority(&write, reservation)?;
                 write.commit()?;
                 return Err(blob_error(BlobStoreError::ExpiredOrRetired));
             }
@@ -1063,6 +1214,16 @@ impl Store {
             acceptance_marker,
             pack_len: checkpoint.pack_len(),
         };
+        let variant = publication_variant(&publication);
+        super::deletion::require_variant_available_write(&write, variant)?;
+        let variant_key = stream_variant_key(variant, reservation.stream_id);
+        if write
+            .open_table(BLOB_STREAM_VARIANTS)?
+            .get(variant_key.as_slice())?
+            .is_some()
+        {
+            return Err(schema_error());
+        }
         let dot = Dot {
             publisher: reservation.open.publisher(),
             counter: reservation.open.publisher_counter(),
@@ -1087,6 +1248,9 @@ impl Store {
         write
             .open_table(BLOB_STREAM_PUBLICATIONS)?
             .insert(key, publication.encode()?.as_slice())?;
+        write
+            .open_table(BLOB_STREAM_VARIANTS)?
+            .insert(variant_key.as_slice(), &[][..])?;
         write
             .open_table(ACCEPTED_DOTS)?
             .insert(dot_key.as_slice(), reservation.open_digest.as_slice())?;
@@ -1146,11 +1310,7 @@ impl Store {
                 return Err(schema_error());
             }
         }
-        write.open_table(BLOB_STREAM_RESERVATIONS)?.remove(key)?;
-        write
-            .open_table(BLOB_STREAM_OPERATIONS)?
-            .remove(reservation.operation.as_slice())?;
-        write.open_table(BLOB_STREAM_CONFLICTS)?.remove(key)?;
+        release_provisional_stream_authority(&write, reservation)?;
         write.commit()?;
         Ok(true)
     }
@@ -1419,6 +1579,14 @@ mod tests {
         assert_eq!(publications.len(), 1);
         assert_eq!(publications[0].blob_id(), promoted.blob_id());
         assert_eq!(publications[0].pack_len(), durable.pack_len());
+        let variant = super::super::blob_variant_id(
+            promoted.blob_id(),
+            &open.open().content_group(),
+            open.open().content_epoch(),
+        );
+        let write = store.database.begin_write().unwrap();
+        assert!(super::super::variant_has_valid_reference_write(&write, variant).unwrap());
+        drop(write);
         let next = store
             .reserve_blob_with_policy(
                 &policy,
@@ -1438,6 +1606,11 @@ mod tests {
 
         let mission = publisher.mission_authority_id();
         drop(store);
+        let database = redb::Database::create(root.0.join("state.redb")).unwrap();
+        let write = database.begin_write().unwrap();
+        assert!(write.delete_table(BLOB_STREAM_VARIANTS).unwrap());
+        write.commit().unwrap();
+        drop(database);
         let reopened = Store::open_for_mission(root.0.join("state.redb"), mission).unwrap();
         assert_eq!(
             reopened
@@ -1643,12 +1816,126 @@ mod tests {
     }
 
     #[test]
+    fn blob_stream_revoked_publisher_reclaims_provisional_authority() {
+        let total_len = aster_mesh::BLOB_STREAM_SEGMENT_BYTES as u64;
+        let (root, store, mut publisher, operation, open) = fixture_with_len(0x78, total_len);
+        let policy = store.control_policy_snapshot().unwrap();
+        let request = BlobStreamReservationRequest {
+            operation: &operation,
+            source: BlobStreamSource::LocalApplication,
+        };
+        let (reservation, _) = store
+            .reserve_blob_stream_with_policy(&policy, request, &open)
+            .unwrap();
+
+        let revocation = publisher
+            .seal_chained_revocation_control(publisher.identity(), 1, 1, None)
+            .unwrap();
+        let verified_revocation = publisher.verify_control(&revocation).unwrap();
+        store
+            .ingest_verified_control(&verified_revocation, &revocation)
+            .unwrap();
+        let current_policy = store.control_policy_snapshot().unwrap();
+        let commitment =
+            BlobStreamFinalCommitment::new(&open, [0xb1; 32], [0xb2; 32], 1, None).unwrap();
+        let signed = publisher.seal_blob_stream_commitment(&commitment).unwrap();
+        let commitment = publisher
+            .verify_blob_stream_commitment(&open, &signed)
+            .unwrap();
+
+        assert!(matches!(
+            store.promote_blob_stream_with_policy(&current_policy, &reservation, &commitment),
+            Err(StoreError::Blob(BlobStoreError::PublisherRevoked(publisher_id)))
+                if publisher_id == publisher.identity()
+        ));
+        assert!(store.blob_stream_resume(&reservation).is_err());
+        drop(store);
+        let reopened =
+            Store::open_for_mission(root.0.join("state.redb"), publisher.mission_authority_id())
+                .unwrap();
+        assert!(reopened.blob_stream_resume(&reservation).is_err());
+    }
+
+    #[test]
+    fn blob_stream_promotion_respects_deletion_fence() {
+        let total_len = aster_mesh::BLOB_STREAM_SEGMENT_BYTES as u64;
+        let (root, store, publisher, operation, open) = fixture_with_len(0x79, total_len);
+        let policy = store.control_policy_snapshot().unwrap();
+        let request = BlobStreamReservationRequest {
+            operation: &operation,
+            source: BlobStreamSource::LocalApplication,
+        };
+        let (reservation, resume) = store
+            .reserve_blob_stream_with_policy(&policy, request, &open)
+            .unwrap();
+        let mut writer = BlobPackWriter::create(&root.0.join("pack"), open.open()).unwrap();
+        let sealer = publisher.blob_stream_segment_sealer(&open).unwrap();
+        let (segment, leaves) = sealer
+            .seal(
+                BlobStreamPlainPartition::new(
+                    *open.open().stream_id().as_bytes(),
+                    open.open().digest(),
+                    open.open().content_epoch(),
+                    0,
+                    0,
+                    total_len,
+                    vec![0xc1; total_len as usize],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        writer.append(&segment, leaves).unwrap();
+        let durable = writer.checkpoint().unwrap();
+        store
+            .checkpoint_blob_stream(&policy, &reservation, resume, durable.clone())
+            .unwrap();
+        let roots = BlobStreamFrontier::restore(durable.frontier().clone())
+            .unwrap()
+            .finish(total_len)
+            .unwrap();
+        let commitment = BlobStreamFinalCommitment::new(&open, roots.0, roots.1, 1, None).unwrap();
+        let signed = publisher.seal_blob_stream_commitment(&commitment).unwrap();
+        let commitment = publisher
+            .verify_blob_stream_commitment(&open, &signed)
+            .unwrap();
+        let content_group = open.open().content_group();
+        let variant = super::super::blob_variant_id(
+            commitment.commitment().blob_id(),
+            &content_group,
+            open.open().content_epoch(),
+        );
+        let write = store.database.begin_write().unwrap();
+        super::super::deletion::insert_variant_fence_for_test(
+            &write,
+            variant,
+            commitment.commitment().blob_id(),
+            content_group,
+            open.open().content_epoch(),
+        )
+        .unwrap();
+        write.commit().unwrap();
+
+        assert!(matches!(
+            store.promote_blob_stream_with_policy(&policy, &reservation, &commitment),
+            Err(StoreError::Blob(BlobStoreError::VariantDeleting))
+        ));
+        assert!(store.blob_stream_resume(&reservation).is_ok());
+        assert!(
+            store
+                .blob_stream_publications_with_policy(&policy)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn blob_stream_conflict_table_is_additive_for_predecessor_stream_schema() {
         let (root, store, publisher, _operation, _open) = fixture(0x77);
         drop(store);
         let database = redb::Database::create(root.0.join("state.redb")).unwrap();
         let write = database.begin_write().unwrap();
         assert!(write.delete_table(BLOB_STREAM_CONFLICTS).unwrap());
+        assert!(write.delete_table(BLOB_STREAM_VARIANTS).unwrap());
         write.commit().unwrap();
         drop(database);
 

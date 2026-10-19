@@ -3295,6 +3295,51 @@ pub(crate) fn move_variant_to_manifest_for_test(
     Ok(manifest)
 }
 
+/// Installs only the durable variant fence needed to exercise admission races.
+/// The owning test must not reopen or audit this intentionally partial fixture.
+#[cfg(test)]
+pub(crate) fn insert_variant_fence_for_test(
+    write: &redb::WriteTransaction,
+    variant: BlobVariantId,
+    blob_id: BlobId,
+    content_group: [u8; 32],
+    epoch: u64,
+) -> Result<(), StoreError> {
+    let header = BlobDeletionManifestHeader {
+        variant_id: variant,
+        blob_id,
+        content_group,
+        epoch,
+        physical_lineage: [0x91; 32],
+        owner_binding: [0x92; 32],
+        lineage_fence: vec![1],
+        original_import: vec![1],
+        finalized_root: None,
+        phase: BlobDeletionPhase::DirectoryDeletePending,
+        retry: BlobDeletionRetry::default(),
+        age: BlobDeletionAge {
+            cumulative_age_ms: 0,
+            checkpoint: None,
+            continuity_generation: 0,
+            continuity_lost: false,
+        },
+        totals: BlobDeletionTotals {
+            chunks: 0,
+            queued: 0,
+            deleted: 0,
+            charged_variants: 1,
+            charged_files: 0,
+            charged_reserved_bytes: 0,
+            charged_committed_bytes: 0,
+        },
+    };
+    write.open_table(BLOB_DELETION_MANIFESTS)?.insert(
+        variant.as_bytes().as_slice(),
+        encode_manifest_header(&header)?.as_slice(),
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 pub(crate) fn move_finalized_variant_to_manifest_for_test(
     write: &redb::WriteTransaction,
