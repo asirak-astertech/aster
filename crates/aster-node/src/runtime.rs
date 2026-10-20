@@ -26395,8 +26395,31 @@ async fn receive_profile5_blob_direction(
                         .selector(verified.open().topic(), verified.open().scope())
                         .is_some_and(|selector| selector.epoch() == verified.open().content_epoch())
                     {
-                        accepted = Some((nonce, authenticated_open, verified));
-                        Some(nonce)
+                        let existing = store
+                            .blob_stream_publications_with_policy(guard.policy())?
+                            .into_iter()
+                            .find(|publication| {
+                                publication.stream_id() == verified.open().stream_id()
+                            });
+                        match existing {
+                            Some(publication)
+                                if publication.open() == verified.open()
+                                    && publication.authenticated_open()
+                                        == authenticated_open.as_slice() =>
+                            {
+                                None
+                            }
+                            Some(_) => {
+                                return Err(NodeError::Protocol(
+                                    "Blob stream offer conflicts with an existing publication"
+                                        .into(),
+                                ));
+                            }
+                            None => {
+                                accepted = Some((nonce, authenticated_open, verified));
+                                Some(nonce)
+                            }
+                        }
                     } else {
                         None
                     }
@@ -55261,6 +55284,30 @@ mod tests {
                 )
                 .expect("profile-5 scheduling cursor"),
             Some(*second_stream_id.as_bytes())
+        );
+
+        let (converged_client, converged_server, _, _) =
+            contact_test_pair_with_forwarding_results_tracked_and_interests(
+                node(receiver_store.clone(), services.other.clone(), 0x9c),
+                node(source_store.clone(), services.member.clone(), 0x9d),
+                MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
+                    services.topic.clone(),
+                    services.scope.clone(),
+                    false,
+                )]),
+                MutableSourceInterests::default(),
+            )
+            .await;
+        let converged_client = converged_client.expect("converged v9 stream sender contact");
+        let converged_server = converged_server.expect("converged v9 stream receiver contact");
+        assert_eq!(converged_client.receipt.blob_stream.sent_bytes, 0);
+        assert_eq!(converged_server.receipt.blob_stream.received_bytes, 0);
+        assert_eq!(
+            receiver_store
+                .blob_stream_publications_with_policy(&policy)
+                .expect("converged receiver publications")
+                .len(),
+            2
         );
 
         drop((publications, source_store, receiver_store));
