@@ -9,10 +9,11 @@ use crate::{
         StreamPartition, run_ordered_channel_pipeline_from,
     },
     stream_transfer::{
-        MAX_STREAM_CHECKPOINT_BATCH_BYTES, PROFILE5_EXTENT_BYTES, StreamAction, StreamClass,
-        StreamDirection, StreamExtentAction, StreamFrame, StreamOpenV1, StreamReceiverState,
-        StreamResultCode, StreamSenderState, blob_pack_wire_len, encode_composite_data_record,
-        profile5_attempt_bounds, split_composite_data_record,
+        MAX_STREAM_CHECKPOINT_BATCH_BYTES, PROFILE5_ATTEMPT_TIMEOUT, PROFILE5_EXTENT_BYTES,
+        PROFILE5_MAX_RECORD_BYTES, StreamAction, StreamClass, StreamDirection, StreamExtentAction,
+        StreamFrame, StreamOpenV1, StreamReceiverState, StreamResultCode, StreamSenderState,
+        blob_pack_wire_len, encode_composite_data_record, profile5_attempt_bounds,
+        split_composite_data_record,
     },
     stream_transport::{AttemptOpenRequest, IrohQuicV1Adapter, StreamTransportAdapter},
 };
@@ -27,11 +28,8 @@ use aster_redb_store::{
     pack::{BlobPackCheckpoint, BlobPackReader, BlobPackWriter, PinnedBlobPackRoot},
 };
 use sha2::{Digest, Sha256};
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{path::Path, sync::Arc};
 use tokio::{sync::mpsc, time::Instant};
-
-const MAX_RECORD_BYTES: usize = 2 * 1024 * 1024;
-const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BlobNetworkStage {
@@ -635,7 +633,7 @@ async fn send_completed_pack_inner(
         })?;
     let attempt = IrohQuicV1Adapter::new(connection)
         .open_attempt(AttemptOpenRequest {
-            deadline: Instant::now() + ATTEMPT_TIMEOUT,
+            deadline: Instant::now() + PROFILE5_ATTEMPT_TIMEOUT,
             max_data_bytes,
             max_control_bytes,
         })
@@ -807,7 +805,7 @@ impl RecordPartitioner {
             ));
         }
         let len = u32::from_be_bytes(bytes[..4].try_into().expect("record length")) as usize;
-        if len == 0 || len > MAX_RECORD_BYTES {
+        if len == 0 || len > PROFILE5_MAX_RECORD_BYTES {
             return Err(BlobNetworkError::new(
                 BlobNetworkStage::Framing,
                 "partition network extent",
@@ -864,7 +862,7 @@ async fn send_durable_checkpoint(
     current_limit: &mut u64,
     codec: &mut dyn BlobRecordCodec,
 ) -> Result<(), BlobNetworkError> {
-    let window = u64::from(MAX_STREAM_CHECKPOINT_BATCH_BYTES) + MAX_RECORD_BYTES as u64;
+    let window = u64::from(MAX_STREAM_CHECKPOINT_BATCH_BYTES) + PROFILE5_EXTENT_BYTES as u64;
     let new_limit = wire_len.min((*current_limit).max(progress.wire_offset.saturating_add(window)));
     let StreamAction::Send(checkpoint) = state
         .persisted(
@@ -990,7 +988,7 @@ async fn receive_completed_pack_inner(
         })?;
     let attempt = IrohQuicV1Adapter::new(connection)
         .accept_attempt(AttemptOpenRequest {
-            deadline: Instant::now() + ATTEMPT_TIMEOUT,
+            deadline: Instant::now() + PROFILE5_ATTEMPT_TIMEOUT,
             max_data_bytes,
             max_control_bytes,
         })
@@ -1029,7 +1027,7 @@ async fn receive_completed_pack_inner(
     let durable_wire = resume.durable_wire_offset();
     let resumed_from = durable_wire;
     let mut writer = root.projected_writer(open, resume)?;
-    let window = u64::from(MAX_STREAM_CHECKPOINT_BATCH_BYTES) + MAX_RECORD_BYTES as u64;
+    let window = u64::from(MAX_STREAM_CHECKPOINT_BATCH_BYTES) + PROFILE5_EXTENT_BYTES as u64;
     let mut current_limit = wire_len.min(durable_wire.saturating_add(window));
     let mut state = StreamReceiverState::new(
         &transfer_open,
@@ -1636,6 +1634,22 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn record_partitioner_rejects_records_larger_than_one_profile_extent() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let declared = PROFILE5_MAX_RECORD_BYTES + 1;
+        let mut bytes = vec![0; declared + crate::stream_transfer::PROFILE5_RECORD_PREFIX_BYTES];
+        bytes[..crate::stream_transfer::PROFILE5_RECORD_PREFIX_BYTES]
+            .copy_from_slice(&(declared as u32).to_be_bytes());
+
+        let error = RecordPartitioner::new(0, 0)
+            .push(bytes, &sender)
+            .await
+            .expect_err("oversized profile-5 record must fail before verification");
+
+        assert_eq!(error.stage(), BlobNetworkStage::Framing);
     }
 
     #[tokio::test]

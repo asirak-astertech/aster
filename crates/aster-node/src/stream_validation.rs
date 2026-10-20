@@ -6,15 +6,15 @@
 
 use crate::{
     stream_transfer::{
-        MAX_STREAM_CHECKPOINT_BATCH_BYTES, PROFILE5_EXTENT_BYTES, StreamAction, StreamClass,
-        StreamDirection, StreamExtentAction, StreamFrame, StreamOpenV1, StreamReceiverState,
-        StreamResultCode, StreamSenderState, profile5_attempt_bounds,
+        MAX_STREAM_CHECKPOINT_BATCH_BYTES, PROFILE5_ATTEMPT_TIMEOUT, PROFILE5_EXTENT_BYTES,
+        StreamAction, StreamClass, StreamDirection, StreamExtentAction, StreamFrame, StreamOpenV1,
+        StreamReceiverState, StreamResultCode, StreamSenderState, profile5_attempt_bounds,
     },
     stream_transport::{AttemptOpenRequest, IrohQuicV1Adapter, StreamTransportAdapter},
 };
 use aster_iroh::Connection;
 use sha2::{Digest, Sha256};
-use std::time::{Duration, Instant as StdInstant};
+use std::time::Instant as StdInstant;
 use tokio::time::Instant;
 
 pub use crate::runtime::blob_stream::{
@@ -83,8 +83,6 @@ pub async fn receive_completed_pack_with_store(
     .map_err(|error| error.to_string())
 }
 
-const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct StreamValidationReport {
     pub bytes: u64,
@@ -122,7 +120,7 @@ pub async fn send(connection: Connection, bytes: u64) -> Result<StreamValidation
     let adapter = IrohQuicV1Adapter::new(connection);
     let attempt = adapter
         .open_attempt(AttemptOpenRequest {
-            deadline: Instant::now() + ATTEMPT_TIMEOUT,
+            deadline: Instant::now() + PROFILE5_ATTEMPT_TIMEOUT,
             max_data_bytes,
             max_control_bytes,
         })
@@ -279,7 +277,7 @@ pub async fn receive(
     let adapter = IrohQuicV1Adapter::new(connection);
     let attempt = adapter
         .accept_attempt(AttemptOpenRequest {
-            deadline: Instant::now() + ATTEMPT_TIMEOUT,
+            deadline: Instant::now() + PROFILE5_ATTEMPT_TIMEOUT,
             max_data_bytes,
             max_control_bytes,
         })

@@ -1,13 +1,22 @@
-use std::fmt::{self, Display, Formatter};
+use std::{
+    fmt::{self, Display, Formatter},
+    time::Duration,
+};
 
 const MAGIC: &[u8; 4] = b"ASM\x01";
 const COMPOSITE_DATA_MAGIC: &[u8; 4] = b"ASD1";
+pub(crate) const PROFILE5_RECORD_PREFIX_BYTES: usize = 4;
 /// One profile-5 data extent is one complete length-prefixed canonical Blob
 /// pack record. Keeping the transport and cryptographic partition boundaries
 /// identical avoids slicing, reassembly, and delayed source authentication.
-pub(crate) const PROFILE5_EXTENT_BYTES: usize = 4
+/// The segment size is authenticated wire format, not a local tuning knob;
+/// changing it requires a negotiated protocol profile.
+pub(crate) const PROFILE5_EXTENT_BYTES: usize = PROFILE5_RECORD_PREFIX_BYTES
     + aster_mesh::BLOB_STREAM_SEGMENT_BYTES
     + aster_mesh::BLOB_STREAM_SEGMENT_ENCODED_OVERHEAD_BYTES;
+pub(crate) const PROFILE5_MAX_RECORD_BYTES: usize =
+    PROFILE5_EXTENT_BYTES - PROFILE5_RECORD_PREFIX_BYTES;
+pub(crate) const PROFILE5_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 pub(crate) const MAX_STREAM_EXTENT_BYTES: usize = PROFILE5_EXTENT_BYTES;
 pub(crate) const MAX_STREAM_CHECKPOINT_BATCH_BYTES: u32 = 8 * 1_048_576;
 pub(crate) const STREAM_DATA_FIXED_BYTES: usize = 89;
@@ -45,7 +54,10 @@ pub(crate) fn blob_pack_wire_len(plaintext_len: u64) -> Result<u64, StreamError>
     plaintext_len
         .checked_add(
             segments
-                .checked_mul(4 + aster_mesh::BLOB_STREAM_SEGMENT_ENCODED_OVERHEAD_BYTES as u64)
+                .checked_mul(
+                    PROFILE5_RECORD_PREFIX_BYTES as u64
+                        + aster_mesh::BLOB_STREAM_SEGMENT_ENCODED_OVERHEAD_BYTES as u64,
+                )
                 .ok_or_else(|| StreamError::invalid("wire length overflow"))?,
         )
         .ok_or_else(|| StreamError::invalid("wire length overflow"))

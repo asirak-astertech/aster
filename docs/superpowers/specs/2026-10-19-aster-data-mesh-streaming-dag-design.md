@@ -211,6 +211,18 @@ For Blob, a partition is identified by:
 (stream_id, segment_index, plaintext_offset, plaintext_length, open_digest)
 ```
 
+The current profile fixes the maximum Blob segment plaintext at 1 MiB. This is
+an authenticated format invariant shared by segment offsets, AEAD records,
+Merkle leaves, packs, checkpoints, resume indices, and transport framing; it is
+not a local throughput or total-transfer limit and cannot be changed by one
+node's runtime configuration. The existing measurements show that this framing
+is not the current critical-path bottleneck, but they do not establish 1 MiB as
+the globally optimal segment size. Any future size alternatives require
+comparative device evidence and explicit protocol negotiation that binds the
+selected canonical size into the authenticated open. Runtime adaptation remains
+free to tune worker concurrency, bounded in-flight extents, credit, batching,
+and transport selection without changing the format.
+
 A map result is immutable and includes:
 
 - the complete expected job and partition identities;
