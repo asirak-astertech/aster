@@ -249,6 +249,18 @@ fn put_attempt(o: &mut Vec<u8>, id: &[u8; 32], n: &[u8; 32], s: u64) {
 }
 
 impl StreamFrame {
+    pub(crate) fn declared_direction(&self) -> Option<StreamDirection> {
+        match self {
+            Self::Open(value) => Some(value.direction),
+            Self::Accept(_)
+            | Self::Data(_)
+            | Self::Checkpoint(_)
+            | Self::Finish(_)
+            | Self::Result(_)
+            | Self::ResultAck(_) => None,
+        }
+    }
+
     pub(crate) fn attempt_binding(&self) -> ([u8; 32], Option<u64>) {
         match self {
             Self::Open(value) => (value.attempt_nonce, None),

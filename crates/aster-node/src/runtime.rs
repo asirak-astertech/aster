@@ -26028,6 +26028,10 @@ fn blob_stream_error(context: &str, error: impl fmt::Display) -> NodeError {
     NodeError::Protocol(format!("{context}: {error}"))
 }
 
+fn protocol_stage_error(context: &str, error: impl fmt::Display) -> NodeError {
+    NodeError::Protocol(format!("{context}: {error}"))
+}
+
 fn next_blob_stream_publication(
     store: &Store,
     policy: &ControlPolicySnapshot,
@@ -26276,6 +26280,7 @@ async fn sync_profile5_blob_lane_if_selected(
         receipt,
     )
     .await
+    .map_err(|error| blob_stream_error("profile-5 initiator receive phase", error))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -26309,7 +26314,8 @@ async fn serve_profile5_blob_lane_if_selected(
         EventDirection::ToSessionResponder,
         receipt,
     )
-    .await?;
+    .await
+    .map_err(|error| blob_stream_error("profile-5 responder receive phase", error))?;
     send_profile5_blob_direction(
         &store,
         connection,
@@ -26320,6 +26326,7 @@ async fn serve_profile5_blob_lane_if_selected(
         receipt,
     )
     .await
+    .map_err(|error| blob_stream_error("profile-5 responder send phase", error))
 }
 
 async fn sync_event_turn_plans(
@@ -28861,9 +28868,9 @@ async fn serve_session(
     // either exact configured identity validation or discovered-peer mission admission
     // finishes.
     let (mut mission, handshake) = match expected_peer {
-        Some(peer) => {
-            respond_over_iroh_metered(&connection, credentials.fresh_bundle()?, peer).await?
-        }
+        Some(peer) => respond_over_iroh_metered(&connection, credentials.fresh_bundle()?, peer)
+            .await
+            .map_err(|error| protocol_stage_error("respond mission handshake", error))?,
         #[cfg(feature = "nearby-discovery")]
         None => {
             respond_discovered_over_iroh_metered(&connection, credentials.fresh_bundle()?).await?
@@ -28875,8 +28882,9 @@ async fn serve_session(
     let mut receipt = authenticated_receipt(&connection, &mission, handshake)?;
     #[cfg(test)]
     apply_test_preaccounted_contact_items(&mut receipt)?;
-    let transfer_profiles =
-        serve_transfer_profiles(&connection, &mut mission, &mut receipt).await?;
+    let transfer_profiles = serve_transfer_profiles(&connection, &mut mission, &mut receipt)
+        .await
+        .map_err(|error| protocol_stage_error("serve transfer profiles", error))?;
     let blob_transfer_mode = BlobTransferMode::from_authenticated_profiles(
         mission.semantic_version(),
         transfer_profiles.as_ref(),
@@ -28909,7 +28917,8 @@ async fn serve_session(
         &mut control_verifier,
         &mut receipt,
     )
-    .await?;
+    .await
+    .map_err(|error| protocol_stage_error("serve control lane", error))?;
     drop(policy_write);
 
     let event_lease = policy_lock.read_owned().await;
@@ -28942,7 +28951,8 @@ async fn serve_session(
         &event_guard,
         &mut receipt,
     )
-    .await?;
+    .await
+    .map_err(|error| protocol_stage_error("serve Event interests", error))?;
     let mut custody_exchanges = CustodyExchangeSequence::new();
 
     let to_responder_lane = DirectedEventLane {
@@ -28959,7 +28969,8 @@ async fn serve_session(
         to_responder_lane,
         &mut receipt,
     )
-    .await?
+    .await
+    .map_err(|error| protocol_stage_error("serve first Event reconciliation", error))?
     {
         EventReconciliationOutcome::Complete(reconciliation) => reconciliation,
         EventReconciliationOutcome::Deferred => {
@@ -36837,7 +36848,7 @@ mod tests {
         assert_eq!(response_plan, server_response_plan);
         assert_eq!(receipt.protected_frames, 4);
         assert_eq!(server_receipt.protected_frames, 4);
-        assert_eq!(mission.semantic_version(), SEMANTIC_PROTOCOL_V8);
+        assert_eq!(mission.semantic_version(), SEMANTIC_PROTOCOL_V9);
         client.close().await;
         server.close().await;
     }
@@ -50105,20 +50116,23 @@ mod tests {
         };
         let source_cache = test_event_route_cache(&source_store, &source_mission);
         let receiver_cache = test_event_route_cache(&receiver_store, &receiver_mission);
-        let (receiver_receipt, source_receipt) = blob_contact_test_pair_with_caches(
-            source_store.clone(),
-            source_mission.clone(),
-            interests(),
-            Arc::clone(&source_cache),
-            receiver_store.clone(),
-            receiver_mission.clone(),
-            interests(),
-            Arc::clone(&receiver_cache),
-            Some(source_bridge.clone()),
-            Some(receiver_bridge.clone()),
-            None,
-            None,
-            preaccounted_contact_items,
+        let (receiver_receipt, source_receipt) = with_test_semantic_version(
+            SEMANTIC_PROTOCOL_V8,
+            blob_contact_test_pair_with_caches(
+                source_store.clone(),
+                source_mission.clone(),
+                interests(),
+                Arc::clone(&source_cache),
+                receiver_store.clone(),
+                receiver_mission.clone(),
+                interests(),
+                Arc::clone(&receiver_cache),
+                Some(source_bridge.clone()),
+                Some(receiver_bridge.clone()),
+                None,
+                None,
+                preaccounted_contact_items,
+            ),
         )
         .await;
 
@@ -54698,6 +54712,267 @@ mod tests {
         }
     }
 
+    fn publish_test_blob_stream(
+        store: &Store,
+        publisher: &mut ReferenceEnvelopeSealer,
+        topic: &Topic,
+        scope: &Scope,
+        plaintext: &[u8],
+    ) -> aster_mesh::BlobPublicationStreamId {
+        let stream_id =
+            aster_mesh::BlobPublicationStreamId::from_bytes([0x94; 32]).expect("test stream id");
+        let operation = aster_redb_store::BlobOperationKey::new(b"selected-contact-profile-5")
+            .expect("test operation");
+        let open = aster_mesh::BlobStreamOpen::new(
+            stream_id,
+            publisher.identity(),
+            operation.as_bytes().to_vec(),
+            publisher.mission_authority_id(),
+            1,
+            aster_mesh::VersionVector::default(),
+            topic.clone(),
+            scope.clone(),
+            aster_mesh::BlobMetadata::new(
+                Some("application/octet-stream".into()),
+                b"profile-5-contact".to_vec(),
+            )
+            .expect("test metadata"),
+            Priority::Immediate,
+            None,
+            None,
+            u64::try_from(plaintext.len()).expect("test plaintext length"),
+            1,
+            1,
+            publisher
+                .blob_stream_authorization_digest(scope, 1)
+                .expect("stream authorization"),
+            [0x95; 32],
+        )
+        .expect("test stream open");
+        let authenticated_open = publisher
+            .seal_blob_stream_open(&open)
+            .expect("seal test stream open");
+        let verified_open = publisher
+            .verify_blob_stream_open(&authenticated_open)
+            .expect("verify test stream open");
+        let policy = store.control_policy_snapshot().expect("test stream policy");
+        let (reservation, mut resume) = store
+            .reserve_blob_stream_with_policy(
+                &policy,
+                aster_redb_store::BlobStreamReservationRequest {
+                    operation: &operation,
+                    source: aster_redb_store::BlobStreamSource::LocalApplication,
+                },
+                &verified_open,
+            )
+            .expect("reserve test stream");
+        let pack_root = aster_redb_store::pack::PinnedBlobPackRoot::open(store)
+            .expect("pin test stream pack root");
+        let mut writer =
+            aster_redb_store::pack::BlobPackWriter::create_pinned(&pack_root, verified_open.open())
+                .expect("create test stream pack");
+        let sealer = publisher
+            .blob_stream_segment_sealer(&verified_open)
+            .expect("test segment sealer");
+        for (index, bytes) in plaintext
+            .chunks(aster_mesh::BLOB_STREAM_SEGMENT_BYTES)
+            .enumerate()
+        {
+            let index = u64::try_from(index).expect("test segment index");
+            let offset = index * aster_mesh::BLOB_STREAM_SEGMENT_BYTES as u64;
+            let (segment, leaves) = sealer
+                .seal(
+                    aster_mesh::BlobStreamPlainPartition::new(
+                        *stream_id.as_bytes(),
+                        open.digest(),
+                        open.content_epoch(),
+                        index,
+                        offset,
+                        open.total_len(),
+                        bytes.to_vec(),
+                    )
+                    .expect("test plaintext partition"),
+                )
+                .expect("seal test stream partition");
+            writer
+                .append(&segment, leaves)
+                .expect("append test stream partition");
+        }
+        let checkpoint = writer.checkpoint().expect("checkpoint test stream");
+        resume = store
+            .checkpoint_blob_stream(&policy, &reservation, resume, checkpoint)
+            .expect("project test stream checkpoint");
+        let roots = writer.finish().expect("finish test stream pack");
+        let commitment = aster_mesh::BlobStreamFinalCommitment::new(
+            &verified_open,
+            roots.0,
+            roots.1,
+            resume.next_segment_index(),
+            None,
+        )
+        .expect("test stream commitment");
+        let authenticated_commitment = publisher
+            .seal_blob_stream_commitment(&commitment)
+            .expect("seal test stream commitment");
+        let verified_commitment = publisher
+            .verify_blob_stream_commitment(&verified_open, &authenticated_commitment)
+            .expect("verify test stream commitment");
+        store
+            .promote_blob_stream_with_policy(&policy, &reservation, &verified_commitment)
+            .expect("promote test stream");
+        stream_id
+    }
+
+    #[tokio::test]
+    async fn semantic_v9_profile_five_contact_completes_without_blob_work() {
+        let services = control_test_services([0x91; 32]);
+        let states = [root("v9-empty-source"), root("v9-empty-receiver")];
+        for state in &states {
+            fs::create_dir_all(state).expect("v9 empty store parent");
+        }
+        let authority = services.member.mission_authority_id();
+        let source_store = Arc::new(
+            Store::open_for_mission(states[0].join(STORE_FILE), authority)
+                .expect("v9 source store"),
+        );
+        let receiver_store = Arc::new(
+            Store::open_for_mission(states[1].join(STORE_FILE), authority)
+                .expect("v9 receiver store"),
+        );
+        let node = |store: Arc<Store>, mission: UnprotectedReferenceMission, clock: u8| {
+            TestForwardingNode {
+                store,
+                mission,
+                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                clock: NodeCustodyClock::injected([clock; 16], 0, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: Vec::new(),
+            }
+        };
+        let (client, server) = contact_test_pair_with_forwarding_results(
+            node(receiver_store.clone(), services.other, 0x92),
+            node(source_store.clone(), services.member, 0x93),
+        )
+        .await;
+        assert!(
+            client.is_ok() && server.is_ok(),
+            "v9 empty contact failed: client={client:?} server={server:?}"
+        );
+        assert_eq!(
+            client
+                .expect("v9 initiator contact")
+                .receipt
+                .semantic_version,
+            SEMANTIC_PROTOCOL_V9
+        );
+        assert_eq!(
+            server
+                .expect("v9 responder contact")
+                .receipt
+                .semantic_version,
+            SEMANTIC_PROTOCOL_V9
+        );
+
+        drop(source_store);
+        drop(receiver_store);
+        for state in states {
+            fs::remove_dir_all(state).expect("v9 empty cleanup");
+        }
+    }
+
+    #[tokio::test]
+    async fn semantic_v9_profile_five_contact_transfers_completed_blob_stream() {
+        let services = control_test_services([0x96; 32]);
+        let states = [root("v9-stream-source"), root("v9-stream-receiver")];
+        for state in &states {
+            fs::create_dir_all(state).expect("v9 stream store parent");
+        }
+        let authority = services.member.mission_authority_id();
+        let source_store = Arc::new(
+            Store::open_for_mission(states[0].join(STORE_FILE), authority)
+                .expect("v9 stream source store"),
+        );
+        let receiver_store = Arc::new(
+            Store::open_for_mission(states[1].join(STORE_FILE), authority)
+                .expect("v9 stream receiver store"),
+        );
+        let plaintext = (0..(2 * aster_mesh::BLOB_STREAM_SEGMENT_BYTES + 17))
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let mut publisher = open_test_sealer(&services.member);
+        let stream_id = publish_test_blob_stream(
+            &source_store,
+            &mut publisher,
+            &services.topic,
+            &services.scope,
+            &plaintext,
+        );
+        let node = |store: Arc<Store>, mission: UnprotectedReferenceMission, clock: u8| {
+            TestForwardingNode {
+                store,
+                mission,
+                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                clock: NodeCustodyClock::injected([clock; 16], 0, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: Vec::new(),
+            }
+        };
+        let receiver_interests =
+            MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
+                services.topic.clone(),
+                services.scope.clone(),
+                false,
+            )]);
+        let (client, server, _, _) =
+            contact_test_pair_with_forwarding_results_tracked_and_interests(
+                node(receiver_store.clone(), services.other.clone(), 0x97),
+                node(source_store.clone(), services.member.clone(), 0x98),
+                receiver_interests,
+                MutableSourceInterests::default(),
+            )
+            .await;
+        assert!(
+            client.is_ok() && server.is_ok(),
+            "v9 stream contact failed: client={client:?} server={server:?}"
+        );
+
+        let policy = receiver_store
+            .control_policy_snapshot()
+            .expect("receiver stream policy");
+        let publications = receiver_store
+            .blob_stream_publications_with_policy(&policy)
+            .expect("receiver stream publications");
+        let publication = publications
+            .iter()
+            .find(|publication| publication.stream_id() == stream_id)
+            .expect("transferred stream publication");
+        let receiver = open_test_sealer(&services.other);
+        let verified_open = receiver
+            .verify_blob_stream_open(publication.authenticated_open())
+            .expect("verify received stream open");
+        let opener = receiver
+            .blob_stream_segment_opener(&verified_open)
+            .expect("open received stream content");
+        let pack_root = aster_redb_store::pack::PinnedBlobPackRoot::open(&receiver_store)
+            .expect("pin received stream pack root");
+        let mut reader =
+            aster_redb_store::pack::BlobPackReader::open_pinned(&pack_root, publication.open())
+                .expect("open received stream pack");
+        let mut received = Vec::with_capacity(plaintext.len());
+        while let Some(segment) = reader.next_segment().expect("read received segment") {
+            let (bytes, _) = opener
+                .open(&segment)
+                .expect("authenticate received segment");
+            received.extend_from_slice(&bytes);
+        }
+        assert_eq!(received, plaintext);
+
+        drop((publications, source_store, receiver_store));
+        for state in states {
+            fs::remove_dir_all(state).expect("v9 stream cleanup");
+        }
+    }
+
     #[tokio::test]
     async fn current_stack_near_two_mib_events_each_direction() {
         // The fixture's hybrid source-authentication envelope is just over 10 KiB.
@@ -54915,6 +55190,26 @@ mod tests {
         Arc<AtomicBool>,
         Arc<AtomicBool>,
     ) {
+        contact_test_pair_with_forwarding_results_tracked_and_interests(
+            server_node,
+            client_node,
+            MutableSourceInterests::default(),
+            MutableSourceInterests::default(),
+        )
+        .await
+    }
+
+    async fn contact_test_pair_with_forwarding_results_tracked_and_interests(
+        server_node: TestForwardingNode,
+        client_node: TestForwardingNode,
+        server_interests: MutableSourceInterests,
+        client_interests: MutableSourceInterests,
+    ) -> (
+        Result<CompletedPeerContact, NodeError>,
+        Result<CompletedPeerContact, NodeError>,
+        Arc<AtomicBool>,
+        Arc<AtomicBool>,
+    ) {
         let server = Endpoint::bind(
             aster_iroh::SecretKey::generate(),
             EndpointConfig::direct("127.0.0.1:0".parse().expect("server address")),
@@ -54928,12 +55223,14 @@ mod tests {
         .await
         .expect("client endpoint");
         let expected_client = client_node.mission.identity();
-        let result = contact_test_pair_on_endpoints(
+        let result = contact_test_pair_on_endpoints_with_interests(
             &server,
             &client,
             expected_client,
             server_node,
             client_node,
+            server_interests,
+            client_interests,
         )
         .await;
         client.close().await;
@@ -54947,6 +55244,32 @@ mod tests {
         expected_client: NodeId,
         server_node: TestForwardingNode,
         client_node: TestForwardingNode,
+    ) -> (
+        Result<CompletedPeerContact, NodeError>,
+        Result<CompletedPeerContact, NodeError>,
+        Arc<AtomicBool>,
+        Arc<AtomicBool>,
+    ) {
+        contact_test_pair_on_endpoints_with_interests(
+            server,
+            client,
+            expected_client,
+            server_node,
+            client_node,
+            MutableSourceInterests::default(),
+            MutableSourceInterests::default(),
+        )
+        .await
+    }
+
+    async fn contact_test_pair_on_endpoints_with_interests(
+        server: &Endpoint,
+        client: &Endpoint,
+        expected_client: NodeId,
+        server_node: TestForwardingNode,
+        client_node: TestForwardingNode,
+        server_interests: MutableSourceInterests,
+        client_interests: MutableSourceInterests,
     ) -> (
         Result<CompletedPeerContact, NodeError>,
         Result<CompletedPeerContact, NodeError>,
@@ -55001,7 +55324,7 @@ mod tests {
                                 custody_clock: server_clock,
                                 event_route_cache: server_event_route_cache,
                                 event_bridge: None,
-                                mutable_interests: MutableSourceInterests::default(),
+                                mutable_interests: server_interests,
                             })),
                         ),
                     )
@@ -55037,7 +55360,7 @@ mod tests {
                             custody_clock: client_clock,
                             event_route_cache: client_event_route_cache,
                             event_bridge: None,
-                            mutable_interests: MutableSourceInterests::default(),
+                            mutable_interests: client_interests,
                             controlled_relay: None,
                         },
                     )),
@@ -56524,7 +56847,7 @@ mod tests {
             services.other.clone(),
         )
         .await;
-        assert_eq!(finite_source.semantic_version, SEMANTIC_PROTOCOL_V8);
+        assert_eq!(finite_source.semantic_version, SEMANTIC_PROTOCOL_V9);
         assert_eq!(finite_source.offered, 1);
         assert_eq!(finite_source.event_pages_sent, 1);
         assert_eq!(finite_source.event_page_entries_sent, 1);
@@ -56675,7 +56998,7 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(source.semantic_version, SEMANTIC_PROTOCOL_V8);
+        assert_eq!(source.semantic_version, SEMANTIC_PROTOCOL_V9);
         assert_eq!(source.offered, EVENT_COUNT);
         assert_eq!(
             source.event_pages_sent,

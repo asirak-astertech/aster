@@ -132,8 +132,21 @@ struct MissionBlobRecordCodec<'a> {
     attempt_nonce: [u8; 32],
 }
 
+fn stream_frame_name(frame: &StreamFrame) -> &'static str {
+    match frame {
+        StreamFrame::Open(_) => "open",
+        StreamFrame::Accept(_) => "accept",
+        StreamFrame::Data(_) => "data",
+        StreamFrame::Checkpoint(_) => "checkpoint",
+        StreamFrame::Finish(_) => "finish",
+        StreamFrame::Result(_) => "result",
+        StreamFrame::ResultAck(_) => "result acknowledgement",
+    }
+}
+
 impl BlobRecordCodec for MissionBlobRecordCodec<'_> {
     fn encode(&mut self, frame: StreamFrame) -> Result<Vec<u8>, String> {
+        let frame_name = stream_frame_name(&frame);
         let plaintext = frame
             .encode_for_context(9, TransferProfileId::BlobStreamV1 as u16)
             .map_err(|error| error.to_string())?;
@@ -144,7 +157,7 @@ impl BlobRecordCodec for MissionBlobRecordCodec<'_> {
                 self.attempt_nonce,
                 &plaintext,
             )
-            .map_err(|error| error.to_string())
+            .map_err(|error| failure(&format!("seal {frame_name} mission record"), error))
     }
 
     fn decode(&mut self, bytes: &[u8]) -> Result<StreamFrame, String> {

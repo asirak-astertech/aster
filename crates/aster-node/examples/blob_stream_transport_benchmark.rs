@@ -284,6 +284,7 @@ async fn pack_store_receive(
         Arc::clone(&store),
         policy,
         verified.clone(),
+        std::fs::read(&signed_open_path)?,
         verified.open().publisher(),
         verifier,
     )

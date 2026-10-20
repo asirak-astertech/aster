@@ -5113,16 +5113,7 @@ impl ReferenceAuthenticatedSession {
         direction: BlobCustodyDirectionV1,
         attempt_nonce: [u8; 32],
         record_sequence: u64,
-        outbound: bool,
     ) -> Result<ApplicationRecordContext, EnvelopeError> {
-        let expected_direction = match (self.role, outbound) {
-            (SessionRole::Initiator, true) | (SessionRole::Responder, false) => {
-                BlobCustodyDirectionV1::ToSessionResponder
-            }
-            (SessionRole::Responder, true) | (SessionRole::Initiator, false) => {
-                BlobCustodyDirectionV1::ToSessionInitiator
-            }
-        };
         let profiles = self
             .transfer_profiles
             .authenticated
@@ -5130,7 +5121,6 @@ impl ReferenceAuthenticatedSession {
             .ok_or_else(blob_custody_contact_unavailable)?;
         if self.semantic_version != SEMANTIC_PROTOCOL_V9
             || transfer_profile_digest != profiles.digest
-            || direction != expected_direction
             || profiles.negotiated.profile(TransferLaneId::Blob)
                 != Some(TransferProfileId::BlobStreamV1)
         {
@@ -5151,22 +5141,17 @@ impl ReferenceAuthenticatedSession {
         transfer_profile_digest: [u8; 32],
         direction: BlobCustodyDirectionV1,
         attempt_nonce: [u8; 32],
-        expected_record_sequence: Option<u64>,
         plaintext: &[u8],
     ) -> Result<Vec<u8>, EnvelopeError> {
         let sequence = self
             .channel
             .next_send_sequence()
             .ok_or_else(blob_custody_contact_unavailable)?;
-        if expected_record_sequence.is_some_and(|expected| expected != sequence) {
-            return Err(blob_custody_contact_unavailable());
-        }
         let context = self.v9_blob_record_context(
             transfer_profile_digest,
             direction,
             attempt_nonce,
             sequence,
-            true,
         )?;
         self.seal_frame_with_context(plaintext, &context.aad())
     }
@@ -5186,7 +5171,6 @@ impl ReferenceAuthenticatedSession {
             direction,
             attempt_nonce,
             record.sequence,
-            false,
         )?;
         let aad = transport_frame_context_aad(&context.aad())?;
         let plaintext = self
@@ -5212,7 +5196,6 @@ impl ReferenceAuthenticatedSession {
             transfer_profile_digest,
             direction,
             attempt_nonce,
-            None,
             &claim.encode(),
         )
     }
@@ -5231,7 +5214,6 @@ impl ReferenceAuthenticatedSession {
             direction,
             attempt_nonce,
             record.sequence,
-            false,
         )?;
         let aad = transport_frame_context_aad(&context.aad())?;
         let plaintext = self
@@ -5708,7 +5690,7 @@ fn custody_version_unavailable() -> EnvelopeError {
 }
 
 fn blob_custody_contact_unavailable() -> EnvelopeError {
-    EnvelopeError("semantic-v8 Blob custody contact is unavailable".into())
+    EnvelopeError("authenticated Blob contact context is unavailable".into())
 }
 
 fn transfer_profile_negotiation_failed() -> EnvelopeError {

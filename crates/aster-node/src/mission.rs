@@ -59,7 +59,7 @@ const CLASSICAL_CHANNEL_BINDING_CONTEXT_MAGIC: &[u8; 8] = b"ASTRCB01";
 // The selected contact runtime below implements the legacy fixed lanes and the
 // v7/v8 BlobRangesStreamV1 lane. The separate profile-5 Blob DAG must not be
 // advertised here until it is dispatched by this contact owner.
-const SELECTED_CONTACT_SEMANTIC_CEILING: u16 = 8;
+const SELECTED_CONTACT_SEMANTIC_CEILING: u16 = 9;
 /// Exact bytes in a canonical carrier-bound classical mission context.
 pub const CLASSICAL_CHANNEL_BINDING_CONTEXT_BYTES: usize = 8 + 2 + 8 + 32 * 6;
 
@@ -2539,7 +2539,7 @@ impl MissionSession {
             .map_err(Into::into)
     }
 
-    /// Protects one semantic-v7-or-v8 record with exact negotiated profile, lane,
+    /// Protects one semantic-v7-through-v9 record with exact negotiated profile, lane,
     /// and direction context as authenticated associated data.
     pub(crate) fn seal_profiled_application_frame(
         &mut self,
@@ -2561,7 +2561,7 @@ impl MissionSession {
             .map_err(Into::into)
     }
 
-    /// Opens one semantic-v7-or-v8 record only under the exact negotiated profile,
+    /// Opens one semantic-v7-through-v9 record only under the exact negotiated profile,
     /// lane, and direction context supplied by the local state machine.
     pub(crate) fn open_profiled_application_frame(
         &mut self,
@@ -2583,7 +2583,6 @@ impl MissionSession {
             .map_err(Into::into)
     }
 
-    #[allow(dead_code)] // Consumed by the profile-5 runtime driver in Task 7.
     pub(crate) fn seal_v9_blob_application_frame(
         &mut self,
         transfer_profile_digest: [u8; 32],
@@ -2597,10 +2596,22 @@ impl MissionSession {
                     "invalid v9 Blob stream record".into(),
                 ))
             })?;
-        let (bound_nonce, record_sequence) = decoded.attempt_binding();
-        if bound_nonce != attempt_nonce {
+        let (bound_nonce, _) = decoded.attempt_binding();
+        let expected_direction = match direction {
+            crate::frame::EventDirection::ToSessionInitiator => {
+                crate::stream_transfer::StreamDirection::ToSessionInitiator
+            }
+            crate::frame::EventDirection::ToSessionResponder => {
+                crate::stream_transfer::StreamDirection::ToSessionResponder
+            }
+        };
+        if bound_nonce != attempt_nonce
+            || decoded
+                .declared_direction()
+                .is_some_and(|direction| direction != expected_direction)
+        {
             return Err(MissionSessionError::Authentication(EnvelopeError(
-                "v9 Blob stream attempt differs".into(),
+                "v9 Blob stream attempt or direction differs".into(),
             )));
         }
         self.inner
@@ -2608,13 +2619,11 @@ impl MissionSession {
                 transfer_profile_digest,
                 Self::blob_direction(direction),
                 attempt_nonce,
-                record_sequence,
                 plaintext,
             )
             .map_err(Into::into)
     }
 
-    #[allow(dead_code)] // Consumed by the profile-5 runtime driver in Task 7.
     pub(crate) fn open_v9_blob_application_frame(
         &mut self,
         transfer_profile_digest: [u8; 32],
@@ -2622,7 +2631,7 @@ impl MissionSession {
         attempt_nonce: [u8; 32],
         frame: &[u8],
     ) -> Result<Vec<u8>, MissionSessionError> {
-        let (plaintext, outer_sequence) = self
+        let (plaintext, _) = self
             .inner
             .open_v9_blob_application_frame(
                 transfer_profile_digest,
@@ -2637,12 +2646,22 @@ impl MissionSession {
                     "invalid v9 Blob stream record".into(),
                 ))
             })?;
-        let (bound_nonce, record_sequence) = decoded.attempt_binding();
+        let (bound_nonce, _) = decoded.attempt_binding();
+        let expected_direction = match direction {
+            crate::frame::EventDirection::ToSessionInitiator => {
+                crate::stream_transfer::StreamDirection::ToSessionInitiator
+            }
+            crate::frame::EventDirection::ToSessionResponder => {
+                crate::stream_transfer::StreamDirection::ToSessionResponder
+            }
+        };
         if bound_nonce != attempt_nonce
-            || record_sequence.is_some_and(|sequence| sequence != outer_sequence)
+            || decoded
+                .declared_direction()
+                .is_some_and(|direction| direction != expected_direction)
         {
             return Err(MissionSessionError::Authentication(EnvelopeError(
-                "v9 Blob stream record binding differs".into(),
+                "v9 Blob stream attempt or direction differs".into(),
             )));
         }
         Ok(plaintext)
@@ -2736,6 +2755,7 @@ impl MissionSession {
         let domain = match semantic_version {
             crate::event_pages::SEMANTIC_PROTOCOL_V7 => b"ASTER/v7-lane-record/v1\0".as_slice(),
             crate::event_pages::SEMANTIC_PROTOCOL_V8 => b"ASTER/v8-lane-record/v1\0".as_slice(),
+            crate::event_pages::SEMANTIC_PROTOCOL_V9 => b"ASTER/v9-lane-record/v1\0".as_slice(),
             _ => {
                 return Err(MissionSessionError::Authentication(EnvelopeError(
                     "profiled record context is unavailable for this session".into(),
@@ -3848,6 +3868,27 @@ mod tests {
         let negotiated = crate::event_pages::negotiate_transfer_profiles(&offer, &offer)
             .expect("negotiate v9 profiles");
         let digest = crate::event_pages::transfer_profile_digest(&offer, &offer, &negotiated);
+        let event_record = sender
+            .seal_profiled_application_frame(
+                digest,
+                crate::event_pages::LaneId::Event,
+                crate::event_pages::TransferProfileId::EventPagesV1,
+                EventDirection::ToSessionResponder,
+                b"v9-event",
+            )
+            .expect("seal v9 Event profile record");
+        assert_eq!(
+            receiver
+                .open_profiled_application_frame(
+                    digest,
+                    crate::event_pages::LaneId::Event,
+                    crate::event_pages::TransferProfileId::EventPagesV1,
+                    EventDirection::ToSessionResponder,
+                    &event_record,
+                )
+                .expect("open v9 Event profile record"),
+            b"v9-event"
+        );
         let nonce = [0x73; 32];
         let stream_open =
             crate::stream_transfer::StreamFrame::Open(crate::stream_transfer::StreamOpenV1 {
