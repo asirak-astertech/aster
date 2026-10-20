@@ -138,8 +138,8 @@ use crate::{
         ChangeTurnFinishedV1, ChangeTurnHeaderV1, EventPagePackingState, EventPageScheduleLimits,
         EventPageSchedulePosition, EventTurnPlanV1, LaneId, LocalEventSendDifference,
         MAX_CHANGE_PAGE_CODEC_BYTES, MAX_EVENT_TURN_PLAN_CODEC_BYTES, NegotiatedTransferProfiles,
-        SEMANTIC_PROTOCOL_V7, SEMANTIC_PROTOCOL_V8, TransferProfileId, TransferProfileOfferV1,
-        blind_set_commitment, build_local_event_send_plan_with_limits,
+        SEMANTIC_PROTOCOL_V7, SEMANTIC_PROTOCOL_V8, SEMANTIC_PROTOCOL_V9, TransferProfileId,
+        TransferProfileOfferV1, blind_set_commitment, build_local_event_send_plan_with_limits,
         negotiate_transfer_profiles_for_semantic_version, pack_event_page_entry, schedule_digest,
         transfer_profile_digest, validate_remote_event_page_budget,
         validate_remote_event_send_plan,
@@ -21720,7 +21720,9 @@ impl MutableReceiveInterest<'_> {
 struct MutableClassesContact<'a> {
     guard: &'a EventLaneGuard,
     interests: &'a MutableSourceInterests,
-    blob_contact_mode: BlobContactMode,
+    /// `None` means Blob is owned by the profile-5 stream lane and therefore
+    /// excluded from the legacy mutable reconciliation/carrier machinery.
+    blob_contact_mode: Option<BlobContactMode>,
 }
 
 #[derive(Clone, Copy)]
@@ -21739,9 +21741,21 @@ enum BlobContactMode {
     CustodyV1,
 }
 
-impl BlobContactMode {
-    const fn finite_transfer_enabled(self) -> bool {
-        matches!(self, Self::CustodyV1)
+/// Authenticated lane selection. Keeping this distinct from
+/// `BlobContactMode` makes it impossible to pass profile 5 into legacy range
+/// helpers by accident.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BlobTransferMode {
+    Legacy(BlobContactMode),
+    StreamV1,
+}
+
+impl BlobTransferMode {
+    const fn legacy(self) -> Option<BlobContactMode> {
+        match self {
+            Self::Legacy(mode) => Some(mode),
+            Self::StreamV1 => None,
+        }
     }
 
     fn from_authenticated_profiles(
@@ -21754,18 +21768,29 @@ impl BlobContactMode {
                     "legacy semantic contact unexpectedly negotiated transfer profiles".into(),
                 ));
             }
-            return Ok(Self::DurableOnly);
+            return Ok(Self::Legacy(BlobContactMode::DurableOnly));
         }
         let profile = profiles
             .and_then(|profiles| profiles.negotiated.profile(LaneId::Blob))
             .ok_or_else(|| NodeError::Protocol("Blob lane has no authenticated profile".into()))?;
         match (semantic_version, profile) {
-            (SEMANTIC_PROTOCOL_V7, TransferProfileId::BlobRangesStreamV1) => Ok(Self::DurableOnly),
-            (SEMANTIC_PROTOCOL_V8, TransferProfileId::BlobRangesStreamV1) => Ok(Self::CustodyV1),
+            (SEMANTIC_PROTOCOL_V7, TransferProfileId::BlobRangesStreamV1) => {
+                Ok(Self::Legacy(BlobContactMode::DurableOnly))
+            }
+            (SEMANTIC_PROTOCOL_V8, TransferProfileId::BlobRangesStreamV1) => {
+                Ok(Self::Legacy(BlobContactMode::CustodyV1))
+            }
+            (SEMANTIC_PROTOCOL_V9, TransferProfileId::BlobStreamV1) => Ok(Self::StreamV1),
             _ => Err(NodeError::Protocol(
                 "Blob lane selected an incompatible semantic/profile pair".into(),
             )),
         }
+    }
+}
+
+impl BlobContactMode {
+    const fn finite_transfer_enabled(self) -> bool {
+        matches!(self, Self::CustodyV1)
     }
 }
 
@@ -25422,6 +25447,9 @@ async fn sync_mutable_classes(
     }
     let mut blob_interests = None;
     for &class in mutable_classes_for_semantic(mission.semantic_version()) {
+        if class == MutableClass::Blob && blob_contact_mode.is_none() {
+            continue;
+        }
         let exchanged = sync_mutable_class(
             store,
             connection,
@@ -25431,7 +25459,7 @@ async fn sync_mutable_classes(
                 guard,
                 interests,
                 class,
-                blob_contact_mode,
+                blob_contact_mode: blob_contact_mode.unwrap_or(BlobContactMode::DurableOnly),
             },
             receipt,
         )
@@ -25441,6 +25469,9 @@ async fn sync_mutable_classes(
         }
     }
     if let Some((local, peer)) = blob_interests {
+        let blob_contact_mode = blob_contact_mode.ok_or_else(|| {
+            NodeError::Protocol("legacy Blob interests entered the profile-5 stream lane".into())
+        })?;
         // Carrier recovery is symmetric and direction-ordered: the initiator
         // first serves the responder's newly staged source, then fetches its
         // own pending source from the responder. Each half streams a bounded
@@ -26188,7 +26219,7 @@ async fn sync_authenticated_session(
     #[cfg(test)]
     apply_test_preaccounted_contact_items(&mut receipt)?;
     let transfer_profiles = sync_transfer_profiles(connection, &mut mission, &mut receipt).await?;
-    let blob_contact_mode = BlobContactMode::from_authenticated_profiles(
+    let blob_transfer_mode = BlobTransferMode::from_authenticated_profiles(
         mission.semantic_version(),
         transfer_profiles.as_ref(),
     )?;
@@ -26231,7 +26262,7 @@ async fn sync_authenticated_session(
     let mutable_contact = MutableClassesContact {
         guard: &event_guard,
         interests: &mutable_interests,
-        blob_contact_mode,
+        blob_contact_mode: blob_transfer_mode.legacy(),
     };
     if mission.semantic_version() < SEMANTIC_PROTOCOL_V7 {
         sync_selected_event_bridge(
@@ -28422,6 +28453,9 @@ async fn serve_mutable_classes(
     }
     let mut blob_interests = None;
     for &class in mutable_classes_for_semantic(mission.semantic_version()) {
+        if class == MutableClass::Blob && blob_contact_mode.is_none() {
+            continue;
+        }
         let exchanged = serve_mutable_class(
             store,
             connection,
@@ -28431,7 +28465,7 @@ async fn serve_mutable_classes(
                 guard,
                 interests,
                 class,
-                blob_contact_mode,
+                blob_contact_mode: blob_contact_mode.unwrap_or(BlobContactMode::DurableOnly),
             },
             receipt,
         )
@@ -28441,6 +28475,9 @@ async fn serve_mutable_classes(
         }
     }
     if let Some((local, peer)) = blob_interests {
+        let blob_contact_mode = blob_contact_mode.ok_or_else(|| {
+            NodeError::Protocol("legacy Blob interests entered the profile-5 stream lane".into())
+        })?;
         // Mirror the initiator's fixed order without role-dependent carrier
         // authority: fetch the responder-bound range, then serve the
         // initiator-bound range.
@@ -28503,7 +28540,7 @@ async fn serve_session(
     apply_test_preaccounted_contact_items(&mut receipt)?;
     let transfer_profiles =
         serve_transfer_profiles(&connection, &mut mission, &mut receipt).await?;
-    let blob_contact_mode = BlobContactMode::from_authenticated_profiles(
+    let blob_transfer_mode = BlobTransferMode::from_authenticated_profiles(
         mission.semantic_version(),
         transfer_profiles.as_ref(),
     )?;
@@ -28550,7 +28587,7 @@ async fn serve_session(
     let mutable_contact = MutableClassesContact {
         guard: &event_guard,
         interests: &mutable_interests,
-        blob_contact_mode,
+        blob_contact_mode: blob_transfer_mode.legacy(),
     };
     if mission.semantic_version() < SEMANTIC_PROTOCOL_V7 {
         serve_selected_event_bridge(
@@ -49807,10 +49844,15 @@ mod tests {
             MIN_BLOB_NETWORK_SEMANTIC_VERSION,
             MIN_BLOB_NETWORK_SEMANTIC_VERSION + 1,
         ] {
-            let mode = BlobContactMode::from_authenticated_profiles(semantic_version, None)
+            let mode = BlobTransferMode::from_authenticated_profiles(semantic_version, None)
                 .expect("v5-v6 durable-only Blob mode");
-            assert_eq!(mode, BlobContactMode::DurableOnly);
-            assert!(!mode.finite_transfer_enabled());
+            assert_eq!(mode, BlobTransferMode::Legacy(BlobContactMode::DurableOnly));
+            assert!(
+                !mode
+                    .legacy()
+                    .expect("legacy mode")
+                    .finite_transfer_enabled()
+            );
         }
         let v7 = negotiated(
             SEMANTIC_PROTOCOL_V7,
@@ -49818,9 +49860,9 @@ mod tests {
                 .expect("v7 transfer offer"),
         );
         assert_eq!(
-            BlobContactMode::from_authenticated_profiles(SEMANTIC_PROTOCOL_V7, Some(&v7))
+            BlobTransferMode::from_authenticated_profiles(SEMANTIC_PROTOCOL_V7, Some(&v7))
                 .expect("v7 Blob mode"),
-            BlobContactMode::DurableOnly
+            BlobTransferMode::Legacy(BlobContactMode::DurableOnly)
         );
         assert!(
             negotiate_transfer_profiles_for_semantic_version(
@@ -49838,17 +49880,36 @@ mod tests {
                 .expect("v8 transfer offer"),
         );
         let custody_mode =
-            BlobContactMode::from_authenticated_profiles(SEMANTIC_PROTOCOL_V8, Some(&v8_custody))
+            BlobTransferMode::from_authenticated_profiles(SEMANTIC_PROTOCOL_V8, Some(&v8_custody))
                 .expect("v8 custody-capable stream mode");
-        assert_eq!(custody_mode, BlobContactMode::CustodyV1);
-        assert!(custody_mode.finite_transfer_enabled());
+        assert_eq!(
+            custody_mode,
+            BlobTransferMode::Legacy(BlobContactMode::CustodyV1)
+        );
+        assert!(
+            custody_mode
+                .legacy()
+                .expect("legacy custody mode")
+                .finite_transfer_enabled()
+        );
         assert!(matches!(
-            BlobContactMode::from_authenticated_profiles(
+            BlobTransferMode::from_authenticated_profiles(
                 SEMANTIC_PROTOCOL_V8 + 1,
                 Some(&v8_custody),
             ),
             Err(NodeError::Protocol(_))
         ));
+
+        let v9_stream = negotiated(
+            SEMANTIC_PROTOCOL_V9,
+            TransferProfileOfferV1::for_semantic_version(SEMANTIC_PROTOCOL_V9)
+                .expect("v9 transfer offer"),
+        );
+        let stream_mode =
+            BlobTransferMode::from_authenticated_profiles(SEMANTIC_PROTOCOL_V9, Some(&v9_stream))
+                .expect("v9 streaming Blob mode");
+        assert_eq!(stream_mode, BlobTransferMode::StreamV1);
+        assert!(stream_mode.legacy().is_none());
     }
 
     #[tokio::test]
