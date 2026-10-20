@@ -53,10 +53,10 @@ use tokio::sync::{mpsc, oneshot};
 use zeroize::{Zeroize as _, Zeroizing};
 
 use super::blob_stream::{
-    BLOB_STREAM_CHECKPOINT_SEGMENTS, BlobPublishProgress, BlobPublishStreamRequest,
-    LocalBlobPublishStream, LocalBlobReadStream, OpenedBlobPublishStream,
-    SelectedBlobPublishStream, blob_pack_application_error, blob_stream_map_pool,
-    blob_stream_pipeline_error, sink_mapped_stream_partitions, take_zeroizing_bytes,
+    BlobPublishProgress, BlobPublishStreamRequest, LocalBlobPublishStream, LocalBlobReadStream,
+    OpenedBlobPublishStream, SelectedBlobPublishStream, blob_pack_application_error,
+    blob_stream_map_pool, blob_stream_pipeline_error, sink_mapped_stream_partitions,
+    take_zeroizing_bytes,
 };
 use super::{
     ApplicationError, ApplicationErrorKind, SelectedApplicationCommand, actor_unavailable,
@@ -1993,6 +1993,7 @@ impl SelectedBlobNode {
                 next_sink_index: next_segment_index,
                 mapped_segments: next_segment_index,
                 publisher_counter: causal.counter(),
+                checkpoint_segments: LocalBlobPublishStream::production_checkpoint_segments(),
             },
         );
         Ok(OpenedBlobPublishStream {
@@ -2049,16 +2050,10 @@ impl SelectedBlobNode {
                 ))
                 .map_err(blob_stream_pipeline_error)?;
             stream.next_map_index += 1;
-            let checkpoint_due = stream
-                .next_map_index
-                .saturating_sub(stream.resume.next_segment_index())
-                >= BLOB_STREAM_CHECKPOINT_SEGMENTS;
+            let checkpoint_due = stream.map_checkpoint_due();
             sink_mapped_stream_partitions(stream, end == stream.total_len || checkpoint_due)?;
         }
-        if stream.writer.plaintext_offset() - stream.resume.durable_plaintext_offset()
-            >= BLOB_STREAM_CHECKPOINT_SEGMENTS * BLOB_STREAM_SEGMENT_BYTES as u64
-            || stream.writer.plaintext_offset() == stream.total_len
-        {
+        if stream.durable_checkpoint_due() || stream.writer.plaintext_offset() == stream.total_len {
             let checkpoint = stream
                 .writer
                 .checkpoint()
@@ -5895,7 +5890,8 @@ mod tests {
     #[test]
     fn selected_blob_publish_stream_restarts_from_store_durable_frontier() {
         let root = TestRoot::new("selected-blob-publish-stream-resume");
-        let checkpoint_bytes = BLOB_STREAM_CHECKPOINT_SEGMENTS as usize * BLOB_STREAM_SEGMENT_BYTES;
+        const TEST_CHECKPOINT_SEGMENTS: u64 = 2;
+        let checkpoint_bytes = TEST_CHECKPOINT_SEGMENTS as usize * BLOB_STREAM_SEGMENT_BYTES;
         let total_len = checkpoint_bytes + 2 * 64 * 1024;
         let bytes = payload(total_len);
         let stream_request = BlobPublishStreamRequest {
@@ -5908,6 +5904,10 @@ mod tests {
             let opened = node
                 .open_publish_stream_inner(stream_request.clone())
                 .expect("open stream");
+            node.publish_streams
+                .get_mut(&opened.token)
+                .expect("open local stream")
+                .set_checkpoint_segments_for_test(TEST_CHECKPOINT_SEGMENTS);
             for (offset, chunk) in bytes[..checkpoint_bytes + 64 * 1024]
                 .chunks(64 * 1024)
                 .enumerate()

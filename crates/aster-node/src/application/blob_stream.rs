@@ -29,7 +29,7 @@ use super::{
     ApplicationError, ApplicationErrorKind, SelectedApplicationCommand, actor_unavailable,
 };
 
-pub(super) const BLOB_STREAM_CHECKPOINT_SEGMENTS: u64 = 64;
+const BLOB_STREAM_CHECKPOINT_SEGMENTS: u64 = 64;
 const BLOB_STREAM_MAP_WORKERS: usize = 2;
 const BLOB_STREAM_MAP_QUEUE_ITEMS: usize = 4;
 
@@ -52,6 +52,32 @@ pub(super) struct LocalBlobPublishStream {
     pub(super) next_sink_index: u64,
     pub(super) mapped_segments: u64,
     pub(super) publisher_counter: u64,
+    pub(super) checkpoint_segments: u64,
+}
+
+impl LocalBlobPublishStream {
+    pub(super) const fn production_checkpoint_segments() -> u64 {
+        BLOB_STREAM_CHECKPOINT_SEGMENTS
+    }
+
+    pub(super) fn map_checkpoint_due(&self) -> bool {
+        self.next_map_index
+            .saturating_sub(self.resume.next_segment_index())
+            >= self.checkpoint_segments
+    }
+
+    pub(super) fn durable_checkpoint_due(&self) -> bool {
+        self.writer
+            .plaintext_offset()
+            .saturating_sub(self.resume.durable_plaintext_offset())
+            >= self.checkpoint_segments * BLOB_STREAM_SEGMENT_BYTES as u64
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_checkpoint_segments_for_test(&mut self, segments: u64) {
+        assert!(segments > 0, "checkpoint cadence must be positive");
+        self.checkpoint_segments = segments;
+    }
 }
 
 pub(super) struct LocalBlobReadStream {
@@ -449,6 +475,12 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn production_checkpoint_policy_batches_sixty_four_segments() {
+        assert_eq!(LocalBlobPublishStream::production_checkpoint_segments(), 64);
+    }
+
     struct TempRoot(std::path::PathBuf);
     impl TempRoot {
         fn new() -> Self {
