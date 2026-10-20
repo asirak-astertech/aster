@@ -79,3 +79,25 @@ Reproduction command:
 ```text
 cargo test --release -p aster-node composite_profile5_records_process_256_mib_in_bounded_extents --lib -- --ignored --nocapture
 ```
+
+## Open qualification: canonical segment size
+
+Profile 5 currently fixes one canonical Blob segment at 1 MiB of plaintext.
+That value is an authenticated format boundary, not a local runtime tuning
+option: it determines segment offsets, AEAD records, Merkle leaves, pack
+encoding, durable checkpoints, resume indices, and transport framing. The
+measurements above and the retained CM4 runs establish that 1-MiB segment
+processing is faster than the validated WLAN path; they do **not** establish
+that 1 MiB is the globally optimal size.
+
+Before adding another segment-size profile, run the same warmed CM4 workload at
+256 KiB, 512 KiB, 1 MiB, 2 MiB, and 4 MiB. Retain end-to-end throughput and
+latency, CPU, peak RSS and in-flight bytes, checkpoint cost, retransmitted bytes,
+resume amplification, and behavior under loss and constrained MTU. Keep 1 MiB
+unless another size produces a material end-to-end improvement without
+violating memory, fairness, durability, or recovery bounds.
+
+Alternative sizes must be separate negotiated protocol profiles and must bind
+the selected canonical size into the authenticated open. A unilateral
+configuration setting is invalid because peers using different sizes would
+derive different records, checkpoints, roots, and Blob identities.
