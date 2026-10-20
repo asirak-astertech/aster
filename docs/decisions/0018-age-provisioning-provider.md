@@ -143,16 +143,18 @@ The bounded pilot therefore carries `cargo-deny` ignores for exactly
 `RUSTSEC-2026-0173` and `RUSTSEC-2026-0374`, and no other advisories. This does
 not reclassify either package as maintained or safe for production. Both
 packages execute only while building localization proc macros, their exact
-registry checksums are locked, and CI downloads them before running offline
-validation; neither is executed in the deployed runtime. The scope gate asserts
-the complete reverse graph of both packages and inspects the separately
+registry sources and checksums are locked, and CI downloads them before running
+offline validation; neither is executed in the deployed runtime. The scope gate
+requires exactly one root-lock occurrence of each ignored package, with the
+reviewed version, crates.io registry source, and archive checksum. It also
+asserts the complete reverse graph of both packages and inspects the separately
 excluded fuzz lock, preventing either workspace-wide ignore from silently
-covering another consumer. Generated output is still compiled into the
-dependency, so the build-time supply-chain exposure remains. Those controls
-bound the exceptions; they do not erase them. Production remains prohibited,
-and a compatible published upstream migration, a narrowly maintained patch,
-provider replacement, or provider removal must eliminate both exceptions
-before production-readiness review.
+covering another version, source, archive, or consumer. Generated output is
+still compiled into the dependency, so the build-time supply-chain exposure
+remains. Those controls bound the exceptions; they do not erase them.
+Production remains prohibited, and a compatible published upstream migration,
+a narrowly maintained patch, provider replacement, or provider removal must
+eliminate both exceptions before production-readiness review.
 
 The newer Rust `age` 0.12.1 was reevaluated but is not admitted. The attempted
 workspace lock selected an `ml-kem`/`kem` API combination that failed to compile

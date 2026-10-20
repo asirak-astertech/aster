@@ -1788,13 +1788,16 @@ Because `deny.toml` expresses an active advisory exception at workspace scope,
 both the primary and dependency-policy gates also run
 `tools/check-dependency-exception-scope.sh`. Its exact reverse-graph assertions
 fail unless `proc-macro-error2` 2.0.1 and `basic-toml` 0.1.10 remain reachable
-only through the isolated age-provider pilot and `paste` remains absent from
-the root lock and resolved workspace/fuzz graphs. Both ignored packages must be
-absent from fuzz. The same gate proves the vulnerable raw-lock Hickory pair
-remains inactive while allowing Iroh's fixed 0.26.1 packages. Adversarial
-wrappers force a fuzz graph command failure, an active vulnerable Hickory
-package, reintroduced `paste` versions, an expanded `basic-toml` reverse graph,
-and `basic-toml` in fuzz; each must fail closed.
+only through the isolated age-provider pilot. Each ignored package must occur
+exactly once in the root lock with its reviewed version, crates.io registry
+source, and archive checksum; both must be absent from fuzz. `paste` must remain
+absent from the root lock and resolved workspace/fuzz graphs. The same gate
+proves the vulnerable raw-lock Hickory pair remains inactive while allowing
+Iroh's fixed 0.26.1 packages. Adversarial checks force a fuzz graph command
+failure, an active vulnerable Hickory package, reintroduced `paste` versions,
+an expanded `basic-toml` reverse graph, `basic-toml` in fuzz, a second ignored
+package version, an alternate package source, and a changed archive checksum;
+each must fail closed.
 
 ## Security posture
 
