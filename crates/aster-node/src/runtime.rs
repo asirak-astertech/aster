@@ -26024,6 +26024,216 @@ async fn serve_transfer_profiles(
     Ok(Some(profiles))
 }
 
+fn blob_stream_error(context: &str, error: impl fmt::Display) -> NodeError {
+    NodeError::Protocol(format!("{context}: {error}"))
+}
+
+fn next_blob_stream_publication(
+    store: &Store,
+    policy: &ControlPolicySnapshot,
+) -> Result<Option<aster_redb_store::BlobStreamPublication>, NodeError> {
+    Ok(store
+        .blob_stream_publications_with_policy(policy)?
+        .into_iter()
+        .next())
+}
+
+async fn send_profile5_blob_direction(
+    store: &Store,
+    connection: &aster_iroh::Connection,
+    mission: &mut MissionSession,
+    profiles: &V7TransferProfiles,
+    guard: &EventLaneGuard,
+    direction: EventDirection,
+    receipt: &mut PeerReceipt,
+) -> Result<(), NodeError> {
+    guard.check(store)?;
+    let publication = next_blob_stream_publication(store, guard.policy())?;
+    let mut attempt_nonce = publication.as_ref().map(|_| [0; 32]);
+    if let Some(nonce) = attempt_nonce.as_mut() {
+        getrandom::fill(nonce).map_err(|error| blob_stream_error("Blob stream nonce", error))?;
+    }
+    let authenticated_open = publication.as_ref().map_or_else(Vec::new, |publication| {
+        publication.authenticated_open().to_vec()
+    });
+    let response = request_mission_frame(
+        connection,
+        mission,
+        Frame::BlobStreamPlan {
+            direction,
+            attempt_nonce,
+            authenticated_open,
+        },
+        receipt,
+    )
+    .await?;
+    let Frame::BlobStreamPlanAck {
+        direction: acknowledged_direction,
+        attempt_nonce: acknowledged_nonce,
+    } = response
+    else {
+        return Err(NodeError::Protocol(
+            "Blob stream plan received another response".into(),
+        ));
+    };
+    if acknowledged_direction != direction {
+        return Err(NodeError::Protocol(
+            "Blob stream plan acknowledgement crossed directions".into(),
+        ));
+    }
+    let Some(publication) = publication else {
+        return if acknowledged_nonce.is_none() {
+            Ok(())
+        } else {
+            Err(NodeError::Protocol(
+                "peer accepted an absent Blob stream offer".into(),
+            ))
+        };
+    };
+    let nonce = attempt_nonce.expect("publication has attempt nonce");
+    if acknowledged_nonce.is_none() {
+        return Ok(());
+    }
+    if acknowledged_nonce != Some(nonce) {
+        return Err(NodeError::Protocol(
+            "Blob stream plan acknowledgement changed the attempt nonce".into(),
+        ));
+    }
+    guard.check(store)?;
+    let pack_root = aster_redb_store::pack::PinnedBlobPackRoot::open(store)?;
+    let roots = (
+        *publication.commitment().plaintext_root(),
+        *publication.commitment().ciphertext_root(),
+    );
+    blob_stream::send_completed_pack_protected(
+        connection.clone(),
+        mission,
+        profiles.digest,
+        direction,
+        nonce,
+        publication.open(),
+        publication.authenticated_open().to_vec(),
+        &pack_root,
+        roots,
+        publication.authenticated_commitment().to_vec(),
+    )
+    .await
+    .map_err(|error| blob_stream_error("send profile-5 Blob", error))?;
+    guard.check(store)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn receive_profile5_blob_direction(
+    store: Arc<Store>,
+    connection: &aster_iroh::Connection,
+    mission: &mut MissionSession,
+    profiles: &V7TransferProfiles,
+    guard: &EventLaneGuard,
+    verifier: Arc<ReferenceEnvelopeSealer>,
+    local_interest: &BlobInterest,
+    direction: EventDirection,
+    receipt: &mut PeerReceipt,
+) -> Result<(), NodeError> {
+    guard.check(&store)?;
+    let mut accepted = None;
+    let wire_budget = exchange_wire_budget(receipt)?;
+    let (complete, request_bytes, response_bytes) =
+        respond_mission_frame(connection, mission, wire_budget, |frame, _, _mission| {
+            let Frame::BlobStreamPlan {
+                direction: offered_direction,
+                attempt_nonce,
+                authenticated_open,
+            } = frame
+            else {
+                return Err(NodeError::Protocol(
+                    "Blob stream receive phase expected a plan".into(),
+                ));
+            };
+            if offered_direction != direction {
+                return Err(NodeError::Protocol(
+                    "Blob stream offer crossed directions".into(),
+                ));
+            }
+            let acknowledged_nonce = match attempt_nonce {
+                None => None,
+                Some(nonce) => {
+                    let verified = verifier
+                        .verify_blob_stream_open(&authenticated_open)
+                        .map_err(|error| blob_stream_error("verify Blob stream open", error))?;
+                    if local_interest
+                        .selector(verified.open().topic(), verified.open().scope())
+                        .is_some_and(|selector| selector.epoch() == verified.open().content_epoch())
+                    {
+                        accepted = Some((nonce, authenticated_open, verified));
+                        Some(nonce)
+                    } else {
+                        None
+                    }
+                }
+            };
+            Ok((
+                Frame::BlobStreamPlanAck {
+                    direction,
+                    attempt_nonce: acknowledged_nonce,
+                },
+                true,
+            ))
+        })
+        .await?;
+    account(receipt, request_bytes, response_bytes)?;
+    if !complete {
+        return Err(NodeError::Protocol(
+            "Blob stream plan exchange did not complete".into(),
+        ));
+    }
+    let Some((nonce, authenticated_open, verified_open)) = accepted else {
+        return Ok(());
+    };
+    guard.check(&store)?;
+    let opener = verifier
+        .blob_stream_segment_opener(&verified_open)
+        .map_err(|error| blob_stream_error("open Blob stream content", error))?;
+    let commitment_verifier = {
+        let verifier = Arc::clone(&verifier);
+        Arc::new(
+            move |open: &aster_mesh::VerifiedBlobStreamOpen, bytes: &[u8]| {
+                verifier
+                    .verify_blob_stream_commitment(open, bytes)
+                    .map_err(|error| error.to_string())
+            },
+        ) as blob_stream::BlobCommitmentVerifier
+    };
+    let session = blob_stream::BlobReceiveStoreSession::new(
+        Arc::clone(&store),
+        *guard.policy(),
+        verified_open.clone(),
+        authenticated_open,
+        mission.peer().mission_id(),
+        commitment_verifier,
+    )
+    .map_err(|error| blob_stream_error("prepare Blob stream receive", error))?;
+    let wire_len = blob_stream::expected_pack_wire_len(verified_open.open().total_len())
+        .map_err(|error| blob_stream_error("plan Blob stream wire length", error))?;
+    let pack_root = aster_redb_store::pack::PinnedBlobPackRoot::open(&store)?;
+    let limits = crate::stream_pipeline::PipelineLimits::new(2, 4, 5 * 1024 * 1024, 4)
+        .map_err(|error| blob_stream_error("configure Blob stream pipeline", error))?;
+    blob_stream::receive_completed_pack_with_store_protected(
+        connection.clone(),
+        mission,
+        profiles.digest,
+        direction,
+        nonce,
+        session,
+        opener,
+        &pack_root,
+        wire_len,
+        limits,
+    )
+    .await
+    .map_err(|error| blob_stream_error("receive profile-5 Blob", error))?;
+    guard.check(&store)
+}
+
 async fn sync_event_turn_plans(
     connection: &aster_iroh::Connection,
     mission: &mut MissionSession,
@@ -26604,7 +26814,7 @@ async fn sync_authenticated_session(
     sync_event_transfer_lane_planned(
         EventTransferLaneContext {
             store,
-            lease_store,
+            lease_store: Arc::clone(&lease_store),
             connection,
             mission: &mut mission,
             event_verifier: &mut event_verifier,
@@ -26628,6 +26838,32 @@ async fn sync_authenticated_session(
             &mut mission,
             &mut event_verifier,
             mutable_contact,
+            &mut receipt,
+        )
+        .await?;
+    }
+    if blob_transfer_mode == BlobTransferMode::StreamV1 {
+        let local_blob_interest =
+            protected_blob_interest(store, &event_verifier, &mutable_interests, true)?;
+        send_profile5_blob_direction(
+            store,
+            connection,
+            &mut mission,
+            profiles,
+            &event_guard,
+            EventDirection::ToSessionResponder,
+            &mut receipt,
+        )
+        .await?;
+        receive_profile5_blob_direction(
+            lease_store,
+            connection,
+            &mut mission,
+            profiles,
+            &event_guard,
+            Arc::new(event_verifier),
+            &local_blob_interest,
+            EventDirection::ToSessionInitiator,
             &mut receipt,
         )
         .await?;
@@ -28947,6 +29183,33 @@ async fn serve_session(
             &mut mission,
             &mut event_verifier,
             mutable_contact,
+            &mut receipt,
+        )
+        .await?;
+    }
+    if blob_transfer_mode == BlobTransferMode::StreamV1 {
+        let local_blob_interest =
+            protected_blob_interest(&store, &event_verifier, &mutable_interests, true)?;
+        let stream_verifier = Arc::new(event_verifier);
+        receive_profile5_blob_direction(
+            Arc::clone(&store),
+            &connection,
+            &mut mission,
+            profiles,
+            &event_guard,
+            Arc::clone(&stream_verifier),
+            &local_blob_interest,
+            EventDirection::ToSessionResponder,
+            &mut receipt,
+        )
+        .await?;
+        send_profile5_blob_direction(
+            &store,
+            &connection,
+            &mut mission,
+            profiles,
+            &event_guard,
+            EventDirection::ToSessionInitiator,
             &mut receipt,
         )
         .await?;

@@ -52,6 +52,7 @@ pub struct BlobReceiveStoreSession {
     store: Arc<Store>,
     policy: ControlPolicySnapshot,
     open: VerifiedBlobStreamOpen,
+    authenticated_open: Vec<u8>,
     operation: BlobOperationKey,
     source: BlobStreamSource,
     verify_commitment: BlobCommitmentVerifier,
@@ -62,6 +63,7 @@ impl BlobReceiveStoreSession {
         store: Arc<Store>,
         policy: ControlPolicySnapshot,
         open: VerifiedBlobStreamOpen,
+        authenticated_open: Vec<u8>,
         peer: NodeId,
         verify_commitment: BlobCommitmentVerifier,
     ) -> Result<Self, String> {
@@ -71,6 +73,7 @@ impl BlobReceiveStoreSession {
             store,
             policy,
             open,
+            authenticated_open,
             operation,
             source: BlobStreamSource::AuthenticatedPeer(peer),
             verify_commitment,
@@ -122,7 +125,6 @@ impl BlobRecordCodec for PlainBlobRecordCodec {
     }
 }
 
-#[allow(dead_code)] // Activated by the selected-contact driver in the next Task 4 increment.
 struct MissionBlobRecordCodec<'a> {
     mission: &'a mut MissionSession,
     profile_digest: [u8; 32],
@@ -327,10 +329,11 @@ fn protocol_open(
     authenticated_open: Vec<u8>,
     wire_len: u64,
     attempt_nonce: [u8; 32],
+    direction: StreamDirection,
 ) -> StreamOpenV1 {
     StreamOpenV1 {
         class: StreamClass::Blob,
-        direction: StreamDirection::ToSessionResponder,
+        direction,
         session_transcript: open.digest(),
         exchange_id: 1,
         transfer_id: open.digest(),
@@ -362,13 +365,13 @@ pub async fn send_completed_pack(
         roots,
         semantic_commitment,
         None,
+        StreamDirection::ToSessionResponder,
         &mut codec,
     )
     .await
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(dead_code)] // Activated by the selected-contact driver in the next Task 4 increment.
 pub(crate) async fn send_completed_pack_protected(
     connection: Connection,
     mission: &mut MissionSession,
@@ -395,6 +398,10 @@ pub(crate) async fn send_completed_pack_protected(
         roots,
         semantic_commitment,
         Some(attempt_nonce),
+        match direction {
+            EventDirection::ToSessionInitiator => StreamDirection::ToSessionInitiator,
+            EventDirection::ToSessionResponder => StreamDirection::ToSessionResponder,
+        },
         &mut codec,
     )
     .await
@@ -409,6 +416,7 @@ async fn send_completed_pack_inner(
     roots: ([u8; 32], [u8; 32]),
     semantic_commitment: Vec<u8>,
     planned_nonce: Option<[u8; 32]>,
+    direction: StreamDirection,
     codec: &mut dyn BlobRecordCodec,
 ) -> Result<BlobNetworkReport, String> {
     let wire_len = root.reader(open)?.checkpoint().payload_len();
@@ -429,7 +437,7 @@ async fn send_completed_pack_inner(
     if planned_nonce.is_none() {
         getrandom::fill(&mut attempt_nonce).map_err(|error| failure("attempt nonce", error))?;
     }
-    let transfer_open = protocol_open(open, authenticated_open, wire_len, attempt_nonce);
+    let transfer_open = protocol_open(open, authenticated_open, wire_len, attempt_nonce, direction);
     attempt
         .send_data(&codec.encode(StreamFrame::Open(transfer_open.clone()))?)
         .await
@@ -673,6 +681,7 @@ pub async fn receive_completed_pack(
         limits,
         None,
         None,
+        StreamDirection::ToSessionResponder,
         &mut codec,
     )
     .await
@@ -697,13 +706,13 @@ pub async fn receive_completed_pack_with_store(
         limits,
         Some(session),
         None,
+        StreamDirection::ToSessionResponder,
         &mut codec,
     )
     .await
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(dead_code)] // Activated by the selected-contact driver in the next Task 4 increment.
 pub(crate) async fn receive_completed_pack_with_store_protected(
     connection: Connection,
     mission: &mut MissionSession,
@@ -732,6 +741,10 @@ pub(crate) async fn receive_completed_pack_with_store_protected(
         limits,
         Some(session),
         Some(attempt_nonce),
+        match direction {
+            EventDirection::ToSessionInitiator => StreamDirection::ToSessionInitiator,
+            EventDirection::ToSessionResponder => StreamDirection::ToSessionResponder,
+        },
         &mut codec,
     )
     .await
@@ -747,6 +760,7 @@ async fn receive_completed_pack_inner(
     limits: PipelineLimits,
     store_session: Option<BlobReceiveStoreSession>,
     planned_nonce: Option<[u8; 32]>,
+    direction: StreamDirection,
     codec: &mut dyn BlobRecordCodec,
 ) -> Result<BlobNetworkReport, String> {
     let (max_data_bytes, max_control_bytes) =
@@ -768,9 +782,13 @@ async fn receive_completed_pack_inner(
         return Err("first data frame was not open".into());
     };
     if transfer_open.class != StreamClass::Blob
+        || transfer_open.direction != direction
         || transfer_open.total_len != wire_len
         || transfer_open.session_transcript != open.digest()
         || transfer_open.publication_id != *open.stream_id().as_bytes()
+        || store_session
+            .as_ref()
+            .is_some_and(|session| session.authenticated_open != transfer_open.authenticated_open)
         || planned_nonce.is_some_and(|nonce| nonce != transfer_open.attempt_nonce)
     {
         return Err("transport open differs from authenticated Blob open".into());
@@ -1343,6 +1361,7 @@ mod tests {
             Arc::clone(&store),
             policy,
             verified_open.clone(),
+            signed_open.clone(),
             provider.identity(),
             verifier,
         )
