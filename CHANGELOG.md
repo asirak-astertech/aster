@@ -45,6 +45,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Removed `MeshService` and its obsolete transfer, large-Blob, scale, resource,
+  and live-node lab commands. Native mesh, Gate H, and shared binding APIs remain.
+- Replaced wrapper batch tests with shared-backend inventory, State receive and
+  restart, and two-Blob transfer tests. Load and impaired-link work is deferred
+  to [#105](https://github.com/defenseunicorns/aster/issues/105).
+- Fixed gaps in relay confidentiality and acknowledgement coverage, rekey
+  visibility after restart, and malformed provisioning rejection tests.
+
 - Faster Blob transfers. Breaking change: both nodes must be updated.
 - Replaced libp2p-based tests with Event delivery and reconnection tests using Iroh. Removed the unused libp2p provider and its dependencies.
 - Fixed a test failure caused by `iroh` in the checkout directory name.

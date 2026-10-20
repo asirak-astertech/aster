@@ -58890,6 +58890,203 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rekey_reopens_all_nodes_before_fresh_event_and_public_visibility() {
+        use crate::application::{
+            EventPollRequest, EventPublishRequest, EventQuery, EventSubscriptionRequest,
+        };
+
+        let states = [
+            root("rekey-reopen-authority"),
+            root("rekey-reopen-member"),
+            root("rekey-reopen-excluded"),
+        ];
+        let services = control_test_services([0xd4; 32]);
+        let missions = [&services.authority, &services.member, &services.excluded];
+        let identities = missions.map(|mission| mission.identity());
+        // Reuse the protected bootstrap fixture with locally generated bundles.
+        let open = |index: usize| {
+            let mut provider = RuntimeTestUnprotector {
+                calls: 0,
+                plaintext: Some(
+                    missions[index]
+                        .fresh_bundle()
+                        .expect("fresh bundle")
+                        .to_bytes()
+                        .expect("encode bundle"),
+                ),
+            };
+            let node = SelectedEventNode::from_protected_bytes(
+                &states[index],
+                b"test-protected",
+                &mut provider,
+            )
+            .expect("open public application");
+            assert_eq!(provider.calls, 1);
+            assert_eq!(node.identity(), identities[index]);
+            node
+        };
+        let subscriptions = [1, 2].map(|index| {
+            let mut node = open(index);
+            node.subscribe(EventSubscriptionRequest {
+                operation_key: b"rekey-persisted-consume".to_vec(),
+                topic: services.topic.clone(),
+                scope: services.scope.clone(),
+                include_descendant_scopes: false,
+            })
+            .expect("subscribe before rekey")
+            .id
+        });
+        publish_scope_rekey_control(
+            &states[0],
+            &services.authority,
+            &services.registry_next,
+            0,
+            services.scope.clone(),
+            2,
+            vec![
+                ScopeRekeyRecipient::member(identities[0], vec![services.topic.clone()])
+                    .expect("authority recipient"),
+                ScopeRekeyRecipient::member(identities[1], vec![services.topic.clone()])
+                    .expect("included recipient"),
+            ],
+        )
+        .expect("publish rekey");
+        let open_store = |index: usize| {
+            Arc::new(
+                Store::open_for_mission(
+                    states[index].join(STORE_FILE),
+                    missions[index].mission_authority_id(),
+                )
+                .expect("open durable store"),
+            )
+        };
+        {
+            let stores = [open_store(0), open_store(1), open_store(2)];
+            for index in [1, 2] {
+                let (receipt, _) = contact_test_pair(
+                    stores[0].clone(),
+                    missions[0].clone(),
+                    stores[index].clone(),
+                    missions[index].clone(),
+                )
+                .await;
+                assert_eq!(receipt.controls_activated, 1);
+                assert_eq!(receipt.controls_remaining, 0);
+                assert_eq!(receipt.fetched, 0, "no Event exists before all-node reopen");
+                let controls = stores[index].control_stats().expect("applied rekey");
+                assert_eq!(controls.applied, 1);
+                assert_eq!(controls.pending, 0);
+            }
+        } // Every Store and contact endpoint is closed before fresh publication.
+        let mut reopened = [open(0), open(1), open(2)];
+        for index in [1, 2] {
+            let page = reopened[index]
+                .poll(EventPollRequest {
+                    subscription: subscriptions[index - 1],
+                    delivery_limit: 8,
+                    scan_limit: 8,
+                })
+                .expect("persisted subscription after reopen");
+            assert!(page.deliveries.is_empty());
+        }
+        let payload = b"fresh Event only after every rekeyed node reopened";
+        let published = reopened[0]
+            .publish(EventPublishRequest {
+                operation_key: b"after-all-reopen".to_vec(),
+                predecessor: None,
+                topic: services.topic.clone(),
+                scope: services.scope.clone(),
+                priority: Priority::Immediate,
+                logical_key: b"fresh-rekey-event".to_vec(),
+                payload: payload.to_vec(),
+                tombstone: false,
+            })
+            .expect("publish fresh epoch-two Event");
+        drop(reopened);
+        {
+            let stores = [open_store(0), open_store(1), open_store(2)];
+            let (included, _) = contact_test_pair(
+                stores[0].clone(),
+                missions[0].clone(),
+                stores[1].clone(),
+                missions[1].clone(),
+            )
+            .await;
+            assert_eq!(included.fetched, 1);
+            let (excluded, _) = contact_test_pair(
+                stores[0].clone(),
+                missions[0].clone(),
+                stores[2].clone(),
+                missions[2].clone(),
+            )
+            .await;
+            assert_eq!(excluded.fetched, 0);
+            assert_eq!(excluded.offered, 0);
+            let policy = stores[2]
+                .control_policy_snapshot()
+                .expect("excluded policy");
+            assert!(
+                stores[2]
+                    .transfer_inventory_with_policy(&policy)
+                    .expect("excluded inventory")
+                    .is_empty()
+            );
+            assert_eq!(
+                stores[2]
+                    .event_stats()
+                    .expect("excluded stats")
+                    .route_cached,
+                0
+            );
+            let source_policy = stores[0].control_policy_snapshot().expect("source policy");
+            let inventory = stores[0]
+                .transfer_inventory_with_policy(&source_policy)
+                .expect("source inventory");
+            assert_eq!(inventory.len(), 1);
+            let Some(StoredEventTransfer::Accepted(event)) = stores[0]
+                .get_transfer_with_policy(
+                    &source_policy,
+                    *inventory.iter().next().expect("source transfer"),
+                )
+                .expect("fresh source Event")
+            else {
+                panic!("source Event missing")
+            };
+            assert_eq!(event.header.key_epoch, 2);
+            let mut excluded_verifier =
+                open_replayed_verifier(&stores[2], missions[2]).expect("excluded replay");
+            assert!(excluded_verifier.verify_event(&event.sealed).is_err());
+        }
+        for index in [1, 2] {
+            let mut node = open(index);
+            let page = node
+                .poll(EventPollRequest {
+                    subscription: subscriptions[index - 1],
+                    delivery_limit: 8,
+                    scan_limit: 8,
+                })
+                .expect("public poll after contact");
+            let query = node
+                .query(EventQuery::default())
+                .expect("public query after contact");
+            if index == 1 {
+                assert_eq!(page.deliveries.len(), 1);
+                assert_eq!(page.deliveries[0].event.id, published.id);
+                assert_eq!(page.deliveries[0].event.payload, payload);
+                assert_eq!(query.items.len(), 1);
+                assert_eq!(query.items[0].id, published.id);
+                assert_eq!(query.items[0].payload, payload);
+            } else {
+                assert!(page.deliveries.is_empty());
+                assert!(query.items.is_empty());
+            }
+        }
+        for state in states {
+            fs::remove_dir_all(state).expect("cleanup rekey state");
+        }
+    }
+
+    #[tokio::test]
     async fn same_contact_rekey_uses_authenticated_peer_identity_for_member_route_and_exclusion() {
         let authority_state = root("same-contact-rekey-authority");
         let member_state = root("same-contact-rekey-member");

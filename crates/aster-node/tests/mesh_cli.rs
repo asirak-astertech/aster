@@ -2839,6 +2839,99 @@ fn four_real_processes_default_to_ping_pong_and_restart_cleanly() {
     for node in 0..4 {
         assert_default_noop_node(&root, node, node == 0 || node == 3);
     }
+    // The demo has already stopped/reopened each relay between real Iroh hops,
+    // checked exact sealed bytes, and proved its relay-only content grants.
+    // Inspect every retained relay file, not just the logical Store rows.
+    use sha2::{Digest, Sha256};
+    for relay in [1, 2] {
+        let mut pending = vec![root.join(format!("node-{relay}"))];
+        let mut files = 0;
+        while let Some(path) = pending.pop() {
+            if path.is_dir() {
+                pending.extend(
+                    std::fs::read_dir(path)
+                        .expect("relay directory")
+                        .map(|entry| entry.expect("relay entry").path()),
+                );
+            } else {
+                let bytes = std::fs::read(&path).expect("retained relay file");
+                files += 1;
+                for payload in [b"ASTER_SAMPLE_PING_V1", b"ASTER_SAMPLE_PONG_V1"] {
+                    let digest = Sha256::digest(payload);
+                    assert!(!bytes.windows(payload.len()).any(|window| window == payload));
+                    assert!(
+                        !bytes
+                            .windows(digest.len())
+                            .any(|window| window == digest.as_slice())
+                    );
+                }
+            }
+        }
+        assert!(files > 0, "relay disk scan must not be vacuous");
+    }
+
+    // Exercise the public consumer ledger on the destination's same durable
+    // Event, independently of the demo application's reaction bookkeeping.
+    use aster_node::application::{EventQuery, SelectedEventNode};
+    let state = root.join("node-3");
+    let mission = state.join("mission.unprotected-reference.bundle");
+    let mut consumer = SelectedEventNode::open_unprotected_reference(&state, &mission)
+        .expect("reopen destination consumer");
+    let items = consumer
+        .query(EventQuery::default())
+        .expect("query destination");
+    let ping = items
+        .items
+        .iter()
+        .find(|item| item.payload == b"ASTER_SAMPLE_PING_V1")
+        .expect("exact delivered Ping");
+    let subscription = consumer
+        .subscribe(EventSubscriptionRequest {
+            operation_key: b"relay-public-consumer".to_vec(),
+            topic: ping.topic.clone(),
+            scope: ping.scope.clone(),
+            include_descendant_scopes: false,
+        })
+        .expect("subscribe destination");
+    let poll = EventPollRequest {
+        subscription: subscription.id,
+        delivery_limit: 8,
+        scan_limit: 8,
+    };
+    let deliveries = consumer.poll(poll).expect("poll forwarded Events");
+    assert_eq!(deliveries.deliveries.len(), 2);
+    assert!(
+        deliveries
+            .deliveries
+            .iter()
+            .any(|delivery| delivery.event.id == ping.id && delivery.event.payload == ping.payload)
+    );
+    for delivery in deliveries.deliveries {
+        assert_eq!(
+            consumer
+                .acknowledge(subscription.id, delivery.event.id)
+                .expect("ack forwarded Event"),
+            EventAcknowledgement::Acknowledged
+        );
+    }
+    assert!(
+        consumer
+            .poll(poll)
+            .expect("poll after ack")
+            .deliveries
+            .is_empty()
+    );
+    drop(consumer);
+    let mut consumer = SelectedEventNode::open_unprotected_reference(&state, &mission)
+        .expect("reopen acknowledged consumer");
+    assert!(
+        consumer
+            .poll(poll)
+            .expect("poll persisted ack")
+            .deliveries
+            .is_empty()
+    );
+    drop(consumer);
     std::fs::remove_dir_all(&root).expect("remove successful demo root");
 }
 

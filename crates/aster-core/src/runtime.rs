@@ -4762,6 +4762,11 @@ impl<S: RecordStore, E: crate::engine::EnvelopeSealer> RuntimeBackend for Node<S
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "adapter-sdk")]
+    mod batch;
+    #[cfg(feature = "adapter-sdk")]
+    mod record;
+
     use super::*;
     use crate::blob::{BlobMetadata, BlobStoreConfig, MAX_BLOB_CHUNK_SIZE};
     use crate::crypto::{
