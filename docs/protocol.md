@@ -1112,12 +1112,14 @@ one composite carrier message:
 `protected_header` is a mission-protected record whose plaintext is exactly the
 canonical fixed 89-byte `StreamDataV1` header through `extent_len`; its encoded
 length is nonzero and bounded at 2,048 bytes. The adjacent extent is not wrapped
-in a second mission AEAD. It is already canonical source-encrypted Blob-pack
-segment material whose source AEAD binds its stream, open digest, epoch,
-segment index, offsets, declared lengths, and ciphertext. The receiver first
+in a second mission AEAD. It is exactly one length-prefixed canonical,
+source-encrypted Blob-pack segment, bounded at 1,048,710 bytes, whose source
+AEAD binds its stream, open digest, epoch, segment index, offsets, declared
+lengths, and ciphertext. The receiver first
 authenticates the protected header, requires the adjacent extent length to equal
-the authenticated `extent_len`, and then verifies the source segment before it
-can advance durable credit. A changed, substituted, truncated, replayed, or
+the authenticated `extent_len`, rejects fragmented or coalesced pack records,
+and then verifies that segment before it can advance durable credit. A changed,
+substituted, truncated, replayed, or
 cross-stream extent therefore fails source authentication or canonical pack
 validation; carrier integrity is not used as the content trust boundary. This
 split avoids encrypting and copying every large extent through two independent

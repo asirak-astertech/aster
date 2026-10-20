@@ -2,8 +2,13 @@ use std::fmt::{self, Display, Formatter};
 
 const MAGIC: &[u8; 4] = b"ASM\x01";
 const COMPOSITE_DATA_MAGIC: &[u8; 4] = b"ASD1";
-pub(crate) const MAX_STREAM_EXTENT_BYTES: usize = 1_048_576;
-pub(crate) const PROFILE5_EXTENT_BYTES: usize = 256 * 1024;
+/// One profile-5 data extent is one complete length-prefixed canonical Blob
+/// pack record. Keeping the transport and cryptographic partition boundaries
+/// identical avoids slicing, reassembly, and delayed source authentication.
+pub(crate) const PROFILE5_EXTENT_BYTES: usize = 4
+    + aster_mesh::BLOB_STREAM_SEGMENT_BYTES
+    + aster_mesh::BLOB_STREAM_SEGMENT_ENCODED_OVERHEAD_BYTES;
+pub(crate) const MAX_STREAM_EXTENT_BYTES: usize = PROFILE5_EXTENT_BYTES;
 pub(crate) const MAX_STREAM_CHECKPOINT_BATCH_BYTES: u32 = 8 * 1_048_576;
 pub(crate) const STREAM_DATA_FIXED_BYTES: usize = 89;
 pub(crate) const MAX_PROTECTED_STREAM_DATA_HEADER_BYTES: usize = 2 * 1024;
@@ -22,7 +27,7 @@ pub(crate) fn profile5_attempt_bounds(bytes: u64) -> Result<(usize, usize), Stre
         .and_then(|value| {
             usize::try_from(extents)
                 .ok()
-                .and_then(|count| count.checked_mul(128))
+                .and_then(|count| count.checked_mul(192))
                 .and_then(|overhead| value.checked_add(overhead))
         })
         .and_then(|value| value.checked_add(MAX_STREAM_SEMANTIC_COMMITMENT_BYTES + 4096))

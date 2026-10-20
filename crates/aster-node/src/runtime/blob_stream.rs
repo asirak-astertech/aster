@@ -314,16 +314,12 @@ pub fn expected_pack_wire_len(plaintext_len: u64) -> Result<u64, String> {
 
 struct PackExtentSource {
     reader: BlobPackReader,
-    record: Vec<u8>,
-    cursor: usize,
 }
 
 impl PackExtentSource {
     fn new(root: &PackAccess<'_>, open: &BlobStreamOpen) -> Result<Self, String> {
         Ok(Self {
             reader: root.reader(open)?,
-            record: Vec::new(),
-            cursor: 0,
         })
     }
 
@@ -355,27 +351,14 @@ impl PackExtentSource {
         };
         Ok(Self {
             reader: root.reader_at(open, next_index, wire_offset)?,
-            record: Vec::new(),
-            cursor: 0,
         })
     }
 
     fn next_extent(&mut self) -> Result<Option<Vec<u8>>, String> {
-        if self.cursor == self.record.len() {
-            let Some(record) = self
-                .reader
-                .next_record()
-                .map_err(|error| failure("read source record", error))?
-            else {
-                return Ok(None);
-            };
-            self.record = record.into_bytes();
-            self.cursor = 0;
-        }
-        let end = self.record.len().min(self.cursor + PROFILE5_EXTENT_BYTES);
-        let extent = self.record[self.cursor..end].to_vec();
-        self.cursor = end;
-        Ok(Some(extent))
+        self.reader
+            .next_record()
+            .map(|record| record.map(|record| record.into_bytes()))
+            .map_err(|error| failure("read source record", error))
     }
 }
 
@@ -618,16 +601,14 @@ async fn send_completed_pack_inner(
     })
 }
 
-struct RecordParser {
-    buffer: Vec<u8>,
+struct RecordPartitioner {
     next_index: u64,
     consumed: u64,
 }
 
-impl RecordParser {
+impl RecordPartitioner {
     fn new(next_index: u64, consumed: u64) -> Self {
         Self {
-            buffer: Vec::new(),
             next_index,
             consumed,
         }
@@ -638,48 +619,39 @@ impl RecordParser {
         bytes: Vec<u8>,
         sender: &mpsc::Sender<Result<StreamPartition, PipelineError>>,
     ) -> Result<(), String> {
-        if self.buffer.is_empty() {
-            self.buffer = bytes;
-        } else {
-            self.buffer.extend_from_slice(&bytes);
+        if bytes.len() < 4 {
+            return Err("Blob network extent is shorter than its record length".into());
         }
-        loop {
-            if self.buffer.len() < 4 {
-                return Ok(());
-            }
-            let len =
-                u32::from_be_bytes(self.buffer[..4].try_into().expect("record length")) as usize;
-            if len == 0 || len > MAX_RECORD_BYTES {
-                return Err("Blob network record length is out of bounds".into());
-            }
-            let record_len = 4usize.checked_add(len).ok_or("record length overflow")?;
-            if self.buffer.len() < record_len {
-                return Ok(());
-            }
-            let wire_end = self
-                .consumed
-                .checked_add(record_len as u64)
-                .ok_or("wire offset overflow")?;
-            let remainder = self.buffer.split_off(record_len);
-            let record = std::mem::replace(&mut self.buffer, remainder);
-            sender
-                .send(Ok(StreamPartition::new_at(
-                    self.next_index,
-                    wire_end,
-                    record,
-                )))
-                .await
-                .map_err(|_| "verification pipeline closed")?;
-            self.next_index += 1;
-            self.consumed = wire_end;
+        let len = u32::from_be_bytes(bytes[..4].try_into().expect("record length")) as usize;
+        if len == 0 || len > MAX_RECORD_BYTES {
+            return Err("Blob network record length is out of bounds".into());
         }
+        let record_len = 4usize.checked_add(len).ok_or("record length overflow")?;
+        if bytes.len() != record_len {
+            return Err("Blob network extent is not exactly one canonical record".into());
+        }
+        let wire_end = self
+            .consumed
+            .checked_add(record_len as u64)
+            .ok_or("wire offset overflow")?;
+        sender
+            .send(Ok(StreamPartition::new_at(
+                self.next_index,
+                wire_end,
+                bytes,
+            )))
+            .await
+            .map_err(|_| "verification pipeline closed")?;
+        self.next_index += 1;
+        self.consumed = wire_end;
+        Ok(())
     }
 
     fn finish(&self, expected: u64) -> Result<(), String> {
-        if self.buffer.is_empty() && self.consumed == expected {
+        if self.consumed == expected {
             Ok(())
         } else {
-            Err("network stream ended with an incomplete Blob record".into())
+            Err("network stream ended before the complete Blob pack".into())
         }
     }
 }
@@ -942,7 +914,7 @@ async fn receive_completed_pack_inner(
         Ok::<_, PipelineError>((report, roots))
     });
 
-    let mut parser = RecordParser::new(resume.next_segment_index(), durable_wire);
+    let mut partitioner = RecordPartitioner::new(resume.next_segment_index(), durable_wire);
     let mut received = durable_wire;
     let mut durable_wire = durable_wire;
     let mut checkpoints = 0_u64;
@@ -960,10 +932,10 @@ async fn receive_completed_pack_inner(
         else {
             return Err("receiver did not accept new data".into());
         };
-        parser.push(data.bytes, &partition_tx).await?;
+        partitioner.push(data.bytes, &partition_tx).await?;
         received = through;
-        if parser.consumed - durable_wire >= u64::from(MAX_STREAM_CHECKPOINT_BATCH_BYTES)
-            || parser.consumed == wire_len
+        if partitioner.consumed - durable_wire >= u64::from(MAX_STREAM_CHECKPOINT_BATCH_BYTES)
+            || partitioner.consumed == wire_len
         {
             let progress = durable_rx
                 .recv()
@@ -995,7 +967,7 @@ async fn receive_completed_pack_inner(
             checkpoints += 1;
         }
     }
-    parser.finish(wire_len)?;
+    partitioner.finish(wire_len)?;
     drop(partition_tx);
     let (pipeline, roots) = pipeline_task
         .await
@@ -1222,7 +1194,6 @@ mod tests {
         const TOTAL: u64 = 256 * 1024 * 1024;
         let (mut sender, mut receiver, profile_digest) = mission_pair();
         let nonce = [0xd1; 32];
-        let payload = vec![0xd2; PROFILE5_EXTENT_BYTES];
         let mut sender_codec = MissionBlobRecordCodec {
             mission: &mut sender,
             profile_digest,
@@ -1239,16 +1210,18 @@ mod tests {
         let mut offset = 0_u64;
         let mut sequence = 0_u64;
         while offset < TOTAL {
+            let extent_len =
+                usize::try_from((TOTAL - offset).min(PROFILE5_EXTENT_BYTES as u64)).unwrap();
             let frame = StreamFrame::Data(crate::stream_transfer::StreamDataV1 {
                 transfer_id: [0xd3; 32],
                 attempt_nonce: nonce,
                 sequence,
                 offset,
-                bytes: payload.clone(),
+                bytes: vec![0xd2; extent_len],
             });
             let protected = sender_codec.encode(frame).unwrap();
             std::hint::black_box(receiver_codec.decode(&protected).unwrap());
-            offset += PROFILE5_EXTENT_BYTES as u64;
+            offset += extent_len as u64;
             sequence += 1;
         }
         let elapsed = started.elapsed();
@@ -1340,6 +1313,73 @@ mod tests {
             [0x52; 32],
         )
         .expect("open")
+    }
+
+    #[tokio::test]
+    async fn pack_source_emits_one_canonical_record_per_transport_extent() {
+        let source_root = TempRoot::new("record-extents");
+        let total_len = 2 * BLOB_STREAM_SEGMENT_BYTES + 17;
+        let open = open(total_len as u64);
+        let key = [0x63; 32];
+        let nonce = [0x73; 12];
+        let limits = PipelineLimits::new(2, 4, 5 * 1024 * 1024, 4).expect("limits");
+        let published = publish_blob_stream(
+            std::io::Cursor::new(vec![0x5a; total_len]),
+            &open,
+            BlobStreamSegmentSealer::from_test_key(
+                *open.stream_id().as_bytes(),
+                open.digest(),
+                open.content_epoch(),
+                key,
+                nonce,
+            ),
+            &source_root.0,
+            limits,
+        )
+        .await
+        .expect("publish");
+        let opener = BlobStreamSegmentOpener::from_test_key(
+            *open.stream_id().as_bytes(),
+            open.digest(),
+            open.content_epoch(),
+            key,
+            nonce,
+        );
+        let mut source =
+            PackExtentSource::new(&PackAccess::Path(&source_root.0), &open).expect("pack source");
+        let mut extents = Vec::new();
+        while let Some(extent) = source.next_extent().expect("next extent") {
+            let declared = u32::from_be_bytes(extent[..4].try_into().expect("record length"));
+            assert_eq!(extent.len(), declared as usize + 4);
+            opener
+                .open_encoded(&extent[4..])
+                .expect("independently authenticated extent");
+            extents.push(extent);
+        }
+
+        assert_eq!(extents.len() as u64, published.segment_count);
+        assert_eq!(extents[0].len(), PROFILE5_EXTENT_BYTES);
+        assert_eq!(extents[1].len(), PROFILE5_EXTENT_BYTES);
+    }
+
+    #[tokio::test]
+    async fn record_partitioner_rejects_fragmented_or_coalesced_transport_extents() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let mut fragmented = RecordPartitioner::new(0, 0);
+        assert!(
+            fragmented
+                .push(vec![0, 0, 0, 3, 0xa1, 0xa2], &sender)
+                .await
+                .is_err()
+        );
+
+        let mut coalesced = RecordPartitioner::new(0, 0);
+        assert!(
+            coalesced
+                .push(vec![0, 0, 0, 1, 0xa1, 0, 0, 0, 1, 0xa2], &sender)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

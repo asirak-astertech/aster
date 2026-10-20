@@ -63,11 +63,14 @@ as a non-transport bottleneck on the local x86 host.
 
 Semantic v9/profile 5 now uses a composite record: the mission layer protects
 the fixed canonical StreamData header, while the adjacent canonical pack
-segment retains its existing end-to-end source AEAD. The same optimized
-256-MiB sender-encode plus receiver-decode measurement completed in 0.017359
-seconds, or 14,747.147 MiB/s. This is approximately 429 times the rejected
-full-envelope rate and includes bounded frame construction and receiver body
-materialization. It establishes only that profile-5 record processing is no
+segment retains its existing end-to-end source AEAD. After aligning each
+StreamData extent with one complete canonical pack record, the same optimized
+256-MiB sender-encode plus receiver-decode measurement used 256 extents and
+completed in 0.014036 seconds, or 18,238.555 MiB/s. This is approximately 531
+times the rejected full-envelope rate and includes bounded frame construction
+and receiver body materialization. The aligned boundary also removes sender
+slicing and receiver reassembly from the integrated path. This establishes only
+that profile-5 record processing is no
 longer the local throughput ceiling; it excludes transport, pack I/O, source
 segment verification, checkpoints, and CM4 effects.
 

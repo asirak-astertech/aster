@@ -317,8 +317,11 @@ bounded plaintext frames.
 For semantic-v9/profile-5 replication, the network record operator protects
 only the fixed canonical StreamData header with the mission record layer. The
 already source-encrypted, independently authenticated pack segment remains an
-adjacent body in the same bounded carrier message. The receiver authenticates
-the header and exact declared body length before the segment enters the
+adjacent body in the same bounded carrier message. One StreamData record carries
+exactly one length-prefixed pack segment; transport, map, Merkle-reduction, and
+checkpoint partitions therefore share one boundary without sender slicing or
+receiver reassembly. The receiver authenticates the header and exact declared
+body length before the segment enters the
 verification map. It does not decrypt and re-encrypt the segment through a
 second full-payload mission envelope. Control records remain wholly
 mission-protected. This preserves the zero-trust content boundary at the source
