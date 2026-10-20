@@ -20,11 +20,43 @@ python3 tools/blob_benchmark.py \
   --output /durable/new-results --state /scratch/new-state
 ```
 
-The campaign is exactly one run per variant at 16 KiB, 64 KiB, 256 KiB, and
-1 MiB: eight real runs, alternating baseline then feature at each size. A
-300-second receive bound applies per run, plus an outer 180-second allowance.
-`--sizes` restricts the campaign without adding repetitions. Finish all builds
-and tests before timing; do not edit measured sources during the campaign.
+The default campaign is exactly one run per variant at 16 KiB, 64 KiB, 256
+KiB, and 1 MiB: eight real runs, alternating baseline then feature at each
+size. A 300-second receive bound applies per run, plus an outer 180-second
+allowance. `--sizes` restricts the selected campaign without adding
+repetitions. Finish all builds and tests before timing; do not edit measured
+sources during the campaign. The selected campaign name is retained in
+`metadata.json` together with the exact cases and source/binary identities.
+
+Select the explicit 100 MiB scale campaign with:
+
+```sh
+python3 tools/blob_benchmark.py \
+  --campaign scale \
+  --variant baseline /absolute/baseline /absolute/baseline-binary \
+  --variant stream /absolute/feature /absolute/feature-binary \
+  --output /durable/new-scale-results --state /scratch/new-scale-state
+```
+
+The current production network admission limit is 64 MiB. Therefore, the 100
+MiB campaign currently qualifies the exact resource-limit rejection and its
+retained receipt; it is not evidence of a successful 100 MiB network transfer.
+A successful above-limit network campaign requires a separately reviewed
+production-limit change.
+
+The core streaming pipeline retains its original generated 101 MiB + 123 byte
+workload as an ignored qualification test. Run only that workload explicitly:
+
+```sh
+cargo nextest run --locked -p aster-core --all-features \
+  --run-ignored ignored-only \
+  -E 'test(qualify_generated_100mb_blob_pipeline)'
+```
+
+The default correctness test uses eight full 64 KiB chunks plus a partial
+chunk. It still proves seven-chunk interruption, bounded buffers, exact resume,
+deduplication, manifest and full-content verification, tail and cross-chunk
+ranges, and tamper rejection without allocating a production-scale fixture.
 
 ## Timing and verification boundaries
 
