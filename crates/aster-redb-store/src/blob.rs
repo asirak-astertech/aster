@@ -45,8 +45,8 @@ use super::*;
 pub use depot::{AuthenticatedBlobReadDepot, BlobDepot, BlobDepotCompletion};
 pub use lease::{BlobLeaseLimitError, BlobLeaseLimits};
 pub use stream::{
-    BlobStreamConflictEvidence, BlobStreamPromotion, BlobStreamPublication, BlobStreamReservation,
-    BlobStreamReservationRequest, BlobStreamResume, BlobStreamSource,
+    BlobStreamConflictEvidence, BlobStreamInspection, BlobStreamPromotion, BlobStreamPublication,
+    BlobStreamReservation, BlobStreamReservationRequest, BlobStreamResume, BlobStreamSource,
 };
 
 pub(crate) const BLOB_PUBLICATIONS: TableDefinition<&[u8], &[u8]> =
@@ -93,6 +93,8 @@ pub(crate) const BLOB_STREAM_CONFLICTS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.blob-stream-conflicts.v2");
 pub(crate) const BLOB_STREAM_VARIANTS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.blob-stream-variants.v2");
+pub(crate) const BLOB_STREAM_RETIREMENTS: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("aster.blob-stream-retirements.v2");
 
 pub(crate) const BLOB_ITEM_COUNT: &str = "semantic_blob_item_count";
 pub(crate) const BLOB_TOTAL_BYTES: &str = "semantic_blob_total_bytes";
@@ -14849,6 +14851,13 @@ pub(crate) fn blob_schema_present_write(
         && existing.contains(BLOB_STREAM_PUBLICATIONS.name())
         && existing.contains(BLOB_STREAM_CONFLICTS.name())
         && !existing.contains(BLOB_STREAM_VARIANTS.name());
+    let stream_variant_predecessor = stream_present == 5
+        && existing.contains(BLOB_STREAM_RESERVATIONS.name())
+        && existing.contains(BLOB_STREAM_OPERATIONS.name())
+        && existing.contains(BLOB_STREAM_PUBLICATIONS.name())
+        && existing.contains(BLOB_STREAM_CONFLICTS.name())
+        && existing.contains(BLOB_STREAM_VARIANTS.name())
+        && !existing.contains(BLOB_STREAM_RETIREMENTS.name());
     let metadata = write.open_table(METADATA)?;
     let global = blob_global_metadata_fields();
     let global_present = global
@@ -14870,7 +14879,8 @@ pub(crate) fn blob_schema_present_write(
         || !(stream_present == 0
             || stream_present == stream_tables.len()
             || stream_legacy_predecessor
-            || stream_conflict_predecessor)
+            || stream_conflict_predecessor
+            || stream_variant_predecessor)
         || global_present.iter().any(|present| !present)
     {
         return Err(blob_error(BlobStoreError::SchemaInvariant(
@@ -14886,9 +14896,13 @@ pub(crate) fn blob_schema_present_write(
         let _ = write.open_table(BLOB_STREAM_CONFLICTS)?;
         let _ = write.open_table(BLOB_STREAM_VARIANTS)?;
         stream::migrate_blob_stream_variant_index_write(write)?;
+        let _ = write.open_table(BLOB_STREAM_RETIREMENTS)?;
     } else if stream_conflict_predecessor {
         let _ = write.open_table(BLOB_STREAM_VARIANTS)?;
         stream::migrate_blob_stream_variant_index_write(write)?;
+        let _ = write.open_table(BLOB_STREAM_RETIREMENTS)?;
+    } else if stream_variant_predecessor {
+        let _ = write.open_table(BLOB_STREAM_RETIREMENTS)?;
     }
     Ok(true)
 }
@@ -16085,6 +16099,7 @@ fn initialize_blob_stream_schema(write: &redb::WriteTransaction) -> Result<(), S
     let _ = write.open_table(BLOB_STREAM_PUBLICATIONS)?;
     let _ = write.open_table(BLOB_STREAM_CONFLICTS)?;
     let _ = write.open_table(BLOB_STREAM_VARIANTS)?;
+    let _ = write.open_table(BLOB_STREAM_RETIREMENTS)?;
     Ok(())
 }
 
@@ -16127,13 +16142,14 @@ fn network_blob_table_names() -> [&'static str; 4] {
     ]
 }
 
-fn stream_blob_table_names() -> [&'static str; 5] {
+fn stream_blob_table_names() -> [&'static str; 6] {
     [
         BLOB_STREAM_RESERVATIONS.name(),
         BLOB_STREAM_OPERATIONS.name(),
         BLOB_STREAM_PUBLICATIONS.name(),
         BLOB_STREAM_CONFLICTS.name(),
         BLOB_STREAM_VARIANTS.name(),
+        BLOB_STREAM_RETIREMENTS.name(),
     ]
 }
 

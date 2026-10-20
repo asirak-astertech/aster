@@ -275,7 +275,7 @@ pub(crate) fn deletion_manifest_resume_position(variant: super::BlobVariantId) -
 }
 
 const RETIREMENT_AGE_VERSION: u8 = 1;
-const RETIREMENT_AGE_ENCODED_BYTES: usize = 43;
+pub(crate) const RETIREMENT_AGE_ENCODED_BYTES: usize = 43;
 const RETIRED_PUBLICATION_STATE_BYTES: usize = 2 + 8 + RETIREMENT_AGE_ENCODED_BYTES;
 
 /// Stable reason retained after one Blob publication leaves live state.
@@ -1442,7 +1442,7 @@ impl RetirementAge {
         self.retain_for_ms
     }
 
-    fn encode(self) -> [u8; RETIREMENT_AGE_ENCODED_BYTES] {
+    pub(crate) fn encode(self) -> [u8; RETIREMENT_AGE_ENCODED_BYTES] {
         let mut encoded = [0u8; RETIREMENT_AGE_ENCODED_BYTES];
         encoded[0] = RETIREMENT_AGE_VERSION;
         encoded[1..9].copy_from_slice(&self.retain_for_ms.to_be_bytes());
@@ -1456,7 +1456,7 @@ impl RetirementAge {
         encoded
     }
 
-    fn decode(bytes: &[u8]) -> Result<Self, BlobStoreError> {
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, BlobStoreError> {
         let bytes: [u8; RETIREMENT_AGE_ENCODED_BYTES] = bytes.try_into().map_err(|_| {
             BlobStoreError::SchemaInvariant("Blob retirement age has an invalid canonical length")
         })?;

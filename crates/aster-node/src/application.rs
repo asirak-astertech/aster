@@ -68,14 +68,15 @@ mod record;
 mod state;
 pub(crate) use blob::SelectedBlobCommand;
 pub use blob::{
-    BLOB_DELIVERY_TOKEN_BYTES, BlobAcknowledgement, BlobDelivery, BlobDeliveryItem,
-    BlobDeliveryPage, BlobDeliveryStatus, BlobDeliveryToken, BlobDepotLimits,
+    BLOB_DELIVERY_TOKEN_BYTES, BlobAcknowledgement, BlobCapacityStatus, BlobDelivery,
+    BlobDeliveryItem, BlobDeliveryPage, BlobDeliveryStatus, BlobDeliveryToken, BlobDepotLimits,
     BlobGcFailureCategory, BlobGcRetryState, BlobGcStatus, BlobId, BlobPollRequest,
-    BlobPublicationId, BlobPublishOptions, BlobPublishRequest, BlobPublishResult, BlobReadPage,
+    BlobPublicationId, BlobPublicationInspection, BlobPublicationInspectionRequest,
+    BlobPublicationPhase, BlobPublishOptions, BlobPublishRequest, BlobPublishResult, BlobReadPage,
     BlobReadPageRequest, BlobReadRequest, BlobReadResult, BlobRetirementDelivery,
-    BlobRetirementReason, BlobSubscription, BlobSubscriptionId, BlobSubscriptionRequest,
-    BlobTransferPhase, BlobTransferStatus, BlobUnsubscribe, MAX_SELECTED_BLOB_DELIVERIES,
-    MAX_SELECTED_BLOB_PAGE_BYTES, MAX_SELECTED_BLOB_STREAM_BYTES,
+    BlobRetirementReason, BlobStreamPublicationId, BlobSubscription, BlobSubscriptionId,
+    BlobSubscriptionRequest, BlobTransferPhase, BlobTransferStatus, BlobUnsubscribe,
+    MAX_SELECTED_BLOB_DELIVERIES, MAX_SELECTED_BLOB_PAGE_BYTES, MAX_SELECTED_BLOB_STREAM_BYTES,
     MAX_SELECTED_BLOB_SUBSCRIPTION_SCAN, MAX_SELECTED_LIVE_BLOB_BYTES,
     MAX_SELECTED_LIVE_BLOB_CHUNKS, PendingBlobTransferStatus, SelectedBlobHandle, SelectedBlobNode,
     SelectedBlobOptions,

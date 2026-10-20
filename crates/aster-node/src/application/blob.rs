@@ -37,11 +37,11 @@ use aster_redb_store::{
     BlobDeliveryAck as StoreBlobDeliveryAck, BlobDeliveryToken as StoreBlobDeliveryToken,
     BlobDepotCompletion, BlobOperationKey, BlobOperationRequest, BlobPublicationDisposition,
     BlobPublicationIntent, BlobReadPlan, BlobSemanticId, BlobSourceProjection, BlobSourceRetention,
-    BlobStoreError, BlobStreamPublication, BlobStreamReservationRequest, BlobStreamSource,
-    BlobSubscriptionId as StoreBlobSubscriptionId, BlobSubscriptionKey,
-    BlobSubscriptionPollSelection, BlobSubscriptionRemoveOutcome, BlobSubscriptionSpec,
-    BlobTransferStatusSnapshot as StoreBlobTransferStatusSnapshot, BlobVariantId,
-    ControlPolicySnapshot, ControlTransferId, MAX_BLOB_OPERATION_KEY_BYTES,
+    BlobStoreError, BlobStoreStats, BlobStreamInspection, BlobStreamPublication,
+    BlobStreamReservationRequest, BlobStreamSource, BlobSubscriptionId as StoreBlobSubscriptionId,
+    BlobSubscriptionKey, BlobSubscriptionPollSelection, BlobSubscriptionRemoveOutcome,
+    BlobSubscriptionSpec, BlobTransferStatusSnapshot as StoreBlobTransferStatusSnapshot,
+    BlobVariantId, ControlPolicySnapshot, ControlTransferId, MAX_BLOB_OPERATION_KEY_BYTES,
     MAX_BLOB_POLL_DELIVERIES, MAX_BLOB_SUBSCRIPTION_SCAN, MAX_NETWORK_BLOB_BYTES,
     MAX_NETWORK_BLOB_CHUNKS, Store, StoreError, StoreLimits, StoredBlob,
 };
@@ -368,6 +368,49 @@ impl fmt::Display for BlobPublicationId {
     }
 }
 
+/// Transport-neutral authenticated identity of one profile-5 Blob publication.
+///
+/// This identity exists before data byte zero and tracks one publication through
+/// interrupted attempts. It is distinct from both legacy [`BlobPublicationId`]
+/// and the content-derived [`BlobId`].
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct BlobStreamPublicationId([u8; 32]);
+
+impl BlobStreamPublicationId {
+    pub fn from_bytes(bytes: [u8; 32]) -> Result<Self, ApplicationError> {
+        BlobPublicationStreamId::from_bytes(bytes)
+            .map(Self::from_core)
+            .map_err(|_| {
+                ApplicationError::new(
+                    ApplicationErrorKind::InvalidRequest,
+                    "blob publication identity",
+                )
+            })
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    fn from_core(id: BlobPublicationStreamId) -> Self {
+        Self(*id.as_bytes())
+    }
+
+    fn into_core(self) -> BlobPublicationStreamId {
+        BlobPublicationStreamId::from_bytes(self.0)
+            .expect("validated Blob stream publication identity")
+    }
+}
+
+impl fmt::Display for BlobStreamPublicationId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
 /// Stable mission-local identity of one durable Blob metadata subscription.
 ///
 /// The identifier grants no route, content, carrier, or network interest
@@ -662,6 +705,186 @@ pub struct BlobTransferStatus {
     pub pending: Vec<PendingBlobTransferStatus>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlobPublicationInspectionRequest {
+    pub publication_id: BlobStreamPublicationId,
+    pub topic: Topic,
+    pub scope: Scope,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlobPublicationPhase {
+    Missing,
+    AwaitingData,
+    Receiving,
+    ReadyToFinalize,
+    Available,
+    ExpiredOrRetired,
+}
+
+/// One bounded receiver-local profile-5 publication snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlobPublicationInspection {
+    pub publication_id: BlobStreamPublicationId,
+    pub phase: BlobPublicationPhase,
+    pub plaintext_total_bytes: u64,
+    pub durable_plaintext_bytes: u64,
+    pub transfer_total_bytes: u64,
+    pub durable_transfer_bytes: u64,
+    pub total_units: u64,
+    pub durable_units: u64,
+    pub blob_id: Option<BlobId>,
+}
+
+/// Local durable Blob capacity observations. These counters do not reserve space.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BlobCapacityStatus {
+    pub reserved_bytes: u64,
+    pub byte_limit: u64,
+    pub variants: u64,
+    pub variant_limit: u64,
+    pub expected_chunks: u64,
+    pub chunk_limit: u64,
+    pub pending_sources: u64,
+    pub network_staging_bytes: u64,
+    pub bytes_exhausted: bool,
+    pub variants_exhausted: bool,
+    pub chunks_exhausted: bool,
+}
+
+fn map_blob_capacity_status(
+    stats: BlobStoreStats,
+    limits: BlobDepotLimits,
+) -> Result<BlobCapacityStatus, ApplicationError> {
+    if stats.reserved_file_bytes > limits.max_bytes()
+        || stats.committed_chunks > limits.max_chunks()
+        || stats.variants > limits.max_variants()
+    {
+        return Err(ApplicationError::new(
+            ApplicationErrorKind::Integrity,
+            "blob capacity status",
+        ));
+    }
+    Ok(BlobCapacityStatus {
+        reserved_bytes: stats.reserved_file_bytes,
+        byte_limit: limits.max_bytes(),
+        variants: stats.variants,
+        variant_limit: limits.max_variants(),
+        expected_chunks: stats.committed_chunks,
+        chunk_limit: limits.max_chunks(),
+        pending_sources: stats.pending_sources,
+        network_staging_bytes: stats.network_staging_bytes,
+        bytes_exhausted: stats.reserved_file_bytes >= limits.max_bytes(),
+        variants_exhausted: stats.variants >= limits.max_variants(),
+        chunks_exhausted: stats.committed_chunks >= limits.max_chunks(),
+    })
+}
+
+fn map_publication_inspection(
+    publication_id: BlobStreamPublicationId,
+    inspection: BlobStreamInspection,
+) -> BlobPublicationInspection {
+    let (
+        phase,
+        plaintext_total_bytes,
+        durable_plaintext_bytes,
+        transfer_total_bytes,
+        durable_transfer_bytes,
+        total_units,
+        durable_units,
+        blob_id,
+    ) = match inspection {
+        BlobStreamInspection::Missing => (BlobPublicationPhase::Missing, 0, 0, 0, 0, 0, 0, None),
+        BlobStreamInspection::AwaitingData {
+            plaintext_total_bytes,
+            durable_plaintext_bytes,
+            transfer_total_bytes,
+            durable_transfer_bytes,
+            total_units,
+            durable_units,
+        } => (
+            BlobPublicationPhase::AwaitingData,
+            plaintext_total_bytes,
+            durable_plaintext_bytes,
+            transfer_total_bytes,
+            durable_transfer_bytes,
+            total_units,
+            durable_units,
+            None,
+        ),
+        BlobStreamInspection::Receiving {
+            plaintext_total_bytes,
+            durable_plaintext_bytes,
+            transfer_total_bytes,
+            durable_transfer_bytes,
+            total_units,
+            durable_units,
+        } => (
+            BlobPublicationPhase::Receiving,
+            plaintext_total_bytes,
+            durable_plaintext_bytes,
+            transfer_total_bytes,
+            durable_transfer_bytes,
+            total_units,
+            durable_units,
+            None,
+        ),
+        BlobStreamInspection::ReadyToFinalize {
+            plaintext_total_bytes,
+            durable_plaintext_bytes,
+            transfer_total_bytes,
+            durable_transfer_bytes,
+            total_units,
+            durable_units,
+        } => (
+            BlobPublicationPhase::ReadyToFinalize,
+            plaintext_total_bytes,
+            durable_plaintext_bytes,
+            transfer_total_bytes,
+            durable_transfer_bytes,
+            total_units,
+            durable_units,
+            None,
+        ),
+        BlobStreamInspection::Available {
+            blob_id,
+            plaintext_total_bytes,
+            transfer_total_bytes,
+            total_units,
+        } => (
+            BlobPublicationPhase::Available,
+            plaintext_total_bytes,
+            plaintext_total_bytes,
+            transfer_total_bytes,
+            transfer_total_bytes,
+            total_units,
+            total_units,
+            Some(BlobId::from_core(blob_id)),
+        ),
+        BlobStreamInspection::ExpiredOrRetired => (
+            BlobPublicationPhase::ExpiredOrRetired,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            None,
+        ),
+    };
+    BlobPublicationInspection {
+        publication_id,
+        phase,
+        plaintext_total_bytes,
+        durable_plaintext_bytes,
+        transfer_total_bytes,
+        durable_transfer_bytes,
+        total_units,
+        durable_units,
+        blob_id,
+    }
+}
+
 fn blob_transfer_phase(
     total_carriers: u64,
     durable_carriers: u64,
@@ -752,6 +975,8 @@ impl BlobPublishOptions {
 /// Successful Blob publication without manifest or provider details.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BlobPublishResult {
+    /// Present for semantic-v9/profile-5 streaming publications only.
+    pub publication_id: Option<BlobStreamPublicationId>,
     pub id: BlobId,
     pub publisher: NodeId,
     pub publisher_counter: u64,
@@ -1154,6 +1379,29 @@ impl SelectedBlobHandle {
         .await
     }
 
+    pub async fn inspect_publication(
+        &self,
+        request: BlobPublicationInspectionRequest,
+    ) -> Result<BlobPublicationInspection, ApplicationError> {
+        let (response, received) = oneshot::channel();
+        self.send(
+            SelectedBlobCommand::InspectPublication { request, response },
+            received,
+            "blob publication status",
+        )
+        .await
+    }
+
+    pub async fn capacity_status(&self) -> Result<BlobCapacityStatus, ApplicationError> {
+        let (response, received) = oneshot::channel();
+        self.send(
+            SelectedBlobCommand::CapacityStatus { response },
+            received,
+            "blob capacity status",
+        )
+        .await
+    }
+
     async fn send<T>(
         &self,
         command: SelectedBlobCommand,
@@ -1220,6 +1468,13 @@ pub(crate) enum SelectedBlobCommand {
     TransferStatus {
         response: oneshot::Sender<Result<BlobTransferStatus, ApplicationError>>,
     },
+    InspectPublication {
+        request: BlobPublicationInspectionRequest,
+        response: oneshot::Sender<Result<BlobPublicationInspection, ApplicationError>>,
+    },
+    CapacityStatus {
+        response: oneshot::Sender<Result<BlobCapacityStatus, ApplicationError>>,
+    },
 }
 
 impl SelectedBlobCommand {
@@ -1257,6 +1512,12 @@ impl SelectedBlobCommand {
             }
             Self::TransferStatus { response } => {
                 _ = response.send(Err(actor_unavailable("blob transfer status")));
+            }
+            Self::InspectPublication { response, .. } => {
+                _ = response.send(Err(actor_unavailable("blob publication status")));
+            }
+            Self::CapacityStatus { response } => {
+                _ = response.send(Err(actor_unavailable("blob capacity status")));
             }
         }
     }
@@ -1327,6 +1588,18 @@ impl SelectedBlobCommand {
                 _ = response.send(Err(ApplicationError::new(
                     ApplicationErrorKind::ResourceLimit,
                     "blob transfer status",
+                )));
+            }
+            Self::InspectPublication { response, .. } => {
+                _ = response.send(Err(ApplicationError::new(
+                    ApplicationErrorKind::ResourceLimit,
+                    "blob publication status",
+                )));
+            }
+            Self::CapacityStatus { response } => {
+                _ = response.send(Err(ApplicationError::new(
+                    ApplicationErrorKind::ResourceLimit,
+                    "blob capacity status",
                 )));
             }
         }
@@ -1773,6 +2046,26 @@ impl SelectedBlobNode {
                     "live Blob transfer status failed a durable/network invariant",
                 )
             }
+            SelectedBlobCommand::InspectPublication { request, response } => {
+                let result = self.inspect_publication(request);
+                finish_live_blob_ledger_command(
+                    result,
+                    response,
+                    admission,
+                    "blob publication status",
+                    "live Blob publication status failed a durable invariant",
+                )
+            }
+            SelectedBlobCommand::CapacityStatus { response } => {
+                let result = self.capacity_status();
+                finish_live_blob_ledger_command(
+                    result,
+                    response,
+                    admission,
+                    "blob capacity status",
+                    "live Blob capacity status failed a durable invariant",
+                )
+            }
         }
     }
 
@@ -2131,6 +2424,7 @@ impl SelectedBlobNode {
             .promote_blob_stream_with_policy(&policy, &stream.reservation, &commitment)
             .map_err(|error| application_error("blob stream finish", error.into()))?;
         Ok(BlobPublishResult {
+            publication_id: Some(BlobStreamPublicationId::from_core(promotion.stream_id())),
             id: BlobId::from_core(promotion.blob_id()),
             publisher: self.identity(),
             publisher_counter: stream.publisher_counter,
@@ -3314,6 +3608,35 @@ impl SelectedBlobNode {
             .blob_gc_status(Some(sample))
             .map_err(|error| application_error("blob transfer status", error.into()))?;
         self.map_transfer_status(snapshot, gc)
+    }
+
+    pub fn inspect_publication(
+        &mut self,
+        request: BlobPublicationInspectionRequest,
+    ) -> Result<BlobPublicationInspection, ApplicationError> {
+        let policy = self.current_policy("blob publication status")?;
+        let inspection = self
+            .store
+            .inspect_blob_stream_with_policy(
+                &policy,
+                request.publication_id.into_core(),
+                &request.topic,
+                &request.scope,
+            )
+            .map_err(|error| application_error("blob publication status", error.into()))?;
+        Ok(map_publication_inspection(
+            request.publication_id,
+            inspection,
+        ))
+    }
+
+    pub fn capacity_status(&mut self) -> Result<BlobCapacityStatus, ApplicationError> {
+        let _policy = self.current_policy("blob capacity status")?;
+        let stats = self
+            .store
+            .blob_stats()
+            .map_err(|error| application_error("blob capacity status", error.into()))?;
+        map_blob_capacity_status(stats, self.store.blob_depot_limits())
     }
 
     fn observe_current_blob_custody_sample(
@@ -4582,6 +4905,7 @@ impl SelectedBlobNode {
         }
         let metadata = prepared.metadata();
         Ok(BlobPublishResult {
+            publication_id: None,
             id: BlobId::from_core(prepared.id()),
             publisher: stored.header.stamp.dot.publisher,
             publisher_counter: stored.header.stamp.dot.counter,
@@ -4678,6 +5002,7 @@ impl SelectedBlobNode {
 fn blob_publish_result(blob: &VerifiedStoredBlob, inserted: bool) -> BlobPublishResult {
     let metadata = blob.blob.manifest().metadata();
     BlobPublishResult {
+        publication_id: None,
         id: BlobId::from_core(blob.blob.blob_id()),
         publisher: blob.blob.publisher(),
         publisher_counter: blob.blob.dot().counter,
@@ -4876,6 +5201,7 @@ fn completed_blob_stream_result(
         ));
     }
     Ok(BlobPublishResult {
+        publication_id: Some(BlobStreamPublicationId::from_core(completed.stream_id())),
         id: BlobId::from_core(completed.blob_id()),
         publisher: open.publisher(),
         publisher_counter: open.publisher_counter(),
@@ -5885,6 +6211,135 @@ mod tests {
             restored.extend_from_slice(page.as_bytes());
         }
         assert_eq!(restored, bytes);
+    }
+
+    #[test]
+    fn profile5_receipt_preserves_publication_id_through_completion() {
+        let root = TestRoot::new("profile5-publication-identity");
+        let bytes = payload(BLOB_STREAM_SEGMENT_BYTES + 17);
+        let stream_request = BlobPublishStreamRequest {
+            publication: request(b"blob/stream/publication-identity"),
+            options: BlobPublishOptions::durable(),
+            total_len: bytes.len() as u64,
+        };
+        let (publication_id, result) = {
+            let mut node = selected_node(&root);
+            let opened = node
+                .open_publish_stream_inner(stream_request.clone())
+                .expect("open publication stream");
+            let publication_id = BlobStreamPublicationId::from_bytes(opened.token).unwrap();
+            let awaiting = node
+                .inspect_publication(BlobPublicationInspectionRequest {
+                    publication_id,
+                    topic: blob_topic(),
+                    scope: blob_scope(),
+                })
+                .expect("inspect awaiting publication");
+            assert_eq!(awaiting.phase, BlobPublicationPhase::AwaitingData);
+            for (offset, chunk) in bytes.chunks(64 * 1024).enumerate() {
+                node.append_publish_stream_inner(
+                    opened.token,
+                    (offset * 64 * 1024) as u64,
+                    Zeroizing::new(chunk.to_vec()),
+                )
+                .expect("append publication bytes");
+            }
+            let result = node
+                .finish_publish_stream_inner(opened.token)
+                .expect("finish publication stream");
+            assert_eq!(result.publication_id, Some(publication_id));
+            (publication_id, result)
+        };
+        let mut reopened = selected_node(&root);
+        let available = reopened
+            .inspect_publication(BlobPublicationInspectionRequest {
+                publication_id,
+                topic: blob_topic(),
+                scope: blob_scope(),
+            })
+            .expect("inspect restarted publication");
+        assert_eq!(available.phase, BlobPublicationPhase::Available);
+        assert_eq!(available.blob_id, Some(result.id));
+        assert_eq!(available.plaintext_total_bytes, bytes.len() as u64);
+    }
+
+    #[test]
+    fn publication_inspection_survives_restart_with_monotonic_progress() {
+        const CHECKPOINT_SEGMENTS: u64 = 1;
+        let root = TestRoot::new("publication-inspection-restart");
+        let bytes = payload(2 * BLOB_STREAM_SEGMENT_BYTES);
+        let stream_request = BlobPublishStreamRequest {
+            publication: request(b"blob/stream/inspection-restart"),
+            options: BlobPublishOptions::durable(),
+            total_len: bytes.len() as u64,
+        };
+        let (publication_id, before) = {
+            let mut node = selected_node(&root);
+            let opened = node
+                .open_publish_stream_inner(stream_request.clone())
+                .expect("open restart stream");
+            node.publish_streams
+                .get_mut(&opened.token)
+                .expect("open local stream")
+                .set_checkpoint_segments_for_test(CHECKPOINT_SEGMENTS);
+            node.append_publish_stream_inner(
+                opened.token,
+                0,
+                Zeroizing::new(bytes[..BLOB_STREAM_SEGMENT_BYTES].to_vec()),
+            )
+            .expect("append first durable segment");
+            let publication_id = BlobStreamPublicationId::from_bytes(opened.token).unwrap();
+            let status = node
+                .inspect_publication(BlobPublicationInspectionRequest {
+                    publication_id,
+                    topic: blob_topic(),
+                    scope: blob_scope(),
+                })
+                .expect("inspect first durable segment");
+            assert_eq!(status.phase, BlobPublicationPhase::Receiving);
+            (publication_id, status)
+        };
+        let mut restarted = selected_node(&root);
+        let after = restarted
+            .inspect_publication(BlobPublicationInspectionRequest {
+                publication_id,
+                topic: blob_topic(),
+                scope: blob_scope(),
+            })
+            .expect("inspect after restart");
+        assert_eq!(after, before);
+        assert!(after.durable_plaintext_bytes > 0);
+        assert!(after.durable_transfer_bytes > 0);
+    }
+
+    #[test]
+    fn blob_capacity_status_handles_zero_and_maximum_counters() {
+        let limits = BlobDepotLimits::new(u64::MAX, u64::MAX, u64::MAX).unwrap();
+        let empty = map_blob_capacity_status(aster_redb_store::BlobStoreStats::default(), limits)
+            .expect("map empty capacity");
+        assert_eq!(empty.reserved_bytes, 0);
+        assert_eq!(empty.byte_limit, u64::MAX);
+        assert!(!empty.bytes_exhausted);
+        assert!(!empty.chunks_exhausted);
+        assert!(!empty.variants_exhausted);
+
+        let maximum = map_blob_capacity_status(
+            aster_redb_store::BlobStoreStats {
+                reserved_file_bytes: u64::MAX,
+                committed_chunks: u64::MAX,
+                variants: u64::MAX,
+                pending_sources: u64::MAX,
+                network_staging_bytes: u64::MAX,
+                ..Default::default()
+            },
+            limits,
+        )
+        .expect("map maximum capacity");
+        assert!(maximum.bytes_exhausted);
+        assert!(maximum.chunks_exhausted);
+        assert!(maximum.variants_exhausted);
+        assert_eq!(maximum.pending_sources, u64::MAX);
+        assert_eq!(maximum.network_staging_bytes, u64::MAX);
     }
 
     #[test]
