@@ -3138,6 +3138,33 @@ impl LiveEmissionPolicy {
 }
 
 /// Metrics for one completed contact from this local node's point of view.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BlobStreamStageReceipt {
+    pub items: u64,
+    pub bytes: u64,
+    pub queue_wait_ns: u64,
+    pub service_ns: u64,
+    pub output_blocked_ns: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BlobStreamContactReceipt {
+    pub sent_bytes: u64,
+    pub received_bytes: u64,
+    pub resumed_bytes: u64,
+    pub checkpoints: u64,
+    pub completed_partitions: u64,
+    pub worker_count: usize,
+    pub peak_in_flight_items: usize,
+    pub peak_in_flight_bytes: usize,
+    pub peak_reorder_items: usize,
+    pub admission: BlobStreamStageReceipt,
+    pub map: BlobStreamStageReceipt,
+    pub reorder: BlobStreamStageReceipt,
+    pub sink: BlobStreamStageReceipt,
+}
+
+/// Metrics for one completed contact from this local node's point of view.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PeerReceipt {
     /// Authenticated negotiated semantic protocol version.
@@ -3192,6 +3219,8 @@ pub struct PeerReceipt {
     pub blob_remaining: usize,
     /// Blob range attempts deferred by a typed durable capacity boundary.
     pub blob_deferred: usize,
+    /// Bounded semantic-v9/profile-5 transfer and pipeline measurements.
+    pub blob_stream: BlobStreamContactReceipt,
     /// Mission-control transfers offered from local durable state.
     pub controls_offered: usize,
     /// Mission-control transfers fetched from the remote durable state.
@@ -13513,6 +13542,30 @@ fn format_transfer_profiles(profiles: Option<[u16; 5]>) -> String {
         .unwrap_or_else(|| "none".into())
 }
 
+fn format_blob_stream_pipeline(receipt: BlobStreamContactReceipt) -> String {
+    let stage = |name: &str, stage: BlobStreamStageReceipt| {
+        format!(
+            "{name}:{}:{}:{}:{}:{}",
+            stage.items,
+            stage.bytes,
+            stage.queue_wait_ns,
+            stage.service_ns,
+            stage.output_blocked_ns
+        )
+    };
+    format!(
+        "workers:{};peak_items:{};peak_bytes:{};peak_reorder:{};{};{};{};{}",
+        receipt.worker_count,
+        receipt.peak_in_flight_items,
+        receipt.peak_in_flight_bytes,
+        receipt.peak_reorder_items,
+        stage("admission", receipt.admission),
+        stage("map", receipt.map),
+        stage("reorder", receipt.reorder),
+        stage("sink", receipt.sink),
+    )
+}
+
 #[cfg(unix)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct LocalPathIdentity {
@@ -17602,7 +17655,7 @@ async fn run_node_actor_inner(
                         }
                         receipt.contacts += 1;
                         node_stdout!(
-                            "CONTACT direction=in carrier_peer={} mission_peer={} rounds={} control_offered={} control_fetched={} control_retained={} control_duplicates={} control_activated={} control_remaining={} offered={} fetched={} inserted={} duplicates={} remaining={} deferred_event_lanes={} mutable_remaining={} deferred_mutable_lanes={} blob_ranges_fetched={} blob_bytes_fetched={} blob_remaining={} blob_deferred={} bridge_offered={} bridge_applied={} bridge_delivered={} bridge_remaining={} handshake_frames={} handshake_bytes={} protected_frames={} protected_bytes={} event_uni_turns_sent={} event_uni_turns_received={} event_pages_sent={} event_pages_received={} event_page_entries_sent={} event_page_entries_received={} event_page_bytes_sent={} event_page_bytes_received={} event_page_inserts={} event_page_duplicates={} event_page_unscheduled={} receiptful_event_offers={} transfer_profiles={} transfer_profile_digest={} carrier_path={} carrier_path_transitions={} carrier_path_transitions_saturated={} path_observation=not-authorization mission_auth=hybrid-pq semantics=source-authenticated-event reconciliation_classes={} controls=source-authenticated-flash content_admission=capability-gated status={}",
+                            "CONTACT direction=in carrier_peer={} mission_peer={} rounds={} control_offered={} control_fetched={} control_retained={} control_duplicates={} control_activated={} control_remaining={} offered={} fetched={} inserted={} duplicates={} remaining={} deferred_event_lanes={} mutable_remaining={} deferred_mutable_lanes={} blob_ranges_fetched={} blob_bytes_fetched={} blob_remaining={} blob_deferred={} blob_stream_sent_bytes={} blob_stream_received_bytes={} blob_stream_resumed_bytes={} blob_stream_checkpoints={} blob_stream_partitions={} blob_stream_pipeline={} bridge_offered={} bridge_applied={} bridge_delivered={} bridge_remaining={} handshake_frames={} handshake_bytes={} protected_frames={} protected_bytes={} event_uni_turns_sent={} event_uni_turns_received={} event_pages_sent={} event_pages_received={} event_page_entries_sent={} event_page_entries_received={} event_page_bytes_sent={} event_page_bytes_received={} event_page_inserts={} event_page_duplicates={} event_page_unscheduled={} receiptful_event_offers={} transfer_profiles={} transfer_profile_digest={} carrier_path={} carrier_path_transitions={} carrier_path_transitions_saturated={} path_observation=not-authorization mission_auth=hybrid-pq semantics=source-authenticated-event reconciliation_classes={} controls=source-authenticated-flash content_admission=capability-gated status={}",
                             peer,
                             format_node_id(server_receipt.mission_peer.expect("successful mission contact has peer identity")),
                             server_receipt.rounds,
@@ -17624,6 +17677,12 @@ async fn run_node_actor_inner(
                             server_receipt.blob_bytes_fetched,
                             server_receipt.blob_remaining,
                             server_receipt.blob_deferred,
+                            server_receipt.blob_stream.sent_bytes,
+                            server_receipt.blob_stream.received_bytes,
+                            server_receipt.blob_stream.resumed_bytes,
+                            server_receipt.blob_stream.checkpoints,
+                            server_receipt.blob_stream.completed_partitions,
+                            format_blob_stream_pipeline(server_receipt.blob_stream),
                             server_receipt.bridge_offered,
                             server_receipt.bridge_applied,
                             server_receipt.bridge_delivered,
@@ -17776,7 +17835,7 @@ async fn run_node_actor_inner(
                         }
                         receipt.contacts += 1;
                         node_stdout!(
-                            "CONTACT direction=out carrier_peer={} mission_peer={} locator={} rounds={} control_offered={} control_fetched={} control_retained={} control_duplicates={} control_activated={} control_remaining={} offered={} fetched={} inserted={} duplicates={} remaining={} deferred_event_lanes={} mutable_remaining={} deferred_mutable_lanes={} blob_ranges_fetched={} blob_bytes_fetched={} blob_remaining={} blob_deferred={} bridge_offered={} bridge_applied={} bridge_delivered={} bridge_remaining={} handshake_frames={} handshake_bytes={} protected_frames={} protected_bytes={} event_uni_turns_sent={} event_uni_turns_received={} event_pages_sent={} event_pages_received={} event_page_entries_sent={} event_page_entries_received={} event_page_bytes_sent={} event_page_bytes_received={} event_page_inserts={} event_page_duplicates={} event_page_unscheduled={} receiptful_event_offers={} transfer_profiles={} transfer_profile_digest={} carrier_path={} carrier_path_transitions={} carrier_path_transitions_saturated={} path_observation=not-authorization mission_auth=hybrid-pq semantics=source-authenticated-event reconciliation_classes={} controls=source-authenticated-flash content_admission=capability-gated status={}",
+                            "CONTACT direction=out carrier_peer={} mission_peer={} locator={} rounds={} control_offered={} control_fetched={} control_retained={} control_duplicates={} control_activated={} control_remaining={} offered={} fetched={} inserted={} duplicates={} remaining={} deferred_event_lanes={} mutable_remaining={} deferred_mutable_lanes={} blob_ranges_fetched={} blob_bytes_fetched={} blob_remaining={} blob_deferred={} blob_stream_sent_bytes={} blob_stream_received_bytes={} blob_stream_resumed_bytes={} blob_stream_checkpoints={} blob_stream_partitions={} blob_stream_pipeline={} bridge_offered={} bridge_applied={} bridge_delivered={} bridge_remaining={} handshake_frames={} handshake_bytes={} protected_frames={} protected_bytes={} event_uni_turns_sent={} event_uni_turns_received={} event_pages_sent={} event_pages_received={} event_page_entries_sent={} event_page_entries_received={} event_page_bytes_sent={} event_page_bytes_received={} event_page_inserts={} event_page_duplicates={} event_page_unscheduled={} receiptful_event_offers={} transfer_profiles={} transfer_profile_digest={} carrier_path={} carrier_path_transitions={} carrier_path_transitions_saturated={} path_observation=not-authorization mission_auth=hybrid-pq semantics=source-authenticated-event reconciliation_classes={} controls=source-authenticated-flash content_admission=capability-gated status={}",
                             peer.carrier(),
                             format_node_id(peer_receipt.mission_peer.expect("successful mission contact has peer identity")),
                             peer.locator_name(),
@@ -17799,6 +17858,12 @@ async fn run_node_actor_inner(
                             peer_receipt.blob_bytes_fetched,
                             peer_receipt.blob_remaining,
                             peer_receipt.blob_deferred,
+                            peer_receipt.blob_stream.sent_bytes,
+                            peer_receipt.blob_stream.received_bytes,
+                            peer_receipt.blob_stream.resumed_bytes,
+                            peer_receipt.blob_stream.checkpoints,
+                            peer_receipt.blob_stream.completed_partitions,
+                            format_blob_stream_pipeline(peer_receipt.blob_stream),
                             peer_receipt.bridge_offered,
                             peer_receipt.bridge_applied,
                             peer_receipt.bridge_delivered,
@@ -26028,6 +26093,103 @@ fn blob_stream_error(context: &str, error: impl fmt::Display) -> NodeError {
     NodeError::Protocol(format!("{context}: {error}"))
 }
 
+#[derive(Clone, Copy)]
+enum BlobStreamReportDirection {
+    Sent,
+    Received,
+}
+
+fn add_blob_stream_stage_receipt(
+    target: &mut BlobStreamStageReceipt,
+    observation: crate::stream_pipeline::StageObservation,
+) -> Result<(), NodeError> {
+    target.items = target
+        .items
+        .checked_add(observation.items)
+        .ok_or_else(|| blob_stream_error("account Blob stream stage", "item count overflow"))?;
+    target.bytes = target
+        .bytes
+        .checked_add(observation.bytes)
+        .ok_or_else(|| blob_stream_error("account Blob stream stage", "byte count overflow"))?;
+    target.queue_wait_ns = target
+        .queue_wait_ns
+        .checked_add(observation.queue_wait_ns)
+        .ok_or_else(|| blob_stream_error("account Blob stream stage", "queue time overflow"))?;
+    target.service_ns = target
+        .service_ns
+        .checked_add(observation.service_ns)
+        .ok_or_else(|| blob_stream_error("account Blob stream stage", "service time overflow"))?;
+    target.output_blocked_ns = target
+        .output_blocked_ns
+        .checked_add(observation.output_blocked_ns)
+        .ok_or_else(|| blob_stream_error("account Blob stream stage", "blocked time overflow"))?;
+    Ok(())
+}
+
+fn record_blob_stream_report(
+    receipt: &mut PeerReceipt,
+    report: &blob_stream::BlobNetworkReport,
+    direction: BlobStreamReportDirection,
+) -> Result<(), NodeError> {
+    let bytes = match direction {
+        BlobStreamReportDirection::Sent => &mut receipt.blob_stream.sent_bytes,
+        BlobStreamReportDirection::Received => &mut receipt.blob_stream.received_bytes,
+    };
+    *bytes = bytes
+        .checked_add(report.attempt_bytes)
+        .ok_or_else(|| blob_stream_error("account Blob stream report", "wire byte overflow"))?;
+    receipt.blob_stream.resumed_bytes = receipt
+        .blob_stream
+        .resumed_bytes
+        .checked_add(report.resumed_from)
+        .ok_or_else(|| blob_stream_error("account Blob stream report", "resume byte overflow"))?;
+    receipt.blob_stream.checkpoints = receipt
+        .blob_stream
+        .checkpoints
+        .checked_add(report.checkpoints)
+        .ok_or_else(|| blob_stream_error("account Blob stream report", "checkpoint overflow"))?;
+    let Some(pipeline) = report.pipeline.as_ref() else {
+        return Ok(());
+    };
+    receipt.blob_stream.completed_partitions = receipt
+        .blob_stream
+        .completed_partitions
+        .checked_add(pipeline.completed_items())
+        .ok_or_else(|| blob_stream_error("account Blob stream report", "partition overflow"))?;
+    receipt.blob_stream.worker_count = receipt
+        .blob_stream
+        .worker_count
+        .max(pipeline.worker_count());
+    receipt.blob_stream.peak_in_flight_items = receipt
+        .blob_stream
+        .peak_in_flight_items
+        .max(pipeline.peak_in_flight_items());
+    receipt.blob_stream.peak_in_flight_bytes = receipt
+        .blob_stream
+        .peak_in_flight_bytes
+        .max(pipeline.peak_in_flight_bytes());
+    receipt.blob_stream.peak_reorder_items = receipt
+        .blob_stream
+        .peak_reorder_items
+        .max(pipeline.peak_reorder_items());
+    add_blob_stream_stage_receipt(
+        &mut receipt.blob_stream.admission,
+        pipeline.stage(crate::stream_pipeline::PipelineStage::Admission),
+    )?;
+    add_blob_stream_stage_receipt(
+        &mut receipt.blob_stream.map,
+        pipeline.stage(crate::stream_pipeline::PipelineStage::Map),
+    )?;
+    add_blob_stream_stage_receipt(
+        &mut receipt.blob_stream.reorder,
+        pipeline.stage(crate::stream_pipeline::PipelineStage::Reorder),
+    )?;
+    add_blob_stream_stage_receipt(
+        &mut receipt.blob_stream.sink,
+        pipeline.stage(crate::stream_pipeline::PipelineStage::Sink),
+    )
+}
+
 fn protocol_stage_error(context: &str, error: impl fmt::Display) -> NodeError {
     NodeError::Protocol(format!("{context}: {error}"))
 }
@@ -26109,7 +26271,7 @@ async fn send_profile5_blob_direction(
         *publication.commitment().plaintext_root(),
         *publication.commitment().ciphertext_root(),
     );
-    blob_stream::send_completed_pack_protected(
+    let report = blob_stream::send_completed_pack_protected(
         connection.clone(),
         mission,
         profiles.digest,
@@ -26123,6 +26285,7 @@ async fn send_profile5_blob_direction(
     )
     .await
     .map_err(|error| blob_stream_error("send profile-5 Blob", error))?;
+    record_blob_stream_report(receipt, &report, BlobStreamReportDirection::Sent)?;
     guard.check(store)
 }
 
@@ -26221,7 +26384,7 @@ async fn receive_profile5_blob_direction(
     let pack_root = aster_redb_store::pack::PinnedBlobPackRoot::open(&store)?;
     let limits = crate::stream_pipeline::PipelineLimits::new(2, 4, 5 * 1024 * 1024, 4)
         .map_err(|error| blob_stream_error("configure Blob stream pipeline", error))?;
-    blob_stream::receive_completed_pack_with_store_protected(
+    let report = blob_stream::receive_completed_pack_with_store_protected(
         connection.clone(),
         mission,
         profiles.digest,
@@ -26235,6 +26398,7 @@ async fn receive_profile5_blob_direction(
     )
     .await
     .map_err(|error| blob_stream_error("receive profile-5 Blob", error))?;
+    record_blob_stream_report(receipt, &report, BlobStreamReportDirection::Received)?;
     guard.check(&store)
 }
 
@@ -54935,6 +55099,18 @@ mod tests {
             client.is_ok() && server.is_ok(),
             "v9 stream contact failed: client={client:?} server={server:?}"
         );
+        let client = client.expect("v9 stream sender contact");
+        let server = server.expect("v9 stream receiver contact");
+        assert!(client.receipt.blob_stream.sent_bytes > plaintext.len() as u64);
+        assert_eq!(client.receipt.blob_stream.received_bytes, 0);
+        assert_eq!(server.receipt.blob_stream.sent_bytes, 0);
+        assert_eq!(
+            server.receipt.blob_stream.received_bytes,
+            client.receipt.blob_stream.sent_bytes
+        );
+        assert_eq!(server.receipt.blob_stream.completed_partitions, 3);
+        assert_eq!(server.receipt.blob_stream.map.items, 3);
+        assert_eq!(server.receipt.blob_stream.sink.items, 3);
 
         let policy = receiver_store
             .control_policy_snapshot()
