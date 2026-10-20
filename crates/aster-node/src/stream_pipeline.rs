@@ -733,7 +733,7 @@ mod tests {
     use std::{
         collections::HashSet,
         sync::{
-            Arc, Mutex,
+            Arc, Barrier, Condvar, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
     };
@@ -864,6 +864,8 @@ mod tests {
     async fn pipeline_uses_one_fixed_worker_set_for_the_complete_job() {
         let threads = Arc::new(Mutex::new(HashSet::new()));
         let observed_threads = Arc::clone(&threads);
+        let first_workers = Arc::new(Barrier::new(2));
+        let worker_rendezvous = Arc::clone(&first_workers);
         let report = run_ordered_pipeline(
             StreamJobId::from_bytes([0x81; 16]),
             (0..64)
@@ -875,7 +877,9 @@ mod tests {
                     .lock()
                     .expect("thread set")
                     .insert(std::thread::current().id());
-                std::thread::sleep(std::time::Duration::from_millis(1));
+                if partition.index() < 2 {
+                    worker_rendezvous.wait();
+                }
                 Ok(partition.into_bytes())
             },
             |_| std::future::ready(Ok(())),
@@ -884,7 +888,7 @@ mod tests {
         .expect("pipeline");
 
         assert_eq!(report.worker_count(), 2);
-        assert!(threads.lock().expect("thread set").len() <= 2);
+        assert_eq!(threads.lock().expect("thread set").len(), 2);
     }
 
     #[test]
@@ -921,6 +925,9 @@ mod tests {
         let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
         let active = Arc::new(AtomicUsize::new(0));
         let active_worker = Arc::clone(&active);
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let source_release = Arc::clone(&release);
+        let worker_release = Arc::clone(&release);
         let mut index = 0_u64;
         let partitions = std::iter::from_fn(move || {
             let partition = match index {
@@ -929,6 +936,9 @@ mod tests {
                     started_rx
                         .recv_timeout(std::time::Duration::from_secs(1))
                         .expect("first worker started");
+                    let (released, condition) = &*source_release;
+                    *released.lock().expect("release state") = true;
+                    condition.notify_all();
                     StreamPartition::new(1, vec![0; 33])
                 }
                 _ => return None,
@@ -943,7 +953,11 @@ mod tests {
             move |partition| {
                 active_worker.fetch_add(1, Ordering::SeqCst);
                 started_tx.send(()).expect("signal worker start");
-                std::thread::sleep(std::time::Duration::from_millis(50));
+                let (released, condition) = &*worker_release;
+                let mut released = released.lock().expect("release state");
+                while !*released {
+                    released = condition.wait(released).expect("release worker");
+                }
                 active_worker.fetch_sub(1, Ordering::SeqCst);
                 Ok(partition.into_bytes())
             },
@@ -1018,24 +1032,46 @@ mod tests {
 
     #[tokio::test]
     async fn pipeline_sink_failure_joins_workers_and_reclaims_permits() {
-        let started = std::time::Instant::now();
+        let active = Arc::new(AtomicUsize::new(0));
+        let map_active = Arc::clone(&active);
+        let gate = Arc::new((Mutex::new((0_usize, false)), Condvar::new()));
+        let map_gate = Arc::clone(&gate);
+        let sink_gate = Arc::clone(&gate);
         let result = run_ordered_pipeline(
             StreamJobId::from_bytes([11; 16]),
             (0..4)
                 .map(|index| StreamPartition::new(index, vec![0; 16]))
                 .collect::<Vec<_>>(),
             PipelineLimits::new(4, 4, 64, 4).expect("limits"),
-            |partition| {
-                if partition.index() != 0 {
-                    std::thread::sleep(std::time::Duration::from_millis(15));
+            move |partition| {
+                map_active.fetch_add(1, Ordering::SeqCst);
+                let (state, condition) = &*map_gate;
+                let mut state = state.lock().expect("worker gate");
+                if partition.index() == 0 {
+                    while state.0 == 0 {
+                        state = condition.wait(state).expect("wait for active worker");
+                    }
+                } else {
+                    state.0 += 1;
+                    condition.notify_all();
+                    while !state.1 {
+                        state = condition.wait(state).expect("wait for sink failure");
+                    }
                 }
+                drop(state);
+                map_active.fetch_sub(1, Ordering::SeqCst);
                 Ok(partition.into_bytes())
             },
-            |_| std::future::ready(Err(PipelineError::SinkFailed("cancel".into()))),
+            move |_| {
+                let (state, condition) = &*sink_gate;
+                state.lock().expect("worker gate").1 = true;
+                condition.notify_all();
+                std::future::ready(Err(PipelineError::SinkFailed("cancel".into())))
+            },
         )
         .await;
         assert!(matches!(result, Err(PipelineError::SinkFailed(_))));
-        assert!(started.elapsed() >= std::time::Duration::from_millis(10));
+        assert_eq!(active.load(Ordering::SeqCst), 0, "worker still running");
     }
 
     #[tokio::test]
