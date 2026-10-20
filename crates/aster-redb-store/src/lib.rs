@@ -392,6 +392,8 @@ pub enum MutableTransferCursorClass {
     Record,
     /// Immutable selected Blob source transfers.
     Blob,
+    /// Completed semantic-v9/profile-5 Blob stream publications.
+    BlobStream,
 }
 
 impl MutableTransferCursorClass {
@@ -400,6 +402,7 @@ impl MutableTransferCursorClass {
             Self::State => 1,
             Self::Record => 2,
             Self::Blob => 3,
+            Self::BlobStream => 4,
         }
     }
 
@@ -408,6 +411,7 @@ impl MutableTransferCursorClass {
             1 => Ok(Self::State),
             2 => Ok(Self::Record),
             3 => Ok(Self::Blob),
+            4 => Ok(Self::BlobStream),
             _ => Err(StoreError::MutableTransferCursorInvariant(
                 "mutable-transfer cursor key has an invalid class tag",
             )),

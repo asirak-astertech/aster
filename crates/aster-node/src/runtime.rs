@@ -26194,14 +26194,58 @@ fn protocol_stage_error(context: &str, error: impl fmt::Display) -> NodeError {
     NodeError::Protocol(format!("{context}: {error}"))
 }
 
+struct SelectedBlobStreamPublication {
+    expected_cursor: Option<[u8; 32]>,
+    publication: aster_redb_store::BlobStreamPublication,
+}
+
 fn next_blob_stream_publication(
     store: &Store,
     policy: &ControlPolicySnapshot,
-) -> Result<Option<aster_redb_store::BlobStreamPublication>, NodeError> {
-    Ok(store
-        .blob_stream_publications_with_policy(policy)?
-        .into_iter()
-        .next())
+    peer: NodeId,
+    direction: EventDirection,
+) -> Result<Option<SelectedBlobStreamPublication>, NodeError> {
+    let cursor = store.mutable_transfer_cursor(
+        peer,
+        MutableTransferCursorClass::BlobStream,
+        mutable_transfer_cursor_mode(direction),
+    )?;
+    let mut publications = store.blob_stream_publications_with_policy(policy)?;
+    publications.sort_unstable_by_key(|publication| *publication.stream_id().as_bytes());
+    let selected = cursor
+        .and_then(|cursor| {
+            publications
+                .iter()
+                .position(|publication| publication.stream_id().as_bytes() > &cursor)
+        })
+        .and_then(|index| publications.get(index).cloned())
+        .or_else(|| publications.into_iter().next());
+    Ok(selected.map(|publication| SelectedBlobStreamPublication {
+        expected_cursor: cursor,
+        publication,
+    }))
+}
+
+fn settle_blob_stream_cursor(
+    store: &Store,
+    peer: NodeId,
+    direction: EventDirection,
+    expected: Option<[u8; 32]>,
+    stream_id: aster_mesh::BlobPublicationStreamId,
+) -> Result<(), NodeError> {
+    if store.compare_and_advance_mutable_transfer_cursor(
+        peer,
+        MutableTransferCursorClass::BlobStream,
+        mutable_transfer_cursor_mode(direction),
+        expected,
+        *stream_id.as_bytes(),
+    )? {
+        Ok(())
+    } else {
+        Err(NodeError::Protocol(
+            "Blob stream scheduling cursor changed before settlement".into(),
+        ))
+    }
 }
 
 async fn send_profile5_blob_direction(
@@ -26214,7 +26258,9 @@ async fn send_profile5_blob_direction(
     receipt: &mut PeerReceipt,
 ) -> Result<(), NodeError> {
     guard.check(store)?;
-    let publication = next_blob_stream_publication(store, guard.policy())?;
+    let peer = mission.peer().mission_id();
+    let selected = next_blob_stream_publication(store, guard.policy(), peer, direction)?;
+    let publication = selected.as_ref().map(|selected| &selected.publication);
     let mut attempt_nonce = publication.as_ref().map(|_| [0; 32]);
     if let Some(nonce) = attempt_nonce.as_mut() {
         getrandom::fill(nonce).map_err(|error| blob_stream_error("Blob stream nonce", error))?;
@@ -26247,7 +26293,11 @@ async fn send_profile5_blob_direction(
             "Blob stream plan acknowledgement crossed directions".into(),
         ));
     }
-    let Some(publication) = publication else {
+    let Some(SelectedBlobStreamPublication {
+        expected_cursor,
+        publication,
+    }) = selected
+    else {
         return if acknowledged_nonce.is_none() {
             Ok(())
         } else {
@@ -26258,6 +26308,13 @@ async fn send_profile5_blob_direction(
     };
     let nonce = attempt_nonce.expect("publication has attempt nonce");
     if acknowledged_nonce.is_none() {
+        settle_blob_stream_cursor(
+            store,
+            peer,
+            direction,
+            expected_cursor,
+            publication.stream_id(),
+        )?;
         return Ok(());
     }
     if acknowledged_nonce != Some(nonce) {
@@ -26286,6 +26343,13 @@ async fn send_profile5_blob_direction(
     .await
     .map_err(|error| blob_stream_error("send profile-5 Blob", error))?;
     record_blob_stream_report(receipt, &report, BlobStreamReportDirection::Sent)?;
+    settle_blob_stream_cursor(
+        store,
+        peer,
+        direction,
+        expected_cursor,
+        publication.stream_id(),
+    )?;
     guard.check(store)
 }
 
@@ -54882,18 +54946,24 @@ mod tests {
         topic: &Topic,
         scope: &Scope,
         plaintext: &[u8],
+        seed: u8,
     ) -> aster_mesh::BlobPublicationStreamId {
         let stream_id =
-            aster_mesh::BlobPublicationStreamId::from_bytes([0x94; 32]).expect("test stream id");
-        let operation = aster_redb_store::BlobOperationKey::new(b"selected-contact-profile-5")
-            .expect("test operation");
+            aster_mesh::BlobPublicationStreamId::from_bytes([seed; 32]).expect("test stream id");
+        let operation =
+            aster_redb_store::BlobOperationKey::new(format!("selected-contact-profile-5-{seed}"))
+                .expect("test operation");
+        let policy = store.control_policy_snapshot().expect("test stream policy");
+        let causal = store
+            .reserve_local_blob_with_policy(&policy, publisher.identity(), topic, scope, None, None)
+            .expect("reserve test stream causal dot");
         let open = aster_mesh::BlobStreamOpen::new(
             stream_id,
             publisher.identity(),
             operation.as_bytes().to_vec(),
             publisher.mission_authority_id(),
-            1,
-            aster_mesh::VersionVector::default(),
+            causal.counter(),
+            causal.context().clone(),
             topic.clone(),
             scope.clone(),
             aster_mesh::BlobMetadata::new(
@@ -54910,7 +54980,7 @@ mod tests {
             publisher
                 .blob_stream_authorization_digest(scope, 1)
                 .expect("stream authorization"),
-            [0x95; 32],
+            [seed.wrapping_add(1); 32],
         )
         .expect("test stream open");
         let authenticated_open = publisher
@@ -54919,7 +54989,6 @@ mod tests {
         let verified_open = publisher
             .verify_blob_stream_open(&authenticated_open)
             .expect("verify test stream open");
-        let policy = store.control_policy_snapshot().expect("test stream policy");
         let (reservation, mut resume) = store
             .reserve_blob_stream_with_policy(
                 &policy,
@@ -55070,6 +55139,16 @@ mod tests {
             &services.topic,
             &services.scope,
             &plaintext,
+            0x94,
+        );
+        let second_plaintext = vec![0xa7; aster_mesh::BLOB_STREAM_SEGMENT_BYTES + 29];
+        let second_stream_id = publish_test_blob_stream(
+            &source_store,
+            &mut publisher,
+            &services.topic,
+            &services.scope,
+            &second_plaintext,
+            0x99,
         );
         let node = |store: Arc<Store>, mission: UnprotectedReferenceMission, clock: u8| {
             TestForwardingNode {
@@ -55142,6 +55221,47 @@ mod tests {
             received.extend_from_slice(&bytes);
         }
         assert_eq!(received, plaintext);
+
+        drop(source_store);
+        let source_store = Arc::new(
+            Store::open_for_mission(states[0].join(STORE_FILE), authority)
+                .expect("reopen v9 stream source store"),
+        );
+        let (second_client, second_server, _, _) =
+            contact_test_pair_with_forwarding_results_tracked_and_interests(
+                node(receiver_store.clone(), services.other.clone(), 0x9a),
+                node(source_store.clone(), services.member.clone(), 0x9b),
+                MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
+                    services.topic.clone(),
+                    services.scope.clone(),
+                    false,
+                )]),
+                MutableSourceInterests::default(),
+            )
+            .await;
+        assert!(
+            second_client.is_ok() && second_server.is_ok(),
+            "second v9 stream contact failed: client={second_client:?} server={second_server:?}"
+        );
+        let publications = receiver_store
+            .blob_stream_publications_with_policy(&policy)
+            .expect("receiver publications after second contact");
+        assert!(
+            publications
+                .iter()
+                .any(|publication| publication.stream_id() == second_stream_id),
+            "a second contact must progress past the first settled publication"
+        );
+        assert_eq!(
+            source_store
+                .mutable_transfer_cursor(
+                    services.other.identity(),
+                    MutableTransferCursorClass::BlobStream,
+                    MutableTransferCursorMode::OfferToPeer,
+                )
+                .expect("profile-5 scheduling cursor"),
+            Some(*second_stream_id.as_bytes())
+        );
 
         drop((publications, source_store, receiver_store));
         for state in states {
