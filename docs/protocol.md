@@ -1092,7 +1092,8 @@ Finite profile-5 work uses `BlobCustodyClaimV2[208]`. Its field widths and age
 semantics are identical to `BlobCustodyClaimV1`, but its fixed header is
 `"ASTRBL09" || format_version u16 = 2 || semantic_version u16 = 9 ||
 profile_id u16 = 5`. Lane ID 4 is bound by the record context rather than
-duplicated in the fixed claim body. Each protected stream record authenticates
+duplicated in the fixed claim body. Each protected control record and each
+protected StreamData header authenticates
 `"ASTER/v9-lane-record/v1\0" || semantic_version u16 ||
 transfer_profile_digest[32] || lane u16 || profile u16 || direction u8 ||
 attempt_nonce[32] || record_sequence u64`. A custody contact capability also
@@ -1100,6 +1101,28 @@ binds the session transcript and exact claim digest under
 `"ASTER/v9-blob-custody-contact/v2\0"`. These send/contact capabilities are
 non-clone, exact-context values; decoding raw claim bytes grants no Store
 authority. Semantic-v8 claim bytes and domains remain unchanged.
+
+Profile-5 control frames are complete mission-protected records. StreamData is
+one composite carrier message:
+
+```text
+"ASD1" || protected_header_len u32 || protected_header || extent[extent_len]
+```
+
+`protected_header` is a mission-protected record whose plaintext is exactly the
+canonical fixed 89-byte `StreamDataV1` header through `extent_len`; its encoded
+length is nonzero and bounded at 2,048 bytes. The adjacent extent is not wrapped
+in a second mission AEAD. It is already canonical source-encrypted Blob-pack
+segment material whose source AEAD binds its stream, open digest, epoch,
+segment index, offsets, declared lengths, and ciphertext. The receiver first
+authenticates the protected header, requires the adjacent extent length to equal
+the authenticated `extent_len`, and then verifies the source segment before it
+can advance durable credit. A changed, substituted, truncated, replayed, or
+cross-stream extent therefore fails source authentication or canonical pack
+validation; carrier integrity is not used as the content trust boundary. This
+split avoids encrypting and copying every large extent through two independent
+record layers while retaining mission authorization for the attempt metadata
+and end-to-end source authentication for the content.
 
 For each admitted Blob direction, profile 4 sends one protected `ABRS || 0x01`
 schedule containing at most 64 canonical `BlobRangeFetchV5` tuples and receives

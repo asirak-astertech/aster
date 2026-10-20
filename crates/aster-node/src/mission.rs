@@ -2624,6 +2624,66 @@ impl MissionSession {
             .map_err(Into::into)
     }
 
+    pub(crate) fn seal_v9_blob_data_header(
+        &mut self,
+        transfer_profile_digest: [u8; 32],
+        direction: crate::frame::EventDirection,
+        attempt_nonce: [u8; 32],
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, MissionSessionError> {
+        let header =
+            crate::stream_transfer::StreamDataHeaderV1::decode_for_context(9, 5, plaintext)
+                .map_err(|_| {
+                    MissionSessionError::Authentication(EnvelopeError(
+                        "invalid v9 Blob stream data header".into(),
+                    ))
+                })?;
+        if header.attempt_nonce != attempt_nonce {
+            return Err(MissionSessionError::Authentication(EnvelopeError(
+                "v9 Blob stream data-header attempt differs".into(),
+            )));
+        }
+        self.inner
+            .seal_v9_blob_application_frame(
+                transfer_profile_digest,
+                Self::blob_direction(direction),
+                attempt_nonce,
+                plaintext,
+            )
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn open_v9_blob_data_header(
+        &mut self,
+        transfer_profile_digest: [u8; 32],
+        direction: crate::frame::EventDirection,
+        attempt_nonce: [u8; 32],
+        frame: &[u8],
+    ) -> Result<crate::stream_transfer::StreamDataHeaderV1, MissionSessionError> {
+        let (plaintext, _) = self
+            .inner
+            .open_v9_blob_application_frame(
+                transfer_profile_digest,
+                Self::blob_direction(direction),
+                attempt_nonce,
+                frame,
+            )
+            .map_err(MissionSessionError::from)?;
+        let header =
+            crate::stream_transfer::StreamDataHeaderV1::decode_for_context(9, 5, &plaintext)
+                .map_err(|_| {
+                    MissionSessionError::Authentication(EnvelopeError(
+                        "invalid v9 Blob stream data header".into(),
+                    ))
+                })?;
+        if header.attempt_nonce != attempt_nonce {
+            return Err(MissionSessionError::Authentication(EnvelopeError(
+                "v9 Blob stream data-header attempt differs".into(),
+            )));
+        }
+        Ok(header)
+    }
+
     pub(crate) fn open_v9_blob_application_frame(
         &mut self,
         transfer_profile_digest: [u8; 32],
@@ -3963,6 +4023,56 @@ mod tests {
                     &protected,
                 )
                 .is_err()
+        );
+
+        let data_header = crate::stream_transfer::StreamDataHeaderV1 {
+            transfer_id: [0x31; 32],
+            attempt_nonce: nonce,
+            sequence: 1,
+            offset: 256 * 1024,
+            extent_len: 256 * 1024,
+        };
+        let encoded_header = data_header
+            .encode_for_context(9, 5)
+            .expect("encode stream data header");
+        assert!(
+            sender
+                .seal_v9_blob_data_header(
+                    digest,
+                    EventDirection::ToSessionResponder,
+                    wrong_nonce,
+                    &encoded_header,
+                )
+                .is_err()
+        );
+        let protected_header = sender
+            .seal_v9_blob_data_header(
+                digest,
+                EventDirection::ToSessionResponder,
+                nonce,
+                &encoded_header,
+            )
+            .expect("seal v9 Blob data header");
+        assert!(
+            receiver
+                .open_v9_blob_data_header(
+                    digest,
+                    EventDirection::ToSessionInitiator,
+                    nonce,
+                    &protected_header,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            receiver
+                .open_v9_blob_data_header(
+                    digest,
+                    EventDirection::ToSessionResponder,
+                    nonce,
+                    &protected_header,
+                )
+                .expect("open exact v9 Blob data header"),
+            data_header
         );
     }
 

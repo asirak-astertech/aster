@@ -51,3 +51,28 @@ has the form `name:items:bytes:queue_wait_ns:service_ns:output_blocked_ns` for
 `admission`, `map`, `reorder`, and `sink`. These cumulative, bounded counters
 make a CM4 run attributable without retaining per-partition histories or Blob
 identifiers. A sender-only direction has no receiver pipeline samples.
+
+## 2026-10-20 mission-record hot-path isolation
+
+An optimized 256-MiB, 1,024-extent measurement of the original profile-5
+composition took 7.450 seconds, or 34.362 MiB/s. That rejected composition
+mission-encrypted and decrypted every complete 256-KiB StreamData frame even
+though each body was already a source-encrypted and independently authenticated
+canonical Blob-pack segment. The result identified the outer mission envelope
+as a non-transport bottleneck on the local x86 host.
+
+Semantic v9/profile 5 now uses a composite record: the mission layer protects
+the fixed canonical StreamData header, while the adjacent canonical pack
+segment retains its existing end-to-end source AEAD. The same optimized
+256-MiB sender-encode plus receiver-decode measurement completed in 0.017359
+seconds, or 14,747.147 MiB/s. This is approximately 429 times the rejected
+full-envelope rate and includes bounded frame construction and receiver body
+materialization. It establishes only that profile-5 record processing is no
+longer the local throughput ceiling; it excludes transport, pack I/O, source
+segment verification, checkpoints, and CM4 effects.
+
+Reproduction command:
+
+```text
+cargo test --release -p aster-node composite_profile5_records_process_256_mib_in_bounded_extents --lib -- --ignored --nocapture
+```

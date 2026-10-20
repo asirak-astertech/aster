@@ -86,11 +86,30 @@ def corpus():
         '\t'.join(row) + '\n' for row in rows)
 
 
+def profile5_composite_corpus():
+    rows = [
+        ('ACCEPT', 'one-segment', b'ASD1' + struct.pack('>I', 2) + b'\xa1\xa2\xb1\xb2\xb3'),
+        ('REJECT', 'wrong-magic', b'ASD2' + struct.pack('>I', 2) + b'\xa1\xa2\xb1'),
+        ('REJECT', 'zero-header', b'ASD1' + struct.pack('>I', 0) + b'\xb1'),
+        ('REJECT', 'oversized-header', b'ASD1' + struct.pack('>I', 2049) + b'\xa1'),
+        ('REJECT', 'truncated-length', b'ASD1\0\0\0'),
+        ('REJECT', 'truncated-header', b'ASD1' + struct.pack('>I', 3) + b'\xa1\xa2'),
+    ]
+    return '# aster-profile5-composite-data-record/v1\toracle=python-stdlib\n' + ''.join(
+        '\t'.join((status, name, wire.hex())) + '\n'
+        for status, name, wire in rows
+    )
+
+
 def main():
     offer = ('# aster-blob-ranges-stream-vectors/v1\tsemantic=7,8\toracle=python-stdlib\n'
              'ACCEPT\toffer-blob-stream-only-v1\t'
              '0105000501000100040100040003010001000201000100010200020001\n')
-    outputs = {'blob-ranges-stream-v1.tsv': offer, 'blob-stream-records-v1.tsv': corpus()}
+    outputs = {
+        'blob-ranges-stream-v1.tsv': offer,
+        'blob-stream-records-v1.tsv': corpus(),
+        'profile5-composite-data-record-v1.tsv': profile5_composite_corpus(),
+    }
     for name, text in outputs.items():
         path = ROOT / 'vectors' / name
         if '--write' in sys.argv:
@@ -103,7 +122,7 @@ def main():
         seed.write_bytes(seed_bytes)
     else:
         assert seed.read_bytes() == seed_bytes, 'fuzz offer seed differs'
-    print('Blob stream oracle: both corpora and fuzz offer match independent Python construction')
+    print('Blob stream oracle: all corpora and fuzz offer match independent Python construction')
 
 
 if __name__ == '__main__':

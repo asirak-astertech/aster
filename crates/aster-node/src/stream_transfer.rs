@@ -1,10 +1,12 @@
 use std::fmt::{self, Display, Formatter};
 
 const MAGIC: &[u8; 4] = b"ASM\x01";
+const COMPOSITE_DATA_MAGIC: &[u8; 4] = b"ASD1";
 pub(crate) const MAX_STREAM_EXTENT_BYTES: usize = 1_048_576;
 pub(crate) const PROFILE5_EXTENT_BYTES: usize = 256 * 1024;
 pub(crate) const MAX_STREAM_CHECKPOINT_BATCH_BYTES: u32 = 8 * 1_048_576;
 pub(crate) const STREAM_DATA_FIXED_BYTES: usize = 89;
+pub(crate) const MAX_PROTECTED_STREAM_DATA_HEADER_BYTES: usize = 2 * 1024;
 pub(crate) const MAX_STREAM_DATA_FRAME_BYTES: usize =
     STREAM_DATA_FIXED_BYTES + MAX_STREAM_EXTENT_BYTES;
 pub(crate) const MAX_STREAM_SEMANTIC_COMMITMENT_BYTES: usize = 64 * 1024;
@@ -520,6 +522,27 @@ impl StreamFrame {
 }
 
 impl StreamDataHeaderV1 {
+    pub(crate) fn encode_for_context(self, v: u16, p: u16) -> Result<Vec<u8>, StreamError> {
+        context(v, p)?;
+        nonce(&self.attempt_nonce)?;
+        extent(self.extent_len)?;
+        self.offset
+            .checked_add(self.extent_len.into())
+            .ok_or_else(|| StreamError::invalid("offset overflow"))?;
+        let mut output = Vec::with_capacity(STREAM_DATA_FIXED_BYTES);
+        output.extend_from_slice(MAGIC);
+        output.push(0xd8);
+        put_attempt(
+            &mut output,
+            &self.transfer_id,
+            &self.attempt_nonce,
+            self.sequence,
+        );
+        output.extend_from_slice(&self.offset.to_be_bytes());
+        output.extend_from_slice(&self.extent_len.to_be_bytes());
+        Ok(output)
+    }
+
     pub(crate) fn decode_for_context(v: u16, p: u16, b: &[u8]) -> Result<Self, StreamError> {
         context(v, p)?;
         if b.len() != STREAM_DATA_FIXED_BYTES || &b[..4] != MAGIC || b[4] != 0xd8 {
@@ -554,6 +577,70 @@ impl StreamDataHeaderV1 {
             bytes: b.to_vec(),
         })
     }
+}
+
+impl StreamDataV1 {
+    pub(crate) fn into_header_and_body(self) -> Result<(StreamDataHeaderV1, Vec<u8>), StreamError> {
+        let extent_len =
+            u32::try_from(self.bytes.len()).map_err(|_| StreamError::invalid("extent overflow"))?;
+        let header = StreamDataHeaderV1 {
+            transfer_id: self.transfer_id,
+            attempt_nonce: self.attempt_nonce,
+            sequence: self.sequence,
+            offset: self.offset,
+            extent_len,
+        };
+        header.encode_for_context(9, 5)?;
+        Ok((header, self.bytes))
+    }
+}
+
+pub(crate) fn encode_composite_data_record(
+    protected_header: &[u8],
+    body: Vec<u8>,
+) -> Result<Vec<u8>, StreamError> {
+    if protected_header.is_empty()
+        || protected_header.len() > MAX_PROTECTED_STREAM_DATA_HEADER_BYTES
+    {
+        return Err(StreamError::invalid(
+            "protected data header length exceeds its bound",
+        ));
+    }
+    let protected_len = u32::try_from(protected_header.len())
+        .map_err(|_| StreamError::invalid("protected data header length exceeds wire field"))?;
+    let capacity = 8_usize
+        .checked_add(protected_header.len())
+        .and_then(|length| length.checked_add(body.len()))
+        .ok_or_else(|| StreamError::invalid("composite data record length overflow"))?;
+    let mut output = Vec::with_capacity(capacity);
+    output.extend_from_slice(COMPOSITE_DATA_MAGIC);
+    output.extend_from_slice(&protected_len.to_be_bytes());
+    output.extend_from_slice(protected_header);
+    output.extend_from_slice(&body);
+    Ok(output)
+}
+
+pub(crate) fn split_composite_data_record(bytes: &[u8]) -> Result<(&[u8], &[u8]), StreamError> {
+    if bytes.len() < 8 || &bytes[..4] != COMPOSITE_DATA_MAGIC {
+        return Err(StreamError::invalid("composite data record marker differs"));
+    }
+    let protected_len = u32::from_be_bytes(
+        bytes[4..8]
+            .try_into()
+            .map_err(|_| StreamError::invalid("truncated protected data header length"))?,
+    ) as usize;
+    if protected_len == 0 || protected_len > MAX_PROTECTED_STREAM_DATA_HEADER_BYTES {
+        return Err(StreamError::invalid(
+            "protected data header length exceeds its bound",
+        ));
+    }
+    let body_offset = 8_usize
+        .checked_add(protected_len)
+        .ok_or_else(|| StreamError::invalid("composite data record length overflow"))?;
+    if body_offset > bytes.len() {
+        return Err(StreamError::invalid("truncated protected data header"));
+    }
+    Ok((&bytes[8..body_offset], &bytes[body_offset..]))
 }
 fn decode_data(b: &[u8]) -> Result<StreamDataV1, StreamError> {
     if b.len() < STREAM_DATA_FIXED_BYTES {
@@ -1017,6 +1104,7 @@ impl<'a> Reader<'a> {
 
 #[cfg(feature = "fuzzing")]
 pub(crate) fn fuzz_decode(input: &[u8]) {
+    let _ = split_composite_data_record(input);
     let id = [1; 32];
     let attempt_nonce = [2; 32];
     let seeded = match input {
@@ -1283,6 +1371,75 @@ mod stream_frame_codec {
         let mut h = b[..STREAM_DATA_FIXED_BYTES].to_vec();
         h[85..].copy_from_slice(&(MAX_STREAM_EXTENT_BYTES as u32 + 1).to_be_bytes());
         assert!(StreamDataHeaderV1::decode_for_context(9, 5, &h).is_err());
+    }
+    #[test]
+    fn data_frame_splits_into_a_canonical_header_and_exact_body() {
+        let data = match frames().remove(2) {
+            StreamFrame::Data(data) => data,
+            _ => unreachable!(),
+        };
+        let (header, body) = data.clone().into_header_and_body().unwrap();
+        let encoded_header = header.encode_for_context(9, 5).unwrap();
+
+        assert_eq!(encoded_header.len(), STREAM_DATA_FIXED_BYTES);
+        assert_eq!(body, data.bytes);
+        assert_eq!(
+            StreamDataHeaderV1::decode_for_context(9, 5, &encoded_header)
+                .unwrap()
+                .decode_body(&body)
+                .unwrap(),
+            data
+        );
+    }
+    #[test]
+    fn composite_data_record_keeps_the_segment_body_outside_the_protected_header() {
+        let protected_header = vec![0xa1; 137];
+        let body = vec![0xb2; PROFILE5_EXTENT_BYTES];
+        let encoded = encode_composite_data_record(&protected_header, body.clone()).unwrap();
+
+        assert_eq!(&encoded[..4], b"ASD1");
+        assert_eq!(encoded.len(), 4 + 4 + protected_header.len() + body.len());
+        let (decoded_header, decoded_body) = split_composite_data_record(&encoded).unwrap();
+        assert_eq!(decoded_header, protected_header);
+        assert_eq!(decoded_body, body);
+    }
+    #[test]
+    fn composite_data_record_rejects_unbounded_or_truncated_protected_headers() {
+        let mut truncated = b"ASD1".to_vec();
+        truncated.extend_from_slice(&137_u32.to_be_bytes());
+        truncated.extend_from_slice(&[0xa1; 16]);
+        assert!(split_composite_data_record(&truncated).is_err());
+
+        let mut unbounded = b"ASD1".to_vec();
+        unbounded.extend_from_slice(&2049_u32.to_be_bytes());
+        unbounded.extend_from_slice(&[0xa1; 16]);
+        assert!(split_composite_data_record(&unbounded).is_err());
+
+        assert!(split_composite_data_record(b"full-mission-record").is_err());
+    }
+    #[test]
+    fn composite_data_record_matches_the_independent_wire_corpus() {
+        for line in
+            include_str!("../../../conformance/vectors/profile5-composite-data-record-v1.tsv")
+                .lines()
+                .filter(|line| !line.starts_with('#'))
+        {
+            let mut fields = line.split('\t');
+            let disposition = fields.next().unwrap();
+            let name = fields.next().unwrap();
+            let hex = fields.next().unwrap();
+            assert!(fields.next().is_none(), "unexpected vector field: {name}");
+            let wire = hex
+                .as_bytes()
+                .chunks_exact(2)
+                .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                split_composite_data_record(&wire).is_ok(),
+                disposition == "ACCEPT",
+                "vector disposition differs: {name}"
+            );
+        }
     }
     #[test]
     fn codec_rejects_truncation_trailing_empty_and_overflow() {

@@ -11,7 +11,8 @@ use crate::{
     stream_transfer::{
         MAX_STREAM_CHECKPOINT_BATCH_BYTES, PROFILE5_EXTENT_BYTES, StreamAction, StreamClass,
         StreamDirection, StreamExtentAction, StreamFrame, StreamOpenV1, StreamReceiverState,
-        StreamResultCode, StreamSenderState, blob_pack_wire_len, profile5_attempt_bounds,
+        StreamResultCode, StreamSenderState, blob_pack_wire_len, encode_composite_data_record,
+        profile5_attempt_bounds, split_composite_data_record,
     },
     stream_transport::{AttemptOpenRequest, IrohQuicV1Adapter, StreamTransportAdapter},
 };
@@ -146,6 +147,25 @@ fn stream_frame_name(frame: &StreamFrame) -> &'static str {
 
 impl BlobRecordCodec for MissionBlobRecordCodec<'_> {
     fn encode(&mut self, frame: StreamFrame) -> Result<Vec<u8>, String> {
+        if let StreamFrame::Data(data) = frame {
+            let (header, body) = data
+                .into_header_and_body()
+                .map_err(|error| error.to_string())?;
+            let encoded_header = header
+                .encode_for_context(9, TransferProfileId::BlobStreamV1 as u16)
+                .map_err(|error| error.to_string())?;
+            let protected_header = self
+                .mission
+                .seal_v9_blob_data_header(
+                    self.profile_digest,
+                    self.direction,
+                    self.attempt_nonce,
+                    &encoded_header,
+                )
+                .map_err(|error| failure("seal data-header mission record", error))?;
+            return encode_composite_data_record(&protected_header, body)
+                .map_err(|error| error.to_string());
+        }
         let frame_name = stream_frame_name(&frame);
         let plaintext = frame
             .encode_for_context(9, TransferProfileId::BlobStreamV1 as u16)
@@ -161,6 +181,23 @@ impl BlobRecordCodec for MissionBlobRecordCodec<'_> {
     }
 
     fn decode(&mut self, bytes: &[u8]) -> Result<StreamFrame, String> {
+        if bytes.starts_with(b"ASD1") {
+            let (protected_header, body) =
+                split_composite_data_record(bytes).map_err(|error| error.to_string())?;
+            let header = self
+                .mission
+                .open_v9_blob_data_header(
+                    self.profile_digest,
+                    self.direction,
+                    self.attempt_nonce,
+                    protected_header,
+                )
+                .map_err(|error| failure("open data-header mission record", error))?;
+            return header
+                .decode_body(body)
+                .map(StreamFrame::Data)
+                .map_err(|error| error.to_string());
+        }
         let plaintext = self
             .mission
             .open_v9_blob_application_frame(
@@ -170,8 +207,13 @@ impl BlobRecordCodec for MissionBlobRecordCodec<'_> {
                 bytes,
             )
             .map_err(|error| error.to_string())?;
-        StreamFrame::decode_for_context(9, TransferProfileId::BlobStreamV1 as u16, &plaintext)
-            .map_err(|error| error.to_string())
+        let frame =
+            StreamFrame::decode_for_context(9, TransferProfileId::BlobStreamV1 as u16, &plaintext)
+                .map_err(|error| error.to_string())?;
+        if matches!(frame, StreamFrame::Data(_)) {
+            return Err("StreamData requires the profile-5 composite record".into());
+        }
+        Ok(frame)
     }
 }
 
@@ -1030,14 +1072,15 @@ async fn receive_completed_pack_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mission::{MissionPeerBinding, MissionSessionInitiator, MissionSessionResponder};
     use crate::stream_transport::{AdapterFuture, StreamReceiveAttempt, StreamTransportError};
     use crate::{application::blob_stream::publish_blob_stream, stream_pipeline::PipelineLimits};
     use aster_iroh::{CarrierSecurityProfile, Endpoint, EndpointConfig, ExpectedPeer, SecretKey};
     use aster_mesh::{
         BLOB_STREAM_SEGMENT_BYTES, BlobMetadata, BlobPublicationStreamId,
         BlobStreamFinalCommitment, BlobStreamOpen, BlobStreamSegmentOpener,
-        BlobStreamSegmentSealer, Priority, ProvisioningAccess, ReferenceEnvelopeSealer,
-        ReferenceProvisioner, Scope, Topic, VersionVector,
+        BlobStreamSegmentSealer, Priority, ProvisioningAccess, ProvisioningBundle,
+        ReferenceEnvelopeSealer, ReferenceProvisioner, Scope, Topic, VersionVector,
     };
     use std::{
         collections::BTreeSet,
@@ -1048,6 +1091,173 @@ mod tests {
     };
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+    fn mission_pair() -> (MissionSession, MissionSession, [u8; 32]) {
+        let scope = Scope::new("mission/alpha").unwrap();
+        let access =
+            ProvisioningAccess::member(scope, vec![1], vec![Topic::new("imagery").unwrap()])
+                .unwrap();
+        let mut provisioner = ReferenceProvisioner::from_seed([0xc1; 32]).unwrap();
+        let initiator_bytes = provisioner
+            .issue_node(1, std::slice::from_ref(&access))
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+        let responder_bytes = provisioner
+            .issue_node(2, &[access])
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+        let initiator_identity = ReferenceEnvelopeSealer::open(
+            ProvisioningBundle::from_bytes(&initiator_bytes).unwrap(),
+        )
+        .unwrap()
+        .identity();
+        let responder_identity = ReferenceEnvelopeSealer::open(
+            ProvisioningBundle::from_bytes(&responder_bytes).unwrap(),
+        )
+        .unwrap()
+        .identity();
+        let initiator_carrier = SecretKey::generate();
+        let responder_carrier = SecretKey::generate();
+        let (initiator, first) = MissionSessionInitiator::start(
+            ProvisioningBundle::from_bytes(&initiator_bytes).unwrap(),
+            MissionPeerBinding::new(responder_carrier.public(), responder_identity),
+            responder_carrier.public(),
+        )
+        .unwrap();
+        let responder = MissionSessionResponder::open(
+            ProvisioningBundle::from_bytes(&responder_bytes).unwrap(),
+            MissionPeerBinding::new(initiator_carrier.public(), initiator_identity),
+            initiator_carrier.public(),
+        )
+        .unwrap();
+        let (responder, second) = responder.receive_client(first.as_bytes()).unwrap();
+        let (initiator, third) = initiator.receive_server(second.as_bytes()).unwrap();
+        let (mut responder, fourth) = responder.receive_client_auth(third.as_bytes()).unwrap();
+        let mut initiator = initiator.receive_finished(fourth.as_bytes()).unwrap();
+
+        let offer = crate::event_pages::TransferProfileOfferV1::for_semantic_version(9).unwrap();
+        let initiator_offer = initiator.seal_transfer_profile_offer(&offer).unwrap();
+        responder
+            .open_transfer_profile_offer(&initiator_offer)
+            .unwrap();
+        let responder_offer = responder.seal_transfer_profile_offer(&offer).unwrap();
+        initiator
+            .open_transfer_profile_offer(&responder_offer)
+            .unwrap();
+        let negotiated = crate::event_pages::negotiate_transfer_profiles(&offer, &offer).unwrap();
+        let digest = crate::event_pages::transfer_profile_digest(&offer, &offer, &negotiated);
+        (initiator, responder, digest)
+    }
+
+    #[test]
+    fn mission_data_record_protects_only_the_canonical_header() {
+        let (mut sender, mut receiver, profile_digest) = mission_pair();
+        let nonce = [0xc2; 32];
+        let body = vec![0xc3; PROFILE5_EXTENT_BYTES];
+        let frame = StreamFrame::Data(crate::stream_transfer::StreamDataV1 {
+            transfer_id: [0xc4; 32],
+            attempt_nonce: nonce,
+            sequence: 0,
+            offset: 0,
+            bytes: body.clone(),
+        });
+        let mut sender_codec = MissionBlobRecordCodec {
+            mission: &mut sender,
+            profile_digest,
+            direction: EventDirection::ToSessionResponder,
+            attempt_nonce: nonce,
+        };
+        let encoded = sender_codec.encode(frame.clone()).unwrap();
+
+        assert_eq!(&encoded[encoded.len() - body.len()..], body);
+        assert!(
+            encoded.len()
+                < body.len() + crate::stream_transfer::MAX_PROTECTED_STREAM_DATA_HEADER_BYTES
+        );
+
+        let mut receiver_codec = MissionBlobRecordCodec {
+            mission: &mut receiver,
+            profile_digest,
+            direction: EventDirection::ToSessionResponder,
+            attempt_nonce: nonce,
+        };
+        assert_eq!(receiver_codec.decode(&encoded).unwrap(), frame);
+    }
+
+    #[test]
+    fn mission_codec_rejects_a_fully_wrapped_data_record() {
+        let (mut sender, mut receiver, profile_digest) = mission_pair();
+        let nonce = [0xc5; 32];
+        let frame = StreamFrame::Data(crate::stream_transfer::StreamDataV1 {
+            transfer_id: [0xc6; 32],
+            attempt_nonce: nonce,
+            sequence: 0,
+            offset: 0,
+            bytes: vec![0xc7; 32],
+        });
+        let plaintext = frame.encode_for_context(9, 5).unwrap();
+        let fully_wrapped = sender
+            .seal_v9_blob_application_frame(
+                profile_digest,
+                EventDirection::ToSessionResponder,
+                nonce,
+                &plaintext,
+            )
+            .unwrap();
+        let mut receiver_codec = MissionBlobRecordCodec {
+            mission: &mut receiver,
+            profile_digest,
+            direction: EventDirection::ToSessionResponder,
+            attempt_nonce: nonce,
+        };
+
+        assert!(receiver_codec.decode(&fully_wrapped).is_err());
+    }
+
+    #[test]
+    #[ignore = "explicit 256 MiB profile-5 composite-record measurement"]
+    fn composite_profile5_records_process_256_mib_in_bounded_extents() {
+        const TOTAL: u64 = 256 * 1024 * 1024;
+        let (mut sender, mut receiver, profile_digest) = mission_pair();
+        let nonce = [0xd1; 32];
+        let payload = vec![0xd2; PROFILE5_EXTENT_BYTES];
+        let mut sender_codec = MissionBlobRecordCodec {
+            mission: &mut sender,
+            profile_digest,
+            direction: EventDirection::ToSessionResponder,
+            attempt_nonce: nonce,
+        };
+        let mut receiver_codec = MissionBlobRecordCodec {
+            mission: &mut receiver,
+            profile_digest,
+            direction: EventDirection::ToSessionResponder,
+            attempt_nonce: nonce,
+        };
+        let started = std::time::Instant::now();
+        let mut offset = 0_u64;
+        let mut sequence = 0_u64;
+        while offset < TOTAL {
+            let frame = StreamFrame::Data(crate::stream_transfer::StreamDataV1 {
+                transfer_id: [0xd3; 32],
+                attempt_nonce: nonce,
+                sequence,
+                offset,
+                bytes: payload.clone(),
+            });
+            let protected = sender_codec.encode(frame).unwrap();
+            std::hint::black_box(receiver_codec.decode(&protected).unwrap());
+            offset += PROFILE5_EXTENT_BYTES as u64;
+            sequence += 1;
+        }
+        let elapsed = started.elapsed();
+        let mib_per_second = TOTAL as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64();
+        eprintln!(
+            "composite_profile5_record_benchmark bytes={TOTAL} extents={sequence} elapsed_ns={} mib_per_second={mib_per_second:.3}",
+            elapsed.as_nanos()
+        );
+    }
 
     struct TerminalReceiveAttempt {
         events: std::sync::Mutex<Vec<&'static str>>,
