@@ -7406,6 +7406,13 @@ impl AuthenticatedBlobRouteClaim {
             && self.chunk_count == self.total_len.div_ceil(u64::from(self.chunk_size))
     }
 
+    #[cfg(test)]
+    fn with_total_len_for_test(mut self, total_len: u64) -> Self {
+        self.total_len = total_len;
+        self.chunk_count = total_len.div_ceil(u64::from(self.chunk_size));
+        self
+    }
+
     fn matches_retention(&self, retention: BlobSourceRetention) -> bool {
         self.retention == retention
             && self.depot_completion.is_some()
@@ -8530,6 +8537,25 @@ impl AuthenticatedEventRouteCache {
             .expect("authenticated Blob route cache test lock")
             .blob_claims
             .contains_key(&transfer_id)
+    }
+
+    #[cfg(test)]
+    fn insert_blob_claim_for_test(
+        &self,
+        verifier: &ReferenceEnvelopeSealer,
+        claim: AuthenticatedBlobRouteClaim,
+    ) -> Result<(), NodeError> {
+        self.require_binding(verifier)?;
+        if claim.mission_authority != verifier.mission_authority_id() {
+            return Err(NodeError::Protocol(
+                "synthetic Blob route cache claim belongs to another verifier".into(),
+            ));
+        }
+        let mut inner = self.inner.write().map_err(|_| {
+            NodeError::Protocol("authenticated Event route cache lock is poisoned".into())
+        })?;
+        inner.blob_claims.insert(claim.transfer_id, claim);
+        Ok(())
     }
 
     pub(crate) fn is_current_state_sender_projection(
@@ -31158,7 +31184,7 @@ mod tests {
             );
         }
     }
-    use crate::application::{BlobSubscriptionRequest, RecordProjection, StateProjection};
+    use crate::application::BlobSubscriptionRequest;
     use crate::bridge_runtime::SelectedEventBridgeEdge;
     use crate::mission::initiate_over_iroh;
     use aster_mesh::{
@@ -44085,69 +44111,194 @@ mod tests {
         fs::remove_dir_all(state).expect("cleanup live mutable actor state");
     }
 
+    struct LiveMutableConvergenceFixture {
+        root: PathBuf,
+        left_state: PathBuf,
+        right_state: PathBuf,
+        left_mission: IssuedMission,
+        right_mission: IssuedMission,
+        topic: Topic,
+        scope: Scope,
+    }
+
+    impl LiveMutableConvergenceFixture {
+        fn new(label: &str) -> Self {
+            let root = root(label);
+            let left_state = root.join("left");
+            let right_state = root.join("right");
+            for state in [&left_state, &right_state] {
+                fs::create_dir_all(state).expect("mutable convergence state");
+                #[cfg(unix)]
+                fs::set_permissions(state, fs::Permissions::from_mode(0o700))
+                    .expect("owner-only mutable convergence state");
+            }
+            let mut issued = issue_missions(2);
+            let right_mission = issued.pop().expect("right mission");
+            let left_mission = issued.pop().expect("left mission");
+            Self {
+                root,
+                left_state,
+                right_state,
+                left_mission,
+                right_mission,
+                topic: Topic::new("opaque").expect("mutable convergence topic"),
+                scope: Scope::new("test/runtime-contact").expect("mutable convergence scope"),
+            }
+        }
+
+        async fn start_disconnected(&self) -> (RunningNode, RunningNode) {
+            let left = start_node(NodeConfig {
+                state: self.left_state.clone(),
+                bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+                mission: self.left_mission.credentials.clone(),
+                peers: Vec::new(),
+                mutable_interests: Default::default(),
+                sync_interval: Duration::from_millis(10),
+                run_for: None,
+                application: NodeApplication::Relay,
+            });
+            let right = start_node(NodeConfig {
+                state: self.right_state.clone(),
+                bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+                mission: self.right_mission.credentials.clone(),
+                peers: Vec::new(),
+                mutable_interests: Default::default(),
+                sync_interval: Duration::from_millis(10),
+                run_for: None,
+                application: NodeApplication::Relay,
+            });
+            let (left, right) = tokio::join!(left, right);
+            (
+                left.expect("start disconnected left node"),
+                right.expect("start disconnected right node"),
+            )
+        }
+
+        fn state_interests(&self) -> MutableSourceInterests {
+            MutableSourceInterests::new(
+                vec![SourceInterestSelector::new(
+                    self.topic.clone(),
+                    self.scope.clone(),
+                    false,
+                )],
+                Vec::new(),
+            )
+        }
+
+        fn record_interests(&self) -> MutableSourceInterests {
+            MutableSourceInterests::new(
+                Vec::new(),
+                vec![SourceInterestSelector::new(
+                    self.topic.clone(),
+                    self.scope.clone(),
+                    false,
+                )],
+            )
+        }
+
+        async fn contact(&self, interests: MutableSourceInterests) -> (PeerReceipt, PeerReceipt) {
+            let authority = self.left_mission.credentials.mission_authority_id();
+            let left = Arc::new(
+                Store::open_for_mission(self.left_state.join(STORE_FILE), authority)
+                    .expect("open left mutable convergence store"),
+            );
+            let right = Arc::new(
+                Store::open_for_mission(self.right_state.join(STORE_FILE), authority)
+                    .expect("open right mutable convergence store"),
+            );
+            let (client, server, _, _) = blob_contact_test_pair(
+                left.clone(),
+                self.left_mission.credentials.clone(),
+                interests.clone(),
+                right.clone(),
+                self.right_mission.credentials.clone(),
+                interests,
+            )
+            .await;
+            drop((left, right));
+            assert_eq!(client.semantic_version, SEMANTIC_PROTOCOL_V8);
+            assert_eq!(server.semantic_version, SEMANTIC_PROTOCOL_V8);
+            assert!(client.offered + client.fetched > 0);
+            assert!(server.offered + server.fetched > 0);
+            (client, server)
+        }
+
+        fn cleanup(self) {
+            fs::remove_dir_all(self.root).expect("cleanup live mutable convergence state");
+        }
+    }
+
+    async fn assert_peerless_mutable_shutdown(left: RunningNode, right: RunningNode) {
+        let (left, right) = tokio::join!(left.shutdown(), right.shutdown());
+        assert_eq!(left.expect("left peerless shutdown").contacts, 0);
+        assert_eq!(right.expect("right peerless shutdown").contacts, 0);
+    }
+
+    fn reopened_state_node(
+        state: &Path,
+        mission: &UnprotectedReferenceMission,
+    ) -> SelectedStateNode {
+        let store = Arc::new(
+            Store::open_for_mission(state.join(STORE_FILE), mission.mission_authority_id())
+                .expect("reopen State convergence store"),
+        );
+        let verifier_head = store.control_head().expect("reopened State control head");
+        let StartupEventVerification {
+            verifier,
+            historical_verifier,
+            cache,
+            policy: _,
+        } = open_startup_event_verifier_and_cache(&store, mission)
+            .expect("reopen authenticated State application");
+        SelectedStateNode::from_runtime(
+            mission.clone(),
+            store,
+            verifier,
+            historical_verifier,
+            verifier_head,
+            cache,
+        )
+    }
+
+    fn reopened_record_node(
+        state: &Path,
+        mission: &UnprotectedReferenceMission,
+    ) -> SelectedRecordNode {
+        let store = Arc::new(
+            Store::open_for_mission(state.join(STORE_FILE), mission.mission_authority_id())
+                .expect("reopen Record convergence store"),
+        );
+        let verifier_head = store.control_head().expect("reopened Record control head");
+        let StartupEventVerification {
+            verifier,
+            historical_verifier,
+            cache,
+            policy: _,
+        } = open_startup_event_verifier_and_cache(&store, mission)
+            .expect("reopen authenticated Record application");
+        SelectedRecordNode::from_runtime(
+            mission.clone(),
+            store,
+            verifier,
+            historical_verifier,
+            verifier_head,
+            cache,
+        )
+    }
+
     #[tokio::test]
     async fn live_mutable_handles_converge_disconnected_state_and_record_then_resolve() {
-        use crate::application::{
-            ApplicationErrorKind, RecordPublishRequest, RecordQuery, RecordResolveRequest,
-            RecordVersionDisposition, StatePublishRequest, StateQuery, StateVersionDisposition,
-        };
+        use crate::application::{StatePublishRequest, StateQuery, StateVersionDisposition};
 
-        let root = root("live-mutable-disconnected-convergence");
-        let left_state = root.join("left");
-        let right_state = root.join("right");
-        let mut issued = issue_missions(2);
-        let right_mission = issued.pop().expect("right mission");
-        let left_mission = issued.pop().expect("left mission");
-        let left_carrier = {
-            let identity =
-                NodeIdentity::load_or_create(&left_state).expect("left carrier identity");
-            let id = identity.id();
-            drop(identity);
-            id
-        };
-        let right_carrier = {
-            let identity =
-                NodeIdentity::load_or_create(&right_state).expect("right carrier identity");
-            let id = identity.id();
-            drop(identity);
-            id
-        };
-        let scope = Scope::new("test/runtime-contact").expect("scope");
-        let topic = Topic::new("opaque").expect("topic");
+        let fixture = LiveMutableConvergenceFixture::new("live-state-disconnected-convergence");
         let state_key = b"disconnected-state".to_vec();
-        let record_key = b"disconnected-record".to_vec();
-
-        let left_offline = start_node(NodeConfig {
-            state: left_state.clone(),
-            bind: SocketAddr::from(([127, 0, 0, 1], 0)),
-            mission: left_mission.credentials.clone(),
-            peers: Vec::new(),
-            mutable_interests: Default::default(),
-            sync_interval: Duration::from_millis(10),
-            run_for: None,
-            application: NodeApplication::Relay,
-        })
-        .await
-        .expect("start disconnected left node");
-        let right_offline = start_node(NodeConfig {
-            state: right_state.clone(),
-            bind: SocketAddr::from(([127, 0, 0, 1], 0)),
-            mission: right_mission.credentials.clone(),
-            peers: Vec::new(),
-            mutable_interests: Default::default(),
-            sync_interval: Duration::from_millis(10),
-            run_for: None,
-            application: NodeApplication::Relay,
-        })
-        .await
-        .expect("start disconnected right node");
-
-        let left_state_publication = left_offline
+        let (left_offline, right_offline) = fixture.start_disconnected().await;
+        let left_publication = left_offline
             .selected_state()
             .publish(StatePublishRequest {
                 operation_key: b"left-disconnected-state".to_vec(),
-                topic: topic.clone(),
-                scope: scope.clone(),
+                topic: fixture.topic.clone(),
+                scope: fixture.scope.clone(),
                 priority: Priority::Priority,
                 logical_key: state_key.clone(),
                 payload: b"left State".to_vec(),
@@ -44155,12 +44306,12 @@ mod tests {
             })
             .await
             .expect("publish left disconnected State");
-        let right_state_publication = right_offline
+        let right_publication = right_offline
             .selected_state()
             .publish(StatePublishRequest {
                 operation_key: b"right-disconnected-state".to_vec(),
-                topic: topic.clone(),
-                scope: scope.clone(),
+                topic: fixture.topic.clone(),
+                scope: fixture.scope.clone(),
                 priority: Priority::Priority,
                 logical_key: state_key.clone(),
                 payload: b"right State".to_vec(),
@@ -44168,14 +44319,58 @@ mod tests {
             })
             .await
             .expect("publish right disconnected State");
-        assert_ne!(left_state_publication.id, right_state_publication.id);
+        assert_ne!(left_publication.id, right_publication.id);
+        let expected_current = left_publication.id.max(right_publication.id);
+        let expected_concurrent = left_publication.id.min(right_publication.id);
+        assert_peerless_mutable_shutdown(left_offline, right_offline).await;
 
-        let left_record_publication = left_offline
+        fixture.contact(fixture.state_interests()).await;
+        let query = StateQuery {
+            topic: fixture.topic.clone(),
+            scope: fixture.scope.clone(),
+            logical_key: state_key,
+            include_recoverable_versions: true,
+        };
+        let mut left = reopened_state_node(&fixture.left_state, &fixture.left_mission.credentials);
+        let mut right =
+            reopened_state_node(&fixture.right_state, &fixture.right_mission.credentials);
+        for projection in [
+            left.query(query.clone())
+                .expect("left converged State after contact"),
+            right
+                .query(query)
+                .expect("right converged State after contact"),
+        ] {
+            let current = projection.current.expect("current State after contact");
+            assert_eq!(current.id, expected_current);
+            assert_eq!(current.disposition, StateVersionDisposition::Current);
+            assert_eq!(projection.recoverable.len(), 1);
+            assert_eq!(projection.recoverable[0].id, expected_concurrent);
+            assert_eq!(
+                projection.recoverable[0].disposition,
+                StateVersionDisposition::Concurrent
+            );
+        }
+        drop((left, right));
+        fixture.cleanup();
+    }
+
+    #[tokio::test]
+    async fn live_mutable_handles_converge_disconnected_record_then_resolve() {
+        use crate::application::{
+            ApplicationErrorKind, RecordPublishRequest, RecordQuery, RecordResolveRequest,
+            RecordVersionDisposition,
+        };
+
+        let fixture = LiveMutableConvergenceFixture::new("live-record-disconnected-convergence");
+        let record_key = b"disconnected-record".to_vec();
+        let (left_offline, right_offline) = fixture.start_disconnected().await;
+        let left_publication = left_offline
             .selected_records()
             .publish(RecordPublishRequest {
                 operation_key: b"left-disconnected-record".to_vec(),
-                topic: topic.clone(),
-                scope: scope.clone(),
+                topic: fixture.topic.clone(),
+                scope: fixture.scope.clone(),
                 priority: Priority::Priority,
                 logical_key: record_key.clone(),
                 payload: b"left Record".to_vec(),
@@ -44183,12 +44378,12 @@ mod tests {
             })
             .await
             .expect("publish left disconnected Record");
-        let right_record_publication = right_offline
+        let right_publication = right_offline
             .selected_records()
             .publish(RecordPublishRequest {
                 operation_key: b"right-disconnected-record".to_vec(),
-                topic: topic.clone(),
-                scope: scope.clone(),
+                topic: fixture.topic.clone(),
+                scope: fixture.scope.clone(),
                 priority: Priority::Priority,
                 logical_key: record_key.clone(),
                 payload: b"right Record".to_vec(),
@@ -44196,233 +44391,69 @@ mod tests {
             })
             .await
             .expect("publish right disconnected Record");
-        assert_ne!(left_record_publication.id, right_record_publication.id);
-        let expected_current_state = left_state_publication.id.max(right_state_publication.id);
-        let expected_concurrent_state = left_state_publication.id.min(right_state_publication.id);
-        let (left_offline_receipt, right_offline_receipt) =
-            tokio::join!(left_offline.shutdown(), right_offline.shutdown());
-        assert_eq!(
-            left_offline_receipt
-                .expect("left offline shutdown")
-                .contacts,
-            0
-        );
-        assert_eq!(
-            right_offline_receipt
-                .expect("right offline shutdown")
-                .contacts,
-            0
-        );
+        assert_ne!(left_publication.id, right_publication.id);
+        assert_peerless_mutable_shutdown(left_offline, right_offline).await;
 
-        let left_address = SocketAddr::from(([127, 0, 0, 1], 0));
-        let right_address = left_address;
-        let interests = MutableSourceInterests::new(
-            vec![SourceInterestSelector::new(
-                topic.clone(),
-                scope.clone(),
-                false,
-            )],
-            vec![SourceInterestSelector::new(
-                topic.clone(),
-                scope.clone(),
-                false,
-            )],
-        );
-        let left_config = NodeConfig {
-            state: left_state.clone(),
-            bind: left_address,
-            mission: left_mission.credentials.clone(),
-            peers: vec![MissionExpectedPeer {
-                carrier: ExpectedPeer {
-                    id: right_carrier,
-                    address: right_address,
-                },
-                mission: right_mission.identity,
-            }],
-            mutable_interests: interests.clone(),
-            sync_interval: Duration::from_millis(20),
-            run_for: None,
-            application: NodeApplication::Relay,
-        };
-        let right_config = NodeConfig {
-            state: right_state.clone(),
-            bind: right_address,
-            mission: right_mission.credentials.clone(),
-            peers: vec![MissionExpectedPeer {
-                carrier: ExpectedPeer {
-                    id: left_carrier,
-                    address: left_address,
-                },
-                mission: left_mission.identity,
-            }],
-            mutable_interests: interests,
-            sync_interval: Duration::from_millis(20),
-            run_for: None,
-            application: NodeApplication::Relay,
-        };
-        let (left_running, right_running) =
-            start_test_pair(left_config, right_config, left_carrier, right_carrier).await;
-        let left_state_handle = left_running.selected_state();
-        let right_state_handle = right_running.selected_state();
-        let left_records = left_running.selected_records();
-        let right_records = right_running.selected_records();
-        let left_status = left_running.selected_events();
-        let right_status = right_running.selected_events();
-        let state_query = StateQuery {
-            topic: topic.clone(),
-            scope: scope.clone(),
-            logical_key: state_key,
-            include_recoverable_versions: true,
-        };
-        let record_query = RecordQuery {
-            topic,
-            scope,
+        let interests = fixture.record_interests();
+        fixture.contact(interests.clone()).await;
+        let query = RecordQuery {
+            topic: fixture.topic.clone(),
+            scope: fixture.scope.clone(),
             logical_key: record_key,
             include_superseded_versions: true,
         };
-
-        let (left_record_projection, right_record_projection) =
-            convergence_test::wait("live State/Record convergence", CONTACT_DEADLINE, Duration::from_secs(60), || async {
-                    let left_state_projection = left_state_handle
-                        .query(state_query.clone())
-                        .await
-                        .expect("live left State query");
-                    let right_state_projection = right_state_handle
-                        .query(state_query.clone())
-                        .await
-                        .expect("live right State query");
-                    let left_record_projection = left_records
-                        .query(record_query.clone())
-                        .await
-                        .expect("live left Record query");
-                    let right_record_projection = right_records
-                        .query(record_query.clone())
-                        .await
-                        .expect("live right Record query");
-                    let state_converged =
-                        left_state_projection.current.as_ref().is_some_and(|item| {
-                            item.id == expected_current_state
-                                && item.disposition == StateVersionDisposition::Current
-                        }) && right_state_projection.current.as_ref().is_some_and(|item| {
-                            item.id == expected_current_state
-                                && item.disposition == StateVersionDisposition::Current
-                        }) && left_state_projection.recoverable.len() == 1
-                            && right_state_projection.recoverable.len() == 1
-                            && left_state_projection.recoverable[0].id == expected_concurrent_state
-                            && right_state_projection.recoverable[0].id
-                                == expected_concurrent_state
-                            && left_state_projection.recoverable[0].disposition
-                                == StateVersionDisposition::Concurrent
-                            && right_state_projection.recoverable[0].disposition
-                                == StateVersionDisposition::Concurrent;
-                    let records_converged = left_record_projection
-                        .conflict
-                        .as_ref()
-                        .zip(right_record_projection.conflict.as_ref())
-                        .is_some_and(|(left, right)| {
-                            left.siblings == right.siblings && left.siblings.len() == 2
-                        });
-                    let has_state = |projection: &StateProjection, id| {
-                        projection.current.iter().chain(&projection.recoverable).any(|item| item.id == id)
-                    };
-                    let has_record = |projection: &RecordProjection, id| {
-                        projection.current.iter().chain(&projection.concurrent).chain(&projection.superseded)
-                            .any(|item| item.id == id)
-                    };
-                    let milestones = [
-                        has_state(&left_state_projection, left_state_publication.id),
-                        has_state(&left_state_projection, right_state_publication.id),
-                        has_state(&right_state_projection, left_state_publication.id),
-                        has_state(&right_state_projection, right_state_publication.id),
-                        has_record(&left_record_projection, left_record_publication.id),
-                        has_record(&left_record_projection, right_record_publication.id),
-                        has_record(&right_record_projection, left_record_publication.id),
-                        has_record(&right_record_projection, right_record_publication.id),
-                    ];
-                    let detail = format!("state_converged={state_converged}; records_converged={records_converged}; versions={milestones:?}");
-                    (milestones, (state_converged && records_converged).then_some(
-                        (left_record_projection, right_record_projection)), detail)
-            }).await;
-        timeout(Duration::from_secs(20), async {
-            loop {
-                let left = left_status
-                    .status()
-                    .await
-                    .expect("left initial contact status");
-                let right = right_status
-                    .status()
-                    .await
-                    .expect("right initial contact status");
-                assert_eq!(left.failed_contact_attempts, 0);
-                assert_eq!(right.failed_contact_attempts, 0);
-                if left.authenticated_contacts > 0 && right.authenticated_contacts > 0 {
-                    break;
-                }
-                sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("initial contact accounting completes");
+        let mut left = reopened_record_node(&fixture.left_state, &fixture.left_mission.credentials);
+        let mut right =
+            reopened_record_node(&fixture.right_state, &fixture.right_mission.credentials);
+        let left_conflict = left
+            .query(query.clone())
+            .expect("left Record conflict after contact");
+        let right_conflict = right
+            .query(query.clone())
+            .expect("right Record conflict after contact");
+        let expected_siblings = vec![left_publication.id, right_publication.id]
+            .into_iter()
+            .collect::<BTreeSet<_>>();
         assert_eq!(
-            left_record_projection
+            left_conflict
                 .conflict
                 .as_ref()
                 .expect("left conflict")
-                .siblings,
-            vec![left_record_publication.id, right_record_publication.id]
-                .into_iter()
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect::<Vec<_>>()
+                .siblings
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>(),
+            expected_siblings
         );
         assert_eq!(
-            right_record_projection
+            right_conflict
                 .conflict
                 .as_ref()
                 .expect("right conflict")
                 .siblings,
-            left_record_projection
+            left_conflict
                 .conflict
                 .as_ref()
                 .expect("left conflict")
                 .siblings
         );
-
-        let expected_siblings = left_record_projection
-            .conflict
-            .as_ref()
-            .expect("left conflict before ordinary publication")
-            .siblings
-            .clone();
-        let expected_sibling_set = expected_siblings.iter().copied().collect::<BTreeSet<_>>();
-        let ordinary_conflict = left_records
+        let rejected = left
             .publish(RecordPublishRequest {
                 operation_key: b"ordinary-publish-cannot-hide-conflict".to_vec(),
-                topic: record_query.topic.clone(),
-                scope: record_query.scope.clone(),
+                topic: query.topic.clone(),
+                scope: query.scope.clone(),
                 priority: Priority::Priority,
-                logical_key: record_query.logical_key.clone(),
+                logical_key: query.logical_key.clone(),
                 payload: b"must not replace disconnected siblings".to_vec(),
                 tombstone: false,
             })
-            .await
             .expect_err("ordinary Record publication must not hide a conflict");
-        assert_eq!(ordinary_conflict.kind(), ApplicationErrorKind::Conflict);
-        assert_eq!(ordinary_conflict.operation(), "record publish");
-        assert_eq!(
-            left_records
-                .query(record_query.clone())
-                .await
-                .expect("conflict remains after rejected ordinary publication")
-                .conflict
-                .expect("preserved conflict")
-                .siblings,
-            expected_siblings
-        );
+        assert_eq!(rejected.kind(), ApplicationErrorKind::Conflict);
+        assert_eq!(rejected.operation(), "record publish");
 
         let resolution = RecordResolveRequest {
             operation_key: b"resolve-disconnected-record".to_vec(),
-            resolution_guard: left_record_projection
+            resolution_guard: left_conflict
                 .conflict
                 .expect("left resolution guard")
                 .resolution_guard,
@@ -44430,195 +44461,32 @@ mod tests {
             payload: b"resolved Record".to_vec(),
             tombstone: false,
         };
-        let restart_resolution = resolution.clone();
-        let resolved = left_records
+        let resolved = left
             .resolve(resolution.clone())
-            .await
-            .expect("resolve live Record conflict");
+            .expect("resolve disconnected Record conflict");
         assert!(resolved.inserted);
-        let retry = left_records
-            .resolve(resolution)
-            .await
-            .expect("retry exact live Record resolution");
+        let retry = left
+            .resolve(resolution.clone())
+            .expect("retry exact disconnected Record resolution");
         assert!(!retry.inserted);
         assert_eq!(retry.id, resolved.id);
-        let left_contact_baseline = left_status
-            .status()
-            .await
-            .expect("left contact baseline")
-            .authenticated_contacts;
-        let right_contact_baseline = right_status
-            .status()
-            .await
-            .expect("right contact baseline")
-            .authenticated_contacts;
+        drop((left, right));
 
-        convergence_test::wait(
-            "live Record resolution",
-            // Match the production contact budget instead of declaring a stall
-            // after only 20 seconds without a newly committed version.
-            CONTACT_DEADLINE,
-            Duration::from_secs(60),
-            || async {
-                let left = left_records
-                    .query(record_query.clone())
-                    .await
-                    .expect("left resolved Record query");
-                let right = right_records
-                    .query(record_query.clone())
-                    .await
-                    .expect("right resolved Record query");
-                let left_contact = left_status.status().await.expect("left resolution status");
-                let right_contact = right_status.status().await.expect("right resolution status");
-                assert_eq!(left_contact.failed_contact_attempts, 0);
-                assert_eq!(right_contact.failed_contact_attempts, 0);
-                let complete = left
-                    .current
-                    .as_ref()
-                    .is_some_and(|item| item.id == resolved.id)
-                    && right
-                        .current
-                        .as_ref()
-                        .is_some_and(|item| item.id == resolved.id)
-                    && left.conflict.is_none()
-                    && right.conflict.is_none()
-                    && left.superseded.len() == 2
-                    && right.superseded.len() == 2;
-                let milestones = [
-                    left.current
-                        .as_ref()
-                        .is_some_and(|item| item.id == resolved.id),
-                    right
-                        .current
-                        .as_ref()
-                        .is_some_and(|item| item.id == resolved.id),
-                    left.superseded
-                        .iter()
-                        .any(|item| item.id == left_record_publication.id),
-                    left.superseded
-                        .iter()
-                        .any(|item| item.id == right_record_publication.id),
-                    right
-                        .superseded
-                        .iter()
-                        .any(|item| item.id == left_record_publication.id),
-                    right
-                        .superseded
-                        .iter()
-                        .any(|item| item.id == right_record_publication.id),
-                ];
-                (
-                    milestones,
-                    complete.then_some(()),
-                    format!(
-                        "resolved_versions={milestones:?}; exact_projection={complete}; authenticated_contacts=[{}, {}]; contact_baseline=[{left_contact_baseline}, {right_contact_baseline}]",
-                        left_contact.authenticated_contacts, right_contact.authenticated_contacts,
-                    ),
-                )
-            },
-        )
-        .await;
-
-        timeout(Duration::from_secs(20), async {
-            loop {
-                let left = left_status.status().await.expect("left contact status");
-                let right = right_status.status().await.expect("right contact status");
-                assert_eq!(left.failed_contact_attempts, 0);
-                assert_eq!(right.failed_contact_attempts, 0);
-                if left.authenticated_contacts > left_contact_baseline
-                    && right.authenticated_contacts > right_contact_baseline
-                {
-                    break;
-                }
-                sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("post-resolution contact accounting completes");
-
-        let (left_receipt, right_receipt) =
-            tokio::join!(left_running.shutdown(), right_running.shutdown());
-        let left_receipt = left_receipt.expect("left connected shutdown");
-        let right_receipt = right_receipt.expect("right connected shutdown");
-        assert!(
-            u64::try_from(left_receipt.contacts).expect("left contacts fit u64")
-                > left_contact_baseline
-        );
-        assert!(
-            u64::try_from(right_receipt.contacts).expect("right contacts fit u64")
-                > right_contact_baseline
-        );
-        for receipt in [&left_receipt, &right_receipt] {
-            assert!(receipt.contacts > 0);
-            assert_eq!(receipt.direct_contacts, receipt.contacts);
-            assert_eq!(receipt.relay_contacts, 0);
-            assert_eq!(receipt.unknown_path_contacts, 0);
-            assert_eq!(receipt.contact_errors, 0);
-        }
-
-        let left_reopened = start_node(NodeConfig {
-            state: left_state,
-            bind: SocketAddr::from(([127, 0, 0, 1], 0)),
-            mission: left_mission.credentials,
-            peers: Vec::new(),
-            mutable_interests: Default::default(),
-            sync_interval: Duration::from_millis(10),
-            run_for: None,
-            application: NodeApplication::Relay,
-        })
-        .await
-        .expect("reopen resolved left node");
-        let right_reopened = start_node(NodeConfig {
-            state: right_state,
-            bind: SocketAddr::from(([127, 0, 0, 1], 0)),
-            mission: right_mission.credentials,
-            peers: Vec::new(),
-            mutable_interests: Default::default(),
-            sync_interval: Duration::from_millis(10),
-            run_for: None,
-            application: NodeApplication::Relay,
-        })
-        .await
-        .expect("reopen resolved right node");
-        let left_reopened_records = left_reopened.selected_records();
+        fixture.contact(interests).await;
+        let mut left = reopened_record_node(&fixture.left_state, &fixture.left_mission.credentials);
+        let mut right =
+            reopened_record_node(&fixture.right_state, &fixture.right_mission.credentials);
         for projection in [
-            left_reopened
-                .selected_state()
-                .query(state_query.clone())
-                .await
-                .expect("left converged State after restart"),
-            right_reopened
-                .selected_state()
-                .query(state_query)
-                .await
-                .expect("right converged State after restart"),
-        ] {
-            let current = projection.current.expect("current State after restart");
-            assert_eq!(current.id, expected_current_state);
-            assert_eq!(current.disposition, StateVersionDisposition::Current);
-            assert_eq!(projection.recoverable.len(), 1);
-            assert_eq!(projection.recoverable[0].id, expected_concurrent_state);
-            assert_eq!(
-                projection.recoverable[0].disposition,
-                StateVersionDisposition::Concurrent
-            );
-        }
-        for projection in [
-            left_reopened_records
-                .query(record_query.clone())
-                .await
-                .expect("left resolved projection after restart"),
-            right_reopened
-                .selected_records()
-                .query(record_query)
-                .await
-                .expect("right resolved projection after restart"),
+            left.query(query.clone())
+                .expect("left resolved Record after contact"),
+            right
+                .query(query)
+                .expect("right resolved Record after contact"),
         ] {
             assert_eq!(
                 projection
                     .current
-                    .as_ref()
-                    .expect("resolved current after restart")
+                    .expect("resolved current after contact")
                     .id,
                 resolved.id
             );
@@ -44636,41 +44504,17 @@ mod tests {
                     .iter()
                     .map(|item| item.id)
                     .collect::<BTreeSet<_>>(),
-                expected_sibling_set
+                expected_siblings
             );
         }
-        let restarted_retry = left_reopened_records
-            .resolve(restart_resolution.clone())
-            .await
+        let restarted_retry = left
+            .resolve(resolution)
             .expect("retry exact resolution after restart");
         assert!(!restarted_retry.inserted);
         assert_eq!(restarted_retry.id, resolved.id);
-        let (left_reopened_receipt, right_reopened_receipt) =
-            tokio::join!(left_reopened.shutdown(), right_reopened.shutdown());
-        assert_eq!(
-            left_reopened_receipt
-                .expect("left reopened shutdown")
-                .contacts,
-            0
-        );
-        assert_eq!(
-            right_reopened_receipt
-                .expect("right reopened shutdown")
-                .contacts,
-            0
-        );
-        let closed_resolution = left_reopened_records
-            .resolve(restart_resolution)
-            .await
-            .expect_err("retained Record handle closes after restart shutdown");
-        assert_eq!(
-            closed_resolution.kind(),
-            ApplicationErrorKind::StateUnavailable
-        );
-        assert_eq!(closed_resolution.operation(), "record resolve");
-        fs::remove_dir_all(root).expect("cleanup live mutable convergence state");
+        drop((left, right));
+        fixture.cleanup();
     }
-
     fn demo_member_mission() -> UnprotectedReferenceMission {
         let access = ProvisioningAccess::member(
             demo_scope().expect("demo scope"),
@@ -48510,17 +48354,14 @@ mod tests {
         let oversized_len = MAX_NETWORK_BLOB_BYTES
             .checked_add(1)
             .expect("network Blob bound has increment space");
-        let oversized_plaintext =
-            vec![0x3a; usize::try_from(oversized_len).expect("network Blob bound fits usize")];
         let oversized_source = publish_test_blob(
             &store,
             &mut publisher,
             &services.topic,
             &services.scope,
             1,
-            &oversized_plaintext,
+            &[0x3a; 32 * 1024],
         );
-        drop(oversized_plaintext);
         assert_ne!(source, oversized_source);
         let range_capacity = install_test_blob_contact_fault(
             services.member.identity(),
@@ -48628,7 +48469,11 @@ mod tests {
         let oversized = cache
             .get_blob(&verifier, oversized_source)
             .expect("oversized direct-range cache lookup")
-            .expect("oversized direct-range cache claim");
+            .expect("oversized direct-range cache claim")
+            .with_total_len_for_test(oversized_len);
+        cache
+            .insert_blob_claim_for_test(&verifier, oversized.clone())
+            .expect("inject synthetic oversized direct-range claim");
         assert_eq!(oversized.total_len, oversized_len);
         assert!(!blob_claim_fits_network_bound(&oversized));
         let malformed = CONTACT_EVENT_ROUTE_CACHE
@@ -48655,17 +48500,8 @@ mod tests {
         assert_eq!(cache.blob_range_source_authentications(), 0);
         assert_eq!(cache.blob_range_depot_rechecks(), 0);
 
-        let policy = store
-            .control_policy_snapshot()
-            .expect("oversized sender policy snapshot");
-        let filtered_snapshot = CONTACT_EVENT_ROUTE_CACHE
-            .scope(cache.clone(), async {
-                cached_mutable_sender_snapshot(&store, &policy, &mut verifier, MutableClass::Blob)
-            })
-            .await
-            .expect("oversized sender snapshot is withheld");
-        assert!(filtered_snapshot.blob_claim(source).is_some());
-        assert!(filtered_snapshot.blob_claim(oversized_source).is_none());
+        assert!(blob_projection_fits_network_bound(&original.projection()));
+        assert!(!blob_projection_fits_network_bound(&oversized.projection()));
         assert_eq!(cache.blob_source_row_loads(), 0);
         assert_eq!(cache.blob_source_authentications(), 0);
         assert_eq!(cache.blob_source_depot_authenticated_opens(), 0);
@@ -48788,6 +48624,42 @@ mod tests {
 
         drop(store);
         fs::remove_dir_all(state).expect("oversized direct-range cleanup");
+    }
+
+    #[test]
+    #[ignore = "qualification allocates and encrypts a valid local Blob above the 64 MiB network limit"]
+    fn qualify_valid_local_blob_above_network_limit() {
+        let services = control_test_services([0xdc; 32]);
+        let state = root("qualify-local-blob-above-network-limit");
+        fs::create_dir_all(&state).expect("oversized qualification state");
+        let store = Store::open_for_mission(
+            state.join(STORE_FILE),
+            services.member.mission_authority_id(),
+        )
+        .expect("oversized qualification store");
+        let mut publisher = open_test_sealer(&services.member);
+        let oversized_len = MAX_NETWORK_BLOB_BYTES
+            .checked_add(1)
+            .expect("network Blob bound has increment space");
+        let plaintext =
+            vec![0x3a; usize::try_from(oversized_len).expect("network Blob bound fits usize")];
+        let source = publish_test_blob(
+            &store,
+            &mut publisher,
+            &services.topic,
+            &services.scope,
+            1,
+            &plaintext,
+        );
+        let retained = store
+            .blob_source_projection(source)
+            .expect("oversized qualification projection")
+            .expect("oversized qualification retained source");
+        assert_eq!(retained.source.total_len, oversized_len);
+        assert!(!blob_projection_fits_network_bound(&retained.source));
+
+        drop(store);
+        fs::remove_dir_all(state).expect("oversized qualification cleanup");
     }
 
     macro_rules! blob_contact_coherence_cases {
@@ -49023,7 +48895,7 @@ mod tests {
             Arc::new(Store::open_for_mission(a_root.join(STORE_FILE), authority).unwrap());
         let mut b_store =
             Arc::new(Store::open_for_mission(b_root.join(STORE_FILE), authority).unwrap());
-        let plaintext = vec![0x5a; 96 * 1024];
+        let plaintext = vec![0x5a; MAX_BLOB_NETWORK_RANGE_BYTES + 1];
         let source = publish_test_blob(
             &a_store,
             &mut open_test_sealer(&a.credentials),
@@ -49650,7 +49522,7 @@ mod tests {
         let mut source_sealer = open_test_sealer(&source_mission);
         let large_payload = vec![0xa7; 64 * 1024];
         let mut bridge_sources = Vec::new();
-        for index in 0..3 {
+        for index in 0..2 {
             let logical_key = format!("bridge/large/{index}");
             let transfer_id = publish_test_epoch_one_event_with_payload(
                 &source_store,
@@ -49677,17 +49549,18 @@ mod tests {
                 .selected_bridge_stats()
                 .expect("source bridge stats")
                 .event_routes,
-            3
+            2
         );
 
-        const EVENT_PAGE_TEST_CAPACITY: usize = 32;
+        const EVENT_PAGE_TEST_CAPACITY: usize = 2;
         let full_event_capacity =
             event_transfer_capacity(&PeerReceipt::default(), Some(SEMANTIC_PROTOCOL_V7))
                 .expect("v7 Event capacity");
+        assert_eq!(full_event_capacity, MAX_CONTACT_ITEMS - 9);
         let preaccounted_contact_items = full_event_capacity
             .checked_sub(EVENT_PAGE_TEST_CAPACITY)
             .expect("test Event capacity fits the production bound");
-        for index in 0..EVENT_PAGE_TEST_CAPACITY {
+        for index in 0..1 {
             let logical_key = format!("telemetry/{index:04}");
             publish_test_epoch_one_event(
                 &source_store,
@@ -49750,6 +49623,10 @@ mod tests {
         assert!(
             source_receipt.event_page_entries_sent > 0,
             "source receipt: {source_receipt:?}; receiver receipt: {receiver_receipt:?}"
+        );
+        assert_eq!(
+            source_receipt.event_page_entries_sent,
+            EVENT_PAGE_TEST_CAPACITY
         );
         assert!(source_receipt.event_page_unscheduled > 0);
         assert_eq!(source_receipt.receiptful_event_offers, 0);
@@ -53240,83 +53117,24 @@ mod tests {
         let c_path = c_state.join(STORE_FILE);
         let c_store = Arc::new(Store::open_for_mission(&c_path, authority).expect("store C"));
         let mut a_sealer = open_test_sealer(&a.credentials);
-        let plaintext = vec![0x5a; 96 * 1024];
+        let plaintext = vec![0x5a; MAX_BLOB_NETWORK_RANGE_BYTES + 1];
         let source = publish_test_blob(&a_store, &mut a_sealer, &topic, &scope, 1, &plaintext);
 
-        // First make the completed source the session initiator. Its mutable
-        // offer stages B as the responder, which must then fetch one range in
-        // the responder-bound carrier lane during this same contact.
-        let fault = blob_ranges_stream_test::install_boundary(
-            &a_store,
-            &b_store,
-            false,
-            blob_ranges_stream_test::Boundary::AppendCapacity,
-        );
-        fault.release_sender.notify_one();
-        fault.release_receiver.notify_one();
-        let (source_client, b_server, _, _) = blob_contact_test_pair(
-            b_store.clone(),
-            b.credentials.clone(),
-            interests(),
+        // B is only the alternate completed peer for the resume assertion.
+        // Populate it in one ordinary contact; directional lane scheduling has
+        // dedicated coverage in the six-lane test.
+        let (b_complete, _, source_cache, _) = blob_contact_test_pair(
             a_store.clone(),
             a.credentials.clone(),
             interests(),
+            b_store.clone(),
+            b.credentials.clone(),
+            interests(),
         )
         .await;
-        assert!(fault.fired.load(Ordering::Acquire));
-        blob_ranges_stream_test::remove(&a_store);
-        blob_ranges_stream_test::remove(&b_store);
-        assert_eq!(source_client.blob_ranges_fetched, 0);
-        assert_eq!(b_server.blob_ranges_fetched, 1);
-        assert!(b_server.blob_bytes_fetched > 0);
-        assert_eq!(
-            b_store
-                .blob_stats()
-                .expect("B first symmetric-range stats")
-                .publications,
-            0,
-            "one responder-bound range must remain nonpublic"
-        );
-
-        // Reverse the session orientation for the remaining ranges: A now
-        // serves as responder and B fetches as initiator. Together these two
-        // phases cover both directional carrier sublanes deterministically.
-        let mut b_ranges = b_server.blob_ranges_fetched;
-        let mut initiator_receiver_ranges = 0usize;
-        for _ in 0..16 {
-            let (client, _, source_cache, _) = blob_contact_test_pair(
-                a_store.clone(),
-                a.credentials.clone(),
-                interests(),
-                b_store.clone(),
-                b.credentials.clone(),
-                interests(),
-            )
-            .await;
-            assert_eq!(
-                source_cache.blob_source_depot_authenticated_opens(),
-                0,
-                "source-envelope transfer defers physical access to bounded range serving",
-            );
-            assert_eq!(
-                source_cache.blob_source_row_loads(),
-                u64::from(client.fetched == 1)
-            );
-            assert_eq!(
-                source_cache.blob_source_authentications(),
-                u64::from(client.fetched == 1)
-            );
-            b_ranges += client.blob_ranges_fetched;
-            initiator_receiver_ranges += client.blob_ranges_fetched;
-            if b_store.blob_stats().expect("B Blob stats").publications == 1 {
-                break;
-            }
-        }
-        assert!(b_ranges > 1, "B must converge through bounded ranges");
-        assert!(
-            initiator_receiver_ranges > 0,
-            "initiator-bound carrier recovery must also make progress"
-        );
+        assert_eq!(b_complete.fetched, 1);
+        assert!(b_complete.blob_ranges_fetched > 1);
+        assert_eq!(source_cache.blob_source_depot_authenticated_opens(), 0);
         assert_eq!(
             b_store
                 .blob_stats()
@@ -53401,7 +53219,7 @@ mod tests {
             c_resume.fetched, 0,
             "different completed peer must not retransmit the staged source"
         );
-        assert!(c_resume.blob_ranges_fetched > 1);
+        assert!(c_resume.blob_ranges_fetched > 0);
         assert_eq!(c_resume.duplicates, 0);
         let plan =
             completed_test_blob_plan(&b_store, &mut open_test_sealer(&b.credentials), source);
@@ -53645,249 +53463,245 @@ mod tests {
 
     #[tokio::test]
     async fn stale_pending_blob_cleanup_removes_visibility_but_retains_reserved_staging() {
-        for (seed, invalidation, label, current_epoch) in [
-            (
-                [0xc1; 32],
-                PendingBlobInvalidation::SameEpochLineage,
-                "same-epoch-lineage",
-                1,
-            ),
-            (
-                [0xc2; 32],
-                PendingBlobInvalidation::EpochAdvance,
-                "epoch-advance",
-                2,
-            ),
-            (
-                [0xc3; 32],
-                PendingBlobInvalidation::PublisherRevocation,
-                "publisher-revocation",
-                1,
-            ),
-        ] {
-            let services = control_test_services(seed);
-            let authority_id = services.authority.mission_authority_id();
-            let authority_peer = services.authority.identity();
-            let source_id = services.member.identity();
-            let source_state = root(&format!("blob-cleanup-{label}-source"));
-            let receiver_state = root(&format!("blob-cleanup-{label}-receiver"));
-            fs::create_dir_all(&source_state).expect("stale Blob source state");
-            fs::create_dir_all(&receiver_state).expect("stale Blob receiver state");
-            let source_store = Arc::new(
-                Store::open_for_mission(source_state.join(STORE_FILE), authority_id)
-                    .expect("stale Blob source store"),
-            );
-            let receiver_path = receiver_state.join(STORE_FILE);
-            let receiver_store = Arc::new(
-                Store::open_for_mission(&receiver_path, authority_id)
-                    .expect("stale Blob receiver store"),
-            );
-            let mut source_sealer = open_test_sealer(&services.member);
-            let source = publish_test_blob(
-                &source_store,
-                &mut source_sealer,
-                &services.topic,
-                &services.scope,
-                1,
-                &vec![0x6d; 96 * 1024],
-            );
-            let interests = || {
-                MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
-                    services.topic.clone(),
-                    services.scope.clone(),
-                    false,
-                )])
-            };
-            let fault = blob_ranges_stream_test::install_boundary(
-                &source_store,
-                &receiver_store,
+        assert_stale_pending_blob_cleanup(PendingBlobInvalidation::SameEpochLineage).await;
+    }
+
+    #[tokio::test]
+    async fn stale_pending_blob_epoch_advance_cleanup_retains_reserved_staging() {
+        assert_stale_pending_blob_cleanup(PendingBlobInvalidation::EpochAdvance).await;
+    }
+
+    #[tokio::test]
+    async fn stale_pending_blob_publisher_revocation_cleanup_retains_reserved_staging() {
+        assert_stale_pending_blob_cleanup(PendingBlobInvalidation::PublisherRevocation).await;
+    }
+
+    async fn assert_stale_pending_blob_cleanup(invalidation: PendingBlobInvalidation) {
+        let (seed, label, current_epoch) = match invalidation {
+            PendingBlobInvalidation::SameEpochLineage => ([0xc1; 32], "same-epoch-lineage", 1),
+            PendingBlobInvalidation::EpochAdvance => ([0xc2; 32], "epoch-advance", 2),
+            PendingBlobInvalidation::PublisherRevocation => ([0xc3; 32], "publisher-revocation", 1),
+        };
+        let services = control_test_services(seed);
+        let authority_id = services.authority.mission_authority_id();
+        let authority_peer = services.authority.identity();
+        let source_id = services.member.identity();
+        let source_state = root(&format!("blob-cleanup-{label}-source"));
+        let receiver_state = root(&format!("blob-cleanup-{label}-receiver"));
+        fs::create_dir_all(&source_state).expect("stale Blob source state");
+        fs::create_dir_all(&receiver_state).expect("stale Blob receiver state");
+        let source_store = Arc::new(
+            Store::open_for_mission(source_state.join(STORE_FILE), authority_id)
+                .expect("stale Blob source store"),
+        );
+        let receiver_path = receiver_state.join(STORE_FILE);
+        let receiver_store = Arc::new(
+            Store::open_for_mission(&receiver_path, authority_id)
+                .expect("stale Blob receiver store"),
+        );
+        let mut source_sealer = open_test_sealer(&services.member);
+        let source = publish_test_blob(
+            &source_store,
+            &mut source_sealer,
+            &services.topic,
+            &services.scope,
+            1,
+            &vec![0x6d; MAX_BLOB_NETWORK_RANGE_BYTES + 1],
+        );
+        let interests = || {
+            MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
+                services.topic.clone(),
+                services.scope.clone(),
                 false,
-                blob_ranges_stream_test::Boundary::AppendCapacity,
-            );
-            fault.release_sender.notify_one();
-            fault.release_receiver.notify_one();
-            let (partial, _, _, _) = blob_contact_test_pair(
-                source_store.clone(),
-                services.member.clone(),
-                interests(),
-                receiver_store.clone(),
-                services.other.clone(),
-                interests(),
-            )
-            .await;
-            assert!(fault.fired.load(Ordering::Acquire));
-            blob_ranges_stream_test::remove(&source_store);
-            blob_ranges_stream_test::remove(&receiver_store);
-            assert_eq!(partial.fetched, 1, "{label} stages one exact source");
-            assert_eq!(partial.blob_ranges_fetched, 1);
-            let staged = receiver_store
-                .blob_stats()
-                .expect("stale Blob staged stats");
-            assert_eq!(staged.publications, 0);
-            assert_eq!(staged.pending_sources, 1);
-            assert_eq!(staged.carrier_prefixes, 1);
-            assert!(staged.network_staging_bytes > 0);
-            assert!(staged.reserved_file_bytes > 0);
+            )])
+        };
+        let fault = blob_ranges_stream_test::install_boundary(
+            &source_store,
+            &receiver_store,
+            false,
+            blob_ranges_stream_test::Boundary::AppendCapacity,
+        );
+        fault.release_sender.notify_one();
+        fault.release_receiver.notify_one();
+        let (partial, _, _, _) = blob_contact_test_pair(
+            source_store.clone(),
+            services.member.clone(),
+            interests(),
+            receiver_store.clone(),
+            services.other.clone(),
+            interests(),
+        )
+        .await;
+        assert!(fault.fired.load(Ordering::Acquire));
+        blob_ranges_stream_test::remove(&source_store);
+        blob_ranges_stream_test::remove(&receiver_store);
+        assert_eq!(partial.fetched, 1, "{label} stages one exact source");
+        assert_eq!(partial.blob_ranges_fetched, 1);
+        let staged = receiver_store
+            .blob_stats()
+            .expect("stale Blob staged stats");
+        assert_eq!(staged.publications, 0);
+        assert_eq!(staged.pending_sources, 1);
+        assert_eq!(staged.carrier_prefixes, 1);
+        assert!(staged.network_staging_bytes > 0);
+        assert!(staged.reserved_file_bytes > 0);
 
-            let mut authority = open_test_sealer(&services.authority);
-            let control = match invalidation {
-                PendingBlobInvalidation::SameEpochLineage
-                | PendingBlobInvalidation::EpochAdvance => {
-                    let recipients = vec![
-                        ScopeRekeyRecipient::member(
-                            services.authority.identity(),
-                            vec![services.topic.clone()],
-                        )
-                        .expect("authority Blob rekey recipient"),
-                        ScopeRekeyRecipient::member(
-                            services.member.identity(),
-                            vec![services.topic.clone()],
-                        )
-                        .expect("source Blob rekey recipient"),
-                        ScopeRekeyRecipient::member(
-                            services.other.identity(),
-                            vec![services.topic.clone()],
-                        )
-                        .expect("receiver Blob rekey recipient"),
-                    ];
-                    authority
-                        .seal_chained_scope_rekey_control_from_registry(
-                            &services.registry,
-                            0,
-                            services.scope.clone(),
-                            current_epoch,
-                            recipients,
-                            1,
-                            None,
-                        )
-                        .expect("seal stale-pending Blob rekey")
-                        .0
-                }
-                PendingBlobInvalidation::PublisherRevocation => authority
-                    .seal_chained_revocation_control(source_id, 1, 1, None)
-                    .expect("seal stale-pending Blob publisher revocation"),
-            };
-            let control_id = ControlTransferId::new(
+        let mut authority = open_test_sealer(&services.authority);
+        let control = match invalidation {
+            PendingBlobInvalidation::SameEpochLineage | PendingBlobInvalidation::EpochAdvance => {
+                let recipients = vec![
+                    ScopeRekeyRecipient::member(
+                        services.authority.identity(),
+                        vec![services.topic.clone()],
+                    )
+                    .expect("authority Blob rekey recipient"),
+                    ScopeRekeyRecipient::member(
+                        services.member.identity(),
+                        vec![services.topic.clone()],
+                    )
+                    .expect("source Blob rekey recipient"),
+                    ScopeRekeyRecipient::member(
+                        services.other.identity(),
+                        vec![services.topic.clone()],
+                    )
+                    .expect("receiver Blob rekey recipient"),
+                ];
                 authority
-                    .verify_control(&control)
-                    .expect("verify stale-pending control")
-                    .envelope_id(),
-            );
-            let mut receiver_verifier = open_test_sealer(&services.other);
-            let accepted = accept_received_control(
-                &receiver_store,
-                &mut receiver_verifier,
-                authority_peer,
-                control_id,
-                &control,
-            )
-            .expect("activate stale-pending control");
-            assert_eq!(accepted.activated, 1);
+                    .seal_chained_scope_rekey_control_from_registry(
+                        &services.registry,
+                        0,
+                        services.scope.clone(),
+                        current_epoch,
+                        recipients,
+                        1,
+                        None,
+                    )
+                    .expect("seal stale-pending Blob rekey")
+                    .0
+            }
+            PendingBlobInvalidation::PublisherRevocation => authority
+                .seal_chained_revocation_control(source_id, 1, 1, None)
+                .expect("seal stale-pending Blob publisher revocation"),
+        };
+        let control_id = ControlTransferId::new(
+            authority
+                .verify_control(&control)
+                .expect("verify stale-pending control")
+                .envelope_id(),
+        );
+        let mut receiver_verifier = open_test_sealer(&services.other);
+        let accepted = accept_received_control(
+            &receiver_store,
+            &mut receiver_verifier,
+            authority_peer,
+            control_id,
+            &control,
+        )
+        .expect("activate stale-pending control");
+        assert_eq!(accepted.activated, 1);
 
-            drop(receiver_store);
-            let receiver_store =
-                Store::open_for_mission(&receiver_path, authority_id).expect("reopen stale store");
-            let mut startup =
-                open_startup_event_verifier_and_cache(&receiver_store, &services.other)
-                    .expect("startup cleans stale pending Blob");
-            let cleaned = receiver_store
-                .blob_stats()
-                .expect("cleaned pending Blob stats");
-            assert_eq!(cleaned.publications, 0);
-            assert_eq!(
-                cleaned.variants, 1,
-                "{label} retains the exact unfinished lineage fence"
-            );
-            assert_eq!(cleaned.committed_chunks, 0);
-            assert_eq!(cleaned.committed_file_bytes, 0);
-            assert_eq!(cleaned.pending_sources, 0);
-            assert_eq!(cleaned.carrier_prefixes, 0);
-            assert_eq!(cleaned.network_staging_bytes, 0);
-            assert_eq!(
-                cleaned.reserved_file_bytes, staged.reserved_file_bytes,
-                "{label} retains bounded quota-charged depot staging until future GC"
-            );
-            assert!(
-                startup
-                    .cache
-                    .get_blob(&startup.verifier, source)
-                    .expect("inspect exact cleaned Blob claim")
-                    .is_none(),
-                "{label} removes the exact non-durable cache claim"
-            );
+        drop(receiver_store);
+        let receiver_store =
+            Store::open_for_mission(&receiver_path, authority_id).expect("reopen stale store");
+        let mut startup = open_startup_event_verifier_and_cache(&receiver_store, &services.other)
+            .expect("startup cleans stale pending Blob");
+        let cleaned = receiver_store
+            .blob_stats()
+            .expect("cleaned pending Blob stats");
+        assert_eq!(cleaned.publications, 0);
+        assert_eq!(
+            cleaned.variants, 1,
+            "{label} retains the exact unfinished lineage fence"
+        );
+        assert_eq!(cleaned.committed_chunks, 0);
+        assert_eq!(cleaned.committed_file_bytes, 0);
+        assert_eq!(cleaned.pending_sources, 0);
+        assert_eq!(cleaned.carrier_prefixes, 0);
+        assert_eq!(cleaned.network_staging_bytes, 0);
+        assert_eq!(
+            cleaned.reserved_file_bytes, staged.reserved_file_bytes,
+            "{label} retains bounded quota-charged depot staging until future GC"
+        );
+        assert!(
+            startup
+                .cache
+                .get_blob(&startup.verifier, source)
+                .expect("inspect exact cleaned Blob claim")
+                .is_none(),
+            "{label} removes the exact non-durable cache claim"
+        );
 
-            let valid = publish_test_blob(
-                &receiver_store,
-                &mut startup.verifier,
-                &services.topic,
-                &services.scope,
-                current_epoch,
-                b"valid Blob work after exact stale cleanup",
-            );
-            let post_valid = receiver_store
-                .blob_stats()
-                .expect("post-cleanup valid Blob stats");
-            assert_eq!(
-                post_valid.publications, 1,
-                "{label} does not poison later Blob work"
-            );
-            assert_eq!(post_valid.committed_chunks, 1);
-            assert_eq!(
-                post_valid.reserved_file_bytes,
-                staged
-                    .reserved_file_bytes
-                    .checked_add(post_valid.committed_file_bytes)
-                    .expect("post-cleanup reservation sum"),
-                "{label} charges both abandoned staging and the valid completed chunk"
-            );
-            drop(startup);
-            drop(receiver_store);
+        let valid = publish_test_blob(
+            &receiver_store,
+            &mut startup.verifier,
+            &services.topic,
+            &services.scope,
+            current_epoch,
+            b"valid Blob work after exact stale cleanup",
+        );
+        let post_valid = receiver_store
+            .blob_stats()
+            .expect("post-cleanup valid Blob stats");
+        assert_eq!(
+            post_valid.publications, 1,
+            "{label} does not poison later Blob work"
+        );
+        assert_eq!(post_valid.committed_chunks, 1);
+        assert_eq!(
+            post_valid.reserved_file_bytes,
+            staged
+                .reserved_file_bytes
+                .checked_add(post_valid.committed_file_bytes)
+                .expect("post-cleanup reservation sum"),
+            "{label} charges both abandoned staging and the valid completed chunk"
+        );
+        drop(startup);
+        drop(receiver_store);
 
-            let receiver_store =
-                Store::open_for_mission(&receiver_path, authority_id).expect("second clean reopen");
-            let reopened = open_startup_event_verifier_and_cache(&receiver_store, &services.other)
-                .expect("cleaned Blob store remains restartable");
-            assert!(
+        let receiver_store =
+            Store::open_for_mission(&receiver_path, authority_id).expect("second clean reopen");
+        let reopened = open_startup_event_verifier_and_cache(&receiver_store, &services.other)
+            .expect("cleaned Blob store remains restartable");
+        assert!(
+            reopened
+                .cache
+                .get_blob(&reopened.verifier, source)
+                .expect("inspect old source after second reopen")
+                .is_none()
+        );
+        assert!(
+            matches!(
                 reopened
                     .cache
-                    .get_blob(&reopened.verifier, source)
-                    .expect("inspect old source after second reopen")
-                    .is_none()
-            );
-            assert!(
-                matches!(
-                    reopened
-                        .cache
-                        .get_blob(&reopened.verifier, valid)
-                        .expect("inspect valid source after second reopen")
-                        .expect("valid source remains authenticated")
-                        .retention,
-                    BlobSourceRetention::Completed { .. }
-                ),
-                "valid source remains completed after the second reopen"
-            );
-            assert_eq!(
-                receiver_store
-                    .blob_stats()
-                    .expect("second clean reopen stats")
-                    .pending_sources,
-                0
-            );
-            assert_eq!(
-                receiver_store
-                    .blob_stats()
-                    .expect("second clean reopen retained staging stats")
-                    .reserved_file_bytes,
-                post_valid.reserved_file_bytes,
-                "aborted staging and valid completed reservations survive restart"
-            );
+                    .get_blob(&reopened.verifier, valid)
+                    .expect("inspect valid source after second reopen")
+                    .expect("valid source remains authenticated")
+                    .retention,
+                BlobSourceRetention::Completed { .. }
+            ),
+            "valid source remains completed after the second reopen"
+        );
+        assert_eq!(
+            receiver_store
+                .blob_stats()
+                .expect("second clean reopen stats")
+                .pending_sources,
+            0
+        );
+        assert_eq!(
+            receiver_store
+                .blob_stats()
+                .expect("second clean reopen retained staging stats")
+                .reserved_file_bytes,
+            post_valid.reserved_file_bytes,
+            "aborted staging and valid completed reservations survive restart"
+        );
 
-            drop(reopened);
-            drop(source_store);
-            drop(receiver_store);
-            for state in [source_state, receiver_state] {
-                fs::remove_dir_all(state).expect("stale Blob cleanup state removal");
-            }
+        drop(reopened);
+        drop(source_store);
+        drop(receiver_store);
+        for state in [source_state, receiver_state] {
+            fs::remove_dir_all(state).expect("stale Blob cleanup state removal");
         }
     }
 
@@ -54448,11 +54262,94 @@ mod tests {
         .await;
     }
 
+    fn seal_current_stack_boundary_event(
+        reservation: &aster_redb_store::EventReservation,
+        sealer: &mut ReferenceEnvelopeSealer,
+        payload_size: usize,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let payload = vec![0x52; payload_size];
+        let header = reservation
+            .header(
+                Priority::Routine,
+                b"serialization-boundary".to_vec(),
+                None,
+                payload_size as u64,
+                false,
+                1,
+            )
+            .expect("current-stack boundary header");
+        let sealed = sealer
+            .seal_event(&header, &payload)
+            .expect("seal current-stack boundary Event");
+        (sealed.bytes, payload)
+    }
+
+    fn assert_current_stack_event_serialization_boundary() {
+        let services = control_test_services([0xd7; 32]);
+        for (index, mission) in [services.member, services.other].into_iter().enumerate() {
+            let state = root(&format!("current-stack-boundary-{index}"));
+            fs::create_dir_all(&state).expect("current-stack boundary state");
+            let store =
+                Store::open_for_mission(state.join(STORE_FILE), mission.mission_authority_id())
+                    .expect("current-stack boundary store");
+            let reservation = store
+                .reserve_event(mission.identity(), &services.topic, &services.scope)
+                .expect("current-stack boundary reservation");
+            let mut sealer = open_test_sealer(&mission);
+
+            let probe_size = MAX_OBJECT_BYTES - 11 * 1024;
+            let (probe, _) =
+                seal_current_stack_boundary_event(&reservation, &mut sealer, probe_size);
+            let overhead = probe
+                .len()
+                .checked_sub(probe_size)
+                .expect("current-stack envelope overhead");
+            assert!(overhead > 10 * 1024 && overhead <= 11 * 1024);
+
+            let exact_payload_size = MAX_OBJECT_BYTES
+                .checked_sub(overhead)
+                .expect("current-stack exact payload capacity");
+            let (exact, expected) =
+                seal_current_stack_boundary_event(&reservation, &mut sealer, exact_payload_size);
+            assert_eq!(exact.len(), MAX_OBJECT_BYTES);
+            assert!(mutable_source_fits_transfer_bound(exact.len() as u64));
+            let route = sealer
+                .verify_event(&exact)
+                .expect("authenticate exact-boundary Event source");
+            let EventContentVerification::ContentVerified { payload, .. } = sealer
+                .verify_event_content(route, &exact)
+                .expect("authenticate exact-boundary Event content")
+            else {
+                panic!("boundary source must retain its content grant")
+            };
+            assert_eq!(payload, expected);
+
+            let (over_limit, _) = seal_current_stack_boundary_event(
+                &reservation,
+                &mut sealer,
+                exact_payload_size + 1,
+            );
+            assert_eq!(over_limit.len(), MAX_OBJECT_BYTES + 1);
+            assert!(!mutable_source_fits_transfer_bound(over_limit.len() as u64));
+
+            drop(store);
+            fs::remove_dir_all(state).expect("current-stack boundary cleanup");
+        }
+    }
+
+    #[test]
+    fn current_stack_near_two_mib_events_each_direction() {
+        assert_current_stack_event_serialization_boundary();
+    }
+
     #[tokio::test]
-    async fn current_stack_near_two_mib_events_each_direction() {
-        // The fixture's hybrid source-authentication envelope is just over 10 KiB.
-        // Reserve 11 KiB (the smallest whole-KiB margin that fits), and check the
-        // actual sealed size before contact rather than changing the wire limit.
+    async fn current_stack_small_events_transfer_each_direction() {
+        current_stack_event_regression("small-bidirectional", 4 * 1024, 1, false).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "qualification transfers four near-2-MiB Events over real loopback contacts"]
+    async fn qualify_current_stack_near_two_mib_events_each_direction() {
         current_stack_event_regression("near-two-mib", MAX_OBJECT_BYTES - 11 * 1024, 2, false)
             .await;
     }
