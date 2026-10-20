@@ -641,6 +641,67 @@ func (RetirementReason) EnumDescriptor() ([]byte, []int) {
 	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{10}
 }
 
+type BlobPublicationPhase int32
+
+const (
+	BlobPublicationPhase_BLOB_PUBLICATION_PHASE_UNSPECIFIED        BlobPublicationPhase = 0
+	BlobPublicationPhase_BLOB_PUBLICATION_PHASE_MISSING            BlobPublicationPhase = 1
+	BlobPublicationPhase_BLOB_PUBLICATION_PHASE_AWAITING_DATA      BlobPublicationPhase = 2
+	BlobPublicationPhase_BLOB_PUBLICATION_PHASE_RECEIVING          BlobPublicationPhase = 3
+	BlobPublicationPhase_BLOB_PUBLICATION_PHASE_READY_TO_FINALIZE  BlobPublicationPhase = 4
+	BlobPublicationPhase_BLOB_PUBLICATION_PHASE_AVAILABLE          BlobPublicationPhase = 5
+	BlobPublicationPhase_BLOB_PUBLICATION_PHASE_EXPIRED_OR_RETIRED BlobPublicationPhase = 6
+)
+
+// Enum value maps for BlobPublicationPhase.
+var (
+	BlobPublicationPhase_name = map[int32]string{
+		0: "BLOB_PUBLICATION_PHASE_UNSPECIFIED",
+		1: "BLOB_PUBLICATION_PHASE_MISSING",
+		2: "BLOB_PUBLICATION_PHASE_AWAITING_DATA",
+		3: "BLOB_PUBLICATION_PHASE_RECEIVING",
+		4: "BLOB_PUBLICATION_PHASE_READY_TO_FINALIZE",
+		5: "BLOB_PUBLICATION_PHASE_AVAILABLE",
+		6: "BLOB_PUBLICATION_PHASE_EXPIRED_OR_RETIRED",
+	}
+	BlobPublicationPhase_value = map[string]int32{
+		"BLOB_PUBLICATION_PHASE_UNSPECIFIED":        0,
+		"BLOB_PUBLICATION_PHASE_MISSING":            1,
+		"BLOB_PUBLICATION_PHASE_AWAITING_DATA":      2,
+		"BLOB_PUBLICATION_PHASE_RECEIVING":          3,
+		"BLOB_PUBLICATION_PHASE_READY_TO_FINALIZE":  4,
+		"BLOB_PUBLICATION_PHASE_AVAILABLE":          5,
+		"BLOB_PUBLICATION_PHASE_EXPIRED_OR_RETIRED": 6,
+	}
+)
+
+func (x BlobPublicationPhase) Enum() *BlobPublicationPhase {
+	p := new(BlobPublicationPhase)
+	*p = x
+	return p
+}
+
+func (x BlobPublicationPhase) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (BlobPublicationPhase) Descriptor() protoreflect.EnumDescriptor {
+	return file_aster_application_v1alpha1_aster_proto_enumTypes[11].Descriptor()
+}
+
+func (BlobPublicationPhase) Type() protoreflect.EnumType {
+	return &file_aster_application_v1alpha1_aster_proto_enumTypes[11]
+}
+
+func (x BlobPublicationPhase) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use BlobPublicationPhase.Descriptor instead.
+func (BlobPublicationPhase) EnumDescriptor() ([]byte, []int) {
+	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{11}
+}
+
 type PublicErrorDetail struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Reason        PublicErrorReason      `protobuf:"varint,1,opt,name=reason,proto3,enum=aster.application.v1alpha1.PublicErrorReason" json:"reason,omitempty"`
@@ -1120,8 +1181,10 @@ type PublishBlobReceipt struct {
 	SchemaId         []byte                 `protobuf:"bytes,8,opt,name=schema_id,json=schemaId,proto3" json:"schema_id,omitempty"`
 	AcceptanceMarker uint64                 `protobuf:"varint,9,opt,name=acceptance_marker,json=acceptanceMarker,proto3" json:"acceptance_marker,omitempty"`
 	Inserted         bool                   `protobuf:"varint,10,opt,name=inserted,proto3" json:"inserted,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// Stable opaque identifier used to inspect durable publication progress.
+	PublicationId []byte `protobuf:"bytes,11,opt,name=publication_id,json=publicationId,proto3" json:"publication_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *PublishBlobReceipt) Reset() {
@@ -1222,6 +1285,13 @@ func (x *PublishBlobReceipt) GetInserted() bool {
 		return x.Inserted
 	}
 	return false
+}
+
+func (x *PublishBlobReceipt) GetPublicationId() []byte {
+	if x != nil {
+		return x.PublicationId
+	}
+	return nil
 }
 
 type PublishBlobResponse struct {
@@ -1737,6 +1807,7 @@ type GetStatusResponse struct {
 	PublishOperationCapacity *PublishOperationCapacityStatus `protobuf:"bytes,10,opt,name=publish_operation_capacity,json=publishOperationCapacity,proto3" json:"publish_operation_capacity,omitempty"`
 	DeliveryCapacity         *DeliveryCapacityStatus         `protobuf:"bytes,11,opt,name=delivery_capacity,json=deliveryCapacity,proto3" json:"delivery_capacity,omitempty"`
 	CredentialGeneration     []byte                          `protobuf:"bytes,12,opt,name=credential_generation,json=credentialGeneration,proto3" json:"credential_generation,omitempty"`
+	BlobCapacity             *BlobCapacityStatus             `protobuf:"bytes,13,opt,name=blob_capacity,json=blobCapacity,proto3" json:"blob_capacity,omitempty"`
 	unknownFields            protoimpl.UnknownFields
 	sizeCache                protoimpl.SizeCache
 }
@@ -1851,6 +1922,13 @@ func (x *GetStatusResponse) GetDeliveryCapacity() *DeliveryCapacityStatus {
 func (x *GetStatusResponse) GetCredentialGeneration() []byte {
 	if x != nil {
 		return x.CredentialGeneration
+	}
+	return nil
+}
+
+func (x *GetStatusResponse) GetBlobCapacity() *BlobCapacityStatus {
+	if x != nil {
+		return x.BlobCapacity
 	}
 	return nil
 }
@@ -4492,6 +4570,298 @@ func (x *EventGap) GetEndSequence() uint64 {
 	return 0
 }
 
+type InspectBlobPublicationRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	PublicationId []byte                 `protobuf:"bytes,1,opt,name=publication_id,json=publicationId,proto3" json:"publication_id,omitempty"`
+	Topic         string                 `protobuf:"bytes,2,opt,name=topic,proto3" json:"topic,omitempty"`
+	Scope         string                 `protobuf:"bytes,3,opt,name=scope,proto3" json:"scope,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *InspectBlobPublicationRequest) Reset() {
+	*x = InspectBlobPublicationRequest{}
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[54]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *InspectBlobPublicationRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*InspectBlobPublicationRequest) ProtoMessage() {}
+
+func (x *InspectBlobPublicationRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[54]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use InspectBlobPublicationRequest.ProtoReflect.Descriptor instead.
+func (*InspectBlobPublicationRequest) Descriptor() ([]byte, []int) {
+	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{54}
+}
+
+func (x *InspectBlobPublicationRequest) GetPublicationId() []byte {
+	if x != nil {
+		return x.PublicationId
+	}
+	return nil
+}
+
+func (x *InspectBlobPublicationRequest) GetTopic() string {
+	if x != nil {
+		return x.Topic
+	}
+	return ""
+}
+
+func (x *InspectBlobPublicationRequest) GetScope() string {
+	if x != nil {
+		return x.Scope
+	}
+	return ""
+}
+
+type InspectBlobPublicationResponse struct {
+	state                 protoimpl.MessageState `protogen:"open.v1"`
+	PublicationId         []byte                 `protobuf:"bytes,1,opt,name=publication_id,json=publicationId,proto3" json:"publication_id,omitempty"`
+	Phase                 BlobPublicationPhase   `protobuf:"varint,2,opt,name=phase,proto3,enum=aster.application.v1alpha1.BlobPublicationPhase" json:"phase,omitempty"`
+	PlaintextTotalBytes   uint64                 `protobuf:"varint,3,opt,name=plaintext_total_bytes,json=plaintextTotalBytes,proto3" json:"plaintext_total_bytes,omitempty"`
+	DurablePlaintextBytes uint64                 `protobuf:"varint,4,opt,name=durable_plaintext_bytes,json=durablePlaintextBytes,proto3" json:"durable_plaintext_bytes,omitempty"`
+	TransferTotalBytes    uint64                 `protobuf:"varint,5,opt,name=transfer_total_bytes,json=transferTotalBytes,proto3" json:"transfer_total_bytes,omitempty"`
+	DurableTransferBytes  uint64                 `protobuf:"varint,6,opt,name=durable_transfer_bytes,json=durableTransferBytes,proto3" json:"durable_transfer_bytes,omitempty"`
+	TotalUnits            uint64                 `protobuf:"varint,7,opt,name=total_units,json=totalUnits,proto3" json:"total_units,omitempty"`
+	DurableUnits          uint64                 `protobuf:"varint,8,opt,name=durable_units,json=durableUnits,proto3" json:"durable_units,omitempty"`
+	BlobId                []byte                 `protobuf:"bytes,9,opt,name=blob_id,json=blobId,proto3,oneof" json:"blob_id,omitempty"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
+}
+
+func (x *InspectBlobPublicationResponse) Reset() {
+	*x = InspectBlobPublicationResponse{}
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[55]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *InspectBlobPublicationResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*InspectBlobPublicationResponse) ProtoMessage() {}
+
+func (x *InspectBlobPublicationResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[55]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use InspectBlobPublicationResponse.ProtoReflect.Descriptor instead.
+func (*InspectBlobPublicationResponse) Descriptor() ([]byte, []int) {
+	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{55}
+}
+
+func (x *InspectBlobPublicationResponse) GetPublicationId() []byte {
+	if x != nil {
+		return x.PublicationId
+	}
+	return nil
+}
+
+func (x *InspectBlobPublicationResponse) GetPhase() BlobPublicationPhase {
+	if x != nil {
+		return x.Phase
+	}
+	return BlobPublicationPhase_BLOB_PUBLICATION_PHASE_UNSPECIFIED
+}
+
+func (x *InspectBlobPublicationResponse) GetPlaintextTotalBytes() uint64 {
+	if x != nil {
+		return x.PlaintextTotalBytes
+	}
+	return 0
+}
+
+func (x *InspectBlobPublicationResponse) GetDurablePlaintextBytes() uint64 {
+	if x != nil {
+		return x.DurablePlaintextBytes
+	}
+	return 0
+}
+
+func (x *InspectBlobPublicationResponse) GetTransferTotalBytes() uint64 {
+	if x != nil {
+		return x.TransferTotalBytes
+	}
+	return 0
+}
+
+func (x *InspectBlobPublicationResponse) GetDurableTransferBytes() uint64 {
+	if x != nil {
+		return x.DurableTransferBytes
+	}
+	return 0
+}
+
+func (x *InspectBlobPublicationResponse) GetTotalUnits() uint64 {
+	if x != nil {
+		return x.TotalUnits
+	}
+	return 0
+}
+
+func (x *InspectBlobPublicationResponse) GetDurableUnits() uint64 {
+	if x != nil {
+		return x.DurableUnits
+	}
+	return 0
+}
+
+func (x *InspectBlobPublicationResponse) GetBlobId() []byte {
+	if x != nil {
+		return x.BlobId
+	}
+	return nil
+}
+
+type BlobCapacityStatus struct {
+	state               protoimpl.MessageState `protogen:"open.v1"`
+	ReservedBytes       uint64                 `protobuf:"varint,1,opt,name=reserved_bytes,json=reservedBytes,proto3" json:"reserved_bytes,omitempty"`
+	ByteLimit           uint64                 `protobuf:"varint,2,opt,name=byte_limit,json=byteLimit,proto3" json:"byte_limit,omitempty"`
+	Variants            uint64                 `protobuf:"varint,3,opt,name=variants,proto3" json:"variants,omitempty"`
+	VariantLimit        uint64                 `protobuf:"varint,4,opt,name=variant_limit,json=variantLimit,proto3" json:"variant_limit,omitempty"`
+	ExpectedChunks      uint64                 `protobuf:"varint,5,opt,name=expected_chunks,json=expectedChunks,proto3" json:"expected_chunks,omitempty"`
+	ChunkLimit          uint64                 `protobuf:"varint,6,opt,name=chunk_limit,json=chunkLimit,proto3" json:"chunk_limit,omitempty"`
+	PendingSources      uint64                 `protobuf:"varint,7,opt,name=pending_sources,json=pendingSources,proto3" json:"pending_sources,omitempty"`
+	NetworkStagingBytes uint64                 `protobuf:"varint,8,opt,name=network_staging_bytes,json=networkStagingBytes,proto3" json:"network_staging_bytes,omitempty"`
+	BytesExhausted      bool                   `protobuf:"varint,9,opt,name=bytes_exhausted,json=bytesExhausted,proto3" json:"bytes_exhausted,omitempty"`
+	VariantsExhausted   bool                   `protobuf:"varint,10,opt,name=variants_exhausted,json=variantsExhausted,proto3" json:"variants_exhausted,omitempty"`
+	ChunksExhausted     bool                   `protobuf:"varint,11,opt,name=chunks_exhausted,json=chunksExhausted,proto3" json:"chunks_exhausted,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
+}
+
+func (x *BlobCapacityStatus) Reset() {
+	*x = BlobCapacityStatus{}
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[56]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BlobCapacityStatus) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BlobCapacityStatus) ProtoMessage() {}
+
+func (x *BlobCapacityStatus) ProtoReflect() protoreflect.Message {
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[56]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BlobCapacityStatus.ProtoReflect.Descriptor instead.
+func (*BlobCapacityStatus) Descriptor() ([]byte, []int) {
+	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{56}
+}
+
+func (x *BlobCapacityStatus) GetReservedBytes() uint64 {
+	if x != nil {
+		return x.ReservedBytes
+	}
+	return 0
+}
+
+func (x *BlobCapacityStatus) GetByteLimit() uint64 {
+	if x != nil {
+		return x.ByteLimit
+	}
+	return 0
+}
+
+func (x *BlobCapacityStatus) GetVariants() uint64 {
+	if x != nil {
+		return x.Variants
+	}
+	return 0
+}
+
+func (x *BlobCapacityStatus) GetVariantLimit() uint64 {
+	if x != nil {
+		return x.VariantLimit
+	}
+	return 0
+}
+
+func (x *BlobCapacityStatus) GetExpectedChunks() uint64 {
+	if x != nil {
+		return x.ExpectedChunks
+	}
+	return 0
+}
+
+func (x *BlobCapacityStatus) GetChunkLimit() uint64 {
+	if x != nil {
+		return x.ChunkLimit
+	}
+	return 0
+}
+
+func (x *BlobCapacityStatus) GetPendingSources() uint64 {
+	if x != nil {
+		return x.PendingSources
+	}
+	return 0
+}
+
+func (x *BlobCapacityStatus) GetNetworkStagingBytes() uint64 {
+	if x != nil {
+		return x.NetworkStagingBytes
+	}
+	return 0
+}
+
+func (x *BlobCapacityStatus) GetBytesExhausted() bool {
+	if x != nil {
+		return x.BytesExhausted
+	}
+	return false
+}
+
+func (x *BlobCapacityStatus) GetVariantsExhausted() bool {
+	if x != nil {
+		return x.VariantsExhausted
+	}
+	return false
+}
+
+func (x *BlobCapacityStatus) GetChunksExhausted() bool {
+	if x != nil {
+		return x.ChunksExhausted
+	}
+	return false
+}
+
 var File_aster_application_v1alpha1_aster_proto protoreflect.FileDescriptor
 
 const file_aster_application_v1alpha1_aster_proto_rawDesc = "" +
@@ -4530,7 +4900,7 @@ const file_aster_application_v1alpha1_aster_proto_rawDesc = "" +
 	"\x15canonical_frame_bytes\x18\x03 \x01(\rR\x13canonicalFrameBytes\"g\n" +
 	"\x15PublishBlobCheckpoint\x12'\n" +
 	"\x0faccepted_offset\x18\x01 \x01(\x04R\x0eacceptedOffset\x12%\n" +
-	"\x0edurable_offset\x18\x02 \x01(\x04R\rdurableOffset\"\x8e\x03\n" +
+	"\x0edurable_offset\x18\x02 \x01(\x04R\rdurableOffset\"\xb5\x03\n" +
 	"\x12PublishBlobReceipt\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\fR\x02id\x12\x1c\n" +
 	"\tpublisher\x18\x02 \x01(\fR\tpublisher\x12+\n" +
@@ -4543,7 +4913,8 @@ const file_aster_application_v1alpha1_aster_proto_rawDesc = "" +
 	"\tschema_id\x18\b \x01(\fR\bschemaId\x12+\n" +
 	"\x11acceptance_marker\x18\t \x01(\x04R\x10acceptanceMarker\x12\x1a\n" +
 	"\binserted\x18\n" +
-	" \x01(\bR\binsertedB\t\n" +
+	" \x01(\bR\binserted\x12%\n" +
+	"\x0epublication_id\x18\v \x01(\fR\rpublicationIdB\t\n" +
 	"\a_ttl_msB\r\n" +
 	"\v_media_type\"\x90\x02\n" +
 	"\x13PublishBlobResponse\x12M\n" +
@@ -4585,7 +4956,7 @@ const file_aster_application_v1alpha1_aster_proto_rawDesc = "" +
 	"\x05scope\x18\x03 \x01(\tR\x05scope\x12:\n" +
 	"\x19include_descendant_scopes\x18\x04 \x01(\bR\x17includeDescendantScopes\x12#\n" +
 	"\roperation_key\x18\x05 \x01(\fR\foperationKey\"\x12\n" +
-	"\x10GetStatusRequest\"\xf3\x06\n" +
+	"\x10GetStatusRequest\"\xc8\a\n" +
 	"\x11GetStatusResponse\x12\x1a\n" +
 	"\bidentity\x18\x01 \x01(\fR\bidentity\x12+\n" +
 	"\x11mission_authority\x18\x02 \x01(\fR\x10missionAuthority\x12:\n" +
@@ -4599,7 +4970,8 @@ const file_aster_application_v1alpha1_aster_proto_rawDesc = "" +
 	"\x1apublish_operation_capacity\x18\n" +
 	" \x01(\v2:.aster.application.v1alpha1.PublishOperationCapacityStatusR\x18publishOperationCapacity\x12_\n" +
 	"\x11delivery_capacity\x18\v \x01(\v22.aster.application.v1alpha1.DeliveryCapacityStatusR\x10deliveryCapacity\x123\n" +
-	"\x15credential_generation\x18\f \x01(\fR\x14credentialGeneration\"\x9d\x01\n" +
+	"\x15credential_generation\x18\f \x01(\fR\x14credentialGeneration\x12S\n" +
+	"\rblob_capacity\x18\r \x01(\v2..aster.application.v1alpha1.BlobCapacityStatusR\fblobCapacity\"\x9d\x01\n" +
 	"\x13StoreCapacityStatus\x12\x14\n" +
 	"\x05items\x18\x01 \x01(\x04R\x05items\x12\x1d\n" +
 	"\n" +
@@ -4824,7 +5196,39 @@ const file_aster_application_v1alpha1_aster_proto_rawDesc = "" +
 	"\x05topic\x18\x02 \x01(\tR\x05topic\x12\x14\n" +
 	"\x05scope\x18\x03 \x01(\tR\x05scope\x12%\n" +
 	"\x0estart_sequence\x18\x04 \x01(\x04R\rstartSequence\x12!\n" +
-	"\fend_sequence\x18\x05 \x01(\x04R\vendSequence*\xc6\x06\n" +
+	"\fend_sequence\x18\x05 \x01(\x04R\vendSequence\"r\n" +
+	"\x1dInspectBlobPublicationRequest\x12%\n" +
+	"\x0epublication_id\x18\x01 \x01(\fR\rpublicationId\x12\x14\n" +
+	"\x05topic\x18\x02 \x01(\tR\x05topic\x12\x14\n" +
+	"\x05scope\x18\x03 \x01(\tR\x05scope\"\xd3\x03\n" +
+	"\x1eInspectBlobPublicationResponse\x12%\n" +
+	"\x0epublication_id\x18\x01 \x01(\fR\rpublicationId\x12F\n" +
+	"\x05phase\x18\x02 \x01(\x0e20.aster.application.v1alpha1.BlobPublicationPhaseR\x05phase\x122\n" +
+	"\x15plaintext_total_bytes\x18\x03 \x01(\x04R\x13plaintextTotalBytes\x126\n" +
+	"\x17durable_plaintext_bytes\x18\x04 \x01(\x04R\x15durablePlaintextBytes\x120\n" +
+	"\x14transfer_total_bytes\x18\x05 \x01(\x04R\x12transferTotalBytes\x124\n" +
+	"\x16durable_transfer_bytes\x18\x06 \x01(\x04R\x14durableTransferBytes\x12\x1f\n" +
+	"\vtotal_units\x18\a \x01(\x04R\n" +
+	"totalUnits\x12#\n" +
+	"\rdurable_units\x18\b \x01(\x04R\fdurableUnits\x12\x1c\n" +
+	"\ablob_id\x18\t \x01(\fH\x00R\x06blobId\x88\x01\x01B\n" +
+	"\n" +
+	"\b_blob_id\"\xc5\x03\n" +
+	"\x12BlobCapacityStatus\x12%\n" +
+	"\x0ereserved_bytes\x18\x01 \x01(\x04R\rreservedBytes\x12\x1d\n" +
+	"\n" +
+	"byte_limit\x18\x02 \x01(\x04R\tbyteLimit\x12\x1a\n" +
+	"\bvariants\x18\x03 \x01(\x04R\bvariants\x12#\n" +
+	"\rvariant_limit\x18\x04 \x01(\x04R\fvariantLimit\x12'\n" +
+	"\x0fexpected_chunks\x18\x05 \x01(\x04R\x0eexpectedChunks\x12\x1f\n" +
+	"\vchunk_limit\x18\x06 \x01(\x04R\n" +
+	"chunkLimit\x12'\n" +
+	"\x0fpending_sources\x18\a \x01(\x04R\x0ependingSources\x122\n" +
+	"\x15network_staging_bytes\x18\b \x01(\x04R\x13networkStagingBytes\x12'\n" +
+	"\x0fbytes_exhausted\x18\t \x01(\bR\x0ebytesExhausted\x12-\n" +
+	"\x12variants_exhausted\x18\n" +
+	" \x01(\bR\x11variantsExhausted\x12)\n" +
+	"\x10chunks_exhausted\x18\v \x01(\bR\x0fchunksExhausted*\xc6\x06\n" +
 	"\x11PublicErrorReason\x12#\n" +
 	"\x1fPUBLIC_ERROR_REASON_UNSPECIFIED\x10\x00\x12'\n" +
 	"#PUBLIC_ERROR_REASON_MALFORMED_INPUT\x10\x01\x12)\n" +
@@ -4897,9 +5301,18 @@ const file_aster_application_v1alpha1_aster_proto_rawDesc = "" +
 	"\x10RetirementReason\x12!\n" +
 	"\x1dRETIREMENT_REASON_UNSPECIFIED\x10\x00\x12\x1d\n" +
 	"\x19RETIREMENT_REASON_EXPIRED\x10\x01\x12$\n" +
-	" RETIREMENT_REASON_QUOTA_PRESSURE\x10\x022\xfb\x12\n" +
+	" RETIREMENT_REASON_QUOTA_PRESSURE\x10\x02*\xb5\x02\n" +
+	"\x14BlobPublicationPhase\x12&\n" +
+	"\"BLOB_PUBLICATION_PHASE_UNSPECIFIED\x10\x00\x12\"\n" +
+	"\x1eBLOB_PUBLICATION_PHASE_MISSING\x10\x01\x12(\n" +
+	"$BLOB_PUBLICATION_PHASE_AWAITING_DATA\x10\x02\x12$\n" +
+	" BLOB_PUBLICATION_PHASE_RECEIVING\x10\x03\x12,\n" +
+	"(BLOB_PUBLICATION_PHASE_READY_TO_FINALIZE\x10\x04\x12$\n" +
+	" BLOB_PUBLICATION_PHASE_AVAILABLE\x10\x05\x12-\n" +
+	")BLOB_PUBLICATION_PHASE_EXPIRED_OR_RETIRED\x10\x062\x8d\x14\n" +
 	"\x17AsterApplicationService\x12h\n" +
-	"\tGetStatus\x12,.aster.application.v1alpha1.GetStatusRequest\x1a-.aster.application.v1alpha1.GetStatusResponse\x12q\n" +
+	"\tGetStatus\x12,.aster.application.v1alpha1.GetStatusRequest\x1a-.aster.application.v1alpha1.GetStatusResponse\x12\x8f\x01\n" +
+	"\x16InspectBlobPublication\x129.aster.application.v1alpha1.InspectBlobPublicationRequest\x1a:.aster.application.v1alpha1.InspectBlobPublicationResponse\x12q\n" +
 	"\fPublishEvent\x12/.aster.application.v1alpha1.PublishEventRequest\x1a0.aster.application.v1alpha1.PublishEventResponse\x12x\n" +
 	"\rPublishEvents\x120.aster.application.v1alpha1.PublishEventsRequest\x1a1.aster.application.v1alpha1.PublishEventsResponse(\x010\x01\x12\xa1\x01\n" +
 	"\x1cBeginEventPublicationSession\x12?.aster.application.v1alpha1.BeginEventPublicationSessionRequest\x1a@.aster.application.v1alpha1.BeginEventPublicationSessionResponse\x12\xad\x01\n" +
@@ -4933,8 +5346,8 @@ func file_aster_application_v1alpha1_aster_proto_rawDescGZIP() []byte {
 	return file_aster_application_v1alpha1_aster_proto_rawDescData
 }
 
-var file_aster_application_v1alpha1_aster_proto_enumTypes = make([]protoimpl.EnumInfo, 11)
-var file_aster_application_v1alpha1_aster_proto_msgTypes = make([]protoimpl.MessageInfo, 54)
+var file_aster_application_v1alpha1_aster_proto_enumTypes = make([]protoimpl.EnumInfo, 12)
+var file_aster_application_v1alpha1_aster_proto_msgTypes = make([]protoimpl.MessageInfo, 57)
 var file_aster_application_v1alpha1_aster_proto_goTypes = []any{
 	(PublicErrorReason)(0),                            // 0: aster.application.v1alpha1.PublicErrorReason
 	(EmissionMode)(0),                                 // 1: aster.application.v1alpha1.EmissionMode
@@ -4947,144 +5360,152 @@ var file_aster_application_v1alpha1_aster_proto_goTypes = []any{
 	(ContactStatus)(0),                                // 8: aster.application.v1alpha1.ContactStatus
 	(CommittedContentStatus)(0),                       // 9: aster.application.v1alpha1.CommittedContentStatus
 	(RetirementReason)(0),                             // 10: aster.application.v1alpha1.RetirementReason
-	(*PublicErrorDetail)(nil),                         // 11: aster.application.v1alpha1.PublicErrorDetail
-	(*PublishBlobMetadata)(nil),                       // 12: aster.application.v1alpha1.PublishBlobMetadata
-	(*PublishBlobRequest)(nil),                        // 13: aster.application.v1alpha1.PublishBlobRequest
-	(*PublishBlobData)(nil),                           // 14: aster.application.v1alpha1.PublishBlobData
-	(*PublishBlobFinish)(nil),                         // 15: aster.application.v1alpha1.PublishBlobFinish
-	(*PublishBlobAccepted)(nil),                       // 16: aster.application.v1alpha1.PublishBlobAccepted
-	(*PublishBlobCheckpoint)(nil),                     // 17: aster.application.v1alpha1.PublishBlobCheckpoint
-	(*PublishBlobReceipt)(nil),                        // 18: aster.application.v1alpha1.PublishBlobReceipt
-	(*PublishBlobResponse)(nil),                       // 19: aster.application.v1alpha1.PublishBlobResponse
-	(*ReadBlobRequest)(nil),                           // 20: aster.application.v1alpha1.ReadBlobRequest
-	(*ReadBlobResponse)(nil),                          // 21: aster.application.v1alpha1.ReadBlobResponse
-	(*ListEventSubscriptionsRequest)(nil),             // 22: aster.application.v1alpha1.ListEventSubscriptionsRequest
-	(*ListEventSubscriptionsResponse)(nil),            // 23: aster.application.v1alpha1.ListEventSubscriptionsResponse
-	(*EventSubscription)(nil),                         // 24: aster.application.v1alpha1.EventSubscription
-	(*GetStatusRequest)(nil),                          // 25: aster.application.v1alpha1.GetStatusRequest
-	(*GetStatusResponse)(nil),                         // 26: aster.application.v1alpha1.GetStatusResponse
-	(*StoreCapacityStatus)(nil),                       // 27: aster.application.v1alpha1.StoreCapacityStatus
-	(*PublishOperationCapacityStatus)(nil),            // 28: aster.application.v1alpha1.PublishOperationCapacityStatus
-	(*OperationLedgerAuditStatus)(nil),                // 29: aster.application.v1alpha1.OperationLedgerAuditStatus
-	(*DeliveryCapacityStatus)(nil),                    // 30: aster.application.v1alpha1.DeliveryCapacityStatus
-	(*PeerStatus)(nil),                                // 31: aster.application.v1alpha1.PeerStatus
-	(*PublishEventRequest)(nil),                       // 32: aster.application.v1alpha1.PublishEventRequest
-	(*PublishEventResponse)(nil),                      // 33: aster.application.v1alpha1.PublishEventResponse
-	(*PublishEventsRequest)(nil),                      // 34: aster.application.v1alpha1.PublishEventsRequest
-	(*PublishEventsResponse)(nil),                     // 35: aster.application.v1alpha1.PublishEventsResponse
-	(*BeginEventPublicationSessionRequest)(nil),       // 36: aster.application.v1alpha1.BeginEventPublicationSessionRequest
-	(*BeginEventPublicationSessionResponse)(nil),      // 37: aster.application.v1alpha1.BeginEventPublicationSessionResponse
-	(*CompleteEventPublicationRecoveryRequest)(nil),   // 38: aster.application.v1alpha1.CompleteEventPublicationRecoveryRequest
-	(*CompleteEventPublicationRecoveryResponse)(nil),  // 39: aster.application.v1alpha1.CompleteEventPublicationRecoveryResponse
-	(*PublishNumberedEventRequest)(nil),               // 40: aster.application.v1alpha1.PublishNumberedEventRequest
-	(*PublishNumberedEventResponse)(nil),              // 41: aster.application.v1alpha1.PublishNumberedEventResponse
-	(*AbandonEventPublicationRequest)(nil),            // 42: aster.application.v1alpha1.AbandonEventPublicationRequest
-	(*AbandonEventPublicationResponse)(nil),           // 43: aster.application.v1alpha1.AbandonEventPublicationResponse
-	(*AcknowledgeEventPublicationResultRequest)(nil),  // 44: aster.application.v1alpha1.AcknowledgeEventPublicationResultRequest
-	(*AcknowledgeEventPublicationResultResponse)(nil), // 45: aster.application.v1alpha1.AcknowledgeEventPublicationResultResponse
-	(*CommittedPublicationResult)(nil),                // 46: aster.application.v1alpha1.CommittedPublicationResult
-	(*CommittedEventReceipt)(nil),                     // 47: aster.application.v1alpha1.CommittedEventReceipt
-	(*QueryEventsRequest)(nil),                        // 48: aster.application.v1alpha1.QueryEventsRequest
-	(*QueryEventsResponse)(nil),                       // 49: aster.application.v1alpha1.QueryEventsResponse
-	(*Event)(nil),                                     // 50: aster.application.v1alpha1.Event
-	(*CreateEventSubscriptionRequest)(nil),            // 51: aster.application.v1alpha1.CreateEventSubscriptionRequest
-	(*CreateEventSubscriptionResponse)(nil),           // 52: aster.application.v1alpha1.CreateEventSubscriptionResponse
-	(*PollEventsRequest)(nil),                         // 53: aster.application.v1alpha1.PollEventsRequest
-	(*PollEventsResponse)(nil),                        // 54: aster.application.v1alpha1.PollEventsResponse
-	(*StreamEventsRequest)(nil),                       // 55: aster.application.v1alpha1.StreamEventsRequest
-	(*StreamEventsResponse)(nil),                      // 56: aster.application.v1alpha1.StreamEventsResponse
-	(*EventDelivery)(nil),                             // 57: aster.application.v1alpha1.EventDelivery
-	(*AcknowledgeEventRequest)(nil),                   // 58: aster.application.v1alpha1.AcknowledgeEventRequest
-	(*AcknowledgeEventResponse)(nil),                  // 59: aster.application.v1alpha1.AcknowledgeEventResponse
-	(*DeleteEventSubscriptionRequest)(nil),            // 60: aster.application.v1alpha1.DeleteEventSubscriptionRequest
-	(*DeleteEventSubscriptionResponse)(nil),           // 61: aster.application.v1alpha1.DeleteEventSubscriptionResponse
-	(*QueryEventGapsRequest)(nil),                     // 62: aster.application.v1alpha1.QueryEventGapsRequest
-	(*QueryEventGapsResponse)(nil),                    // 63: aster.application.v1alpha1.QueryEventGapsResponse
-	(*EventGap)(nil),                                  // 64: aster.application.v1alpha1.EventGap
+	(BlobPublicationPhase)(0),                         // 11: aster.application.v1alpha1.BlobPublicationPhase
+	(*PublicErrorDetail)(nil),                         // 12: aster.application.v1alpha1.PublicErrorDetail
+	(*PublishBlobMetadata)(nil),                       // 13: aster.application.v1alpha1.PublishBlobMetadata
+	(*PublishBlobRequest)(nil),                        // 14: aster.application.v1alpha1.PublishBlobRequest
+	(*PublishBlobData)(nil),                           // 15: aster.application.v1alpha1.PublishBlobData
+	(*PublishBlobFinish)(nil),                         // 16: aster.application.v1alpha1.PublishBlobFinish
+	(*PublishBlobAccepted)(nil),                       // 17: aster.application.v1alpha1.PublishBlobAccepted
+	(*PublishBlobCheckpoint)(nil),                     // 18: aster.application.v1alpha1.PublishBlobCheckpoint
+	(*PublishBlobReceipt)(nil),                        // 19: aster.application.v1alpha1.PublishBlobReceipt
+	(*PublishBlobResponse)(nil),                       // 20: aster.application.v1alpha1.PublishBlobResponse
+	(*ReadBlobRequest)(nil),                           // 21: aster.application.v1alpha1.ReadBlobRequest
+	(*ReadBlobResponse)(nil),                          // 22: aster.application.v1alpha1.ReadBlobResponse
+	(*ListEventSubscriptionsRequest)(nil),             // 23: aster.application.v1alpha1.ListEventSubscriptionsRequest
+	(*ListEventSubscriptionsResponse)(nil),            // 24: aster.application.v1alpha1.ListEventSubscriptionsResponse
+	(*EventSubscription)(nil),                         // 25: aster.application.v1alpha1.EventSubscription
+	(*GetStatusRequest)(nil),                          // 26: aster.application.v1alpha1.GetStatusRequest
+	(*GetStatusResponse)(nil),                         // 27: aster.application.v1alpha1.GetStatusResponse
+	(*StoreCapacityStatus)(nil),                       // 28: aster.application.v1alpha1.StoreCapacityStatus
+	(*PublishOperationCapacityStatus)(nil),            // 29: aster.application.v1alpha1.PublishOperationCapacityStatus
+	(*OperationLedgerAuditStatus)(nil),                // 30: aster.application.v1alpha1.OperationLedgerAuditStatus
+	(*DeliveryCapacityStatus)(nil),                    // 31: aster.application.v1alpha1.DeliveryCapacityStatus
+	(*PeerStatus)(nil),                                // 32: aster.application.v1alpha1.PeerStatus
+	(*PublishEventRequest)(nil),                       // 33: aster.application.v1alpha1.PublishEventRequest
+	(*PublishEventResponse)(nil),                      // 34: aster.application.v1alpha1.PublishEventResponse
+	(*PublishEventsRequest)(nil),                      // 35: aster.application.v1alpha1.PublishEventsRequest
+	(*PublishEventsResponse)(nil),                     // 36: aster.application.v1alpha1.PublishEventsResponse
+	(*BeginEventPublicationSessionRequest)(nil),       // 37: aster.application.v1alpha1.BeginEventPublicationSessionRequest
+	(*BeginEventPublicationSessionResponse)(nil),      // 38: aster.application.v1alpha1.BeginEventPublicationSessionResponse
+	(*CompleteEventPublicationRecoveryRequest)(nil),   // 39: aster.application.v1alpha1.CompleteEventPublicationRecoveryRequest
+	(*CompleteEventPublicationRecoveryResponse)(nil),  // 40: aster.application.v1alpha1.CompleteEventPublicationRecoveryResponse
+	(*PublishNumberedEventRequest)(nil),               // 41: aster.application.v1alpha1.PublishNumberedEventRequest
+	(*PublishNumberedEventResponse)(nil),              // 42: aster.application.v1alpha1.PublishNumberedEventResponse
+	(*AbandonEventPublicationRequest)(nil),            // 43: aster.application.v1alpha1.AbandonEventPublicationRequest
+	(*AbandonEventPublicationResponse)(nil),           // 44: aster.application.v1alpha1.AbandonEventPublicationResponse
+	(*AcknowledgeEventPublicationResultRequest)(nil),  // 45: aster.application.v1alpha1.AcknowledgeEventPublicationResultRequest
+	(*AcknowledgeEventPublicationResultResponse)(nil), // 46: aster.application.v1alpha1.AcknowledgeEventPublicationResultResponse
+	(*CommittedPublicationResult)(nil),                // 47: aster.application.v1alpha1.CommittedPublicationResult
+	(*CommittedEventReceipt)(nil),                     // 48: aster.application.v1alpha1.CommittedEventReceipt
+	(*QueryEventsRequest)(nil),                        // 49: aster.application.v1alpha1.QueryEventsRequest
+	(*QueryEventsResponse)(nil),                       // 50: aster.application.v1alpha1.QueryEventsResponse
+	(*Event)(nil),                                     // 51: aster.application.v1alpha1.Event
+	(*CreateEventSubscriptionRequest)(nil),            // 52: aster.application.v1alpha1.CreateEventSubscriptionRequest
+	(*CreateEventSubscriptionResponse)(nil),           // 53: aster.application.v1alpha1.CreateEventSubscriptionResponse
+	(*PollEventsRequest)(nil),                         // 54: aster.application.v1alpha1.PollEventsRequest
+	(*PollEventsResponse)(nil),                        // 55: aster.application.v1alpha1.PollEventsResponse
+	(*StreamEventsRequest)(nil),                       // 56: aster.application.v1alpha1.StreamEventsRequest
+	(*StreamEventsResponse)(nil),                      // 57: aster.application.v1alpha1.StreamEventsResponse
+	(*EventDelivery)(nil),                             // 58: aster.application.v1alpha1.EventDelivery
+	(*AcknowledgeEventRequest)(nil),                   // 59: aster.application.v1alpha1.AcknowledgeEventRequest
+	(*AcknowledgeEventResponse)(nil),                  // 60: aster.application.v1alpha1.AcknowledgeEventResponse
+	(*DeleteEventSubscriptionRequest)(nil),            // 61: aster.application.v1alpha1.DeleteEventSubscriptionRequest
+	(*DeleteEventSubscriptionResponse)(nil),           // 62: aster.application.v1alpha1.DeleteEventSubscriptionResponse
+	(*QueryEventGapsRequest)(nil),                     // 63: aster.application.v1alpha1.QueryEventGapsRequest
+	(*QueryEventGapsResponse)(nil),                    // 64: aster.application.v1alpha1.QueryEventGapsResponse
+	(*EventGap)(nil),                                  // 65: aster.application.v1alpha1.EventGap
+	(*InspectBlobPublicationRequest)(nil),             // 66: aster.application.v1alpha1.InspectBlobPublicationRequest
+	(*InspectBlobPublicationResponse)(nil),            // 67: aster.application.v1alpha1.InspectBlobPublicationResponse
+	(*BlobCapacityStatus)(nil),                        // 68: aster.application.v1alpha1.BlobCapacityStatus
 }
 var file_aster_application_v1alpha1_aster_proto_depIdxs = []int32{
 	0,  // 0: aster.application.v1alpha1.PublicErrorDetail.reason:type_name -> aster.application.v1alpha1.PublicErrorReason
 	5,  // 1: aster.application.v1alpha1.PublishBlobMetadata.priority:type_name -> aster.application.v1alpha1.Priority
-	12, // 2: aster.application.v1alpha1.PublishBlobRequest.metadata:type_name -> aster.application.v1alpha1.PublishBlobMetadata
-	14, // 3: aster.application.v1alpha1.PublishBlobRequest.data:type_name -> aster.application.v1alpha1.PublishBlobData
-	15, // 4: aster.application.v1alpha1.PublishBlobRequest.finish:type_name -> aster.application.v1alpha1.PublishBlobFinish
+	13, // 2: aster.application.v1alpha1.PublishBlobRequest.metadata:type_name -> aster.application.v1alpha1.PublishBlobMetadata
+	15, // 3: aster.application.v1alpha1.PublishBlobRequest.data:type_name -> aster.application.v1alpha1.PublishBlobData
+	16, // 4: aster.application.v1alpha1.PublishBlobRequest.finish:type_name -> aster.application.v1alpha1.PublishBlobFinish
 	5,  // 5: aster.application.v1alpha1.PublishBlobReceipt.priority:type_name -> aster.application.v1alpha1.Priority
-	16, // 6: aster.application.v1alpha1.PublishBlobResponse.accepted:type_name -> aster.application.v1alpha1.PublishBlobAccepted
-	17, // 7: aster.application.v1alpha1.PublishBlobResponse.checkpoint:type_name -> aster.application.v1alpha1.PublishBlobCheckpoint
-	18, // 8: aster.application.v1alpha1.PublishBlobResponse.complete:type_name -> aster.application.v1alpha1.PublishBlobReceipt
+	17, // 6: aster.application.v1alpha1.PublishBlobResponse.accepted:type_name -> aster.application.v1alpha1.PublishBlobAccepted
+	18, // 7: aster.application.v1alpha1.PublishBlobResponse.checkpoint:type_name -> aster.application.v1alpha1.PublishBlobCheckpoint
+	19, // 8: aster.application.v1alpha1.PublishBlobResponse.complete:type_name -> aster.application.v1alpha1.PublishBlobReceipt
 	5,  // 9: aster.application.v1alpha1.ReadBlobResponse.priority:type_name -> aster.application.v1alpha1.Priority
-	24, // 10: aster.application.v1alpha1.ListEventSubscriptionsResponse.subscriptions:type_name -> aster.application.v1alpha1.EventSubscription
+	25, // 10: aster.application.v1alpha1.ListEventSubscriptionsResponse.subscriptions:type_name -> aster.application.v1alpha1.EventSubscription
 	6,  // 11: aster.application.v1alpha1.GetStatusResponse.sync:type_name -> aster.application.v1alpha1.SyncStatus
-	31, // 12: aster.application.v1alpha1.GetStatusResponse.peers:type_name -> aster.application.v1alpha1.PeerStatus
+	32, // 12: aster.application.v1alpha1.GetStatusResponse.peers:type_name -> aster.application.v1alpha1.PeerStatus
 	1,  // 13: aster.application.v1alpha1.GetStatusResponse.configured_emission_mode:type_name -> aster.application.v1alpha1.EmissionMode
 	1,  // 14: aster.application.v1alpha1.GetStatusResponse.effective_emission_mode:type_name -> aster.application.v1alpha1.EmissionMode
-	27, // 15: aster.application.v1alpha1.GetStatusResponse.store_capacity:type_name -> aster.application.v1alpha1.StoreCapacityStatus
-	28, // 16: aster.application.v1alpha1.GetStatusResponse.publish_operation_capacity:type_name -> aster.application.v1alpha1.PublishOperationCapacityStatus
-	30, // 17: aster.application.v1alpha1.GetStatusResponse.delivery_capacity:type_name -> aster.application.v1alpha1.DeliveryCapacityStatus
-	3,  // 18: aster.application.v1alpha1.PublishOperationCapacityStatus.warning_state:type_name -> aster.application.v1alpha1.OperationCapacityWarning
-	29, // 19: aster.application.v1alpha1.PublishOperationCapacityStatus.audit:type_name -> aster.application.v1alpha1.OperationLedgerAuditStatus
-	2,  // 20: aster.application.v1alpha1.PublishOperationCapacityStatus.ledger_mode:type_name -> aster.application.v1alpha1.PublishOperationLedgerMode
-	4,  // 21: aster.application.v1alpha1.OperationLedgerAuditStatus.state:type_name -> aster.application.v1alpha1.OperationLedgerAudit
-	7,  // 22: aster.application.v1alpha1.PeerStatus.authorization:type_name -> aster.application.v1alpha1.PeerAuthorization
-	8,  // 23: aster.application.v1alpha1.PeerStatus.last_contact:type_name -> aster.application.v1alpha1.ContactStatus
-	5,  // 24: aster.application.v1alpha1.PublishEventRequest.priority:type_name -> aster.application.v1alpha1.Priority
-	5,  // 25: aster.application.v1alpha1.PublishEventResponse.priority:type_name -> aster.application.v1alpha1.Priority
-	32, // 26: aster.application.v1alpha1.PublishEventsRequest.publication:type_name -> aster.application.v1alpha1.PublishEventRequest
-	33, // 27: aster.application.v1alpha1.PublishEventsResponse.published:type_name -> aster.application.v1alpha1.PublishEventResponse
-	11, // 28: aster.application.v1alpha1.PublishEventsResponse.failure:type_name -> aster.application.v1alpha1.PublicErrorDetail
-	46, // 29: aster.application.v1alpha1.BeginEventPublicationSessionResponse.outstanding:type_name -> aster.application.v1alpha1.CommittedPublicationResult
-	5,  // 30: aster.application.v1alpha1.PublishNumberedEventRequest.priority:type_name -> aster.application.v1alpha1.Priority
-	46, // 31: aster.application.v1alpha1.PublishNumberedEventResponse.result:type_name -> aster.application.v1alpha1.CommittedPublicationResult
-	47, // 32: aster.application.v1alpha1.CommittedPublicationResult.receipt:type_name -> aster.application.v1alpha1.CommittedEventReceipt
-	9,  // 33: aster.application.v1alpha1.CommittedPublicationResult.content:type_name -> aster.application.v1alpha1.CommittedContentStatus
-	10, // 34: aster.application.v1alpha1.CommittedPublicationResult.retirement_reason:type_name -> aster.application.v1alpha1.RetirementReason
-	50, // 35: aster.application.v1alpha1.QueryEventsResponse.events:type_name -> aster.application.v1alpha1.Event
-	5,  // 36: aster.application.v1alpha1.Event.priority:type_name -> aster.application.v1alpha1.Priority
-	57, // 37: aster.application.v1alpha1.PollEventsResponse.deliveries:type_name -> aster.application.v1alpha1.EventDelivery
-	50, // 38: aster.application.v1alpha1.StreamEventsResponse.event:type_name -> aster.application.v1alpha1.Event
-	50, // 39: aster.application.v1alpha1.EventDelivery.event:type_name -> aster.application.v1alpha1.Event
-	64, // 40: aster.application.v1alpha1.QueryEventGapsResponse.gaps:type_name -> aster.application.v1alpha1.EventGap
-	25, // 41: aster.application.v1alpha1.AsterApplicationService.GetStatus:input_type -> aster.application.v1alpha1.GetStatusRequest
-	32, // 42: aster.application.v1alpha1.AsterApplicationService.PublishEvent:input_type -> aster.application.v1alpha1.PublishEventRequest
-	34, // 43: aster.application.v1alpha1.AsterApplicationService.PublishEvents:input_type -> aster.application.v1alpha1.PublishEventsRequest
-	36, // 44: aster.application.v1alpha1.AsterApplicationService.BeginEventPublicationSession:input_type -> aster.application.v1alpha1.BeginEventPublicationSessionRequest
-	38, // 45: aster.application.v1alpha1.AsterApplicationService.CompleteEventPublicationRecovery:input_type -> aster.application.v1alpha1.CompleteEventPublicationRecoveryRequest
-	40, // 46: aster.application.v1alpha1.AsterApplicationService.PublishNumberedEvent:input_type -> aster.application.v1alpha1.PublishNumberedEventRequest
-	42, // 47: aster.application.v1alpha1.AsterApplicationService.AbandonEventPublication:input_type -> aster.application.v1alpha1.AbandonEventPublicationRequest
-	44, // 48: aster.application.v1alpha1.AsterApplicationService.AcknowledgeEventPublicationResult:input_type -> aster.application.v1alpha1.AcknowledgeEventPublicationResultRequest
-	48, // 49: aster.application.v1alpha1.AsterApplicationService.QueryEvents:input_type -> aster.application.v1alpha1.QueryEventsRequest
-	51, // 50: aster.application.v1alpha1.AsterApplicationService.CreateEventSubscription:input_type -> aster.application.v1alpha1.CreateEventSubscriptionRequest
-	22, // 51: aster.application.v1alpha1.AsterApplicationService.ListEventSubscriptions:input_type -> aster.application.v1alpha1.ListEventSubscriptionsRequest
-	53, // 52: aster.application.v1alpha1.AsterApplicationService.PollEvents:input_type -> aster.application.v1alpha1.PollEventsRequest
-	55, // 53: aster.application.v1alpha1.AsterApplicationService.StreamEvents:input_type -> aster.application.v1alpha1.StreamEventsRequest
-	58, // 54: aster.application.v1alpha1.AsterApplicationService.AcknowledgeEvent:input_type -> aster.application.v1alpha1.AcknowledgeEventRequest
-	60, // 55: aster.application.v1alpha1.AsterApplicationService.DeleteEventSubscription:input_type -> aster.application.v1alpha1.DeleteEventSubscriptionRequest
-	62, // 56: aster.application.v1alpha1.AsterApplicationService.QueryEventGaps:input_type -> aster.application.v1alpha1.QueryEventGapsRequest
-	13, // 57: aster.application.v1alpha1.AsterApplicationService.PublishBlob:input_type -> aster.application.v1alpha1.PublishBlobRequest
-	20, // 58: aster.application.v1alpha1.AsterApplicationService.ReadBlob:input_type -> aster.application.v1alpha1.ReadBlobRequest
-	26, // 59: aster.application.v1alpha1.AsterApplicationService.GetStatus:output_type -> aster.application.v1alpha1.GetStatusResponse
-	33, // 60: aster.application.v1alpha1.AsterApplicationService.PublishEvent:output_type -> aster.application.v1alpha1.PublishEventResponse
-	35, // 61: aster.application.v1alpha1.AsterApplicationService.PublishEvents:output_type -> aster.application.v1alpha1.PublishEventsResponse
-	37, // 62: aster.application.v1alpha1.AsterApplicationService.BeginEventPublicationSession:output_type -> aster.application.v1alpha1.BeginEventPublicationSessionResponse
-	39, // 63: aster.application.v1alpha1.AsterApplicationService.CompleteEventPublicationRecovery:output_type -> aster.application.v1alpha1.CompleteEventPublicationRecoveryResponse
-	41, // 64: aster.application.v1alpha1.AsterApplicationService.PublishNumberedEvent:output_type -> aster.application.v1alpha1.PublishNumberedEventResponse
-	43, // 65: aster.application.v1alpha1.AsterApplicationService.AbandonEventPublication:output_type -> aster.application.v1alpha1.AbandonEventPublicationResponse
-	45, // 66: aster.application.v1alpha1.AsterApplicationService.AcknowledgeEventPublicationResult:output_type -> aster.application.v1alpha1.AcknowledgeEventPublicationResultResponse
-	49, // 67: aster.application.v1alpha1.AsterApplicationService.QueryEvents:output_type -> aster.application.v1alpha1.QueryEventsResponse
-	52, // 68: aster.application.v1alpha1.AsterApplicationService.CreateEventSubscription:output_type -> aster.application.v1alpha1.CreateEventSubscriptionResponse
-	23, // 69: aster.application.v1alpha1.AsterApplicationService.ListEventSubscriptions:output_type -> aster.application.v1alpha1.ListEventSubscriptionsResponse
-	54, // 70: aster.application.v1alpha1.AsterApplicationService.PollEvents:output_type -> aster.application.v1alpha1.PollEventsResponse
-	56, // 71: aster.application.v1alpha1.AsterApplicationService.StreamEvents:output_type -> aster.application.v1alpha1.StreamEventsResponse
-	59, // 72: aster.application.v1alpha1.AsterApplicationService.AcknowledgeEvent:output_type -> aster.application.v1alpha1.AcknowledgeEventResponse
-	61, // 73: aster.application.v1alpha1.AsterApplicationService.DeleteEventSubscription:output_type -> aster.application.v1alpha1.DeleteEventSubscriptionResponse
-	63, // 74: aster.application.v1alpha1.AsterApplicationService.QueryEventGaps:output_type -> aster.application.v1alpha1.QueryEventGapsResponse
-	19, // 75: aster.application.v1alpha1.AsterApplicationService.PublishBlob:output_type -> aster.application.v1alpha1.PublishBlobResponse
-	21, // 76: aster.application.v1alpha1.AsterApplicationService.ReadBlob:output_type -> aster.application.v1alpha1.ReadBlobResponse
-	59, // [59:77] is the sub-list for method output_type
-	41, // [41:59] is the sub-list for method input_type
-	41, // [41:41] is the sub-list for extension type_name
-	41, // [41:41] is the sub-list for extension extendee
-	0,  // [0:41] is the sub-list for field type_name
+	28, // 15: aster.application.v1alpha1.GetStatusResponse.store_capacity:type_name -> aster.application.v1alpha1.StoreCapacityStatus
+	29, // 16: aster.application.v1alpha1.GetStatusResponse.publish_operation_capacity:type_name -> aster.application.v1alpha1.PublishOperationCapacityStatus
+	31, // 17: aster.application.v1alpha1.GetStatusResponse.delivery_capacity:type_name -> aster.application.v1alpha1.DeliveryCapacityStatus
+	68, // 18: aster.application.v1alpha1.GetStatusResponse.blob_capacity:type_name -> aster.application.v1alpha1.BlobCapacityStatus
+	3,  // 19: aster.application.v1alpha1.PublishOperationCapacityStatus.warning_state:type_name -> aster.application.v1alpha1.OperationCapacityWarning
+	30, // 20: aster.application.v1alpha1.PublishOperationCapacityStatus.audit:type_name -> aster.application.v1alpha1.OperationLedgerAuditStatus
+	2,  // 21: aster.application.v1alpha1.PublishOperationCapacityStatus.ledger_mode:type_name -> aster.application.v1alpha1.PublishOperationLedgerMode
+	4,  // 22: aster.application.v1alpha1.OperationLedgerAuditStatus.state:type_name -> aster.application.v1alpha1.OperationLedgerAudit
+	7,  // 23: aster.application.v1alpha1.PeerStatus.authorization:type_name -> aster.application.v1alpha1.PeerAuthorization
+	8,  // 24: aster.application.v1alpha1.PeerStatus.last_contact:type_name -> aster.application.v1alpha1.ContactStatus
+	5,  // 25: aster.application.v1alpha1.PublishEventRequest.priority:type_name -> aster.application.v1alpha1.Priority
+	5,  // 26: aster.application.v1alpha1.PublishEventResponse.priority:type_name -> aster.application.v1alpha1.Priority
+	33, // 27: aster.application.v1alpha1.PublishEventsRequest.publication:type_name -> aster.application.v1alpha1.PublishEventRequest
+	34, // 28: aster.application.v1alpha1.PublishEventsResponse.published:type_name -> aster.application.v1alpha1.PublishEventResponse
+	12, // 29: aster.application.v1alpha1.PublishEventsResponse.failure:type_name -> aster.application.v1alpha1.PublicErrorDetail
+	47, // 30: aster.application.v1alpha1.BeginEventPublicationSessionResponse.outstanding:type_name -> aster.application.v1alpha1.CommittedPublicationResult
+	5,  // 31: aster.application.v1alpha1.PublishNumberedEventRequest.priority:type_name -> aster.application.v1alpha1.Priority
+	47, // 32: aster.application.v1alpha1.PublishNumberedEventResponse.result:type_name -> aster.application.v1alpha1.CommittedPublicationResult
+	48, // 33: aster.application.v1alpha1.CommittedPublicationResult.receipt:type_name -> aster.application.v1alpha1.CommittedEventReceipt
+	9,  // 34: aster.application.v1alpha1.CommittedPublicationResult.content:type_name -> aster.application.v1alpha1.CommittedContentStatus
+	10, // 35: aster.application.v1alpha1.CommittedPublicationResult.retirement_reason:type_name -> aster.application.v1alpha1.RetirementReason
+	51, // 36: aster.application.v1alpha1.QueryEventsResponse.events:type_name -> aster.application.v1alpha1.Event
+	5,  // 37: aster.application.v1alpha1.Event.priority:type_name -> aster.application.v1alpha1.Priority
+	58, // 38: aster.application.v1alpha1.PollEventsResponse.deliveries:type_name -> aster.application.v1alpha1.EventDelivery
+	51, // 39: aster.application.v1alpha1.StreamEventsResponse.event:type_name -> aster.application.v1alpha1.Event
+	51, // 40: aster.application.v1alpha1.EventDelivery.event:type_name -> aster.application.v1alpha1.Event
+	65, // 41: aster.application.v1alpha1.QueryEventGapsResponse.gaps:type_name -> aster.application.v1alpha1.EventGap
+	11, // 42: aster.application.v1alpha1.InspectBlobPublicationResponse.phase:type_name -> aster.application.v1alpha1.BlobPublicationPhase
+	26, // 43: aster.application.v1alpha1.AsterApplicationService.GetStatus:input_type -> aster.application.v1alpha1.GetStatusRequest
+	66, // 44: aster.application.v1alpha1.AsterApplicationService.InspectBlobPublication:input_type -> aster.application.v1alpha1.InspectBlobPublicationRequest
+	33, // 45: aster.application.v1alpha1.AsterApplicationService.PublishEvent:input_type -> aster.application.v1alpha1.PublishEventRequest
+	35, // 46: aster.application.v1alpha1.AsterApplicationService.PublishEvents:input_type -> aster.application.v1alpha1.PublishEventsRequest
+	37, // 47: aster.application.v1alpha1.AsterApplicationService.BeginEventPublicationSession:input_type -> aster.application.v1alpha1.BeginEventPublicationSessionRequest
+	39, // 48: aster.application.v1alpha1.AsterApplicationService.CompleteEventPublicationRecovery:input_type -> aster.application.v1alpha1.CompleteEventPublicationRecoveryRequest
+	41, // 49: aster.application.v1alpha1.AsterApplicationService.PublishNumberedEvent:input_type -> aster.application.v1alpha1.PublishNumberedEventRequest
+	43, // 50: aster.application.v1alpha1.AsterApplicationService.AbandonEventPublication:input_type -> aster.application.v1alpha1.AbandonEventPublicationRequest
+	45, // 51: aster.application.v1alpha1.AsterApplicationService.AcknowledgeEventPublicationResult:input_type -> aster.application.v1alpha1.AcknowledgeEventPublicationResultRequest
+	49, // 52: aster.application.v1alpha1.AsterApplicationService.QueryEvents:input_type -> aster.application.v1alpha1.QueryEventsRequest
+	52, // 53: aster.application.v1alpha1.AsterApplicationService.CreateEventSubscription:input_type -> aster.application.v1alpha1.CreateEventSubscriptionRequest
+	23, // 54: aster.application.v1alpha1.AsterApplicationService.ListEventSubscriptions:input_type -> aster.application.v1alpha1.ListEventSubscriptionsRequest
+	54, // 55: aster.application.v1alpha1.AsterApplicationService.PollEvents:input_type -> aster.application.v1alpha1.PollEventsRequest
+	56, // 56: aster.application.v1alpha1.AsterApplicationService.StreamEvents:input_type -> aster.application.v1alpha1.StreamEventsRequest
+	59, // 57: aster.application.v1alpha1.AsterApplicationService.AcknowledgeEvent:input_type -> aster.application.v1alpha1.AcknowledgeEventRequest
+	61, // 58: aster.application.v1alpha1.AsterApplicationService.DeleteEventSubscription:input_type -> aster.application.v1alpha1.DeleteEventSubscriptionRequest
+	63, // 59: aster.application.v1alpha1.AsterApplicationService.QueryEventGaps:input_type -> aster.application.v1alpha1.QueryEventGapsRequest
+	14, // 60: aster.application.v1alpha1.AsterApplicationService.PublishBlob:input_type -> aster.application.v1alpha1.PublishBlobRequest
+	21, // 61: aster.application.v1alpha1.AsterApplicationService.ReadBlob:input_type -> aster.application.v1alpha1.ReadBlobRequest
+	27, // 62: aster.application.v1alpha1.AsterApplicationService.GetStatus:output_type -> aster.application.v1alpha1.GetStatusResponse
+	67, // 63: aster.application.v1alpha1.AsterApplicationService.InspectBlobPublication:output_type -> aster.application.v1alpha1.InspectBlobPublicationResponse
+	34, // 64: aster.application.v1alpha1.AsterApplicationService.PublishEvent:output_type -> aster.application.v1alpha1.PublishEventResponse
+	36, // 65: aster.application.v1alpha1.AsterApplicationService.PublishEvents:output_type -> aster.application.v1alpha1.PublishEventsResponse
+	38, // 66: aster.application.v1alpha1.AsterApplicationService.BeginEventPublicationSession:output_type -> aster.application.v1alpha1.BeginEventPublicationSessionResponse
+	40, // 67: aster.application.v1alpha1.AsterApplicationService.CompleteEventPublicationRecovery:output_type -> aster.application.v1alpha1.CompleteEventPublicationRecoveryResponse
+	42, // 68: aster.application.v1alpha1.AsterApplicationService.PublishNumberedEvent:output_type -> aster.application.v1alpha1.PublishNumberedEventResponse
+	44, // 69: aster.application.v1alpha1.AsterApplicationService.AbandonEventPublication:output_type -> aster.application.v1alpha1.AbandonEventPublicationResponse
+	46, // 70: aster.application.v1alpha1.AsterApplicationService.AcknowledgeEventPublicationResult:output_type -> aster.application.v1alpha1.AcknowledgeEventPublicationResultResponse
+	50, // 71: aster.application.v1alpha1.AsterApplicationService.QueryEvents:output_type -> aster.application.v1alpha1.QueryEventsResponse
+	53, // 72: aster.application.v1alpha1.AsterApplicationService.CreateEventSubscription:output_type -> aster.application.v1alpha1.CreateEventSubscriptionResponse
+	24, // 73: aster.application.v1alpha1.AsterApplicationService.ListEventSubscriptions:output_type -> aster.application.v1alpha1.ListEventSubscriptionsResponse
+	55, // 74: aster.application.v1alpha1.AsterApplicationService.PollEvents:output_type -> aster.application.v1alpha1.PollEventsResponse
+	57, // 75: aster.application.v1alpha1.AsterApplicationService.StreamEvents:output_type -> aster.application.v1alpha1.StreamEventsResponse
+	60, // 76: aster.application.v1alpha1.AsterApplicationService.AcknowledgeEvent:output_type -> aster.application.v1alpha1.AcknowledgeEventResponse
+	62, // 77: aster.application.v1alpha1.AsterApplicationService.DeleteEventSubscription:output_type -> aster.application.v1alpha1.DeleteEventSubscriptionResponse
+	64, // 78: aster.application.v1alpha1.AsterApplicationService.QueryEventGaps:output_type -> aster.application.v1alpha1.QueryEventGapsResponse
+	20, // 79: aster.application.v1alpha1.AsterApplicationService.PublishBlob:output_type -> aster.application.v1alpha1.PublishBlobResponse
+	22, // 80: aster.application.v1alpha1.AsterApplicationService.ReadBlob:output_type -> aster.application.v1alpha1.ReadBlobResponse
+	62, // [62:81] is the sub-list for method output_type
+	43, // [43:62] is the sub-list for method input_type
+	43, // [43:43] is the sub-list for extension type_name
+	43, // [43:43] is the sub-list for extension extendee
+	0,  // [0:43] is the sub-list for field type_name
 }
 
 func init() { file_aster_application_v1alpha1_aster_proto_init() }
@@ -5116,13 +5537,14 @@ func file_aster_application_v1alpha1_aster_proto_init() {
 	file_aster_application_v1alpha1_aster_proto_msgTypes[35].OneofWrappers = []any{}
 	file_aster_application_v1alpha1_aster_proto_msgTypes[37].OneofWrappers = []any{}
 	file_aster_application_v1alpha1_aster_proto_msgTypes[39].OneofWrappers = []any{}
+	file_aster_application_v1alpha1_aster_proto_msgTypes[55].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_aster_application_v1alpha1_aster_proto_rawDesc), len(file_aster_application_v1alpha1_aster_proto_rawDesc)),
-			NumEnums:      11,
-			NumMessages:   54,
+			NumEnums:      12,
+			NumMessages:   57,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

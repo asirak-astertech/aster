@@ -2,10 +2,11 @@ use std::{path::Path, sync::Arc};
 
 use aster_mesh::{MAX_BLOB_MEDIA_TYPE_BYTES, MAX_BLOB_SCHEMA_ID_BYTES};
 use aster_node::application::{
-    BlobId, BlobPublishOptions, BlobPublishRequest as NodeBlobPublishRequest, BlobPublishResult,
+    BlobId, BlobPublicationInspection, BlobPublicationInspectionRequest, BlobPublicationPhase,
+    BlobPublishOptions, BlobPublishRequest as NodeBlobPublishRequest, BlobPublishResult,
     BlobPublishStreamRequest, BlobReadPage, BlobReadPageRequest,
-    BlobReadRequest as NodeBlobReadRequest, MAX_SELECTED_BLOB_STREAM_BYTES, Priority, Scope,
-    SelectedBlobHandle, Topic,
+    BlobReadRequest as NodeBlobReadRequest, BlobStreamPublicationId,
+    MAX_SELECTED_BLOB_STREAM_BYTES, Priority, Scope, SelectedBlobHandle, Topic,
 };
 use aster_redb_store::MAX_BLOB_OPERATION_KEY_BYTES;
 use connectrpc::{ConnectError, ErrorCode, RequestContext, Response, ServiceResult, ServiceStream};
@@ -131,6 +132,39 @@ impl BlobConnectService {
             Ok(Some((response, state)))
         });
         Response::stream_ok(responses)
+    }
+
+    pub(crate) async fn inspect(
+        &self,
+        request: api::InspectBlobPublicationRequest,
+    ) -> ServiceResult<api::InspectBlobPublicationResponse> {
+        let operation = PublicOperation::InspectBlobPublication;
+        let publication_id_bytes: [u8; 32] = request
+            .publication_id
+            .as_slice()
+            .try_into()
+            .map_err(|_| malformed(operation))?;
+        let publication_id = BlobStreamPublicationId::from_bytes(publication_id_bytes)
+            .map_err(|_| malformed(operation))?;
+        let inspection = self
+            .blobs
+            .inspect_publication(BlobPublicationInspectionRequest {
+                publication_id,
+                topic: Topic::new(request.topic).map_err(|_| malformed(operation))?,
+                scope: Scope::new(request.scope).map_err(|_| malformed(operation))?,
+            })
+            .await
+            .map_err(|error| connect_blob_application_error(error, operation))?;
+        Response::ok(publication_status_message(inspection))
+    }
+
+    pub(crate) async fn capacity_status(
+        &self,
+    ) -> Result<
+        aster_node::application::BlobCapacityStatus,
+        aster_node::application::ApplicationError,
+    > {
+        self.blobs.capacity_status().await
     }
 }
 
@@ -309,7 +343,7 @@ async fn next_publish_response(
                 .await
                 .map_err(|error| connect_blob_application_error(error, operation))?;
             state.complete = true;
-            return Ok(Some((publish_complete(result), state)));
+            return Ok(Some((publish_complete(result)?, state)));
         }
         let grammar = state.grammar.as_mut().ok_or_else(|| internal(operation))?;
         let offset = grammar.received;
@@ -449,17 +483,20 @@ fn publish_checkpoint(
     }
 }
 
-fn publish_complete(result: BlobPublishResult) -> api::PublishBlobResponse {
-    api::PublishBlobResponse {
+fn publish_complete(result: BlobPublishResult) -> Result<api::PublishBlobResponse, ConnectError> {
+    Ok(api::PublishBlobResponse {
         frame: Some(api::publish_blob_response::Frame::Complete(Box::new(
-            publish_receipt(result),
+            publish_receipt(result)?,
         ))),
         ..Default::default()
-    }
+    })
 }
 
-fn publish_receipt(result: BlobPublishResult) -> api::PublishBlobReceipt {
-    api::PublishBlobReceipt {
+fn publish_receipt(result: BlobPublishResult) -> Result<api::PublishBlobReceipt, ConnectError> {
+    let publication_id = result
+        .publication_id
+        .ok_or_else(|| internal(PublicOperation::PublishBlob))?;
+    Ok(api::PublishBlobReceipt {
         id: result.id.as_bytes().to_vec(),
         publisher: result.publisher.to_vec(),
         publisher_counter: result.publisher_counter,
@@ -470,6 +507,32 @@ fn publish_receipt(result: BlobPublishResult) -> api::PublishBlobReceipt {
         schema_id: result.schema_id,
         acceptance_marker: result.acceptance_marker,
         inserted: result.inserted,
+        publication_id: publication_id.as_bytes().to_vec(),
+        ..Default::default()
+    })
+}
+
+fn publication_status_message(
+    inspection: BlobPublicationInspection,
+) -> api::InspectBlobPublicationResponse {
+    api::InspectBlobPublicationResponse {
+        publication_id: inspection.publication_id.as_bytes().to_vec(),
+        phase: match inspection.phase {
+            BlobPublicationPhase::Missing => api::BlobPublicationPhase::Missing,
+            BlobPublicationPhase::AwaitingData => api::BlobPublicationPhase::AwaitingData,
+            BlobPublicationPhase::Receiving => api::BlobPublicationPhase::Receiving,
+            BlobPublicationPhase::ReadyToFinalize => api::BlobPublicationPhase::ReadyToFinalize,
+            BlobPublicationPhase::Available => api::BlobPublicationPhase::Available,
+            BlobPublicationPhase::ExpiredOrRetired => api::BlobPublicationPhase::ExpiredOrRetired,
+        }
+        .into(),
+        plaintext_total_bytes: inspection.plaintext_total_bytes,
+        durable_plaintext_bytes: inspection.durable_plaintext_bytes,
+        transfer_total_bytes: inspection.transfer_total_bytes,
+        durable_transfer_bytes: inspection.durable_transfer_bytes,
+        total_units: inspection.total_units,
+        durable_units: inspection.durable_units,
+        blob_id: inspection.blob_id.map(|id| id.as_bytes().to_vec()),
         ..Default::default()
     }
 }
@@ -587,7 +650,10 @@ mod tests {
     use crate::api;
     #[cfg(target_os = "linux")]
     use aster_mesh::{ProvisioningAccess, ReferenceProvisioner};
-    use aster_node::application::{MAX_SELECTED_BLOB_PAGE_BYTES, MAX_SELECTED_BLOB_STREAM_BYTES};
+    use aster_node::application::{
+        BlobPublicationInspection, BlobPublicationPhase, BlobStreamPublicationId,
+        MAX_SELECTED_BLOB_PAGE_BYTES, MAX_SELECTED_BLOB_STREAM_BYTES,
+    };
     #[cfg(target_os = "linux")]
     use aster_node::mission::UnprotectedReferenceMission;
     #[cfg(target_os = "linux")]
@@ -634,6 +700,91 @@ mod tests {
             ttl_ms,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn inspect_blob_publication_maps_all_states_without_transport_details() {
+        let publication_id = BlobStreamPublicationId::from_bytes([0x31; 32]).unwrap();
+        for (phase, expected) in [
+            (
+                BlobPublicationPhase::Missing,
+                api::BlobPublicationPhase::Missing,
+            ),
+            (
+                BlobPublicationPhase::AwaitingData,
+                api::BlobPublicationPhase::AwaitingData,
+            ),
+            (
+                BlobPublicationPhase::Receiving,
+                api::BlobPublicationPhase::Receiving,
+            ),
+            (
+                BlobPublicationPhase::ReadyToFinalize,
+                api::BlobPublicationPhase::ReadyToFinalize,
+            ),
+            (
+                BlobPublicationPhase::Available,
+                api::BlobPublicationPhase::Available,
+            ),
+            (
+                BlobPublicationPhase::ExpiredOrRetired,
+                api::BlobPublicationPhase::ExpiredOrRetired,
+            ),
+        ] {
+            let available = phase == BlobPublicationPhase::Available;
+            let response = publication_status_message(BlobPublicationInspection {
+                publication_id,
+                phase,
+                plaintext_total_bytes: 1_000,
+                durable_plaintext_bytes: 500,
+                transfer_total_bytes: 1_200,
+                durable_transfer_bytes: 600,
+                total_units: 10,
+                durable_units: 5,
+                blob_id: available.then(|| BlobId::from_bytes([0x32; 32])),
+            });
+            assert_eq!(response.publication_id, [0x31; 32]);
+            assert_eq!(response.phase, expected);
+            assert_eq!(response.blob_id.is_some(), available);
+            assert!(response.encoded_len() < crate::MAX_AGENT_RESPONSE_PROTO_BYTES);
+        }
+    }
+
+    #[test]
+    fn inspect_blob_publication_hides_unauthorized_as_missing() {
+        let response = publication_status_message(BlobPublicationInspection {
+            publication_id: BlobStreamPublicationId::from_bytes([0x33; 32]).unwrap(),
+            phase: BlobPublicationPhase::Missing,
+            plaintext_total_bytes: 0,
+            durable_plaintext_bytes: 0,
+            transfer_total_bytes: 0,
+            durable_transfer_bytes: 0,
+            total_units: 0,
+            durable_units: 0,
+            blob_id: None,
+        });
+        assert_eq!(response.phase, api::BlobPublicationPhase::Missing);
+        assert!(response.blob_id.is_none());
+    }
+
+    #[test]
+    fn publish_receipt_includes_publication_id() {
+        let publication_id = BlobStreamPublicationId::from_bytes([0x34; 32]).unwrap();
+        let receipt = publish_receipt(BlobPublishResult {
+            publication_id: Some(publication_id),
+            id: BlobId::from_bytes([0x35; 32]),
+            publisher: [0x36; 32],
+            publisher_counter: 7,
+            priority: Priority::Immediate,
+            ttl_ms: None,
+            total_len: 8,
+            media_type: None,
+            schema_id: Vec::new(),
+            acceptance_marker: 9,
+            inserted: true,
+        })
+        .unwrap();
+        assert_eq!(receipt.publication_id, [0x34; 32]);
     }
 
     fn metadata_frame(total_len: u64, ttl_ms: Option<u64>) -> api::PublishBlobRequest {

@@ -399,7 +399,8 @@ func statusEvidence(message *applicationv1alpha1.GetStatusResponse) (result, err
 	store := message.StoreCapacity
 	operations := message.PublishOperationCapacity
 	deliveries := message.DeliveryCapacity
-	if store == nil || operations == nil || deliveries == nil {
+	blobs := message.BlobCapacity
+	if store == nil || operations == nil || deliveries == nil || blobs == nil {
 		return nil, errors.New("invalid status response")
 	}
 	var operationLedgerMode string
@@ -434,6 +435,13 @@ func statusEvidence(message *applicationv1alpha1.GetStatusResponse) (result, err
 		deliveries.Pending > deliveries.HardLimit {
 		return nil, errors.New("invalid status response")
 	}
+	if blobs.ReservedBytes > blobs.ByteLimit || blobs.Variants > blobs.VariantLimit ||
+		blobs.ExpectedChunks > blobs.ChunkLimit ||
+		blobs.BytesExhausted != (blobs.ReservedBytes >= blobs.ByteLimit) ||
+		blobs.VariantsExhausted != (blobs.Variants >= blobs.VariantLimit) ||
+		blobs.ChunksExhausted != (blobs.ExpectedChunks >= blobs.ChunkLimit) {
+		return nil, errors.New("invalid status response")
+	}
 	return result{
 		"status":                                    "ok",
 		"configured_emission_mode":                  configured,
@@ -464,6 +472,17 @@ func statusEvidence(message *applicationv1alpha1.GetStatusResponse) (result, err
 		"operation_audit_total":                     operations.Audit.Total,
 		"pending_deliveries":                        deliveries.Pending,
 		"delivery_profile_saturated":                deliveries.ProfileSaturated,
+		"blob_reserved_bytes":                       blobs.ReservedBytes,
+		"blob_byte_limit":                           blobs.ByteLimit,
+		"blob_variants":                             blobs.Variants,
+		"blob_variant_limit":                        blobs.VariantLimit,
+		"blob_expected_chunks":                      blobs.ExpectedChunks,
+		"blob_chunk_limit":                          blobs.ChunkLimit,
+		"blob_pending_sources":                      blobs.PendingSources,
+		"blob_network_staging_bytes":                blobs.NetworkStagingBytes,
+		"blob_bytes_exhausted":                      blobs.BytesExhausted,
+		"blob_variants_exhausted":                   blobs.VariantsExhausted,
+		"blob_chunks_exhausted":                     blobs.ChunksExhausted,
 	}, nil
 }
 

@@ -7,16 +7,16 @@ use std::{
 
 use aster_node::EventEmissionPolicy;
 use aster_node::application::{
-    AuthenticatedPeerStatus, CommittedEventContent, ContactSyncStatus as NodeContactSyncStatus,
-    EventAcknowledgement, EventClientId, EventDelivery as NodeEventDelivery,
-    EventGap as NodeEventGap, EventGapQuery, EventId, EventItem, EventOperationAbandonment,
-    EventOperationAuditState, EventOperationCapacityWarning, EventOperationLedgerMode,
-    EventOperationSequence, EventPollRequest, EventPublicationSession, EventPublishOptions,
-    EventPublishRequest, EventPublishResult, EventQuery, EventResultAcknowledgement,
-    EventSubscriptionId, EventSubscriptionRequest, EventSyncStatus as NodeEventSyncStatus,
-    EventUnsubscribe, NumberedEventPublishRequest, NumberedEventResult,
-    PeerAuthorization as NodePeerAuthorization, Priority as NodePriority, Scope,
-    SelectedBlobHandle, SelectedEventHandle, SelectedEventStatus, Topic,
+    AuthenticatedPeerStatus, BlobCapacityStatus, CommittedEventContent,
+    ContactSyncStatus as NodeContactSyncStatus, EventAcknowledgement, EventClientId,
+    EventDelivery as NodeEventDelivery, EventGap as NodeEventGap, EventGapQuery, EventId,
+    EventItem, EventOperationAbandonment, EventOperationAuditState, EventOperationCapacityWarning,
+    EventOperationLedgerMode, EventOperationSequence, EventPollRequest, EventPublicationSession,
+    EventPublishOptions, EventPublishRequest, EventPublishResult, EventQuery,
+    EventResultAcknowledgement, EventSubscriptionId, EventSubscriptionRequest,
+    EventSyncStatus as NodeEventSyncStatus, EventUnsubscribe, NumberedEventPublishRequest,
+    NumberedEventResult, PeerAuthorization as NodePeerAuthorization, Priority as NodePriority,
+    Scope, SelectedBlobHandle, SelectedEventHandle, SelectedEventStatus, Topic,
 };
 use aster_redb_store::{CustodyRetirementReason, MAX_EVENT_PENDING_DELIVERIES};
 use connectrpc::{
@@ -167,6 +167,14 @@ pub(crate) fn rejection_router() -> connectrpc::Router {
         )
         .route_bidi_stream(
             APPLICATION_SERVICE_NAME,
+            "InspectBlobPublication",
+            rejection_handler::<
+                api::InspectBlobPublicationRequest,
+                api::InspectBlobPublicationResponse,
+            >(),
+        )
+        .route_bidi_stream(
+            APPLICATION_SERVICE_NAME,
             "PublishEvent",
             rejection_handler::<api::PublishEventRequest, api::PublishEventResponse>(),
         )
@@ -282,6 +290,12 @@ impl api::AsterApplicationService for AsterConnectService {
             .status()
             .await
             .map_err(connect_application_error)?;
+        let blob_capacity = match &self.blobs {
+            Some(blobs) => Some(blobs.capacity_status().await.map_err(|error| {
+                crate::error::connect_blob_application_error(error, PublicOperation::GetStatus)
+            })?),
+            None => None,
+        };
         bounded_response(
             status_response(
                 self.events.identity(),
@@ -289,9 +303,27 @@ impl api::AsterApplicationService for AsterConnectService {
                 self.configured_emission_policy,
                 self.credential_generation,
                 status,
+                blob_capacity,
             ),
             PublicOperation::GetStatus,
         )
+    }
+
+    async fn inspect_blob_publication(
+        &self,
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, api::InspectBlobPublicationRequest>,
+    ) -> ServiceResult<api::InspectBlobPublicationResponse> {
+        let blobs = self.blobs.as_ref().ok_or_else(|| {
+            public_error(
+                ErrorCode::FailedPrecondition,
+                api::PublicErrorReason::FailedPrecondition,
+                PublicOperation::InspectBlobPublication,
+                false,
+                None,
+            )
+        })?;
+        blobs.inspect(request.to_owned_message()).await
     }
 
     async fn publish_blob(
@@ -1083,6 +1115,7 @@ fn status_response(
     configured_emission_policy: EventEmissionPolicy,
     credential_generation: Option<CredentialGeneration>,
     status: SelectedEventStatus,
+    blob_capacity: Option<BlobCapacityStatus>,
 ) -> api::GetStatusResponse {
     let operations = status.event_operation_capacity;
     let profile_remaining = PROFILE_EVENT_OPERATION_BOUNDARY.saturating_sub(operations.rows);
@@ -1163,6 +1196,24 @@ fn status_response(
         credential_generation: credential_generation
             .map(|generation| generation.as_bytes().to_vec())
             .unwrap_or_default(),
+        blob_capacity: blob_capacity.map(blob_capacity_message).into(),
+        ..Default::default()
+    }
+}
+
+fn blob_capacity_message(status: BlobCapacityStatus) -> api::BlobCapacityStatus {
+    api::BlobCapacityStatus {
+        reserved_bytes: status.reserved_bytes,
+        byte_limit: status.byte_limit,
+        variants: status.variants,
+        variant_limit: status.variant_limit,
+        expected_chunks: status.expected_chunks,
+        chunk_limit: status.chunk_limit,
+        pending_sources: status.pending_sources,
+        network_staging_bytes: status.network_staging_bytes,
+        bytes_exhausted: status.bytes_exhausted,
+        variants_exhausted: status.variants_exhausted,
+        chunks_exhausted: status.chunks_exhausted,
         ..Default::default()
     }
 }
@@ -1439,6 +1490,28 @@ mod tests {
         .await
         .expect("combined status handler");
         assert_eq!(status.body.identity.len(), 32);
+        assert!(status.body.blob_capacity.as_option().is_some());
+
+        let inspection_message = api::InspectBlobPublicationRequest {
+            publication_id: vec![0x42; 32],
+            topic: "chat.events".to_owned(),
+            scope: "mission/team/alpha".to_owned(),
+            ..Default::default()
+        };
+        let inspection_body = bytes::Bytes::from(inspection_message.encode_to_vec());
+        let inspection_view = api::InspectBlobPublicationRequest::decode_view(&inspection_body)
+            .expect("inspection view");
+        let inspection_request = ServiceRequest::from_parts(&inspection_view, &inspection_body);
+        let inspection = api::AsterApplicationService::inspect_blob_publication(
+            &service,
+            RequestContext::default(),
+            inspection_request,
+        )
+        .await
+        .expect("combined Blob inspection handler");
+        assert_eq!(inspection.body.publication_id, [0x42; 32]);
+        assert_eq!(inspection.body.phase, api::BlobPublicationPhase::Missing);
+        assert!(inspection.body.blob_id.is_none());
 
         let event_message = api::PublishEventRequest {
             operation_key: b"non-linux-handler-event".to_vec(),
@@ -1748,7 +1821,7 @@ mod tests {
     }
 
     #[test]
-    fn status_reports_configured_effective_mode_and_capacity_headroom() {
+    fn status_response_includes_blob_capacity() {
         let response = status_response(
             [0x11; 32],
             [0x22; 32],
@@ -1771,6 +1844,19 @@ mod tests {
                 event_operation_estimated_seconds_to_exhaustion: 0,
                 pending_deliveries: 0,
             },
+            Some(BlobCapacityStatus {
+                reserved_bytes: 11,
+                byte_limit: 100,
+                variants: 2,
+                variant_limit: 10,
+                expected_chunks: 3,
+                chunk_limit: 20,
+                pending_sources: 4,
+                network_staging_bytes: 5,
+                bytes_exhausted: false,
+                variants_exhausted: false,
+                chunks_exhausted: false,
+            }),
         );
 
         assert_eq!(response.configured_emission_mode, api::EmissionMode::Normal);
@@ -1785,6 +1871,20 @@ mod tests {
                 item_limit: 10_000,
                 payload_bytes: 0,
                 payload_byte_limit: 64 * 1024 * 1024,
+                ..Default::default()
+            })
+        );
+        assert_eq!(
+            response.blob_capacity.as_option(),
+            Some(&api::BlobCapacityStatus {
+                reserved_bytes: 11,
+                byte_limit: 100,
+                variants: 2,
+                variant_limit: 10,
+                expected_chunks: 3,
+                chunk_limit: 20,
+                pending_sources: 4,
+                network_staging_bytes: 5,
                 ..Default::default()
             })
         );
@@ -1899,6 +1999,7 @@ mod tests {
                     event_operation_estimated_seconds_to_exhaustion: 123,
                     pending_deliveries: 0,
                 },
+                None,
             );
             let operations = response.publish_operation_capacity.as_option().unwrap();
             assert_eq!(
