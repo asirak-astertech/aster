@@ -26504,6 +26504,8 @@ async fn sync_profile5_blob_lane_if_selected(
     guard: &EventLaneGuard,
     verifier: ReferenceEnvelopeSealer,
     interests: &MutableSourceInterests,
+    send_enabled: bool,
+    receive_enabled: bool,
     receipt: &mut PeerReceipt,
 ) -> Result<(), NodeError> {
     if mode != BlobTransferMode::StreamV1 {
@@ -26513,29 +26515,34 @@ async fn sync_profile5_blob_lane_if_selected(
         NodeError::Protocol("profile-5 Blob lane has no authenticated profiles".into())
     })?;
     let local_interest = protected_blob_interest(store, &verifier, interests, true)?;
-    send_profile5_blob_direction(
-        store,
-        connection,
-        mission,
-        profiles,
-        guard,
-        EventDirection::ToSessionResponder,
-        receipt,
-    )
-    .await?;
-    receive_profile5_blob_direction(
-        lease_store,
-        connection,
-        mission,
-        profiles,
-        guard,
-        Arc::new(verifier),
-        &local_interest,
-        EventDirection::ToSessionInitiator,
-        receipt,
-    )
-    .await
-    .map_err(|error| blob_stream_error("profile-5 initiator receive phase", error))
+    if send_enabled {
+        send_profile5_blob_direction(
+            store,
+            connection,
+            mission,
+            profiles,
+            guard,
+            EventDirection::ToSessionResponder,
+            receipt,
+        )
+        .await?;
+    }
+    if receive_enabled {
+        receive_profile5_blob_direction(
+            lease_store,
+            connection,
+            mission,
+            profiles,
+            guard,
+            Arc::new(verifier),
+            &local_interest,
+            EventDirection::ToSessionInitiator,
+            receipt,
+        )
+        .await
+        .map_err(|error| blob_stream_error("profile-5 initiator receive phase", error))?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -26548,6 +26555,8 @@ async fn serve_profile5_blob_lane_if_selected(
     guard: &EventLaneGuard,
     verifier: ReferenceEnvelopeSealer,
     interests: &MutableSourceInterests,
+    receive_enabled: bool,
+    send_enabled: bool,
     receipt: &mut PeerReceipt,
 ) -> Result<(), NodeError> {
     if mode != BlobTransferMode::StreamV1 {
@@ -26558,30 +26567,35 @@ async fn serve_profile5_blob_lane_if_selected(
     })?;
     let local_interest = protected_blob_interest(&store, &verifier, interests, true)?;
     let verifier = Arc::new(verifier);
-    receive_profile5_blob_direction(
-        Arc::clone(&store),
-        connection,
-        mission,
-        profiles,
-        guard,
-        Arc::clone(&verifier),
-        &local_interest,
-        EventDirection::ToSessionResponder,
-        receipt,
-    )
-    .await
-    .map_err(|error| blob_stream_error("profile-5 responder receive phase", error))?;
-    send_profile5_blob_direction(
-        &store,
-        connection,
-        mission,
-        profiles,
-        guard,
-        EventDirection::ToSessionInitiator,
-        receipt,
-    )
-    .await
-    .map_err(|error| blob_stream_error("profile-5 responder send phase", error))
+    if receive_enabled {
+        receive_profile5_blob_direction(
+            Arc::clone(&store),
+            connection,
+            mission,
+            profiles,
+            guard,
+            Arc::clone(&verifier),
+            &local_interest,
+            EventDirection::ToSessionResponder,
+            receipt,
+        )
+        .await
+        .map_err(|error| blob_stream_error("profile-5 responder receive phase", error))?;
+    }
+    if send_enabled {
+        send_profile5_blob_direction(
+            &store,
+            connection,
+            mission,
+            profiles,
+            guard,
+            EventDirection::ToSessionInitiator,
+            receipt,
+        )
+        .await
+        .map_err(|error| blob_stream_error("profile-5 responder send phase", error))?;
+    }
+    Ok(())
 }
 
 async fn sync_event_turn_plans(
@@ -26890,6 +26904,8 @@ async fn sync_authenticated_session(
                 &event_guard,
                 event_verifier,
                 &mutable_interests,
+                !matches!(local_emission.policy, EventEmissionPolicy::ReceiveOnly),
+                !matches!(remote_emission.policy, EventEmissionPolicy::ReceiveOnly),
                 &mut receipt,
             )
             .await?;
@@ -27066,6 +27082,8 @@ async fn sync_authenticated_session(
                     &event_guard,
                     event_verifier,
                     &mutable_interests,
+                    !matches!(local_emission.policy, EventEmissionPolicy::ReceiveOnly),
+                    !matches!(remote_emission.policy, EventEmissionPolicy::ReceiveOnly),
                     &mut receipt,
                 )
                 .await?;
@@ -27228,6 +27246,8 @@ async fn sync_authenticated_session(
         &event_guard,
         event_verifier,
         &mutable_interests,
+        !matches!(local_emission.policy, EventEmissionPolicy::ReceiveOnly),
+        !matches!(remote_emission.policy, EventEmissionPolicy::ReceiveOnly),
         &mut receipt,
     )
     .await?;
@@ -29123,9 +29143,9 @@ async fn serve_session(
     // either exact configured identity validation or discovered-peer mission admission
     // finishes.
     let (mut mission, handshake) = match expected_peer {
-        Some(peer) => respond_over_iroh_metered(&connection, credentials.fresh_bundle()?, peer)
-            .await
-            .map_err(|error| protocol_stage_error("respond mission handshake", error))?,
+        Some(peer) => {
+            respond_over_iroh_metered(&connection, credentials.fresh_bundle()?, peer).await?
+        }
         #[cfg(feature = "nearby-discovery")]
         None => {
             respond_discovered_over_iroh_metered(&connection, credentials.fresh_bundle()?).await?
@@ -29253,6 +29273,8 @@ async fn serve_session(
                 &event_guard,
                 event_verifier,
                 &mutable_interests,
+                !matches!(remote_emission.policy, EventEmissionPolicy::ReceiveOnly),
+                !matches!(local_emission.policy, EventEmissionPolicy::ReceiveOnly),
                 &mut receipt,
             )
             .await?;
@@ -29426,6 +29448,8 @@ async fn serve_session(
                     &event_guard,
                     event_verifier,
                     &mutable_interests,
+                    !matches!(remote_emission.policy, EventEmissionPolicy::ReceiveOnly),
+                    !matches!(local_emission.policy, EventEmissionPolicy::ReceiveOnly),
                     &mut receipt,
                 )
                 .await?;
@@ -29587,6 +29611,8 @@ async fn serve_session(
         &event_guard,
         event_verifier,
         &mutable_interests,
+        !matches!(remote_emission.policy, EventEmissionPolicy::ReceiveOnly),
+        !matches!(local_emission.policy, EventEmissionPolicy::ReceiveOnly),
         &mut receipt,
     )
     .await?;
@@ -38870,6 +38896,9 @@ mod tests {
         receipt: &mut PeerReceipt,
     ) {
         for &class in mutable_classes_for_semantic(mission.semantic_version()) {
+            if mission.semantic_version() >= SEMANTIC_PROTOCOL_V9 && class == MutableClass::Blob {
+                continue;
+            }
             let (request, expected) = if class == MutableClass::Blob {
                 (
                     Frame::BlobInterest(BlobInterest::empty()),
@@ -38910,7 +38939,51 @@ mod tests {
                 );
             }
         }
-        if mission.semantic_version() >= SEMANTIC_PROTOCOL_V7 {
+        if mission.semantic_version() >= SEMANTIC_PROTOCOL_V9 {
+            assert_eq!(
+                request_mission_frame(
+                    connection,
+                    mission,
+                    Frame::BlobStreamPlan {
+                        direction: EventDirection::ToSessionResponder,
+                        attempt_nonce: None,
+                        authenticated_open: Vec::new(),
+                    },
+                    receipt,
+                )
+                .await
+                .expect("empty Blob stream plan exchange"),
+                Frame::BlobStreamPlanAck {
+                    direction: EventDirection::ToSessionResponder,
+                    attempt_nonce: None,
+                }
+            );
+            let wire_budget = exchange_wire_budget(receipt).expect("Blob stream wire budget");
+            let (complete, request_bytes, response_bytes) =
+                respond_mission_frame(connection, mission, wire_budget, |frame, _, _mission| {
+                    match frame {
+                        Frame::BlobStreamPlan {
+                            direction: EventDirection::ToSessionInitiator,
+                            attempt_nonce: None,
+                            authenticated_open,
+                        } if authenticated_open.is_empty() => Ok((
+                            Frame::BlobStreamPlanAck {
+                                direction: EventDirection::ToSessionInitiator,
+                                attempt_nonce: None,
+                            },
+                            true,
+                        )),
+                        _ => Err(NodeError::Protocol(
+                            "test empty Blob stream plan differs".into(),
+                        )),
+                    }
+                })
+                .await
+                .expect("empty reverse Blob stream plan exchange");
+            assert!(complete);
+            account(receipt, request_bytes, response_bytes)
+                .expect("account empty Blob stream plan");
+        } else if mission.semantic_version() >= SEMANTIC_PROTOCOL_V7 {
             let state = root("empty-blob-stream-client");
             fs::create_dir_all(&state).unwrap();
             let store =
@@ -50129,8 +50202,9 @@ mod tests {
             }
         });
         let snapshot = client_policy.snapshot().expect("client policy snapshot");
-        let client_receipt = TEST_BLOB_SETTLEMENT_HARNESS
-            .scope(
+        let client_receipt = with_default_test_semantic_version(
+            SEMANTIC_PROTOCOL_V8,
+            TEST_BLOB_SETTLEMENT_HARNESS.scope(
                 client_settlement_harness.unwrap_or_default(),
                 TEST_BLOB_RECEIVE_FAULT.scope(
                     std::cell::Cell::new(client_receive_fault),
@@ -50174,8 +50248,9 @@ mod tests {
                         ),
                     ),
                 ),
-            )
-            .await;
+            ),
+        )
+        .await;
         if client_receipt.is_err() {
             client.close().await;
         }
@@ -54961,6 +55036,22 @@ mod tests {
             .await
     }
 
+    async fn with_default_test_semantic_version<F>(semantic_version: u16, future: F) -> F::Output
+    where
+        F: Future,
+    {
+        if TEST_SEMANTIC_VERSION
+            .try_with(std::cell::Cell::get)
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            future.await
+        } else {
+            with_test_semantic_version(semantic_version, future).await
+        }
+    }
+
     async fn with_test_contact_hooks<F>(
         exchanges_before_defer: Option<usize>,
         preopen_custody_races: Vec<TestCustodyPreopenRace>,
@@ -56490,32 +56581,35 @@ mod tests {
             .custody_policy_revision()
             .expect("custody policy before contact");
         let authorization_count = Arc::new(AtomicU64::new(0));
-        let (client, server) = with_test_transfer_profile_offer(
-            legacy_event_with_blob_stream_offer(),
-            contact_test_pair_with_forwarding_results(
-                TestForwardingNode {
-                    store: server_store.clone(),
-                    mission: services.member.clone(),
-                    policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::ReceiveOnly)),
-                    clock: NodeCustodyClock::injected([0x7e; 16], 0, 0),
-                    reconciliation_exchanges_before_defer: None,
-                    preopen_custody_races: Vec::new(),
-                },
-                TestForwardingNode {
-                    store: client_store.clone(),
-                    mission: services.other.clone(),
-                    policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
-                    clock: NodeCustodyClock::injected(clock_id, 0, 0),
-                    reconciliation_exchanges_before_defer: None,
-                    preopen_custody_races: vec![
-                        TestCustodyPreopenRace::FinalCustodyPolicyChange,
-                        TestCustodyPreopenRace::CountAuthorizations {
-                            transfer_id: source.transfer_id,
-                            count: authorization_count.clone(),
-                        },
-                    ],
-                },
-            ),
+        let (client, server) = with_test_semantic_version(
+            SEMANTIC_PROTOCOL_V8,
+            Box::pin(with_test_transfer_profile_offer(
+                legacy_event_with_blob_stream_offer(),
+                contact_test_pair_with_forwarding_results(
+                    TestForwardingNode {
+                        store: server_store.clone(),
+                        mission: services.member.clone(),
+                        policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::ReceiveOnly)),
+                        clock: NodeCustodyClock::injected([0x7e; 16], 0, 0),
+                        reconciliation_exchanges_before_defer: None,
+                        preopen_custody_races: Vec::new(),
+                    },
+                    TestForwardingNode {
+                        store: client_store.clone(),
+                        mission: services.other.clone(),
+                        policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                        clock: NodeCustodyClock::injected(clock_id, 0, 0),
+                        reconciliation_exchanges_before_defer: None,
+                        preopen_custody_races: vec![
+                            TestCustodyPreopenRace::FinalCustodyPolicyChange,
+                            TestCustodyPreopenRace::CountAuthorizations {
+                                transfer_id: source.transfer_id,
+                                count: authorization_count.clone(),
+                            },
+                        ],
+                    },
+                ),
+            )),
         )
         .await;
         assert!(matches!(
@@ -56604,35 +56698,38 @@ mod tests {
         );
         let writer_hold = Arc::new(TestCustodyWriterHold::new());
         let authorization_count = Arc::new(AtomicU64::new(0));
-        let (client, server) = with_test_transfer_profile_offer(
-            legacy_event_with_blob_stream_offer(),
-            contact_test_pair_with_forwarding_results(
-                TestForwardingNode {
-                    store: server_store.clone(),
-                    mission: services.member.clone(),
-                    policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::ReceiveOnly)),
-                    clock: NodeCustodyClock::injected([0x6c; 16], 0, 0),
-                    reconciliation_exchanges_before_defer: None,
-                    preopen_custody_races: Vec::new(),
-                },
-                TestForwardingNode {
-                    store: client_store.clone(),
-                    mission: services.other.clone(),
-                    policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
-                    clock: NodeCustodyClock::injected(clock_id, 0, 0),
-                    reconciliation_exchanges_before_defer: None,
-                    preopen_custody_races: vec![
-                        TestCustodyPreopenRace::HoldWriterAfterLease {
-                            transfer_id: source.transfer_id,
-                            state: writer_hold.clone(),
-                        },
-                        TestCustodyPreopenRace::CountAuthorizations {
-                            transfer_id: source.transfer_id,
-                            count: authorization_count.clone(),
-                        },
-                    ],
-                },
-            ),
+        let (client, server) = with_test_semantic_version(
+            SEMANTIC_PROTOCOL_V8,
+            Box::pin(with_test_transfer_profile_offer(
+                legacy_event_with_blob_stream_offer(),
+                contact_test_pair_with_forwarding_results(
+                    TestForwardingNode {
+                        store: server_store.clone(),
+                        mission: services.member.clone(),
+                        policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::ReceiveOnly)),
+                        clock: NodeCustodyClock::injected([0x6c; 16], 0, 0),
+                        reconciliation_exchanges_before_defer: None,
+                        preopen_custody_races: Vec::new(),
+                    },
+                    TestForwardingNode {
+                        store: client_store.clone(),
+                        mission: services.other.clone(),
+                        policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                        clock: NodeCustodyClock::injected(clock_id, 0, 0),
+                        reconciliation_exchanges_before_defer: None,
+                        preopen_custody_races: vec![
+                            TestCustodyPreopenRace::HoldWriterAfterLease {
+                                transfer_id: source.transfer_id,
+                                state: writer_hold.clone(),
+                            },
+                            TestCustodyPreopenRace::CountAuthorizations {
+                                transfer_id: source.transfer_id,
+                                count: authorization_count.clone(),
+                            },
+                        ],
+                    },
+                ),
+            )),
         )
         .await;
         let client = client.expect("client contact completes after releasing the writer");
@@ -57085,35 +57182,38 @@ mod tests {
             },
         );
 
-        let (client, server) = with_test_transfer_profile_offer(
-            legacy_event_with_blob_stream_offer(),
-            contact_test_pair_with_forwarding_results(
-                TestForwardingNode {
-                    store: server_store.clone(),
-                    mission: services.member.clone(),
-                    policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::ReceiveOnly)),
-                    clock: NodeCustodyClock::injected([0x77; 16], 0, 0),
-                    reconciliation_exchanges_before_defer: None,
-                    preopen_custody_races: Vec::new(),
-                },
-                TestForwardingNode {
-                    store: client_store.clone(),
-                    mission: services.other.clone(),
-                    policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
-                    clock: NodeCustodyClock::injected(clock_id, 0, 0),
-                    reconciliation_exchanges_before_defer: None,
-                    preopen_custody_races: vec![
-                        TestCustodyPreopenRace::Expire {
-                            transfer_id: expired.transfer_id,
-                            tick_ms: 100,
-                        },
-                        TestCustodyPreopenRace::ItemChanged(changed.transfer_id),
-                        TestCustodyPreopenRace::LeaseLimitExceeded(lease_limited.transfer_id),
-                        TestCustodyPreopenRace::RetryLimitExceeded(retry_limited.transfer_id),
-                        TestCustodyPreopenRace::RetryNotDue(retry.transfer_id),
-                    ],
-                },
-            ),
+        let (client, server) = with_test_semantic_version(
+            SEMANTIC_PROTOCOL_V8,
+            Box::pin(with_test_transfer_profile_offer(
+                legacy_event_with_blob_stream_offer(),
+                contact_test_pair_with_forwarding_results(
+                    TestForwardingNode {
+                        store: server_store.clone(),
+                        mission: services.member.clone(),
+                        policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::ReceiveOnly)),
+                        clock: NodeCustodyClock::injected([0x77; 16], 0, 0),
+                        reconciliation_exchanges_before_defer: None,
+                        preopen_custody_races: Vec::new(),
+                    },
+                    TestForwardingNode {
+                        store: client_store.clone(),
+                        mission: services.other.clone(),
+                        policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                        clock: NodeCustodyClock::injected(clock_id, 0, 0),
+                        reconciliation_exchanges_before_defer: None,
+                        preopen_custody_races: vec![
+                            TestCustodyPreopenRace::Expire {
+                                transfer_id: expired.transfer_id,
+                                tick_ms: 100,
+                            },
+                            TestCustodyPreopenRace::ItemChanged(changed.transfer_id),
+                            TestCustodyPreopenRace::LeaseLimitExceeded(lease_limited.transfer_id),
+                            TestCustodyPreopenRace::RetryLimitExceeded(retry_limited.transfer_id),
+                            TestCustodyPreopenRace::RetryNotDue(retry.transfer_id),
+                        ],
+                    },
+                ),
+            )),
         )
         .await;
         let (client, server) = match (client, server) {
@@ -57518,11 +57618,14 @@ mod tests {
             "empty interest must be receive-none rather than a wildcard"
         );
 
-        let (beta_receipt, beta_server_receipt) = contact_test_pair(
-            server_store.clone(),
-            server_mission.clone(),
-            beta_store.clone(),
-            beta_mission,
+        let (beta_receipt, beta_server_receipt) = with_test_semantic_version(
+            SEMANTIC_PROTOCOL_V8,
+            Box::pin(contact_test_pair(
+                server_store.clone(),
+                server_mission.clone(),
+                beta_store.clone(),
+                beta_mission,
+            )),
         )
         .await;
         assert_eq!(beta_receipt.fetched, 3);
@@ -57591,11 +57694,14 @@ mod tests {
         );
         assert_eq!(beta_store.event_count().expect("beta Event count"), 3);
 
-        let (empty_receipt, empty_server_receipt) = contact_test_pair(
-            server_store.clone(),
-            server_mission,
-            empty_store.clone(),
-            empty_mission,
+        let (empty_receipt, empty_server_receipt) = with_test_semantic_version(
+            SEMANTIC_PROTOCOL_V8,
+            Box::pin(contact_test_pair(
+                server_store.clone(),
+                server_mission,
+                empty_store.clone(),
+                empty_mission,
+            )),
         )
         .await;
         assert_eq!(empty_receipt.fetched, 0);
@@ -59298,29 +59404,32 @@ mod tests {
         let source_clock_id = [0x4e; 16];
         let receiver_clock_id = [0x4f; 16];
 
-        let (first_receiver, first_source) = with_test_transfer_profile_offer(
-            legacy_event_with_blob_stream_offer(),
-            contact_test_pair_with_forwarding(
-                TestForwardingNode {
-                    store: source_store.clone(),
-                    mission: source_mission.clone(),
-                    policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
-                    clock: NodeCustodyClock::injected(source_clock_id, 0, 0),
-                    reconciliation_exchanges_before_defer: None,
-                    preopen_custody_races: Vec::new(),
-                },
-                TestForwardingNode {
-                    store: receiver_store.clone(),
-                    mission: receiver_mission.clone(),
-                    policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
-                    clock: NodeCustodyClock::injected(receiver_clock_id, 0, 0),
-                    reconciliation_exchanges_before_defer: None,
-                    preopen_custody_races: vec![
-                        TestCustodyPreopenRace::ForceRouteOnly(common_id),
-                        TestCustodyPreopenRace::ForceRouteOnly(due_id),
-                    ],
-                },
-            ),
+        let (first_receiver, first_source) = with_test_semantic_version(
+            SEMANTIC_PROTOCOL_V8,
+            Box::pin(with_test_transfer_profile_offer(
+                legacy_event_with_blob_stream_offer(),
+                contact_test_pair_with_forwarding(
+                    TestForwardingNode {
+                        store: source_store.clone(),
+                        mission: source_mission.clone(),
+                        policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                        clock: NodeCustodyClock::injected(source_clock_id, 0, 0),
+                        reconciliation_exchanges_before_defer: None,
+                        preopen_custody_races: Vec::new(),
+                    },
+                    TestForwardingNode {
+                        store: receiver_store.clone(),
+                        mission: receiver_mission.clone(),
+                        policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                        clock: NodeCustodyClock::injected(receiver_clock_id, 0, 0),
+                        reconciliation_exchanges_before_defer: None,
+                        preopen_custody_races: vec![
+                            TestCustodyPreopenRace::ForceRouteOnly(common_id),
+                            TestCustodyPreopenRace::ForceRouteOnly(due_id),
+                        ],
+                    },
+                ),
+            )),
         )
         .await;
         assert_eq!(first_receiver.fetched, 2);
@@ -59377,23 +59486,26 @@ mod tests {
             )
             .expect("independently promote common Event");
 
-        let (immediate_receiver, immediate_source) = contact_test_pair_with_forwarding(
-            TestForwardingNode {
-                store: source_store.clone(),
-                mission: source_mission.clone(),
-                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
-                clock: NodeCustodyClock::injected(source_clock_id, 0, 0),
-                reconciliation_exchanges_before_defer: None,
-                preopen_custody_races: Vec::new(),
-            },
-            TestForwardingNode {
-                store: receiver_store.clone(),
-                mission: receiver_mission.clone(),
-                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
-                clock: NodeCustodyClock::injected(receiver_clock_id, 0, 0),
-                reconciliation_exchanges_before_defer: None,
-                preopen_custody_races: Vec::new(),
-            },
+        let (immediate_receiver, immediate_source) = with_test_semantic_version(
+            SEMANTIC_PROTOCOL_V8,
+            Box::pin(contact_test_pair_with_forwarding(
+                TestForwardingNode {
+                    store: source_store.clone(),
+                    mission: source_mission.clone(),
+                    policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                    clock: NodeCustodyClock::injected(source_clock_id, 0, 0),
+                    reconciliation_exchanges_before_defer: None,
+                    preopen_custody_races: Vec::new(),
+                },
+                TestForwardingNode {
+                    store: receiver_store.clone(),
+                    mission: receiver_mission.clone(),
+                    policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                    clock: NodeCustodyClock::injected(receiver_clock_id, 0, 0),
+                    reconciliation_exchanges_before_defer: None,
+                    preopen_custody_races: Vec::new(),
+                },
+            )),
         )
         .await;
         assert_eq!(immediate_receiver.fetched, 1);
@@ -59414,23 +59526,26 @@ mod tests {
                 .expect("reopen source after common settlement"),
         );
 
-        let (due_receiver, due_source) = contact_test_pair_with_forwarding(
-            TestForwardingNode {
-                store: source_store.clone(),
-                mission: source_mission.clone(),
-                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
-                clock: NodeCustodyClock::injected(source_clock_id, 1_000, 0),
-                reconciliation_exchanges_before_defer: None,
-                preopen_custody_races: Vec::new(),
-            },
-            TestForwardingNode {
-                store: receiver_store.clone(),
-                mission: receiver_mission.clone(),
-                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
-                clock: NodeCustodyClock::injected(receiver_clock_id, 1_000, 0),
-                reconciliation_exchanges_before_defer: None,
-                preopen_custody_races: Vec::new(),
-            },
+        let (due_receiver, due_source) = with_test_semantic_version(
+            SEMANTIC_PROTOCOL_V8,
+            Box::pin(contact_test_pair_with_forwarding(
+                TestForwardingNode {
+                    store: source_store.clone(),
+                    mission: source_mission.clone(),
+                    policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                    clock: NodeCustodyClock::injected(source_clock_id, 1_000, 0),
+                    reconciliation_exchanges_before_defer: None,
+                    preopen_custody_races: Vec::new(),
+                },
+                TestForwardingNode {
+                    store: receiver_store.clone(),
+                    mission: receiver_mission.clone(),
+                    policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                    clock: NodeCustodyClock::injected(receiver_clock_id, 1_000, 0),
+                    reconciliation_exchanges_before_defer: None,
+                    preopen_custody_races: Vec::new(),
+                },
+            )),
         )
         .await;
         assert_eq!(due_receiver.fetched, 0);
@@ -59456,23 +59571,26 @@ mod tests {
                 .expect("reopen source after due acceptance"),
         );
 
-        let (repeat_receiver, repeat_source) = contact_test_pair_with_forwarding(
-            TestForwardingNode {
-                store: source_store.clone(),
-                mission: source_mission,
-                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
-                clock: NodeCustodyClock::injected(source_clock_id, 1_001, 0),
-                reconciliation_exchanges_before_defer: None,
-                preopen_custody_races: Vec::new(),
-            },
-            TestForwardingNode {
-                store: receiver_store.clone(),
-                mission: receiver_mission,
-                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
-                clock: NodeCustodyClock::injected(receiver_clock_id, 1_001, 0),
-                reconciliation_exchanges_before_defer: None,
-                preopen_custody_races: Vec::new(),
-            },
+        let (repeat_receiver, repeat_source) = with_test_semantic_version(
+            SEMANTIC_PROTOCOL_V8,
+            Box::pin(contact_test_pair_with_forwarding(
+                TestForwardingNode {
+                    store: source_store.clone(),
+                    mission: source_mission,
+                    policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                    clock: NodeCustodyClock::injected(source_clock_id, 1_001, 0),
+                    reconciliation_exchanges_before_defer: None,
+                    preopen_custody_races: Vec::new(),
+                },
+                TestForwardingNode {
+                    store: receiver_store.clone(),
+                    mission: receiver_mission,
+                    policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                    clock: NodeCustodyClock::injected(receiver_clock_id, 1_001, 0),
+                    reconciliation_exchanges_before_defer: None,
+                    preopen_custody_races: Vec::new(),
+                },
+            )),
         )
         .await;
         assert_eq!(repeat_receiver.fetched, 0);

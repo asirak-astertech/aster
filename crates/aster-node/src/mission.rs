@@ -3851,8 +3851,12 @@ mod tests {
         let mut provisioner = ReferenceProvisioner::from_seed([0x44; 32]).expect("provisioner");
         let initiator = issue(&mut provisioner, 1);
         let responder = issue(&mut provisioner, 2);
-        let (mut sender, mut receiver) =
-            establish(&initiator, &responder).expect("establish semantic-v8 session");
+        let (mut sender, mut receiver) = establish_with_semantic_version(
+            &initiator,
+            &responder,
+            crate::event_pages::SEMANTIC_PROTOCOL_V8,
+        )
+        .expect("establish semantic-v8 session");
         assert_eq!(
             sender.semantic_version(),
             crate::event_pages::SEMANTIC_PROTOCOL_V8
