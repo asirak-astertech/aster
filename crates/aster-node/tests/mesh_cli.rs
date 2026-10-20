@@ -409,6 +409,124 @@ fn public_node_command(
 }
 
 #[cfg(unix)]
+fn is_public_direct_contact(line: &str) -> bool {
+    line.starts_with("CONTACT ")
+        && line.ends_with("status=pass")
+        && line.contains(" mission_auth=hybrid-pq ")
+        && line.contains(" carrier_path=direct ")
+}
+
+#[cfg(unix)]
+fn interrupt_public_node(child: &mut std::process::Child) {
+    if child
+        .try_wait()
+        .expect("poll public-binary node before interrupt")
+        .is_some()
+    {
+        return;
+    }
+    let status = Command::new("kill")
+        .arg("-INT")
+        .arg(child.id().to_string())
+        .status()
+        .expect("signal public-binary node");
+    assert!(status.success(), "SIGINT delivery failed with {status}");
+}
+
+#[cfg(unix)]
+fn wait_for_public_direct_contacts(
+    left: std::process::Child,
+    right: std::process::Child,
+) -> (std::process::Output, std::process::Output) {
+    let mut children = [left, right];
+    let (line_sender, line_receiver) = mpsc::channel();
+    let mut stdout_readers = Vec::new();
+    let mut stderr_readers = Vec::new();
+    for (index, child) in children.iter_mut().enumerate() {
+        let stdout = child.stdout.take().expect("public-binary stdout");
+        let sender = line_sender.clone();
+        stdout_readers.push(thread::spawn(move || {
+            let mut lines = Vec::new();
+            for line in BufReader::new(stdout).lines() {
+                let line = line.expect("public-binary UTF-8 stdout line");
+                let _ = sender.send((index, line.clone()));
+                lines.push(line);
+            }
+            lines
+        }));
+        let stderr = child.stderr.take().expect("public-binary stderr");
+        stderr_readers.push(thread::spawn(move || {
+            BufReader::new(stderr)
+                .lines()
+                .map(|line| line.expect("public-binary UTF-8 stderr line"))
+                .collect::<Vec<_>>()
+        }));
+    }
+    drop(line_sender);
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut contacts = [false; 2];
+    while !contacts.iter().all(|observed| *observed) && Instant::now() < deadline {
+        if let Ok((index, line)) = line_receiver.recv_timeout(Duration::from_millis(20))
+            && is_public_direct_contact(&line)
+        {
+            contacts[index] = true;
+        }
+        if children.iter_mut().any(|child| {
+            child
+                .try_wait()
+                .expect("poll public-binary node before contact")
+                .is_some()
+        }) {
+            break;
+        }
+    }
+    let contacts_completed = contacts.iter().all(|observed| *observed);
+    if contacts_completed {
+        for child in &mut children {
+            interrupt_public_node(child);
+        }
+    } else {
+        for child in &mut children {
+            if child
+                .try_wait()
+                .expect("poll incomplete public-binary node")
+                .is_none()
+            {
+                let _ = child.kill();
+            }
+        }
+    }
+
+    let [left, right] = children;
+    let (left_output, right_output) = wait_for_live_event_workers(left, right);
+    let stdout = stdout_readers
+        .into_iter()
+        .map(|reader| reader.join().expect("join public-binary stdout reader"))
+        .collect::<Vec<_>>();
+    let stderr = stderr_readers
+        .into_iter()
+        .map(|reader| reader.join().expect("join public-binary stderr reader"))
+        .collect::<Vec<_>>();
+    let build_output = |status, stdout: &[String], stderr: &[String]| std::process::Output {
+        status,
+        stdout: stdout.join("\n").into_bytes(),
+        stderr: stderr.join("\n").into_bytes(),
+    };
+    let left_output = build_output(left_output.status, &stdout[0], &stderr[0]);
+    let right_output = build_output(right_output.status, &stdout[1], &stderr[1]);
+    assert!(
+        contacts_completed,
+        "public-binary nodes did not both complete a direct contact before the safety deadline: left_stdout={} left_stderr={} right_stdout={} right_stderr={}",
+        String::from_utf8_lossy(&left_output.stdout),
+        String::from_utf8_lossy(&left_output.stderr),
+        String::from_utf8_lossy(&right_output.stdout),
+        String::from_utf8_lossy(&right_output.stderr),
+    );
+    (left_output, right_output)
+}
+
+#[cfg(unix)]
 fn assert_minimal_public_binary_contact_smoke(label: &str) {
     use std::{net::UdpSocket, os::unix::fs::PermissionsExt as _};
 
@@ -482,7 +600,7 @@ fn assert_minimal_public_binary_contact_smoke(label: &str) {
         &left.mission_path,
         left.address,
         Some(&left_peer),
-        2,
+        30,
     )
     .spawn()
     .expect("spawn public-binary left node");
@@ -491,11 +609,11 @@ fn assert_minimal_public_binary_contact_smoke(label: &str) {
         &right.mission_path,
         right.address,
         Some(&right_peer),
-        2,
+        30,
     )
     .spawn()
     .expect("spawn public-binary right node");
-    let outputs = wait_for_live_event_workers(left_child, right_child);
+    let outputs = wait_for_public_direct_contacts(left_child, right_child);
     for output in [outputs.0, outputs.1] {
         let stdout = String::from_utf8(output.stdout).expect("public-binary UTF-8 stdout");
         let stderr = String::from_utf8(output.stderr).expect("public-binary UTF-8 stderr");
@@ -504,12 +622,7 @@ fn assert_minimal_public_binary_contact_smoke(label: &str) {
             "public-binary node failed: stdout={stdout} stderr={stderr}"
         );
         assert!(stdout.lines().any(has_selected_ready_marker));
-        assert!(stdout.lines().any(|line| {
-            line.starts_with("CONTACT ")
-                && line.ends_with("status=pass")
-                && line.contains(" mission_auth=hybrid-pq ")
-                && line.contains(" carrier_path=direct ")
-        }));
+        assert!(stdout.lines().any(is_public_direct_contact));
         assert!(stdout.lines().any(|line| {
             line.starts_with("STOP lifecycle=complete ")
                 && line.contains(" sync_status=contacts_observed ")
