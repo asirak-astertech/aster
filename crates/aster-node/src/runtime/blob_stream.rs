@@ -1,6 +1,9 @@
 //! Profile-5 Blob network DAG composition.
 
 use crate::{
+    event_pages::TransferProfileId,
+    frame::EventDirection,
+    mission::MissionSession,
     stream_pipeline::{
         MappedPartition, PipelineError, PipelineLimits, PipelineReport, StreamJobId,
         StreamPartition, run_ordered_channel_pipeline_from,
@@ -100,6 +103,61 @@ fn encoded(frame: StreamFrame) -> Result<Vec<u8>, String> {
 
 fn decoded(bytes: &[u8]) -> Result<StreamFrame, String> {
     StreamFrame::decode_for_context(9, 5, bytes).map_err(|error| error.to_string())
+}
+
+trait BlobRecordCodec: Send {
+    fn encode(&mut self, frame: StreamFrame) -> Result<Vec<u8>, String>;
+    fn decode(&mut self, bytes: &[u8]) -> Result<StreamFrame, String>;
+}
+
+struct PlainBlobRecordCodec;
+
+impl BlobRecordCodec for PlainBlobRecordCodec {
+    fn encode(&mut self, frame: StreamFrame) -> Result<Vec<u8>, String> {
+        encoded(frame)
+    }
+
+    fn decode(&mut self, bytes: &[u8]) -> Result<StreamFrame, String> {
+        decoded(bytes)
+    }
+}
+
+#[allow(dead_code)] // Activated by the selected-contact driver in the next Task 4 increment.
+struct MissionBlobRecordCodec<'a> {
+    mission: &'a mut MissionSession,
+    profile_digest: [u8; 32],
+    direction: EventDirection,
+    attempt_nonce: [u8; 32],
+}
+
+impl BlobRecordCodec for MissionBlobRecordCodec<'_> {
+    fn encode(&mut self, frame: StreamFrame) -> Result<Vec<u8>, String> {
+        let plaintext = frame
+            .encode_for_context(9, TransferProfileId::BlobStreamV1 as u16)
+            .map_err(|error| error.to_string())?;
+        self.mission
+            .seal_v9_blob_application_frame(
+                self.profile_digest,
+                self.direction,
+                self.attempt_nonce,
+                &plaintext,
+            )
+            .map_err(|error| error.to_string())
+    }
+
+    fn decode(&mut self, bytes: &[u8]) -> Result<StreamFrame, String> {
+        let plaintext = self
+            .mission
+            .open_v9_blob_application_frame(
+                self.profile_digest,
+                self.direction,
+                self.attempt_nonce,
+                bytes,
+            )
+            .map_err(|error| error.to_string())?;
+        StreamFrame::decode_for_context(9, TransferProfileId::BlobStreamV1 as u16, &plaintext)
+            .map_err(|error| error.to_string())
+    }
 }
 
 fn result_digest(open: &BlobStreamOpen, roots: ([u8; 32], [u8; 32])) -> [u8; 32] {
@@ -233,6 +291,64 @@ pub async fn send_completed_pack(
     roots: ([u8; 32], [u8; 32]),
     semantic_commitment: Vec<u8>,
 ) -> Result<BlobNetworkReport, String> {
+    let mut codec = PlainBlobRecordCodec;
+    send_completed_pack_inner(
+        connection,
+        open,
+        authenticated_open,
+        root,
+        roots,
+        semantic_commitment,
+        None,
+        &mut codec,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)] // Activated by the selected-contact driver in the next Task 4 increment.
+pub(crate) async fn send_completed_pack_protected(
+    connection: Connection,
+    mission: &mut MissionSession,
+    profile_digest: [u8; 32],
+    direction: EventDirection,
+    attempt_nonce: [u8; 32],
+    open: &BlobStreamOpen,
+    authenticated_open: Vec<u8>,
+    root: &Path,
+    roots: ([u8; 32], [u8; 32]),
+    semantic_commitment: Vec<u8>,
+) -> Result<BlobNetworkReport, String> {
+    let mut codec = MissionBlobRecordCodec {
+        mission,
+        profile_digest,
+        direction,
+        attempt_nonce,
+    };
+    send_completed_pack_inner(
+        connection,
+        open,
+        authenticated_open,
+        root,
+        roots,
+        semantic_commitment,
+        Some(attempt_nonce),
+        &mut codec,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_completed_pack_inner(
+    connection: Connection,
+    open: &BlobStreamOpen,
+    authenticated_open: Vec<u8>,
+    root: &Path,
+    roots: ([u8; 32], [u8; 32]),
+    semantic_commitment: Vec<u8>,
+    planned_nonce: Option<[u8; 32]>,
+    codec: &mut dyn BlobRecordCodec,
+) -> Result<BlobNetworkReport, String> {
     let wire_len = completed_pack_wire_len(root, open)?;
     if wire_len != expected_pack_wire_len(open.total_len())? {
         return Err("completed pack wire length differs from canonical segment framing".into());
@@ -247,11 +363,13 @@ pub async fn send_completed_pack(
         })
         .await
         .map_err(|error| failure("open transport attempt", format!("{error:?}")))?;
-    let mut attempt_nonce = [0; 32];
-    getrandom::fill(&mut attempt_nonce).map_err(|error| failure("attempt nonce", error))?;
+    let mut attempt_nonce = planned_nonce.unwrap_or([0; 32]);
+    if planned_nonce.is_none() {
+        getrandom::fill(&mut attempt_nonce).map_err(|error| failure("attempt nonce", error))?;
+    }
     let transfer_open = protocol_open(open, authenticated_open, wire_len, attempt_nonce);
     attempt
-        .send_data(&encoded(StreamFrame::Open(transfer_open.clone()))?)
+        .send_data(&codec.encode(StreamFrame::Open(transfer_open.clone()))?)
         .await
         .map_err(|error| failure("send open", format!("{error:?}")))?;
     let accept = attempt
@@ -259,7 +377,7 @@ pub async fn send_completed_pack(
         .await
         .map_err(|error| failure("receive accept", format!("{error:?}")))?
         .ok_or("control stream closed before accept")?;
-    let StreamFrame::Accept(accept) = decoded(&accept)? else {
+    let StreamFrame::Accept(accept) = codec.decode(&accept)? else {
         return Err("first control frame was not accept".into());
     };
     let resume_offset = accept.durable_offset;
@@ -275,7 +393,7 @@ pub async fn send_completed_pack(
         {
             StreamExtentAction::Send(data) => {
                 attempt
-                    .send_data(&encoded(StreamFrame::Data(data))?)
+                    .send_data(&codec.encode(StreamFrame::Data(data))?)
                     .await
                     .map_err(|error| failure("send data", format!("{error:?}")))?;
                 pending = source.next_extent()?;
@@ -289,7 +407,7 @@ pub async fn send_completed_pack(
                     .await
                     .map_err(|error| failure("receive checkpoint", format!("{error:?}")))?
                     .ok_or("control stream closed before checkpoint")?;
-                let StreamFrame::Checkpoint(checkpoint) = decoded(&checkpoint)? else {
+                let StreamFrame::Checkpoint(checkpoint) = codec.decode(&checkpoint)? else {
                     return Err("credit wait received a non-checkpoint frame".into());
                 };
                 state
@@ -308,7 +426,7 @@ pub async fn send_completed_pack(
         .await
         .map_err(|error| failure("receive final checkpoint", format!("{error:?}")))?
         .ok_or("control stream closed before final checkpoint")?;
-    let StreamFrame::Checkpoint(checkpoint) = decoded(&checkpoint)? else {
+    let StreamFrame::Checkpoint(checkpoint) = codec.decode(&checkpoint)? else {
         return Err("final control frame was not checkpoint".into());
     };
     state
@@ -322,7 +440,7 @@ pub async fn send_completed_pack(
         return Err("sender did not produce finish".into());
     };
     attempt
-        .send_data(&encoded(finish)?)
+        .send_data(&codec.encode(finish)?)
         .await
         .map_err(|error| failure("send finish", format!("{error:?}")))?;
     let result = attempt
@@ -330,7 +448,7 @@ pub async fn send_completed_pack(
         .await
         .map_err(|error| failure("receive result", format!("{error:?}")))?
         .ok_or("control stream closed before result")?;
-    let StreamFrame::Result(result) = decoded(&result)? else {
+    let StreamFrame::Result(result) = codec.decode(&result)? else {
         return Err("terminal control frame was not result".into());
     };
     if !matches!(
@@ -350,7 +468,7 @@ pub async fn send_completed_pack(
         return Err("sender settled a different result code".into());
     }
     attempt
-        .send_data(&encoded(ack)?)
+        .send_data(&codec.encode(ack)?)
         .await
         .map_err(|error| failure("send result acknowledgement", format!("{error:?}")))?;
     attempt
@@ -453,6 +571,7 @@ async fn send_durable_checkpoint(
     progress: &DurableProgress,
     wire_len: u64,
     current_limit: &mut u64,
+    codec: &mut dyn BlobRecordCodec,
 ) -> Result<(), String> {
     let window = u64::from(MAX_STREAM_CHECKPOINT_BATCH_BYTES) + MAX_RECORD_BYTES as u64;
     let new_limit = wire_len.min((*current_limit).max(progress.wire_offset.saturating_add(window)));
@@ -467,7 +586,7 @@ async fn send_durable_checkpoint(
         return Err("receiver did not produce checkpoint".into());
     };
     attempt
-        .send_control(&encoded(checkpoint)?)
+        .send_control(&codec.encode(checkpoint)?)
         .await
         .map_err(|error| failure("send checkpoint", format!("{error:?}")))?;
     *current_limit = new_limit;
@@ -482,7 +601,11 @@ pub async fn receive_completed_pack(
     wire_len: u64,
     limits: PipelineLimits,
 ) -> Result<BlobNetworkReport, String> {
-    receive_completed_pack_inner(connection, open, opener, root, wire_len, limits, None).await
+    let mut codec = PlainBlobRecordCodec;
+    receive_completed_pack_inner(
+        connection, open, opener, root, wire_len, limits, None, None, &mut codec,
+    )
+    .await
 }
 
 pub async fn receive_completed_pack_with_store(
@@ -494,6 +617,7 @@ pub async fn receive_completed_pack_with_store(
     limits: PipelineLimits,
 ) -> Result<BlobNetworkReport, String> {
     let open = session.open.open().clone();
+    let mut codec = PlainBlobRecordCodec;
     receive_completed_pack_inner(
         connection,
         &open,
@@ -502,10 +626,48 @@ pub async fn receive_completed_pack_with_store(
         wire_len,
         limits,
         Some(session),
+        None,
+        &mut codec,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)] // Activated by the selected-contact driver in the next Task 4 increment.
+pub(crate) async fn receive_completed_pack_with_store_protected(
+    connection: Connection,
+    mission: &mut MissionSession,
+    profile_digest: [u8; 32],
+    direction: EventDirection,
+    attempt_nonce: [u8; 32],
+    session: BlobReceiveStoreSession,
+    opener: BlobStreamSegmentOpener,
+    root: &Path,
+    wire_len: u64,
+    limits: PipelineLimits,
+) -> Result<BlobNetworkReport, String> {
+    let open = session.open.open().clone();
+    let mut codec = MissionBlobRecordCodec {
+        mission,
+        profile_digest,
+        direction,
+        attempt_nonce,
+    };
+    receive_completed_pack_inner(
+        connection,
+        &open,
+        opener,
+        root,
+        wire_len,
+        limits,
+        Some(session),
+        Some(attempt_nonce),
+        &mut codec,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn receive_completed_pack_inner(
     connection: Connection,
     open: &BlobStreamOpen,
@@ -514,6 +676,8 @@ async fn receive_completed_pack_inner(
     wire_len: u64,
     limits: PipelineLimits,
     store_session: Option<BlobReceiveStoreSession>,
+    planned_nonce: Option<[u8; 32]>,
+    codec: &mut dyn BlobRecordCodec,
 ) -> Result<BlobNetworkReport, String> {
     let (max_data_bytes, max_control_bytes) =
         profile5_attempt_bounds(wire_len).map_err(|error| error.to_string())?;
@@ -530,13 +694,14 @@ async fn receive_completed_pack_inner(
         .await
         .map_err(|error| failure("receive open", format!("{error:?}")))?
         .ok_or("data stream closed before open")?;
-    let StreamFrame::Open(transfer_open) = decoded(&frame)? else {
+    let StreamFrame::Open(transfer_open) = codec.decode(&frame)? else {
         return Err("first data frame was not open".into());
     };
     if transfer_open.class != StreamClass::Blob
         || transfer_open.total_len != wire_len
         || transfer_open.session_transcript != open.digest()
         || transfer_open.publication_id != *open.stream_id().as_bytes()
+        || planned_nonce.is_some_and(|nonce| nonce != transfer_open.attempt_nonce)
     {
         return Err("transport open differs from authenticated Blob open".into());
     }
@@ -576,7 +741,7 @@ async fn receive_completed_pack_inner(
         return Err("receiver did not produce accept".into());
     };
     attempt
-        .send_control(&encoded(accept)?)
+        .send_control(&codec.encode(accept)?)
         .await
         .map_err(|error| failure("send accept", format!("{error:?}")))?;
 
@@ -653,7 +818,7 @@ async fn receive_completed_pack_inner(
             .await
             .map_err(|error| failure("receive data", format!("{error:?}")))?
             .ok_or("data stream closed before completion")?;
-        let StreamFrame::Data(data) = decoded(&frame)? else {
+        let StreamFrame::Data(data) = codec.decode(&frame)? else {
             return Err("non-data frame before complete payload".into());
         };
         let StreamAction::Persist { through } =
@@ -689,6 +854,7 @@ async fn receive_completed_pack_inner(
                 &progress,
                 wire_len,
                 &mut current_limit,
+                codec,
             )
             .await?;
             durable_wire = progress.wire_offset;
@@ -706,7 +872,7 @@ async fn receive_completed_pack_inner(
         .await
         .map_err(|error| failure("receive finish", format!("{error:?}")))?
         .ok_or("data stream closed before finish")?;
-    let StreamFrame::Finish(finish) = decoded(&finish)? else {
+    let StreamFrame::Finish(finish) = codec.decode(&finish)? else {
         return Err("terminal data frame was not finish".into());
     };
     let semantic_commitment = finish.semantic_commitment.clone();
@@ -738,7 +904,7 @@ async fn receive_completed_pack_inner(
         return Err("receiver did not produce result".into());
     };
     attempt
-        .send_control(&encoded(result)?)
+        .send_control(&codec.encode(result)?)
         .await
         .map_err(|error| failure("send result", format!("{error:?}")))?;
     let ack = attempt
@@ -746,7 +912,7 @@ async fn receive_completed_pack_inner(
         .await
         .map_err(|error| failure("receive result acknowledgement", format!("{error:?}")))?
         .ok_or("data stream closed before result acknowledgement")?;
-    let StreamFrame::ResultAck(ack) = decoded(&ack)? else {
+    let StreamFrame::ResultAck(ack) = codec.decode(&ack)? else {
         return Err("settlement frame was not result acknowledgement".into());
     };
     let StreamAction::Terminal(settled) = state
