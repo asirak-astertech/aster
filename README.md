@@ -151,10 +151,12 @@ provisioning remain open work.
 Semantic v7 changes the network mechanics for Event synchronization,
 not publication semantics: a successful publish remains a local durable commit
 and never waits for a peer. State, Record, and EventBridge negotiate their
-existing mechanics through mandatory `LegacyV6`. Blob requires
-`BlobRangesStreamV1` on both peers and has no legacy fallback; incompatible
-peers are rejected rather than sent another Blob grammar. Stored source and
-partial-prefix formats remain unchanged. Exact differences and bounded blind ReceiveOnly traffic
+existing mechanics through mandatory `LegacyV6`. Semantic v9 Blob contacts use
+`BlobStreamV1`; semantic v7/v8 compatibility contacts require
+`BlobRangesStreamV1`. Blob has no legacy fallback, and an active profile-5
+attempt is not downgraded in place to profile 4. Incompatible peers are
+rejected rather than sent another Blob grammar. Stored source and partial-prefix
+formats remain unchanged. Exact differences and bounded blind ReceiveOnly traffic
 use pages; finite-TTL entries carry authenticated cumulative age without
 creating peer receipt, lease, suppression, or retry state. Page attempts and
 contact completion are not remote delivery evidence. The sender uses distinct

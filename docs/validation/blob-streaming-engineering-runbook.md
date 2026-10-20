@@ -90,8 +90,12 @@ sha256sum "$OUTPUT"
 Compare that digest with the source digest recorded before publication; the
 source and receiver need not share a filesystem.
 
-`blob-read` requires Linux and a destination filesystem that supports the
-documented anonymous-inode finalization. It never replaces an existing path.
+`blob-read` requires Linux, an owner-controlled destination directory, and a
+filesystem supporting named sibling staging, atomic no-replace rename, and
+directory synchronization. It never replaces an existing path. Filesystem
+errors or abrupt process or host failure can leave a hidden owner-only staging
+file for operator cleanup; after a reported post-publication directory-sync
+failure, verify the destination before retrying.
 
 ## Configure and confirm the data path
 

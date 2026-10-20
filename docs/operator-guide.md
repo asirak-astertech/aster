@@ -158,7 +158,12 @@ Write `/etc/aster/agent.json` and replace the load-operation placeholder:
 }
 ```
 
-The capacity values are evaluation defaults, not production sizing guidance.
+The capacity values are evaluation defaults sized only for a small functional
+check, not production sizing guidance. Before publishing or receiving a large
+Blob, set `storage.blob_depot` from the retained-object inventory and ensure
+the state filesystem has room for the object plus database, journal,
+temporary, quota, and operational reserve. In particular, the 64-MiB example
+cannot admit an 800-MiB or 1-GiB object.
 
 Set permissions and validate:
 
@@ -203,6 +208,12 @@ node:
 The selector requests data; it does not grant authorization. Empty interests
 mean no Blob network receipt. Peer, interest, emission-policy, depot, and
 mission changes require a restart.
+
+With semantic v9 selected, the exact interest drives the bounded profile-5
+streaming lane. Local publication remains independent of peer availability;
+the sync scheduler transfers later when the configured destination is
+available, and an interrupted attempt resumes from receiver-authoritative
+durable progress.
 
 ### Step 6: start and verify
 
@@ -288,7 +299,7 @@ Publish on Node A:
 ```sh
 sudo -u aster /usr/bin/asterctl \
   --token-file /etc/aster/agent-credentials/client-token \
-  --timeout 30 \
+  --timeout 900 \
   blob-publish \
   --file /run/aster-operator/map.bin \
   --topic imagery.maps \
@@ -299,6 +310,10 @@ sudo -u aster /usr/bin/asterctl \
 ```
 
 Record the Blob ID. For a one-hour Blob, add `--ttl-ms 3600000`.
+Publication success means the Blob is durable on Node A; it does not wait for
+Node B. Wait for a later eligible contact before reading on Node B. For a
+large-object engineering run, retain the pipeline receipt and follow the
+[Blob streaming engineering runbook](validation/blob-streaming-engineering-runbook.md).
 
 Read on Node B:
 
@@ -306,7 +321,7 @@ Read on Node B:
 sudo install -d -o aster -g aster -m 0700 /run/aster-operator
 sudo -u aster /usr/bin/asterctl \
   --token-file /etc/aster/agent-credentials/client-token \
-  --timeout 30 \
+  --timeout 900 \
   blob-read \
   --id '<BLOB_ID_FROM_NODE_A>' \
   --topic imagery.maps \
@@ -479,7 +494,7 @@ Stage a nonempty file, publish it, and record the returned Blob ID:
 ```sh
 install -m 0600 /secure/input/map.bin "$ASTER_TRANSFER_DIR/map.bin"
 docker compose -f "$ASTER_COMPOSE_FILE" run --rm asterctl \
-  --timeout 30 --json blob-publish --file /transfer/map.bin \
+  --timeout 900 --json blob-publish --file /transfer/map.bin \
   --topic imagery.maps --scope mission/team/alpha --priority routine \
   --media-type application/octet-stream --operation-key compose-map-001
 ```
@@ -488,7 +503,7 @@ Read to a new output path and compare the files:
 
 ```sh
 docker compose -f "$ASTER_COMPOSE_FILE" run --rm asterctl \
-  --timeout 30 --json blob-read --id '<BLOB_ID>' \
+  --timeout 900 --json blob-read --id '<BLOB_ID>' \
   --topic imagery.maps --scope mission/team/alpha \
   --output /transfer/received-map.bin
 sha256sum "$ASTER_TRANSFER_DIR/map.bin" \
@@ -508,7 +523,7 @@ docker compose -f "$ASTER_COMPOSE_FILE" run --rm verify
 docker compose -f "$ASTER_COMPOSE_FILE" run --rm asterctl --json query \
   --topic chat.events --scope mission/team/alpha
 docker compose -f "$ASTER_COMPOSE_FILE" run --rm asterctl \
-  --timeout 30 blob-read --id '<BLOB_ID>' \
+  --timeout 900 blob-read --id '<BLOB_ID>' \
   --topic imagery.maps --scope mission/team/alpha \
   --output /transfer/received-map-after-replace.bin
 sha256sum "$ASTER_TRANSFER_DIR/map.bin" \
@@ -566,7 +581,7 @@ docker compose -f "$ASTER_COMPOSE_FILE" -f "$ASTER_REMOTE_MESH_FILE" \
   --topic chat.events --scope mission/team/alpha --priority routine \
   --operation-key compose-peer-event-001 "Docker to device check"
 docker compose -f "$ASTER_COMPOSE_FILE" -f "$ASTER_REMOTE_MESH_FILE" \
-  run --rm asterctl --timeout 30 --json blob-publish \
+  run --rm asterctl --timeout 900 --json blob-publish \
   --file /transfer/map.bin --topic imagery.maps \
   --scope mission/team/alpha --priority routine \
   --operation-key compose-peer-map-001
@@ -581,7 +596,7 @@ docker compose -f "$ASTER_COMPOSE_FILE" -f "$ASTER_REMOTE_MESH_FILE" \
   run --rm asterctl --json query \
   --topic chat.events --scope mission/team/alpha
 docker compose -f "$ASTER_COMPOSE_FILE" -f "$ASTER_REMOTE_MESH_FILE" \
-  run --rm asterctl --timeout 30 --json blob-read \
+  run --rm asterctl --timeout 900 --json blob-read \
   --id '<DEVICE_BLOB_ID>' --topic imagery.maps \
   --scope mission/team/alpha --output /transfer/device-map.bin
 ```

@@ -189,6 +189,13 @@ Conversely, receiving a Blob through the mesh does not create a Blob
 application subscription; that Rust subscription surface is not exposed by the
 agent API.
 
+When both peers negotiate semantic v9, these exact selectors feed the
+profile-5 Blob streaming lane. Publication through the local agent commits
+independently of peer availability. A later eligible contact transfers bounded
+authenticated segments, and interruption resumes only from the receiver's
+durable checkpoint. Semantic-v7/v8 profile 4 remains the compatibility path;
+one profile-5 attempt does not fall back in place to profile 4.
+
 ## Relay
 
 When `mesh.relay` is present, all three scalar fields are required and

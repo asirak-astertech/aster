@@ -1053,10 +1053,12 @@ an active profile-5 attempt is never downgraded into profile 4.
 Semantic v9 reserves mechanics tags `0xd6` `StreamOpenV1`, `0xd7`
 `StreamAcceptV1`, `0xd8` `StreamDataV1`, `0xd9` `StreamCheckpointV1`, `0xda`
 `StreamFinishV1`, `0xdb` `StreamResultV1`, and `0xdc` `StreamResultAckV1` for
-profile 5. The bounded grammar is implemented, but allocation and parsing alone
-do not activate it: until the runtime driver is present, profile-5 Blob work
-fails closed before carrier I/O. Tags `0xd1..0xd5` and every semantic-v7/v8 byte
-retain their existing meanings.
+profile 5. The bounded grammar and runtime driver are implemented. After an
+authenticated v9/profile-5 selection, the contact exchanges a signed stream
+plan and opens one bounded control/data stream pair for the selected direction;
+framing, authentication, checkpoint, terminal-root, lifecycle, or settlement
+failure fails the attempt closed. Tags `0xd1..0xd5` and every semantic-v7/v8
+byte retain their existing meanings.
 
 The profile-5 mechanics prefix is `"ASM\x01" || tag`. All integers are
 unsigned big-endian. The attempt tuple used after `StreamOpenV1` is
