@@ -4176,14 +4176,16 @@ graphs contain no `paste`; CI fails if it reappears. Patch provenance and the
 upstream-removal condition are recorded in
 [`ASTER-PATCH.md`](../../third-party/netlink-packet-core-0.8.2-aster/ASTER-PATCH.md).
 
-Decision 0028 records stakeholder approval for exact-package deviations, and
-`deny.toml` encodes them narrowly: `webpki-roots` 1.0.9 and
-`webpki-root-certs` 1.0.9 under `CDLA-Permissive-2.0`, plus the browser-WASM-only
+Decision 0028 records the exact-package deviations, and `deny.toml` encodes
+them narrowly: `webpki-roots` 1.0.10 and `webpki-root-certs` 1.0.10 under
+`CDLA-Permissive-2.0`, plus the browser-WASM-only
 `async_io_stream` 0.3.3, `pharos` 0.5.3, and `ws_stream_wasm` 0.7.5 under the
 OSI-approved `Unlicense`. Neither license is in the general allowlist; only
 those exact package/version coordinates are excepted, and coordinate drift
-fails closed. This admits the current dependency graph under the approved
-exception policy. It does not establish literal `DM-8-05` compliance: the
+fails closed. The 1.0.10 security-maintenance coordinates supersede the
+implementation-policy pins, but the prior evaluation approval remains bound
+to 1.0.9 and must not be treated as approval of the replacements. This does
+not establish literal `DM-8-05` compliance: the
 frozen requirement says all dependencies must use OSI-approved licenses, so the
 two CDLA data-package deviations require an express requirement revision or
 disposition, or an approved technical alternative. The supported target matrix,

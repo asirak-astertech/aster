@@ -1429,7 +1429,7 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
     "DM-8-05": selected_claim(
         "open",
         "dependency-policy owner",
-        f"{DEPENDENCY_GATE}; Decision 0028 records stakeholder-approved exact-package deviations, and deny.toml pins CDLA-Permissive-2.0 exceptions to webpki-roots 1.0.9 and webpki-root-certs 1.0.9 plus Unlicense exceptions to async_io_stream 0.3.3, pharos 0.5.3, and ws_stream_wasm 0.7.5; neither license enters the general allowlist and coordinate drift fails closed",
+        f"{DEPENDENCY_GATE}; Decision 0028 records exact-package deviations, and deny.toml pins CDLA-Permissive-2.0 exceptions to webpki-roots 1.0.10 and webpki-root-certs 1.0.10 plus Unlicense exceptions to async_io_stream 0.3.3, pharos 0.5.3, and ws_stream_wasm 0.7.5; neither license enters the general allowlist, coordinate drift fails closed, and the earlier 1.0.9 evaluation approval does not approve the replacement coordinates",
         "The frozen requirement literally requires OSI-approved licenses only, so the two CDLA data-package deviations are not counted as normative DM-8-05 compliance. The requirement owner must expressly revise or disposition that rule, or the implementation must use an approved alternative; supported-target, SBOM, packaging, and release admission remain open.",
     ),
     "DM-9-13": selected_claim(
