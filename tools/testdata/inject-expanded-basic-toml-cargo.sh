@@ -4,16 +4,42 @@
 
 set -eu
 
-invert_target=
+all_features=false
+inverted=false
+basic_toml=false
+manifest_path=
 previous_argument=
 for argument do
-  if [ "$previous_argument" = "--invert" ] || [ "$previous_argument" = "-i" ]; then
-    invert_target=$argument
+  if [ "$previous_argument" = "--manifest-path" ]; then
+    manifest_path=$argument
   fi
+  case "$argument" in
+    --all-features)
+      all_features=true
+      ;;
+    --invert|-i)
+      inverted=true
+      ;;
+    basic-toml@0.1.10)
+      basic_toml=true
+      ;;
+  esac
   previous_argument=$argument
 done
 
-if [ "$invert_target" = "basic-toml@0.1.10" ]; then
+case "$manifest_path" in
+  */fuzz/Cargo.toml)
+    ;;
+  *)
+    if [ "$all_features" = true ] && [ "$inverted" = false ]; then
+      "${ASTER_TEST_REAL_CARGO:?}" "$@"
+      printf '%s\n' 'basic-toml v0.1.10' 'unexpected-basic-toml-consumer v9.9.9'
+      exit 0
+    fi
+    ;;
+esac
+
+if [ "$inverted" = true ] && [ "$basic_toml" = true ]; then
   "${ASTER_TEST_REAL_CARGO:?}" "$@"
   printf '%s\n' 'unexpected-basic-toml-consumer v9.9.9'
   exit 0
