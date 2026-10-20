@@ -24,6 +24,57 @@ problem tag, not a timeout, test termination, allowlist, retry, or CI failure.
   - 1,132.535 seconds cumulative test time
   - 16 cases above 10 seconds
 
+## Current-branch focused measurements
+
+These are warm local libtest measurements for the exact changed identities,
+excluding compilation time. They are implementation evidence, not a substitute
+for the fresh hosted JUnit population required to fill the final column below.
+The owner explicitly excluded a complete local-suite rerun; the branch also
+does not have the pinned `cargo-nextest` shim installed locally.
+
+| Baseline identity or replacement set | Retained baseline | Focused current result |
+| --- | ---: | ---: |
+| Interrupted Event page | 88.735s | 3.28s |
+| State/Record mutable convergence replacements | 34.937s | 7.33s combined |
+| Oversized Blob pre-authentication rejection | 49.023s | 1.45s |
+| Six mutable Blob directions | 10.487s | 5.89s |
+| Blob reopen/complement | 10.415s | 7.03s |
+| Three stale-pending Blob replacements | 12.314s | 7.28s combined |
+| Blob source fairness | 16.797s | 7.40s |
+| Public-binary mesh smoke and failed-child cleanup | new replacement | 3.61s combined |
+| Controlled relay | 10.189s | 7.47s |
+| Protected-edge zeroization | 18.545s | 7.44s |
+| CLI stalled-agent deadline | 11.012s | 2.01s |
+| Generated operation-key timeout pair | 10.013s | 1.01s combined |
+| Live-agent Event TTL | 11.580s | 4.45s |
+| systemd provider-binary isolation | 12.694s | 8.21s |
+| Compose provider-binary isolation | 18.186s | 8.49s |
+| Gate-H queued-generation invalidation/recovery | 22.602s | 2.78s |
+| Blob recovery/reopen/alternate peer | 13.445s | 2.46s |
+| Six independently scheduled reconciliation cases | 11.511s combined | 4.50s combined with two threads |
+
+The three full mesh demonstrations remain explicit qualifications and passed
+locally with their original assertions: two-node Ping/Pong in 19.32s,
+four-node Ping/Pong in 37.83s, and the control topology in 62.85s. They are
+ignored by default and therefore are not duration problems in required CI.
+
+### Pending hosted measurement
+
+- Run the complete unpartitioned `ci` profile and retain JUnit, wall time,
+  cumulative time, peak RSS, temporary-disk delta, child-process high water,
+  and descriptor high water.
+- Confirm the union of the two CI slices equals the unpartitioned population.
+- Time the 37 `check-foundation-core`, 2 `check-compose-policy`, and 16
+  `check-integration` command entries separately. Classify compile-only and
+  policy checks separately from correctness tests.
+- Replace every `Pending hosted verification` cell only from those retained
+  artifacts. Do not infer hosted timings from the focused local table.
+
+CI now invokes the timing reporter with `--problem-seconds 10` and
+`--github-annotations`. A test at 10.001 seconds emits a warning and exits
+zero; malformed timing evidence still exits nonzero. This is measurement and
+problem tagging only—there is no duration gate, allowlist, retry, or timeout.
+
 The inventory was generated with the repository timing summarizer using
 `--limit 100` against each raw JUnit document. Durations are observations from
 that run, not performance guarantees.

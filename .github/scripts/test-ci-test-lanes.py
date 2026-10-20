@@ -175,6 +175,8 @@ class RustTimingLaneTests(unittest.TestCase):
         self.assertIn("--profile ci", lane)
         self.assertIn("python3 .github/scripts/summarize-nextest-junit.py", lane)
         self.assertIn("$GITHUB_STEP_SUMMARY", lane)
+        self.assertIn("--problem-seconds 10", lane)
+        self.assertIn("--github-annotations", lane)
         self.assertIn(
             "uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9",
             lane,

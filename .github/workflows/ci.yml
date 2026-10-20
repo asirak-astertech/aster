@@ -348,7 +348,9 @@ jobs:
             python3 .github/scripts/summarize-nextest-junit.py \
               --input "$report" \
               --output "$GITHUB_STEP_SUMMARY" \
-              --partition "${{ matrix.partition }}/2"
+              --partition "${{ matrix.partition }}/2" \
+              --problem-seconds 10 \
+              --github-annotations
           else
             printf '## Rust test timing — partition %s/2\n\nNo JUnit report was produced.\n' \
               "${{ matrix.partition }}" >> "$GITHUB_STEP_SUMMARY"
