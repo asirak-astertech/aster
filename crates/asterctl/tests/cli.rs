@@ -127,9 +127,50 @@ fn help_needs_neither_token_nor_agent() {
         "--help",
         "blob-publish",
         "blob-read",
+        "blob-status",
     ] {
         assert!(text.contains(flag));
     }
+}
+
+#[test]
+fn blob_status_missing_snapshot_succeeds_over_public_rpc() {
+    let mut body = vec![0x0a, 32];
+    body.extend([1_u8; 32]);
+    body.extend([0x10, 1]);
+    let (address, requests, server) = serve(
+        Ipv4Addr::LOCALHOST.into(),
+        "200 OK",
+        "application/proto",
+        &body,
+        Duration::ZERO,
+    );
+    let output = cli(&[
+        "blob-status",
+        "--token",
+        TOKEN,
+        "--port",
+        &address.port().to_string(),
+        "--publication-id=AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+        "--topic=imagery.maps",
+        "--scope=mission/team/alpha",
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        text.contains("State:") && text.contains("Missing"),
+        "{text}"
+    );
+    let request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(request.starts_with(
+        "POST /aster.application.v1alpha1.AsterApplicationService/InspectBlobPublication HTTP/1.1\r\n"
+    ));
+    server.join().unwrap();
 }
 
 #[test]
@@ -348,6 +389,7 @@ fn non_loopback_is_rejected_before_loading_credentials_or_payload() {
         "publish",
         "blob-publish",
         "blob-read",
+        "blob-status",
         "query",
         "subscribe",
     ] {

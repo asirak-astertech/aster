@@ -2,6 +2,7 @@ mod args;
 mod auth;
 mod blob_publish;
 mod blob_read;
+mod blob_status;
 mod client;
 mod operation_key;
 mod output;
@@ -49,6 +50,7 @@ fn run() -> Result<(), (u8, String)> {
         args::Command::PublishHelp => return write_output(publish::HELP),
         args::Command::BlobPublishHelp => return write_output(blob_publish::HELP),
         args::Command::BlobReadHelp => return write_output(blob_read::HELP),
+        args::Command::BlobStatusHelp => return write_output(blob_status::HELP),
         args::Command::QueryHelp => return write_output(query::HELP),
         args::Command::SubscribeHelp => return write_output(subscribe::HELP),
         args::Command::Status(options) => {
@@ -156,6 +158,39 @@ fn run() -> Result<(), (u8, String)> {
                 .map_err(|error| (1, error))?;
             output::read_blob(&metadata, rpc.json)
                 .map_err(|_| (1, "cannot format ReadBlob response".to_owned()))?
+        }
+        args::Command::BlobStatus(options, status) => {
+            let rpc = RpcContext::new(options)?;
+            let (request, wait, poll) = status.into_parts();
+            let result = rpc.runtime.block_on(blob_status::run(
+                rpc.address,
+                &rpc.token,
+                request,
+                wait,
+                poll,
+                rpc.timeout,
+            ));
+            let response = match result {
+                Ok(response) => response,
+                Err(error) => {
+                    if let Some(last) = error.last() {
+                        let text = output::blob_status(last, rpc.json).map_err(|_| {
+                            (
+                                1,
+                                "cannot format InspectBlobPublication response".to_owned(),
+                            )
+                        })?;
+                        write_output(&text)?;
+                    }
+                    return Err((1, error.message().to_owned()));
+                }
+            };
+            output::blob_status(&response, rpc.json).map_err(|_| {
+                (
+                    1,
+                    "cannot format InspectBlobPublication response".to_owned(),
+                )
+            })?
         }
         args::Command::Query(options, query) => {
             let rpc = RpcContext::new(options)?;

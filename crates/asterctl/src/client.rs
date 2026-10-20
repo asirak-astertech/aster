@@ -380,6 +380,82 @@ pub async fn status(
     Ok(response.into_owned())
 }
 
+pub async fn inspect_blob_publication(
+    client: &api::AsterApplicationServiceClient<HttpClient>,
+    request: api::InspectBlobPublicationRequest,
+) -> Result<api::InspectBlobPublicationResponse, String> {
+    let expected_id = request.publication_id.clone();
+    let response = client
+        .inspect_blob_publication(request)
+        .await
+        .map_err(|error| describe_rpc_error("InspectBlobPublication", error.code))?
+        .into_owned();
+    if !blob_inspection_is_valid(&expected_id, &response) {
+        return Err("InspectBlobPublication failed: invalid status response".to_owned());
+    }
+    Ok(response)
+}
+
+fn blob_inspection_is_valid(
+    expected_id: &[u8],
+    response: &api::InspectBlobPublicationResponse,
+) -> bool {
+    let Some(phase) = response.phase.as_known() else {
+        return false;
+    };
+    if response.publication_id != expected_id
+        || response.publication_id.len() != 32
+        || !response.publication_id.iter().any(|byte| *byte != 0)
+        || response.durable_plaintext_bytes > response.plaintext_total_bytes
+        || response.durable_transfer_bytes > response.transfer_total_bytes
+        || response.durable_units > response.total_units
+        || response
+            .blob_id
+            .as_ref()
+            .is_some_and(|blob_id| blob_id.len() != 32)
+    {
+        return false;
+    }
+    let empty = response.plaintext_total_bytes == 0
+        && response.durable_plaintext_bytes == 0
+        && response.transfer_total_bytes == 0
+        && response.durable_transfer_bytes == 0
+        && response.total_units == 0
+        && response.durable_units == 0
+        && response.blob_id.is_none();
+    let totals_present = response.plaintext_total_bytes != 0
+        && response.transfer_total_bytes != 0
+        && response.total_units != 0;
+    let complete = response.durable_plaintext_bytes == response.plaintext_total_bytes
+        && response.durable_transfer_bytes == response.transfer_total_bytes
+        && response.durable_units == response.total_units;
+    match phase {
+        api::BlobPublicationPhase::Unspecified => false,
+        api::BlobPublicationPhase::Missing | api::BlobPublicationPhase::ExpiredOrRetired => empty,
+        api::BlobPublicationPhase::AwaitingData => {
+            totals_present
+                && response.durable_plaintext_bytes == 0
+                && response.durable_transfer_bytes == 0
+                && response.durable_units == 0
+                && response.blob_id.is_none()
+        }
+        api::BlobPublicationPhase::Receiving => {
+            totals_present
+                && !complete
+                && (response.durable_plaintext_bytes != 0
+                    || response.durable_transfer_bytes != 0
+                    || response.durable_units != 0)
+                && response.blob_id.is_none()
+        }
+        api::BlobPublicationPhase::ReadyToFinalize => {
+            totals_present && complete && response.blob_id.is_none()
+        }
+        api::BlobPublicationPhase::Available => {
+            totals_present && complete && response.blob_id.is_some()
+        }
+    }
+}
+
 pub async fn publish(
     address: SocketAddr,
     token: &Token,
@@ -654,6 +730,42 @@ pub async fn subscribe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blob_status_rejects_contradictory_or_regressed_counters() {
+        let publication_id = vec![7; 32];
+        let valid = api::InspectBlobPublicationResponse {
+            publication_id: publication_id.clone(),
+            phase: api::BlobPublicationPhase::Receiving.into(),
+            plaintext_total_bytes: 10,
+            durable_plaintext_bytes: 5,
+            transfer_total_bytes: 12,
+            durable_transfer_bytes: 6,
+            total_units: 2,
+            durable_units: 1,
+            ..Default::default()
+        };
+        assert!(blob_inspection_is_valid(&publication_id, &valid));
+        for invalid in [
+            api::InspectBlobPublicationResponse {
+                durable_plaintext_bytes: 11,
+                ..valid.clone()
+            },
+            api::InspectBlobPublicationResponse {
+                phase: api::BlobPublicationPhase::Available.into(),
+                durable_plaintext_bytes: 10,
+                durable_transfer_bytes: 12,
+                durable_units: 2,
+                ..valid.clone()
+            },
+            api::InspectBlobPublicationResponse {
+                phase: api::BlobPublicationPhase::Missing.into(),
+                ..valid
+            },
+        ] {
+            assert!(!blob_inspection_is_valid(&publication_id, &invalid));
+        }
+    }
     use std::{
         future::poll_fn,
         sync::{Arc, Mutex},
@@ -715,6 +827,7 @@ mod tests {
 
     fn receipt(metadata: &api::PublishBlobMetadata) -> api::PublishBlobReceipt {
         api::PublishBlobReceipt {
+            publication_id: vec![3; 32],
             id: vec![1; 32],
             publisher: vec![2; 32],
             publisher_counter: 3,

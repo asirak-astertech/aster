@@ -287,7 +287,8 @@ pub(crate) fn receipt_matches(
     request: &api::PublishBlobMetadata,
     response: &api::PublishBlobReceipt,
 ) -> bool {
-    response.id.len() == 32
+    response.publication_id.len() == 32
+        && response.id.len() == 32
         && response.publisher.len() == 32
         && response.publisher_counter != 0
         && response.priority == request.priority
@@ -334,6 +335,7 @@ mod tests {
     fn blob_publish_receipt_compares_ttl_presence_unconditionally() {
         let request = metadata(7);
         let response = api::PublishBlobReceipt {
+            publication_id: vec![3; 32],
             id: vec![1; 32],
             publisher: vec![2; 32],
             publisher_counter: 3,
@@ -380,6 +382,7 @@ mod tests {
     fn blob_publish_receipt_accepts_checked_lengths_above_legacy_boundary() {
         let request = metadata((64 * 1024 * 1024_u64) + 1);
         let response = api::PublishBlobReceipt {
+            publication_id: vec![3; 32],
             id: vec![1; 32],
             publisher: vec![2; 32],
             publisher_counter: 3,
