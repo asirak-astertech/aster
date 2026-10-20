@@ -98,7 +98,8 @@ asterctl --token-file "$TOKEN_FILE" blob-publish \
   --topic imagery.maps \
   --scope mission/team/alpha \
   --operation-key map-001 \
-  --media-type application/octet-stream
+  --media-type application/octet-stream \
+  --progress auto
 
 # Finite publication with a generated recovery key and exact JSON TTL output.
 asterctl --token-file "$TOKEN_FILE" --json blob-publish \
@@ -107,6 +108,13 @@ asterctl --token-file "$TOKEN_FILE" --json blob-publish \
   --scope mission/team/alpha \
   --operation-key auto \
   --ttl-ms 60000
+
+# Inspect or wait for this exact publication in the local node's durable state.
+asterctl --token-file "$TOKEN_FILE" blob-status \
+  --publication-id "$PUBLICATION_ID" \
+  --topic imagery.maps \
+  --scope mission/team/alpha \
+  --wait
 
 # Read the returned ID to a new path; an existing path is never overwritten.
 asterctl --token-file "$TOKEN_FILE" blob-read \
@@ -156,9 +164,11 @@ redirect either side. On other supported Unix platforms the existing Event and
 status service still starts, while Blob publish fails with a fixed unsupported
 response before consuming stream bytes.
 
-This agent increment provides Blob publish and read only. Blob subscription,
-poll, acknowledgement, transfer-status commands, and Blob FFI lifetime fields
-remain outside this surface.
+This agent surface provides Blob publish, receiver-local publication
+status/wait, capacity observation, and read. Status exposes only durable
+lifecycle facts and does not report peer convergence, route selection, or
+carrier details. Blob subscription, poll, acknowledgement, peer/convergence
+status, and Blob FFI lifetime fields remain outside this surface.
 
 The legacy binary flag `--blob-interest TOPIC@SCOPE` is repeatable but exists
 only for development/migration mode. Customer service deployments use strict

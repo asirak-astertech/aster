@@ -20,6 +20,12 @@ Do not keep an application publish RPC open to coordinate peer availability.
 Do not treat a successful local publish, a carrier connection, or a `CONTACT`
 line alone as proof that one exact Blob reached a peer.
 
+Event and Blob receive prerequisites are independent. An Event transfer needs
+a matching receiver-created Event subscription. A profile-5 Blob transfer
+needs the receiver's exact Blob interest plus authenticated peer/mission policy;
+an Event subscription does not authorize Blob custody, and a Blob interest does
+not subscribe to Events.
+
 ## Current bounded profile
 
 | Boundary | Current value | Meaning |
@@ -49,6 +55,15 @@ pack filesystems need room for the object plus database, journal, temporary,
 quota, and operational reserve; logical Blob limits do not include filesystem
 overhead.
 
+For an exact 1-GiB plaintext object, the current 1-MiB format produces 1,024
+segments. Each segment adds 130 authenticated-format bytes plus the 4-byte
+network record prefix, for 1,073,879,040 transfer bytes before database,
+journal, temporary-file, filesystem-allocation, and safety reserve. As an
+evaluation assumption—not a protocol requirement—provision at least 20% beyond
+the logical object and then verify actual free bytes on both state and pack
+filesystems. Capacity status is observational and non-reserving: another
+operation can consume it after the check.
+
 ```sh
 TOKEN_FILE=/run/aster/client.token
 SOURCE=/data/imagery-1g.bin
@@ -57,6 +72,7 @@ OUTPUT=/data/received-imagery-1g.bin
 stat --format='bytes=%s' "$SOURCE"
 sha256sum "$SOURCE"
 df -B1 /var/lib/aster-agent /data
+asterctl --token-file "$TOKEN_FILE" --json status
 
 asterctl --token-file "$TOKEN_FILE" --timeout 900 --json blob-publish \
   --file "$SOURCE" \
@@ -64,16 +80,33 @@ asterctl --token-file "$TOKEN_FILE" --timeout 900 --json blob-publish \
   --scope mission/team/alpha \
   --operation-key imagery-flight-2026-10-20 \
   --priority immediate \
-  --media-type application/octet-stream
+  --media-type application/octet-stream \
+  --progress always \
+  2>publish-progress.log
 ```
 
-Save the returned Blob ID and operation key. Success means the publication is
-durable on this node even if no peer is running. If the outcome is unknown,
+Save the returned Publication ID, Blob ID, and operation key. Progress is on
+stderr and JSON remains the single stdout result. Success means the publication
+is durable on this node even if no peer is running. If the outcome is unknown,
 repeat the exact bytes, metadata, TTL, and operation key; do not invent a new
 key. A retry resumes from the local durable frontier.
 
-After the publication is present on the receiving node, read it to a path that
-does not already exist and compare the application-level hash:
+On the receiver, repeat `asterctl --json status`, then wait for the exact
+publication. This observes receiver-local durable state; it neither coordinates
+the source nor requires one particular carrier:
+
+```sh
+PUBLICATION_ID='PASTE_BASE64_PUBLICATION_ID'
+
+asterctl --token-file "$TOKEN_FILE" --timeout 900 --json blob-status \
+  --publication-id "$PUBLICATION_ID" \
+  --topic imagery.maps \
+  --scope mission/team/alpha \
+  --wait
+```
+
+The terminal `AVAILABLE` response contains the receiver's Blob ID. Read it to a
+path that does not already exist and compare the application-level hash:
 
 ```sh
 BLOB_ID='PASTE_BASE64_BLOB_ID'
@@ -82,7 +115,9 @@ asterctl --token-file "$TOKEN_FILE" --timeout 900 blob-read \
   --id "$BLOB_ID" \
   --topic imagery.maps \
   --scope mission/team/alpha \
-  --output "$OUTPUT"
+  --output "$OUTPUT" \
+  --progress always \
+  2>read-progress.log
 
 sha256sum "$OUTPUT"
 ```
@@ -96,6 +131,8 @@ directory synchronization. It never replaces an existing path. Filesystem
 errors or abrupt process or host failure can leave a hidden owner-only staging
 file for operator cleanup; after a reported post-publication directory-sync
 failure, verify the destination before retrying.
+An interrupted `blob-read` discards authenticated staged bytes and restarts at
+byte zero; this is separate from resumable node-to-node publication transfer.
 
 ## Configure and confirm the data path
 
@@ -128,7 +165,11 @@ authorization. Keep each node's durable state and credentials separate.
 
 Aster deterministically selects one eligible production stream adapter for an
 attempt. Today that adapter is `IrohQuicV1`; this is automatic single-adapter
-selection, not cross-transport failover. Iroh may establish a direct or
+selection, not cross-transport failover. The common protocol retains
+publication identity, absolute durable offset, checkpoint generation, totals,
+and terminal result independently of carrier fragmentation, so a later BLE or
+other reliable ordered full-duplex adapter can resume without changing the
+operator status contract. Iroh may establish a direct or
 operator-pinned relay path. Confirm the observed endpoint and `carrier_path`
 instead of inferring them from SSH reachability:
 
@@ -219,6 +260,16 @@ occupancy. The retained candidate transferred the exact 1-GiB object at
 8.099/8.100 MiB/s in 126.445 seconds versus a same-size 9.344-MiB/s raw WLAN
 baseline (86.7%). The PR acceptance floor is 80% of an adjacent same-path raw
 measurement; one historical or differently routed baseline is insufficient.
+
+Retain one timestamped evidence row per stage rather than only an aggregate:
+
+| Stage | Required evidence |
+| --- | --- |
+| Local publish | start/end UTC, elapsed, source bytes/hash, Publication ID, Blob ID, operation key, final sent/accepted/durable counters |
+| Receiver wait | start/end UTC, each durable checkpoint transition, final state and Blob ID |
+| Receiver read | start/end UTC, elapsed, written/discarded bytes, destination hash |
+| Raw baseline | immediately adjacent start/end UTC, exact interface/address pair, bytes, elapsed, MiB/s |
+| Environment | binary/config hashes, node IDs, interface addresses, route/path evidence, CPU/storage snapshots |
 
 For a same-size raw TCP comparison, discard the receiver bytes and measure the
 sender wall time on the same addresses immediately before or after Aster:

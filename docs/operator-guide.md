@@ -298,6 +298,9 @@ Publish on Node A:
 
 ```sh
 sudo -u aster /usr/bin/asterctl \
+  --token-file /etc/aster/agent-credentials/client-token --json status
+
+sudo -u aster /usr/bin/asterctl \
   --token-file /etc/aster/agent-credentials/client-token \
   --timeout 900 \
   blob-publish \
@@ -306,14 +309,34 @@ sudo -u aster /usr/bin/asterctl \
   --scope mission/team/alpha \
   --priority routine \
   --media-type application/octet-stream \
-  --operation-key map-001
+  --operation-key map-001 \
+  --progress auto
 ```
 
-Record the Blob ID. For a one-hour Blob, add `--ttl-ms 3600000`.
+Record the Publication ID, Blob ID, and operation key. The capacity output is
+an observed preflight, not a reservation; retain filesystem/database/journal
+and operational reserve beyond the logical object size. For a one-hour Blob,
+add `--ttl-ms 3600000`.
 Publication success means the Blob is durable on Node A; it does not wait for
 Node B. Wait for a later eligible contact before reading on Node B. For a
 large-object engineering run, retain the pipeline receipt and follow the
 [Blob streaming engineering runbook](validation/blob-streaming-engineering-runbook.md).
+
+On Node B, inspect or wait for that exact publication before reading:
+
+```sh
+sudo -u aster /usr/bin/asterctl \
+  --token-file /etc/aster/agent-credentials/client-token \
+  --timeout 900 blob-status \
+  --publication-id '<PUBLICATION_ID_FROM_NODE_A>' \
+  --topic imagery.maps \
+  --scope mission/team/alpha \
+  --wait
+```
+
+This wait is receiver-local observation. It does not keep Node A's publication
+RPC open and does not coordinate contact. `AVAILABLE` supplies the Blob ID that
+Node B can read.
 
 Read on Node B:
 
@@ -494,10 +517,18 @@ Stage a nonempty file, publish it, and record the returned Blob ID:
 ```sh
 install -m 0600 /secure/input/map.bin "$ASTER_TRANSFER_DIR/map.bin"
 docker compose -f "$ASTER_COMPOSE_FILE" run --rm asterctl \
+  --json status
+docker compose -f "$ASTER_COMPOSE_FILE" run --rm asterctl \
   --timeout 900 --json blob-publish --file /transfer/map.bin \
   --topic imagery.maps --scope mission/team/alpha --priority routine \
-  --media-type application/octet-stream --operation-key compose-map-001
+  --media-type application/octet-stream --operation-key compose-map-001 \
+  --progress always
 ```
+
+Run the same `status` preflight on the receiving node. After eligible contact,
+wait there with `blob-status --publication-id '<PUBLICATION_ID>' --topic
+imagery.maps --scope mission/team/alpha --wait`; this local wait does not
+coordinate the publisher or select a carrier.
 
 Read to a new output path and compare the files:
 

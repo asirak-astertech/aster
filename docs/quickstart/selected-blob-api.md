@@ -123,12 +123,13 @@ token in the command line:
 TOKEN_FILE=/run/aster/client.token
 
 # Durable publication.
-asterctl --token-file "$TOKEN_FILE" blob-publish \
+asterctl --token-file "$TOKEN_FILE" --json blob-publish \
   --file ./map.bin \
   --topic imagery.maps \
   --scope mission/team/alpha \
   --operation-key map-001 \
-  --media-type application/octet-stream
+  --media-type application/octet-stream \
+  --progress auto
 
 # Finite publication. The original 60000-ms TTL is echoed on every result.
 asterctl --token-file "$TOKEN_FILE" --json blob-publish \
@@ -137,6 +138,13 @@ asterctl --token-file "$TOKEN_FILE" --json blob-publish \
   --scope mission/team/alpha \
   --operation-key auto \
   --ttl-ms 60000
+
+# PUBLICATION_ID is publicationId from blob-publish, not the Blob content ID.
+asterctl --token-file "$TOKEN_FILE" blob-status \
+  --publication-id "$PUBLICATION_ID" \
+  --topic imagery.maps \
+  --scope mission/team/alpha \
+  --wait
 
 # Copy the returned Blob ID into BLOB_ID and read to a path that does not exist.
 asterctl --token-file "$TOKEN_FILE" blob-read \
@@ -160,12 +168,23 @@ exactly `"ttlMs": "60000"`; durable JSON omits `ttlMs`. The value is the
 original authenticated lifetime, never a countdown or deletion time. Blob
 plaintext is written only to the requested output and is never printed.
 
+Run `asterctl --token-file "$TOKEN_FILE" --json status` on both nodes before a
+large transfer. `blobCapacity` is an observed, non-reserving snapshot: it does
+not hold space for a later attempt and does not include filesystem, database,
+journal, temporary, or operational reserve. `blob-status` is likewise local:
+run it on the intended receiver to wait for `AVAILABLE`; it does not coordinate
+publication, prove peer convergence, or expose an IP/Iroh/BLE transport.
+
 The RPC and CLI use checked `u64` lengths and bounded 512-KiB frames/pages over
 independently authenticated 1-MiB segments. The resumable stream protocol has
 an explicit 8-GiB per-object ceiling. Blob publish/read default to 15 minutes;
 an explicit `asterctl --timeout` may shorten that attempt, while the agent caps
 longer requests at 15 minutes. A timed-out upload is retried with the same
 operation key and resumes from the receiver's last durable checkpoint.
+Publish/read progress is written only to stderr. `--progress auto` displays it
+on a terminal, `always` emits newline records, and `never` disables it. A
+download interruption discards its staged output and restarts from byte zero;
+network publication transfer resumes independently from its durable checkpoint.
 
 `blob-read` currently requires Linux, a destination directory owned by the
 current user and not writable by group or other users, and a filesystem that
@@ -188,10 +207,10 @@ boundary. Keep the publish source contents and length unchanged until command
 exit; detectable size changes have an unknown publication outcome, while
 same-length in-place mutation is outside the command contract.
 
-The agent and CLI provide Blob publish and read, not Blob subscription, poll,
-acknowledgement, transfer status, peer/convergence status, or FFI lifetime
-controls. The Rust subscription API below remains a separate application
-surface.
+The agent and CLI provide Blob publish, receiver-local publication status/wait,
+capacity observation, and read. They do not provide Blob subscription, poll,
+acknowledgement, peer/convergence status, or FFI lifetime controls. The Rust
+subscription API below remains a separate application surface.
 
 For 800-MiB through 1-GiB engineering runs, including local-publication versus
 peer-transfer lifecycle, exact WLAN binding, checkpoint/credit semantics,

@@ -92,19 +92,24 @@ The RPC timeout does not limit time spent entering a payload on stdin.
 ## Publish and read Blobs
 
 ```sh
-asterctl --token-file ./client.token blob-publish \
+asterctl --token-file ./client.token --json blob-publish \
     --file ./map.bin --topic imagery.maps --scope mission/team/alpha \
-    --operation-key map-001 --media-type application/octet-stream
+    --operation-key map-001 --media-type application/octet-stream \
+    --progress auto
+
+asterctl --token-file ./client.token blob-status \
+    --publication-id "$PUBLICATION_ID" \
+    --topic imagery.maps --scope mission/team/alpha --wait
 
 asterctl --token-file ./client.token blob-read \
     --id "$BLOB_ID" --topic imagery.maps --scope mission/team/alpha \
     --output ./downloaded-map.bin
 ```
 
-`blob-publish` requires a nonempty regular source file. The path remains local
-and is never sent to the agent. The client sends metadata first, then streams
-canonical chunks of at most 64 KiB without buffering the whole Blob or treating
-the current backend size policy as a public maximum. The current agent may
+`blob-publish` requires a nonempty regular source file. The path remains local;
+its contents stream to the local agent. The client sends metadata first, then
+streams canonical chunks of at most 512 KiB without buffering the whole Blob
+or treating the current backend size policy as a public maximum. The current agent may
 reject a source above its configured backend limit. Keep the opened source
 file's contents and length unchanged until the command exits. Detectable size
 changes fail the command with an unknown publication outcome; in-place
@@ -130,9 +135,20 @@ must have contiguous offsets, stable authenticated metadata and TTL, and an
 exact complete length. Blob bytes go only to the output filesystem; stdout
 contains metadata and never Blob plaintext.
 
+`--progress auto|always|never` is available only on Blob publish/read and
+defaults to `auto`, which writes progress to stderr only on a terminal.
+`always` produces newline-delimited stderr records suitable for retained logs;
+stdout remains one text or JSON result. Publish progress distinguishes bytes
+sent, accepted, and durably staged. A failed read reports discarded staged
+bytes and leaves the requested destination absent. Downloads currently restart
+at byte zero; local-upload and peer-transfer resumes remain receiver-checkpointed.
+
 Both text formats use exactly `TTL: durable` or `TTL: MILLISECONDS ms`. Finite
 JSON includes `"ttlMs": "MILLISECONDS"`; durable JSON omits `ttlMs`.
-`blob-publish --json` also includes `operation_key`. A retry after an earlier
+`blob-publish --json` also includes `publicationId` and `operation_key`. Use
+that publication identity with `blob-status` on the node whose local durable
+state is being inspected; `--wait` does not coordinate publication or imply
+peer convergence. A retry after an earlier
 commit returns `inserted: false`; a retry after a request that did not commit
 may return `inserted: true`. A retained publication that has expired or been
 retired is reported as expired/retired, while reuse of a key after its retained
@@ -141,7 +157,13 @@ If a publish result is unusable or its TTL does not exactly match the request,
 the outcome is unknown; retry the identical request using the same operation
 key.
 
-See [asterctl-blob-publish(1)](asterctl-blob-publish.1) and
+`asterctl status` also reports an observed, non-reserving Blob-capacity snapshot.
+Check it on both publisher and receiver before a large transfer, but allow
+filesystem, database, journal, and operational reserve beyond the logical byte
+count.
+
+See [asterctl-blob-publish(1)](asterctl-blob-publish.1),
+[asterctl-blob-status(1)](asterctl-blob-status.1), and
 [asterctl-blob-read(1)](asterctl-blob-read.1).
 
 ## Publish

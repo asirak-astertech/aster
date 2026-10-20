@@ -490,7 +490,15 @@ fn map_iroh_error(error: aster_iroh::CarrierError) -> StreamTransportError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::application::{
+        BlobId, BlobPublicationInspection, BlobPublicationPhase, BlobStreamPublicationId,
+    };
+    use crate::stream_transfer::{
+        StreamAction, StreamDataV1, StreamExtentAction, StreamFrame, StreamOpenV1,
+        StreamReceiverState, StreamResultCode, StreamSenderState,
+    };
     use aster_iroh::{CarrierSecurityProfile, Endpoint, EndpointConfig, ExpectedPeer, SecretKey};
+    use sha2::{Digest as _, Sha256};
     use std::collections::BTreeSet;
 
     fn candidate(priority: i16, health: CandidateHealth) -> TransportCandidate {
@@ -606,6 +614,183 @@ mod tests {
             coordinator.signal(AttemptSignal::Transport(TransportFailure::Cancelled)),
             CoordinatorAction::Cancelled
         );
+    }
+
+    #[test]
+    fn publication_status_survives_small_mtu_interrupt_and_different_adapter_resume() {
+        struct FragmentingAdapter {
+            mtu: usize,
+        }
+        impl FragmentingAdapter {
+            fn carry(&self, frame: StreamFrame) -> StreamFrame {
+                let encoded = frame.encode_for_context(9, 5).unwrap();
+                let mut received = Vec::with_capacity(encoded.len());
+                for fragment in encoded.chunks(self.mtu) {
+                    received.extend_from_slice(fragment);
+                }
+                StreamFrame::decode_for_context(9, 5, &received).unwrap()
+            }
+        }
+
+        fn open(nonce: [u8; 32]) -> StreamOpenV1 {
+            StreamOpenV1 {
+                class: crate::stream_transfer::StreamClass::Blob,
+                direction: crate::stream_transfer::StreamDirection::ToSessionResponder,
+                session_transcript: [3; 32],
+                exchange_id: 4,
+                transfer_id: [1; 32],
+                source_transfer_id: [5; 32],
+                publication_id: [6; 32],
+                variant_id: [7; 32],
+                total_len: 32,
+                attempt_nonce: nonce,
+                checkpoint_generation: 1,
+                custody_digest: None,
+                authenticated_open: vec![8],
+            }
+        }
+
+        fn accepted(action: StreamAction) -> crate::stream_transfer::StreamAcceptV1 {
+            let StreamAction::Send(StreamFrame::Accept(frame)) = action else {
+                panic!("receiver acceptance")
+            };
+            frame
+        }
+
+        fn sent_data(action: StreamExtentAction) -> StreamDataV1 {
+            let StreamExtentAction::Send(frame) = action else {
+                panic!("sender data")
+            };
+            frame
+        }
+
+        fn checkpoint_frame(action: StreamAction) -> crate::stream_transfer::StreamCheckpointV1 {
+            let StreamAction::Send(StreamFrame::Checkpoint(frame)) = action else {
+                panic!("receiver checkpoint")
+            };
+            frame
+        }
+
+        let payload: Vec<u8> = (0_u8..32).collect();
+        let expected_blob_id: [u8; 32] = Sha256::digest(&payload).into();
+        let first_adapter = FragmentingAdapter { mtu: 3 };
+        let second_adapter = FragmentingAdapter { mtu: 5 };
+
+        let first_open = open([2; 32]);
+        let mut first_receiver = StreamReceiverState::new(&first_open, 0, 1, 32, 16).unwrap();
+        let mut first_sender = StreamSenderState::new([1; 32], [2; 32], 32);
+        let accept = accepted(first_receiver.accept(16).unwrap());
+        let StreamFrame::Accept(accept) = first_adapter.carry(StreamFrame::Accept(accept)) else {
+            unreachable!()
+        };
+        first_sender.accept(accept).unwrap();
+        let data = sent_data(first_sender.send_extent(payload[..16].to_vec()).unwrap());
+        let StreamFrame::Data(data) = first_adapter.carry(StreamFrame::Data(data)) else {
+            unreachable!()
+        };
+        assert_eq!(
+            first_receiver.data(&data).unwrap(),
+            StreamAction::Persist { through: 16 }
+        );
+        let checkpoint = checkpoint_frame(first_receiver.persisted(16, 2, 32).unwrap());
+        let interrupted_generation = checkpoint.checkpoint_generation;
+        let interrupted_status = BlobPublicationInspection {
+            publication_id: BlobStreamPublicationId::from_bytes(first_open.publication_id).unwrap(),
+            phase: BlobPublicationPhase::Receiving,
+            plaintext_total_bytes: first_open.total_len,
+            durable_plaintext_bytes: checkpoint.durable_offset,
+            transfer_total_bytes: first_open.total_len,
+            durable_transfer_bytes: checkpoint.durable_offset,
+            total_units: 2,
+            durable_units: 1,
+            blob_id: None,
+        };
+        let StreamFrame::Checkpoint(checkpoint) =
+            first_adapter.carry(StreamFrame::Checkpoint(checkpoint))
+        else {
+            unreachable!()
+        };
+        first_sender.checkpoint(checkpoint).unwrap();
+
+        let resumed_open = open([9; 32]);
+        let mut resumed_receiver = StreamReceiverState::reopen(
+            &first_open.attempt_nonce,
+            &resumed_open,
+            interrupted_status.durable_transfer_bytes,
+            interrupted_generation,
+            32,
+            16,
+        )
+        .unwrap();
+        let mut resumed_sender = StreamSenderState::new([1; 32], [9; 32], 32);
+        let accept = accepted(resumed_receiver.accept(16).unwrap());
+        let StreamFrame::Accept(accept) = second_adapter.carry(StreamFrame::Accept(accept)) else {
+            unreachable!()
+        };
+        resumed_sender.accept(accept).unwrap();
+        let data = sent_data(resumed_sender.send_extent(payload[16..].to_vec()).unwrap());
+        let StreamFrame::Data(data) = second_adapter.carry(StreamFrame::Data(data)) else {
+            unreachable!()
+        };
+        assert_eq!(
+            resumed_receiver.data(&data).unwrap(),
+            StreamAction::Persist { through: 32 }
+        );
+        let checkpoint = checkpoint_frame(resumed_receiver.persisted(32, 3, 32).unwrap());
+        let StreamFrame::Checkpoint(checkpoint) =
+            second_adapter.carry(StreamFrame::Checkpoint(checkpoint))
+        else {
+            unreachable!()
+        };
+        resumed_sender.checkpoint(checkpoint).unwrap();
+        let StreamAction::Send(StreamFrame::Finish(finish)) =
+            resumed_sender.finish(expected_blob_id.to_vec()).unwrap()
+        else {
+            panic!("sender finish")
+        };
+        let StreamFrame::Finish(finish) = second_adapter.carry(StreamFrame::Finish(finish)) else {
+            unreachable!()
+        };
+        assert_eq!(resumed_receiver.finish(finish), Ok(StreamAction::Promote));
+        assert!(matches!(
+            resumed_receiver.promoted(StreamResultCode::Promoted, expected_blob_id),
+            Ok(StreamAction::Send(StreamFrame::Result(_)))
+        ));
+        let available_status = BlobPublicationInspection {
+            publication_id: BlobStreamPublicationId::from_bytes(resumed_open.publication_id)
+                .unwrap(),
+            phase: BlobPublicationPhase::Available,
+            plaintext_total_bytes: resumed_open.total_len,
+            durable_plaintext_bytes: 32,
+            transfer_total_bytes: resumed_open.total_len,
+            durable_transfer_bytes: 32,
+            total_units: 2,
+            durable_units: 2,
+            blob_id: Some(BlobId::from_bytes(expected_blob_id)),
+        };
+
+        assert_eq!(
+            available_status.publication_id,
+            interrupted_status.publication_id
+        );
+        assert!(
+            available_status.durable_transfer_bytes >= interrupted_status.durable_transfer_bytes
+        );
+        assert_eq!(
+            available_status.blob_id,
+            Some(BlobId::from_bytes(Sha256::digest(&payload).into()))
+        );
+        let BlobPublicationInspection {
+            publication_id: _,
+            phase: _,
+            plaintext_total_bytes: _,
+            durable_plaintext_bytes: _,
+            transfer_total_bytes: _,
+            durable_transfer_bytes: _,
+            total_units: _,
+            durable_units: _,
+            blob_id: _,
+        } = available_status;
     }
 
     #[test]

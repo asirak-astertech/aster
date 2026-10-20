@@ -320,21 +320,26 @@
 - Consumes: Tasks 1-4's stable publication identity, inspection states, capacity output, progress modes, and recovery wording.
 - Produces: a fake-adapter portability test, current operator examples, and the focused pre-CI readiness evidence.
 
-- [ ] **Step 1: Add the failing cross-transport resume test**
+- [x] **Step 1: Add the failing cross-transport resume test**
 
   Add `publication_status_survives_small_mtu_interrupt_and_different_adapter_resume`. The first fake adapter fragments at a small MTU and stops after at least one durable checkpoint; the second adapter resumes from the exact receiver-authoritative offset. Assert unchanged publication ID, monotonic common durable counters, final Blob ID/hash equality, and no IP/Iroh type in the status interface.
 
-- [ ] **Step 2: Run the fake-adapter test and confirm it fails**
+- [x] **Step 2: Run the fake-adapter test and confirm it fails**
 
   Run: `cargo test -p aster-node publication_status_survives_small_mtu_interrupt_and_different_adapter_resume -- --nocapture`
 
   Expected: FAIL until status observation is wired solely to the common checkpoint/promotion path.
 
-- [ ] **Step 3: Connect status observation to the common stream contract**
+  Observed: PASS on first execution because the existing common profile-5 state
+  and Task 1 inspection shape were already transport-neutral. The test uses the
+  real public inspection type and exhaustively destructures it so introducing a
+  transport field fails compilation.
+
+- [x] **Step 3: Connect status observation to the common stream contract**
 
   Keep adapter-local fragments transient and update public durability only after the existing Aster checkpoint commits. Do not add MTU, endpoint, connection-duration, ordered carrier-packet, or Iroh assumptions to the public types or status code.
 
-- [ ] **Step 4: Run the portability and unchanged-profile tests**
+- [x] **Step 4: Run the portability and unchanged-profile tests**
 
   Run: `cargo test -p aster-node publication_status_survives_small_mtu_interrupt_and_different_adapter_resume -- --nocapture`
 
@@ -344,17 +349,17 @@
 
   Expected: PASS with profile-4 vectors unchanged.
 
-- [ ] **Step 5: Update operator and engineering documentation**
+- [x] **Step 5: Update operator and engineering documentation**
 
   Show separate Event-subscription and Blob-interest prerequisites; publisher/receiver capacity checks; local publish retaining publication ID, Blob ID, and operation key; receiver-local status/wait; read after `AVAILABLE`; hash comparison; and exact retry after interruption. Include a concrete 1-GiB evaluation sizing example, clearly label overhead/reserve assumptions and capacity as non-reserving, and preserve the engineering runbook's per-stage timestamps and raw-transfer baseline.
 
-- [ ] **Step 6: Verify documentation commands and requirement evidence**
+- [x] **Step 6: Verify documentation commands and requirement evidence**
 
   Run every new `asterctl` example with `--help`/argument parsing or the existing documentation checker. If `docs/validation/requirements-status.md` changed, run `python3 tools/check-implementation-requirements.py`.
 
   Expected: examples parse, help matches man pages, and the requirements check exits 0 when applicable.
 
-- [ ] **Step 7: Run the focused readiness checks**
+- [x] **Step 7: Run the focused readiness checks**
 
   Run: `cargo fmt --all -- --check`
 
@@ -374,7 +379,7 @@
 
   Expected: all focused checks pass. Record any skipped full-suite evidence explicitly for CI rather than claiming it locally.
 
-- [ ] **Step 8: Commit documentation and portability evidence**
+- [x] **Step 8: Commit documentation and portability evidence**
 
   ```bash
   git add crates/aster-node/src/stream_transport.rs crates/aster-node/src/stream_transfer.rs crates/asterctl/README.md crates/aster-agent/README.md docs/operator-guide.md docs/quickstart/selected-blob-api.md docs/validation/blob-streaming-engineering-runbook.md docs/validation/requirements-status.md
