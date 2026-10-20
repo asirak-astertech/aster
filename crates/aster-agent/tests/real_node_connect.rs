@@ -252,15 +252,19 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
                 },
             ]
         };
-        let cancelled_polled = Arc::new(tokio::sync::Notify::new());
-        let cancelled_client = client.clone();
-        let cancelled_stream =
-            pending_upload(b"real-node-blob-cancelled", Arc::clone(&cancelled_polled));
-        let cancelled =
-            tokio::spawn(async move { cancelled_client.publish_blob(cancelled_stream).await });
-        cancelled_polled.notified().await;
-        tokio::time::timeout(Duration::from_secs(2), async {
+        struct PermitOwner<T>(tokio::task::JoinHandle<T>);
+
+        let PermitOwner(cancelled) = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
+                let cancelled_polled = Arc::new(tokio::sync::Notify::new());
+                let cancelled_client = client.clone();
+                let cancelled_stream =
+                    pending_upload(b"real-node-blob-cancelled", Arc::clone(&cancelled_polled));
+                let candidate =
+                    tokio::spawn(
+                        async move { cancelled_client.publish_blob(cancelled_stream).await },
+                    );
+                cancelled_polled.notified().await;
                 let probe = client
                     .publish_blob(connectrpc::stream_iter(one_byte_upload(
                         b"real-node-capacity-probe",
@@ -269,14 +273,18 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
                     .await
                     .expect_err("capacity probe is intentionally short");
                 if probe.code == ErrorCode::ResourceExhausted {
-                    break;
+                    break PermitOwner(candidate);
                 }
                 assert_eq!(probe.code, ErrorCode::InvalidArgument);
-                tokio::task::yield_now().await;
+                let candidate_error = candidate
+                    .await
+                    .expect("candidate request task")
+                    .expect_err("the probe owned the singleton permit");
+                assert_eq!(candidate_error.code, ErrorCode::ResourceExhausted);
             }
         })
         .await
-        .expect("pending upload acquired server staging and the singleton permit");
+        .expect("one pending upload acquired server staging and the singleton permit");
         cancelled.abort();
         assert!(cancelled.await.unwrap_err().is_cancelled());
         let recovered_cancelled = tokio::time::timeout(Duration::from_secs(2), async {
