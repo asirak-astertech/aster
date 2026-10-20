@@ -41474,7 +41474,27 @@ mod tests {
     }
 
     #[test]
+    fn custody_collection_limit_keeps_the_production_maximum_and_fails_closed() {
+        assert_eq!(MAX_CUSTODY_PAGE, 1_024);
+        let file = TestFile::new("custody collection page limit contract");
+        let services = event_services(0xec);
+        let store = Store::open_for_mission(&file.0, services.authority).expect("store");
+        let revision = store.custody_policy_revision().expect("policy revision");
+
+        for limit in [0, MAX_CUSTODY_PAGE + 1] {
+            assert!(matches!(
+                store.collect_custody_garbage(None, revision, limit),
+                Err(StoreError::Custody(CustodyStoreError::PageLimitExceeded {
+                    requested,
+                    maximum: MAX_CUSTODY_PAGE,
+                })) if requested == limit
+            ));
+        }
+    }
+
+    #[test]
     fn custody_reanchors_more_than_one_page_transactionally_across_reopen() {
+        const TEST_PAGE: usize = 2;
         let file = TestFile::new("custody multi-page re-anchor survives reopen");
         let mut services = event_services(0xed);
         let initial = aster_mesh::CustodySample {
@@ -41485,7 +41505,7 @@ mod tests {
             clock_id: [0xd4; 16],
             tick_ms: 5_000,
         };
-        let item_count = MAX_CUSTODY_PAGE + 1;
+        let item_count = TEST_PAGE + 1;
         let store = Store::open_for_mission(&file.0, services.authority).expect("store");
         seed_numbered_local_finite_event_group(&store, &mut services, item_count, 10_000, initial);
         assert_eq!(custody_expiration_generation_count(&store, 1), item_count);
@@ -41495,7 +41515,7 @@ mod tests {
             store
                 .custody_policy_revision()
                 .expect("pre-transition revision"),
-            MAX_CUSTODY_PAGE,
+            TEST_PAGE,
         );
         assert_eq!(transition.writer_commits(), 1);
         assert!(matches!(
@@ -41503,10 +41523,7 @@ mod tests {
             Err(StoreError::Custody(CustodyStoreError::PolicyChanged))
         ));
         assert_eq!(custody_expiration_generation_count(&store, 1), 1);
-        assert_eq!(
-            custody_expiration_generation_count(&store, 2),
-            MAX_CUSTODY_PAGE
-        );
+        assert_eq!(custody_expiration_generation_count(&store, 2), TEST_PAGE);
         drop(store);
 
         Store::inspect_existing(&file.0).expect("inspect partially re-anchored store");
@@ -41515,7 +41532,7 @@ mod tests {
             .collect_custody_garbage(
                 Some(changed),
                 store.custody_policy_revision().expect("reopened revision"),
-                MAX_CUSTODY_PAGE,
+                TEST_PAGE,
             )
             .expect("finish re-anchor");
         assert_eq!(final_page.examined_expirations, 1);

@@ -19220,7 +19220,11 @@ fn event_page_sender_target_entries() -> usize {
             _ => None,
         })
     }) {
-        return target.clamp(1, EVENT_PAGE_SENDER_TARGET_ENTRIES);
+        assert!(
+            (1..=EVENT_PAGE_SENDER_TARGET_ENTRIES).contains(&target),
+            "Event page test target entries must be within 1..={EVENT_PAGE_SENDER_TARGET_ENTRIES}"
+        );
+        return target;
     }
     EVENT_PAGE_SENDER_TARGET_ENTRIES
 }
@@ -54279,6 +54283,31 @@ mod tests {
     }
 
     #[tokio::test]
+    #[should_panic(expected = "Event page test target entries must be within 1..=256")]
+    async fn event_page_test_target_rejects_zero() {
+        with_test_contact_hooks(
+            None,
+            vec![TestCustodyPreopenRace::EventPageTargetEntries(0)],
+            async { event_page_sender_target_entries() },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "Event page test target entries must be within 1..=256")]
+    async fn event_page_test_target_rejects_above_production_target() {
+        assert_eq!(EVENT_PAGE_SENDER_TARGET_ENTRIES, 256);
+        with_test_contact_hooks(
+            None,
+            vec![TestCustodyPreopenRace::EventPageTargetEntries(
+                EVENT_PAGE_SENDER_TARGET_ENTRIES + 1,
+            )],
+            async { event_page_sender_target_entries() },
+        )
+        .await;
+    }
+
+    #[tokio::test]
     async fn current_stack_near_two_mib_events_each_direction() {
         // The fixture's hybrid source-authentication envelope is just over 10 KiB.
         // Reserve 11 KiB (the smallest whole-KiB margin that fits), and check the
@@ -57455,6 +57484,7 @@ mod tests {
 
     #[tokio::test]
     async fn interrupted_event_page_preserves_prefix_and_reconnects_only_the_remainder() {
+        const TEST_PAGE: usize = 2;
         let scope = Scope::new("test/page-interruption").expect("interruption scope");
         let topic = Topic::new("telemetry").expect("interruption topic");
         let access = ProvisioningAccess::member(scope.clone(), vec![1], vec![topic.clone()])
@@ -57495,7 +57525,7 @@ mod tests {
         );
         let mut source_sealer = open_test_sealer(&source_mission);
         let mut ids = Vec::new();
-        for index in 0..=EVENT_PAGE_SENDER_TARGET_ENTRIES {
+        for index in 0..=TEST_PAGE {
             let key = format!("telemetry-{index:04}");
             ids.push(publish_test_epoch_one_event(
                 &source_store,
@@ -57514,6 +57544,7 @@ mod tests {
                 clock: NodeCustodyClock::injected([0xc1; 16], 0, 0),
                 reconciliation_exchanges_before_defer: None,
                 preopen_custody_races: vec![
+                    TestCustodyPreopenRace::EventPageTargetEntries(TEST_PAGE),
                     TestCustodyPreopenRace::FailEventPageReceiveAfterPages(1),
                 ],
             },
@@ -57524,6 +57555,7 @@ mod tests {
                 clock: NodeCustodyClock::injected([0xc2; 16], 0, 0),
                 reconciliation_exchanges_before_defer: None,
                 preopen_custody_races: vec![
+                    TestCustodyPreopenRace::EventPageTargetEntries(TEST_PAGE),
                     TestCustodyPreopenRace::FailEventPageReceiveAfterPages(1),
                 ],
             },
