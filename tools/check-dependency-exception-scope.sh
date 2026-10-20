@@ -63,6 +63,35 @@ if [ "$packages" != "$expected" ]; then
   exit 1
 fi
 
+basic_toml_tree=$(
+  "$cargo_command" tree \
+    --locked \
+    --manifest-path "$repository_root/Cargo.toml" \
+    --workspace \
+    --invert basic-toml@0.1.10 \
+    --edges normal,build,dev \
+    --target all \
+    --prefix none \
+    --format '{p}'
+)
+basic_toml_packages=$(printf '%s\n' "$basic_toml_tree" | awk '{ print $1 " " $2 }')
+expected_basic_toml_packages='basic-toml v0.1.10
+i18n-config v0.4.8
+i18n-embed-fl v0.9.4
+age v0.11.5
+aster-provisioning-age v0.1.0-alpha.1
+i18n-embed-impl v0.8.4
+i18n-embed v0.15.4
+i18n-embed-fl v0.9.4
+i18n-embed v0.15.4
+age v0.11.5'
+
+if [ "$basic_toml_packages" != "$expected_basic_toml_packages" ]; then
+  printf '%s\n' 'dependency-exception scope failed: unexpected basic-toml reverse dependency graph' >&2
+  printf '%s\n' 'expected:' "$expected_basic_toml_packages" 'actual:' "$basic_toml_packages" >&2
+  exit 1
+fi
+
 active_tree=$(
   "$cargo_command" tree \
     --locked \
@@ -123,4 +152,4 @@ if printf '%s\n' "$fuzz_packages" | awk '
   exit 1
 fi
 
-printf '%s\n' 'dependency-exception scope passed: RUSTSEC-2026-0173 is isolated to aster-provisioning-age; unmaintained paste is absent from the lock and active graphs; Hickory 0.25.2 is absent while safe 0.26.1 is permitted; ignored packages are absent from fuzz'
+printf '%s\n' 'dependency-exception scope passed: RUSTSEC-2026-0173 and RUSTSEC-2026-0374 are isolated to aster-provisioning-age; unmaintained paste is absent from the lock and active graphs; Hickory 0.25.2 is absent while safe 0.26.1 is permitted; ignored packages are absent from fuzz'

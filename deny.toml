@@ -9,6 +9,10 @@ ignore = [
   # the exact graph, future-compiler warning, removal gate, and prohibition on
   # treating this exception as production admission.
   "RUSTSEC-2026-0173",
+  # The same exact-pinned age 0.11.5 pilot graph reaches basic-toml only
+  # through localization build macros. The scope checker fails closed if
+  # this unmaintained transitive dependency gains another consumer.
+  "RUSTSEC-2026-0374",
 ]
 
 [licenses]
