@@ -892,6 +892,7 @@ pub(crate) enum Frame {
     BlobStreamPlan {
         direction: EventDirection,
         attempt_nonce: Option<[u8; 32]>,
+        authenticated_open: Vec<u8>,
     },
     BlobStreamPlanAck {
         direction: EventDirection,
@@ -1534,11 +1535,12 @@ impl Frame {
             Self::BlobStreamPlan {
                 direction,
                 attempt_nonce,
-            } => encode_blob_stream_plan(
+                authenticated_open,
+            } => encode_blob_stream_plan_offer(
                 &mut output,
-                BLOB_STREAM_PLAN_V1,
                 *direction,
                 *attempt_nonce,
+                authenticated_open,
             )?,
             Self::BlobStreamPlanAck {
                 direction,
@@ -2305,13 +2307,16 @@ impl Frame {
                 ChangeTurnFinishedV1::decode(body).map_err(event_pages_protocol_error)?,
             )),
             BLOB_STREAM_PLAN_V1 | BLOB_STREAM_PLAN_ACK_V1 => {
-                let (direction, attempt_nonce) = decode_blob_stream_plan(body)?;
                 if tag == BLOB_STREAM_PLAN_V1 {
+                    let (direction, attempt_nonce, authenticated_open) =
+                        decode_blob_stream_plan_offer(body)?;
                     Ok(Self::BlobStreamPlan {
                         direction,
                         attempt_nonce,
+                        authenticated_open,
                     })
                 } else {
+                    let (direction, attempt_nonce) = decode_blob_stream_plan(body)?;
                     Ok(Self::BlobStreamPlanAck {
                         direction,
                         attempt_nonce,
@@ -2384,6 +2389,75 @@ fn encode_blob_stream_plan(
         }
     }
     Ok(())
+}
+
+fn encode_blob_stream_plan_offer(
+    output: &mut Vec<u8>,
+    direction: EventDirection,
+    attempt_nonce: Option<[u8; 32]>,
+    authenticated_open: &[u8],
+) -> Result<(), NodeError> {
+    output.push(BLOB_STREAM_PLAN_V1);
+    output.push(direction.encode());
+    match attempt_nonce {
+        None if authenticated_open.is_empty() => output.push(0),
+        Some(nonce)
+            if nonce != [0; 32]
+                && !authenticated_open.is_empty()
+                && authenticated_open.len()
+                    <= crate::stream_transfer::MAX_STREAM_AUTHENTICATED_OPEN_BYTES =>
+        {
+            output.push(1);
+            output.extend_from_slice(&nonce);
+            output.extend_from_slice(
+                &u32::try_from(authenticated_open.len())
+                    .map_err(|_| NodeError::Protocol("Blob stream open length overflows".into()))?
+                    .to_be_bytes(),
+            );
+            output.extend_from_slice(authenticated_open);
+        }
+        _ => {
+            return Err(NodeError::Protocol(
+                "Blob stream plan offer is not canonical".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+type DecodedBlobStreamPlanOffer = (EventDirection, Option<[u8; 32]>, Vec<u8>);
+
+fn decode_blob_stream_plan_offer(body: &[u8]) -> Result<DecodedBlobStreamPlanOffer, NodeError> {
+    let (&direction, body) = body
+        .split_first()
+        .ok_or_else(|| NodeError::Protocol("Blob stream plan direction is missing".into()))?;
+    let direction = EventDirection::decode(direction)?;
+    match body {
+        [0] => Ok((direction, None, Vec::new())),
+        [1, rest @ ..] if rest.len() >= 36 => {
+            let nonce: [u8; 32] = rest[..32]
+                .try_into()
+                .map_err(|_| NodeError::Protocol("Blob stream plan nonce length differs".into()))?;
+            let open_len = usize::try_from(u32::from_be_bytes(rest[32..36].try_into().map_err(
+                |_| NodeError::Protocol("Blob stream plan open length differs".into()),
+            )?))
+            .map_err(|_| NodeError::Protocol("Blob stream plan open length overflows".into()))?;
+            let authenticated_open = &rest[36..];
+            if nonce == [0; 32]
+                || open_len == 0
+                || open_len > crate::stream_transfer::MAX_STREAM_AUTHENTICATED_OPEN_BYTES
+                || authenticated_open.len() != open_len
+            {
+                return Err(NodeError::Protocol(
+                    "Blob stream plan offer is not canonical".into(),
+                ));
+            }
+            Ok((direction, Some(nonce), authenticated_open.to_vec()))
+        }
+        _ => Err(NodeError::Protocol(
+            "Blob stream plan offer is not canonical".into(),
+        )),
+    }
 }
 
 fn decode_blob_stream_plan(body: &[u8]) -> Result<(EventDirection, Option<[u8; 32]>), NodeError> {
@@ -4995,6 +5069,7 @@ mod tests {
             Frame::BlobStreamPlan {
                 direction: EventDirection::ToSessionResponder,
                 attempt_nonce: Some([0x71; 32]),
+                authenticated_open: vec![0xa5; 257],
             },
             Frame::BlobStreamPlanAck {
                 direction: EventDirection::ToSessionResponder,
@@ -5003,6 +5078,7 @@ mod tests {
             Frame::BlobStreamPlan {
                 direction: EventDirection::ToSessionInitiator,
                 attempt_nonce: None,
+                authenticated_open: Vec::new(),
             },
         ] {
             let encoded = frame.encode_for_semantic_version(9).expect("v9 plan");
@@ -5016,6 +5092,7 @@ mod tests {
         let mut zero_nonce = Frame::BlobStreamPlan {
             direction: EventDirection::ToSessionResponder,
             attempt_nonce: Some([1; 32]),
+            authenticated_open: vec![1],
         }
         .encode_for_semantic_version(9)
         .expect("nonzero nonce");
