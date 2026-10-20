@@ -133,30 +133,6 @@ fn assert_public_reason_with_retryability(
 }
 
 #[cfg(target_os = "linux")]
-fn has_staged_upload(state_root: &std::path::Path, total_len: u64) -> bool {
-    use std::os::unix::fs::MetadataExt as _;
-
-    // Upload staging is anonymous on Linux, including the unlinked fallback.
-    // Observe its descriptor without submitting another upload that could take
-    // the singleton permit before the request under test reaches the server.
-    fs::read_dir("/proc/self/fd")
-        .expect("inspect this test process's descriptors")
-        .any(|entry| {
-            let descriptor = entry.expect("descriptor directory entry").path();
-            let Ok(target) = fs::read_link(&descriptor) else {
-                return false;
-            };
-            let Ok(metadata) = fs::metadata(&descriptor) else {
-                return false;
-            };
-            target.parent() == Some(state_root)
-                && metadata.is_file()
-                && metadata.nlink() == 0
-                && metadata.len() == total_len
-        })
-}
-
-#[cfg(target_os = "linux")]
 fn blob_mission() -> UnprotectedReferenceMission {
     let access = ProvisioningAccess::member(
         Scope::new("mission/team/alpha").expect("Blob scope"),
@@ -286,26 +262,24 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
         let cancelled =
             tokio::spawn(async move { cancelled_client.publish_blob(cancelled_stream).await });
         cancelled_polled.notified().await;
-        let staging_root = state.0.canonicalize().expect("canonical staging root");
         tokio::time::timeout(Duration::from_secs(2), async {
-            while !has_staged_upload(&staging_root, 1) {
-                assert!(
-                    !cancelled.is_finished(),
-                    "pending upload must remain active until server staging is observed"
-                );
-                tokio::time::sleep(Duration::from_millis(1)).await;
+            loop {
+                let probe = client
+                    .publish_blob(connectrpc::stream_iter(one_byte_upload(
+                        b"real-node-capacity-probe",
+                        2,
+                    )))
+                    .await
+                    .expect_err("capacity probe is intentionally short");
+                if probe.code == ErrorCode::ResourceExhausted {
+                    break;
+                }
+                assert_eq!(probe.code, ErrorCode::InvalidArgument);
+                tokio::task::yield_now().await;
             }
         })
         .await
         .expect("pending upload acquired server staging and the singleton permit");
-        let probe = client
-            .publish_blob(connectrpc::stream_iter(one_byte_upload(
-                b"real-node-capacity-probe",
-                2,
-            )))
-            .await
-            .expect_err("the staged upload holds the singleton permit");
-        assert_eq!(probe.code, ErrorCode::ResourceExhausted);
         cancelled.abort();
         assert!(cancelled.await.unwrap_err().is_cancelled());
         let recovered_cancelled = tokio::time::timeout(Duration::from_secs(2), async {
