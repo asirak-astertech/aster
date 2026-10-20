@@ -255,40 +255,48 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
                 },
             ]
         };
-        let cancelled_polled = Arc::new(tokio::sync::Notify::new());
-        let cancelled_client = client.clone();
-        let cancelled_stream =
-            pending_upload(b"real-node-blob-cancelled", Arc::clone(&cancelled_polled));
-        let cancelled =
-            tokio::spawn(async move { cancelled_client.publish_blob(cancelled_stream).await });
-        cancelled_polled.notified().await;
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let probe = client
-                    .publish_blob(connectrpc::stream_iter(one_byte_upload(
-                        b"real-node-capacity-probe",
-                        2,
-                    )))
-                    .await
-                    .expect_err("capacity probe is intentionally short");
-                if probe.code == ErrorCode::ResourceExhausted {
-                    break;
-                }
-                assert_eq!(probe.code, ErrorCode::InvalidArgument);
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("pending upload acquired server staging and the singleton permit");
-        cancelled.abort();
-        assert!(cancelled.await.unwrap_err().is_cancelled());
+        let stalled_keys = [
+            b"real-node-blob-cancelled-left".as_slice(),
+            b"real-node-blob-cancelled-right".as_slice(),
+        ];
+        let mut uploads = tokio::task::JoinSet::new();
+        for (index, key) in stalled_keys.into_iter().enumerate() {
+            let client = client.clone();
+            let stream = pending_upload(key, Arc::new(tokio::sync::Notify::new()));
+            uploads.spawn(async move { (index, client.publish_blob(stream).await) });
+        }
+
+        // Both uploads remain pending after metadata, so whichever acquires
+        // the singleton permit holds it until cancellation. The first result
+        // must be the other upload's rejection, regardless of arrival order.
+        // JoinSet also aborts outstanding requests if an assertion fails.
+        let (rejected_index, rejection) =
+            tokio::time::timeout(Duration::from_secs(2), uploads.join_next())
+                .await
+                .expect("one competing upload is rejected while the other holds capacity")
+                .expect("two competing upload tasks")
+                .expect("rejected upload task");
+        assert_eq!(
+            rejection
+                .expect_err("one stalled upload must own the singleton permit")
+                .code,
+            ErrorCode::ResourceExhausted
+        );
+        let cancelled_key = stalled_keys[1 - rejected_index];
+        uploads.abort_all();
+        assert!(
+            uploads
+                .join_next()
+                .await
+                .expect("permit-owning upload remains pending")
+                .unwrap_err()
+                .is_cancelled()
+        );
+        assert!(uploads.is_empty());
         let recovered_cancelled = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 match client
-                    .publish_blob(connectrpc::stream_iter(one_byte_upload(
-                        b"real-node-blob-cancelled",
-                        1,
-                    )))
+                    .publish_blob(connectrpc::stream_iter(one_byte_upload(cancelled_key, 1)))
                     .await
                 {
                     Ok(response) => break response.into_owned(),
