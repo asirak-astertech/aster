@@ -196,8 +196,12 @@ fn print_pack_report(
         .pipeline
         .as_ref()
         .map_or(0, |value| value.completed_items());
+    let pipeline = report
+        .pipeline
+        .as_ref()
+        .map_or_else(|| "none".into(), ToString::to_string);
     println!(
-        "ASTER_BLOB_NETWORK {{\"role\":\"{role}\",\"wire_bytes\":{},\"resumed_from\":{},\"attempt_bytes\":{},\"elapsed_ns\":{},\"mib_s\":{mib_s:.3},\"checkpoints\":{},\"segments\":{completed},\"plaintext_root\":\"{}\",\"ciphertext_root\":\"{}\",\"path\":\"{:?}\"}}",
+        "ASTER_BLOB_NETWORK {{\"role\":\"{role}\",\"wire_bytes\":{},\"resumed_from\":{},\"attempt_bytes\":{},\"elapsed_ns\":{},\"mib_s\":{mib_s:.3},\"checkpoints\":{},\"segments\":{completed},\"plaintext_root\":\"{}\",\"ciphertext_root\":\"{}\",\"path\":\"{:?}\",\"pipeline\":\"{pipeline}\"}}",
         report.wire_bytes,
         report.resumed_from,
         report.attempt_bytes,

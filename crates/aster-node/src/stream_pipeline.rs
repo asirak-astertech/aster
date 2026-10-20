@@ -186,6 +186,37 @@ impl PipelineReport {
     }
 }
 
+impl Display for PipelineReport {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "workers:{};peak_items:{};peak_bytes:{};peak_reorder:{}",
+            self.worker_count,
+            self.peak_in_flight_items,
+            self.peak_in_flight_bytes,
+            self.peak_reorder_items,
+        )?;
+        for (name, stage) in [
+            ("admission", PipelineStage::Admission),
+            ("map", PipelineStage::Map),
+            ("reorder", PipelineStage::Reorder),
+            ("sink", PipelineStage::Sink),
+        ] {
+            let observation = self.stage(stage);
+            write!(
+                formatter,
+                ";{name}:{}:{}:{}:{}:{}",
+                observation.items,
+                observation.bytes,
+                observation.queue_wait_ns,
+                observation.service_ns,
+                observation.output_blocked_ns,
+            )?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PipelineError {
     InvalidLimits,
@@ -993,6 +1024,10 @@ mod tests {
         assert!(map.queue_wait_ns > 0);
         assert!(map.service_ns > 0);
         assert!(map.output_blocked_ns > 0);
+        let metrics = report.to_string();
+        assert!(metrics.starts_with("workers:2;peak_items:"));
+        assert!(metrics.contains(";map:8:128:"));
+        assert!(metrics.contains(";sink:8:128:"));
     }
 
     #[tokio::test]
