@@ -28343,6 +28343,7 @@ mod tests {
                 BLOB_STREAM_PUBLICATIONS,
                 BLOB_STREAM_CONFLICTS,
                 BLOB_STREAM_VARIANTS,
+                BLOB_STREAM_RETIREMENTS,
             ] {
                 write.delete_table(table).expect("stream table");
             }
@@ -28437,12 +28438,15 @@ mod tests {
                 Err(error) => error,
             },
         ] {
-            assert!(matches!(
-                error,
-                StoreError::Blob(BlobStoreError::SchemaInvariant(
-                    "Blob lifecycle authority exists without its base schema"
-                ))
-            ));
+            assert!(
+                matches!(
+                    error,
+                    StoreError::Blob(BlobStoreError::SchemaInvariant(
+                        "Blob lifecycle authority exists without its base schema"
+                    ))
+                ),
+                "unexpected orphan-schema error: {error:?}"
+            );
         }
         {
             let database = Database::open(&legacy.database).expect("orphan lifecycle database");
