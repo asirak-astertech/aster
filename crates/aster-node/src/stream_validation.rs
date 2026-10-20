@@ -273,6 +273,19 @@ pub async fn receive(
     connection: Connection,
     expected_bytes: u64,
 ) -> Result<StreamValidationReport, String> {
+    receive_with_batch(
+        connection,
+        expected_bytes,
+        MAX_STREAM_CHECKPOINT_BATCH_BYTES,
+    )
+    .await
+}
+
+async fn receive_with_batch(
+    connection: Connection,
+    expected_bytes: u64,
+    checkpoint_batch: u32,
+) -> Result<StreamValidationReport, String> {
     let (max_data_bytes, max_control_bytes) =
         profile5_attempt_bounds(expected_bytes).map_err(|error| error.to_string())?;
     let adapter = IrohQuicV1Adapter::new(connection);
@@ -295,17 +308,17 @@ pub async fn receive(
     if open.class != StreamClass::Blob || open.total_len != expected_bytes {
         return Err("stream open differs from expected Blob transfer".into());
     }
-    let batch = u64::from(MAX_STREAM_CHECKPOINT_BATCH_BYTES);
+    let batch = u64::from(checkpoint_batch);
     let mut state = StreamReceiverState::new(
         &open,
         0,
         0,
-        profile5_receive_limit(expected_bytes, 0),
+        profile5_receive_limit(expected_bytes, 0, checkpoint_batch),
         PROFILE5_EXTENT_BYTES as u32,
     )
     .map_err(|error| error.to_string())?;
     let StreamAction::Send(accept) = state
-        .accept(MAX_STREAM_CHECKPOINT_BATCH_BYTES)
+        .accept(checkpoint_batch)
         .map_err(|error| error.to_string())?
     else {
         return Err("receiver did not produce accept".into());
@@ -339,7 +352,7 @@ pub async fn receive(
                 hasher.update(&data.bytes);
                 if through == expected_bytes || through - durable >= batch {
                     generation += 1;
-                    let limit = profile5_receive_limit(expected_bytes, through);
+                    let limit = profile5_receive_limit(expected_bytes, through, checkpoint_batch);
                     let StreamAction::Send(checkpoint) = state
                         .persisted(through, generation, limit)
                         .map_err(|error| error.to_string())?
@@ -468,6 +481,7 @@ mod tests {
 
     #[tokio::test]
     async fn semantic_v9_driver_crosses_credit_checkpoint_without_deadlock() {
+        const TEST_CHECKPOINT_BATCH: u32 = 8 * 1_048_576;
         let config = EndpointConfig::direct("127.0.0.1:0".parse().expect("address"));
         let server = Endpoint::bind_with_security_profile(
             SecretKey::generate(),
@@ -488,14 +502,16 @@ mod tests {
             .into_iter()
             .find(std::net::SocketAddr::is_ipv4)
             .expect("IPv4 server address");
-        let bytes = u64::from(MAX_STREAM_CHECKPOINT_BATCH_BYTES)
+        let bytes = u64::from(TEST_CHECKPOINT_BATCH)
             + u64::try_from(PROFILE5_EXTENT_BYTES).expect("extent bytes");
         let receiver = tokio::spawn({
             let server = server.clone();
             let allowed = BTreeSet::from([client.id()]);
             async move {
                 let connection = server.accept(&allowed).await.expect("accept");
-                receive(connection, bytes).await.expect("receive")
+                receive_with_batch(connection, bytes, TEST_CHECKPOINT_BATCH)
+                    .await
+                    .expect("receive")
             }
         });
         let connection = client

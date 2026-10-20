@@ -2730,14 +2730,30 @@ impl BoundedSendStream {
     }
 
     pub async fn write_frame(&mut self, frame: &[u8]) -> Result<(), CarrierError> {
+        self.write_frame_parts(frame, &[]).await
+    }
+
+    pub async fn write_frame_parts(
+        &mut self,
+        prefix: &[u8],
+        body: &[u8],
+    ) -> Result<(), CarrierError> {
         if self.complete {
             return Err(CarrierError::Transport(
                 "stream direction is complete".into(),
             ));
         }
-        ensure_frame_bound(frame.len(), self.max_frame_bytes)?;
+        let frame_len =
+            prefix
+                .len()
+                .checked_add(body.len())
+                .ok_or(CarrierError::FrameTooLarge {
+                    actual: usize::MAX,
+                    maximum: self.max_frame_bytes,
+                })?;
+        ensure_frame_bound(frame_len, self.max_frame_bytes)?;
         let encoded = 4usize
-            .checked_add(frame.len())
+            .checked_add(frame_len)
             .ok_or(CarrierError::TurnTooLarge {
                 actual: usize::MAX,
                 maximum: self.max_stream_bytes,
@@ -2756,13 +2772,14 @@ impl BoundedSendStream {
             });
         }
         self.ensure_started().await?;
-        let length = u32::try_from(frame.len()).map_err(|_| CarrierError::FrameTooLarge {
-            actual: frame.len(),
+        let length = u32::try_from(frame_len).map_err(|_| CarrierError::FrameTooLarge {
+            actual: frame_len,
             maximum: u32::MAX as usize,
         })?;
         timeout_at(self.deadline, async {
             self.stream.write_all(&length.to_be_bytes()).await?;
-            self.stream.write_all(frame).await
+            self.stream.write_all(prefix).await?;
+            self.stream.write_all(body).await
         })
         .await
         .map_err(|_| CarrierError::Timeout("stream pair send"))?
@@ -5319,6 +5336,43 @@ mod tests {
         assert_eq!(pair.control.read_frame().await.unwrap(), None);
         pair.data.finish().await.unwrap();
         receiver.await.unwrap();
+        sender_connection.close();
+        client.close().await;
+        server.close().await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_stream_pair_writes_one_frame_from_two_owned_parts() {
+        let (server, client, receiver_connection, sender_connection) =
+            direct_connection_pair().await;
+        let receiver = tokio::spawn(async move {
+            let mut pair = receiver_connection
+                .accept_stream_pair(uni_deadline(), 64, 64)
+                .await
+                .expect("accept concurrent pair");
+            assert_eq!(
+                pair.data.read_frame().await.expect("read parts frame"),
+                Some(b"headerbody".to_vec())
+            );
+            assert_eq!(pair.data.read_frame().await.expect("exact EOF"), None);
+        });
+        let mut pair = sender_connection
+            .open_stream_pair(uni_deadline(), 64, 64)
+            .await
+            .expect("open concurrent pair");
+        pair.data
+            .write_frame_parts(b"header", b"body")
+            .await
+            .expect("write parts frame");
+        assert!(matches!(
+            pair.data.write_frame_parts(&[0; 40], &[0; 25]).await,
+            Err(CarrierError::TurnTooLarge {
+                actual: 83,
+                maximum: 64
+            })
+        ));
+        pair.data.finish().await.expect("finish data");
+        receiver.await.expect("receiver task");
         sender_connection.close();
         client.close().await;
         server.close().await;

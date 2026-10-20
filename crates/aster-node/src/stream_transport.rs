@@ -303,6 +303,7 @@ pub(crate) type AdapterFuture<'a, T> =
 
 pub(crate) trait StreamAttempt: Send + Sync {
     fn send_data<'a>(&'a self, frame: &'a [u8]) -> AdapterFuture<'a, ()>;
+    fn send_data_parts<'a>(&'a self, prefix: &'a [u8], body: &'a [u8]) -> AdapterFuture<'a, ()>;
     fn receive_control(&self) -> AdapterFuture<'_, Option<Vec<u8>>>;
     fn finish_data(&self) -> AdapterFuture<'_, ()>;
 }
@@ -385,6 +386,16 @@ impl StreamAttempt for IrohSenderAttempt {
                 .lock()
                 .await
                 .write_frame(frame)
+                .await
+                .map_err(map_iroh_error)
+        })
+    }
+    fn send_data_parts<'a>(&'a self, prefix: &'a [u8], body: &'a [u8]) -> AdapterFuture<'a, ()> {
+        Box::pin(async move {
+            self.data
+                .lock()
+                .await
+                .write_frame_parts(prefix, body)
                 .await
                 .map_err(map_iroh_error)
         })
@@ -624,7 +635,11 @@ mod tests {
             let server = server.clone();
             async move {
                 let connection = server.accept(&allowed).await.unwrap();
-                for expected in [b"first".as_slice(), b"resume".as_slice()] {
+                for expected in [
+                    b"first".as_slice(),
+                    b"headerbody".as_slice(),
+                    b"resume".as_slice(),
+                ] {
                     let mut pair = connection
                         .accept_stream_pair(Instant::now() + Duration::from_secs(2), 64, 64)
                         .await
@@ -653,7 +668,11 @@ mod tests {
             .unwrap();
         let adapter = IrohQuicV1Adapter::new(connection.clone());
         assert_eq!(adapter.id(), StreamTransportId::IrohQuicV1);
-        for payload in [b"first".as_slice(), b"resume".as_slice()] {
+        for (prefix, body) in [
+            (b"first".as_slice(), b"".as_slice()),
+            (b"header".as_slice(), b"body".as_slice()),
+            (b"resume".as_slice(), b"".as_slice()),
+        ] {
             let attempt = adapter
                 .open_attempt(AttemptOpenRequest {
                     deadline: Instant::now() + Duration::from_secs(2),
@@ -662,7 +681,7 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            attempt.send_data(payload).await.unwrap();
+            attempt.send_data_parts(prefix, body).await.unwrap();
             assert_eq!(
                 attempt.receive_control().await.unwrap().as_deref(),
                 Some(b"checkpoint".as_slice())

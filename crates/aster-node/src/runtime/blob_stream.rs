@@ -12,7 +12,7 @@ use crate::{
         MAX_STREAM_CHECKPOINT_BATCH_BYTES, PROFILE5_ATTEMPT_TIMEOUT, PROFILE5_EXTENT_BYTES,
         PROFILE5_MAX_RECORD_BYTES, StreamAction, StreamClass, StreamDirection, StreamExtentAction,
         StreamFrame, StreamOpenV1, StreamReceiverState, StreamResultCode, StreamSenderState,
-        blob_pack_wire_len, encode_composite_data_record, profile5_attempt_bounds,
+        blob_pack_wire_len, encode_composite_data_prefix, profile5_attempt_bounds,
         profile5_receive_limit, split_composite_data_record,
     },
     stream_transport::{AttemptOpenRequest, IrohQuicV1Adapter, StreamTransportAdapter},
@@ -231,6 +231,10 @@ fn decoded(bytes: &[u8]) -> Result<StreamFrame, BlobNetworkError> {
 
 trait BlobRecordCodec: Send {
     fn encode(&mut self, frame: StreamFrame) -> Result<Vec<u8>, BlobNetworkError>;
+    fn encode_data_parts(
+        &mut self,
+        data: crate::stream_transfer::StreamDataV1,
+    ) -> Result<(Vec<u8>, Vec<u8>), BlobNetworkError>;
     fn decode(&mut self, bytes: &[u8]) -> Result<StreamFrame, BlobNetworkError>;
 }
 
@@ -238,7 +242,25 @@ struct PlainBlobRecordCodec;
 
 impl BlobRecordCodec for PlainBlobRecordCodec {
     fn encode(&mut self, frame: StreamFrame) -> Result<Vec<u8>, BlobNetworkError> {
+        if let StreamFrame::Data(data) = frame {
+            let (mut header, body) = self.encode_data_parts(data)?;
+            header.extend_from_slice(&body);
+            return Ok(header);
+        }
         encoded(frame)
+    }
+
+    fn encode_data_parts(
+        &mut self,
+        data: crate::stream_transfer::StreamDataV1,
+    ) -> Result<(Vec<u8>, Vec<u8>), BlobNetworkError> {
+        let (header, body) = data.into_header_and_body().map_err(|error| {
+            BlobNetworkError::new(BlobNetworkStage::Framing, "split data frame", error)
+        })?;
+        let encoded_header = header.encode_for_context(9, 5).map_err(|error| {
+            BlobNetworkError::new(BlobNetworkStage::Framing, "encode data header", error)
+        })?;
+        Ok((encoded_header, body))
     }
 
     fn decode(&mut self, bytes: &[u8]) -> Result<StreamFrame, BlobNetworkError> {
@@ -268,32 +290,9 @@ fn stream_frame_name(frame: &StreamFrame) -> &'static str {
 impl BlobRecordCodec for MissionBlobRecordCodec<'_> {
     fn encode(&mut self, frame: StreamFrame) -> Result<Vec<u8>, BlobNetworkError> {
         if let StreamFrame::Data(data) = frame {
-            let (header, body) = data.into_header_and_body().map_err(|error| {
-                BlobNetworkError::new(BlobNetworkStage::Framing, "split data frame", error)
-            })?;
-            let encoded_header = header
-                .encode_for_context(9, TransferProfileId::BlobStreamV1 as u16)
-                .map_err(|error| {
-                    BlobNetworkError::new(BlobNetworkStage::Framing, "encode data header", error)
-                })?;
-            let protected_header = self
-                .mission
-                .seal_v9_blob_data_header(
-                    self.profile_digest,
-                    self.direction,
-                    self.attempt_nonce,
-                    &encoded_header,
-                )
-                .map_err(|error| {
-                    authentication_failure("seal data-header mission record", error)
-                })?;
-            return encode_composite_data_record(&protected_header, body).map_err(|error| {
-                BlobNetworkError::new(
-                    BlobNetworkStage::Framing,
-                    "encode composite data record",
-                    error,
-                )
-            });
+            let (mut prefix, body) = self.encode_data_parts(data)?;
+            prefix.extend_from_slice(&body);
+            return Ok(prefix);
         }
         let frame_name = stream_frame_name(&frame);
         let plaintext = frame
@@ -311,6 +310,37 @@ impl BlobRecordCodec for MissionBlobRecordCodec<'_> {
             .map_err(|error| {
                 authentication_failure(format!("seal {frame_name} mission record"), error)
             })
+    }
+
+    fn encode_data_parts(
+        &mut self,
+        data: crate::stream_transfer::StreamDataV1,
+    ) -> Result<(Vec<u8>, Vec<u8>), BlobNetworkError> {
+        let (header, body) = data.into_header_and_body().map_err(|error| {
+            BlobNetworkError::new(BlobNetworkStage::Framing, "split data frame", error)
+        })?;
+        let encoded_header = header
+            .encode_for_context(9, TransferProfileId::BlobStreamV1 as u16)
+            .map_err(|error| {
+                BlobNetworkError::new(BlobNetworkStage::Framing, "encode data header", error)
+            })?;
+        let protected_header = self
+            .mission
+            .seal_v9_blob_data_header(
+                self.profile_digest,
+                self.direction,
+                self.attempt_nonce,
+                &encoded_header,
+            )
+            .map_err(|error| authentication_failure("seal data-header mission record", error))?;
+        let prefix = encode_composite_data_prefix(&protected_header).map_err(|error| {
+            BlobNetworkError::new(
+                BlobNetworkStage::Framing,
+                "encode composite data prefix",
+                error,
+            )
+        })?;
+        Ok((prefix, body))
     }
 
     fn decode(&mut self, bytes: &[u8]) -> Result<StreamFrame, BlobNetworkError> {
@@ -671,8 +701,9 @@ async fn send_completed_pack_inner(
             .map_err(|error| failure("advance sender extent", error))?
         {
             StreamExtentAction::Send(data) => {
+                let (prefix, body) = codec.encode_data_parts(data)?;
                 attempt
-                    .send_data(&codec.encode(StreamFrame::Data(data))?)
+                    .send_data_parts(&prefix, &body)
                     .await
                     .map_err(|error| transport_failure("send data", format!("{error:?}")))?;
                 pending = source.next_extent()?;
@@ -862,7 +893,11 @@ async fn send_durable_checkpoint(
     current_limit: &mut u64,
     codec: &mut dyn BlobRecordCodec,
 ) -> Result<(), BlobNetworkError> {
-    let new_limit = (*current_limit).max(profile5_receive_limit(wire_len, progress.wire_offset));
+    let new_limit = (*current_limit).max(profile5_receive_limit(
+        wire_len,
+        progress.wire_offset,
+        MAX_STREAM_CHECKPOINT_BATCH_BYTES,
+    ));
     let StreamAction::Send(checkpoint) = state
         .persisted(
             progress.wire_offset,
@@ -1026,7 +1061,8 @@ async fn receive_completed_pack_inner(
     let durable_wire = resume.durable_wire_offset();
     let resumed_from = durable_wire;
     let mut writer = root.projected_writer(open, resume)?;
-    let mut current_limit = profile5_receive_limit(wire_len, durable_wire);
+    let mut current_limit =
+        profile5_receive_limit(wire_len, durable_wire, MAX_STREAM_CHECKPOINT_BATCH_BYTES);
     let mut state = StreamReceiverState::new(
         &transfer_open,
         durable_wire,
@@ -1373,6 +1409,29 @@ mod tests {
             attempt_nonce: nonce,
         };
         assert_eq!(receiver_codec.decode(&encoded).unwrap(), frame);
+    }
+
+    #[test]
+    fn plain_data_framing_moves_the_canonical_record_allocation() {
+        let body = vec![0xc3; PROFILE5_EXTENT_BYTES];
+        let allocation = body.as_ptr();
+        let data = crate::stream_transfer::StreamDataV1 {
+            transfer_id: [0xc4; 32],
+            attempt_nonce: [0xc2; 32],
+            sequence: 0,
+            offset: 0,
+            bytes: body,
+        };
+
+        let (header, body) = PlainBlobRecordCodec
+            .encode_data_parts(data)
+            .expect("split data frame");
+
+        assert_eq!(
+            header.len(),
+            crate::stream_transfer::STREAM_DATA_FIXED_BYTES
+        );
+        assert_eq!(body.as_ptr(), allocation);
     }
 
     #[test]
@@ -1754,7 +1813,7 @@ mod tests {
         assert_eq!(received.roots, roots);
         assert_eq!(sent.wire_bytes, wire_len);
         assert_eq!(received.wire_bytes, wire_len);
-        assert!(received.checkpoints >= 2);
+        assert_eq!(received.checkpoints, 1);
         assert_eq!(
             received
                 .pipeline

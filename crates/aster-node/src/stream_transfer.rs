@@ -18,7 +18,7 @@ pub(crate) const PROFILE5_MAX_RECORD_BYTES: usize =
     PROFILE5_EXTENT_BYTES - PROFILE5_RECORD_PREFIX_BYTES;
 pub(crate) const PROFILE5_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 pub(crate) const MAX_STREAM_EXTENT_BYTES: usize = PROFILE5_EXTENT_BYTES;
-pub(crate) const MAX_STREAM_CHECKPOINT_BATCH_BYTES: u32 = 8 * 1_048_576;
+pub(crate) const MAX_STREAM_CHECKPOINT_BATCH_BYTES: u32 = 128 * 1_048_576;
 pub(crate) const STREAM_DATA_FIXED_BYTES: usize = 89;
 pub(crate) const MAX_PROTECTED_STREAM_DATA_HEADER_BYTES: usize = 2 * 1024;
 pub(crate) const MAX_STREAM_DATA_FRAME_BYTES: usize =
@@ -28,9 +28,9 @@ pub(crate) const MAX_STREAM_SEMANTIC_COMMITMENT_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_STREAM_AUTHENTICATED_OPEN_BYTES: usize = 256 * 1024;
 pub(crate) const STREAM_TAGS: std::ops::RangeInclusive<u8> = 0xd6..=0xdc;
 
-pub(crate) fn profile5_receive_limit(total: u64, durable: u64) -> u64 {
+pub(crate) fn profile5_receive_limit(total: u64, durable: u64, checkpoint_batch: u32) -> u64 {
     let extent = PROFILE5_EXTENT_BYTES as u64;
-    let window = u64::from(MAX_STREAM_CHECKPOINT_BATCH_BYTES)
+    let window = u64::from(checkpoint_batch)
         .div_ceil(extent)
         .saturating_mul(extent);
     total.min(durable.saturating_add(window))
@@ -38,7 +38,6 @@ pub(crate) fn profile5_receive_limit(total: u64, durable: u64) -> u64 {
 
 pub(crate) fn profile5_attempt_bounds(bytes: u64) -> Result<(usize, usize), StreamError> {
     let extents = bytes.div_ceil(PROFILE5_EXTENT_BYTES as u64);
-    let checkpoints = bytes.div_ceil(u64::from(MAX_STREAM_CHECKPOINT_BATCH_BYTES));
     let data = usize::try_from(bytes)
         .ok()
         .and_then(|value| {
@@ -49,7 +48,9 @@ pub(crate) fn profile5_attempt_bounds(bytes: u64) -> Result<(usize, usize), Stre
         })
         .and_then(|value| value.checked_add(MAX_STREAM_SEMANTIC_COMMITMENT_BYTES + 4096))
         .ok_or_else(|| StreamError::invalid("data stream bound overflow"))?;
-    let control = usize::try_from(checkpoints)
+    // A receiver may select a batch smaller than the profile maximum. One
+    // cumulative checkpoint per admitted extent is the bounded worst case.
+    let control = usize::try_from(extents)
         .ok()
         .and_then(|count| count.checked_mul(192))
         .and_then(|value| value.checked_add(8192))
@@ -624,6 +625,17 @@ pub(crate) fn encode_composite_data_record(
     protected_header: &[u8],
     body: Vec<u8>,
 ) -> Result<Vec<u8>, StreamError> {
+    let mut output = encode_composite_data_prefix(protected_header)?;
+    output
+        .try_reserve(body.len())
+        .map_err(|_| StreamError::invalid("composite data record length overflow"))?;
+    output.extend_from_slice(&body);
+    Ok(output)
+}
+
+pub(crate) fn encode_composite_data_prefix(
+    protected_header: &[u8],
+) -> Result<Vec<u8>, StreamError> {
     if protected_header.is_empty()
         || protected_header.len() > MAX_PROTECTED_STREAM_DATA_HEADER_BYTES
     {
@@ -635,13 +647,11 @@ pub(crate) fn encode_composite_data_record(
         .map_err(|_| StreamError::invalid("protected data header length exceeds wire field"))?;
     let capacity = 8_usize
         .checked_add(protected_header.len())
-        .and_then(|length| length.checked_add(body.len()))
         .ok_or_else(|| StreamError::invalid("composite data record length overflow"))?;
     let mut output = Vec::with_capacity(capacity);
     output.extend_from_slice(COMPOSITE_DATA_MAGIC);
     output.extend_from_slice(&protected_len.to_be_bytes());
     output.extend_from_slice(protected_header);
-    output.extend_from_slice(&body);
     Ok(output)
 }
 
@@ -1229,6 +1239,16 @@ pub(crate) fn fuzz_decode(input: &[u8]) {
 mod stream_frame_codec {
     use super::*;
     use sha2::{Digest, Sha256};
+
+    #[test]
+    fn profile5_checkpoint_policy_batches_one_hundred_twenty_eight_mib() {
+        assert_eq!(MAX_STREAM_CHECKPOINT_BATCH_BYTES, 128 * 1_048_576);
+        let total = 8 * 1024 * 1024 * 1024_u64;
+        let extents = total.div_ceil(PROFILE5_EXTENT_BYTES as u64);
+        let (_, control_bytes) = profile5_attempt_bounds(total).expect("attempt bounds");
+        assert!(control_bytes >= usize::try_from(extents).expect("extents") * 192 + 8192);
+    }
+
     fn frames() -> Vec<StreamFrame> {
         let id = [1; 32];
         let n = [2; 32];
