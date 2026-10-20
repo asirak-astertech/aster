@@ -67,12 +67,19 @@ impl BlobConnectService {
             .map_err(|_| resource_exhausted(operation))?;
         let mut writer = BlockingUploadWriter::start(staging, grammar.total_len, permit).await?;
 
-        while let Some(frame) = requests.next().await {
-            let frame = frame.map_err(|_| malformed(operation))?.to_owned_message();
-            let chunk = Zeroizing::new(grammar.accept(frame)?);
-            writer.write(chunk).await?;
+        let receive_result = async {
+            while let Some(frame) = requests.next().await {
+                let frame = frame.map_err(|_| malformed(operation))?.to_owned_message();
+                let chunk = Zeroizing::new(grammar.accept(frame)?);
+                writer.write(chunk).await?;
+            }
+            grammar.finish()
         }
-        grammar.finish()?;
+        .await;
+        if let Err(error) = receive_result {
+            writer.close().await?;
+            return Err(error);
+        }
         let (file, permit) = writer.finish().await?;
         let blobs = self.blobs.clone();
         let result = await_upload_with_permit(permit, async move {
@@ -297,6 +304,13 @@ impl BlockingUploadWriter {
             .await
             .map_err(|_| state_unavailable(PublicOperation::PublishBlob))?;
         Ok(result.into_parts())
+    }
+
+    async fn close(self) -> Result<(), ConnectError> {
+        let Self { commands, task } = self;
+        drop(commands);
+        task.await
+            .map_err(|_| state_unavailable(PublicOperation::PublishBlob))
     }
 }
 
@@ -1065,6 +1079,22 @@ mod tests {
             .try_acquire_owned()
             .expect("writer cleanup releases upload capacity");
         drop(reacquired);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rejected_upload_cleanup_completes_before_capacity_reopens() {
+        let uploads = Arc::new(Semaphore::new(1));
+        let permit = Arc::clone(&uploads).try_acquire_owned().unwrap();
+        let fixture = StagingTestRoot::new();
+        let staging = Arc::new(PinnedStagingDirectory::open(&fixture.0).unwrap());
+        let writer = BlockingUploadWriter::start(staging, 1, permit)
+            .await
+            .unwrap();
+
+        assert!(Arc::clone(&uploads).try_acquire_owned().is_err());
+        writer.close().await.unwrap();
+        assert!(Arc::clone(&uploads).try_acquire_owned().is_ok());
     }
 
     #[cfg(target_os = "linux")]
