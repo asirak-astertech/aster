@@ -64,6 +64,18 @@ chunk. It still proves seven-chunk interruption, bounded buffers, exact resume,
 deduplication, manifest and full-content verification, tail and cross-chunk
 ranges, and tamper rejection without allocating a production-scale fixture.
 
+The selected runtime also retains a local valid-Blob fixture one byte above the
+64 MiB network-admission limit. Run that allocation-heavy boundary explicitly:
+
+```sh
+mise run qualify-local-blob-above-network-limit
+```
+
+Budget two warm minutes, two CPU cores, 1 GiB of available memory, and 1 GiB of
+temporary disk. The test proves that a valid local Blob remains readable while
+network admission rejects its size; it does not transfer the Blob or provide
+throughput, device, or production qualification.
+
 The separate `--campaign scale` benchmark runs real 100 MiB cases for both
 provided variants. Allow the per-run 300-second receive bound plus the runner's
 outer allowance, at least 4 GiB of memory, and enough scratch/output capacity

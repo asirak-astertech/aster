@@ -354,6 +354,7 @@ jobs:
           else
             printf '## Rust test timing — partition %s/2\n\nNo JUnit report was produced.\n' \
               "${{ matrix.partition }}" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
           fi
 
       - name: Retain raw Rust test timing
@@ -362,7 +363,7 @@ jobs:
         with:
           name: rust-test-timing-${{ matrix.partition }}-${{ github.sha }}
           path: target/nextest/ci/junit.xml
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 14
 
       - name: Run complete workspace doctests offline

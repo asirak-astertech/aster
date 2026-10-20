@@ -168,7 +168,7 @@ class RustTimingLaneTests(unittest.TestCase):
         )
         self.assertEqual(ping_pong.count("test(="), 2)
 
-    def test_documented_ci_slices_and_blob_qualification_match_required_selection(self):
+    def test_documented_ci_slices_and_scale_qualifications_match_required_selection(self):
         config = MISE_CONFIG.read_text(encoding="utf-8")
 
         for partition in (1, 2):
@@ -183,7 +183,26 @@ class RustTimingLaneTests(unittest.TestCase):
         self.assertIn("sh tools/with-test-resources.sh cargo nextest run", blob)
         self.assertIn("--locked -p aster-core --all-features", blob)
         self.assertIn("--run-ignored ignored-only", blob)
-        self.assertIn("test(qualify_generated_100mb_blob_pipeline)", blob)
+        self.assertIn(
+            "test(=blob::tests::qualify_generated_100mb_blob_pipeline)", blob
+        )
+
+        for task_name, test_name in (
+            (
+                "qualify-local-blob-above-network-limit",
+                "runtime::tests::qualify_valid_local_blob_above_network_limit",
+            ),
+            (
+                "qualify-near-two-mib-events",
+                "runtime::tests::qualify_current_stack_near_two_mib_events_each_direction",
+            ),
+        ):
+            task = mise_task(config, task_name)
+            self.assertIn("sh tools/with-test-resources.sh cargo nextest run", task)
+            self.assertIn("--locked -p aster-node --all-features --lib", task)
+            self.assertIn("--run-ignored ignored-only", task)
+            self.assertIn("--test-threads 1", task)
+            self.assertIn(f"-E 'test(={test_name})'", task)
 
     def test_partition_lane_retains_raw_timings_and_publishes_slowest_tests(self):
         workflow = CI_WORKFLOW.read_text(encoding="utf-8")
@@ -194,11 +213,14 @@ class RustTimingLaneTests(unittest.TestCase):
         self.assertIn("$GITHUB_STEP_SUMMARY", lane)
         self.assertIn("--problem-seconds 10", lane)
         self.assertIn("--github-annotations", lane)
+        self.assertIn("No JUnit report was produced", lane)
+        self.assertIn("exit 1", lane)
         self.assertIn(
             "uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9",
             lane,
         )
         self.assertIn("target/nextest/ci/junit.xml", lane)
+        self.assertIn("if-no-files-found: error", lane)
         self.assertIn("retention-days: 14", lane)
 
     def test_ci_profile_emits_bounded_junit_without_success_output(self):

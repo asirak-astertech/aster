@@ -35,7 +35,7 @@ does not have the pinned `cargo-nextest` shim installed locally.
 | Baseline identity or replacement set | Retained baseline | Focused current result |
 | --- | ---: | ---: |
 | Interrupted Event page | 88.735s | 3.28s |
-| State/Record mutable convergence replacements | 34.937s | 7.33s combined |
+| State/Record mutable convergence replacements | 34.937s | Serial pair 10.58s and 13.81s repeat; State 6.05s/6.04s, Record 4.52s/7.78s |
 | Oversized Blob pre-authentication rejection | 49.023s | 1.45s |
 | Six mutable Blob directions | 10.487s | 5.89s |
 | Blob reopen/complement | 10.415s | 7.03s |
@@ -57,6 +57,15 @@ The three full mesh demonstrations remain explicit qualifications and passed
 locally with their original assertions: two-node Ping/Pong in 19.32s,
 four-node Ping/Pong in 37.83s, and the control topology in 62.85s. They are
 ignored by default and therefore are not duration problems in required CI.
+
+The mutable live-path replacements deliberately retain production
+`RunningNode` scheduling, application handles, authenticated contact receipts,
+resolution propagation, and restart checks. Authenticated local fixture seeding
+removes redundant network setup, and each live proof uses one bounded
+two-worker Tokio runtime so the two carrier endpoints and hybrid-PQ work do not
+serialize on one executor thread. The timing reporter must still tag any hosted
+observation above 10 seconds; such observations are visible optimization
+problems, not allowlisted exceptions or gates.
 
 ### Pending hosted measurement
 
@@ -92,7 +101,7 @@ they do not claim that later tasks are already complete.
 | 1 | `aster-core::runtime::tests::active_two_way_sync_converges_across_root_offer_boundary` (84.144) | Authentication, convergence in both directions, exact ingested sets, bounded requests, and empty terminal wants below/at/above the offer boundary. | Split counts 3, 4, and 5 around an injected offer limit of 4; independently assert the production limit remains 256. | None; the boundary is preserved with a smaller fixture. | [ ] Pending hosted verification |
 | 1 | `aster-node::mesh_cli::four_real_processes_propagate_controls_without_authority_and_exclude_captured_leaf` (63.805) | Four-process wiring, control propagation, authority exclusion, captured-leaf exclusion, and clean shutdown. | A minimal real-process wiring smoke retains process/readiness/shutdown behavior; deterministic in-process tests retain topology and authorization assertions. | Keep the full four-process scenario as an ignored, explicitly selected qualification test. | [ ] Pending hosted verification |
 | 1 | `aster-node::runtime::tests::finite_blob_lifetime_loss_is_ordinary_at_every_carrier_boundary` (47.518) | Every carrier-boundary expiry outcome is ordinary, with correct prefix/cursor/settlement state and cleanup. | Split each boundary into an independent named test using the minimum multi-chunk Blob and shared setup/assertion helpers. | None. | [ ] Pending hosted verification |
-| 1 | `aster-node::runtime::tests::live_mutable_handles_converge_disconnected_state_and_record_then_resolve` (34.937) | Disconnected publication, State convergence, Record conflict visibility, guarded resolution, and stable terminal state. | Split State and Record phases into focused tests with minimum values and no repeated topology setup. | None. | [ ] Pending hosted verification |
+| 1 | `aster-node::runtime::tests::live_mutable_handles_converge_disconnected_state_and_record_then_resolve` (34.937) | Disconnected publication, State convergence, Record conflict visibility, guarded resolution, and stable terminal state. | Split State and Record phases into focused tests; seed authenticated local conflicts without transport; retain one real direct `RunningNode` contact per class, exact path receipts, resolution propagation, and restart checks on a bounded two-worker runtime. | None. | [ ] Pending hosted verification |
 | 1 | `aster-node::runtime::tests::v8_blob_protected_contact_rejection_matrix_is_receiver_state_neutral` (32.869) | Every protected-contact rejection reason fails closed and leaves receiver store, staging, cursors, and settlement neutral. | One independently scheduled test per rejection case through a shared assertion helper and minimum Blob fixture. | None. | [ ] Pending hosted verification |
 | 1 | `aster-node::mesh_cli::two_real_processes_use_the_same_stopped_state_ping_pong_plan` (21.834) | Two-process plan, readiness, exact ping-pong transfer, stopped state, and cleanup. | Minimal two-process wiring smoke ending on exact durable receipts rather than elapsed time. | Keep the complete operator-facing scenario as an ignored qualification test if it exceeds the target. | [ ] Pending hosted verification |
 | 1 | `aster-node::runtime::tests::blob_wrong_settlement_matrix_uses_real_claims_and_production_handlers` (19.294) | Each wrong settlement is rejected through real claims and production handlers without corrupting prefix, cursor, or terminal state. | Split matrix rows into independent named cases sharing immutable fixtures and minimum payloads. | None. | [ ] Pending hosted verification |

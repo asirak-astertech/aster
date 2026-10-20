@@ -1771,14 +1771,25 @@ The dependency-exception scope gate now requires only the retained safe
 The unrelated age advisory disposition, exact license exceptions, and netlink
 patch remain unchanged.
 
-Current-stack regressions in `aster-node::runtime::tests` exercise production
-mission-authenticated contacts over persistent direct-loopback Iroh endpoints:
-`current_stack_near_two_mib_events_each_direction` sends two Events each way,
-each with `MAX_OBJECT_BYTES - 11 * 1024` plaintext bytes. The measured envelope
-overhead is checked to be above 10 KiB and at most 11 KiB; every sealed Event
-must fit the existing object bound. Exact source bytes and authenticated
-plaintext are checked at the receiver. This is near-two-MiB payload volume per
-direction, not two exact one-MiB plaintext Events or throughput evidence.
+Current-stack regressions in `aster-node::runtime::tests` separate default
+serialization coverage from scale qualification. The default
+`current_stack_near_two_mib_events_each_direction` test checks the exact
+current-stack envelope boundary without a network transfer. The ignored
+`qualify_current_stack_near_two_mib_events_each_direction` test uses production
+mission-authenticated contacts over persistent direct-loopback Iroh endpoints
+and sends two Events each way, each with `MAX_OBJECT_BYTES - 11 * 1024`
+plaintext bytes. Run it explicitly with:
+
+```sh
+mise run qualify-near-two-mib-events
+```
+
+Budget two warm minutes, two CPU cores, 1 GiB of available memory, and 1 GiB of
+temporary disk. The measured envelope overhead is checked to be above 10 KiB
+and at most 11 KiB; every sealed Event must fit the existing object bound.
+Exact source bytes and authenticated plaintext are checked at the receiver.
+This is near-two-MiB payload volume per direction, not two exact one-MiB
+plaintext Events, throughput evidence, or device qualification.
 `current_stack_exact_64_kib_event_after_fresh_auth_reconnect` completes and
 closes a contact, retains both endpoint identities and addresses, rejects a
 fresh contact with the wrong expected mission identity without insertion, then

@@ -44128,6 +44128,15 @@ mod tests {
         scope: Scope,
     }
 
+    #[derive(Clone, Copy)]
+    enum MutableFixtureSide {
+        Left,
+        Right,
+    }
+
+    const LIVE_MUTABLE_CONVERGENCE_STALL: Duration = Duration::from_secs(15);
+    const LIVE_MUTABLE_CONVERGENCE_CAP: Duration = Duration::from_secs(20);
+
     impl LiveMutableConvergenceFixture {
         fn new(label: &str) -> Self {
             let root = root(label);
@@ -44153,32 +44162,23 @@ mod tests {
             }
         }
 
-        async fn start_disconnected(&self) -> (RunningNode, RunningNode) {
-            let left = start_node(NodeConfig {
-                state: self.left_state.clone(),
+        async fn start_peerless(&self, side: MutableFixtureSide) -> RunningNode {
+            let (state, mission) = match side {
+                MutableFixtureSide::Left => (&self.left_state, &self.left_mission),
+                MutableFixtureSide::Right => (&self.right_state, &self.right_mission),
+            };
+            start_node(NodeConfig {
+                state: state.clone(),
                 bind: SocketAddr::from(([127, 0, 0, 1], 0)),
-                mission: self.left_mission.credentials.clone(),
+                mission: mission.credentials.clone(),
                 peers: Vec::new(),
                 mutable_interests: Default::default(),
                 sync_interval: Duration::from_millis(10),
                 run_for: None,
                 application: NodeApplication::Relay,
-            });
-            let right = start_node(NodeConfig {
-                state: self.right_state.clone(),
-                bind: SocketAddr::from(([127, 0, 0, 1], 0)),
-                mission: self.right_mission.credentials.clone(),
-                peers: Vec::new(),
-                mutable_interests: Default::default(),
-                sync_interval: Duration::from_millis(10),
-                run_for: None,
-                application: NodeApplication::Relay,
-            });
-            let (left, right) = tokio::join!(left, right);
-            (
-                left.expect("start disconnected left node"),
-                right.expect("start disconnected right node"),
-            )
+            })
+            .await
+            .expect("start peerless mutable convergence node")
         }
 
         fn state_interests(&self) -> MutableSourceInterests {
@@ -44203,42 +44203,243 @@ mod tests {
             )
         }
 
-        async fn contact(&self, interests: MutableSourceInterests) -> (PeerReceipt, PeerReceipt) {
-            let authority = self.left_mission.credentials.mission_authority_id();
-            let left = Arc::new(
-                Store::open_for_mission(self.left_state.join(STORE_FILE), authority)
-                    .expect("open left mutable convergence store"),
-            );
-            let right = Arc::new(
-                Store::open_for_mission(self.right_state.join(STORE_FILE), authority)
-                    .expect("open right mutable convergence store"),
-            );
-            let (client, server, _, _) = blob_contact_test_pair(
-                left.clone(),
-                self.left_mission.credentials.clone(),
-                interests.clone(),
-                right.clone(),
-                self.right_mission.credentials.clone(),
-                interests,
-            )
-            .await;
-            drop((left, right));
-            assert_eq!(client.semantic_version, SEMANTIC_PROTOCOL_V8);
-            assert_eq!(server.semantic_version, SEMANTIC_PROTOCOL_V8);
-            assert!(client.offered + client.fetched > 0);
-            assert!(server.offered + server.fetched > 0);
-            (client, server)
+        fn seed_disconnected_state_siblings(
+            &self,
+            state_key: &[u8],
+        ) -> (
+            crate::application::StatePublishResult,
+            crate::application::StatePublishResult,
+        ) {
+            use crate::application::StatePublishRequest;
+
+            let mut left = reopened_state_node(&self.left_state, &self.left_mission.credentials);
+            let mut right = reopened_state_node(&self.right_state, &self.right_mission.credentials);
+            let left_publication = left
+                .publish(StatePublishRequest {
+                    operation_key: b"left-disconnected-state".to_vec(),
+                    topic: self.topic.clone(),
+                    scope: self.scope.clone(),
+                    priority: Priority::Priority,
+                    logical_key: state_key.to_vec(),
+                    payload: b"left State".to_vec(),
+                    tombstone: false,
+                })
+                .expect("seed left disconnected State");
+            let right_publication = right
+                .publish(StatePublishRequest {
+                    operation_key: b"right-disconnected-state".to_vec(),
+                    topic: self.topic.clone(),
+                    scope: self.scope.clone(),
+                    priority: Priority::Priority,
+                    logical_key: state_key.to_vec(),
+                    payload: b"right State".to_vec(),
+                    tombstone: false,
+                })
+                .expect("seed right disconnected State");
+            assert_ne!(left_publication.id, right_publication.id);
+            (left_publication, right_publication)
         }
 
-        fn cleanup(self) {
-            fs::remove_dir_all(self.root).expect("cleanup live mutable convergence state");
+        fn seed_disconnected_record_siblings(
+            &self,
+            record_key: &[u8],
+        ) -> (
+            crate::application::RecordPublishResult,
+            crate::application::RecordPublishResult,
+        ) {
+            use crate::application::RecordPublishRequest;
+
+            let mut left = reopened_record_node(&self.left_state, &self.left_mission.credentials);
+            let mut right =
+                reopened_record_node(&self.right_state, &self.right_mission.credentials);
+            let left_publication = left
+                .publish(RecordPublishRequest {
+                    operation_key: b"left-disconnected-record".to_vec(),
+                    topic: self.topic.clone(),
+                    scope: self.scope.clone(),
+                    priority: Priority::Priority,
+                    logical_key: record_key.to_vec(),
+                    payload: b"left Record".to_vec(),
+                    tombstone: false,
+                })
+                .expect("seed left disconnected Record");
+            let right_publication = right
+                .publish(RecordPublishRequest {
+                    operation_key: b"right-disconnected-record".to_vec(),
+                    topic: self.topic.clone(),
+                    scope: self.scope.clone(),
+                    priority: Priority::Priority,
+                    logical_key: record_key.to_vec(),
+                    payload: b"right Record".to_vec(),
+                    tombstone: false,
+                })
+                .expect("seed right disconnected Record");
+            assert_ne!(left_publication.id, right_publication.id);
+            drop((left, right));
+            self.copy_record_source(
+                &self.left_state,
+                left_publication.id,
+                &self.right_state,
+                &self.right_mission.credentials,
+            );
+            self.copy_record_source(
+                &self.right_state,
+                right_publication.id,
+                &self.left_state,
+                &self.left_mission.credentials,
+            );
+            (left_publication, right_publication)
+        }
+
+        fn copy_record_source(
+            &self,
+            source_state: &Path,
+            source: crate::application::RecordId,
+            destination_state: &Path,
+            destination_mission: &UnprotectedReferenceMission,
+        ) {
+            let authority = destination_mission.mission_authority_id();
+            let source_store = Store::open_for_mission(source_state.join(STORE_FILE), authority)
+                .expect("open Record conflict source store");
+            let sealed = source_store
+                .record_by_semantic_id(aster_redb_store::RecordSemanticId::new(*source.as_bytes()))
+                .expect("read Record conflict source")
+                .expect("retained Record conflict source")
+                .sealed;
+            drop(source_store);
+
+            let destination_store =
+                Store::open_for_mission(destination_state.join(STORE_FILE), authority)
+                    .expect("open Record conflict destination store");
+            let policy = destination_store
+                .control_policy_snapshot()
+                .expect("Record conflict destination policy");
+            let mut verifier = ReferenceEnvelopeSealer::open(
+                destination_mission
+                    .fresh_bundle()
+                    .expect("fresh Record conflict destination mission"),
+            )
+            .expect("open Record conflict destination verifier");
+            let route = verifier
+                .verify_record(&sealed)
+                .expect("verify copied Record route");
+            let record = match verifier
+                .verify_record_content(route, &sealed)
+                .expect("verify copied Record content")
+            {
+                RecordContentVerification::ContentVerified { record, .. } => record,
+                RecordContentVerification::RouteOnly(_) => {
+                    panic!("Record conflict destination has content access")
+                }
+            };
+            assert!(
+                destination_store
+                    .apply_verified_record_with_policy(&policy, &record, &sealed)
+                    .expect("apply copied Record source")
+                    .inserted()
+            );
+        }
+
+        fn carrier_ids(&self) -> (aster_iroh::EndpointId, aster_iroh::EndpointId) {
+            let left = NodeIdentity::load_or_create(&self.left_state)
+                .expect("left mutable convergence carrier")
+                .id();
+            let right = NodeIdentity::load_or_create(&self.right_state)
+                .expect("right mutable convergence carrier")
+                .id();
+            (left, right)
+        }
+
+        fn reopen_record(&self, side: MutableFixtureSide) -> SelectedRecordNode {
+            match side {
+                MutableFixtureSide::Left => {
+                    reopened_record_node(&self.left_state, &self.left_mission.credentials)
+                }
+                MutableFixtureSide::Right => {
+                    reopened_record_node(&self.right_state, &self.right_mission.credentials)
+                }
+            }
+        }
+
+        async fn start_connected(
+            &self,
+            interests: MutableSourceInterests,
+        ) -> (RunningNode, RunningNode) {
+            let (left_carrier, right_carrier) = self.carrier_ids();
+            let placeholder = SocketAddr::from(([127, 0, 0, 1], 0));
+            let left = NodeConfig {
+                state: self.left_state.clone(),
+                bind: placeholder,
+                mission: self.left_mission.credentials.clone(),
+                peers: vec![MissionExpectedPeer {
+                    carrier: ExpectedPeer {
+                        id: right_carrier,
+                        address: placeholder,
+                    },
+                    mission: self.right_mission.identity,
+                }],
+                mutable_interests: interests.clone(),
+                sync_interval: Duration::from_millis(20),
+                run_for: None,
+                application: NodeApplication::Relay,
+            };
+            let right = NodeConfig {
+                state: self.right_state.clone(),
+                bind: placeholder,
+                mission: self.right_mission.credentials.clone(),
+                peers: vec![MissionExpectedPeer {
+                    carrier: ExpectedPeer {
+                        id: left_carrier,
+                        address: placeholder,
+                    },
+                    mission: self.left_mission.identity,
+                }],
+                mutable_interests: interests,
+                sync_interval: Duration::from_millis(20),
+                run_for: None,
+                application: NodeApplication::Relay,
+            };
+            start_test_pair(left, right, left_carrier, right_carrier).await
         }
     }
 
-    async fn assert_peerless_mutable_shutdown(left: RunningNode, right: RunningNode) {
-        let (left, right) = tokio::join!(left.shutdown(), right.shutdown());
-        assert_eq!(left.expect("left peerless shutdown").contacts, 0);
-        assert_eq!(right.expect("right peerless shutdown").contacts, 0);
+    impl Drop for LiveMutableConvergenceFixture {
+        fn drop(&mut self) {
+            if let Err(error) = fs::remove_dir_all(&self.root) {
+                if error.kind() == std::io::ErrorKind::NotFound || std::thread::panicking() {
+                    return;
+                }
+                panic!("cleanup live mutable convergence state: {error}");
+            }
+        }
+    }
+
+    async fn assert_healthy_live_contacts(
+        events: &crate::application::SelectedEventHandle,
+        minimum: u64,
+        label: &str,
+    ) {
+        wait_for_authenticated_contacts(events, minimum, label).await;
+        let status = events.status().await.expect("live contact status");
+        assert_eq!(
+            status.failed_contact_attempts, 0,
+            "{label} recorded a failed contact"
+        );
+    }
+
+    fn assert_direct_contact_receipt(receipt: Result<NodeReceipt, NodeError>, label: &str) {
+        let receipt = receipt.unwrap_or_else(|error| panic!("{label} shutdown failed: {error}"));
+        assert!(receipt.contacts > 0, "{label} observed no contacts");
+        assert_eq!(receipt.contact_errors, 0, "{label} contact errors");
+        assert_eq!(
+            receipt.direct_contacts, receipt.contacts,
+            "{label} did not use only direct transport"
+        );
+        assert_eq!(receipt.relay_contacts, 0, "{label} used relay transport");
+        assert_eq!(
+            receipt.unknown_path_contacts, 0,
+            "{label} recorded an unknown transport path"
+        );
     }
 
     fn reopened_state_node(
@@ -44293,61 +44494,85 @@ mod tests {
         )
     }
 
-    #[tokio::test]
-    async fn live_mutable_handles_converge_disconnected_state_and_record_then_resolve() {
-        use crate::application::{StatePublishRequest, StateQuery, StateVersionDisposition};
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_mutable_handles_converge_disconnected_state_and_restart() {
+        use crate::application::{
+            ApplicationErrorKind, StateProjection, StateQuery, StateVersionDisposition,
+        };
 
         let fixture = LiveMutableConvergenceFixture::new("live-state-disconnected-convergence");
         let state_key = b"disconnected-state".to_vec();
-        let (left_offline, right_offline) = fixture.start_disconnected().await;
-        let left_publication = left_offline
-            .selected_state()
-            .publish(StatePublishRequest {
-                operation_key: b"left-disconnected-state".to_vec(),
-                topic: fixture.topic.clone(),
-                scope: fixture.scope.clone(),
-                priority: Priority::Priority,
-                logical_key: state_key.clone(),
-                payload: b"left State".to_vec(),
-                tombstone: false,
-            })
-            .await
-            .expect("publish left disconnected State");
-        let right_publication = right_offline
-            .selected_state()
-            .publish(StatePublishRequest {
-                operation_key: b"right-disconnected-state".to_vec(),
-                topic: fixture.topic.clone(),
-                scope: fixture.scope.clone(),
-                priority: Priority::Priority,
-                logical_key: state_key.clone(),
-                payload: b"right State".to_vec(),
-                tombstone: false,
-            })
-            .await
-            .expect("publish right disconnected State");
-        assert_ne!(left_publication.id, right_publication.id);
+        let (left_publication, right_publication) =
+            fixture.seed_disconnected_state_siblings(&state_key);
         let expected_current = left_publication.id.max(right_publication.id);
         let expected_concurrent = left_publication.id.min(right_publication.id);
-        assert_peerless_mutable_shutdown(left_offline, right_offline).await;
 
-        fixture.contact(fixture.state_interests()).await;
         let query = StateQuery {
             topic: fixture.topic.clone(),
             scope: fixture.scope.clone(),
             logical_key: state_key,
             include_recoverable_versions: true,
         };
-        let mut left = reopened_state_node(&fixture.left_state, &fixture.left_mission.credentials);
-        let mut right =
-            reopened_state_node(&fixture.right_state, &fixture.right_mission.credentials);
-        for projection in [
-            left.query(query.clone())
-                .expect("left converged State after contact"),
-            right
-                .query(query)
-                .expect("right converged State after contact"),
-        ] {
+        let (left, right) = fixture.start_connected(fixture.state_interests()).await;
+        let left_state = left.selected_state();
+        let right_state = right.selected_state();
+        let (left_projection, right_projection) = convergence_test::wait(
+            "live State convergence",
+            LIVE_MUTABLE_CONVERGENCE_STALL,
+            LIVE_MUTABLE_CONVERGENCE_CAP,
+            || async {
+                let left_projection = match left_state.query(query.clone()).await {
+                    Ok(projection) => Some(projection),
+                    Err(error) if error.kind() == ApplicationErrorKind::PolicyUnsettled => None,
+                    Err(error) => panic!("live left State query: {error}"),
+                };
+                let right_projection = match right_state.query(query.clone()).await {
+                    Ok(projection) => Some(projection),
+                    Err(error) if error.kind() == ApplicationErrorKind::PolicyUnsettled => None,
+                    Err(error) => panic!("live right State query: {error}"),
+                };
+                let (Some(left_projection), Some(right_projection)) =
+                    (left_projection, right_projection)
+                else {
+                    return (
+                        [false; 4],
+                        None,
+                        "startup policy is not settled on both nodes".to_owned(),
+                    );
+                };
+                let contains = |projection: &StateProjection, id| {
+                    projection
+                        .current
+                        .iter()
+                        .chain(&projection.recoverable)
+                        .any(|item| item.id == id)
+                };
+                let milestones = [
+                    contains(&left_projection, left_publication.id),
+                    contains(&left_projection, right_publication.id),
+                    contains(&right_projection, left_publication.id),
+                    contains(&right_projection, right_publication.id),
+                ];
+                let exact = |projection: &StateProjection| {
+                    projection
+                        .current
+                        .as_ref()
+                        .is_some_and(|item| item.id == expected_current)
+                        && projection.recoverable.len() == 1
+                        && projection.recoverable[0].id == expected_concurrent
+                };
+                (
+                    milestones,
+                    (exact(&left_projection) && exact(&right_projection))
+                        .then_some((left_projection, right_projection)),
+                    format!("versions={milestones:?}"),
+                )
+            },
+        )
+        .await;
+        assert_healthy_live_contacts(&left.selected_events(), 1, "left State convergence").await;
+        assert_healthy_live_contacts(&right.selected_events(), 1, "right State convergence").await;
+        for projection in [left_projection, right_projection] {
             let current = projection.current.expect("current State after contact");
             assert_eq!(current.id, expected_current);
             assert_eq!(current.disposition, StateVersionDisposition::Current);
@@ -44358,94 +44583,84 @@ mod tests {
                 StateVersionDisposition::Concurrent
             );
         }
-        drop((left, right));
-        fixture.cleanup();
+        let (left_receipt, right_receipt) = tokio::join!(left.shutdown(), right.shutdown());
+        assert_direct_contact_receipt(left_receipt, "left State convergence");
+        assert_direct_contact_receipt(right_receipt, "right State convergence");
+
+        let reopened = fixture.start_peerless(MutableFixtureSide::Right).await;
+        let projection = reopened
+            .selected_state()
+            .query(query)
+            .await
+            .expect("right converged State after restart");
+        assert_eq!(
+            projection.current.expect("current State after restart").id,
+            expected_current
+        );
+        assert_eq!(projection.recoverable.len(), 1);
+        assert_eq!(projection.recoverable[0].id, expected_concurrent);
+        assert_eq!(
+            reopened
+                .shutdown()
+                .await
+                .expect("State restart shutdown")
+                .contacts,
+            0
+        );
     }
 
-    #[tokio::test]
-    async fn live_mutable_handles_converge_disconnected_record_then_resolve() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_mutable_handles_resolve_propagate_and_restart_record() {
         use crate::application::{
-            ApplicationErrorKind, RecordPublishRequest, RecordQuery, RecordResolveRequest,
+            ApplicationErrorKind, RecordProjection, RecordQuery, RecordResolveRequest,
             RecordVersionDisposition,
         };
 
-        let fixture = LiveMutableConvergenceFixture::new("live-record-disconnected-convergence");
-        let record_key = b"disconnected-record".to_vec();
-        let (left_offline, right_offline) = fixture.start_disconnected().await;
-        let left_publication = left_offline
-            .selected_records()
-            .publish(RecordPublishRequest {
-                operation_key: b"left-disconnected-record".to_vec(),
-                topic: fixture.topic.clone(),
-                scope: fixture.scope.clone(),
-                priority: Priority::Priority,
-                logical_key: record_key.clone(),
-                payload: b"left Record".to_vec(),
-                tombstone: false,
-            })
-            .await
-            .expect("publish left disconnected Record");
-        let right_publication = right_offline
-            .selected_records()
-            .publish(RecordPublishRequest {
-                operation_key: b"right-disconnected-record".to_vec(),
-                topic: fixture.topic.clone(),
-                scope: fixture.scope.clone(),
-                priority: Priority::Priority,
-                logical_key: record_key.clone(),
-                payload: b"right Record".to_vec(),
-                tombstone: false,
-            })
-            .await
-            .expect("publish right disconnected Record");
-        assert_ne!(left_publication.id, right_publication.id);
-        assert_peerless_mutable_shutdown(left_offline, right_offline).await;
-
-        let interests = fixture.record_interests();
-        fixture.contact(interests.clone()).await;
+        let fixture = LiveMutableConvergenceFixture::new("live-record-resolution-propagation");
+        let record_key = b"resolved-record-propagation".to_vec();
+        let (left_publication, right_publication) =
+            fixture.seed_disconnected_record_siblings(&record_key);
+        let expected_siblings = vec![left_publication.id, right_publication.id]
+            .into_iter()
+            .collect::<BTreeSet<_>>();
         let query = RecordQuery {
             topic: fixture.topic.clone(),
             scope: fixture.scope.clone(),
             logical_key: record_key,
             include_superseded_versions: true,
         };
-        let mut left = reopened_record_node(&fixture.left_state, &fixture.left_mission.credentials);
-        let mut right =
-            reopened_record_node(&fixture.right_state, &fixture.right_mission.credentials);
-        let left_conflict = left
+        let (left_carrier, right_carrier) = fixture.carrier_ids();
+        let resolver_is_left = left_carrier < right_carrier;
+        let resolver_side = if resolver_is_left {
+            MutableFixtureSide::Left
+        } else {
+            MutableFixtureSide::Right
+        };
+        let destination_side = if resolver_is_left {
+            MutableFixtureSide::Right
+        } else {
+            MutableFixtureSide::Left
+        };
+
+        let mut resolver = fixture.reopen_record(resolver_side);
+        let conflict = resolver
             .query(query.clone())
-            .expect("left Record conflict after contact");
-        let right_conflict = right
-            .query(query.clone())
-            .expect("right Record conflict after contact");
-        let expected_siblings = vec![left_publication.id, right_publication.id]
-            .into_iter()
-            .collect::<BTreeSet<_>>();
+            .expect("query seeded Record conflict")
+            .conflict
+            .expect("seeded Record conflict");
         assert_eq!(
-            left_conflict
-                .conflict
-                .as_ref()
-                .expect("left conflict")
-                .siblings
-                .iter()
-                .copied()
-                .collect::<BTreeSet<_>>(),
+            conflict.siblings.iter().copied().collect::<BTreeSet<_>>(),
             expected_siblings
         );
-        assert_eq!(
-            right_conflict
-                .conflict
-                .as_ref()
-                .expect("right conflict")
-                .siblings,
-            left_conflict
-                .conflict
-                .as_ref()
-                .expect("left conflict")
-                .siblings
-        );
-        let rejected = left
-            .publish(RecordPublishRequest {
+        let resolution = RecordResolveRequest {
+            operation_key: b"propagate-resolved-record".to_vec(),
+            resolution_guard: conflict.resolution_guard,
+            priority: Priority::Immediate,
+            payload: b"propagated resolved Record".to_vec(),
+            tombstone: false,
+        };
+        let rejected = resolver
+            .publish(crate::application::RecordPublishRequest {
                 operation_key: b"ordinary-publish-cannot-hide-conflict".to_vec(),
                 topic: query.topic.clone(),
                 scope: query.scope.clone(),
@@ -44457,39 +44672,85 @@ mod tests {
             .expect_err("ordinary Record publication must not hide a conflict");
         assert_eq!(rejected.kind(), ApplicationErrorKind::Conflict);
         assert_eq!(rejected.operation(), "record publish");
-
-        let resolution = RecordResolveRequest {
-            operation_key: b"resolve-disconnected-record".to_vec(),
-            resolution_guard: left_conflict
-                .conflict
-                .expect("left resolution guard")
-                .resolution_guard,
-            priority: Priority::Immediate,
-            payload: b"resolved Record".to_vec(),
-            tombstone: false,
-        };
-        let resolved = left
+        let resolved = resolver
             .resolve(resolution.clone())
-            .expect("resolve disconnected Record conflict");
+            .expect("resolve seeded Record");
         assert!(resolved.inserted);
-        let retry = left
+        let exact_retry = resolver
             .resolve(resolution.clone())
-            .expect("retry exact disconnected Record resolution");
-        assert!(!retry.inserted);
-        assert_eq!(retry.id, resolved.id);
-        drop((left, right));
+            .expect("retry exact Record resolution");
+        assert!(!exact_retry.inserted);
+        assert_eq!(exact_retry.id, resolved.id);
+        drop(resolver);
 
-        fixture.contact(interests).await;
-        let mut left = reopened_record_node(&fixture.left_state, &fixture.left_mission.credentials);
-        let mut right =
-            reopened_record_node(&fixture.right_state, &fixture.right_mission.credentials);
-        for projection in [
-            left.query(query.clone())
-                .expect("left resolved Record after contact"),
-            right
-                .query(query)
-                .expect("right resolved Record after contact"),
-        ] {
+        let (left, right) = fixture.start_connected(fixture.record_interests()).await;
+        let left_records = left.selected_records();
+        let right_records = right.selected_records();
+        let (left_projection, right_projection) = convergence_test::wait(
+            "live resolved Record propagation",
+            LIVE_MUTABLE_CONVERGENCE_STALL,
+            LIVE_MUTABLE_CONVERGENCE_CAP,
+            || async {
+                // Live ingestion can invalidate the exact Record plan between
+                // prepare and recheck; the selected API reports that race as
+                // Conflict. The bounded convergence probe retries only that
+                // race and startup policy settlement.
+                let left_projection = match left_records.query(query.clone()).await {
+                    Ok(projection) => Some(projection),
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            ApplicationErrorKind::PolicyUnsettled | ApplicationErrorKind::Conflict
+                        ) =>
+                    {
+                        None
+                    }
+                    Err(error) => panic!("live left resolved Record query: {error}"),
+                };
+                let right_projection = match right_records.query(query.clone()).await {
+                    Ok(projection) => Some(projection),
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            ApplicationErrorKind::PolicyUnsettled | ApplicationErrorKind::Conflict
+                        ) =>
+                    {
+                        None
+                    }
+                    Err(error) => panic!("live right resolved Record query: {error}"),
+                };
+                let (Some(left_projection), Some(right_projection)) =
+                    (left_projection, right_projection)
+                else {
+                    return (
+                        [false; 2],
+                        None,
+                        "live Record projection changed or startup policy is unsettled".to_owned(),
+                    );
+                };
+                let exact = |projection: &RecordProjection| {
+                    projection
+                        .current
+                        .as_ref()
+                        .is_some_and(|item| item.id == resolved.id)
+                        && projection.conflict.is_none()
+                        && projection.superseded.len() == 2
+                };
+                let milestones = [exact(&left_projection), exact(&right_projection)];
+                (
+                    milestones,
+                    milestones
+                        .into_iter()
+                        .all(|complete| complete)
+                        .then_some((left_projection, right_projection)),
+                    format!("resolved={milestones:?}"),
+                )
+            },
+        )
+        .await;
+        assert_healthy_live_contacts(&left.selected_events(), 1, "left Record resolution").await;
+        assert_healthy_live_contacts(&right.selected_events(), 1, "right Record resolution").await;
+        for projection in [left_projection, right_projection] {
             assert_eq!(
                 projection
                     .current
@@ -44514,14 +44775,33 @@ mod tests {
                 expected_siblings
             );
         }
-        let restarted_retry = left
+        let (left_receipt, right_receipt) = tokio::join!(left.shutdown(), right.shutdown());
+        assert_direct_contact_receipt(left_receipt, "left Record resolution");
+        assert_direct_contact_receipt(right_receipt, "right Record resolution");
+
+        let mut destination = fixture.reopen_record(destination_side);
+        let destination_projection = destination
+            .query(query)
+            .expect("query propagated Record after destination restart");
+        assert_eq!(
+            destination_projection
+                .current
+                .expect("resolved destination current after restart")
+                .id,
+            resolved.id
+        );
+        assert!(destination_projection.conflict.is_none());
+        assert_eq!(destination_projection.superseded.len(), 2);
+        drop(destination);
+        let mut resolver_reopened = fixture.reopen_record(resolver_side);
+        let restarted_retry = resolver_reopened
             .resolve(resolution)
-            .expect("retry exact resolution after restart");
+            .expect("retry exact Record resolution after restart");
         assert!(!restarted_retry.inserted);
         assert_eq!(restarted_retry.id, resolved.id);
-        drop((left, right));
-        fixture.cleanup();
+        drop(resolver_reopened);
     }
+
     fn demo_member_mission() -> UnprotectedReferenceMission {
         let access = ProvisioningAccess::member(
             demo_scope().expect("demo scope"),
