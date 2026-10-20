@@ -785,6 +785,16 @@ mod tests {
     #[cfg(target_os = "linux")]
     static NEXT_STAGING_TEST: AtomicU64 = AtomicU64::new(0);
 
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn platform_compat_blob_staging_fails_closed_without_linux_primitives() {
+        assert!(
+            open_optional_staging(std::path::Path::new("."))
+                .expect("unsupported staging is a bounded capability result")
+                .is_none()
+        );
+    }
+
     #[cfg(target_os = "linux")]
     struct StagingTestRoot(PathBuf);
 

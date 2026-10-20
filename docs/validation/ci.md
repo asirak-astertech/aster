@@ -56,7 +56,7 @@ mandatory-access-control profile. The manual operator procedure is
 | `quality` | `ubuntu-24.04` | Runs the exact-source Python process contract, Rust and Go formatting, Apache-2.0-only project-license and package checks, exact 348-row implementation-requirements traceability, the selected-node dependency boundary, vendored netlink source-equivalence and 13-test compatibility gates, selected live-Event, live-mutable, live-State-subscription, live-Record-subscription, live-Blob, and live-Blob-subscription receipt checker tests, real-process smokes, C ABI build and C/C++ header checks, Rust/Python conformance, Python/Go binding tests, and lab-controller tests. |
 | `Rust Clippy` | `ubuntu-24.04` | Runs locked Clippy for every workspace target and feature, with warnings denied. |
 | `Rust tests (1/2)` and `Rust tests (2/2)` | `ubuntu-24.04` | Run two disjoint nextest partitions covering the complete locked, all-feature Rust workspace suite. Partition 1 also runs all workspace doctests with Cargo. Both start independently of Clippy and use the existing resource wrapper. |
-| `macOS tests` | `macos-14` | Runs all Rust workspace tests on the supported Apple runner with Rust 1.97.1. |
+| `macOS compatibility` | `macos-14` | Compiles and links every all-feature Rust workspace test target, then runs focused macOS/non-Linux custody-clock, finite-TTL, Blob staging/read, and credential-provider contracts. |
 | `Rust 1.91 MSRV` | `ubuntu-24.04` | Checks every workspace target and feature with the declared minimum supported Rust version. |
 | `dependency policy` | `ubuntu-24.04` | Applies `deny.toml` to the root and fuzz dependency graphs, and audits both lockfiles against a freshly downloaded RustSec database. |
 | `age reference interoperability` | `ubuntu-24.04` | Installs exact `govulncheck` v1.6.0, runs `mise run age-reference-audit`, then runs `mise run age-reference-interop`: the Go oracle's reachable vulnerability and compiled-module license gates must pass before exact reference Go `filippo.io/age` v1.3.1 and the Rust provider exchange classic-X25519 artifacts in both directions, compare recovered plaintext, and agree on the recipient. |
@@ -98,6 +98,39 @@ real-process tests cannot overlap each other on the same runner; the nextest
 limit remains two workers per runner. Matrix fail-fast is disabled so a failed
 partition does not cancel the other partition.
 
+The required macOS lane does not repeat the OS-agnostic workspace suite already
+covered by the two Linux partitions. It uses `cargo test --no-run` to retain
+Apple ARM compile and link coverage for every all-feature test target, then
+runs the platform contracts in `tools/test-macos-compatibility.sh`. The complete
+macOS workspace suite remains available in the separate `macOS full suite`
+workflow, which runs weekly and on manual dispatch. That workflow is diagnostic
+and is not part of `CI / required`.
+
+### Test classes and timing evidence
+
+Tests are grouped by the boundary they prove rather than by source-file size:
+
+| Class | Boundary | Required PR lane |
+| --- | --- | --- |
+| Unit | Deterministic behavior inside one Rust component | Linux nextest partitions |
+| Integration | Multiple in-process components or one public binary/API boundary | Linux nextest partitions or `quality` |
+| Real process | Starts child Aster processes, binds sockets, or exercises restart/shutdown | Serialized nextest group or `quality` process smoke |
+| Platform contract | OS-specific compile/link or fail-closed behavior | Focused required macOS lane and applicable Linux tests |
+| Qualification | Validates retained evidence or a named evaluation profile | `quality`; claims remain limited to the named profile |
+| Device/hardware | Exercises physical systems, packaging, networks, or resource brackets | Separate retained validation; never inferred from hosted CI |
+
+The two Linux nextest partitions use the `ci` profile in
+`.config/nextest.toml`. Each partition writes one bounded JUnit report without
+successful-test output, appends its twenty slowest tests to the Actions step
+summary, and retains the raw report for 14 days. Partition reports remain
+separate so skipped tests and repeated identifiers are not merged incorrectly.
+
+This increment does not set hard per-test runtime budgets. Establish a baseline
+from multiple successful hosted runs that includes cold and warm compiler-cache
+states, then use the retained per-test distributions to select regression
+thresholds and rebalance partitions. A single local or hosted duration is not a
+supported performance threshold.
+
 ### CI critical-path profile (2026-09-17)
 
 Recent successful Linux quality jobs took approximately 31--38 minutes. In
@@ -132,7 +165,13 @@ the pinned [mise 2026.4.28](https://github.com/jdx/mise/blob/v2026.4.28/docs/tas
 instead of shell commands invoking mise. A failed step stops the sequence.
 
 Hosted Linux CI runs `mise run check-clippy` alongside two nextest partitions,
-while `quality` runs the foundation and integration segments. Locally,
+while `quality` runs `check-foundation-core` and the integration segment. The
+required `cargo-lockfiles` prerequisite owns the Cargo graph validation in CI;
+the local `check-foundation` aggregate composes `check-lockfiles`,
+`check-foundation-core`, and `check-compose-policy`, so local coverage remains
+complete without repeating the prerequisite in `quality`. CI retains the
+explicit fail-closed Compose policy step required by its release validator;
+those suites are excluded from the foundation core and execute once. Locally,
 `mise run check-workspace-tests` executes the complete suite without
 partitioning and then all doctests.
 The stable `required` job fails unless Clippy, both test partitions, and every
@@ -161,11 +200,10 @@ and warm hosted runs.
   Rust cache while allowing repeated pull-request runs to reuse compatible
   fuzz compilation results. Its cache server remains alive through the
   campaigns so the action can report final hit and miss statistics.
-- The macOS lane uses the separate
+- The required and full macOS lanes use the separate
   `aster-macos-arm64-rust-1.97.1-v1` read-write namespace and disables dev/test
-  debug information for the complete job. The workspace tests and later
-  real-process smoke therefore use compatible debug settings, while Apple ARM
-  compiler objects remain isolated from Linux objects.
+  debug information. Apple ARM compiler objects remain isolated from Linux
+  objects.
 - The workflow does not archive the complete Cargo `target` directory. Cache
   eviction, storage limits, hit rates, transfer time, and compilation time
   remain visible in the Actions and `sccache` statistics.

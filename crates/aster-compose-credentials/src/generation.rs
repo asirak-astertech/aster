@@ -763,6 +763,26 @@ const fn error(reason: GenerationCreateReason) -> GenerationCreateError {
     GenerationCreateError { reason }
 }
 
+#[cfg(all(test, not(target_os = "linux")))]
+mod non_linux_tests {
+    use super::{GenerationCreateReason, create_generation};
+    use std::{io::Cursor, path::Path};
+
+    #[test]
+    fn platform_compat_generation_creation_fails_closed_before_input_access() {
+        let result = create_generation(
+            Path::new("/unused-generation-parent"),
+            Path::new("/unused-token"),
+            Cursor::new(Vec::<u8>::new()),
+        );
+
+        assert_eq!(
+            result.err().map(|error| error.reason()),
+            Some(GenerationCreateReason::UnsupportedPlatform)
+        );
+    }
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::{

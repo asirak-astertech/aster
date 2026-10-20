@@ -32016,6 +32016,21 @@ mod tests {
         assert_eq!(clock.sample().expect("third sample").tick_ms, 43);
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn platform_compat_macos_custody_clock_is_stable_and_monotonic() {
+        let identity = [0x82; 32];
+        let first = NodeCustodyClock::open(identity).expect("first macOS custody clock");
+        let second = NodeCustodyClock::open(identity).expect("second macOS custody clock");
+
+        assert_eq!(first.clock_id, second.clock_id);
+        assert!(!first.supports_finite_ttl());
+        let earlier = first.sample().expect("first monotonic sample");
+        let later = first.sample().expect("second monotonic sample");
+        assert_eq!(earlier.clock_id, later.clock_id);
+        assert!(later.tick_ms >= earlier.tick_ms);
+    }
+
     #[test]
     fn canonical_linux_boot_id_decodes_to_one_nonzero_identity() {
         let canonical = b"00112233-4455-6677-8899-aabbccddeeff";
