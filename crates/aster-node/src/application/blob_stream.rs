@@ -1,16 +1,20 @@
 //! Single-pass local Blob adapters composed over the shared bounded pipeline.
 
 use crate::stream_pipeline::{
-    MappedPartition, PipelineError, PipelineLimits, PipelineReport, StreamJobId, StreamPartition,
-    run_ordered_pipeline,
+    FixedPartitionMapPool, MappedPartition, PipelineError, PipelineLimits, PipelineReport,
+    StreamJobId, StreamPartition, run_ordered_pipeline,
 };
 use aster_mesh::{
     BLOB_STREAM_SEGMENT_BYTES, BlobStreamFrontier, BlobStreamOpen, BlobStreamPlainPartition,
-    BlobStreamSegmentOpener, BlobStreamSegmentSealer, BlobStreamSubtree,
-    EncryptedBlobStreamSegment,
+    BlobStreamSegmentLeaves, BlobStreamSegmentOpener, BlobStreamSegmentSealer, BlobStreamSubtree,
+    EncryptedBlobStreamSegment, VerifiedBlobStreamOpen,
 };
-use aster_redb_store::pack::{BlobPackError, BlobPackReader, BlobPackWriter};
+use aster_redb_store::{
+    BlobStreamPublication, BlobStreamReservation, BlobStreamResume,
+    pack::{BlobPackError, BlobPackReader, BlobPackWriter},
+};
 use std::{
+    collections::{BTreeMap, VecDeque},
     error::Error,
     fmt::{self, Display, Formatter},
     io::{Read, Write},
@@ -21,7 +25,143 @@ use tokio::sync::{mpsc, oneshot};
 use zeroize::Zeroizing;
 
 use super::blob::{BlobPublishOptions, BlobPublishRequest, BlobPublishResult, SelectedBlobCommand};
-use super::{ApplicationError, SelectedApplicationCommand, actor_unavailable};
+use super::{
+    ApplicationError, ApplicationErrorKind, SelectedApplicationCommand, actor_unavailable,
+};
+
+pub(super) const BLOB_STREAM_CHECKPOINT_SEGMENTS: u64 = 64;
+const BLOB_STREAM_MAP_WORKERS: usize = 2;
+const BLOB_STREAM_MAP_QUEUE_ITEMS: usize = 4;
+
+type SealedBlobStreamPartition = (EncryptedBlobStreamSegment, BlobStreamSegmentLeaves);
+
+pub(super) struct LocalBlobPublishStream {
+    pub(super) open: VerifiedBlobStreamOpen,
+    pub(super) reservation: BlobStreamReservation,
+    pub(super) resume: BlobStreamResume,
+    pub(super) writer: BlobPackWriter,
+    pub(super) sealer: BlobStreamSegmentSealer,
+    pub(super) request: BlobPublishRequest,
+    pub(super) options: BlobPublishOptions,
+    pub(super) total_len: u64,
+    pub(super) accepted_offset: u64,
+    pub(super) pending: Zeroizing<Vec<u8>>,
+    pub(super) map_pool: Option<FixedPartitionMapPool<SealedBlobStreamPartition>>,
+    pub(super) mapped: BTreeMap<u64, MappedPartition<SealedBlobStreamPartition>>,
+    pub(super) next_map_index: u64,
+    pub(super) next_sink_index: u64,
+    pub(super) mapped_segments: u64,
+    pub(super) publisher_counter: u64,
+}
+
+pub(super) struct LocalBlobReadStream {
+    pub(super) publication: BlobStreamPublication,
+    pub(super) reader: BlobPackReader,
+    pub(super) opener: BlobStreamSegmentOpener,
+    pub(super) segments: VecDeque<(u64, Zeroizing<Vec<u8>>)>,
+    pub(super) last_request_offset: u64,
+}
+
+pub(super) fn take_zeroizing_bytes(mut bytes: Zeroizing<Vec<u8>>) -> Vec<u8> {
+    std::mem::take(&mut *bytes)
+}
+
+pub(super) fn blob_stream_map_pool(
+    open: &VerifiedBlobStreamOpen,
+    sealer: &BlobStreamSegmentSealer,
+    total_len: u64,
+) -> Result<FixedPartitionMapPool<SealedBlobStreamPartition>, ApplicationError> {
+    let stream_id = *open.open().stream_id().as_bytes();
+    let open_digest = open.open().digest();
+    let content_epoch = open.open().content_epoch();
+    let sealer = sealer.clone();
+    FixedPartitionMapPool::new(
+        BLOB_STREAM_MAP_WORKERS,
+        BLOB_STREAM_MAP_QUEUE_ITEMS,
+        move |partition| {
+            let index = partition.index();
+            let offset = index.checked_mul(BLOB_STREAM_SEGMENT_BYTES as u64).ok_or(
+                PipelineError::MapFailed("blob stream offset overflow".into()),
+            )?;
+            let partition = BlobStreamPlainPartition::new(
+                stream_id,
+                open_digest,
+                content_epoch,
+                index,
+                offset,
+                total_len,
+                partition.into_bytes(),
+            )
+            .map_err(|error| PipelineError::MapFailed(error.to_string()))?;
+            sealer
+                .seal(partition)
+                .map_err(|error| PipelineError::MapFailed(error.to_string()))
+        },
+    )
+    .map_err(blob_stream_pipeline_error)
+}
+
+pub(super) fn blob_stream_pipeline_error(_error: PipelineError) -> ApplicationError {
+    ApplicationError::new(ApplicationErrorKind::Integrity, "blob stream pipeline")
+}
+
+pub(super) fn blob_pack_application_error(
+    operation: &'static str,
+    error: BlobPackError,
+) -> ApplicationError {
+    let kind = match error {
+        BlobPackError::Io(_) | BlobPackError::Store(_) => ApplicationErrorKind::StateUnavailable,
+        BlobPackError::Invalid(_) => ApplicationErrorKind::Integrity,
+    };
+    ApplicationError::new(kind, operation)
+}
+
+pub(super) fn sink_mapped_stream_partitions(
+    stream: &mut LocalBlobPublishStream,
+    wait_for_all: bool,
+) -> Result<(), ApplicationError> {
+    loop {
+        let mapped = if wait_for_all && stream.mapped_segments < stream.next_map_index {
+            Some(
+                stream
+                    .map_pool
+                    .as_mut()
+                    .expect("open stream map pool")
+                    .recv_mapped_blocking()
+                    .map_err(blob_stream_pipeline_error)?,
+            )
+        } else {
+            stream
+                .map_pool
+                .as_mut()
+                .expect("open stream map pool")
+                .try_recv_mapped()
+                .map_err(blob_stream_pipeline_error)?
+        };
+        let Some(mapped) = mapped else {
+            break;
+        };
+        let index = mapped.index();
+        if stream.mapped.insert(index, mapped).is_some() {
+            return Err(blob_stream_pipeline_error(
+                PipelineError::NonContiguousIndex {
+                    expected: stream.next_sink_index,
+                    actual: index,
+                },
+            ));
+        }
+        stream.mapped_segments += 1;
+        while let Some(mapped) = stream.mapped.remove(&stream.next_sink_index) {
+            let (segment, leaves) = mapped.into_value();
+            stream
+                .writer
+                .append(&segment, leaves)
+                .map_err(|error| blob_pack_application_error("blob stream write", error))?;
+            stream.next_sink_index += 1;
+        }
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BlobPublishStreamRequest {

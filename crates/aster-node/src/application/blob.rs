@@ -25,11 +25,10 @@ use std::{
 use aster_mesh::{
     BLOB_STREAM_SEGMENT_BYTES, BlobContentVerification, BlobError, BlobId as CoreBlobId,
     BlobMetadata as CoreBlobMetadata, BlobPublicationStreamId, BlobStreamFinalCommitment,
-    BlobStreamFrontier, BlobStreamOpen, BlobStreamPlainPartition, BlobStreamSegmentLeaves,
-    BlobStreamSegmentOpener, BlobStreamSegmentSealer, ContentVerifiedBlobEnvelope, CustodySample,
-    EncryptedBlobStreamSegment, MAX_BLOB_MEDIA_TYPE_BYTES, MAX_BLOB_SCHEMA_ID_BYTES,
-    MAX_BLOB_STREAM_BYTES, NodeId, PreparedBlob, Priority, ReferenceEnvelopeSealer,
-    SELECTED_BLOB_CHUNK_SIZE, Scope, Topic, VerifiedBlobStreamOpen, prepare_blob,
+    BlobStreamFrontier, BlobStreamOpen, ContentVerifiedBlobEnvelope, CustodySample,
+    MAX_BLOB_MEDIA_TYPE_BYTES, MAX_BLOB_SCHEMA_ID_BYTES, MAX_BLOB_STREAM_BYTES, NodeId,
+    PreparedBlob, Priority, ReferenceEnvelopeSealer, SELECTED_BLOB_CHUNK_SIZE, Scope, Topic,
+    prepare_blob,
 };
 use aster_redb_store::pack::{BlobPackReader, BlobPackWriter, PinnedBlobPackRoot};
 #[cfg(test)]
@@ -38,11 +37,11 @@ use aster_redb_store::{
     BlobDeliveryAck as StoreBlobDeliveryAck, BlobDeliveryToken as StoreBlobDeliveryToken,
     BlobDepotCompletion, BlobOperationKey, BlobOperationRequest, BlobPublicationDisposition,
     BlobPublicationIntent, BlobReadPlan, BlobSemanticId, BlobSourceProjection, BlobSourceRetention,
-    BlobStoreError, BlobStreamPublication, BlobStreamReservation, BlobStreamReservationRequest,
-    BlobStreamResume, BlobStreamSource, BlobSubscriptionId as StoreBlobSubscriptionId,
-    BlobSubscriptionKey, BlobSubscriptionPollSelection, BlobSubscriptionRemoveOutcome,
-    BlobSubscriptionSpec, BlobTransferStatusSnapshot as StoreBlobTransferStatusSnapshot,
-    BlobVariantId, ControlPolicySnapshot, ControlTransferId, MAX_BLOB_OPERATION_KEY_BYTES,
+    BlobStoreError, BlobStreamPublication, BlobStreamReservationRequest, BlobStreamSource,
+    BlobSubscriptionId as StoreBlobSubscriptionId, BlobSubscriptionKey,
+    BlobSubscriptionPollSelection, BlobSubscriptionRemoveOutcome, BlobSubscriptionSpec,
+    BlobTransferStatusSnapshot as StoreBlobTransferStatusSnapshot, BlobVariantId,
+    ControlPolicySnapshot, ControlTransferId, MAX_BLOB_OPERATION_KEY_BYTES,
     MAX_BLOB_POLL_DELIVERIES, MAX_BLOB_SUBSCRIPTION_SCAN, MAX_NETWORK_BLOB_BYTES,
     MAX_NETWORK_BLOB_CHUNKS, Store, StoreError, StoreLimits, StoredBlob,
 };
@@ -54,8 +53,10 @@ use tokio::sync::{mpsc, oneshot};
 use zeroize::{Zeroize as _, Zeroizing};
 
 use super::blob_stream::{
-    BlobPublishProgress, BlobPublishStreamRequest, OpenedBlobPublishStream,
-    SelectedBlobPublishStream,
+    BLOB_STREAM_CHECKPOINT_SEGMENTS, BlobPublishProgress, BlobPublishStreamRequest,
+    LocalBlobPublishStream, LocalBlobReadStream, OpenedBlobPublishStream,
+    SelectedBlobPublishStream, blob_pack_application_error, blob_stream_map_pool,
+    blob_stream_pipeline_error, sink_mapped_stream_partitions, take_zeroizing_bytes,
 };
 use super::{
     ApplicationError, ApplicationErrorKind, SelectedApplicationCommand, actor_unavailable,
@@ -71,7 +72,7 @@ use crate::{
         open_startup_event_verifier_and_cache, recover_local_blob_capacity_after_cleanup,
         refresh_application_policy,
     },
-    stream_pipeline::{FixedPartitionMapPool, MappedPartition, PipelineError, StreamPartition},
+    stream_pipeline::StreamPartition,
 };
 
 #[derive(Clone, Eq, PartialEq)]
@@ -281,12 +282,6 @@ pub const MAX_SELECTED_LIVE_BLOB_CHUNKS: u64 = MAX_NETWORK_BLOB_CHUNKS;
 pub const MAX_SELECTED_BLOB_PAGE_BYTES: usize = 8 * SELECTED_BLOB_CHUNK_SIZE as usize;
 const MAX_SELECTED_BLOB_PAGE_CHUNKS: u64 =
     MAX_SELECTED_BLOB_PAGE_BYTES as u64 / SELECTED_BLOB_CHUNK_SIZE as u64 + 1;
-const BLOB_STREAM_CHECKPOINT_SEGMENTS: u64 = 64;
-// CM4 policy reserves one runtime/network lane and one ordered storage lane.
-// Two crypto workers keep the pipeline concurrent without oversubscribing all
-// four cores; device evidence may tune this policy at checkpoint boundaries.
-const BLOB_STREAM_MAP_WORKERS: usize = 2;
-const BLOB_STREAM_MAP_QUEUE_ITEMS: usize = 4;
 
 /// Maximum number of immutable Blob publication notifications returned by one poll.
 pub const MAX_SELECTED_BLOB_DELIVERIES: usize = MAX_BLOB_POLL_DELIVERIES;
@@ -1378,125 +1373,6 @@ struct VerifiedBlobDeliveryMetadata {
     schema_id: Vec<u8>,
     acceptance_marker: u64,
     completion: BlobDepotCompletion,
-}
-
-struct LocalBlobPublishStream {
-    open: VerifiedBlobStreamOpen,
-    reservation: BlobStreamReservation,
-    resume: BlobStreamResume,
-    writer: BlobPackWriter,
-    sealer: BlobStreamSegmentSealer,
-    request: BlobPublishRequest,
-    options: BlobPublishOptions,
-    total_len: u64,
-    accepted_offset: u64,
-    pending: Zeroizing<Vec<u8>>,
-    map_pool: Option<FixedPartitionMapPool<SealedBlobStreamPartition>>,
-    mapped: BTreeMap<u64, MappedPartition<SealedBlobStreamPartition>>,
-    next_map_index: u64,
-    next_sink_index: u64,
-    mapped_segments: u64,
-    publisher_counter: u64,
-}
-
-type SealedBlobStreamPartition = (EncryptedBlobStreamSegment, BlobStreamSegmentLeaves);
-
-struct LocalBlobReadStream {
-    publication: BlobStreamPublication,
-    reader: BlobPackReader,
-    opener: BlobStreamSegmentOpener,
-    segments: VecDeque<(u64, Zeroizing<Vec<u8>>)>,
-    last_request_offset: u64,
-}
-
-fn take_zeroizing_bytes(mut bytes: Zeroizing<Vec<u8>>) -> Vec<u8> {
-    std::mem::take(&mut *bytes)
-}
-
-fn blob_stream_map_pool(
-    open: &VerifiedBlobStreamOpen,
-    sealer: &BlobStreamSegmentSealer,
-    total_len: u64,
-) -> Result<FixedPartitionMapPool<SealedBlobStreamPartition>, ApplicationError> {
-    let stream_id = *open.open().stream_id().as_bytes();
-    let open_digest = open.open().digest();
-    let content_epoch = open.open().content_epoch();
-    let sealer = sealer.clone();
-    FixedPartitionMapPool::new(
-        BLOB_STREAM_MAP_WORKERS,
-        BLOB_STREAM_MAP_QUEUE_ITEMS,
-        move |partition| {
-            let index = partition.index();
-            let offset = index.checked_mul(BLOB_STREAM_SEGMENT_BYTES as u64).ok_or(
-                PipelineError::MapFailed("blob stream offset overflow".into()),
-            )?;
-            let partition = BlobStreamPlainPartition::new(
-                stream_id,
-                open_digest,
-                content_epoch,
-                index,
-                offset,
-                total_len,
-                partition.into_bytes(),
-            )
-            .map_err(|error| PipelineError::MapFailed(error.to_string()))?;
-            sealer
-                .seal(partition)
-                .map_err(|error| PipelineError::MapFailed(error.to_string()))
-        },
-    )
-    .map_err(blob_stream_pipeline_error)
-}
-
-fn blob_stream_pipeline_error(_error: PipelineError) -> ApplicationError {
-    ApplicationError::new(ApplicationErrorKind::Integrity, "blob stream pipeline")
-}
-
-fn sink_mapped_stream_partitions(
-    stream: &mut LocalBlobPublishStream,
-    wait_for_all: bool,
-) -> Result<(), ApplicationError> {
-    loop {
-        let mapped = if wait_for_all && stream.mapped_segments < stream.next_map_index {
-            Some(
-                stream
-                    .map_pool
-                    .as_mut()
-                    .expect("open stream map pool")
-                    .recv_mapped_blocking()
-                    .map_err(blob_stream_pipeline_error)?,
-            )
-        } else {
-            stream
-                .map_pool
-                .as_mut()
-                .expect("open stream map pool")
-                .try_recv_mapped()
-                .map_err(blob_stream_pipeline_error)?
-        };
-        let Some(mapped) = mapped else {
-            break;
-        };
-        let index = mapped.index();
-        if stream.mapped.insert(index, mapped).is_some() {
-            return Err(blob_stream_pipeline_error(
-                PipelineError::NonContiguousIndex {
-                    expected: stream.next_sink_index,
-                    actual: index,
-                },
-            ));
-        }
-        stream.mapped_segments += 1;
-        while let Some(mapped) = stream.mapped.remove(&stream.next_sink_index) {
-            let (segment, leaves) = mapped.into_value();
-            stream
-                .writer
-                .append(&segment, leaves)
-                .map_err(|error| blob_pack_application_error("blob stream write", error))?;
-            stream.next_sink_index += 1;
-        }
-    }
-    Ok(())
 }
 
 impl VerifiedBlobDeliveryMetadata {
@@ -4982,18 +4858,6 @@ fn blob_core_error(operation: &'static str, error: BlobError) -> ApplicationErro
         | BlobError::InvalidChunkIndex
         | BlobError::MissingChunk
         | BlobError::AuthenticationFailed => ApplicationErrorKind::Integrity,
-    };
-    ApplicationError::new(kind, operation)
-}
-
-fn blob_pack_application_error(
-    operation: &'static str,
-    error: aster_redb_store::pack::BlobPackError,
-) -> ApplicationError {
-    let kind = match error {
-        aster_redb_store::pack::BlobPackError::Io(_) => ApplicationErrorKind::StateUnavailable,
-        aster_redb_store::pack::BlobPackError::Store(_) => ApplicationErrorKind::StateUnavailable,
-        aster_redb_store::pack::BlobPackError::Invalid(_) => ApplicationErrorKind::Integrity,
     };
     ApplicationError::new(kind, operation)
 }
