@@ -25,10 +25,12 @@ use std::path::Path;
 
 pub fn completed_pack_wire_len(root: &Path, open: &BlobStreamOpen) -> Result<u64, String> {
     crate::runtime::blob_stream::completed_pack_wire_len(root, open)
+        .map_err(|error| error.to_string())
 }
 
 pub fn expected_pack_wire_len(plaintext_len: u64) -> Result<u64, String> {
     crate::runtime::blob_stream::expected_pack_wire_len(plaintext_len)
+        .map_err(|error| error.to_string())
 }
 
 pub async fn send_completed_pack(
@@ -48,6 +50,7 @@ pub async fn send_completed_pack(
         semantic_commitment,
     )
     .await
+    .map_err(|error| error.to_string())
 }
 
 pub async fn receive_completed_pack(
@@ -62,6 +65,7 @@ pub async fn receive_completed_pack(
         connection, open, opener, root, wire_len, limits,
     )
     .await
+    .map_err(|error| error.to_string())
 }
 
 pub async fn receive_completed_pack_with_store(
@@ -76,6 +80,7 @@ pub async fn receive_completed_pack_with_store(
         connection, session, opener, root, wire_len, limits,
     )
     .await
+    .map_err(|error| error.to_string())
 }
 
 const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10 * 60);

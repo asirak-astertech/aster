@@ -33,6 +33,84 @@ use tokio::{sync::mpsc, time::Instant};
 const MAX_RECORD_BYTES: usize = 2 * 1024 * 1024;
 const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlobNetworkStage {
+    Framing,
+    Authentication,
+    Transport,
+    Protocol,
+    Verification,
+    Durability,
+    Lifecycle,
+    Settlement,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlobNetworkError {
+    stage: BlobNetworkStage,
+    context: String,
+    detail: String,
+}
+
+impl BlobNetworkError {
+    fn new(
+        stage: BlobNetworkStage,
+        context: impl Into<String>,
+        detail: impl std::fmt::Display,
+    ) -> Self {
+        Self {
+            stage,
+            context: context.into(),
+            detail: detail.to_string(),
+        }
+    }
+
+    pub const fn stage(&self) -> BlobNetworkStage {
+        self.stage
+    }
+
+    pub const fn public_message(&self) -> &'static str {
+        match self.stage {
+            BlobNetworkStage::Framing => "profile-5 Blob framing failed",
+            BlobNetworkStage::Authentication => "profile-5 Blob authentication failed",
+            BlobNetworkStage::Transport => "profile-5 Blob transport failed",
+            BlobNetworkStage::Protocol => "profile-5 Blob protocol failed",
+            BlobNetworkStage::Verification => "profile-5 Blob verification failed",
+            BlobNetworkStage::Durability => "profile-5 Blob durability failed",
+            BlobNetworkStage::Lifecycle => "profile-5 Blob lifecycle failed",
+            BlobNetworkStage::Settlement => "profile-5 Blob settlement failed",
+        }
+    }
+}
+
+impl From<&'static str> for BlobNetworkError {
+    fn from(detail: &'static str) -> Self {
+        Self::new(
+            BlobNetworkStage::Protocol,
+            "profile-5 Blob protocol",
+            detail,
+        )
+    }
+}
+
+impl From<String> for BlobNetworkError {
+    fn from(detail: String) -> Self {
+        Self::new(
+            BlobNetworkStage::Protocol,
+            "profile-5 Blob protocol",
+            detail,
+        )
+    }
+}
+
+impl std::fmt::Display for BlobNetworkError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.context, self.detail)
+    }
+}
+
+impl std::error::Error for BlobNetworkError {}
+
 #[derive(Debug)]
 pub struct BlobNetworkReport {
     pub wire_bytes: u64,
@@ -67,7 +145,7 @@ impl BlobReceiveStoreSession {
         authenticated_open: Vec<u8>,
         peer: NodeId,
         verify_commitment: BlobCommitmentVerifier,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, BlobNetworkError> {
         let operation = BlobOperationKey::new(open.open().operation_key().to_vec())
             .map_err(|error| failure("stream operation", error))?;
         Ok(Self {
@@ -81,7 +159,7 @@ impl BlobReceiveStoreSession {
         })
     }
 
-    fn reserve(&self) -> Result<(BlobStreamReservation, BlobStreamResume), String> {
+    fn reserve(&self) -> Result<(BlobStreamReservation, BlobStreamResume), BlobNetworkError> {
         self.store
             .reserve_blob_stream_with_policy(
                 &self.policy,
@@ -91,37 +169,81 @@ impl BlobReceiveStoreSession {
                 },
                 &self.open,
             )
-            .map_err(|error| failure("reserve stream", error))
+            .map_err(|error| lifecycle_failure("reserve stream", error))
     }
 }
 
-fn failure(context: &str, error: impl std::fmt::Display) -> String {
-    format!("{context}: {error}")
+fn failure(context: impl Into<String>, error: impl std::fmt::Display) -> BlobNetworkError {
+    BlobNetworkError::new(BlobNetworkStage::Protocol, context, error)
 }
 
-fn encoded(frame: StreamFrame) -> Result<Vec<u8>, String> {
-    frame
-        .encode_for_context(9, 5)
-        .map_err(|error| error.to_string())
+fn authentication_failure(
+    context: impl Into<String>,
+    error: impl std::fmt::Display,
+) -> BlobNetworkError {
+    BlobNetworkError::new(BlobNetworkStage::Authentication, context, error)
 }
 
-fn decoded(bytes: &[u8]) -> Result<StreamFrame, String> {
-    StreamFrame::decode_for_context(9, 5, bytes).map_err(|error| error.to_string())
+fn transport_failure(
+    context: impl Into<String>,
+    error: impl std::fmt::Display,
+) -> BlobNetworkError {
+    BlobNetworkError::new(BlobNetworkStage::Transport, context, error)
+}
+
+fn verification_failure(
+    context: impl Into<String>,
+    error: impl std::fmt::Display,
+) -> BlobNetworkError {
+    BlobNetworkError::new(BlobNetworkStage::Verification, context, error)
+}
+
+fn durability_failure(
+    context: impl Into<String>,
+    error: impl std::fmt::Display,
+) -> BlobNetworkError {
+    BlobNetworkError::new(BlobNetworkStage::Durability, context, error)
+}
+
+fn lifecycle_failure(
+    context: impl Into<String>,
+    error: impl std::fmt::Display,
+) -> BlobNetworkError {
+    BlobNetworkError::new(BlobNetworkStage::Lifecycle, context, error)
+}
+
+fn settlement_failure(
+    context: impl Into<String>,
+    error: impl std::fmt::Display,
+) -> BlobNetworkError {
+    BlobNetworkError::new(BlobNetworkStage::Settlement, context, error)
+}
+
+fn encoded(frame: StreamFrame) -> Result<Vec<u8>, BlobNetworkError> {
+    frame.encode_for_context(9, 5).map_err(|error| {
+        BlobNetworkError::new(BlobNetworkStage::Framing, "encode stream frame", error)
+    })
+}
+
+fn decoded(bytes: &[u8]) -> Result<StreamFrame, BlobNetworkError> {
+    StreamFrame::decode_for_context(9, 5, bytes).map_err(|error| {
+        BlobNetworkError::new(BlobNetworkStage::Framing, "decode stream frame", error)
+    })
 }
 
 trait BlobRecordCodec: Send {
-    fn encode(&mut self, frame: StreamFrame) -> Result<Vec<u8>, String>;
-    fn decode(&mut self, bytes: &[u8]) -> Result<StreamFrame, String>;
+    fn encode(&mut self, frame: StreamFrame) -> Result<Vec<u8>, BlobNetworkError>;
+    fn decode(&mut self, bytes: &[u8]) -> Result<StreamFrame, BlobNetworkError>;
 }
 
 struct PlainBlobRecordCodec;
 
 impl BlobRecordCodec for PlainBlobRecordCodec {
-    fn encode(&mut self, frame: StreamFrame) -> Result<Vec<u8>, String> {
+    fn encode(&mut self, frame: StreamFrame) -> Result<Vec<u8>, BlobNetworkError> {
         encoded(frame)
     }
 
-    fn decode(&mut self, bytes: &[u8]) -> Result<StreamFrame, String> {
+    fn decode(&mut self, bytes: &[u8]) -> Result<StreamFrame, BlobNetworkError> {
         decoded(bytes)
     }
 }
@@ -146,14 +268,16 @@ fn stream_frame_name(frame: &StreamFrame) -> &'static str {
 }
 
 impl BlobRecordCodec for MissionBlobRecordCodec<'_> {
-    fn encode(&mut self, frame: StreamFrame) -> Result<Vec<u8>, String> {
+    fn encode(&mut self, frame: StreamFrame) -> Result<Vec<u8>, BlobNetworkError> {
         if let StreamFrame::Data(data) = frame {
-            let (header, body) = data
-                .into_header_and_body()
-                .map_err(|error| error.to_string())?;
+            let (header, body) = data.into_header_and_body().map_err(|error| {
+                BlobNetworkError::new(BlobNetworkStage::Framing, "split data frame", error)
+            })?;
             let encoded_header = header
                 .encode_for_context(9, TransferProfileId::BlobStreamV1 as u16)
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| {
+                    BlobNetworkError::new(BlobNetworkStage::Framing, "encode data header", error)
+                })?;
             let protected_header = self
                 .mission
                 .seal_v9_blob_data_header(
@@ -162,14 +286,23 @@ impl BlobRecordCodec for MissionBlobRecordCodec<'_> {
                     self.attempt_nonce,
                     &encoded_header,
                 )
-                .map_err(|error| failure("seal data-header mission record", error))?;
-            return encode_composite_data_record(&protected_header, body)
-                .map_err(|error| error.to_string());
+                .map_err(|error| {
+                    authentication_failure("seal data-header mission record", error)
+                })?;
+            return encode_composite_data_record(&protected_header, body).map_err(|error| {
+                BlobNetworkError::new(
+                    BlobNetworkStage::Framing,
+                    "encode composite data record",
+                    error,
+                )
+            });
         }
         let frame_name = stream_frame_name(&frame);
         let plaintext = frame
             .encode_for_context(9, TransferProfileId::BlobStreamV1 as u16)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| {
+                BlobNetworkError::new(BlobNetworkStage::Framing, "encode control frame", error)
+            })?;
         self.mission
             .seal_v9_blob_application_frame(
                 self.profile_digest,
@@ -177,13 +310,20 @@ impl BlobRecordCodec for MissionBlobRecordCodec<'_> {
                 self.attempt_nonce,
                 &plaintext,
             )
-            .map_err(|error| failure(&format!("seal {frame_name} mission record"), error))
+            .map_err(|error| {
+                authentication_failure(format!("seal {frame_name} mission record"), error)
+            })
     }
 
-    fn decode(&mut self, bytes: &[u8]) -> Result<StreamFrame, String> {
+    fn decode(&mut self, bytes: &[u8]) -> Result<StreamFrame, BlobNetworkError> {
         if bytes.starts_with(b"ASD1") {
-            let (protected_header, body) =
-                split_composite_data_record(bytes).map_err(|error| error.to_string())?;
+            let (protected_header, body) = split_composite_data_record(bytes).map_err(|error| {
+                BlobNetworkError::new(
+                    BlobNetworkStage::Framing,
+                    "split composite data record",
+                    error,
+                )
+            })?;
             let header = self
                 .mission
                 .open_v9_blob_data_header(
@@ -192,11 +332,19 @@ impl BlobRecordCodec for MissionBlobRecordCodec<'_> {
                     self.attempt_nonce,
                     protected_header,
                 )
-                .map_err(|error| failure("open data-header mission record", error))?;
+                .map_err(|error| {
+                    authentication_failure("open data-header mission record", error)
+                })?;
             return header
                 .decode_body(body)
                 .map(StreamFrame::Data)
-                .map_err(|error| error.to_string());
+                .map_err(|error| {
+                    BlobNetworkError::new(
+                        BlobNetworkStage::Framing,
+                        "decode composite data body",
+                        error,
+                    )
+                });
         }
         let plaintext = self
             .mission
@@ -206,10 +354,12 @@ impl BlobRecordCodec for MissionBlobRecordCodec<'_> {
                 self.attempt_nonce,
                 bytes,
             )
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| authentication_failure("open mission record", error))?;
         let frame =
             StreamFrame::decode_for_context(9, TransferProfileId::BlobStreamV1 as u16, &plaintext)
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| {
+                    BlobNetworkError::new(BlobNetworkStage::Framing, "decode control frame", error)
+                })?;
         if matches!(frame, StreamFrame::Data(_)) {
             return Err("StreamData requires the profile-5 composite record".into());
         }
@@ -228,11 +378,11 @@ fn result_digest(open: &BlobStreamOpen, roots: ([u8; 32], [u8; 32])) -> [u8; 32]
 
 async fn finish_receiver_attempt(
     attempt: Arc<dyn crate::stream_transport::StreamReceiveAttempt>,
-) -> Result<(), String> {
+) -> Result<(), BlobNetworkError> {
     if attempt
         .receive_data()
         .await
-        .map_err(|error| failure("receive data EOF", format!("{error:?}")))?
+        .map_err(|error| transport_failure("receive data EOF", format!("{error:?}")))?
         .is_some()
     {
         return Err("data stream contained a frame after result acknowledgement".into());
@@ -240,11 +390,15 @@ async fn finish_receiver_attempt(
     attempt
         .finish_control()
         .await
-        .map_err(|error| failure("finish control stream", format!("{error:?}")))
+        .map_err(|error| transport_failure("finish control stream", format!("{error:?}")))
 }
 
-pub fn completed_pack_wire_len(root: &Path, open: &BlobStreamOpen) -> Result<u64, String> {
-    let reader = BlobPackReader::open(root, open).map_err(|error| failure("open pack", error))?;
+pub(crate) fn completed_pack_wire_len(
+    root: &Path,
+    open: &BlobStreamOpen,
+) -> Result<u64, BlobNetworkError> {
+    let reader =
+        BlobPackReader::open(root, open).map_err(|error| durability_failure("open pack", error))?;
     Ok(reader.checkpoint().payload_len())
 }
 
@@ -254,12 +408,12 @@ enum PackAccess<'a> {
 }
 
 impl PackAccess<'_> {
-    fn reader(&self, open: &BlobStreamOpen) -> Result<BlobPackReader, String> {
+    fn reader(&self, open: &BlobStreamOpen) -> Result<BlobPackReader, BlobNetworkError> {
         match self {
             Self::Path(root) => BlobPackReader::open(root, open),
             Self::Pinned(root) => BlobPackReader::open_pinned(root, open),
         }
-        .map_err(|error| failure("open pack", error))
+        .map_err(|error| durability_failure("open pack", error))
     }
 
     fn reader_at(
@@ -267,7 +421,7 @@ impl PackAccess<'_> {
         open: &BlobStreamOpen,
         next_index: u64,
         wire_offset: u64,
-    ) -> Result<BlobPackReader, String> {
+    ) -> Result<BlobPackReader, BlobNetworkError> {
         match self {
             Self::Path(root) => {
                 BlobPackReader::open_at_payload_offset(root, open, next_index, wire_offset)
@@ -276,14 +430,14 @@ impl PackAccess<'_> {
                 BlobPackReader::open_pinned_at_payload_offset(root, open, next_index, wire_offset)
             }
         }
-        .map_err(|error| failure("open resumed source pack", error))
+        .map_err(|error| durability_failure("open resumed source pack", error))
     }
 
     fn projected_writer(
         &self,
         open: &BlobStreamOpen,
         resume: BlobStreamResume,
-    ) -> Result<BlobPackWriter, String> {
+    ) -> Result<BlobPackWriter, BlobNetworkError> {
         match self {
             Self::Path(root) => BlobPackWriter::open_projected(
                 root,
@@ -304,12 +458,18 @@ impl PackAccess<'_> {
                 resume.durable_wire_offset(),
             ),
         }
-        .map_err(|error| failure("open receiver pack", error))
+        .map_err(|error| durability_failure("open receiver pack", error))
     }
 }
 
-pub fn expected_pack_wire_len(plaintext_len: u64) -> Result<u64, String> {
-    blob_pack_wire_len(plaintext_len).map_err(|error| error.to_string())
+pub(crate) fn expected_pack_wire_len(plaintext_len: u64) -> Result<u64, BlobNetworkError> {
+    blob_pack_wire_len(plaintext_len).map_err(|error| {
+        BlobNetworkError::new(
+            BlobNetworkStage::Framing,
+            "calculate Blob pack wire length",
+            error,
+        )
+    })
 }
 
 struct PackExtentSource {
@@ -317,7 +477,7 @@ struct PackExtentSource {
 }
 
 impl PackExtentSource {
-    fn new(root: &PackAccess<'_>, open: &BlobStreamOpen) -> Result<Self, String> {
+    fn new(root: &PackAccess<'_>, open: &BlobStreamOpen) -> Result<Self, BlobNetworkError> {
         Ok(Self {
             reader: root.reader(open)?,
         })
@@ -327,7 +487,7 @@ impl PackExtentSource {
         root: &PackAccess<'_>,
         open: &BlobStreamOpen,
         wire_offset: u64,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, BlobNetworkError> {
         if wire_offset == 0 {
             return Self::new(root, open);
         }
@@ -347,18 +507,22 @@ impl PackExtentSource {
             open.total_len()
                 .div_ceil(aster_mesh::BLOB_STREAM_SEGMENT_BYTES as u64)
         } else {
-            return Err("resume offset is not a canonical Blob record boundary".into());
+            return Err(BlobNetworkError::new(
+                BlobNetworkStage::Framing,
+                "resume source pack",
+                "offset is not a canonical Blob record boundary",
+            ));
         };
         Ok(Self {
             reader: root.reader_at(open, next_index, wire_offset)?,
         })
     }
 
-    fn next_extent(&mut self) -> Result<Option<Vec<u8>>, String> {
+    fn next_extent(&mut self) -> Result<Option<Vec<u8>>, BlobNetworkError> {
         self.reader
             .next_record()
             .map(|record| record.map(|record| record.into_bytes()))
-            .map_err(|error| failure("read source record", error))
+            .map_err(|error| durability_failure("read source record", error))
     }
 }
 
@@ -393,7 +557,7 @@ pub async fn send_completed_pack(
     root: &Path,
     roots: ([u8; 32], [u8; 32]),
     semantic_commitment: Vec<u8>,
-) -> Result<BlobNetworkReport, String> {
+) -> Result<BlobNetworkReport, BlobNetworkError> {
     let mut codec = PlainBlobRecordCodec;
     send_completed_pack_inner(
         connection,
@@ -421,7 +585,7 @@ pub(crate) async fn send_completed_pack_protected(
     root: &PinnedBlobPackRoot,
     roots: ([u8; 32], [u8; 32]),
     semantic_commitment: Vec<u8>,
-) -> Result<BlobNetworkReport, String> {
+) -> Result<BlobNetworkReport, BlobNetworkError> {
     let mut codec = MissionBlobRecordCodec {
         mission,
         profile_digest,
@@ -456,13 +620,19 @@ async fn send_completed_pack_inner(
     planned_nonce: Option<[u8; 32]>,
     direction: StreamDirection,
     codec: &mut dyn BlobRecordCodec,
-) -> Result<BlobNetworkReport, String> {
+) -> Result<BlobNetworkReport, BlobNetworkError> {
     let wire_len = root.reader(open)?.checkpoint().payload_len();
     if wire_len != expected_pack_wire_len(open.total_len())? {
-        return Err("completed pack wire length differs from canonical segment framing".into());
+        return Err(BlobNetworkError::new(
+            BlobNetworkStage::Framing,
+            "validate completed pack",
+            "wire length differs from canonical segment framing",
+        ));
     }
     let (max_data_bytes, max_control_bytes) =
-        profile5_attempt_bounds(wire_len).map_err(|error| error.to_string())?;
+        profile5_attempt_bounds(wire_len).map_err(|error| {
+            BlobNetworkError::new(BlobNetworkStage::Framing, "bound stream attempt", error)
+        })?;
     let attempt = IrohQuicV1Adapter::new(connection)
         .open_attempt(AttemptOpenRequest {
             deadline: Instant::now() + ATTEMPT_TIMEOUT,
@@ -470,40 +640,43 @@ async fn send_completed_pack_inner(
             max_control_bytes,
         })
         .await
-        .map_err(|error| failure("open transport attempt", format!("{error:?}")))?;
+        .map_err(|error| transport_failure("open transport attempt", format!("{error:?}")))?;
     let mut attempt_nonce = planned_nonce.unwrap_or([0; 32]);
     if planned_nonce.is_none() {
-        getrandom::fill(&mut attempt_nonce).map_err(|error| failure("attempt nonce", error))?;
+        getrandom::fill(&mut attempt_nonce)
+            .map_err(|error| authentication_failure("attempt nonce", error))?;
     }
     let transfer_open = protocol_open(open, authenticated_open, wire_len, attempt_nonce, direction);
     attempt
         .send_data(&codec.encode(StreamFrame::Open(transfer_open.clone()))?)
         .await
-        .map_err(|error| failure("send open", format!("{error:?}")))?;
+        .map_err(|error| transport_failure("send open", format!("{error:?}")))?;
     let accept = attempt
         .receive_control()
         .await
-        .map_err(|error| failure("receive accept", format!("{error:?}")))?
+        .map_err(|error| transport_failure("receive accept", format!("{error:?}")))?
         .ok_or("control stream closed before accept")?;
     let StreamFrame::Accept(accept) = codec.decode(&accept)? else {
         return Err("first control frame was not accept".into());
     };
     let resume_offset = accept.durable_offset;
     let mut state = StreamSenderState::new(transfer_open.transfer_id, attempt_nonce, wire_len);
-    state.accept(accept).map_err(|error| error.to_string())?;
+    state
+        .accept(accept)
+        .map_err(|error| failure("accept stream", error))?;
     let mut source = PackExtentSource::new_at(&root, open, resume_offset)?;
     let mut pending = source.next_extent()?;
     let mut checkpoints = 0;
     while let Some(extent) = pending.take() {
         match state
             .send_extent(extent)
-            .map_err(|error| error.to_string())?
+            .map_err(|error| failure("advance sender extent", error))?
         {
             StreamExtentAction::Send(data) => {
                 attempt
                     .send_data(&codec.encode(StreamFrame::Data(data))?)
                     .await
-                    .map_err(|error| failure("send data", format!("{error:?}")))?;
+                    .map_err(|error| transport_failure("send data", format!("{error:?}")))?;
                 pending = source.next_extent()?;
             }
             StreamExtentAction::Retry {
@@ -513,14 +686,14 @@ async fn send_completed_pack_inner(
                 let checkpoint = attempt
                     .receive_control()
                     .await
-                    .map_err(|error| failure("receive checkpoint", format!("{error:?}")))?
+                    .map_err(|error| transport_failure("receive checkpoint", format!("{error:?}")))?
                     .ok_or("control stream closed before checkpoint")?;
                 let StreamFrame::Checkpoint(checkpoint) = codec.decode(&checkpoint)? else {
                     return Err("credit wait received a non-checkpoint frame".into());
                 };
                 state
                     .checkpoint(checkpoint)
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| failure("advance sender checkpoint", error))?;
                 checkpoints += 1;
                 pending = Some(bytes);
             }
@@ -532,29 +705,29 @@ async fn send_completed_pack_inner(
     let checkpoint = attempt
         .receive_control()
         .await
-        .map_err(|error| failure("receive final checkpoint", format!("{error:?}")))?
+        .map_err(|error| transport_failure("receive final checkpoint", format!("{error:?}")))?
         .ok_or("control stream closed before final checkpoint")?;
     let StreamFrame::Checkpoint(checkpoint) = codec.decode(&checkpoint)? else {
         return Err("final control frame was not checkpoint".into());
     };
     state
         .checkpoint(checkpoint)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| failure("advance final sender checkpoint", error))?;
     checkpoints += 1;
     let StreamAction::Send(finish) = state
         .finish(semantic_commitment)
-        .map_err(|error| error.to_string())?
+        .map_err(|error| failure("finish sender state", error))?
     else {
         return Err("sender did not produce finish".into());
     };
     attempt
         .send_data(&codec.encode(finish)?)
         .await
-        .map_err(|error| failure("send finish", format!("{error:?}")))?;
+        .map_err(|error| transport_failure("send finish", format!("{error:?}")))?;
     let result = attempt
         .receive_control()
         .await
-        .map_err(|error| failure("receive result", format!("{error:?}")))?
+        .map_err(|error| transport_failure("receive result", format!("{error:?}")))?
         .ok_or("control stream closed before result")?;
     let StreamFrame::Result(result) = codec.decode(&result)? else {
         return Err("terminal control frame was not result".into());
@@ -564,29 +737,36 @@ async fn send_completed_pack_inner(
         StreamResultCode::Promoted | StreamResultCode::AlreadyPresent
     ) || result.result_digest != result_digest(open, roots)
     {
-        return Err("receiver result did not bind the expected Blob roots".into());
+        return Err(settlement_failure(
+            "validate receiver result",
+            "result did not bind the expected Blob roots",
+        ));
     }
     let expected_result = result.code;
-    let (StreamAction::Send(ack), StreamAction::Terminal(settled)) =
-        state.result(result).map_err(|error| error.to_string())?
+    let (StreamAction::Send(ack), StreamAction::Terminal(settled)) = state
+        .result(result)
+        .map_err(|error| settlement_failure("settle sender state", error))?
     else {
-        return Err("sender settlement action differed".into());
+        return Err(settlement_failure(
+            "settle sender",
+            "settlement action differed",
+        ));
     };
     if settled != expected_result {
-        return Err("sender settled a different result code".into());
+        return Err(settlement_failure("settle sender", "result code differed"));
     }
     attempt
         .send_data(&codec.encode(ack)?)
         .await
-        .map_err(|error| failure("send result acknowledgement", format!("{error:?}")))?;
+        .map_err(|error| transport_failure("send result acknowledgement", format!("{error:?}")))?;
     attempt
         .finish_data()
         .await
-        .map_err(|error| failure("finish data stream", format!("{error:?}")))?;
+        .map_err(|error| transport_failure("finish data stream", format!("{error:?}")))?;
     if attempt
         .receive_control()
         .await
-        .map_err(|error| failure("receive control EOF", format!("{error:?}")))?
+        .map_err(|error| transport_failure("receive control EOF", format!("{error:?}")))?
         .is_some()
     {
         return Err("control stream contained data after terminal result".into());
@@ -618,17 +798,29 @@ impl RecordPartitioner {
         &mut self,
         bytes: Vec<u8>,
         sender: &mpsc::Sender<Result<StreamPartition, PipelineError>>,
-    ) -> Result<(), String> {
+    ) -> Result<(), BlobNetworkError> {
         if bytes.len() < 4 {
-            return Err("Blob network extent is shorter than its record length".into());
+            return Err(BlobNetworkError::new(
+                BlobNetworkStage::Framing,
+                "partition network extent",
+                "extent is shorter than its record length",
+            ));
         }
         let len = u32::from_be_bytes(bytes[..4].try_into().expect("record length")) as usize;
         if len == 0 || len > MAX_RECORD_BYTES {
-            return Err("Blob network record length is out of bounds".into());
+            return Err(BlobNetworkError::new(
+                BlobNetworkStage::Framing,
+                "partition network extent",
+                "record length is out of bounds",
+            ));
         }
         let record_len = 4usize.checked_add(len).ok_or("record length overflow")?;
         if bytes.len() != record_len {
-            return Err("Blob network extent is not exactly one canonical record".into());
+            return Err(BlobNetworkError::new(
+                BlobNetworkStage::Framing,
+                "partition network extent",
+                "extent is not exactly one canonical record",
+            ));
         }
         let wire_end = self
             .consumed
@@ -641,13 +833,15 @@ impl RecordPartitioner {
                 bytes,
             )))
             .await
-            .map_err(|_| "verification pipeline closed")?;
+            .map_err(|_| {
+                verification_failure("submit network extent", "verification pipeline closed")
+            })?;
         self.next_index += 1;
         self.consumed = wire_end;
         Ok(())
     }
 
-    fn finish(&self, expected: u64) -> Result<(), String> {
+    fn finish(&self, expected: u64) -> Result<(), BlobNetworkError> {
         if self.consumed == expected {
             Ok(())
         } else {
@@ -669,7 +863,7 @@ async fn send_durable_checkpoint(
     wire_len: u64,
     current_limit: &mut u64,
     codec: &mut dyn BlobRecordCodec,
-) -> Result<(), String> {
+) -> Result<(), BlobNetworkError> {
     let window = u64::from(MAX_STREAM_CHECKPOINT_BATCH_BYTES) + MAX_RECORD_BYTES as u64;
     let new_limit = wire_len.min((*current_limit).max(progress.wire_offset.saturating_add(window)));
     let StreamAction::Send(checkpoint) = state
@@ -678,14 +872,14 @@ async fn send_durable_checkpoint(
             progress.checkpoint.generation(),
             new_limit,
         )
-        .map_err(|error| error.to_string())?
+        .map_err(|error| failure("advance receiver checkpoint", error))?
     else {
         return Err("receiver did not produce checkpoint".into());
     };
     attempt
         .send_control(&codec.encode(checkpoint)?)
         .await
-        .map_err(|error| failure("send checkpoint", format!("{error:?}")))?;
+        .map_err(|error| transport_failure("send checkpoint", format!("{error:?}")))?;
     *current_limit = new_limit;
     Ok(())
 }
@@ -697,7 +891,7 @@ pub async fn receive_completed_pack(
     root: &Path,
     wire_len: u64,
     limits: PipelineLimits,
-) -> Result<BlobNetworkReport, String> {
+) -> Result<BlobNetworkReport, BlobNetworkError> {
     let mut codec = PlainBlobRecordCodec;
     receive_completed_pack_inner(
         connection,
@@ -721,7 +915,7 @@ pub async fn receive_completed_pack_with_store(
     root: &Path,
     wire_len: u64,
     limits: PipelineLimits,
-) -> Result<BlobNetworkReport, String> {
+) -> Result<BlobNetworkReport, BlobNetworkError> {
     let open = session.open.open().clone();
     let mut codec = PlainBlobRecordCodec;
     receive_completed_pack_inner(
@@ -751,7 +945,7 @@ pub(crate) async fn receive_completed_pack_with_store_protected(
     root: &PinnedBlobPackRoot,
     wire_len: u64,
     limits: PipelineLimits,
-) -> Result<BlobNetworkReport, String> {
+) -> Result<BlobNetworkReport, BlobNetworkError> {
     let open = session.open.open().clone();
     let mut codec = MissionBlobRecordCodec {
         mission,
@@ -789,9 +983,11 @@ async fn receive_completed_pack_inner(
     planned_nonce: Option<[u8; 32]>,
     direction: StreamDirection,
     codec: &mut dyn BlobRecordCodec,
-) -> Result<BlobNetworkReport, String> {
+) -> Result<BlobNetworkReport, BlobNetworkError> {
     let (max_data_bytes, max_control_bytes) =
-        profile5_attempt_bounds(wire_len).map_err(|error| error.to_string())?;
+        profile5_attempt_bounds(wire_len).map_err(|error| {
+            BlobNetworkError::new(BlobNetworkStage::Framing, "bound stream attempt", error)
+        })?;
     let attempt = IrohQuicV1Adapter::new(connection)
         .accept_attempt(AttemptOpenRequest {
             deadline: Instant::now() + ATTEMPT_TIMEOUT,
@@ -799,11 +995,11 @@ async fn receive_completed_pack_inner(
             max_control_bytes,
         })
         .await
-        .map_err(|error| failure("accept transport attempt", format!("{error:?}")))?;
+        .map_err(|error| transport_failure("accept transport attempt", format!("{error:?}")))?;
     let frame = attempt
         .receive_data()
         .await
-        .map_err(|error| failure("receive open", format!("{error:?}")))?
+        .map_err(|error| transport_failure("receive open", format!("{error:?}")))?
         .ok_or("data stream closed before open")?;
     let StreamFrame::Open(transfer_open) = codec.decode(&frame)? else {
         return Err("first data frame was not open".into());
@@ -818,7 +1014,10 @@ async fn receive_completed_pack_inner(
             .is_some_and(|session| session.authenticated_open != transfer_open.authenticated_open)
         || planned_nonce.is_some_and(|nonce| nonce != transfer_open.attempt_nonce)
     {
-        return Err("transport open differs from authenticated Blob open".into());
+        return Err(authentication_failure(
+            "validate transport open",
+            "open differs from authenticated Blob open",
+        ));
     }
     let mut store_state = store_session
         .as_ref()
@@ -839,17 +1038,17 @@ async fn receive_completed_pack_inner(
         current_limit,
         PROFILE5_EXTENT_BYTES as u32,
     )
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| failure("initialize receiver state", error))?;
     let StreamAction::Send(accept) = state
         .accept(MAX_STREAM_CHECKPOINT_BATCH_BYTES)
-        .map_err(|error| error.to_string())?
+        .map_err(|error| failure("accept receiver stream", error))?
     else {
         return Err("receiver did not produce accept".into());
     };
     attempt
         .send_control(&codec.encode(accept)?)
         .await
-        .map_err(|error| failure("send accept", format!("{error:?}")))?;
+        .map_err(|error| transport_failure("send accept", format!("{error:?}")))?;
 
     let (partition_tx, partition_rx) = mpsc::channel(limits.max_in_flight_items());
     let (durable_tx, mut durable_rx) = mpsc::unbounded_channel();
@@ -922,13 +1121,14 @@ async fn receive_completed_pack_inner(
         let frame = attempt
             .receive_data()
             .await
-            .map_err(|error| failure("receive data", format!("{error:?}")))?
+            .map_err(|error| transport_failure("receive data", format!("{error:?}")))?
             .ok_or("data stream closed before completion")?;
         let StreamFrame::Data(data) = codec.decode(&frame)? else {
             return Err("non-data frame before complete payload".into());
         };
-        let StreamAction::Persist { through } =
-            state.data(&data).map_err(|error| error.to_string())?
+        let StreamAction::Persist { through } = state
+            .data(&data)
+            .map_err(|error| failure("advance receiver data", error))?
         else {
             return Err("receiver did not accept new data".into());
         };
@@ -937,10 +1137,12 @@ async fn receive_completed_pack_inner(
         if partitioner.consumed - durable_wire >= u64::from(MAX_STREAM_CHECKPOINT_BATCH_BYTES)
             || partitioner.consumed == wire_len
         {
-            let progress = durable_rx
-                .recv()
-                .await
-                .ok_or("verification pipeline closed before checkpoint")?;
+            let progress = durable_rx.recv().await.ok_or_else(|| {
+                verification_failure(
+                    "receive durable checkpoint",
+                    "verification pipeline closed before checkpoint",
+                )
+            })?;
             if let (Some(session), Some((reservation, resume))) =
                 (store_session.as_ref(), store_state.as_mut())
             {
@@ -952,7 +1154,7 @@ async fn receive_completed_pack_inner(
                         *resume,
                         progress.checkpoint.clone(),
                     )
-                    .map_err(|error| failure("project durable checkpoint", error))?;
+                    .map_err(|error| durability_failure("project durable checkpoint", error))?;
             }
             send_durable_checkpoint(
                 &attempt,
@@ -971,29 +1173,32 @@ async fn receive_completed_pack_inner(
     drop(partition_tx);
     let (pipeline, roots) = pipeline_task
         .await
-        .map_err(|error| failure("verification pipeline task", error))?
-        .map_err(|error| failure("verification pipeline", error))?;
+        .map_err(|error| verification_failure("join verification pipeline", error))?
+        .map_err(|error| verification_failure("verification pipeline", error))?;
     let finish = attempt
         .receive_data()
         .await
-        .map_err(|error| failure("receive finish", format!("{error:?}")))?
+        .map_err(|error| transport_failure("receive finish", format!("{error:?}")))?
         .ok_or("data stream closed before finish")?;
     let StreamFrame::Finish(finish) = codec.decode(&finish)? else {
         return Err("terminal data frame was not finish".into());
     };
     let semantic_commitment = finish.semantic_commitment.clone();
-    let StreamAction::Promote = state.finish(finish).map_err(|error| error.to_string())? else {
+    let StreamAction::Promote = state
+        .finish(finish)
+        .map_err(|error| failure("finish receiver state", error))?
+    else {
         return Err("receiver did not reach promotion".into());
     };
     let result_code = if let (Some(session), Some((reservation, _))) =
         (store_session.as_ref(), store_state.as_ref())
     {
         let commitment = (session.verify_commitment)(&session.open, &semantic_commitment)
-            .map_err(|error| failure("verify final commitment", error))?;
+            .map_err(|error| verification_failure("verify final commitment", error))?;
         let promotion = session
             .store
             .promote_blob_stream_with_policy(&session.policy, reservation, &commitment)
-            .map_err(|error| failure("promote stream", error))?;
+            .map_err(|error| lifecycle_failure("promote stream", error))?;
         if promotion.duplicate() {
             StreamResultCode::AlreadyPresent
         } else {
@@ -1005,30 +1210,36 @@ async fn receive_completed_pack_inner(
     let digest = result_digest(open, roots);
     let StreamAction::Send(result) = state
         .promoted(result_code, digest)
-        .map_err(|error| error.to_string())?
+        .map_err(|error| settlement_failure("record receiver promotion", error))?
     else {
         return Err("receiver did not produce result".into());
     };
     attempt
         .send_control(&codec.encode(result)?)
         .await
-        .map_err(|error| failure("send result", format!("{error:?}")))?;
+        .map_err(|error| transport_failure("send result", format!("{error:?}")))?;
     let ack = attempt
         .receive_data()
         .await
-        .map_err(|error| failure("receive result acknowledgement", format!("{error:?}")))?
+        .map_err(|error| transport_failure("receive result acknowledgement", format!("{error:?}")))?
         .ok_or("data stream closed before result acknowledgement")?;
     let StreamFrame::ResultAck(ack) = codec.decode(&ack)? else {
         return Err("settlement frame was not result acknowledgement".into());
     };
     let StreamAction::Terminal(settled) = state
         .result_ack(ack, result_code)
-        .map_err(|error| error.to_string())?
+        .map_err(|error| settlement_failure("settle receiver state", error))?
     else {
-        return Err("receiver settlement action differed".into());
+        return Err(settlement_failure(
+            "settle receiver",
+            "settlement action differed",
+        ));
     };
     if settled != result_code {
-        return Err("receiver settled a different result code".into());
+        return Err(settlement_failure(
+            "settle receiver",
+            "result code differed",
+        ));
     }
     finish_receiver_attempt(attempt).await?;
     Ok(BlobNetworkReport {
@@ -1063,6 +1274,16 @@ mod tests {
     };
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn network_error_retains_stage_but_sanitizes_internal_detail() {
+        let error = expected_pack_wire_len(u64::MAX).expect_err("wire length must overflow");
+
+        assert_eq!(error.stage(), BlobNetworkStage::Framing);
+        assert!(error.to_string().contains("wire length overflow"));
+        assert_eq!(error.public_message(), "profile-5 Blob framing failed");
+        assert!(!error.public_message().contains("overflow"));
+    }
 
     fn mission_pair() -> (MissionSession, MissionSession, [u8; 32]) {
         let scope = Scope::new("mission/alpha").unwrap();
@@ -1156,6 +1377,41 @@ mod tests {
             attempt_nonce: nonce,
         };
         assert_eq!(receiver_codec.decode(&encoded).unwrap(), frame);
+    }
+
+    #[test]
+    fn wrong_mission_direction_is_an_authentication_failure() {
+        let (mut sender, mut receiver, profile_digest) = mission_pair();
+        let nonce = [0xc8; 32];
+        let frame = StreamFrame::Data(crate::stream_transfer::StreamDataV1 {
+            transfer_id: [0xc9; 32],
+            attempt_nonce: nonce,
+            sequence: 0,
+            offset: 0,
+            bytes: vec![0xca; 32],
+        });
+        let encoded = MissionBlobRecordCodec {
+            mission: &mut sender,
+            profile_digest,
+            direction: EventDirection::ToSessionResponder,
+            attempt_nonce: nonce,
+        }
+        .encode(frame)
+        .unwrap();
+        let error = MissionBlobRecordCodec {
+            mission: &mut receiver,
+            profile_digest,
+            direction: EventDirection::ToSessionInitiator,
+            attempt_nonce: nonce,
+        }
+        .decode(&encoded)
+        .expect_err("wrong mission direction must fail");
+
+        assert_eq!(error.stage(), BlobNetworkStage::Authentication);
+        assert_eq!(
+            error.public_message(),
+            "profile-5 Blob authentication failed"
+        );
     }
 
     #[test]

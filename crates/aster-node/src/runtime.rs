@@ -26093,6 +26093,10 @@ fn blob_stream_error(context: &str, error: impl fmt::Display) -> NodeError {
     NodeError::Protocol(format!("{context}: {error}"))
 }
 
+fn profile5_blob_network_error(error: blob_stream::BlobNetworkError) -> NodeError {
+    NodeError::Protocol(error.public_message().into())
+}
+
 #[derive(Clone, Copy)]
 enum BlobStreamReportDirection {
     Sent,
@@ -26341,7 +26345,7 @@ async fn send_profile5_blob_direction(
         publication.authenticated_commitment().to_vec(),
     )
     .await
-    .map_err(|error| blob_stream_error("send profile-5 Blob", error))?;
+    .map_err(profile5_blob_network_error)?;
     record_blob_stream_report(receipt, &report, BlobStreamReportDirection::Sent)?;
     settle_blob_stream_cursor(
         store,
@@ -26465,9 +26469,9 @@ async fn receive_profile5_blob_direction(
         mission.peer().mission_id(),
         commitment_verifier,
     )
-    .map_err(|error| blob_stream_error("prepare Blob stream receive", error))?;
+    .map_err(profile5_blob_network_error)?;
     let wire_len = blob_stream::expected_pack_wire_len(verified_open.open().total_len())
-        .map_err(|error| blob_stream_error("plan Blob stream wire length", error))?;
+        .map_err(profile5_blob_network_error)?;
     let pack_root = aster_redb_store::pack::PinnedBlobPackRoot::open(&store)?;
     let limits = crate::stream_pipeline::PipelineLimits::new(2, 4, 5 * 1024 * 1024, 4)
         .map_err(|error| blob_stream_error("configure Blob stream pipeline", error))?;
@@ -26484,7 +26488,7 @@ async fn receive_profile5_blob_direction(
         limits,
     )
     .await
-    .map_err(|error| blob_stream_error("receive profile-5 Blob", error))?;
+    .map_err(profile5_blob_network_error)?;
     record_blob_stream_report(receipt, &report, BlobStreamReportDirection::Received)?;
     guard.check(&store)
 }
@@ -31796,6 +31800,19 @@ mod tests {
     use std::sync::{Barrier, mpsc as std_mpsc};
 
     use super::*;
+
+    #[test]
+    fn profile5_blob_error_boundary_does_not_expose_internal_detail() {
+        let internal =
+            blob_stream::expected_pack_wire_len(u64::MAX).expect_err("wire length must overflow");
+        assert!(internal.to_string().contains("wire length overflow"));
+
+        let NodeError::Protocol(public) = profile5_blob_network_error(internal) else {
+            panic!("profile-5 failure must remain a protocol error");
+        };
+        assert_eq!(public, "profile-5 Blob framing failed");
+        assert!(!public.contains("overflow"));
+    }
 
     #[test]
     fn blob_retry_boundaries_preserve_only_equivalent_second_capacity_errors() {
