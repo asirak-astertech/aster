@@ -33,6 +33,7 @@ pub(crate) enum AuthenticatedSupportSource {
     ProvisionedPeer,
     AuthenticatedConfiguration,
     AuthenticatedDiscovery,
+    MissionSessionNegotiation,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -56,6 +57,11 @@ pub(crate) struct TransportCandidate {
     pub full_duplex: bool,
     pub health: CandidateHealth,
     pub configured_priority: i16,
+}
+
+pub(crate) struct TransportAdapterCandidate {
+    pub candidate: TransportCandidate,
+    pub adapter: Arc<dyn StreamTransportAdapter>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -101,6 +107,29 @@ impl TransportSelector {
                 .then_with(|| left.id.cmp(&right.id))
         });
         ranked
+    }
+
+    pub(crate) fn select_adapter(
+        requirements: TransferRequirements,
+        candidates: &[TransportAdapterCandidate],
+    ) -> Option<Arc<dyn StreamTransportAdapter>> {
+        let descriptors = candidates
+            .iter()
+            .map(|candidate| candidate.candidate)
+            .collect::<Vec<_>>();
+        Self::rank(requirements, &descriptors)
+            .into_iter()
+            .find_map(|selected| {
+                candidates
+                    .iter()
+                    .find(|candidate| {
+                        candidate.candidate == selected
+                            && candidate.adapter.id() == selected.id
+                            && candidate.adapter.health() == selected.health
+                            && candidate.adapter.eligibility(requirements)
+                    })
+                    .map(|candidate| Arc::clone(&candidate.adapter))
+            })
     }
 }
 
@@ -533,6 +562,76 @@ mod tests {
             ),
             vec![healthy, degraded]
         );
+    }
+
+    struct SelectionAdapter {
+        health: CandidateHealth,
+    }
+
+    impl StreamTransportAdapter for SelectionAdapter {
+        fn id(&self) -> StreamTransportId {
+            StreamTransportId::IrohQuicV1
+        }
+
+        fn eligibility(&self, requirements: TransferRequirements) -> bool {
+            requirements.reliable_ordered && requirements.full_duplex
+        }
+
+        fn health(&self) -> CandidateHealth {
+            self.health
+        }
+
+        fn open_attempt<'a>(
+            &'a self,
+            _request: AttemptOpenRequest,
+        ) -> AdapterFuture<'a, Arc<dyn StreamAttempt>> {
+            Box::pin(async { Err(StreamTransportError::Closed) })
+        }
+
+        fn accept_attempt<'a>(
+            &'a self,
+            _request: AttemptOpenRequest,
+        ) -> AdapterFuture<'a, Arc<dyn StreamReceiveAttempt>> {
+            Box::pin(async { Err(StreamTransportError::Closed) })
+        }
+    }
+
+    #[test]
+    fn stream_transport_selector_returns_best_eligible_adapter() {
+        let unavailable = Arc::new(SelectionAdapter {
+            health: CandidateHealth::Healthy,
+        });
+        let degraded: Arc<dyn StreamTransportAdapter> = Arc::new(SelectionAdapter {
+            health: CandidateHealth::Degraded,
+        });
+        let healthy: Arc<dyn StreamTransportAdapter> = Arc::new(SelectionAdapter {
+            health: CandidateHealth::Healthy,
+        });
+
+        let selected = TransportSelector::select_adapter(
+            TransferRequirements::default(),
+            &[
+                TransportAdapterCandidate {
+                    candidate: TransportCandidate {
+                        policy_allowed: false,
+                        ..candidate(100, CandidateHealth::Healthy)
+                    },
+                    adapter: unavailable,
+                },
+                TransportAdapterCandidate {
+                    candidate: candidate(10, CandidateHealth::Degraded),
+                    adapter: Arc::clone(&degraded),
+                },
+                TransportAdapterCandidate {
+                    candidate: candidate(1, CandidateHealth::Healthy),
+                    adapter: Arc::clone(&healthy),
+                },
+            ],
+        )
+        .expect("one adapter is eligible");
+
+        assert!(Arc::ptr_eq(&selected, &healthy));
+        assert!(!Arc::ptr_eq(&selected, &degraded));
     }
 
     fn authority(seed: u8, age: u64, offset: u64, generation: u64) -> AttemptAuthority {

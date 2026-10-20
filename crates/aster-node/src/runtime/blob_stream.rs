@@ -15,7 +15,11 @@ use crate::{
         blob_pack_wire_len, encode_composite_data_prefix, profile5_attempt_bounds,
         profile5_receive_limit, split_composite_data_record,
     },
-    stream_transport::{AttemptOpenRequest, IrohQuicV1Adapter, StreamTransportAdapter},
+    stream_transport::{
+        AttemptOpenRequest, AuthenticatedPeerSupport, AuthenticatedSupportSource,
+        IrohQuicV1Adapter, StreamTransportAdapter, StreamTransportId, TransferRequirements,
+        TransportAdapterCandidate, TransportCandidate, TransportSelector,
+    },
 };
 use aster_iroh::Connection;
 use aster_mesh::{
@@ -30,6 +34,35 @@ use aster_redb_store::{
 use sha2::{Digest, Sha256};
 use std::{path::Path, sync::Arc};
 use tokio::{sync::mpsc, time::Instant};
+
+#[cfg(test)]
+static ACTIVE_RECEIVE_PIPELINES: std::sync::Mutex<Vec<StreamJobId>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+struct ReceivePipelineGuard {
+    job: StreamJobId,
+}
+
+#[cfg(test)]
+impl ReceivePipelineGuard {
+    fn enter(job: StreamJobId) -> Self {
+        ACTIVE_RECEIVE_PIPELINES.lock().unwrap().push(job);
+        Self { job }
+    }
+}
+
+#[cfg(test)]
+impl Drop for ReceivePipelineGuard {
+    fn drop(&mut self) {
+        let mut active = ACTIVE_RECEIVE_PIPELINES.lock().unwrap();
+        let index = active
+            .iter()
+            .position(|job| *job == self.job)
+            .expect("receive pipeline guard was registered");
+        active.swap_remove(index);
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BlobNetworkStage {
@@ -215,6 +248,36 @@ fn settlement_failure(
     error: impl std::fmt::Display,
 ) -> BlobNetworkError {
     BlobNetworkError::new(BlobNetworkStage::Settlement, context, error)
+}
+
+fn select_stream_transport(
+    connection: Connection,
+) -> Result<Arc<dyn StreamTransportAdapter>, BlobNetworkError> {
+    let adapter: Arc<dyn StreamTransportAdapter> = Arc::new(IrohQuicV1Adapter::new(connection));
+    let candidates = [TransportAdapterCandidate {
+        candidate: TransportCandidate {
+            id: StreamTransportId::IrohQuicV1,
+            locally_enabled: true,
+            policy_allowed: true,
+            peer_support: Some(AuthenticatedPeerSupport::new(
+                AuthenticatedSupportSource::MissionSessionNegotiation,
+                true,
+            )),
+            reliable_ordered: true,
+            full_duplex: true,
+            health: adapter.health(),
+            configured_priority: 0,
+        },
+        adapter,
+    }];
+    TransportSelector::select_adapter(TransferRequirements::default(), &candidates).ok_or_else(
+        || {
+            transport_failure(
+                "select stream transport",
+                "no eligible transport is available",
+            )
+        },
+    )
 }
 
 fn encoded(frame: StreamFrame) -> Result<Vec<u8>, BlobNetworkError> {
@@ -587,8 +650,9 @@ pub async fn send_completed_pack(
     semantic_commitment: Vec<u8>,
 ) -> Result<BlobNetworkReport, BlobNetworkError> {
     let mut codec = PlainBlobRecordCodec;
+    let transport = select_stream_transport(connection)?;
     send_completed_pack_inner(
-        connection,
+        transport.as_ref(),
         open,
         authenticated_open,
         PackAccess::Path(root),
@@ -620,8 +684,9 @@ pub(crate) async fn send_completed_pack_protected(
         direction,
         attempt_nonce,
     };
+    let transport = select_stream_transport(connection)?;
     send_completed_pack_inner(
-        connection,
+        transport.as_ref(),
         open,
         authenticated_open,
         PackAccess::Pinned(root),
@@ -639,7 +704,7 @@ pub(crate) async fn send_completed_pack_protected(
 
 #[allow(clippy::too_many_arguments)]
 async fn send_completed_pack_inner(
-    connection: Connection,
+    transport: &dyn StreamTransportAdapter,
     open: &BlobStreamOpen,
     authenticated_open: Vec<u8>,
     root: PackAccess<'_>,
@@ -661,7 +726,7 @@ async fn send_completed_pack_inner(
         profile5_attempt_bounds(wire_len).map_err(|error| {
             BlobNetworkError::new(BlobNetworkStage::Framing, "bound stream attempt", error)
         })?;
-    let attempt = IrohQuicV1Adapter::new(connection)
+    let attempt = transport
         .open_attempt(AttemptOpenRequest {
             deadline: Instant::now() + PROFILE5_ATTEMPT_TIMEOUT,
             max_data_bytes,
@@ -925,8 +990,9 @@ pub async fn receive_completed_pack(
     limits: PipelineLimits,
 ) -> Result<BlobNetworkReport, BlobNetworkError> {
     let mut codec = PlainBlobRecordCodec;
+    let transport = select_stream_transport(connection)?;
     receive_completed_pack_inner(
-        connection,
+        transport.as_ref(),
         open,
         opener,
         PackAccess::Path(root),
@@ -950,8 +1016,9 @@ pub async fn receive_completed_pack_with_store(
 ) -> Result<BlobNetworkReport, BlobNetworkError> {
     let open = session.open.open().clone();
     let mut codec = PlainBlobRecordCodec;
+    let transport = select_stream_transport(connection)?;
     receive_completed_pack_inner(
-        connection,
+        transport.as_ref(),
         &open,
         opener,
         PackAccess::Path(root),
@@ -985,8 +1052,9 @@ pub(crate) async fn receive_completed_pack_with_store_protected(
         direction,
         attempt_nonce,
     };
+    let transport = select_stream_transport(connection)?;
     receive_completed_pack_inner(
-        connection,
+        transport.as_ref(),
         &open,
         opener,
         PackAccess::Pinned(root),
@@ -1005,7 +1073,7 @@ pub(crate) async fn receive_completed_pack_with_store_protected(
 
 #[allow(clippy::too_many_arguments)]
 async fn receive_completed_pack_inner(
-    connection: Connection,
+    transport: &dyn StreamTransportAdapter,
     open: &BlobStreamOpen,
     opener: BlobStreamSegmentOpener,
     root: PackAccess<'_>,
@@ -1020,7 +1088,7 @@ async fn receive_completed_pack_inner(
         profile5_attempt_bounds(wire_len).map_err(|error| {
             BlobNetworkError::new(BlobNetworkStage::Framing, "bound stream attempt", error)
         })?;
-    let attempt = IrohQuicV1Adapter::new(connection)
+    let attempt = transport
         .accept_attempt(AttemptOpenRequest {
             deadline: Instant::now() + PROFILE5_ATTEMPT_TIMEOUT,
             max_data_bytes,
@@ -1090,7 +1158,9 @@ async fn receive_completed_pack_inner(
             .try_into()
             .expect("job ID"),
     );
-    let pipeline_task = tokio::spawn(async move {
+    let pipeline = async move {
+        #[cfg(test)]
+        let _lifetime = ReceivePipelineGuard::enter(stream_job);
         let mut last_checkpoint_wire = resume.durable_wire_offset();
         let report = run_ordered_channel_pipeline_from(
             stream_job,
@@ -1143,70 +1213,75 @@ async fn receive_completed_pack_inner(
             .finish()
             .map_err(|error| PipelineError::SinkFailed(error.to_string()))?;
         Ok::<_, PipelineError>((report, roots))
-    });
+    };
 
     let mut partitioner = RecordPartitioner::new(resume.next_segment_index(), durable_wire);
     let mut received = durable_wire;
     let mut durable_wire = durable_wire;
     let mut checkpoints = 0_u64;
-    while received < wire_len {
-        let frame = attempt
-            .receive_data()
-            .await
-            .map_err(|error| transport_failure("receive data", format!("{error:?}")))?
-            .ok_or("data stream closed before completion")?;
-        let StreamFrame::Data(data) = codec.decode(&frame)? else {
-            return Err("non-data frame before complete payload".into());
-        };
-        let StreamAction::Persist { through } = state
-            .data(&data)
-            .map_err(|error| failure("advance receiver data", error))?
-        else {
-            return Err("receiver did not accept new data".into());
-        };
-        partitioner.push(data.bytes, &partition_tx).await?;
-        received = through;
-        if partitioner.consumed - durable_wire >= u64::from(MAX_STREAM_CHECKPOINT_BATCH_BYTES)
-            || partitioner.consumed == wire_len
-        {
-            let progress = durable_rx.recv().await.ok_or_else(|| {
-                verification_failure(
-                    "receive durable checkpoint",
-                    "verification pipeline closed before checkpoint",
-                )
-            })?;
-            if let (Some(session), Some((reservation, resume))) =
-                (store_session.as_ref(), store_state.as_mut())
+    let receive = async {
+        while received < wire_len {
+            let frame = attempt
+                .receive_data()
+                .await
+                .map_err(|error| transport_failure("receive data", format!("{error:?}")))?
+                .ok_or("data stream closed before completion")?;
+            let StreamFrame::Data(data) = codec.decode(&frame)? else {
+                return Err("non-data frame before complete payload".into());
+            };
+            let StreamAction::Persist { through } = state
+                .data(&data)
+                .map_err(|error| failure("advance receiver data", error))?
+            else {
+                return Err("receiver did not accept new data".into());
+            };
+            partitioner.push(data.bytes, &partition_tx).await?;
+            received = through;
+            if partitioner.consumed - durable_wire >= u64::from(MAX_STREAM_CHECKPOINT_BATCH_BYTES)
+                || partitioner.consumed == wire_len
             {
-                *resume = session
-                    .store
-                    .checkpoint_blob_stream(
-                        &session.policy,
-                        reservation,
-                        *resume,
-                        progress.checkpoint.clone(),
+                let progress = durable_rx.recv().await.ok_or_else(|| {
+                    verification_failure(
+                        "receive durable checkpoint",
+                        "verification pipeline closed before checkpoint",
                     )
-                    .map_err(|error| durability_failure("project durable checkpoint", error))?;
+                })?;
+                if let (Some(session), Some((reservation, resume))) =
+                    (store_session.as_ref(), store_state.as_mut())
+                {
+                    *resume = session
+                        .store
+                        .checkpoint_blob_stream(
+                            &session.policy,
+                            reservation,
+                            *resume,
+                            progress.checkpoint.clone(),
+                        )
+                        .map_err(|error| durability_failure("project durable checkpoint", error))?;
+                }
+                send_durable_checkpoint(
+                    &attempt,
+                    &mut state,
+                    &progress,
+                    wire_len,
+                    &mut current_limit,
+                    codec,
+                )
+                .await?;
+                durable_wire = progress.wire_offset;
+                checkpoints += 1;
             }
-            send_durable_checkpoint(
-                &attempt,
-                &mut state,
-                &progress,
-                wire_len,
-                &mut current_limit,
-                codec,
-            )
-            .await?;
-            durable_wire = progress.wire_offset;
-            checkpoints += 1;
         }
-    }
-    partitioner.finish(wire_len)?;
-    drop(partition_tx);
-    let (pipeline, roots) = pipeline_task
-        .await
-        .map_err(|error| verification_failure("join verification pipeline", error))?
-        .map_err(|error| verification_failure("verification pipeline", error))?;
+        partitioner.finish(wire_len)?;
+        drop(partition_tx);
+        Ok::<(), BlobNetworkError>(())
+    };
+    let verify = async {
+        pipeline
+            .await
+            .map_err(|error| verification_failure("verification pipeline", error))
+    };
+    let ((), (pipeline, roots)) = tokio::try_join!(receive, verify)?;
     let finish = attempt
         .receive_data()
         .await
@@ -1288,7 +1363,10 @@ async fn receive_completed_pack_inner(
 mod tests {
     use super::*;
     use crate::mission::{MissionPeerBinding, MissionSessionInitiator, MissionSessionResponder};
-    use crate::stream_transport::{AdapterFuture, StreamReceiveAttempt, StreamTransportError};
+    use crate::stream_transport::{
+        AdapterFuture, CandidateHealth, StreamAttempt, StreamReceiveAttempt,
+        StreamTransportAdapter, StreamTransportError, StreamTransportId, TransferRequirements,
+    };
     use crate::{application::blob_stream::publish_blob_stream, stream_pipeline::PipelineLimits};
     use aster_iroh::{CarrierSecurityProfile, Endpoint, EndpointConfig, ExpectedPeer, SecretKey};
     use aster_mesh::{
@@ -1547,6 +1625,145 @@ mod tests {
         events: std::sync::Mutex<Vec<&'static str>>,
     }
 
+    struct MemorySenderAttempt {
+        data: mpsc::UnboundedSender<Option<Vec<u8>>>,
+        control: tokio::sync::Mutex<mpsc::UnboundedReceiver<Option<Vec<u8>>>>,
+    }
+
+    impl StreamAttempt for MemorySenderAttempt {
+        fn send_data<'a>(&'a self, frame: &'a [u8]) -> AdapterFuture<'a, ()> {
+            Box::pin(async move {
+                self.data
+                    .send(Some(frame.to_vec()))
+                    .map_err(|_| StreamTransportError::Closed)
+            })
+        }
+
+        fn send_data_parts<'a>(
+            &'a self,
+            prefix: &'a [u8],
+            body: &'a [u8],
+        ) -> AdapterFuture<'a, ()> {
+            Box::pin(async move {
+                let mut frame = Vec::with_capacity(prefix.len() + body.len());
+                frame.extend_from_slice(prefix);
+                frame.extend_from_slice(body);
+                self.data
+                    .send(Some(frame))
+                    .map_err(|_| StreamTransportError::Closed)
+            })
+        }
+
+        fn receive_control(&self) -> AdapterFuture<'_, Option<Vec<u8>>> {
+            Box::pin(async move { Ok(self.control.lock().await.recv().await.flatten()) })
+        }
+
+        fn finish_data(&self) -> AdapterFuture<'_, ()> {
+            Box::pin(async move {
+                self.data
+                    .send(None)
+                    .map_err(|_| StreamTransportError::Closed)
+            })
+        }
+    }
+
+    struct MemoryReceiverAttempt {
+        data: tokio::sync::Mutex<mpsc::UnboundedReceiver<Option<Vec<u8>>>>,
+        control: mpsc::UnboundedSender<Option<Vec<u8>>>,
+        fail_after_receives: Option<usize>,
+        receives: std::sync::atomic::AtomicUsize,
+    }
+
+    impl StreamReceiveAttempt for MemoryReceiverAttempt {
+        fn receive_data(&self) -> AdapterFuture<'_, Option<Vec<u8>>> {
+            Box::pin(async move {
+                let receive = self.receives.fetch_add(1, Ordering::SeqCst);
+                if self
+                    .fail_after_receives
+                    .is_some_and(|limit| receive >= limit)
+                {
+                    let _ = self.control.send(None);
+                    return Err(StreamTransportError::Closed);
+                }
+                Ok(self.data.lock().await.recv().await.flatten())
+            })
+        }
+
+        fn send_control<'a>(&'a self, frame: &'a [u8]) -> AdapterFuture<'a, ()> {
+            Box::pin(async move {
+                self.control
+                    .send(Some(frame.to_vec()))
+                    .map_err(|_| StreamTransportError::Closed)
+            })
+        }
+
+        fn finish_control(&self) -> AdapterFuture<'_, ()> {
+            Box::pin(async move {
+                self.control
+                    .send(None)
+                    .map_err(|_| StreamTransportError::Closed)
+            })
+        }
+    }
+
+    struct MemoryTransportAdapter {
+        sender: Arc<MemorySenderAttempt>,
+        receiver: Arc<MemoryReceiverAttempt>,
+    }
+
+    impl MemoryTransportAdapter {
+        fn new() -> Self {
+            Self::with_receive_failure(None)
+        }
+
+        fn with_receive_failure(fail_after_receives: Option<usize>) -> Self {
+            let (data_send, data_receive) = mpsc::unbounded_channel();
+            let (control_send, control_receive) = mpsc::unbounded_channel();
+            Self {
+                sender: Arc::new(MemorySenderAttempt {
+                    data: data_send,
+                    control: tokio::sync::Mutex::new(control_receive),
+                }),
+                receiver: Arc::new(MemoryReceiverAttempt {
+                    data: tokio::sync::Mutex::new(data_receive),
+                    control: control_send,
+                    fail_after_receives,
+                    receives: std::sync::atomic::AtomicUsize::new(0),
+                }),
+            }
+        }
+    }
+
+    impl StreamTransportAdapter for MemoryTransportAdapter {
+        fn id(&self) -> StreamTransportId {
+            StreamTransportId::IrohQuicV1
+        }
+
+        fn eligibility(&self, requirements: TransferRequirements) -> bool {
+            requirements.reliable_ordered && requirements.full_duplex
+        }
+
+        fn health(&self) -> CandidateHealth {
+            CandidateHealth::Healthy
+        }
+
+        fn open_attempt<'a>(
+            &'a self,
+            _request: AttemptOpenRequest,
+        ) -> AdapterFuture<'a, Arc<dyn StreamAttempt>> {
+            let sender = Arc::clone(&self.sender);
+            Box::pin(async move { Ok(sender as Arc<dyn StreamAttempt>) })
+        }
+
+        fn accept_attempt<'a>(
+            &'a self,
+            _request: AttemptOpenRequest,
+        ) -> AdapterFuture<'a, Arc<dyn StreamReceiveAttempt>> {
+            let receiver = Arc::clone(&self.receiver);
+            Box::pin(async move { Ok(receiver as Arc<dyn StreamReceiveAttempt>) })
+        }
+    }
+
     impl StreamReceiveAttempt for TerminalReceiveAttempt {
         fn receive_data(&self) -> AdapterFuture<'_, Option<Vec<u8>>> {
             Box::pin(async move {
@@ -1604,8 +1821,12 @@ mod tests {
     }
 
     fn open(total_len: u64) -> BlobStreamOpen {
+        open_with_stream_seed(total_len, 0x12)
+    }
+
+    fn open_with_stream_seed(total_len: u64, stream_seed: u8) -> BlobStreamOpen {
         BlobStreamOpen::new(
-            BlobPublicationStreamId::from_bytes([0x12; 32]).expect("stream"),
+            BlobPublicationStreamId::from_bytes([stream_seed; 32]).expect("stream"),
             [0x22; 32],
             b"network-pipeline".to_vec(),
             [0x32; 32],
@@ -1707,6 +1928,150 @@ mod tests {
             .expect_err("oversized profile-5 record must fail before verification");
 
         assert_eq!(error.stage(), BlobNetworkStage::Framing);
+    }
+
+    #[tokio::test]
+    async fn completed_pack_runtime_uses_selected_transport_adapter() {
+        let source_root = TempRoot::new("adapter-source");
+        let receiver_root = TempRoot::new("adapter-receiver");
+        let total_len = 2 * BLOB_STREAM_SEGMENT_BYTES + 17;
+        let open = open(total_len as u64);
+        let key = [0x66; 32];
+        let nonce = [0x76; 12];
+        let limits = PipelineLimits::new(2, 4, 5 * 1024 * 1024, 4).unwrap();
+        let published = publish_blob_stream(
+            std::io::Cursor::new(vec![0x5c; total_len]),
+            &open,
+            BlobStreamSegmentSealer::from_test_key(
+                *open.stream_id().as_bytes(),
+                open.digest(),
+                open.content_epoch(),
+                key,
+                nonce,
+            ),
+            &source_root.0,
+            limits,
+        )
+        .await
+        .unwrap();
+        let roots = (published.plaintext_root, published.ciphertext_root);
+        let wire_len = completed_pack_wire_len(&source_root.0, &open).unwrap();
+        let transport = MemoryTransportAdapter::new();
+        let mut sender_codec = PlainBlobRecordCodec;
+        let mut receiver_codec = PlainBlobRecordCodec;
+
+        let sender = send_completed_pack_inner(
+            &transport,
+            &open,
+            open.encode(),
+            PackAccess::Path(&source_root.0),
+            roots,
+            open.digest().to_vec(),
+            None,
+            StreamDirection::ToSessionResponder,
+            &mut sender_codec,
+        );
+        let receiver = receive_completed_pack_inner(
+            &transport,
+            &open,
+            BlobStreamSegmentOpener::from_test_key(
+                *open.stream_id().as_bytes(),
+                open.digest(),
+                open.content_epoch(),
+                key,
+                nonce,
+            ),
+            PackAccess::Path(&receiver_root.0),
+            wire_len,
+            limits,
+            None,
+            None,
+            StreamDirection::ToSessionResponder,
+            &mut receiver_codec,
+        );
+        let (sent, received) = tokio::join!(sender, receiver);
+        let sent = sent.unwrap();
+        let received = received.unwrap();
+
+        assert_eq!(sent.roots, roots);
+        assert_eq!(received.roots, roots);
+        assert_eq!(sent.wire_bytes, wire_len);
+        assert_eq!(received.wire_bytes, wire_len);
+        assert_eq!(
+            received.pipeline.unwrap().completed_items(),
+            published.segment_count
+        );
+    }
+
+    #[tokio::test]
+    async fn receive_transport_failure_cancels_and_joins_pipeline() {
+        let source_root = TempRoot::new("cancel-source");
+        let receiver_root = TempRoot::new("cancel-receiver");
+        let total_len = 3 * BLOB_STREAM_SEGMENT_BYTES + 17;
+        let open = open_with_stream_seed(total_len as u64, 0x13);
+        let key = [0x67; 32];
+        let nonce = [0x77; 12];
+        let limits = PipelineLimits::new(2, 4, 5 * 1024 * 1024, 4).unwrap();
+        let published = publish_blob_stream(
+            std::io::Cursor::new(vec![0x5b; total_len]),
+            &open,
+            BlobStreamSegmentSealer::from_test_key(
+                *open.stream_id().as_bytes(),
+                open.digest(),
+                open.content_epoch(),
+                key,
+                nonce,
+            ),
+            &source_root.0,
+            limits,
+        )
+        .await
+        .unwrap();
+        let roots = (published.plaintext_root, published.ciphertext_root);
+        let wire_len = completed_pack_wire_len(&source_root.0, &open).unwrap();
+        let transport = MemoryTransportAdapter::with_receive_failure(Some(2));
+        let mut sender_codec = PlainBlobRecordCodec;
+        let mut receiver_codec = PlainBlobRecordCodec;
+
+        let sender = send_completed_pack_inner(
+            &transport,
+            &open,
+            open.encode(),
+            PackAccess::Path(&source_root.0),
+            roots,
+            open.digest().to_vec(),
+            None,
+            StreamDirection::ToSessionResponder,
+            &mut sender_codec,
+        );
+        let receiver = receive_completed_pack_inner(
+            &transport,
+            &open,
+            BlobStreamSegmentOpener::from_test_key(
+                *open.stream_id().as_bytes(),
+                open.digest(),
+                open.content_epoch(),
+                key,
+                nonce,
+            ),
+            PackAccess::Path(&receiver_root.0),
+            wire_len,
+            limits,
+            None,
+            None,
+            StreamDirection::ToSessionResponder,
+            &mut receiver_codec,
+        );
+        let (_sent, received) = tokio::join!(sender, receiver);
+        let error = received.expect_err("injected transport failure must terminate receive");
+
+        assert_eq!(error.stage(), BlobNetworkStage::Transport);
+        let job = StreamJobId::from_bytes(
+            open.stream_id().as_bytes()[..16]
+                .try_into()
+                .expect("job ID"),
+        );
+        assert!(!ACTIVE_RECEIVE_PIPELINES.lock().unwrap().contains(&job));
     }
 
     #[tokio::test]

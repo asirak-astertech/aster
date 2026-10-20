@@ -173,6 +173,13 @@ operator status contract. Iroh may establish a direct or
 operator-pinned relay path. Confirm the observed endpoint and `carrier_path`
 instead of inferring them from SSH reachability:
 
+The production sender and receiver consume only the selected stream-adapter
+contract after selection; Iroh is constructed at the outer composition edge.
+The receiver runs transport ingestion and verification/checkpoint work in one
+scoped operation. Any transport, framing, verification, or sink failure drops
+admission and joins the fixed verification workers before the attempt returns,
+so no failed attempt leaves a detached pipeline holding pack or key material.
+
 ```sh
 rg 'CONTACT .*blob_stream_(sent|received)_bytes=[1-9]' /path/to/node.log
 ```
