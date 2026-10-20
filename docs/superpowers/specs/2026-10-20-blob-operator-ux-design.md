@@ -30,45 +30,47 @@ BTLE implementation, or release authorization.
 
 ### 1. Exact local lifecycle inspection
 
-Add one authenticated local-agent unary operation, `InspectBlob`, addressed by
-exact Blob ID, topic, and scope. The response reports only facts the queried node
-can prove from its current authorized durable state:
+Add one authenticated local-agent unary operation, `InspectBlobPublication`,
+addressed by exact publication ID, topic, and scope. The publication ID is the
+transport-neutral, source-authenticated profile-5 stream identity present in the
+open before any data bytes. It is distinct from the immutable content `BlobId`,
+which is derived only after the final plaintext root exists. `blob-publish`
+returns both identities: publication ID tracks this publication through the
+mesh, while Blob ID remains the read and deduplication identity.
+
+The response reports only facts the queried node can prove from its current
+authorized durable state:
 
 - `MISSING`: no current authorized pending or completed object is visible;
 - `AWAITING_DATA`: authenticated source metadata is durable and no carrier or
   profile-5 pack bytes are durable;
 - `RECEIVING`: a nonzero durable prefix exists and work remains;
 - `READY_TO_FINALIZE`: all data is durable but atomic promotion is unfinished;
-- `AVAILABLE`: a current authorized completed publication can be read; and
+- `AVAILABLE`: this publication is complete and its returned Blob ID can be
+  read; and
 - `EXPIRED_OR_RETIRED`: retained lifecycle evidence proves the object is no
   longer readable.
 
 Pending states include plaintext total bytes, transfer total bytes, durable
 transfer bytes, total units, and durable units. The byte domain is named
 explicitly: transfer bytes are authenticated encrypted pack/carrier bytes, not
-plaintext. Available state includes the authenticated plaintext length.
+plaintext. Available state includes the authenticated plaintext length and Blob
+ID.
 
-Inspection uses the existing bounded completed/retired content index plus a new
-audited pending-content index keyed by exact topic, scope, Blob ID, and
-publication/stream identity. Both profile-4 pending sources and profile-5 stream
-reservations maintain that index in the same transaction as their authoritative
-row. Startup inspection rejects missing, extra, or contradictory index rows;
-schema migration reconstructs the index transactionally before the store becomes
-live. The existing per-content publication bound also bounds pending candidates.
-
-State precedence is `AVAILABLE`, the most advanced current authorized pending
-state, `EXPIRED_OR_RETIRED`, then `MISSING`. If several authorized pending
-publications reference the same content, inspection reports the candidate with
-the greatest exact durable-byte fraction, breaking ties by durable bytes and
-then canonical publication identity. Contradictory totals fail closed rather
-than being combined.
+Inspection performs direct bounded lookup in the existing profile-5 reservation
+or completed-publication authority keyed by publication ID. A bounded durable
+retirement record keyed by the same ID preserves only the minimum state needed
+to distinguish `EXPIRED_OR_RETIRED` from `MISSING`; it follows the existing Blob
+lifecycle retention and capacity policy. Promotion atomically replaces pending
+state with completed state, and retirement atomically replaces visible state
+with retirement evidence. Contradictory simultaneous states fail closed.
 
 The operation is exact rather than a list so its response is bounded regardless
 of depot size. It does not expose peer identities, paths, carrier object IDs,
 lineages, cryptographic material, or transport-selection internals. It does not
 claim that any other node has or lacks the object.
 
-`asterctl blob-status --id ID --topic TOPIC --scope SCOPE` prints one snapshot.
+`asterctl blob-status --publication-id ID --topic TOPIC --scope SCOPE` prints one snapshot.
 `--wait` polls the same local operation until `AVAILABLE`,
 `EXPIRED_OR_RETIRED`, or the global client deadline. `--poll-ms` is accepted in
 `100..=60000` and defaults to `1000`. A wait deadline reports the final observed
@@ -77,6 +79,11 @@ state, including `MISSING`; wait succeeds only for `AVAILABLE`.
 
 Operators inspect the receiving node to observe destination durability. A sender
 does not infer receiver completion from its own local publication receipt.
+
+This first public lifecycle query covers semantic-v9/profile-5 publication IDs.
+Semantic-v7/v8 profile-4 remains byte-compatible but does not gain a new public
+tracking identity in this increment. Unsupported legacy identities fail as
+invalid input rather than being guessed or translated.
 
 Lifecycle state is derived from Aster store and stream-checkpoint authority, not
 from an IP connection, QUIC stream, endpoint, or transport callback. A future
@@ -159,8 +166,8 @@ interest prerequisites must be documented separately. The operator guide must
 show the complete workflow:
 
 1. inspect capacity on publisher and receiver;
-2. publish locally and retain Blob ID plus operation key;
-3. inspect or wait on the receiver by exact identity;
+2. publish locally and retain publication ID, Blob ID, and operation key;
+3. inspect or wait on the receiver by exact publication identity;
 4. read only after receiver-local `AVAILABLE`;
 5. compare hashes; and
 6. use the reported durable offset and exact retry instruction after an
@@ -172,10 +179,11 @@ to determine ordinary lifecycle state.
 
 ## Protocol and compatibility
 
-`InspectBlob` and `BlobCapacityStatus` are additive fields and methods in the
-existing alpha application protocol. Existing `GetStatus`, `PublishBlob`, and
-`ReadBlob` field meanings are unchanged. Generated Rust and Go artifacts and
-descriptor fixtures are regenerated in the same change.
+`InspectBlobPublication`, `BlobCapacityStatus`, and the publication-ID field in
+`PublishBlobReceipt` are additive fields and methods in the existing alpha
+application protocol. Existing `GetStatus`, `PublishBlob`, and `ReadBlob` field
+meanings are unchanged. Generated Rust and Go artifacts and descriptor fixtures
+are regenerated in the same change.
 
 Semantic-v9/profile-5 mesh framing does not change. Semantic-v7/v8 profile 4 is
 unchanged. This increment adds no peer acknowledgement, coordination message,
@@ -220,7 +228,10 @@ state meanings, CLI output schema, or safe-retry procedure.
 
 Focused automated evidence must cover:
 
-- all six lifecycle states, including missing/unauthorized conflation;
+- all six lifecycle states by exact publication ID, including
+  missing/unauthorized conflation;
+- stable publication ID from local receipt through interrupted receiver progress
+  and final Blob-ID availability;
 - monotonic durable progress across restart and interrupted contact;
 - exact bounded status responses at zero and maximum counters;
 - wait success, terminal retirement, and deadline with final-state reporting;
