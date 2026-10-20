@@ -15,11 +15,27 @@ def positive_integer(value: str) -> int:
     return parsed
 
 
+def positive_finite_seconds(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive finite number")
+    return parsed
+
+
 def markdown_cell(value: str) -> str:
     return " ".join(value.split()).replace("\\", "\\\\").replace("|", "\\|")
 
 
-def summarize(source: Path, partition: str, limit: int) -> str:
+def github_command_value(value: str) -> str:
+    return value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
+def summarize(
+    source: Path,
+    partition: str,
+    limit: int,
+    problem_seconds: float | None = None,
+) -> tuple[str, list[tuple[float, str]]]:
     root = ET.parse(source).getroot()
     cases = []
     for case in root.iter("testcase"):
@@ -50,7 +66,28 @@ def summarize(source: Path, partition: str, limit: int) -> str:
     for rank, (duration, identity) in enumerate(cases[:limit], start=1):
         lines.append(f"| {rank} | {markdown_cell(identity)} | {duration:.3f} |")
     lines.append("")
-    return "\n".join(lines)
+
+    problems = []
+    if problem_seconds is not None:
+        problems = [item for item in cases if item[0] > problem_seconds]
+        if problems:
+            lines.extend(
+                [
+                    f"### Duration problems (> {problem_seconds:.3f}s)",
+                    "",
+                    "These are advisory optimization targets; they do not fail this job.",
+                    "",
+                    "| Test | Seconds | Target |",
+                    "| --- | ---: | ---: |",
+                ]
+            )
+            for duration, identity in problems:
+                lines.append(
+                    f"| {markdown_cell(identity)} | {duration:.3f} | "
+                    f"{problem_seconds:.3f} |"
+                )
+            lines.append("")
+    return "\n".join(lines), problems
 
 
 def main() -> int:
@@ -59,12 +96,29 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--partition", required=True)
     parser.add_argument("--limit", type=positive_integer, default=20)
+    parser.add_argument("--problem-seconds", type=positive_finite_seconds)
+    parser.add_argument("--github-annotations", action="store_true")
     arguments = parser.parse_args()
 
     try:
-        summary = summarize(arguments.input, arguments.partition, arguments.limit)
+        summary, problems = summarize(
+            arguments.input,
+            arguments.partition,
+            arguments.limit,
+            arguments.problem_seconds,
+        )
         with arguments.output.open("a", encoding="utf-8") as output:
             output.write(summary)
+        if arguments.github_annotations and arguments.problem_seconds is not None:
+            for duration, identity in problems:
+                message = (
+                    f"{identity} took {duration:.3f}s; advisory target "
+                    f"{arguments.problem_seconds:.3f}s in partition {arguments.partition}"
+                )
+                print(
+                    "::warning title=Rust test duration::"
+                    f"{github_command_value(message)}"
+                )
     except (OSError, ET.ParseError, ValueError) as error:
         print(f"nextest timing summary failed: {error}", file=sys.stderr)
         return 1
