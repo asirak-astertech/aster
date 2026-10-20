@@ -49279,6 +49279,19 @@ mod tests {
                 .sum();
             assert_eq!(prefix, committed_prefix);
         }
+        let plan =
+            completed_test_blob_plan(&a_store, &mut open_test_sealer(&a.credentials), source);
+        let carrier_ids: Vec<_> = plan.carrier_ids().collect();
+        assert_eq!(
+            carrier_ids.len(),
+            1,
+            "multi-range completion fixture uses one carrier"
+        );
+        let encrypted_total = plan
+            .carrier_total_len(&carrier_ids[0].wire_bytes())
+            .unwrap();
+        let expected_ranges =
+            (encrypted_total - committed_prefix).div_ceil(MAX_BLOB_NETWORK_RANGE_BYTES as u64);
         let (received, _, sender_cache, _) = blob_contact_test_pair(
             a_store.clone(),
             a.credentials.clone(),
@@ -49288,7 +49301,10 @@ mod tests {
             interests(),
         )
         .await;
-        assert!(received.blob_ranges_fetched > 1, "{received:?}");
+        assert_eq!(
+            received.blob_ranges_fetched as u64, expected_ranges,
+            "resume fetches exactly the missing ciphertext ranges: {received:?}"
+        );
         assert_eq!(sender_cache.blob_range_source_authentications(), 1);
         assert_eq!(
             sender_cache.blob_range_depot_rechecks(),
@@ -49297,12 +49313,6 @@ mod tests {
         if interrupt.is_some() {
             assert_eq!(received.fetched, 0, "resume reuses authenticated source");
         }
-        let plan =
-            completed_test_blob_plan(&a_store, &mut open_test_sealer(&a.credentials), source);
-        let encrypted_total: u64 = plan
-            .carrier_ids()
-            .map(|object| plan.carrier_total_len(&object.wire_bytes()).unwrap())
-            .sum();
         assert_eq!(
             received.blob_bytes_fetched as u64,
             encrypted_total - committed_prefix
