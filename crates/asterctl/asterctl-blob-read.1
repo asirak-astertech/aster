@@ -46,12 +46,25 @@ Required exact Blob scope.
 .TP
 .BI \-\-output " PATH"
 Required destination path. It must not already exist.
+.TP
+.BI \-\-progress " MODE"
+Progress policy: auto, always, or never. The default auto writes progress only
+when standard error is a terminal. always emits newline-delimited records when
+redirected; never disables progress. Progress never changes standard output.
 .SH OUTPUT
 Blob bytes are written only to
 .BR \-\-output .
 After a complete verified stream, stdout reports Blob ID, publisher, publisher
 counter, topic, scope, priority, total length, optional media type, schema ID,
 acceptance marker, and original TTL. It never prints Blob plaintext.
+.PP
+Progress on standard error reports authenticated bytes written to the hidden
+staging file. Periodic output is limited to four updates per second. On failure,
+the diagnostic reports how many staged bytes were discarded and confirms that
+the requested destination was not published.
+.PP
+Interrupted downloads restart from byte zero; download resume is not yet
+supported.
 .PP
 Text renders TTL as exactly
 .B TTL: durable

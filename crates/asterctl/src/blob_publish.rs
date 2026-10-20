@@ -1,4 +1,4 @@
-use crate::{api, operation_key, validation};
+use crate::{api, operation_key, progress::ProgressMode, validation};
 use std::{
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom},
@@ -17,7 +17,7 @@ pub const HELP: &str = "Usage: asterctl (--token TOKEN | --token-file PATH) [OPT
 Publish a nonempty regular file as an immutable Blob through a running Aster agent.
 
 BLOB OPTIONS:
-      --file PATH               Source file (required; never sent to the agent)
+      --file PATH               Source file (required; path remains local)
       --topic TOPIC             Blob topic (required)
       --scope SCOPE             Propagation and authorization scope (required)
       --priority PRIORITY       routine, priority, immediate, or flash (default: routine)
@@ -25,10 +25,12 @@ BLOB OPTIONS:
       --schema-id BASE64        Schema identity, up to 1024 decoded bytes
       --ttl-ms MILLISECONDS     Positive Blob lifetime (default: durable)
       --operation-key KEY|auto  Required UTF-8 key, 1–256 bytes; auto generates a key
+      --progress MODE           auto, always, or never (default: auto)
       --help                    Show this help
 
 See asterctl --help for global options.
 Generated keys are printed to stderr before sending and included in JSON output.
+The path remains local; file contents stream to the local agent.
 The source file's contents and length must remain unchanged until the command exits.
 ";
 
@@ -48,6 +50,7 @@ pub struct Publication {
     schema_id: Vec<u8>,
     ttl_ms: Option<u64>,
     operation_key: Option<operation_key::Selection>,
+    pub(crate) progress: ProgressMode,
 }
 
 impl Default for Publication {
@@ -61,6 +64,7 @@ impl Default for Publication {
             schema_id: Vec::new(),
             ttl_ms: None,
             operation_key: None,
+            progress: ProgressMode::Auto,
         }
     }
 }
@@ -102,6 +106,7 @@ impl Publication {
             "--operation-key" => {
                 self.operation_key = Some(operation_key::Selection::parse(value)?);
             }
+            "--progress" => self.progress = ProgressMode::parse(&value)?,
             _ => unreachable!("Blob publish option"),
         }
         Ok(())
@@ -152,6 +157,7 @@ impl Publication {
             },
             file,
             key,
+            progress: self.progress,
         })
     }
 }
@@ -201,6 +207,7 @@ pub struct PreparedUpload {
     pub metadata: api::PublishBlobMetadata,
     pub file: File,
     pub key: operation_key::Key,
+    pub progress: ProgressMode,
 }
 
 pub(crate) struct FrameStream {
@@ -453,7 +460,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blob_publish_seeks_to_the_store_authoritative_resume_offset() {
+    async fn publish_retry_uses_agent_resume_offset() {
         use connectrpc::client::Stream as _;
         use std::{fs, future::poll_fn};
 

@@ -1,4 +1,4 @@
-use crate::{api, validation};
+use crate::{api, progress::ProgressMode, validation};
 use std::{fs::File, io::Write as _, path::PathBuf};
 
 #[cfg(target_os = "linux")]
@@ -15,10 +15,12 @@ OPTIONS:
       --topic TOPIC    Exact Blob topic (required)
       --scope SCOPE    Exact Blob scope (required)
       --output PATH    New destination path (required)
+      --progress MODE  auto, always, or never (default: auto)
       --help           Show this help
 
 See asterctl --help for global options.
 Blob bytes are written only to --output; stdout contains metadata only.
+Interrupted downloads restart from byte zero; download resume is not yet supported.
 ";
 
 /// Stable native gRPC Blob response-page size owned by the CLI protocol layer.
@@ -27,12 +29,25 @@ const MAX_PAGE_BYTES: usize = RPC_PAGE_BYTES;
 const MAX_MEDIA_TYPE_BYTES: usize = 255;
 const MAX_SCHEMA_ID_BYTES: usize = 1024;
 
-#[derive(Debug, PartialEq, Default)]
+#[derive(Debug, PartialEq)]
 pub struct Read {
     id: Vec<u8>,
     topic: String,
     scope: String,
     output: Option<PathBuf>,
+    progress: ProgressMode,
+}
+
+impl Default for Read {
+    fn default() -> Self {
+        Self {
+            id: Vec::new(),
+            topic: String::new(),
+            scope: String::new(),
+            output: None,
+            progress: ProgressMode::Auto,
+        }
+    }
 }
 
 impl Read {
@@ -58,6 +73,7 @@ impl Read {
                 validation::scope(&value)?;
                 self.scope = value;
             }
+            "--progress" => self.progress = ProgressMode::parse(&value)?,
             _ => unreachable!("Blob read option"),
         }
         Ok(())
@@ -79,7 +95,7 @@ impl Read {
         Ok(())
     }
 
-    pub fn into_parts(self) -> (api::ReadBlobRequest, PathBuf) {
+    pub fn into_parts(self) -> (api::ReadBlobRequest, PathBuf, ProgressMode) {
         (
             api::ReadBlobRequest {
                 id: self.id,
@@ -88,6 +104,7 @@ impl Read {
                 ..Default::default()
             },
             self.output.expect("validated output path"),
+            self.progress,
         )
     }
 }

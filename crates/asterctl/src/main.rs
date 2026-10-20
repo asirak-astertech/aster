@@ -6,6 +6,7 @@ mod blob_status;
 mod client;
 mod operation_key;
 mod output;
+mod progress;
 mod publish;
 mod query;
 mod subscribe;
@@ -130,30 +131,48 @@ fn run() -> Result<(), (u8, String)> {
                 .prepare()
                 .map_err(|error| (1, error.to_owned()))?;
             announce_key(&upload.key)?;
+            let stderr = io::stderr();
+            let progress = std::cell::RefCell::new(progress::ProgressReporter::new(
+                stderr.lock(),
+                upload.progress,
+                stderr.is_terminal(),
+                progress::ProgressKind::Publish,
+                progress::SystemClock::start(),
+            ));
             let response = rpc
                 .runtime
-                .block_on(client::publish_blob(
+                .block_on(client::publish_blob_with_progress(
                     rpc.address,
                     &rpc.token,
                     upload.metadata,
                     upload.file,
                     rpc.timeout,
+                    &progress,
                 ))
-                .map_err(|error| (1, error.describe("PublishBlob", &upload.key)))?;
+                .map_err(|error| (1, error.describe(&upload.key)))?;
             output::publish_blob(&response, &upload.key.value, rpc.json)
                 .map_err(|_| (1, "cannot format PublishBlob response".to_owned()))?
         }
         args::Command::BlobRead(options, read) => {
             let rpc = RpcContext::new(options)?;
-            let (request, output_path) = read.into_parts();
+            let (request, output_path, progress_mode) = read.into_parts();
+            let stderr = io::stderr();
+            let mut progress = progress::ProgressReporter::new(
+                stderr.lock(),
+                progress_mode,
+                stderr.is_terminal(),
+                progress::ProgressKind::Read,
+                progress::SystemClock::start(),
+            );
             let metadata = rpc
                 .runtime
-                .block_on(client::read_blob(
+                .block_on(client::read_blob_with_progress(
                     rpc.address,
                     &rpc.token,
                     request,
                     output_path,
                     rpc.timeout,
+                    &mut progress,
                 ))
                 .map_err(|error| (1, error))?;
             output::read_blob(&metadata, rpc.json)

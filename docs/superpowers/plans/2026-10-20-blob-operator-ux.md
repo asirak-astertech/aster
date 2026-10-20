@@ -252,25 +252,25 @@
 - Consumes: existing accepted/checkpoint/complete publish frames and authenticated read pages.
 - Produces: `ProgressMode::{Auto,Always,Never}`, a bounded `ProgressReporter<W: Write>`, publish failure snapshots, and read-discard diagnostics.
 
-- [ ] **Step 1: Add failing progress policy tests**
+- [x] **Step 1: Add failing progress policy tests**
 
   Add `progress_auto_requires_tty`, `progress_always_is_newline_delimited_off_tty`, `progress_never_writes_nothing`, `progress_is_rate_limited_to_four_periodic_updates_per_second`, and `progress_emits_initial_checkpoint_and_terminal_records`. Use a fake clock and memory writer so the tests do not sleep.
 
-- [ ] **Step 2: Run the progress tests and confirm they fail**
+- [x] **Step 2: Run the progress tests and confirm they fail**
 
   Run: `cargo test -p asterctl progress -- --nocapture`
 
   Expected: FAIL because the reporter does not exist.
 
-- [ ] **Step 3: Implement transport-neutral progress rendering**
+- [x] **Step 3: Implement transport-neutral progress rendering**
 
   Implement `ProgressReporter<W>` using only source/accepted/durable/written offsets, totals, `Instant`, and `Write`. Render current bytes, total bytes, percentage, elapsed time, and interval rate; use carriage-return updates only for a terminal and newline records otherwise; reject overflow, regression, or inconsistent totals.
 
-- [ ] **Step 4: Add failing publish/read recovery tests**
+- [x] **Step 4: Add failing publish/read recovery tests**
 
   Add `publish_timeout_reports_sent_accepted_durable_total_and_retry`, `publish_retry_uses_agent_resume_offset`, `broken_publish_stderr_prevents_success`, `read_interruption_reports_discarded_bytes`, `broken_read_stderr_does_not_publish_destination`, and `json_stdout_remains_single_terminal_object_with_progress`. Assert the exact operation key appears in the retry instruction.
 
-- [ ] **Step 5: Run recovery tests and confirm they fail**
+- [x] **Step 5: Run recovery tests and confirm they fail**
 
   Run: `cargo test -p asterctl publish_timeout -- --nocapture`
 
@@ -278,15 +278,15 @@
 
   Expected: FAIL because validated counters are not retained outside the timed future and progress errors are not propagated.
 
-- [ ] **Step 6: Integrate progress and retained recovery snapshots**
+- [x] **Step 6: Integrate progress and retained recovery snapshots**
 
   Add `--progress` to Blob publish/read only. Retain the latest validated sent/accepted/durable counters in shared bounded state outside the transfer future; make the agent's accepted resume offset authoritative; propagate progress write errors; on read failure report authenticated staged bytes and confirm the destination rename did not occur.
 
-- [ ] **Step 7: Correct command help and man-page wording**
+- [x] **Step 7: Correct command help and man-page wording**
 
   Replace “never sent to the agent” with “the path remains local; file contents stream to the local agent.” Document stdout/stderr separation, `auto|always|never`, exact retry, and the lack of download resume.
 
-- [ ] **Step 8: Run focused CLI verification**
+- [x] **Step 8: Run focused CLI verification**
 
   Run: `cargo test -p asterctl progress -- --nocapture`
 
@@ -296,7 +296,7 @@
 
   Expected: PASS.
 
-- [ ] **Step 9: Commit progress and recovery UX**
+- [x] **Step 9: Commit progress and recovery UX**
 
   ```bash
   git add crates/asterctl

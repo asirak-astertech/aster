@@ -1,10 +1,19 @@
-use crate::{api, auth::Token, blob_publish, blob_read, operation_key::Key};
+#[cfg(test)]
+use crate::progress::NoProgress;
+use crate::{
+    api,
+    auth::Token,
+    blob_publish, blob_read,
+    operation_key::Key,
+    progress::{ProgressEvent, ProgressSink, ProgressSnapshot},
+};
 use buffa::Message as _;
 use connectrpc::{
     Protocol,
     client::{ClientConfig, Http2Connection, HttpClient, SharedHttp2Connection},
 };
 use std::{
+    cell::RefCell,
     fs::File,
     net::SocketAddr,
     path::PathBuf,
@@ -14,6 +23,64 @@ use std::{
     },
     time::Duration,
 };
+
+#[derive(Clone)]
+struct PublishProgress {
+    sent: Arc<AtomicU64>,
+    accepted: Arc<AtomicU64>,
+    durable: Arc<AtomicU64>,
+    total: u64,
+}
+
+impl PublishProgress {
+    fn new(offset: u64, total: u64) -> Self {
+        Self {
+            sent: Arc::new(AtomicU64::new(offset)),
+            accepted: Arc::new(AtomicU64::new(offset)),
+            durable: Arc::new(AtomicU64::new(offset)),
+            total,
+        }
+    }
+
+    fn snapshot(&self) -> ProgressSnapshot {
+        ProgressSnapshot {
+            sent: self.sent.load(Ordering::Acquire),
+            accepted: self.accepted.load(Ordering::Acquire),
+            durable: self.durable.load(Ordering::Acquire),
+            written: 0,
+            total: self.total,
+        }
+    }
+
+    fn report<P: ProgressSink>(
+        &self,
+        sink: &RefCell<P>,
+        event: ProgressEvent,
+    ) -> Result<(), MutationError> {
+        sink.borrow_mut()
+            .report(event, self.snapshot())
+            .map_err(|_| MutationError::unknown("cannot write Blob progress; transfer cancelled"))
+    }
+}
+
+pub struct BlobPublishFailure {
+    error: MutationError,
+    pub progress: ProgressSnapshot,
+}
+
+impl BlobPublishFailure {
+    pub fn describe(&self, key: &Key) -> String {
+        let description = self.error.describe("PublishBlob", key);
+        let progress = format!(
+            "progress before failure: sent={} accepted={} durable={} total={}",
+            self.progress.sent, self.progress.accepted, self.progress.durable, self.progress.total,
+        );
+        if let Some((reason, retry)) = description.rsplit_once("\nretry the identical request") {
+            return format!("{reason}\n{progress}\nretry the identical request{retry}");
+        }
+        format!("{description}\n{progress}")
+    }
+}
 
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const BLOB_TRANSFER_DEFAULT_TIMEOUT: Duration = Duration::from_secs(15 * 60);
@@ -483,6 +550,7 @@ pub async fn publish(
     Ok(response)
 }
 
+#[cfg(test)]
 pub async fn publish_blob(
     address: SocketAddr,
     token: &Token,
@@ -490,6 +558,22 @@ pub async fn publish_blob(
     file: File,
     timeout: Duration,
 ) -> Result<api::PublishBlobReceipt, MutationError> {
+    let progress = RefCell::new(NoProgress);
+    publish_blob_with_progress(address, token, metadata, file, timeout, &progress)
+        .await
+        .map_err(|failure| failure.error)
+}
+
+pub async fn publish_blob_with_progress<P: ProgressSink>(
+    address: SocketAddr,
+    token: &Token,
+    metadata: api::PublishBlobMetadata,
+    file: File,
+    timeout: Duration,
+    progress: &RefCell<P>,
+) -> Result<api::PublishBlobReceipt, BlobPublishFailure> {
+    let progress_state = PublishProgress::new(0, metadata.total_len);
+    let failure_state = progress_state.clone();
     let transfer = async {
         let requested = metadata.clone();
         let total_len = metadata.total_len;
@@ -532,10 +616,17 @@ pub async fn publish_blob(
             ));
         }
         let resume_offset = accepted.durable_offset;
-        let sent_offset = Arc::new(AtomicU64::new(resume_offset));
+        progress_state.sent.store(resume_offset, Ordering::Release);
+        progress_state
+            .accepted
+            .store(resume_offset, Ordering::Release);
+        progress_state
+            .durable
+            .store(resume_offset, Ordering::Release);
+        progress_state.report(progress, ProgressEvent::Initial)?;
         let (mut send, mut receive) = rpc.into_split();
         let (mut frames, reader) = blob_publish::stream_file(file, total_len, resume_offset);
-        let sender_offset = Arc::clone(&sent_offset);
+        let sender_progress = progress_state.clone();
         let sender = async move {
             while let Some(frame) = frames.next().await {
                 let end = match frame.frame.as_ref() {
@@ -548,7 +639,8 @@ pub async fn publish_blob(
                 send.send(frame)
                     .await
                     .map_err(|error| MutationError::rpc_error(&error, "publish_blob"))?;
-                sender_offset.store(end, Ordering::Release);
+                sender_progress.sent.store(end, Ordering::Release);
+                sender_progress.report(progress, ProgressEvent::Periodic)?;
             }
             send.send(api::PublishBlobRequest {
                 frame: Some(api::publish_blob_request::Frame::Finish(Box::default())),
@@ -564,6 +656,7 @@ pub async fn publish_blob(
                 })?
                 .map_err(MutationError::unknown)
         };
+        let receiver_progress = progress_state.clone();
         let receiver = async move {
             let mut accepted_offset = resume_offset;
             let mut durable_offset = resume_offset;
@@ -580,12 +673,22 @@ pub async fn publish_blob(
                                 &checkpoint,
                                 accepted_offset,
                                 durable_offset,
-                                sent_offset.load(Ordering::Acquire),
+                                receiver_progress.sent.load(Ordering::Acquire),
                                 total_len,
                             ) =>
                     {
                         accepted_offset = checkpoint.accepted_offset;
                         durable_offset = checkpoint.durable_offset;
+                        receiver_progress
+                            .sent
+                            .fetch_max(accepted_offset, Ordering::AcqRel);
+                        receiver_progress
+                            .accepted
+                            .store(accepted_offset, Ordering::Release);
+                        receiver_progress
+                            .durable
+                            .store(durable_offset, Ordering::Release);
+                        receiver_progress.report(progress, ProgressEvent::Checkpoint)?;
                     }
                     Some(api::publish_blob_response::Frame::Complete(complete))
                         if receipt.is_none() =>
@@ -601,22 +704,27 @@ pub async fn publish_blob(
             }
             receipt.ok_or_else(|| MutationError::unknown("agent omitted Blob completion"))
         };
-        let (sent, received) = tokio::join!(sender, receiver);
-        let response = match (sent, received) {
-            (_, Err(error)) => return Err(error),
-            (Err(error), Ok(_)) => return Err(error),
-            (Ok(()), Ok(response)) => response,
-        };
+        let ((), response) = tokio::try_join!(sender, receiver)?;
         if !blob_publish::receipt_matches(&requested, &response) {
             return Err(MutationError::unknown("invalid publication receipt"));
         }
+        progress_state.sent.store(total_len, Ordering::Release);
+        progress_state.accepted.store(total_len, Ordering::Release);
+        progress_state.durable.store(total_len, Ordering::Release);
+        progress_state.report(progress, ProgressEvent::Terminal)?;
         Ok(response)
     };
-    tokio::time::timeout(timeout, transfer)
+    let result = tokio::time::timeout(timeout, transfer)
         .await
-        .map_err(|_| MutationError::rpc(connectrpc::ErrorCode::DeadlineExceeded))?
+        .map_err(|_| MutationError::rpc(connectrpc::ErrorCode::DeadlineExceeded))
+        .and_then(|result| result);
+    result.map_err(|error| BlobPublishFailure {
+        error,
+        progress: failure_state.snapshot(),
+    })
 }
 
+#[cfg(test)]
 pub async fn read_blob(
     address: SocketAddr,
     token: &Token,
@@ -624,9 +732,23 @@ pub async fn read_blob(
     output_path: PathBuf,
     timeout: Duration,
 ) -> Result<blob_read::Metadata, String> {
+    let mut progress = NoProgress;
+    read_blob_with_progress(address, token, request, output_path, timeout, &mut progress).await
+}
+
+pub async fn read_blob_with_progress<P: ProgressSink>(
+    address: SocketAddr,
+    token: &Token,
+    request: api::ReadBlobRequest,
+    output_path: PathBuf,
+    timeout: Duration,
+    progress: &mut P,
+) -> Result<blob_read::Metadata, String> {
     let mut output = blob_read::OutputFile::create(output_path).map_err(str::to_owned)?;
     let mut validator = blob_read::Validator::new(request.clone());
-    let transfer = async {
+    let mut written = 0_u64;
+    let mut started = false;
+    let transfer: Result<blob_read::Metadata, String> = async {
         let mut stream = blob_client(address, token, timeout)
             .read_blob(request)
             .await
@@ -638,9 +760,49 @@ pub async fn read_blob(
         {
             let page = page.to_owned_message();
             validator.accept(&page).map_err(str::to_owned)?;
+            if !started {
+                progress
+                    .report(
+                        ProgressEvent::Initial,
+                        ProgressSnapshot {
+                            total: page.total_len,
+                            ..Default::default()
+                        },
+                    )
+                    .map_err(|_| "cannot write Blob progress; read cancelled".to_owned())?;
+                started = true;
+            }
             output.write_page(&page.chunk).map_err(str::to_owned)?;
+            written = written
+                .checked_add(page.chunk.len() as u64)
+                .ok_or_else(|| "ReadBlob failed: written byte count overflow".to_owned())?;
+            progress
+                .report(
+                    if page.complete {
+                        ProgressEvent::Checkpoint
+                    } else {
+                        ProgressEvent::Periodic
+                    },
+                    ProgressSnapshot {
+                        written,
+                        total: page.total_len,
+                        ..Default::default()
+                    },
+                )
+                .map_err(|_| "cannot write Blob progress; read cancelled".to_owned())?;
         }
-        validator.finish().map_err(str::to_owned)
+        let metadata = validator.finish().map_err(str::to_owned)?;
+        progress
+            .report(
+                ProgressEvent::Terminal,
+                ProgressSnapshot {
+                    written,
+                    total: metadata.total_len,
+                    ..Default::default()
+                },
+            )
+            .map_err(|_| "cannot write Blob progress; read cancelled".to_owned())?;
+        Ok(metadata)
     }
     .await;
     match transfer {
@@ -648,7 +810,12 @@ pub async fn read_blob(
             Ok(()) => Ok(metadata),
             Err(error) => Err(discard_output(output, error.to_owned())),
         },
-        Err(error) => Err(discard_output(output, error)),
+        Err(error) => Err(discard_output(
+            output,
+            format!(
+                "{error}; discarded {written} authenticated bytes; destination was not published"
+            ),
+        )),
     }
 }
 
@@ -768,8 +935,17 @@ mod tests {
     }
     use std::{
         future::poll_fn,
+        io,
         sync::{Arc, Mutex},
     };
+
+    struct FailingProgress;
+
+    impl ProgressSink for FailingProgress {
+        fn report(&mut self, _event: ProgressEvent, _snapshot: ProgressSnapshot) -> io::Result<()> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "fixture"))
+        }
+    }
 
     const SERVICE: &str = "aster.application.v1alpha1.AsterApplicationService";
 
@@ -1342,16 +1518,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blob_native_http2_fixture_classifies_client_deadline_as_unknown() {
+    async fn publish_timeout_reports_sent_accepted_durable_total_and_retry() {
         let router = connectrpc::Router::new().route_bidi_stream(
             SERVICE,
             "PublishBlob",
             connectrpc::bidi_streaming_handler_fn(
                 |_ctx, _requests: connectrpc::ServiceStream<api::PublishBlobRequest>| async move {
-                    std::future::pending::<()>().await;
-                    connectrpc::Response::stream_ok(futures::stream::empty::<
-                        Result<api::PublishBlobResponse, connectrpc::ConnectError>,
-                    >())
+                    let responses = futures::stream::try_unfold(false, |accepted| async move {
+                        if !accepted {
+                            return Ok(Some((
+                                api::PublishBlobResponse {
+                                    frame: Some(api::publish_blob_response::Frame::Accepted(
+                                        Box::new(api::PublishBlobAccepted {
+                                            canonical_frame_bytes: blob_publish::CHUNK_BYTES as u32,
+                                            ..Default::default()
+                                        }),
+                                    )),
+                                    ..Default::default()
+                                },
+                                true,
+                            )));
+                        }
+                        std::future::pending::<()>().await;
+                        Ok(None)
+                    });
+                    connectrpc::Response::stream_ok(responses)
                 },
             ),
         );
@@ -1359,28 +1550,84 @@ mod tests {
         let source = test_path("deadline-source");
         let _ = std::fs::remove_file(&source);
         std::fs::write(&source, b"x").unwrap();
-        let error = publish_blob(
+        let progress = RefCell::new(NoProgress);
+        let error = publish_blob_with_progress(
             fixture.address,
             &token(),
             publish_metadata(1),
             File::open(&source).unwrap(),
             Duration::from_millis(20),
+            &progress,
         )
         .await
         .unwrap_err();
         let key = crate::operation_key::Selection::Explicit("blob-key".into())
             .resolve()
             .unwrap();
-        let description = error.describe("PublishBlob", &key);
+        let description = error.describe(&key);
         assert!(description.contains("PublishBlob outcome unknown: deadline_exceeded"));
         assert!(description.contains("--operation-key=blob-key"));
+        assert!(
+            description.contains("sent=1 accepted=0 durable=0 total=1"),
+            "{description}"
+        );
+        fixture.stop().await;
+        std::fs::remove_file(source).unwrap();
+    }
+
+    #[tokio::test]
+    async fn broken_publish_stderr_prevents_success() {
+        let router = connectrpc::Router::new().route_bidi_stream(
+            SERVICE,
+            "PublishBlob",
+            connectrpc::bidi_streaming_handler_fn(
+                |_ctx, _requests: connectrpc::ServiceStream<api::PublishBlobRequest>| async move {
+                    connectrpc::Response::stream_ok(connectrpc::stream_iter([Ok(
+                        api::PublishBlobResponse {
+                            frame: Some(api::publish_blob_response::Frame::Accepted(Box::new(
+                                api::PublishBlobAccepted {
+                                    canonical_frame_bytes: blob_publish::CHUNK_BYTES as u32,
+                                    ..Default::default()
+                                },
+                            ))),
+                            ..Default::default()
+                        },
+                    )]))
+                },
+            ),
+        );
+        let fixture = Fixture::start(router).await;
+        let source = test_path("broken-publish-progress-source");
+        let _ = std::fs::remove_file(&source);
+        std::fs::write(&source, b"x").unwrap();
+        let progress = RefCell::new(FailingProgress);
+        let error = publish_blob_with_progress(
+            fixture.address,
+            &token(),
+            publish_metadata(1),
+            File::open(&source).unwrap(),
+            Duration::from_secs(2),
+            &progress,
+        )
+        .await
+        .unwrap_err();
+        let key = crate::operation_key::Selection::Explicit("blob-key".into())
+            .resolve()
+            .unwrap();
+        let description = error.describe(&key);
+        assert!(
+            description.contains("cannot write Blob progress"),
+            "{description}"
+        );
+        assert!(description.contains("sent=0 accepted=0 durable=0 total=1"));
+
         fixture.stop().await;
         std::fs::remove_file(source).unwrap();
     }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn blob_native_http2_read_error_discards_staged_partial_output() {
+    async fn read_interruption_reports_discarded_bytes() {
         let router = connectrpc::Router::new().route_server_stream(
             SERVICE,
             "ReadBlob",
@@ -1412,8 +1659,57 @@ mod tests {
         .await
         .unwrap_err();
         assert!(error.contains("ReadBlob failed: unavailable"), "{error}");
+        assert!(
+            error.contains(&format!(
+                "discarded {} authenticated bytes",
+                blob_publish::CHUNK_BYTES
+            )),
+            "{error}"
+        );
+        assert!(error.contains("destination was not published"), "{error}");
         assert!(!error.contains("secret fixture detail"), "{error}");
         assert!(!destination.exists());
+        fixture.stop().await;
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn broken_read_stderr_does_not_publish_destination() {
+        let router = connectrpc::Router::new().route_server_stream(
+            SERVICE,
+            "ReadBlob",
+            connectrpc::streaming_handler_fn(|_ctx, _request: api::ReadBlobRequest| async move {
+                connectrpc::Response::stream_ok(connectrpc::stream_iter([Ok(read_page(
+                    0,
+                    b"authenticated".to_vec(),
+                    false,
+                ))]))
+            }),
+        );
+        let fixture = Fixture::start(router).await;
+        let directory = private_test_directory("broken-progress-directory");
+        let destination = directory.join("destination");
+        let request = api::ReadBlobRequest {
+            id: vec![1; 32],
+            topic: "imagery.maps".into(),
+            scope: "mission/team/alpha".into(),
+            ..Default::default()
+        };
+        let error = read_blob_with_progress(
+            fixture.address,
+            &token(),
+            request,
+            destination.clone(),
+            Duration::from_secs(2),
+            &mut FailingProgress,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("progress"), "{error}");
+        assert!(error.contains("discarded 0 authenticated bytes"), "{error}");
+        assert!(!destination.exists());
+
         fixture.stop().await;
         std::fs::remove_dir(directory).unwrap();
     }

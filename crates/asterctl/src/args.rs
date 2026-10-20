@@ -358,7 +358,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
                     .set_file(value.into())?;
             }
             "--topic" | "--scope" | "--priority" | "--media-type" | "--schema-id" | "--ttl-ms"
-            | "--operation-key"
+            | "--operation-key" | "--progress"
                 if blob_publication.is_some() =>
             {
                 if !command_options.insert(name.to_owned()) {
@@ -380,7 +380,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
                     .expect("Blob read command")
                     .set_output(value.into())?;
             }
-            "--id" | "--topic" | "--scope" if blob_read.is_some() => {
+            "--id" | "--topic" | "--scope" | "--progress" if blob_read.is_some() => {
                 if !command_options.insert(name.to_owned()) {
                     return Err(format!("{name} must not be repeated"));
                 }
@@ -585,6 +585,47 @@ mod tests {
             crate::client::BLOB_TRANSFER_DEFAULT_TIMEOUT
         );
         assert_eq!(parse_publish(Some("7")), Duration::from_secs(7));
+    }
+
+    #[test]
+    fn blob_progress_defaults_to_auto_and_accepts_only_documented_modes() {
+        for (value, expected) in [
+            (None, crate::progress::ProgressMode::Auto),
+            (Some("auto"), crate::progress::ProgressMode::Auto),
+            (Some("always"), crate::progress::ProgressMode::Always),
+            (Some("never"), crate::progress::ProgressMode::Never),
+        ] {
+            let mut args = vec![
+                "blob-publish",
+                "--file=/tmp/blob",
+                "--topic=imagery.maps",
+                "--scope=mission/team/alpha",
+                "--operation-key=test",
+            ];
+            if let Some(value) = value {
+                args.extend(["--progress", value]);
+            }
+            let Command::BlobPublish(_, publication) = arguments(&args).unwrap() else {
+                panic!("Blob publish command")
+            };
+            assert_eq!(publication.progress, expected);
+        }
+
+        for value in ["", "sometimes", "ALWAYS"] {
+            assert!(
+                arguments(&[
+                    "blob-read",
+                    "--id=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+                    "--topic=x",
+                    "--scope=x",
+                    "--output=/tmp/blob",
+                    "--progress",
+                    value,
+                ])
+                .is_err()
+            );
+        }
+        assert!(arguments(&["status", "--progress=always"]).is_err());
     }
 
     #[test]
