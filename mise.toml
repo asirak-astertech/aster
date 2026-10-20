@@ -96,6 +96,21 @@ run = [
   "sh tools/with-test-resources.sh cargo test --locked --workspace --all-features --doc",
 ]
 
+[tasks.check-rust-ci-slice-1]
+description = "Run the first required-CI Rust test slice with retained JUnit timing"
+tools = { "cargo:cargo-nextest" = "0.9.145" }
+run = "sh tools/with-test-resources.sh cargo nextest run --profile ci --locked --workspace --all-features --test-threads 2 --partition slice:1/2"
+
+[tasks.check-rust-ci-slice-2]
+description = "Run the second required-CI Rust test slice with retained JUnit timing"
+tools = { "cargo:cargo-nextest" = "0.9.145" }
+run = "sh tools/with-test-resources.sh cargo nextest run --profile ci --locked --workspace --all-features --test-threads 2 --partition slice:2/2"
+
+[tasks.qualify-generated-blob]
+description = "Run the ignored generated 100 MiB Blob pipeline qualification"
+tools = { "cargo:cargo-nextest" = "0.9.145" }
+run = "sh tools/with-test-resources.sh cargo nextest run --locked -p aster-core --all-features --run-ignored ignored-only -E 'test(qualify_generated_100mb_blob_pipeline)'"
+
 [tasks.qualify-control-mesh]
 description = "Run the complete ignored 23-process control-mesh qualification"
 tools = { "cargo:cargo-nextest" = "0.9.145" }

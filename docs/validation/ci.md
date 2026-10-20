@@ -1877,6 +1877,50 @@ mise install
 mise run check
 ```
 
+For the normal edit/test loop, run the narrow owning package or exact identity
+first, then the complete Rust population before handoff:
+
+```sh
+# Examples; replace the filter with the identity you changed.
+cargo test --locked -p aster-node --all-features TEST_FILTER -- --exact
+cargo test --locked -p aster-lab --all-features --test reconciliation_bakeoff TEST_FILTER -- --exact
+
+# Complete default Rust tests and doctests, with two nextest workers.
+mise run check-workspace-tests
+```
+
+The two required-CI Rust selections are reproducible independently. Each task
+uses the `ci` nextest profile and writes its latest raw report to
+`target/nextest/ci/junit.xml`; copy or summarize that file before running the
+other slice because the second run replaces it.
+
+```sh
+mise run check-rust-ci-slice-1
+python3 .github/scripts/summarize-nextest-junit.py \
+  --input target/nextest/ci/junit.xml \
+  --output /tmp/aster-rust-slice-1.md \
+  --partition 1/2 --problem-seconds 10
+
+mise run check-rust-ci-slice-2
+python3 .github/scripts/summarize-nextest-junit.py \
+  --input target/nextest/ci/junit.xml \
+  --output /tmp/aster-rust-slice-2.md \
+  --partition 2/2 --problem-seconds 10
+
+# Reporter selection, warning, and malformed-input contracts.
+python3 .github/scripts/test-nextest-timing.py
+python3 .github/scripts/test-ci-test-lanes.py
+```
+
+A `Duration problems (> 10.000s)` table or `Rust test duration` annotation is
+an optimization tag. It does not fail, terminate, retry, or exclude the test.
+Functional failures still fail normally, and malformed timing evidence fails
+the reporting step because there is no valid measurement to retain. Compare
+the JUnit test durations separately from job wall time: dependency downloads,
+cold compilation, linking, and compiler-cache misses are setup/build time and
+must not be reported as test execution time. Record both when profiling the CI
+critical path.
+
 The primary gate runs `tools/check-project-license.py`. It requires every
 first-party Cargo package to declare exactly `Apache-2.0`, carry a byte-identical
 copy of the canonical `LICENSE`, and include that text in its package archive.

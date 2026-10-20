@@ -59,6 +59,22 @@ ignored qualifications; run them when changing demo orchestration or preparing
 new operational evidence. Their assertions, logs, and result grammar are the
 same as the scenarios documented below.
 
+On the warm development host used for the test refactor, the two-node and
+four-node Ping/Pong cases took 19.32 and 37.83 seconds, and the control case
+took 62.85 seconds. Budget two warm minutes for each task, two CPU cores, at
+least 2 GiB of available memory, and 2 GiB of temporary disk; dependency
+download and cold compilation are separate. Nextest reports results on the
+terminal. Child stdout/stderr live beneath the fresh
+`/tmp/aster-selected-mesh-smoke-*` fixture while a scenario is running; a
+successful test removes its fixture, while a failed test may leave that exact
+root for diagnosis. Retain terminal output, the failed fixture when present,
+source revision, and host resource/network context when publishing evidence.
+
+These commands are explicit engineering qualifications, not required-PR tests.
+Their results do not add requirements credit, production approval, device
+qualification, or a throughput claim unless the exact artifacts are admitted
+through the applicable retained validation process.
+
 ## Run three nodes
 
 Use a new child beneath a temporary directory because `aster demo` refuses to

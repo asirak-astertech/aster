@@ -168,6 +168,23 @@ class RustTimingLaneTests(unittest.TestCase):
         )
         self.assertEqual(ping_pong.count("test(="), 2)
 
+    def test_documented_ci_slices_and_blob_qualification_match_required_selection(self):
+        config = MISE_CONFIG.read_text(encoding="utf-8")
+
+        for partition in (1, 2):
+            task = mise_task(config, f"check-rust-ci-slice-{partition}")
+            self.assertIn("sh tools/with-test-resources.sh cargo nextest run", task)
+            self.assertIn("--profile ci --locked --workspace --all-features", task)
+            self.assertIn("--test-threads 2", task)
+            self.assertIn(f"--partition slice:{partition}/2", task)
+            self.assertNotIn("--run-ignored", task)
+
+        blob = mise_task(config, "qualify-generated-blob")
+        self.assertIn("sh tools/with-test-resources.sh cargo nextest run", blob)
+        self.assertIn("--locked -p aster-core --all-features", blob)
+        self.assertIn("--run-ignored ignored-only", blob)
+        self.assertIn("test(qualify_generated_100mb_blob_pipeline)", blob)
+
     def test_partition_lane_retains_raw_timings_and_publishes_slowest_tests(self):
         workflow = CI_WORKFLOW.read_text(encoding="utf-8")
         lane = workflow_job(workflow, "rust-tests", "msrv")
