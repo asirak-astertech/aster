@@ -8,6 +8,8 @@ pub(crate) const STREAM_DATA_FIXED_BYTES: usize = 89;
 pub(crate) const MAX_STREAM_DATA_FRAME_BYTES: usize =
     STREAM_DATA_FIXED_BYTES + MAX_STREAM_EXTENT_BYTES;
 pub(crate) const MAX_STREAM_SEMANTIC_COMMITMENT_BYTES: usize = 64 * 1024;
+/// Signed source open plus bounded source credential/signature material.
+pub(crate) const MAX_STREAM_AUTHENTICATED_OPEN_BYTES: usize = 256 * 1024;
 pub(crate) const STREAM_TAGS: std::ops::RangeInclusive<u8> = 0xd6..=0xdc;
 
 pub(crate) fn profile5_attempt_bounds(bytes: u64) -> Result<(usize, usize), StreamError> {
@@ -123,6 +125,9 @@ pub(crate) struct StreamOpenV1 {
     pub attempt_nonce: [u8; 32],
     pub checkpoint_generation: u64,
     pub custody_digest: Option<[u8; 32]>,
+    /// Source-authenticated semantic admission object. Transport identity
+    /// alone is not authority to reserve or promote receiver storage.
+    pub authenticated_open: Vec<u8>,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StreamAcceptV1 {
@@ -227,6 +232,16 @@ fn validate_semantic_commitment(bytes: &[u8]) -> Result<(), StreamError> {
         Ok(())
     }
 }
+
+fn validate_authenticated_open(bytes: &[u8]) -> Result<(), StreamError> {
+    if bytes.is_empty() || bytes.len() > MAX_STREAM_AUTHENTICATED_OPEN_BYTES {
+        Err(StreamError::invalid(
+            "authenticated open length is out of bounds",
+        ))
+    } else {
+        Ok(())
+    }
+}
 fn put_attempt(o: &mut Vec<u8>, id: &[u8; 32], n: &[u8; 32], s: u64) {
     o.extend_from_slice(id);
     o.extend_from_slice(n);
@@ -252,6 +267,7 @@ impl StreamFrame {
         match self {
             Self::Open(x) => {
                 nonce(&x.attempt_nonce)?;
+                validate_authenticated_open(&x.authenticated_open)?;
                 o.push(0xd6);
                 o.extend([x.class as u8, x.direction as u8]);
                 o.extend(9u16.to_be_bytes());
@@ -272,6 +288,12 @@ impl StreamFrame {
                         o.extend(d)
                     }
                 }
+                o.extend(
+                    u32::try_from(x.authenticated_open.len())
+                        .map_err(|_| StreamError::invalid("authenticated open overflow"))?
+                        .to_be_bytes(),
+                );
+                o.extend(&x.authenticated_open);
             }
             Self::Accept(x) => {
                 nonce(&x.attempt_nonce)?;
@@ -378,6 +400,16 @@ impl StreamFrame {
                     1 => Some(r.array()?),
                     _ => return Err(StreamError::invalid("noncanonical custody presence")),
                 };
+                let authenticated_open_len = usize::try_from(r.u32()?)
+                    .map_err(|_| StreamError::invalid("authenticated open overflow"))?;
+                if authenticated_open_len == 0
+                    || authenticated_open_len > MAX_STREAM_AUTHENTICATED_OPEN_BYTES
+                {
+                    return Err(StreamError::invalid(
+                        "authenticated open length is out of bounds",
+                    ));
+                }
+                let authenticated_open = r.take(authenticated_open_len)?.to_vec();
                 Self::Open(StreamOpenV1 {
                     class,
                     direction,
@@ -391,6 +423,7 @@ impl StreamFrame {
                     attempt_nonce,
                     checkpoint_generation,
                     custody_digest,
+                    authenticated_open,
                 })
             }
             0xd7 => {
@@ -988,6 +1021,7 @@ pub(crate) fn fuzz_decode(input: &[u8]) {
             attempt_nonce,
             checkpoint_generation: 0,
             custody_digest: None,
+            authenticated_open: vec![7],
         })),
         b"d7" => Some(StreamFrame::Accept(StreamAcceptV1 {
             transfer_id: id,
@@ -1058,6 +1092,7 @@ pub(crate) fn fuzz_decode(input: &[u8]) {
             attempt_nonce,
             checkpoint_generation: 0,
             custody_digest: None,
+            authenticated_open: vec![7],
         };
         if let Ok(mut receiver) = StreamReceiverState::new(&open, 0, 0, 1, 1) {
             let _ = receiver.data(&data);
@@ -1086,6 +1121,7 @@ mod stream_frame_codec {
                 attempt_nonce: n,
                 checkpoint_generation: 8,
                 custody_digest: Some([9; 32]),
+                authenticated_open: vec![0xa5; 257],
             }),
             StreamFrame::Accept(StreamAcceptV1 {
                 transfer_id: id,
@@ -1140,11 +1176,11 @@ mod stream_frame_codec {
         let vectors = [
             (
                 0xd6,
-                260,
+                521,
                 [
-                    0xca, 0x40, 0x52, 0x28, 0xf2, 0xb5, 0x64, 0x9c, 0x43, 0xf3, 0xe7, 0x59, 0x60,
-                    0xce, 0x5c, 0xca, 0x94, 0x92, 0x41, 0x36, 0x9d, 0x60, 0x12, 0x50, 0x5b, 0xc9,
-                    0xa5, 0x0f, 0xca, 0xdf, 0x57, 0x5f,
+                    0x69, 0x7b, 0x46, 0x39, 0x9b, 0x15, 0x20, 0xcb, 0x83, 0x7f, 0x9f, 0x7f, 0x66,
+                    0x27, 0xb9, 0xe1, 0xd4, 0x9a, 0x84, 0xca, 0xaa, 0x8f, 0xd4, 0x18, 0x3a, 0xbc,
+                    0x58, 0x2c, 0xd2, 0xdd, 0x5c, 0xe9,
                 ],
             ),
             (
@@ -1260,9 +1296,25 @@ mod stream_frame_codec {
             );
         }
         let mut open = frames()[0].encode_for_context(9, 5).unwrap();
-        let custody_presence = open.len() - 33;
+        let authenticated_open_len = match &frames()[0] {
+            StreamFrame::Open(open) => open.authenticated_open.len(),
+            _ => unreachable!(),
+        };
+        let custody_presence = open.len() - authenticated_open_len - 4 - 33;
         open[custody_presence] = 2;
         assert!(StreamFrame::decode_for_context(9, 5, &open).is_err());
+        let mut open = match frames().remove(0) {
+            StreamFrame::Open(open) => open,
+            _ => unreachable!(),
+        };
+        open.authenticated_open.clear();
+        assert!(
+            StreamFrame::Open(open.clone())
+                .encode_for_context(9, 5)
+                .is_err()
+        );
+        open.authenticated_open = vec![0; MAX_STREAM_AUTHENTICATED_OPEN_BYTES + 1];
+        assert!(StreamFrame::Open(open).encode_for_context(9, 5).is_err());
         let mut data = match frames().remove(2) {
             StreamFrame::Data(data) => data,
             _ => unreachable!(),
@@ -1332,6 +1384,7 @@ mod stream_state {
             attempt_nonce: nonce,
             checkpoint_generation: 1,
             custody_digest: None,
+            authenticated_open: vec![7],
         }
     }
 

@@ -34,6 +34,7 @@ pub fn expected_pack_wire_len(plaintext_len: u64) -> Result<u64, String> {
 pub async fn send_completed_pack(
     connection: Connection,
     open: &BlobStreamOpen,
+    authenticated_open: Vec<u8>,
     root: &Path,
     roots: ([u8; 32], [u8; 32]),
     semantic_commitment: Vec<u8>,
@@ -41,6 +42,7 @@ pub async fn send_completed_pack(
     crate::runtime::blob_stream::send_completed_pack(
         connection,
         open,
+        authenticated_open,
         root,
         roots,
         semantic_commitment,
@@ -136,6 +138,7 @@ pub async fn send(connection: Connection, bytes: u64) -> Result<StreamValidation
         attempt_nonce,
         checkpoint_generation: 0,
         custody_digest: None,
+        authenticated_open: vec![0x35],
     };
     attempt
         .send_data(&encoded(StreamFrame::Open(open))?)

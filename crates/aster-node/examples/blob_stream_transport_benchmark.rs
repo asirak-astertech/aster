@@ -377,6 +377,7 @@ async fn pack_send(
     let report = stream_validation::send_completed_pack(
         connection.clone(),
         open,
+        std::fs::read(&signed_open_path)?,
         &root.0,
         roots,
         signed_commitment,

@@ -202,7 +202,12 @@ impl PackExtentSource {
     }
 }
 
-fn protocol_open(open: &BlobStreamOpen, wire_len: u64, attempt_nonce: [u8; 32]) -> StreamOpenV1 {
+fn protocol_open(
+    open: &BlobStreamOpen,
+    authenticated_open: Vec<u8>,
+    wire_len: u64,
+    attempt_nonce: [u8; 32],
+) -> StreamOpenV1 {
     StreamOpenV1 {
         class: StreamClass::Blob,
         direction: StreamDirection::ToSessionResponder,
@@ -216,12 +221,14 @@ fn protocol_open(open: &BlobStreamOpen, wire_len: u64, attempt_nonce: [u8; 32]) 
         attempt_nonce,
         checkpoint_generation: 0,
         custody_digest: None,
+        authenticated_open,
     }
 }
 
 pub async fn send_completed_pack(
     connection: Connection,
     open: &BlobStreamOpen,
+    authenticated_open: Vec<u8>,
     root: &Path,
     roots: ([u8; 32], [u8; 32]),
     semantic_commitment: Vec<u8>,
@@ -242,7 +249,7 @@ pub async fn send_completed_pack(
         .map_err(|error| failure("open transport attempt", format!("{error:?}")))?;
     let mut attempt_nonce = [0; 32];
     getrandom::fill(&mut attempt_nonce).map_err(|error| failure("attempt nonce", error))?;
-    let transfer_open = protocol_open(open, wire_len, attempt_nonce);
+    let transfer_open = protocol_open(open, authenticated_open, wire_len, attempt_nonce);
     attempt
         .send_data(&encoded(StreamFrame::Open(transfer_open.clone()))?)
         .await
@@ -958,6 +965,7 @@ mod tests {
         let sent = send_completed_pack(
             connection,
             &open,
+            open.encode(),
             &source_root.0,
             roots,
             open.digest().to_vec(),
@@ -1156,6 +1164,7 @@ mod tests {
         let sent = send_completed_pack(
             connection,
             verified_open.open(),
+            signed_open,
             &source_root.0,
             roots,
             signed_commitment,

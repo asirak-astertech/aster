@@ -3863,6 +3863,7 @@ mod tests {
                 attempt_nonce: nonce,
                 checkpoint_generation: 0,
                 custody_digest: None,
+                authenticated_open: vec![0x35],
             })
             .encode_for_context(9, 5)
             .expect("encode stream open");
