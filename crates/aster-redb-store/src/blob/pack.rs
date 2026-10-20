@@ -593,7 +593,23 @@ impl BlobPackReader {
         next_index: u64,
         payload_offset: u64,
     ) -> Result<Self, BlobPackError> {
-        let mut reader = Self::open(root, open)?;
+        Self::open_at_payload_offset_in(Self::open(root, open)?, next_index, payload_offset)
+    }
+
+    pub fn open_pinned_at_payload_offset(
+        root: &PinnedBlobPackRoot,
+        open: &BlobStreamOpen,
+        next_index: u64,
+        payload_offset: u64,
+    ) -> Result<Self, BlobPackError> {
+        Self::open_at_payload_offset_in(Self::open_pinned(root, open)?, next_index, payload_offset)
+    }
+
+    fn open_at_payload_offset_in(
+        mut reader: Self,
+        next_index: u64,
+        payload_offset: u64,
+    ) -> Result<Self, BlobPackError> {
         if next_index > reader.checkpoint.next_index
             || payload_offset > reader.checkpoint.payload_len()
             || (next_index == 0) != (payload_offset == 0)

@@ -23,7 +23,7 @@ use aster_mesh::{
 use aster_redb_store::{
     BlobOperationKey, BlobStreamReservation, BlobStreamReservationRequest, BlobStreamResume,
     BlobStreamSource, ControlPolicySnapshot, Store,
-    pack::{BlobPackCheckpoint, BlobPackReader, BlobPackWriter},
+    pack::{BlobPackCheckpoint, BlobPackReader, BlobPackWriter, PinnedBlobPackRoot},
 };
 use sha2::{Digest, Sha256};
 use std::{path::Path, sync::Arc, time::Duration};
@@ -191,6 +191,66 @@ pub fn completed_pack_wire_len(root: &Path, open: &BlobStreamOpen) -> Result<u64
     Ok(reader.checkpoint().payload_len())
 }
 
+enum PackAccess<'a> {
+    Path(&'a Path),
+    Pinned(&'a PinnedBlobPackRoot),
+}
+
+impl PackAccess<'_> {
+    fn reader(&self, open: &BlobStreamOpen) -> Result<BlobPackReader, String> {
+        match self {
+            Self::Path(root) => BlobPackReader::open(root, open),
+            Self::Pinned(root) => BlobPackReader::open_pinned(root, open),
+        }
+        .map_err(|error| failure("open pack", error))
+    }
+
+    fn reader_at(
+        &self,
+        open: &BlobStreamOpen,
+        next_index: u64,
+        wire_offset: u64,
+    ) -> Result<BlobPackReader, String> {
+        match self {
+            Self::Path(root) => {
+                BlobPackReader::open_at_payload_offset(root, open, next_index, wire_offset)
+            }
+            Self::Pinned(root) => {
+                BlobPackReader::open_pinned_at_payload_offset(root, open, next_index, wire_offset)
+            }
+        }
+        .map_err(|error| failure("open resumed source pack", error))
+    }
+
+    fn projected_writer(
+        &self,
+        open: &BlobStreamOpen,
+        resume: BlobStreamResume,
+    ) -> Result<BlobPackWriter, String> {
+        match self {
+            Self::Path(root) => BlobPackWriter::open_projected(
+                root,
+                open,
+                resume.generation(),
+                resume.next_segment_index(),
+                resume.durable_plaintext_offset(),
+                resume.durable_pack_len(),
+                resume.durable_wire_offset(),
+            ),
+            Self::Pinned(root) => BlobPackWriter::open_projected_pinned(
+                root,
+                open,
+                resume.generation(),
+                resume.next_segment_index(),
+                resume.durable_plaintext_offset(),
+                resume.durable_pack_len(),
+                resume.durable_wire_offset(),
+            ),
+        }
+        .map_err(|error| failure("open receiver pack", error))
+    }
+}
+
 pub fn expected_pack_wire_len(plaintext_len: u64) -> Result<u64, String> {
     blob_pack_wire_len(plaintext_len).map_err(|error| error.to_string())
 }
@@ -202,16 +262,19 @@ struct PackExtentSource {
 }
 
 impl PackExtentSource {
-    fn new(root: &Path, open: &BlobStreamOpen) -> Result<Self, String> {
+    fn new(root: &PackAccess<'_>, open: &BlobStreamOpen) -> Result<Self, String> {
         Ok(Self {
-            reader: BlobPackReader::open(root, open)
-                .map_err(|error| failure("open source pack", error))?,
+            reader: root.reader(open)?,
             record: Vec::new(),
             cursor: 0,
         })
     }
 
-    fn new_at(root: &Path, open: &BlobStreamOpen, wire_offset: u64) -> Result<Self, String> {
+    fn new_at(
+        root: &PackAccess<'_>,
+        open: &BlobStreamOpen,
+        wire_offset: u64,
+    ) -> Result<Self, String> {
         if wire_offset == 0 {
             return Self::new(root, open);
         }
@@ -234,8 +297,7 @@ impl PackExtentSource {
             return Err("resume offset is not a canonical Blob record boundary".into());
         };
         Ok(Self {
-            reader: BlobPackReader::open_at_payload_offset(root, open, next_index, wire_offset)
-                .map_err(|error| failure("open resumed source pack", error))?,
+            reader: root.reader_at(open, next_index, wire_offset)?,
             record: Vec::new(),
             cursor: 0,
         })
@@ -296,7 +358,7 @@ pub async fn send_completed_pack(
         connection,
         open,
         authenticated_open,
-        root,
+        PackAccess::Path(root),
         roots,
         semantic_commitment,
         None,
@@ -315,7 +377,7 @@ pub(crate) async fn send_completed_pack_protected(
     attempt_nonce: [u8; 32],
     open: &BlobStreamOpen,
     authenticated_open: Vec<u8>,
-    root: &Path,
+    root: &PinnedBlobPackRoot,
     roots: ([u8; 32], [u8; 32]),
     semantic_commitment: Vec<u8>,
 ) -> Result<BlobNetworkReport, String> {
@@ -329,7 +391,7 @@ pub(crate) async fn send_completed_pack_protected(
         connection,
         open,
         authenticated_open,
-        root,
+        PackAccess::Pinned(root),
         roots,
         semantic_commitment,
         Some(attempt_nonce),
@@ -343,13 +405,13 @@ async fn send_completed_pack_inner(
     connection: Connection,
     open: &BlobStreamOpen,
     authenticated_open: Vec<u8>,
-    root: &Path,
+    root: PackAccess<'_>,
     roots: ([u8; 32], [u8; 32]),
     semantic_commitment: Vec<u8>,
     planned_nonce: Option<[u8; 32]>,
     codec: &mut dyn BlobRecordCodec,
 ) -> Result<BlobNetworkReport, String> {
-    let wire_len = completed_pack_wire_len(root, open)?;
+    let wire_len = root.reader(open)?.checkpoint().payload_len();
     if wire_len != expected_pack_wire_len(open.total_len())? {
         return Err("completed pack wire length differs from canonical segment framing".into());
     }
@@ -383,7 +445,7 @@ async fn send_completed_pack_inner(
     let resume_offset = accept.durable_offset;
     let mut state = StreamSenderState::new(transfer_open.transfer_id, attempt_nonce, wire_len);
     state.accept(accept).map_err(|error| error.to_string())?;
-    let mut source = PackExtentSource::new_at(root, open, resume_offset)?;
+    let mut source = PackExtentSource::new_at(&root, open, resume_offset)?;
     let mut pending = source.next_extent()?;
     let mut checkpoints = 0;
     while let Some(extent) = pending.take() {
@@ -603,7 +665,15 @@ pub async fn receive_completed_pack(
 ) -> Result<BlobNetworkReport, String> {
     let mut codec = PlainBlobRecordCodec;
     receive_completed_pack_inner(
-        connection, open, opener, root, wire_len, limits, None, None, &mut codec,
+        connection,
+        open,
+        opener,
+        PackAccess::Path(root),
+        wire_len,
+        limits,
+        None,
+        None,
+        &mut codec,
     )
     .await
 }
@@ -622,7 +692,7 @@ pub async fn receive_completed_pack_with_store(
         connection,
         &open,
         opener,
-        root,
+        PackAccess::Path(root),
         wire_len,
         limits,
         Some(session),
@@ -642,7 +712,7 @@ pub(crate) async fn receive_completed_pack_with_store_protected(
     attempt_nonce: [u8; 32],
     session: BlobReceiveStoreSession,
     opener: BlobStreamSegmentOpener,
-    root: &Path,
+    root: &PinnedBlobPackRoot,
     wire_len: u64,
     limits: PipelineLimits,
 ) -> Result<BlobNetworkReport, String> {
@@ -657,7 +727,7 @@ pub(crate) async fn receive_completed_pack_with_store_protected(
         connection,
         &open,
         opener,
-        root,
+        PackAccess::Pinned(root),
         wire_len,
         limits,
         Some(session),
@@ -672,7 +742,7 @@ async fn receive_completed_pack_inner(
     connection: Connection,
     open: &BlobStreamOpen,
     opener: BlobStreamSegmentOpener,
-    root: &Path,
+    root: PackAccess<'_>,
     wire_len: u64,
     limits: PipelineLimits,
     store_session: Option<BlobReceiveStoreSession>,
@@ -714,16 +784,7 @@ async fn receive_completed_pack_inner(
         .map_or_else(BlobStreamResume::default, |(_, resume)| *resume);
     let durable_wire = resume.durable_wire_offset();
     let resumed_from = durable_wire;
-    let mut writer = BlobPackWriter::open_projected(
-        root,
-        open,
-        resume.generation(),
-        resume.next_segment_index(),
-        resume.durable_plaintext_offset(),
-        resume.durable_pack_len(),
-        resume.durable_wire_offset(),
-    )
-    .map_err(|error| failure("open receiver pack", error))?;
+    let mut writer = root.projected_writer(open, resume)?;
     let window = u64::from(MAX_STREAM_CHECKPOINT_BATCH_BYTES) + MAX_RECORD_BYTES as u64;
     let mut current_limit = wire_len.min(durable_wire.saturating_add(window));
     let mut state = StreamReceiverState::new(
