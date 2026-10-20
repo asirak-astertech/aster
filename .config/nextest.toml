@@ -12,6 +12,8 @@ store-failure-output = true
 report-skipped = "none"
 
 [test-groups]
+# The group covers both default real-process smokes and explicitly selected
+# ignored mesh qualifications. Required CI never opts into ignored tests.
 mesh-cli-process = { max-threads = 1 }
 
 [[profile.default.overrides]]

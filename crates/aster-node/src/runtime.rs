@@ -29733,6 +29733,8 @@ pub fn run_demo_scenario(
         )));
     }
     fs::create_dir_all(root)?;
+    #[cfg(unix)]
+    fs::set_permissions(root, fs::Permissions::from_mode(0o700))?;
     let base_port = if base_port == 0 {
         find_port_block(nodes)?
     } else {
@@ -29744,7 +29746,12 @@ pub fn run_demo_scenario(
         .collect::<Vec<_>>();
     let identities = states
         .iter()
-        .map(|state| NodeIdentity::load_or_create(state).map(|identity| identity.id()))
+        .map(|state| -> Result<_, NodeError> {
+            let identity = NodeIdentity::load_or_create(state)?;
+            #[cfg(unix)]
+            fs::set_permissions(state, fs::Permissions::from_mode(0o700))?;
+            Ok(identity.id())
+        })
         .collect::<Result<Vec<_>, _>>()?;
     let demo_scope =
         Scope::new(DEMO_SCOPE).map_err(|error| NodeError::Configuration(error.to_string()))?;

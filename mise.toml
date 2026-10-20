@@ -96,6 +96,16 @@ run = [
   "sh tools/with-test-resources.sh cargo test --locked --workspace --all-features --doc",
 ]
 
+[tasks.qualify-control-mesh]
+description = "Run the complete ignored 23-process control-mesh qualification"
+tools = { "cargo:cargo-nextest" = "0.9.145" }
+run = "sh tools/with-test-resources.sh cargo nextest run --locked -p aster-node --all-features --test mesh_cli --run-ignored ignored-only --test-threads 1 -E 'test(=four_real_processes_propagate_controls_without_authority_and_exclude_captured_leaf)'"
+
+[tasks.qualify-ping-pong-mesh]
+description = "Run both complete ignored Ping/Pong mesh qualifications serially"
+tools = { "cargo:cargo-nextest" = "0.9.145" }
+run = "sh tools/with-test-resources.sh cargo nextest run --locked -p aster-node --all-features --test mesh_cli --run-ignored ignored-only --test-threads 1 -E 'test(=two_real_processes_use_the_same_stopped_state_ping_pong_plan) | test(=four_real_processes_default_to_ping_pong_and_restart_cleanly)'"
+
 [tasks.check-integration]
 description = "Run real-process, binding, and conformance checks"
 run = [

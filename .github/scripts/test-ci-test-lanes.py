@@ -20,6 +20,10 @@ def workflow_job(workflow: str, job: str, next_job: str) -> str:
     return workflow.split(f"  {job}:\n", 1)[1].split(f"\n  {next_job}:\n", 1)[0]
 
 
+def mise_task(config: str, task: str) -> str:
+    return config.split(f"[tasks.{task}]\n", 1)[1].split("\n[tasks.", 1)[0]
+
+
 class RequiredMacosLaneTests(unittest.TestCase):
     def test_required_lane_compiles_every_target_then_runs_platform_contracts(self):
         workflow = CI_WORKFLOW.read_text(encoding="utf-8")
@@ -135,6 +139,35 @@ class FullMacosLaneTests(unittest.TestCase):
 
 
 class RustTimingLaneTests(unittest.TestCase):
+    def test_required_ci_never_selects_ignored_qualifications(self):
+        workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+
+        self.assertNotIn("--run-ignored", workflow)
+
+    def test_mesh_qualification_tasks_are_exact_serial_ignored_only_runs(self):
+        config = MISE_CONFIG.read_text(encoding="utf-8")
+        control = mise_task(config, "qualify-control-mesh")
+        ping_pong = mise_task(config, "qualify-ping-pong-mesh")
+
+        for task in (control, ping_pong):
+            self.assertIn("sh tools/with-test-resources.sh cargo nextest run", task)
+            self.assertIn("--locked -p aster-node --all-features --test mesh_cli", task)
+            self.assertIn("--run-ignored ignored-only", task)
+            self.assertIn("--test-threads 1", task)
+
+        control_test = (
+            "four_real_processes_propagate_controls_without_authority_"
+            "and_exclude_captured_leaf"
+        )
+        self.assertIn(f"-E 'test(={control_test})'", control)
+        self.assertEqual(control.count("test(="), 1)
+        self.assertIn(
+            "-E 'test(=two_real_processes_use_the_same_stopped_state_ping_pong_plan) "
+            "| test(=four_real_processes_default_to_ping_pong_and_restart_cleanly)'",
+            ping_pong,
+        )
+        self.assertEqual(ping_pong.count("test(="), 2)
+
     def test_partition_lane_retains_raw_timings_and_publishes_slowest_tests(self):
         workflow = CI_WORKFLOW.read_text(encoding="utf-8")
         lane = workflow_job(workflow, "rust-tests", "msrv")
