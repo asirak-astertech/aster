@@ -123,17 +123,41 @@ Tests are grouped by the boundary they prove rather than by source-file size:
 | Qualification | Validates retained evidence or a named evaluation profile | `quality`; claims remain limited to the named profile |
 | Device/hardware | Exercises physical systems, packaging, networks, or resource brackets | Separate retained validation; never inferred from hosted CI |
 
+The functional population uses three complementary evidence forms:
+
+- **Default correctness tests** use the smallest deterministic fixture that
+  crosses the semantic boundary. They run in the normal local and required-CI
+  population.
+- **Production-limit contracts** assert configured production constants and
+  fail-closed validation without allocating production-scale fixtures merely
+  to prove a constant.
+- **Explicit qualification and benchmark commands** retain intentionally
+  physical-scale, multi-process, or device workloads. They are named,
+  runnable, excluded from default nextest selection, and documented with the
+  environment to which their evidence applies.
+
+Fixture minimization changes neither requirement credit nor capability
+maturity. A requirement keeps credit only when its original behavioral
+assertions remain in a default correctness test or the applicable retained
+evidence; moving physical scale to qualification does not add credit, and
+reducing a fixture without changing its semantic boundary does not remove it.
+The assertion mapping and the complete initial over-target inventory are
+retained in
+[`2026-10-20-fast-test-baseline.md`](../superpowers/reports/2026-10-20-fast-test-baseline.md).
+
 The two Linux nextest partitions use the `ci` profile in
 `.config/nextest.toml`. Each partition writes one bounded JUnit report without
 successful-test output, appends its twenty slowest tests to the Actions step
 summary, and retains the raw report for 14 days. Partition reports remain
 separate so skipped tests and repeated identifiers are not merged incorrectly.
 
-This increment does not set hard per-test runtime budgets. Establish a baseline
-from multiple successful hosted runs that includes cold and warm compiler-cache
-states, then use the retained per-test distributions to select regression
-thresholds and rebalance partitions. A single local or hosted duration is not a
-supported performance threshold.
+The 10-second per-test target is advisory. Reports tag every finite duration
+above the target, while durations at or below it remain untagged. Duration
+problems do not terminate tests, make functional CI fail, create an allowlist,
+or trigger retries. Missing, empty, malformed, negative, NaN, or infinite timing
+evidence still fails closed because the measurement itself is invalid. Raw
+JUnit remains the authoritative artifact, and an individual local or hosted
+duration is an observation rather than a performance guarantee.
 
 ### CI critical-path profile (2026-09-17)
 
