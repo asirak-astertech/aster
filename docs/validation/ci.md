@@ -1685,13 +1685,17 @@ administration, non-Linux/cross-class finite-TTL custody, protected provisioning
 zeroization assurance, admitted release cryptography, independent review, or
 physical-network acceptance.
 
-One explicit `cargo deny` advisory ignore covers a bounded active pilot graph.
-`RUSTSEC-2026-0173` covers unmaintained build-time `proc-macro-error2` 2.0.1 in
-the non-production age-provider pilot. RustSec reports no vulnerability and no
-patched release; current Rust separately emits future-incompatibility `E0365`.
-The ignore permits that exact informational finding only. It does not suppress
-other advisories, change exact package checksums, permit online execution after
-the acquisition step, or authorize the provider for production.
+Two explicit `cargo deny` advisory ignores cover one bounded active pilot
+graph. `RUSTSEC-2026-0173` covers unmaintained build-time
+`proc-macro-error2` 2.0.1, and `RUSTSEC-2026-0374` covers unmaintained
+compile-time configuration parser `basic-toml` 0.1.10, both in the
+non-production age-provider pilot. RustSec reports no vulnerability and no
+patched release for either package; current Rust separately emits
+future-incompatibility `E0365` for `proc-macro-error2`. The ignores permit only
+those exact informational findings. They do not suppress other advisories,
+change exact package checksums, permit online execution after the acquisition
+step, or authorize the provider for production. Decision 0018 records the
+upstream `basic-toml` replacement, release gap, and removal gate.
 
 The former `RUSTSEC-2024-0436` exception is retired. A path-patched exact
 `netlink-packet-core` 0.8.2 preserves its API while resolving the dependency
@@ -1706,10 +1710,10 @@ a disposable dependency-minimized copy. The decision continues to admit
 first-party packages and distributed project files remain subject to the
 separate byte-identical Apache-2.0 gate.
 
-The companion scope gate fails if the remaining ignored package's reverse graph
-drifts, if it appears in the separately excluded fuzz graph, or if any `paste`
-version reappears. Any change to a package chain or advisory disposition
-requires a recorded pilot review.
+The companion scope gate fails if either ignored package's reverse graph
+drifts, if either appears in the separately excluded fuzz graph, or if any
+`paste` version reappears. Any change to a package chain or advisory
+disposition requires a recorded pilot review.
 
 The selected Iroh graph carries five stakeholder-approved, exact-coordinate
 license exceptions recorded by Decision 0028: `webpki-root-certs` and
@@ -1773,14 +1777,14 @@ ambient age CLI.
 Because `deny.toml` expresses an active advisory exception at workspace scope,
 both the primary and dependency-policy gates also run
 `tools/check-dependency-exception-scope.sh`. Its exact reverse-graph assertions
-fail unless `proc-macro-error2` 2.0.1 remains reachable only through the
-isolated age-provider pilot and `paste` remains absent from the root lock and
-resolved workspace/fuzz graphs. The
-ignored package must be absent from fuzz. The same gate proves the vulnerable
-raw-lock Hickory pair remains inactive while allowing Iroh's fixed 0.26.1
-packages. Adversarial wrappers force a fuzz graph command failure, an active
-vulnerable Hickory package, and reintroduced `paste` versions; each must fail
-closed.
+fail unless `proc-macro-error2` 2.0.1 and `basic-toml` 0.1.10 remain reachable
+only through the isolated age-provider pilot and `paste` remains absent from
+the root lock and resolved workspace/fuzz graphs. Both ignored packages must be
+absent from fuzz. The same gate proves the vulnerable raw-lock Hickory pair
+remains inactive while allowing Iroh's fixed 0.26.1 packages. Adversarial
+wrappers force a fuzz graph command failure, an active vulnerable Hickory
+package, reintroduced `paste` versions, an expanded `basic-toml` reverse graph,
+and `basic-toml` in fuzz; each must fail closed.
 
 ## Security posture
 

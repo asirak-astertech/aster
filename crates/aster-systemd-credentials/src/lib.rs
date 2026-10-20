@@ -772,8 +772,10 @@ mod non_linux_tests {
         let secret_ref = provisioning_secret_ref(1, [0x5a; PROVIDER_REFERENCE_ID_BYTES])
             .expect("valid provider reference");
         assert_eq!(
-            loader.load(ProvisioningLoadId::new([0x2a; 32]), &secret_ref),
-            Err(ProvisioningSecretStoreError::Unavailable)
+            loader
+                .load(ProvisioningLoadId::new([0x2a; 32]), &secret_ref)
+                .err(),
+            Some(ProvisioningSecretStoreError::Unavailable)
         );
     }
 }

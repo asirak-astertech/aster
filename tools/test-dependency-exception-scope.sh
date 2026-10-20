@@ -10,6 +10,8 @@ failing_cargo="$repository_root/tools/testdata/fail-fuzz-cargo.sh"
 active_hickory_cargo="$repository_root/tools/testdata/inject-active-hickory-cargo.sh"
 expanded_paste_cargo="$repository_root/tools/testdata/inject-expanded-paste-cargo.sh"
 second_paste_version_cargo="$repository_root/tools/testdata/inject-second-paste-version-cargo.sh"
+expanded_basic_toml_cargo="$repository_root/tools/testdata/inject-expanded-basic-toml-cargo.sh"
+fuzz_basic_toml_cargo="$repository_root/tools/testdata/inject-fuzz-basic-toml-cargo.sh"
 real_cargo=$(command -v "${CARGO:-cargo}")
 
 if ASTER_TEST_REAL_CARGO="$real_cargo" CARGO="$failing_cargo" \
@@ -64,4 +66,30 @@ if [ "$status" -ne 1 ]; then
   exit 1
 fi
 
-printf '%s\n' 'dependency-exception regression passed: fuzz cargo-tree failure propagates; active vulnerable Hickory and any reintroduced paste version fail closed'
+if ASTER_TEST_REAL_CARGO="$real_cargo" CARGO="$expanded_basic_toml_cargo" \
+  sh "$checker" >/dev/null 2>&1; then
+  printf '%s\n' 'dependency-exception regression failed: expanded basic-toml graph passed' >&2
+  exit 1
+else
+  status=$?
+fi
+
+if [ "$status" -ne 1 ]; then
+  printf 'dependency-exception regression failed: expected expanded-basic-toml status 1, got %s\n' "$status" >&2
+  exit 1
+fi
+
+if ASTER_TEST_REAL_CARGO="$real_cargo" CARGO="$fuzz_basic_toml_cargo" \
+  sh "$checker" >/dev/null 2>&1; then
+  printf '%s\n' 'dependency-exception regression failed: fuzz basic-toml graph passed' >&2
+  exit 1
+else
+  status=$?
+fi
+
+if [ "$status" -ne 1 ]; then
+  printf 'dependency-exception regression failed: expected fuzz-basic-toml status 1, got %s\n' "$status" >&2
+  exit 1
+fi
+
+printf '%s\n' 'dependency-exception regression passed: cargo-tree failures propagate; active vulnerable Hickory, reintroduced paste, and escaped basic-toml fail closed'

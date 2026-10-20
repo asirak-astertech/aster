@@ -1036,7 +1036,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cancelled_blocking_write_keeps_capacity_until_current_io_and_cleanup_finish() {
+    async fn cancelled_blocking_write_keeps_capacity_until_writer_cleanup_finishes() {
         use std::os::fd::AsRawFd as _;
 
         let uploads = Arc::new(Semaphore::new(1));
@@ -1056,22 +1056,14 @@ mod tests {
         assert!(Arc::clone(&uploads).try_acquire_owned().is_err());
         assert!(descriptor_path.exists());
         drop(commands);
-        let reacquired = tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            loop {
-                if descriptor_path.exists() {
-                    assert!(Arc::clone(&uploads).try_acquire_owned().is_err());
-                    tokio::task::yield_now().await;
-                    continue;
-                }
-                if let Ok(permit) = Arc::clone(&uploads).try_acquire_owned() {
-                    break permit;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("writer cleanup deadline");
-        task.await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .expect("writer cleanup deadline")
+            .unwrap();
+        assert!(!descriptor_path.exists());
+        let reacquired = Arc::clone(&uploads)
+            .try_acquire_owned()
+            .expect("writer cleanup releases upload capacity");
         drop(reacquired);
     }
 
