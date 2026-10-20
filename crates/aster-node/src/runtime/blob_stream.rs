@@ -13,7 +13,7 @@ use crate::{
         PROFILE5_MAX_RECORD_BYTES, StreamAction, StreamClass, StreamDirection, StreamExtentAction,
         StreamFrame, StreamOpenV1, StreamReceiverState, StreamResultCode, StreamSenderState,
         blob_pack_wire_len, encode_composite_data_record, profile5_attempt_bounds,
-        split_composite_data_record,
+        profile5_receive_limit, split_composite_data_record,
     },
     stream_transport::{AttemptOpenRequest, IrohQuicV1Adapter, StreamTransportAdapter},
 };
@@ -862,8 +862,7 @@ async fn send_durable_checkpoint(
     current_limit: &mut u64,
     codec: &mut dyn BlobRecordCodec,
 ) -> Result<(), BlobNetworkError> {
-    let window = u64::from(MAX_STREAM_CHECKPOINT_BATCH_BYTES) + PROFILE5_EXTENT_BYTES as u64;
-    let new_limit = wire_len.min((*current_limit).max(progress.wire_offset.saturating_add(window)));
+    let new_limit = (*current_limit).max(profile5_receive_limit(wire_len, progress.wire_offset));
     let StreamAction::Send(checkpoint) = state
         .persisted(
             progress.wire_offset,
@@ -1027,8 +1026,7 @@ async fn receive_completed_pack_inner(
     let durable_wire = resume.durable_wire_offset();
     let resumed_from = durable_wire;
     let mut writer = root.projected_writer(open, resume)?;
-    let window = u64::from(MAX_STREAM_CHECKPOINT_BATCH_BYTES) + PROFILE5_EXTENT_BYTES as u64;
-    let mut current_limit = wire_len.min(durable_wire.saturating_add(window));
+    let mut current_limit = profile5_receive_limit(wire_len, durable_wire);
     let mut state = StreamReceiverState::new(
         &transfer_open,
         durable_wire,

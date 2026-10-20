@@ -9,6 +9,7 @@ use crate::{
         MAX_STREAM_CHECKPOINT_BATCH_BYTES, PROFILE5_ATTEMPT_TIMEOUT, PROFILE5_EXTENT_BYTES,
         StreamAction, StreamClass, StreamDirection, StreamExtentAction, StreamFrame, StreamOpenV1,
         StreamReceiverState, StreamResultCode, StreamSenderState, profile5_attempt_bounds,
+        profile5_receive_limit,
     },
     stream_transport::{AttemptOpenRequest, IrohQuicV1Adapter, StreamTransportAdapter},
 };
@@ -299,7 +300,7 @@ pub async fn receive(
         &open,
         0,
         0,
-        expected_bytes.min(batch),
+        profile5_receive_limit(expected_bytes, 0),
         PROFILE5_EXTENT_BYTES as u32,
     )
     .map_err(|error| error.to_string())?;
@@ -338,7 +339,7 @@ pub async fn receive(
                 hasher.update(&data.bytes);
                 if through == expected_bytes || through - durable >= batch {
                     generation += 1;
-                    let limit = expected_bytes.min(through.saturating_add(batch));
+                    let limit = profile5_receive_limit(expected_bytes, through);
                     let StreamAction::Send(checkpoint) = state
                         .persisted(through, generation, limit)
                         .map_err(|error| error.to_string())?
@@ -461,6 +462,59 @@ mod tests {
         assert_eq!(sent.digest, received.digest);
         assert_eq!(sent.checkpoints, 1);
         assert_eq!(received.checkpoints, 1);
+        client.close().await;
+        server.close().await;
+    }
+
+    #[tokio::test]
+    async fn semantic_v9_driver_crosses_credit_checkpoint_without_deadlock() {
+        let config = EndpointConfig::direct("127.0.0.1:0".parse().expect("address"));
+        let server = Endpoint::bind_with_security_profile(
+            SecretKey::generate(),
+            config,
+            CarrierSecurityProfile::IrohQuicV1,
+        )
+        .await
+        .expect("server");
+        let client = Endpoint::bind_with_security_profile(
+            SecretKey::generate(),
+            config,
+            CarrierSecurityProfile::IrohQuicV1,
+        )
+        .await
+        .expect("client");
+        let address = server
+            .bound_sockets()
+            .into_iter()
+            .find(std::net::SocketAddr::is_ipv4)
+            .expect("IPv4 server address");
+        let bytes = u64::from(MAX_STREAM_CHECKPOINT_BATCH_BYTES)
+            + u64::try_from(PROFILE5_EXTENT_BYTES).expect("extent bytes");
+        let receiver = tokio::spawn({
+            let server = server.clone();
+            let allowed = BTreeSet::from([client.id()]);
+            async move {
+                let connection = server.accept(&allowed).await.expect("accept");
+                receive(connection, bytes).await.expect("receive")
+            }
+        });
+        let connection = client
+            .connect(ExpectedPeer {
+                id: server.id(),
+                address,
+            })
+            .await
+            .expect("connect");
+        let sent = tokio::time::timeout(std::time::Duration::from_secs(5), send(connection, bytes))
+            .await
+            .expect("credit checkpoint must not deadlock")
+            .expect("send");
+        let received = receiver.await.expect("receiver task");
+        assert_eq!(sent.bytes, bytes);
+        assert_eq!(received.bytes, bytes);
+        assert_eq!(sent.digest, received.digest);
+        assert!(sent.checkpoints > 1);
+        assert_eq!(received.checkpoints, sent.checkpoints);
         client.close().await;
         server.close().await;
     }

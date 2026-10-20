@@ -28,6 +28,14 @@ pub(crate) const MAX_STREAM_SEMANTIC_COMMITMENT_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_STREAM_AUTHENTICATED_OPEN_BYTES: usize = 256 * 1024;
 pub(crate) const STREAM_TAGS: std::ops::RangeInclusive<u8> = 0xd6..=0xdc;
 
+pub(crate) fn profile5_receive_limit(total: u64, durable: u64) -> u64 {
+    let extent = PROFILE5_EXTENT_BYTES as u64;
+    let window = u64::from(MAX_STREAM_CHECKPOINT_BATCH_BYTES)
+        .div_ceil(extent)
+        .saturating_mul(extent);
+    total.min(durable.saturating_add(window))
+}
+
 pub(crate) fn profile5_attempt_bounds(bytes: u64) -> Result<(usize, usize), StreamError> {
     let extents = bytes.div_ceil(PROFILE5_EXTENT_BYTES as u64);
     let checkpoints = bytes.div_ceil(u64::from(MAX_STREAM_CHECKPOINT_BATCH_BYTES));
