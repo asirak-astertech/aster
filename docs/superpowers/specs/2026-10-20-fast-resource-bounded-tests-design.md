@@ -1,6 +1,6 @@
 # Fast, resource-bounded correctness test architecture
 
-**Status:** Approved in chat and written-spec review on 2026-10-20
+**Status:** Approved in chat and written-spec review on 2026-10-20; timing policy revised per owner review to advisory measurement and problem tagging
 
 **Capability tracks:** engineering quality and delivery confidence
 
@@ -167,25 +167,27 @@ Each migration must first inventory the original assertions and then map every
 assertion to a replacement test or qualification check. The review diff must
 make this mapping obvious.
 
-## Time-budget enforcement
+## Timing measurement and problem tagging
 
-Measurement without enforcement allowed the current regressions to accumulate.
-After the slow tests are migrated, the default nextest profile will enforce a
-10-second slow-test termination threshold. The CI profile inherits the same
-threshold. A test crossing the threshold fails with its full identity and
-elapsed time; it is not retried to hide the regression.
+The 10-second value is an optimization target and reporting threshold, not a
+test gate. The default and CI nextest profiles do not terminate a test because
+of elapsed time, and a duration above the target does not fail an otherwise
+functional CI run.
 
 The existing JUnit artifacts and bounded slow-test summary remain the source
-for aggregate evidence. The timing tool will also fail when a completed test
-exceeds the budget, so checked-in fixtures exercise the policy parser and its
-diagnostics. Local nextest termination provides immediate developer feedback;
-the retained CI report provides auditable timing history.
+for aggregate evidence. The timing tool tags every completed test above 10
+seconds with its full identity and elapsed time in the job summary and emits a
+GitHub warning annotation when requested by CI. It exits successfully after
+reporting duration problems; malformed, missing, or invalid timing data still
+fails because no trustworthy measurement was produced. Raw retained reports
+provide auditable timing history and allow platform variance to be compared
+without hiding it behind a pass/fail threshold.
 
 The 5-minute warm-suite target is evaluated from nextest wall time, not the sum
 of individual test durations. CI partition durations remain useful operational
 data but cannot substitute for an occasional unpartitioned warm measurement.
 No timeout increase, retry, partition-count increase, or test exclusion counts
-as a performance fix.
+as a performance improvement merely because it changes the reported timing.
 
 ## Resource policy
 
@@ -211,7 +213,7 @@ record peak resident memory, peak temporary-disk use, maximum child-process
 count, and maximum open descriptors where the runner permits reliable
 measurement. Those baselines determine whether a later numeric resource gate is
 portable. This design does not invent an unevidenced absolute memory threshold;
-it immediately enforces the structural rule that production-scale allocation
+code review and retained measurements identify production-scale allocation that
 does not belong in default correctness tests.
 
 ## Local and CI workflow
@@ -238,16 +240,15 @@ are reported separately from test execution.
 
 - A malformed or missing timing report fails the timing policy check rather
   than reporting success.
-- A test over budget reports its identity, observed duration, and 10-second
-  limit.
+- A test over the reporting target produces a non-failing problem tag with its
+  identity, observed duration, and 10-second target.
 - An invalid injected limit fails at construction with a specific diagnostic.
 - A leaked child or incomplete cleanup fails its owning fixture instead of
   relying on a later test to expose the leak.
 - A scheduled qualification timeout reports incomplete qualification; it does
   not change correctness-suite status or requirement maturity.
 - Platform variance is investigated from retained raw timing before changing a
-  budget. Budget exceptions and permanent allowlists are not part of this
-  design.
+  reporting target. Permanent timing allowlists are not part of this design.
 
 ## Compatibility and security
 
@@ -276,7 +277,8 @@ Implementation proceeds in reviewable increments:
 6. separate minimal real-process CLI wiring from full mesh qualification;
 7. inventory and classify the remaining repository checks, applying the same
    limit to any additional slow correctness checks;
-8. enable the 10-second nextest budget and timing-report enforcement;
+8. enable 10-second problem tagging in the retained timing report without a
+   duration gate;
 9. update the engineering runbook with local, CI-equivalent, benchmark, and
    qualification examples; and
 10. retain before/after timing and resource evidence in the pull request.

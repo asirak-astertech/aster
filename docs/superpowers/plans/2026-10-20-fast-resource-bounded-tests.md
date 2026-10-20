@@ -4,7 +4,7 @@
 
 **Goal:** Preserve Aster's correctness coverage while making every default test complete within 10 seconds and the warm all-feature Rust workspace suite complete within 5 minutes using bounded fixtures and resources.
 
-**Architecture:** Default correctness tests exercise the smallest fixture that crosses each semantic boundary, while non-allocating contract tests pin production limits. Independent fault cases become separately scheduled tests, and intentionally physical-scale workloads remain available only through explicit ignored qualification targets or benchmark commands. Nextest and the retained JUnit policy enforce the time budget locally and in CI after the known offenders are migrated.
+**Architecture:** Default correctness tests exercise the smallest fixture that crosses each semantic boundary, while non-allocating contract tests pin production limits. Independent fault cases become separately scheduled tests, and intentionally physical-scale workloads remain available only through explicit ignored qualification targets or benchmark commands. Retained JUnit data measures the result and tags tests above the 10-second target without terminating them or failing functional CI.
 
 **Tech Stack:** Rust 1.97.1, Tokio, cargo-nextest 0.9.145, Python 3.13 JUnit policy tooling, mise, GitHub Actions
 
@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Every default correctness test must complete in at most 10 seconds on its required supported runner after compilation.
+- Optimize every default correctness test toward at most 10 seconds on its required supported runner after compilation; report and tag misses without gating execution.
 - A warm unpartitioned `cargo nextest run --locked --workspace --all-features --test-threads 2` must complete in at most 5 minutes.
 - Local and required-CI Rust runs must contain the same correctness population; CI slicing changes scheduling only.
 - Use the smallest boundary-derived fixture and separately assert unchanged production constants.
@@ -26,10 +26,10 @@
 ## Review Focus
 
 - A zero or above-production injected page/offer limit must fail closed, while production constructors still select exactly 1,024 custody rows, 256 Event page entries, and 256 offer identifiers; Task 4 adds these contract and invalid-input assertions for each limit-owning component.
-- A JUnit duration equal to 10.000 seconds passes and any finite duration above it fails with the full test identity; malformed, empty, negative, NaN, and infinite reports fail closed in Task 2.
+- A JUnit duration equal to 10.000 seconds is not tagged and any finite duration above it is tagged with the full test identity without a nonzero exit; malformed, empty, negative, NaN, and infinite reports fail closed in Task 2.
 - A split fault case that panics or times out must still reap tasks, child processes, stores, sockets, and temporary directories without poisoning another case; Tasks 5 and 7 add sequential-after-failure cleanup regressions.
 - Qualification workloads must remain runnable but must neither enter default nextest execution nor silently disappear; Tasks 3 and 7 add selection-policy tests for both outcomes.
-- Platform or runner variance must remain visible through raw JUnit evidence and may not create a budget exception; Task 11 tests the policy configuration and records an unpartitioned verification run.
+- Platform or runner variance must remain visible through raw JUnit evidence and problem tags, never timing allowlists; Task 11 tests the reporting configuration and records an unpartitioned verification run.
 
 ---
 
@@ -68,7 +68,7 @@ git add docs/superpowers/reports/2026-10-20-fast-test-baseline.md docs/validatio
 git commit -S -m "docs(test): retain slow-suite baseline"
 ```
 
-### Task 2: Make the 10-second policy deterministic and fail closed
+### Task 2: Measure and tag the 10-second target deterministically
 
 **Files:**
 - Modify: `.github/scripts/summarize-nextest-junit.py`
@@ -76,21 +76,21 @@ git commit -S -m "docs(test): retain slow-suite baseline"
 
 **Interfaces:**
 - Consumes: nextest JUnit `<testcase time>` values
-- Produces: `summarize(source: Path, partition: str, limit: int, maximum_seconds: float | None) -> tuple[str, list[tuple[float, str]]]`, with deterministic optional budget enforcement ready for Task 11
+- Produces: `summarize(source: Path, partition: str, limit: int, problem_seconds: float | None) -> tuple[str, list[tuple[float, str]]]`, with deterministic non-failing problem tags ready for Task 11
 
 - [ ] **Step 1: Write failing timing-policy tests**
 
-Add tests named `test_accepts_duration_equal_to_budget`, `test_rejects_every_duration_above_budget_with_identity`, and `test_rejects_negative_nan_infinite_empty_and_malformed_reports`. Assert `10.000` succeeds, `10.001` exits nonzero, the diagnostic contains the classname/name identity plus both values, and no successful summary is published for invalid input.
+Add tests named `test_does_not_tag_duration_equal_to_target`, `test_tags_every_duration_above_target_without_failing`, and `test_rejects_negative_nan_infinite_empty_and_malformed_reports`. Assert `10.000` is untagged, `10.001` exits zero and appears in the problem table with its classname/name identity and target, and no successful summary is published for invalid input.
 
 - [ ] **Step 2: Run the policy tests to verify failure**
 
 Run: `python3 .github/scripts/test-nextest-timing.py`
 
-Expected: FAIL because `--maximum-seconds` and over-budget rejection do not exist.
+Expected: FAIL because `--problem-seconds` and problem tagging do not exist.
 
 - [ ] **Step 3: Implement the policy parser and CLI**
 
-Add `positive_finite_seconds(value: str) -> float`, add optional `--maximum-seconds`, return sorted violations from `summarize`, write the bounded summary, then exit nonzero with one diagnostic line per violation when the option is present. Keep current report-only callers compatible and malformed reports fail-closed.
+Add `positive_finite_seconds(value: str) -> float`, add optional `--problem-seconds`, return sorted problem rows from `summarize`, and add optional `--github-annotations`. Write the bounded summary and warning annotations but return zero for duration problems. Keep current report-only callers compatible and malformed reports fail-closed.
 
 - [ ] **Step 4: Run focused verification**
 
@@ -102,7 +102,7 @@ Expected: PASS, including the exact boundary and malformed-input cases.
 
 ```bash
 git add .github/scripts/summarize-nextest-junit.py .github/scripts/test-nextest-timing.py
-git commit -S -m "test(ci): validate per-test timing budgets"
+git commit -S -m "test(ci): classify slow test timings"
 ```
 
 ### Task 3: Replace the production-scale core Blob fixture
@@ -392,10 +392,9 @@ git add crates/aster-lab/src/lib.rs crates/aster-lab/src/mesh_experiment.rs crat
 git commit -S -m "test(lab): minimize correctness scenarios"
 ```
 
-### Task 11: Enforce the budget and close every remaining timing violation
+### Task 11: Measure the suite and tag remaining timing problems
 
 **Files:**
-- Modify: `.config/nextest.toml`
 - Modify: `.github/workflows/ci.yml`
 - Modify: `.github/scripts/summarize-nextest-junit.py`
 - Modify: `.github/scripts/test-nextest-timing.py`
@@ -405,34 +404,34 @@ git commit -S -m "test(lab): minimize correctness scenarios"
 
 **Interfaces:**
 - Consumes: Task 2's committed optional policy and Tasks 3–10's minimized suite
-- Produces: a default suite with no over-10-second case and no timing exceptions
+- Produces: retained before/after measurements and non-failing problem tags for every over-10-second case
 
-- [ ] **Step 1: Run the warm unpartitioned suite with JUnit retention before enforcement**
+- [ ] **Step 1: Run the warm unpartitioned suite with JUnit retention**
 
-Run the existing `ci` JUnit profile unpartitioned before adding the terminating threshold. Record wall time, cumulative time, peak RSS, temporary-disk delta, child-process high water, and open-descriptor high water where supported.
+Run the existing `ci` JUnit profile unpartitioned. Record wall time, cumulative time, peak RSS, temporary-disk delta, child-process high water, and open-descriptor high water where supported.
 
-- [ ] **Step 2: Treat every remaining over-budget identity as a failing regression**
+- [ ] **Step 2: Tag and investigate every remaining over-target identity**
 
-Run the timing policy against the fresh report. Expected before final fixes: either PASS or exact identities over 10 seconds. For each failure, add it to the baseline report, classify its scale/wait/matrix cause, apply the smallest-fixture or case-split rule in its owning file, and rerun that identity. Do not add exceptions.
+Run the timing reporter against the fresh report with `--problem-seconds 10`. Expected: exit zero plus an exact problem table for any identities over 10 seconds. Add each tag to the baseline report, classify its scale/wait/matrix cause, apply the smallest-fixture or case-split rule in its owning file, and rerun that identity. Do not add timing allowlists.
 
 - [ ] **Step 3: Time and classify every non-Rust default correctness command**
 
 Enumerate the Python, shell, binding, conformance, and real-process commands reached by `check-foundation-core`, `check-compose-policy`, and `check-integration`. Run each command separately from a warm checkout with elapsed time and peak RSS retained in the baseline report. Classify compile-only and policy checks separately. Any correctness command over 10 seconds must be minimized, decomposed, or moved to an explicit qualification task with its semantic assertions retained in a fast component check; rerun each changed command individually.
 
-- [ ] **Step 4: Enable the shared nextest threshold**
+- [ ] **Step 4: Add non-failing CI problem annotations**
 
-Apply Task 2's `[profile.default]` 10-second terminating threshold and inherited CI policy. Ensure the CI timing step passes `--maximum-seconds 10` explicitly for auditability.
+Keep nextest profiles free of duration-based termination. Make the CI timing step pass `--problem-seconds 10 --github-annotations`; extend the lane contract tests to prove a 10.001-second fixture emits a warning and exits zero, while malformed timing still exits nonzero.
 
-- [ ] **Step 5: Verify policy, suite population, and budget**
+- [ ] **Step 5: Verify reporting, suite population, and measurements**
 
-Run the policy tests, CI-lane tests, `cargo nextest list` for local/default and both CI slices, and the complete warm unpartitioned suite. Expected: equal union/population, zero failures, no default test over 10 seconds, wall time at most 5 minutes.
+Run the timing tests, CI-lane tests, `cargo nextest list` for local/default and both CI slices, and the complete warm unpartitioned suite. Expected: equal union/population and zero functional failures; the report explicitly shows whether any test remains above 10 seconds and whether warm wall time meets 5 minutes, without changing the command's result for timing alone.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add .config/nextest.toml .github/workflows/ci.yml .github/scripts/test-ci-test-lanes.py docs/superpowers/reports/2026-10-20-fast-test-baseline.md
+git add .github/workflows/ci.yml .github/scripts/test-ci-test-lanes.py docs/superpowers/reports/2026-10-20-fast-test-baseline.md
 # Add only the exact owning test files changed for fresh timing violations.
-git commit -S -m "ci: enforce fast resource-bounded tests"
+git commit -S -m "ci: tag slow tests in retained timing"
 ```
 
 ### Task 12: Update the engineering runbook and retain before/after evidence
@@ -450,7 +449,7 @@ git commit -S -m "ci: enforce fast resource-bounded tests"
 
 - [ ] **Step 1: Document the developer loop**
 
-Include exact commands for focused tests, `mise run check-workspace-tests`, the two CI-equivalent slices, timing-policy verification, and interpreting a 10-second termination. State cold build/download time separately.
+Include exact commands for focused tests, `mise run check-workspace-tests`, the two CI-equivalent slices, timing-report verification, and interpreting a non-failing over-10-second problem tag. State cold build/download time separately.
 
 - [ ] **Step 2: Document explicit qualification**
 
@@ -496,7 +495,7 @@ Expected: PASS with no warnings.
 
 Run: `mise run check-workspace-tests`.
 
-Expected: all default tests and doctests pass; no test reaches 10 seconds; warm nextest wall time is at most 5 minutes when measured from a warm build.
+Expected: all default tests and doctests pass; the timing report tags any test above 10 seconds without gating it and records whether warm nextest wall time meets 5 minutes.
 
 - [ ] **Step 4: Run non-Rust focused integration checks**
 
