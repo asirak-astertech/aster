@@ -101,10 +101,14 @@ partition does not cancel the other partition.
 The required macOS lane does not repeat the OS-agnostic workspace suite already
 covered by the two Linux partitions. It uses `cargo test --no-run` to retain
 Apple ARM compile and link coverage for every all-feature test target, then
-runs the platform contracts in `tools/test-macos-compatibility.sh`. The complete
-macOS workspace suite remains available in the separate `macOS full suite`
-workflow, which runs weekly and on manual dispatch. That workflow is diagnostic
-and is not part of `CI / required`.
+runs the platform contracts in `tools/test-macos-compatibility.sh`. The runner
+uses the same systemd-workspace and Compose-package target directories for the
+compile and execution phases. Each phase also uses the same Cargo package and
+feature selection, so the focused contracts execute the already-linked test
+binaries instead of compiling the dependency graph again. The complete macOS
+workspace suite remains available in the separate `macOS full suite` workflow,
+which runs weekly and on manual dispatch. That workflow is diagnostic and is
+not part of `CI / required`.
 
 ### Test classes and timing evidence
 
@@ -345,7 +349,13 @@ and optional `--offline`/`--no-run`) executes two package selections with
 distinct target directories. The first excludes `aster-compose-credentials`;
 the second tests it directly. This prevents Cargo's shared output filename from
 making either package inspect the other package's binary. Other wrapper command
-shapes are executed unchanged.
+shapes are executed unchanged. The macOS compatibility runner constructs these
+same two selections directly, first with `--no-run` and then with the
+`platform_compat_` filter, and pins both phases to their matching target
+directory. Keep those selections and target-directory assignments paired when
+adding a macOS platform contract; using an unpartitioned target directory can
+reintroduce the binary collision, while using a third directory discards the
+compiled artifacts and repeats the build.
 
 These tests keep exact data and zero-contact-error assertions. Blob waiting
 tracks committed carrier prefixes. State/Record waiting counts each expected

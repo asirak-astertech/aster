@@ -9,15 +9,23 @@ fi
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
 
-run_cargo_test() {
-    sh tools/with-test-resources.sh cargo +1.97.1 test --locked --offline --all-features "$@"
+target_root=${CARGO_TARGET_DIR:-target}
+systemd_target="$target_root/systemd-workspace"
+compose_target="$target_root/compose-package"
+
+run_systemd_workspace_tests() {
+    CARGO_TARGET_DIR="$systemd_target" sh tools/with-test-resources.sh \
+        cargo +1.97.1 test --locked --offline --workspace --all-features \
+        --exclude aster-compose-credentials "$@"
 }
 
-sh tools/with-test-resources.sh \
-    cargo +1.97.1 test --locked --offline --workspace --all-features --no-run
+run_compose_tests() {
+    CARGO_TARGET_DIR="$compose_target" sh tools/with-test-resources.sh \
+        cargo +1.97.1 test --locked --offline \
+        -p aster-compose-credentials --all-features "$@"
+}
 
-run_cargo_test -p aster-node --lib platform_compat_
-run_cargo_test -p aster-agent platform_compat_
-run_cargo_test -p asterctl platform_compat_
-run_cargo_test -p aster-compose-credentials platform_compat_
-run_cargo_test -p aster-systemd-credentials platform_compat_
+run_systemd_workspace_tests --no-run
+run_compose_tests --no-run
+run_systemd_workspace_tests platform_compat_
+run_compose_tests platform_compat_

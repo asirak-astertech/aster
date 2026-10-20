@@ -75,7 +75,9 @@ class RequiredMacosLaneTests(unittest.TestCase):
             (root / "uname").chmod(0o700)
             cargo_log = root / "cargo-log"
             (root / "cargo").write_text(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$CARGO_LOG\"\n"
+                "#!/bin/sh\n"
+                "printf '%s|%s\\n' \"${CARGO_TARGET_DIR:-unset}\" "
+                "\"$*\" >> \"$CARGO_LOG\"\n"
             )
             (root / "cargo").chmod(0o700)
             result = subprocess.run(
@@ -93,24 +95,26 @@ class RequiredMacosLaneTests(unittest.TestCase):
             commands = cargo_log.read_text().splitlines()
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(len(commands), 7)
+        self.assertEqual(len(commands), 4)
+        target_roots = [command.split("|", 1)[0] for command in commands]
+        arguments = [command.split("|", 1)[1] for command in commands]
+        self.assertTrue(target_roots[0].endswith("/systemd-workspace"))
+        self.assertTrue(target_roots[1].endswith("/compose-package"))
+        self.assertEqual(target_roots[2:], target_roots[:2])
         self.assertIn(
             "--workspace --all-features --exclude aster-compose-credentials",
-            commands[0],
+            arguments[0],
         )
-        self.assertIn("-p aster-compose-credentials --all-features", commands[1])
-        self.assertTrue(all("--no-run" in command for command in commands[:2]))
-        self.assertEqual(
-            [command.split(" -p ", 1)[1].split(" ", 1)[0] for command in commands[2:]],
-            [
-                "aster-node",
-                "aster-agent",
-                "asterctl",
-                "aster-compose-credentials",
-                "aster-systemd-credentials",
-            ],
+        self.assertIn("-p aster-compose-credentials --all-features", arguments[1])
+        self.assertTrue(all("--no-run" in command for command in arguments[:2]))
+        self.assertNotIn("--no-run", arguments[2])
+        self.assertNotIn("--no-run", arguments[3])
+        self.assertTrue(all("platform_compat_" in command for command in arguments[2:]))
+        self.assertIn(
+            "--workspace --all-features --exclude aster-compose-credentials",
+            arguments[2],
         )
-        self.assertTrue(all("platform_compat_" in command for command in commands[2:]))
+        self.assertIn("-p aster-compose-credentials --all-features", arguments[3])
 
 
 class FullMacosLaneTests(unittest.TestCase):
