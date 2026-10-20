@@ -26234,6 +26234,94 @@ async fn receive_profile5_blob_direction(
     guard.check(&store)
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn sync_profile5_blob_lane_if_selected(
+    store: &Store,
+    lease_store: Arc<Store>,
+    connection: &aster_iroh::Connection,
+    mission: &mut MissionSession,
+    profiles: Option<&V7TransferProfiles>,
+    mode: BlobTransferMode,
+    guard: &EventLaneGuard,
+    verifier: ReferenceEnvelopeSealer,
+    interests: &MutableSourceInterests,
+    receipt: &mut PeerReceipt,
+) -> Result<(), NodeError> {
+    if mode != BlobTransferMode::StreamV1 {
+        return Ok(());
+    }
+    let profiles = profiles.ok_or_else(|| {
+        NodeError::Protocol("profile-5 Blob lane has no authenticated profiles".into())
+    })?;
+    let local_interest = protected_blob_interest(store, &verifier, interests, true)?;
+    send_profile5_blob_direction(
+        store,
+        connection,
+        mission,
+        profiles,
+        guard,
+        EventDirection::ToSessionResponder,
+        receipt,
+    )
+    .await?;
+    receive_profile5_blob_direction(
+        lease_store,
+        connection,
+        mission,
+        profiles,
+        guard,
+        Arc::new(verifier),
+        &local_interest,
+        EventDirection::ToSessionInitiator,
+        receipt,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn serve_profile5_blob_lane_if_selected(
+    store: Arc<Store>,
+    connection: &aster_iroh::Connection,
+    mission: &mut MissionSession,
+    profiles: Option<&V7TransferProfiles>,
+    mode: BlobTransferMode,
+    guard: &EventLaneGuard,
+    verifier: ReferenceEnvelopeSealer,
+    interests: &MutableSourceInterests,
+    receipt: &mut PeerReceipt,
+) -> Result<(), NodeError> {
+    if mode != BlobTransferMode::StreamV1 {
+        return Ok(());
+    }
+    let profiles = profiles.ok_or_else(|| {
+        NodeError::Protocol("profile-5 Blob lane has no authenticated profiles".into())
+    })?;
+    let local_interest = protected_blob_interest(&store, &verifier, interests, true)?;
+    let verifier = Arc::new(verifier);
+    receive_profile5_blob_direction(
+        Arc::clone(&store),
+        connection,
+        mission,
+        profiles,
+        guard,
+        Arc::clone(&verifier),
+        &local_interest,
+        EventDirection::ToSessionResponder,
+        receipt,
+    )
+    .await?;
+    send_profile5_blob_direction(
+        &store,
+        connection,
+        mission,
+        profiles,
+        guard,
+        EventDirection::ToSessionInitiator,
+        receipt,
+    )
+    .await
+}
+
 async fn sync_event_turn_plans(
     connection: &aster_iroh::Connection,
     mission: &mut MissionSession,
@@ -26530,6 +26618,19 @@ async fn sync_authenticated_session(
                 )
                 .await?;
             }
+            sync_profile5_blob_lane_if_selected(
+                store,
+                Arc::clone(&lease_store),
+                connection,
+                &mut mission,
+                transfer_profiles.as_ref(),
+                blob_transfer_mode,
+                &event_guard,
+                event_verifier,
+                &mutable_interests,
+                &mut receipt,
+            )
+            .await?;
             if transfer_profiles.is_some() {
                 sync_selected_event_bridge(
                     connection,
@@ -26693,6 +26794,19 @@ async fn sync_authenticated_session(
                     &mut receipt,
                 )
                 .await?;
+                sync_profile5_blob_lane_if_selected(
+                    store,
+                    Arc::clone(&lease_store),
+                    connection,
+                    &mut mission,
+                    transfer_profiles.as_ref(),
+                    blob_transfer_mode,
+                    &event_guard,
+                    event_verifier,
+                    &mutable_interests,
+                    &mut receipt,
+                )
+                .await?;
                 sync_selected_event_bridge(
                     connection,
                     &mut mission,
@@ -26842,32 +26956,19 @@ async fn sync_authenticated_session(
         )
         .await?;
     }
-    if blob_transfer_mode == BlobTransferMode::StreamV1 {
-        let local_blob_interest =
-            protected_blob_interest(store, &event_verifier, &mutable_interests, true)?;
-        send_profile5_blob_direction(
-            store,
-            connection,
-            &mut mission,
-            profiles,
-            &event_guard,
-            EventDirection::ToSessionResponder,
-            &mut receipt,
-        )
-        .await?;
-        receive_profile5_blob_direction(
-            lease_store,
-            connection,
-            &mut mission,
-            profiles,
-            &event_guard,
-            Arc::new(event_verifier),
-            &local_blob_interest,
-            EventDirection::ToSessionInitiator,
-            &mut receipt,
-        )
-        .await?;
-    }
+    sync_profile5_blob_lane_if_selected(
+        store,
+        lease_store,
+        connection,
+        &mut mission,
+        Some(profiles),
+        blob_transfer_mode,
+        &event_guard,
+        event_verifier,
+        &mutable_interests,
+        &mut receipt,
+    )
+    .await?;
     sync_selected_event_bridge(
         connection,
         &mut mission,
@@ -28877,6 +28978,18 @@ async fn serve_session(
                 )
                 .await?;
             }
+            serve_profile5_blob_lane_if_selected(
+                Arc::clone(&store),
+                &connection,
+                &mut mission,
+                transfer_profiles.as_ref(),
+                blob_transfer_mode,
+                &event_guard,
+                event_verifier,
+                &mutable_interests,
+                &mut receipt,
+            )
+            .await?;
             if transfer_profiles.is_some() {
                 serve_selected_event_bridge(
                     &connection,
@@ -29038,6 +29151,18 @@ async fn serve_session(
                     &mut receipt,
                 )
                 .await?;
+                serve_profile5_blob_lane_if_selected(
+                    Arc::clone(&store),
+                    &connection,
+                    &mut mission,
+                    transfer_profiles.as_ref(),
+                    blob_transfer_mode,
+                    &event_guard,
+                    event_verifier,
+                    &mutable_interests,
+                    &mut receipt,
+                )
+                .await?;
                 serve_selected_event_bridge(
                     &connection,
                     &mut mission,
@@ -29187,33 +29312,18 @@ async fn serve_session(
         )
         .await?;
     }
-    if blob_transfer_mode == BlobTransferMode::StreamV1 {
-        let local_blob_interest =
-            protected_blob_interest(&store, &event_verifier, &mutable_interests, true)?;
-        let stream_verifier = Arc::new(event_verifier);
-        receive_profile5_blob_direction(
-            Arc::clone(&store),
-            &connection,
-            &mut mission,
-            profiles,
-            &event_guard,
-            Arc::clone(&stream_verifier),
-            &local_blob_interest,
-            EventDirection::ToSessionResponder,
-            &mut receipt,
-        )
-        .await?;
-        send_profile5_blob_direction(
-            &store,
-            &connection,
-            &mut mission,
-            profiles,
-            &event_guard,
-            EventDirection::ToSessionInitiator,
-            &mut receipt,
-        )
-        .await?;
-    }
+    serve_profile5_blob_lane_if_selected(
+        Arc::clone(&store),
+        &connection,
+        &mut mission,
+        Some(profiles),
+        blob_transfer_mode,
+        &event_guard,
+        event_verifier,
+        &mutable_interests,
+        &mut receipt,
+    )
+    .await?;
     serve_selected_event_bridge(
         &connection,
         &mut mission,
