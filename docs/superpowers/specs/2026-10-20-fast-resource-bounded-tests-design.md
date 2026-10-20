@@ -1,6 +1,6 @@
 # Fast, resource-bounded correctness test architecture
 
-**Status:** Approved in chat on 2026-10-20; written specification awaiting review
+**Status:** Approved in chat and written-spec review on 2026-10-20
 
 **Capability tracks:** engineering quality and delivery confidence
 
@@ -96,7 +96,7 @@ storage format, or protocol.
 ### Qualification and benchmark programs
 
 Scale, throughput, soak, and resource-envelope work moves to explicit harnesses
-outside default `cargo test` discovery. Examples include a 100 MiB or 1 GiB
+outside default `cargo test` execution. Examples include a 100 MiB or 1 GiB
 Blob, a complete 1,024-entry page, a 23-process mesh scenario, and hardware
 measurements on CM4 devices. Each command must state:
 
