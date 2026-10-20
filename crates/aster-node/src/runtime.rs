@@ -48790,180 +48790,196 @@ mod tests {
         fs::remove_dir_all(state).expect("oversized direct-range cleanup");
     }
 
-    #[tokio::test]
-    async fn live_blob_contact_coherence_faults_send_no_result_and_close_the_actor() {
+    macro_rules! blob_contact_coherence_cases {
+        ($($name:ident => $fault:expr),+ $(,)?) => {
+            $(
+                #[tokio::test]
+                async fn $name() {
+                    assert_blob_contact_coherence_fault($fault).await;
+                }
+            )+
+        };
+    }
+
+    blob_contact_coherence_cases! {
+        live_blob_contact_post_stage_fault_sends_no_result_and_closes_actor => TestBlobContactFault::PostStage,
+        live_blob_contact_post_promotion_fault_sends_no_result_and_closes_actor => TestBlobContactFault::PostPromotion,
+        live_blob_contact_post_abort_fault_sends_no_result_and_closes_actor => TestBlobContactFault::PostAbort,
+        live_blob_contact_sender_projection_mismatch_sends_no_result_and_closes_actor => TestBlobContactFault::SenderProjectionMismatch,
+        live_blob_contact_sender_sealed_mismatch_sends_no_result_and_closes_actor => TestBlobContactFault::SenderSealedMismatch,
+        live_blob_contact_range_postcheck_fault_sends_no_result_and_closes_actor => TestBlobContactFault::RangePostcheck,
+        live_blob_contact_pending_completion_fault_sends_no_result_and_closes_actor => TestBlobContactFault::PendingCompletion,
+        live_blob_contact_stage_coherence_fault_sends_no_result_and_closes_actor => TestBlobContactFault::StageCoherence,
+        live_blob_contact_append_coherence_fault_sends_no_result_and_closes_actor => TestBlobContactFault::AppendCoherence,
+    }
+
+    async fn assert_blob_contact_coherence_fault(fault: TestBlobContactFault) {
         use crate::application::ApplicationErrorKind;
 
-        for fault in [
-            TestBlobContactFault::PostStage,
-            TestBlobContactFault::PostPromotion,
-            TestBlobContactFault::PostAbort,
-            TestBlobContactFault::SenderProjectionMismatch,
-            TestBlobContactFault::SenderSealedMismatch,
-            TestBlobContactFault::RangePostcheck,
-            TestBlobContactFault::PendingCompletion,
-            TestBlobContactFault::StageCoherence,
-            TestBlobContactFault::AppendCoherence,
-        ] {
-            let root = root(&format!("live-blob-contact-fatal-{fault:?}"));
-            let source_state = root.join("source");
-            let receiver_state = root.join("receiver");
-            let source_path = root.join("source.bin");
-            fs::create_dir_all(&root).expect("contact-fatal Blob root");
-            fs::write(&source_path, vec![0x6d; 32 * 1024]).expect("contact-fatal Blob source");
-            let services = control_test_services([0xf0 + fault as u8; 32]);
-            let source_mission = IssuedMission {
-                identity: services.member.identity(),
-                credentials: services.member,
-            };
-            let receiver_mission = IssuedMission {
-                identity: services.other.identity(),
-                credentials: services.other,
-            };
-            let source_carrier = {
-                let identity = NodeIdentity::load_or_create(&source_state)
-                    .expect("contact-fatal source carrier identity");
-                let id = identity.id();
-                drop(identity);
-                id
-            };
-            let receiver_carrier = {
-                let identity = NodeIdentity::load_or_create(&receiver_state)
-                    .expect("contact-fatal receiver carrier identity");
-                let id = identity.id();
-                drop(identity);
-                id
-            };
-            let topic = services.topic;
-            let scope = services.scope;
-            let offline = start_node(NodeConfig {
-                state: source_state.clone(),
-                bind: SocketAddr::from(([127, 0, 0, 1], 0)),
-                mission: source_mission.credentials.clone(),
-                peers: Vec::new(),
-                mutable_interests: Default::default(),
-                sync_interval: Duration::from_millis(10),
-                run_for: None,
-                application: NodeApplication::Relay,
-            })
-            .await
-            .expect("start contact-fatal source fixture");
-            offline
-                .selected_blobs()
-                .publish(
-                    live_blob_request(
-                        format!("contact-fatal-{fault:?}").as_bytes(),
-                        &topic,
-                        &scope,
-                    ),
-                    File::open(&source_path).expect("open contact-fatal Blob source"),
-                )
-                .await
-                .expect("publish contact-fatal Blob fixture");
-            offline
-                .shutdown()
-                .await
-                .expect("stop contact-fatal source fixture");
-
-            let target_is_source = matches!(
-                fault,
-                TestBlobContactFault::SenderProjectionMismatch
-                    | TestBlobContactFault::SenderSealedMismatch
-                    | TestBlobContactFault::RangePostcheck
-            );
-            let fault_state = install_test_blob_contact_fault(
-                if target_is_source {
-                    source_mission.identity
-                } else {
-                    receiver_mission.identity
-                },
-                fault,
-            );
-            let source_address = SocketAddr::from(([127, 0, 0, 1], 0));
-            let receiver_address = source_address;
-            let interests =
-                MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
-                    topic.clone(),
-                    scope.clone(),
-                    false,
-                )]);
-            let source_config = NodeConfig {
-                state: source_state,
-                bind: source_address,
-                mission: source_mission.credentials,
-                peers: vec![MissionExpectedPeer {
-                    carrier: ExpectedPeer {
-                        id: receiver_carrier,
-                        address: receiver_address,
-                    },
-                    mission: receiver_mission.identity,
-                }],
-                mutable_interests: interests.clone(),
-                sync_interval: Duration::from_millis(10),
-                run_for: None,
-                application: NodeApplication::Relay,
-            };
-            let receiver_config = NodeConfig {
-                state: receiver_state,
-                bind: receiver_address,
-                mission: receiver_mission.credentials,
-                peers: vec![MissionExpectedPeer {
-                    carrier: ExpectedPeer {
-                        id: source_carrier,
-                        address: source_address,
-                    },
-                    mission: source_mission.identity,
-                }],
-                mutable_interests: interests,
-                sync_interval: Duration::from_millis(10),
-                run_for: None,
-                application: NodeApplication::Relay,
-            };
-            let (source_running, receiver_running) = start_test_pair(
-                source_config,
-                receiver_config,
-                source_carrier,
-                receiver_carrier,
-            )
-            .await;
-            let (faulted, peer) = if target_is_source {
-                (source_running, receiver_running)
-            } else {
-                (receiver_running, source_running)
-            };
-            let retained = faulted.selected_events();
-            let error = timeout(Duration::from_secs(20), faulted.wait())
-                .await
-                .unwrap_or_else(|_| panic!("{fault:?} did not terminate its actor"))
-                .expect_err("contact coherence fault must terminate the actor");
-            assert!(
-                matches!(error, NodeError::FatalBlobCoherence(_)),
-                "unexpected {fault:?} terminal error: {error}"
-            );
-            assert!(
-                fault_state.fired.load(Ordering::Acquire),
-                "{fault:?} injection did not reach its durable transition; actor terminated with {error}"
-            );
-            assert_eq!(
-                fault_state
-                    .result_frames_after_fault
-                    .load(Ordering::Acquire),
-                0,
-                "{fault:?} constructed a result/ACK after the fatal transition"
-            );
-            assert_eq!(
-                retained
-                    .status()
-                    .await
-                    .expect_err("faulted actor closes retained application admission")
-                    .kind(),
-                ApplicationErrorKind::StateUnavailable
-            );
-            let _ = timeout(Duration::from_secs(5), peer.shutdown())
-                .await
-                .unwrap_or_else(|_| panic!("{fault:?} peer did not quiesce"));
-            fs::remove_dir_all(root).expect("contact-fatal Blob cleanup");
+        let root = root(&format!("live-blob-contact-fatal-{fault:?}"));
+        let source_state = root.join("source");
+        let receiver_state = root.join("receiver");
+        let source_path = root.join("source.bin");
+        fs::create_dir_all(&root).expect("contact-fatal Blob root");
+        fs::write(&source_path, vec![0x6d; MAX_BLOB_NETWORK_RANGE_BYTES + 1])
+            .expect("contact-fatal Blob source");
+        let services = control_test_services([0xf0 + fault as u8; 32]);
+        let source_mission = IssuedMission {
+            identity: services.member.identity(),
+            credentials: services.member,
+        };
+        let receiver_mission = IssuedMission {
+            identity: services.other.identity(),
+            credentials: services.other,
+        };
+        let source_carrier = {
+            let identity = NodeIdentity::load_or_create(&source_state)
+                .expect("contact-fatal source carrier identity");
+            let id = identity.id();
+            drop(identity);
+            id
+        };
+        let receiver_carrier = {
+            let identity = NodeIdentity::load_or_create(&receiver_state)
+                .expect("contact-fatal receiver carrier identity");
+            let id = identity.id();
+            drop(identity);
+            id
+        };
+        #[cfg(unix)]
+        for state in [&source_state, &receiver_state] {
+            fs::set_permissions(state, fs::Permissions::from_mode(0o700))
+                .expect("owner-only contact-fatal state");
         }
+        let topic = services.topic;
+        let scope = services.scope;
+        let offline = start_node(NodeConfig {
+            state: source_state.clone(),
+            bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+            mission: source_mission.credentials.clone(),
+            peers: Vec::new(),
+            mutable_interests: Default::default(),
+            sync_interval: Duration::from_millis(10),
+            run_for: None,
+            application: NodeApplication::Relay,
+        })
+        .await
+        .expect("start contact-fatal source fixture");
+        offline
+            .selected_blobs()
+            .publish(
+                live_blob_request(
+                    format!("contact-fatal-{fault:?}").as_bytes(),
+                    &topic,
+                    &scope,
+                ),
+                File::open(&source_path).expect("open contact-fatal Blob source"),
+            )
+            .await
+            .expect("publish contact-fatal Blob fixture");
+        offline
+            .shutdown()
+            .await
+            .expect("stop contact-fatal source fixture");
+
+        let target_is_source = matches!(
+            fault,
+            TestBlobContactFault::SenderProjectionMismatch
+                | TestBlobContactFault::SenderSealedMismatch
+                | TestBlobContactFault::RangePostcheck
+        );
+        let fault_state = install_test_blob_contact_fault(
+            if target_is_source {
+                source_mission.identity
+            } else {
+                receiver_mission.identity
+            },
+            fault,
+        );
+        let source_address = SocketAddr::from(([127, 0, 0, 1], 0));
+        let receiver_address = source_address;
+        let interests =
+            MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
+                topic.clone(),
+                scope.clone(),
+                false,
+            )]);
+        let source_config = NodeConfig {
+            state: source_state,
+            bind: source_address,
+            mission: source_mission.credentials,
+            peers: vec![MissionExpectedPeer {
+                carrier: ExpectedPeer {
+                    id: receiver_carrier,
+                    address: receiver_address,
+                },
+                mission: receiver_mission.identity,
+            }],
+            mutable_interests: interests.clone(),
+            sync_interval: Duration::from_millis(10),
+            run_for: None,
+            application: NodeApplication::Relay,
+        };
+        let receiver_config = NodeConfig {
+            state: receiver_state,
+            bind: receiver_address,
+            mission: receiver_mission.credentials,
+            peers: vec![MissionExpectedPeer {
+                carrier: ExpectedPeer {
+                    id: source_carrier,
+                    address: source_address,
+                },
+                mission: source_mission.identity,
+            }],
+            mutable_interests: interests,
+            sync_interval: Duration::from_millis(10),
+            run_for: None,
+            application: NodeApplication::Relay,
+        };
+        let (source_running, receiver_running) = start_test_pair(
+            source_config,
+            receiver_config,
+            source_carrier,
+            receiver_carrier,
+        )
+        .await;
+        let (faulted, peer) = if target_is_source {
+            (source_running, receiver_running)
+        } else {
+            (receiver_running, source_running)
+        };
+        let retained = faulted.selected_events();
+        let error = timeout(Duration::from_secs(20), faulted.wait())
+            .await
+            .unwrap_or_else(|_| panic!("{fault:?} did not terminate its actor"))
+            .expect_err("contact coherence fault must terminate the actor");
+        assert!(
+            matches!(error, NodeError::FatalBlobCoherence(_)),
+            "unexpected {fault:?} terminal error: {error}"
+        );
+        assert!(
+            fault_state.fired.load(Ordering::Acquire),
+            "{fault:?} injection did not reach its durable transition; actor terminated with {error}"
+        );
+        assert_eq!(
+            fault_state
+                .result_frames_after_fault
+                .load(Ordering::Acquire),
+            0,
+            "{fault:?} constructed a result/ACK after the fatal transition"
+        );
+        assert_eq!(
+            retained
+                .status()
+                .await
+                .expect_err("faulted actor closes retained application admission")
+                .kind(),
+            ApplicationErrorKind::StateUnavailable
+        );
+        let _ = timeout(Duration::from_secs(5), peer.shutdown())
+            .await
+            .unwrap_or_else(|_| panic!("{fault:?} peer did not quiesce"));
+        fs::remove_dir_all(root).expect("contact-fatal Blob cleanup");
     }
 
     include!("runtime/blob_ranges_stream_lanes_tests.rs");
@@ -50771,119 +50787,582 @@ mod tests {
         assert_ne!(prior_offer_digest, prior_fetch_digest);
     }
 
-    #[tokio::test]
-    async fn finite_blob_lifetime_loss_is_ordinary_at_every_carrier_boundary() {
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum FiniteBlobLifetimeBoundary {
+        PendingRecheck,
+        Service,
+        PostInstallCompletion,
+        Promotion,
+    }
+
+    macro_rules! finite_blob_lifetime_cases {
+        ($($name:ident => ($label:literal, $boundary:expr, $fault:expr)),+ $(,)?) => {
+            $(
+                #[tokio::test]
+                async fn $name() {
+                    assert_finite_blob_lifetime_case($label, $boundary, $fault).await;
+                }
+            )+
+        };
+    }
+
+    finite_blob_lifetime_cases! {
+        finite_blob_pending_expiry_is_ordinary => ("pending-expiry", FiniteBlobLifetimeBoundary::PendingRecheck, TestBlobContactFault::PendingLifetimeExpiry),
+        finite_blob_pending_discontinuity_is_ordinary => ("pending-discontinuity", FiniteBlobLifetimeBoundary::PendingRecheck, TestBlobContactFault::PendingLifetimeDiscontinuity),
+        finite_blob_service_expiry_is_ordinary => ("service-expiry", FiniteBlobLifetimeBoundary::Service, TestBlobContactFault::ServiceLifetimeExpiry),
+        finite_blob_service_discontinuity_is_ordinary => ("service-discontinuity", FiniteBlobLifetimeBoundary::Service, TestBlobContactFault::ServiceLifetimeDiscontinuity),
+        finite_blob_completion_expiry_is_ordinary => ("completion-expiry", FiniteBlobLifetimeBoundary::PostInstallCompletion, TestBlobContactFault::CompletionLifetimeExpiry),
+        finite_blob_completion_discontinuity_is_ordinary => ("completion-discontinuity", FiniteBlobLifetimeBoundary::PostInstallCompletion, TestBlobContactFault::CompletionLifetimeDiscontinuity),
+        finite_blob_promotion_expiry_is_ordinary => ("promotion-expiry", FiniteBlobLifetimeBoundary::Promotion, TestBlobContactFault::PromotionLifetimeExpiry),
+        finite_blob_promotion_discontinuity_is_ordinary => ("promotion-discontinuity", FiniteBlobLifetimeBoundary::Promotion, TestBlobContactFault::PromotionLifetimeDiscontinuity),
+    }
+
+    fn next_blob_progress_attempt(label: &str, attempts: &mut usize) {
+        assert!(
+            *attempts < blob_ranges_stream::MAX_RANGES,
+            "{label}: Blob setup did not reach its asserted boundary after the production maximum of {} range attempts",
+            blob_ranges_stream::MAX_RANGES
+        );
+        *attempts += 1;
+    }
+
+    async fn assert_finite_blob_lifetime_case(
+        label: &str,
+        boundary: FiniteBlobLifetimeBoundary,
+        fault: TestBlobContactFault,
+    ) {
         // Mutation caught: interpreting Store-owned expiry or continuity loss
         // as authenticated-state corruption aborts the retained pending source
         // and prefix, advances its carrier turn, or terminates the node actor.
-        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-        enum Boundary {
-            PendingRecheck,
-            Service,
-            PostInstallCompletion,
-            Promotion,
+        let case_seed = 0x90_u8.wrapping_add(fault as u8);
+        let services = control_test_services([case_seed; 32]);
+        let authority = services.member.mission_authority_id();
+        let source_state = root(&format!("finite-lifetime-{label}-source"));
+        let receiver_state = root(&format!("finite-lifetime-{label}-receiver"));
+        fs::create_dir_all(&source_state).expect("lifetime source root");
+        fs::create_dir_all(&receiver_state).expect("lifetime receiver root");
+        let source_store = Arc::new(
+            Store::open_for_mission(source_state.join(STORE_FILE), authority)
+                .expect("lifetime source store"),
+        );
+        let receiver_store = Arc::new(
+            Store::open_for_mission(receiver_state.join(STORE_FILE), authority)
+                .expect("lifetime receiver store"),
+        );
+        let mut source_verifier = open_test_sealer(&services.member);
+        let transfer = publish_test_finite_blob(
+            &source_store,
+            &mut source_verifier,
+            &services.topic,
+            &services.scope,
+            1,
+            &vec![0xa0_u8.wrapping_add(fault as u8); MAX_BLOB_NETWORK_RANGE_BYTES + 1],
+            600_000,
+            25,
+            CustodySample {
+                clock_id: [0xb1; 16],
+                tick_ms: 0,
+            },
+        );
+        let source_stored = source_store
+            .get_blob(transfer)
+            .expect("lifetime source lookup")
+            .expect("lifetime source exists");
+        let source_route = source_verifier
+            .verify_blob(&source_stored.sealed)
+            .expect("lifetime source route verification");
+        let BlobContentVerification::ContentVerified {
+            blob: source_blob,
+            manifest_bytes: source_manifest,
+        } = source_verifier
+            .verify_blob_content(source_route, &source_stored.sealed)
+            .expect("lifetime source content verification")
+        else {
+            panic!("lifetime source lost content grant")
+        };
+        let source_plan = source_blob
+            .transfer_plan(&source_manifest)
+            .expect("lifetime source transfer plan");
+        let interests = || {
+            MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
+                services.topic.clone(),
+                services.scope.clone(),
+                false,
+            )])
+        };
+
+        let initial_fault = blob_ranges_stream_test::install_boundary(
+            &source_store,
+            &receiver_store,
+            false,
+            blob_ranges_stream_test::Boundary::AppendCapacity,
+        );
+        initial_fault.release_sender.notify_one();
+        initial_fault.release_receiver.notify_one();
+        let (first_receiver, _, _, _) = blob_contact_test_pair(
+            source_store.clone(),
+            services.member.clone(),
+            interests(),
+            receiver_store.clone(),
+            services.other.clone(),
+            interests(),
+        )
+        .await;
+        assert!(initial_fault.fired.load(Ordering::Acquire));
+        blob_ranges_stream_test::remove(&source_store);
+        blob_ranges_stream_test::remove(&receiver_store);
+        assert!(
+            (1..=blob_ranges_stream::MAX_RANGES).contains(&first_receiver.blob_ranges_fetched),
+            "{label}: bounded first multi-range turn"
+        );
+        assert!(
+            receiver_store
+                .pending_blob_source(transfer)
+                .expect("lifetime initial pending lookup")
+                .is_some(),
+            "{label}: multi-range source remains pending"
+        );
+
+        if boundary == FiniteBlobLifetimeBoundary::PostInstallCompletion {
+            let policy = receiver_store
+                .control_policy_snapshot()
+                .expect("lifetime completion setup policy");
+            let mut completion_boundary_ready = false;
+            let mut attempts = 0;
+            while !completion_boundary_ready {
+                next_blob_progress_attempt(label, &mut attempts);
+                let carriers = receiver_store
+                    .pending_blob_carrier_work_with_policy(&policy, transfer, &source_plan)
+                    .expect("lifetime completion setup work");
+                let cursor = receiver_store
+                    .blob_carrier_fetch_cursor(services.member.identity())
+                    .expect("lifetime completion setup cursor");
+                let next = cursor
+                    .and_then(|cursor| {
+                        carriers.iter().find(|status| {
+                            (status.source(), status.object()) > (cursor.source(), cursor.object())
+                        })
+                    })
+                    .or_else(|| carriers.first())
+                    .expect("lifetime completion setup retained work");
+                if next
+                    .exact_complement()
+                    .is_some_and(|range| range.end == next.total_len())
+                {
+                    completion_boundary_ready = true;
+                    continue;
+                }
+                let setup_fault = blob_ranges_stream_test::install_boundary(
+                    &source_store,
+                    &receiver_store,
+                    false,
+                    blob_ranges_stream_test::Boundary::AppendCapacity,
+                );
+                setup_fault.release_sender.notify_one();
+                setup_fault.release_receiver.notify_one();
+                let prepared = blob_contact_test_pair(
+                    source_store.clone(),
+                    services.member.clone(),
+                    interests(),
+                    receiver_store.clone(),
+                    services.other.clone(),
+                    interests(),
+                )
+                .await;
+                assert!(setup_fault.fired.load(Ordering::Acquire));
+                blob_ranges_stream_test::remove(&source_store);
+                blob_ranges_stream_test::remove(&receiver_store);
+                assert!(
+                    (1..=blob_ranges_stream::MAX_RANGES).contains(&prepared.0.blob_ranges_fetched),
+                    "{label}: bounded setup multi-range turn"
+                );
+            }
+            assert!(
+                completion_boundary_ready,
+                "{label}: bounded completion setup"
+            );
         }
 
-        let cases = [
-            (
-                "pending-expiry",
-                Boundary::PendingRecheck,
-                TestBlobContactFault::PendingLifetimeExpiry,
-            ),
-            (
-                "pending-discontinuity",
-                Boundary::PendingRecheck,
-                TestBlobContactFault::PendingLifetimeDiscontinuity,
-            ),
-            (
-                "service-expiry",
-                Boundary::Service,
-                TestBlobContactFault::ServiceLifetimeExpiry,
-            ),
-            (
-                "service-discontinuity",
-                Boundary::Service,
-                TestBlobContactFault::ServiceLifetimeDiscontinuity,
-            ),
-            (
-                "completion-expiry",
-                Boundary::PostInstallCompletion,
-                TestBlobContactFault::CompletionLifetimeExpiry,
-            ),
-            (
-                "completion-discontinuity",
-                Boundary::PostInstallCompletion,
-                TestBlobContactFault::CompletionLifetimeDiscontinuity,
-            ),
-            (
-                "promotion-expiry",
-                Boundary::Promotion,
-                TestBlobContactFault::PromotionLifetimeExpiry,
-            ),
-            (
-                "promotion-discontinuity",
-                Boundary::Promotion,
-                TestBlobContactFault::PromotionLifetimeDiscontinuity,
-            ),
-        ];
+        if boundary == FiniteBlobLifetimeBoundary::Promotion {
+            let hold = install_test_blob_contact_fault(
+                services.other.identity(),
+                TestBlobContactFault::HoldPromotion,
+            );
+            let source_cache = test_event_route_cache(&source_store, &services.member);
+            let receiver_cache = test_event_route_cache(&receiver_store, &services.other);
+            let mut attempts = 0;
+            while !hold.fired.load(Ordering::Acquire) {
+                next_blob_progress_attempt(label, &mut attempts);
+                let held = blob_contact_test_pair_with_caches_results(
+                    source_store.clone(),
+                    services.member.clone(),
+                    interests(),
+                    Arc::clone(&source_cache),
+                    receiver_store.clone(),
+                    services.other.clone(),
+                    interests(),
+                    Arc::clone(&receiver_cache),
+                    None,
+                    None,
+                    None,
+                    None,
+                    0,
+                )
+                .await;
+                assert!(held.0.is_ok() && held.1.is_ok(), "{label}: hold promotion");
+            }
+            assert!(hold.fired.load(Ordering::Acquire), "{label}: hold fault");
+        }
 
-        for (case_index, (label, boundary, fault)) in cases.into_iter().enumerate() {
-            let services = control_test_services([0x90 + case_index as u8; 32]);
-            let authority = services.member.mission_authority_id();
-            let source_state = root(&format!("finite-lifetime-{label}-source"));
-            let receiver_state = root(&format!("finite-lifetime-{label}-receiver"));
-            fs::create_dir_all(&source_state).expect("lifetime source root");
-            fs::create_dir_all(&receiver_state).expect("lifetime receiver root");
-            let source_store = Arc::new(
-                Store::open_for_mission(source_state.join(STORE_FILE), authority)
-                    .expect("lifetime source store"),
+        let before_stats = receiver_store
+            .blob_stats()
+            .expect("lifetime retained stats before fault");
+        assert_eq!(
+            before_stats.pending_sources, 1,
+            "{label}: retained pending row"
+        );
+        if boundary == FiniteBlobLifetimeBoundary::Promotion {
+            assert_eq!(
+                before_stats.carrier_prefixes, 0,
+                "{label}: no prefix after hold"
             );
-            let receiver_store = Arc::new(
-                Store::open_for_mission(receiver_state.join(STORE_FILE), authority)
-                    .expect("lifetime receiver store"),
+        } else {
+            assert_ne!(before_stats.carrier_prefixes, 0, "{label}: retained prefix");
+        }
+        let carrier_cursor_before = receiver_store
+            .blob_carrier_fetch_cursor(services.member.identity())
+            .expect("lifetime carrier cursor before fault");
+        let receiver_digest_before = receiver_store.test_blob_logical_digest();
+        let fault_identity = if boundary == FiniteBlobLifetimeBoundary::Service {
+            services.member.identity()
+        } else {
+            services.other.identity()
+        };
+        let fault_state = install_test_blob_contact_fault(fault_identity, fault);
+        let receiver_cache = test_event_route_cache(&receiver_store, &services.other);
+        let (client_result, server_result) = blob_contact_test_pair_with_caches_results(
+            source_store.clone(),
+            services.member.clone(),
+            interests(),
+            test_event_route_cache(&source_store, &services.member),
+            receiver_store.clone(),
+            services.other.clone(),
+            interests(),
+            Arc::clone(&receiver_cache),
+            None,
+            None,
+            None,
+            None,
+            0,
+        )
+        .await;
+
+        assert!(
+            fault_state.fired.load(Ordering::Acquire),
+            "{label}: fault fired"
+        );
+        if let Err(error) = &client_result {
+            assert!(
+                !actor_fatal_contact_error(error, services.other.identity()),
+                "{label}: client lifetime loss became actor-fatal: {error}"
             );
-            let mut source_verifier = open_test_sealer(&services.member);
-            let transfer = publish_test_finite_blob(
+        }
+        if let Err(error) = &server_result {
+            assert!(
+                !actor_fatal_contact_error(error, services.member.identity()),
+                "{label}: server lifetime loss became actor-fatal: {error}"
+            );
+        }
+        assert!(
+            client_result.is_ok() && server_result.is_ok(),
+            "{label}: omission/unavailability should settle normally: client={client_result:?}, server={server_result:?}"
+        );
+        if matches!(
+            boundary,
+            FiniteBlobLifetimeBoundary::PendingRecheck | FiniteBlobLifetimeBoundary::Service
+        ) {
+            assert_eq!(
+                client_result
+                    .as_ref()
+                    .expect("checked successful lifetime contact")
+                    .receipt
+                    .blob_ranges_fetched,
+                0,
+                "{label}: lifetime loss cannot open a later range"
+            );
+        }
+
+        let after_stats = receiver_store
+            .blob_stats()
+            .expect("lifetime retained stats after fault");
+        let receiver_settles_lifetime = matches!(
+            boundary,
+            FiniteBlobLifetimeBoundary::PostInstallCompletion
+                | FiniteBlobLifetimeBoundary::Promotion
+        );
+        let receiver_settles_expiry = label.ends_with("-expiry") && receiver_settles_lifetime;
+        if receiver_settles_expiry {
+            assert_eq!(after_stats.pending_sources, 0, "{label}: exact retirement");
+            assert_eq!(
+                after_stats.carrier_prefixes, 0,
+                "{label}: prefix retirement"
+            );
+            assert!(
+                !receiver_cache.has_blob_claim_for_test(transfer),
+                "{label}: retired pending authority removes its cache claim"
+            );
+        } else {
+            assert_eq!(
+                after_stats.pending_sources, before_stats.pending_sources,
+                "{label}"
+            );
+            assert_eq!(
+                after_stats.carrier_prefixes, before_stats.carrier_prefixes,
+                "{label}"
+            );
+            assert!(
+                receiver_cache.has_blob_claim_for_test(transfer),
+                "{label}: retained pending authority must keep its cache claim"
+            );
+        }
+        let carrier_cursor_after = receiver_store
+            .blob_carrier_fetch_cursor(services.member.identity())
+            .expect("lifetime carrier cursor after fault");
+        assert_eq!(
+            carrier_cursor_after, carrier_cursor_before,
+            "{label}: the bounded fault fixture remains on its exact carrier object"
+        );
+        let fault_digest = fault_state
+            .logical_digest_after_fault()
+            .unwrap_or_else(|| panic!("{label}: fault-boundary logical digest"));
+        if boundary == FiniteBlobLifetimeBoundary::Service {
+            assert_eq!(
+                source_store.test_blob_logical_digest(),
+                fault_digest,
+                "{label}"
+            );
+            assert_eq!(
+                receiver_store.test_blob_logical_digest(),
+                receiver_digest_before,
+                "{label}: unavailable multi-range data must not mutate requester state"
+            );
+            assert!(
+                receiver_store
+                    .pending_blob_source(transfer)
+                    .expect("service-loss requester pending lookup")
+                    .is_some()
+            );
+            assert_eq!(
+                fault_state
+                    .result_frames_after_fault
+                    .load(Ordering::Acquire),
+                0,
+                "{label}: multi-range unavailability emits no removed result/ACK frame"
+            );
+        } else if !receiver_settles_lifetime {
+            assert_eq!(
+                receiver_store.test_blob_logical_digest(),
+                fault_digest,
+                "{label}"
+            );
+            assert!(
+                receiver_store
+                    .pending_blob_source(transfer)
+                    .expect("lifetime-invisible pending lookup")
+                    .is_none(),
+                "{label}: invisible finite work remains non-forwardable"
+            );
+            assert_eq!(
+                fault_state
+                    .result_frames_after_fault
+                    .load(Ordering::Acquire),
+                0,
+                "{label}: no result/ACK follows the failed boundary"
+            );
+        } else {
+            assert_ne!(
+                receiver_store.test_blob_logical_digest(),
+                fault_digest,
+                "{label}: terminal lifetime settlement must persist after the injected transition"
+            );
+            assert!(
+                receiver_store
+                    .pending_blob_source(transfer)
+                    .expect("settled lifetime pending lookup")
+                    .is_none(),
+                "{label}: settled finite work remains non-forwardable"
+            );
+            assert_eq!(
+                fault_state
+                    .result_frames_after_fault
+                    .load(Ordering::Acquire),
+                0,
+                "{label}: no result/ACK follows the settled boundary"
+            );
+        }
+
+        drop((source_store, receiver_store));
+        fs::remove_dir_all(source_state).expect("lifetime source cleanup");
+        fs::remove_dir_all(receiver_state).expect("lifetime receiver cleanup");
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum FiniteBlobLateLoadWindow {
+        OutboundLoad,
+        PostStage,
+        FinalComparison,
+        PendingCacheRepair,
+        CompletedPostStageCapability,
+        CompletedPostStageFinalComparison,
+        CompletedCacheRepairCapability,
+        CompletedCacheRepairFinalComparison,
+        ServiceLoad,
+        PostPromotionLoad,
+    }
+
+    macro_rules! finite_blob_late_load_cases {
+        ($($name:ident => ($label:literal, $window:expr, $fault:expr)),+ $(,)?) => {
+            $(
+                #[tokio::test]
+                async fn $name() {
+                    assert_finite_blob_late_load_case($label, $window, $fault).await;
+                }
+            )+
+        };
+    }
+
+    finite_blob_late_load_cases! {
+        finite_blob_outbound_load_expiry_is_ordinary => ("outbound-load-expiry", FiniteBlobLateLoadWindow::OutboundLoad, TestBlobContactFault::OutboundLoadLifetimeExpiry),
+        finite_blob_outbound_load_discontinuity_is_ordinary => ("outbound-load-discontinuity", FiniteBlobLateLoadWindow::OutboundLoad, TestBlobContactFault::OutboundLoadLifetimeDiscontinuity),
+        finite_blob_post_stage_expiry_is_ordinary => ("post-stage-expiry", FiniteBlobLateLoadWindow::PostStage, TestBlobContactFault::PostStageLifetimeExpiry),
+        finite_blob_post_stage_discontinuity_is_ordinary => ("post-stage-discontinuity", FiniteBlobLateLoadWindow::PostStage, TestBlobContactFault::PostStageLifetimeDiscontinuity),
+        finite_blob_final_comparison_expiry_is_ordinary => ("final-comparison-expiry", FiniteBlobLateLoadWindow::FinalComparison, TestBlobContactFault::FinalComparisonLifetimeExpiry),
+        finite_blob_final_comparison_discontinuity_is_ordinary => ("final-comparison-discontinuity", FiniteBlobLateLoadWindow::FinalComparison, TestBlobContactFault::FinalComparisonLifetimeDiscontinuity),
+        finite_blob_pending_cache_repair_expiry_is_ordinary => ("pending-cache-repair-expiry", FiniteBlobLateLoadWindow::PendingCacheRepair, TestBlobContactFault::PendingCacheRepairLifetimeExpiry),
+        finite_blob_pending_cache_repair_discontinuity_is_ordinary => ("pending-cache-repair-discontinuity", FiniteBlobLateLoadWindow::PendingCacheRepair, TestBlobContactFault::PendingCacheRepairLifetimeDiscontinuity),
+        finite_blob_completed_post_stage_capability_expiry_is_ordinary => ("completed-post-stage-capability-expiry", FiniteBlobLateLoadWindow::CompletedPostStageCapability, TestBlobContactFault::CompletedPostStageCapabilityLifetimeExpiry),
+        finite_blob_completed_post_stage_capability_discontinuity_is_ordinary => ("completed-post-stage-capability-discontinuity", FiniteBlobLateLoadWindow::CompletedPostStageCapability, TestBlobContactFault::CompletedPostStageCapabilityLifetimeDiscontinuity),
+        finite_blob_completed_post_stage_final_comparison_expiry_is_ordinary => ("completed-post-stage-final-comparison-expiry", FiniteBlobLateLoadWindow::CompletedPostStageFinalComparison, TestBlobContactFault::CompletedPostStageFinalComparisonLifetimeExpiry),
+        finite_blob_completed_post_stage_final_comparison_discontinuity_is_ordinary => ("completed-post-stage-final-comparison-discontinuity", FiniteBlobLateLoadWindow::CompletedPostStageFinalComparison, TestBlobContactFault::CompletedPostStageFinalComparisonLifetimeDiscontinuity),
+        finite_blob_completed_cache_repair_capability_expiry_is_ordinary => ("completed-cache-repair-capability-expiry", FiniteBlobLateLoadWindow::CompletedCacheRepairCapability, TestBlobContactFault::CompletedCacheRepairCapabilityLifetimeExpiry),
+        finite_blob_completed_cache_repair_capability_discontinuity_is_ordinary => ("completed-cache-repair-capability-discontinuity", FiniteBlobLateLoadWindow::CompletedCacheRepairCapability, TestBlobContactFault::CompletedCacheRepairCapabilityLifetimeDiscontinuity),
+        finite_blob_completed_cache_repair_final_comparison_expiry_is_ordinary => ("completed-cache-repair-final-comparison-expiry", FiniteBlobLateLoadWindow::CompletedCacheRepairFinalComparison, TestBlobContactFault::CompletedCacheRepairFinalComparisonLifetimeExpiry),
+        finite_blob_completed_cache_repair_final_comparison_discontinuity_is_ordinary => ("completed-cache-repair-final-comparison-discontinuity", FiniteBlobLateLoadWindow::CompletedCacheRepairFinalComparison, TestBlobContactFault::CompletedCacheRepairFinalComparisonLifetimeDiscontinuity),
+        finite_blob_service_load_expiry_is_ordinary => ("service-load-expiry", FiniteBlobLateLoadWindow::ServiceLoad, TestBlobContactFault::ServiceLoadLifetimeExpiry),
+        finite_blob_service_load_discontinuity_is_ordinary => ("service-load-discontinuity", FiniteBlobLateLoadWindow::ServiceLoad, TestBlobContactFault::ServiceLoadLifetimeDiscontinuity),
+        finite_blob_post_promotion_load_expiry_is_ordinary => ("post-promotion-load-expiry", FiniteBlobLateLoadWindow::PostPromotionLoad, TestBlobContactFault::PostPromotionLoadLifetimeExpiry),
+        finite_blob_post_promotion_load_discontinuity_is_ordinary => ("post-promotion-load-discontinuity", FiniteBlobLateLoadWindow::PostPromotionLoad, TestBlobContactFault::PostPromotionLoadLifetimeDiscontinuity),
+    }
+
+    async fn assert_finite_blob_late_load_case(
+        label: &str,
+        window: FiniteBlobLateLoadWindow,
+        fault: TestBlobContactFault,
+    ) {
+        // Mutation caught: the first contact projection may be visible while a
+        // subsequent exact load observes Store-owned expiry or continuity
+        // loss. Those late transitions withhold this unit; they are not cache
+        // corruption and must not settle a cursor or expose a later item.
+        let case_seed = 0xa8_u8.wrapping_add(fault as u8);
+        let services = control_test_services([case_seed; 32]);
+        let authority = services.member.mission_authority_id();
+        let source_state = root(&format!("finite-late-lifetime-{label}-source"));
+        let receiver_state = root(&format!("finite-late-lifetime-{label}-receiver"));
+        fs::create_dir_all(&source_state).expect("late lifetime source root");
+        fs::create_dir_all(&receiver_state).expect("late lifetime receiver root");
+        let source_store = Arc::new(
+            Store::open_for_mission(source_state.join(STORE_FILE), authority)
+                .expect("late lifetime source store"),
+        );
+        let receiver_store = Arc::new(
+            Store::open_for_mission(receiver_state.join(STORE_FILE), authority)
+                .expect("late lifetime receiver store"),
+        );
+        let mut source_verifier = open_test_sealer(&services.member);
+        let transfer = publish_test_finite_blob(
+            &source_store,
+            &mut source_verifier,
+            &services.topic,
+            &services.scope,
+            1,
+            &vec![0xc0_u8.wrapping_add(fault as u8); MAX_BLOB_NETWORK_RANGE_BYTES + 1],
+            600_000,
+            25,
+            CustodySample {
+                clock_id: [0xb1; 16],
+                tick_ms: 0,
+            },
+        );
+        let interests = || {
+            MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
+                services.topic.clone(),
+                services.scope.clone(),
+                false,
+            )])
+        };
+
+        let completed_source_window = matches!(
+            window,
+            FiniteBlobLateLoadWindow::CompletedPostStageCapability
+                | FiniteBlobLateLoadWindow::CompletedPostStageFinalComparison
+                | FiniteBlobLateLoadWindow::CompletedCacheRepairCapability
+                | FiniteBlobLateLoadWindow::CompletedCacheRepairFinalComparison
+        );
+        if completed_source_window {
+            let initial_fault = blob_ranges_stream_test::install_boundary(
                 &source_store,
-                &mut source_verifier,
-                &services.topic,
-                &services.scope,
-                1,
-                &vec![0xa0 + case_index as u8; 32 * 1024],
-                600_000,
-                25,
-                CustodySample {
-                    clock_id: [0xb1; 16],
-                    tick_ms: 0,
-                },
+                &receiver_store,
+                false,
+                blob_ranges_stream_test::Boundary::AppendCapacity,
             );
-            let source_stored = source_store
-                .get_blob(transfer)
-                .expect("lifetime source lookup")
-                .expect("lifetime source exists");
-            let source_route = source_verifier
-                .verify_blob(&source_stored.sealed)
-                .expect("lifetime source route verification");
-            let BlobContentVerification::ContentVerified {
-                blob: source_blob,
-                manifest_bytes: source_manifest,
-            } = source_verifier
-                .verify_blob_content(source_route, &source_stored.sealed)
-                .expect("lifetime source content verification")
-            else {
-                panic!("lifetime source lost content grant")
-            };
-            let source_plan = source_blob
-                .transfer_plan(&source_manifest)
-                .expect("lifetime source transfer plan");
-            let interests = || {
-                MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
-                    services.topic.clone(),
-                    services.scope.clone(),
-                    false,
-                )])
-            };
-
+            initial_fault.release_sender.notify_one();
+            initial_fault.release_receiver.notify_one();
+            let (first_receiver, _, _, _) = blob_contact_test_pair(
+                source_store.clone(),
+                services.member.clone(),
+                interests(),
+                receiver_store.clone(),
+                services.other.clone(),
+                interests(),
+            )
+            .await;
+            assert!(initial_fault.fired.load(Ordering::Acquire));
+            blob_ranges_stream_test::remove(&source_store);
+            blob_ranges_stream_test::remove(&receiver_store);
+            assert!(
+                (1..=blob_ranges_stream::MAX_RANGES).contains(&first_receiver.blob_ranges_fetched),
+                "{label}: bounded first multi-range turn"
+            );
+            let fetched = Box::pin(complete_v8_finite_blob_carrier(
+                true,
+                &services,
+                &source_store,
+                &receiver_store,
+                transfer,
+                first_receiver.blob_ranges_fetched,
+            ))
+            .await;
+            assert!(fetched > 1, "{label}: completed-source carrier ranges");
+            let completed = receiver_store
+                .blob_source_projection(transfer)
+                .expect("late completed-source receiver projection")
+                .expect("late completed-source receiver row");
+            assert!(matches!(
+                completed.retention,
+                BlobSourceRetention::Completed { .. }
+            ));
+            source_store
+                .reconcile_mutable_transfer_cursor_peers(&[])
+                .expect("reset completed-source sender cursors");
+            receiver_store
+                .reconcile_mutable_transfer_cursor_peers(&[])
+                .expect("reset completed-source receiver cursors");
+        } else if !matches!(
+            window,
+            FiniteBlobLateLoadWindow::OutboundLoad
+                | FiniteBlobLateLoadWindow::PostStage
+                | FiniteBlobLateLoadWindow::FinalComparison
+        ) {
             let initial_fault = blob_ranges_stream_test::install_boundary(
                 &source_store,
                 &receiver_store,
@@ -50911,221 +51390,259 @@ mod tests {
             assert!(
                 receiver_store
                     .pending_blob_source(transfer)
-                    .expect("lifetime initial pending lookup")
+                    .expect("late lifetime initial pending lookup")
                     .is_some(),
-                "{label}: multi-range source remains pending"
+                "{label}: initial contact retains pending carrier authority"
             );
+        }
 
-            if boundary == Boundary::PostInstallCompletion {
-                let policy = receiver_store
-                    .control_policy_snapshot()
-                    .expect("lifetime completion setup policy");
-                let mut completion_boundary_ready = false;
-                for _ in 0..32 {
-                    let carriers = receiver_store
-                        .pending_blob_carrier_work_with_policy(&policy, transfer, &source_plan)
-                        .expect("lifetime completion setup work");
-                    let cursor = receiver_store
-                        .blob_carrier_fetch_cursor(services.member.identity())
-                        .expect("lifetime completion setup cursor");
-                    let next = cursor
-                        .and_then(|cursor| {
-                            carriers.iter().find(|status| {
-                                (status.source(), status.object())
-                                    > (cursor.source(), cursor.object())
-                            })
-                        })
-                        .or_else(|| carriers.first())
-                        .expect("lifetime completion setup retained work");
-                    if next
-                        .exact_complement()
-                        .is_some_and(|range| range.end == next.total_len())
-                    {
-                        completion_boundary_ready = true;
-                        break;
-                    }
-                    let setup_fault = blob_ranges_stream_test::install_boundary(
-                        &source_store,
-                        &receiver_store,
-                        false,
-                        blob_ranges_stream_test::Boundary::AppendCapacity,
-                    );
-                    setup_fault.release_sender.notify_one();
-                    setup_fault.release_receiver.notify_one();
-                    let prepared = blob_contact_test_pair(
-                        source_store.clone(),
-                        services.member.clone(),
-                        interests(),
-                        receiver_store.clone(),
-                        services.other.clone(),
-                        interests(),
-                    )
-                    .await;
-                    assert!(setup_fault.fired.load(Ordering::Acquire));
-                    blob_ranges_stream_test::remove(&source_store);
-                    blob_ranges_stream_test::remove(&receiver_store);
-                    assert!(
-                        (1..=blob_ranges_stream::MAX_RANGES)
-                            .contains(&prepared.0.blob_ranges_fetched),
-                        "{label}: bounded setup multi-range turn"
-                    );
-                }
-                assert!(
-                    completion_boundary_ready,
-                    "{label}: bounded completion setup"
-                );
-            }
-
-            if boundary == Boundary::Promotion {
-                let hold = install_test_blob_contact_fault(
-                    services.other.identity(),
-                    TestBlobContactFault::HoldPromotion,
-                );
-                let source_cache = test_event_route_cache(&source_store, &services.member);
-                let receiver_cache = test_event_route_cache(&receiver_store, &services.other);
-                for _ in 0..32 {
-                    let held = blob_contact_test_pair_with_caches_results(
-                        source_store.clone(),
-                        services.member.clone(),
-                        interests(),
-                        Arc::clone(&source_cache),
-                        receiver_store.clone(),
-                        services.other.clone(),
-                        interests(),
-                        Arc::clone(&receiver_cache),
-                        None,
-                        None,
-                        None,
-                        None,
-                        0,
-                    )
-                    .await;
-                    assert!(held.0.is_ok() && held.1.is_ok(), "{label}: hold promotion");
-                    if hold.fired.load(Ordering::Acquire) {
-                        break;
-                    }
-                }
-                assert!(hold.fired.load(Ordering::Acquire), "{label}: hold fault");
-            }
-
-            let before_stats = receiver_store
-                .blob_stats()
-                .expect("lifetime retained stats before fault");
-            assert_eq!(
-                before_stats.pending_sources, 1,
-                "{label}: retained pending row"
+        if window == FiniteBlobLateLoadWindow::PostPromotionLoad {
+            let hold = install_test_blob_contact_fault(
+                services.other.identity(),
+                TestBlobContactFault::HoldPromotion,
             );
-            if boundary == Boundary::Promotion {
-                assert_eq!(
-                    before_stats.carrier_prefixes, 0,
-                    "{label}: no prefix after hold"
-                );
-            } else {
-                assert_ne!(before_stats.carrier_prefixes, 0, "{label}: retained prefix");
-            }
-            let carrier_cursor_before = receiver_store
-                .blob_carrier_fetch_cursor(services.member.identity())
-                .expect("lifetime carrier cursor before fault");
-            let receiver_digest_before = receiver_store.test_blob_logical_digest();
-            let fault_identity = if boundary == Boundary::Service {
-                services.member.identity()
-            } else {
-                services.other.identity()
-            };
-            let fault_state = install_test_blob_contact_fault(fault_identity, fault);
+            let source_cache = test_event_route_cache(&source_store, &services.member);
             let receiver_cache = test_event_route_cache(&receiver_store, &services.other);
-            let (client_result, server_result) = blob_contact_test_pair_with_caches_results(
-                source_store.clone(),
-                services.member.clone(),
-                interests(),
-                test_event_route_cache(&source_store, &services.member),
-                receiver_store.clone(),
-                services.other.clone(),
-                interests(),
-                Arc::clone(&receiver_cache),
-                None,
-                None,
-                None,
-                None,
-                0,
-            )
-            .await;
+            let mut attempts = 0;
+            while !hold.fired.load(Ordering::Acquire) {
+                next_blob_progress_attempt(label, &mut attempts);
+                let held = blob_contact_test_pair_with_caches_results(
+                    source_store.clone(),
+                    services.member.clone(),
+                    interests(),
+                    Arc::clone(&source_cache),
+                    receiver_store.clone(),
+                    services.other.clone(),
+                    interests(),
+                    Arc::clone(&receiver_cache),
+                    None,
+                    None,
+                    None,
+                    None,
+                    0,
+                )
+                .await;
+                assert!(
+                    held.0.is_ok() && held.1.is_ok(),
+                    "{label}: promotion hold contact: client={:?}, server={:?}",
+                    held.0,
+                    held.1
+                );
+            }
+            assert!(hold.fired.load(Ordering::Acquire), "{label}: hold fired");
+        }
 
-            assert!(
-                fault_state.fired.load(Ordering::Acquire),
-                "{label}: fault fired"
+        if matches!(
+            window,
+            FiniteBlobLateLoadWindow::PendingCacheRepair
+                | FiniteBlobLateLoadWindow::CompletedCacheRepairCapability
+                | FiniteBlobLateLoadWindow::CompletedCacheRepairFinalComparison
+        ) {
+            let source_expiry = matches!(
+                fault,
+                TestBlobContactFault::PendingCacheRepairLifetimeExpiry
+                    | TestBlobContactFault::CompletedCacheRepairCapabilityLifetimeExpiry
+                    | TestBlobContactFault::CompletedCacheRepairFinalComparisonLifetimeExpiry
             );
-            if let Err(error) = &client_result {
-                assert!(
-                    !actor_fatal_contact_error(error, services.other.identity()),
-                    "{label}: client lifetime loss became actor-fatal: {error}"
-                );
+            let source_sample = if source_expiry {
+                CustodySample {
+                    clock_id: [0xb1; 16],
+                    tick_ms: 1_000_000,
+                }
+            } else {
+                let mut clock_id = [0xb1; 16];
+                clock_id[0] ^= 0x80;
+                CustodySample {
+                    clock_id,
+                    tick_ms: 0,
+                }
+            };
+            source_store
+                .test_observe_blob_custody_sample(source_sample)
+                .expect("late cache repair source lifetime observation");
+        }
+
+        let receiver_stats_before = receiver_store
+            .blob_stats()
+            .expect("late lifetime receiver stats before fault");
+        match window {
+            FiniteBlobLateLoadWindow::OutboundLoad => {
+                assert_eq!(receiver_stats_before.pending_sources, 0, "{label}");
+                assert_eq!(receiver_stats_before.carrier_prefixes, 0, "{label}");
             }
-            if let Err(error) = &server_result {
-                assert!(
-                    !actor_fatal_contact_error(error, services.member.identity()),
-                    "{label}: server lifetime loss became actor-fatal: {error}"
-                );
+            FiniteBlobLateLoadWindow::PostStage | FiniteBlobLateLoadWindow::FinalComparison => {
+                assert_eq!(receiver_stats_before.pending_sources, 0, "{label}");
+                assert_eq!(receiver_stats_before.carrier_prefixes, 0, "{label}");
             }
+            FiniteBlobLateLoadWindow::CompletedPostStageCapability
+            | FiniteBlobLateLoadWindow::CompletedPostStageFinalComparison
+            | FiniteBlobLateLoadWindow::CompletedCacheRepairCapability
+            | FiniteBlobLateLoadWindow::CompletedCacheRepairFinalComparison => {
+                assert_eq!(receiver_stats_before.pending_sources, 0, "{label}");
+                assert_eq!(receiver_stats_before.carrier_prefixes, 0, "{label}");
+                assert_eq!(receiver_stats_before.publications, 1, "{label}");
+            }
+            FiniteBlobLateLoadWindow::ServiceLoad => {
+                assert_eq!(receiver_stats_before.pending_sources, 1, "{label}");
+                assert_ne!(receiver_stats_before.carrier_prefixes, 0, "{label}");
+            }
+            FiniteBlobLateLoadWindow::PendingCacheRepair => {
+                assert_eq!(receiver_stats_before.pending_sources, 1, "{label}");
+                assert_ne!(receiver_stats_before.carrier_prefixes, 0, "{label}");
+            }
+            FiniteBlobLateLoadWindow::PostPromotionLoad => {
+                assert_eq!(receiver_stats_before.pending_sources, 1, "{label}");
+                assert_eq!(receiver_stats_before.carrier_prefixes, 0, "{label}");
+            }
+        }
+        let source_offer_before = source_store
+            .mutable_transfer_cursor(
+                services.other.identity(),
+                MutableTransferCursorClass::Blob,
+                MutableTransferCursorMode::OfferToPeer,
+            )
+            .expect("late lifetime source offer cursor before fault");
+        let receiver_fetch_before = receiver_store
+            .mutable_transfer_cursor(
+                services.member.identity(),
+                MutableTransferCursorClass::Blob,
+                MutableTransferCursorMode::FetchFromPeer,
+            )
+            .expect("late lifetime receiver fetch cursor before fault");
+        let carrier_cursor_before = receiver_store
+            .blob_carrier_fetch_cursor(services.member.identity())
+            .expect("late lifetime carrier cursor before fault");
+        let receiver_digest_before = receiver_store.test_blob_logical_digest();
+        let fault_identity = if matches!(
+            window,
+            FiniteBlobLateLoadWindow::PendingCacheRepair
+                | FiniteBlobLateLoadWindow::CompletedCacheRepairCapability
+                | FiniteBlobLateLoadWindow::CompletedCacheRepairFinalComparison
+                | FiniteBlobLateLoadWindow::PostPromotionLoad
+                | FiniteBlobLateLoadWindow::PostStage
+                | FiniteBlobLateLoadWindow::FinalComparison
+                | FiniteBlobLateLoadWindow::CompletedPostStageCapability
+                | FiniteBlobLateLoadWindow::CompletedPostStageFinalComparison
+        ) {
+            services.other.identity()
+        } else {
+            services.member.identity()
+        };
+        let fault_state = install_test_blob_contact_fault(fault_identity, fault);
+        let source_cache = test_event_route_cache(&source_store, &services.member);
+        let receiver_cache = if matches!(
+            window,
+            FiniteBlobLateLoadWindow::PendingCacheRepair
+                | FiniteBlobLateLoadWindow::CompletedPostStageCapability
+                | FiniteBlobLateLoadWindow::CompletedPostStageFinalComparison
+                | FiniteBlobLateLoadWindow::CompletedCacheRepairCapability
+                | FiniteBlobLateLoadWindow::CompletedCacheRepairFinalComparison
+        ) {
+            let receiver_verifier = open_test_sealer(&services.other);
+            Arc::new(
+                AuthenticatedEventRouteCache::empty_for_store(&receiver_verifier, &receiver_store)
+                    .expect("late pending repair empty receiver cache"),
+            )
+        } else {
+            test_event_route_cache(&receiver_store, &services.other)
+        };
+        let (client_result, server_result) = blob_contact_test_pair_with_caches_results(
+            source_store.clone(),
+            services.member.clone(),
+            interests(),
+            Arc::clone(&source_cache),
+            receiver_store.clone(),
+            services.other.clone(),
+            interests(),
+            Arc::clone(&receiver_cache),
+            None,
+            None,
+            None,
+            None,
+            0,
+        )
+        .await;
+
+        assert!(
+            fault_state.fired.load(Ordering::Acquire),
+            "{label}: fault fired"
+        );
+        if let Err(error) = &client_result {
+            assert!(
+                !actor_fatal_contact_error(error, services.other.identity()),
+                "{label}: client late lifetime loss became actor-fatal: {error}"
+            );
+        }
+        if let Err(error) = &server_result {
+            assert!(
+                !actor_fatal_contact_error(error, services.member.identity()),
+                "{label}: server late lifetime loss became actor-fatal: {error}"
+            );
+        }
+        if matches!(
+            window,
+            FiniteBlobLateLoadWindow::PendingCacheRepair
+                | FiniteBlobLateLoadWindow::CompletedCacheRepairCapability
+                | FiniteBlobLateLoadWindow::CompletedCacheRepairFinalComparison
+                | FiniteBlobLateLoadWindow::ServiceLoad
+        ) {
             assert!(
                 client_result.is_ok() && server_result.is_ok(),
-                "{label}: omission/unavailability should settle normally: client={client_result:?}, server={server_result:?}"
+                "{label}: service Unavailable settles normally: client={client_result:?}, server={server_result:?}"
             );
-            if matches!(boundary, Boundary::PendingRecheck | Boundary::Service) {
-                assert_eq!(
-                    client_result
-                        .as_ref()
-                        .expect("checked successful lifetime contact")
-                        .receipt
-                        .blob_ranges_fetched,
-                    0,
-                    "{label}: lifetime loss cannot open a later range"
-                );
-            }
-
-            let after_stats = receiver_store
-                .blob_stats()
-                .expect("lifetime retained stats after fault");
-            let receiver_settles_lifetime = matches!(
-                boundary,
-                Boundary::PostInstallCompletion | Boundary::Promotion
-            );
-            let receiver_settles_expiry = label.ends_with("-expiry") && receiver_settles_lifetime;
-            if receiver_settles_expiry {
-                assert_eq!(after_stats.pending_sources, 0, "{label}: exact retirement");
-                assert_eq!(
-                    after_stats.carrier_prefixes, 0,
-                    "{label}: prefix retirement"
-                );
-                assert!(
-                    !receiver_cache.has_blob_claim_for_test(transfer),
-                    "{label}: retired pending authority removes its cache claim"
-                );
-            } else {
-                assert_eq!(
-                    after_stats.pending_sources, before_stats.pending_sources,
-                    "{label}"
-                );
-                assert_eq!(
-                    after_stats.carrier_prefixes, before_stats.carrier_prefixes,
-                    "{label}"
-                );
-                assert!(
-                    receiver_cache.has_blob_claim_for_test(transfer),
-                    "{label}: retained pending authority must keep its cache claim"
-                );
-            }
-            let carrier_cursor_after = receiver_store
-                .blob_carrier_fetch_cursor(services.member.identity())
-                .expect("lifetime carrier cursor after fault");
             assert_eq!(
-                carrier_cursor_after, carrier_cursor_before,
-                "{label}: the bounded fault fixture remains on its exact carrier object"
+                client_result
+                    .as_ref()
+                    .expect("checked successful late lifetime contact")
+                    .receipt
+                    .blob_ranges_fetched,
+                0,
+                "{label}: no later carrier unit is exposed"
             );
-            let fault_digest = fault_state
-                .logical_digest_after_fault()
-                .unwrap_or_else(|| panic!("{label}: fault-boundary logical digest"));
-            if boundary == Boundary::Service {
+        } else {
+            assert!(
+                client_result.is_err() || server_result.is_err(),
+                "{label}: withheld exact unit must not be acknowledged"
+            );
+        }
+
+        assert_eq!(
+            source_store
+                .mutable_transfer_cursor(
+                    services.other.identity(),
+                    MutableTransferCursorClass::Blob,
+                    MutableTransferCursorMode::OfferToPeer,
+                )
+                .expect("late lifetime source offer cursor after fault"),
+            source_offer_before,
+            "{label}: failed source unit cannot advance its offer cursor"
+        );
+        assert_eq!(
+            receiver_store
+                .mutable_transfer_cursor(
+                    services.member.identity(),
+                    MutableTransferCursorClass::Blob,
+                    MutableTransferCursorMode::FetchFromPeer,
+                )
+                .expect("late lifetime receiver fetch cursor after fault"),
+            receiver_fetch_before,
+            "{label}: failed source unit cannot advance its fetch cursor"
+        );
+        assert_eq!(
+            receiver_store
+                .blob_carrier_fetch_cursor(services.member.identity())
+                .expect("late lifetime carrier cursor after fault"),
+            carrier_cursor_before,
+            "{label}: failed carrier unit cannot advance its carrier cursor"
+        );
+        let fault_digest = fault_state
+            .logical_digest_after_fault()
+            .unwrap_or_else(|| panic!("{label}: late lifetime logical digest"));
+        let receiver_stats_after = receiver_store
+            .blob_stats()
+            .expect("late lifetime receiver stats after fault");
+        match window {
+            FiniteBlobLateLoadWindow::OutboundLoad => {
                 assert_eq!(
                     source_store.test_blob_logical_digest(),
                     fault_digest,
@@ -51134,13 +51651,98 @@ mod tests {
                 assert_eq!(
                     receiver_store.test_blob_logical_digest(),
                     receiver_digest_before,
-                    "{label}: unavailable multi-range data must not mutate requester state"
+                    "{label}: skipped outbound load cannot mutate the receiver"
                 );
+                assert_eq!(receiver_stats_after, receiver_stats_before, "{label}");
+                assert!(source_cache.has_blob_claim_for_test(transfer), "{label}");
+                assert!(matches!(
+                    source_store.get_blob(transfer),
+                    Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+                ));
+                assert_eq!(
+                    fault_state
+                        .result_frames_after_fault
+                        .load(Ordering::Acquire),
+                    0,
+                    "{label}: skipped exact load emits no result"
+                );
+            }
+            FiniteBlobLateLoadWindow::PostStage | FiniteBlobLateLoadWindow::FinalComparison => {
+                assert_eq!(
+                    receiver_store.test_blob_logical_digest(),
+                    fault_digest,
+                    "{label}: post-stage comparison cannot mutate retained state"
+                );
+                assert_eq!(receiver_stats_after.pending_sources, 1, "{label}");
+                assert_eq!(receiver_stats_after.carrier_prefixes, 0, "{label}");
+                assert_eq!(receiver_stats_after.publications, 0, "{label}");
+                assert!(
+                    !receiver_cache.has_blob_claim_for_test(transfer),
+                    "{label}: lifetime-withheld stage cannot cache the source"
+                );
+                assert!(matches!(
+                    receiver_store.custody_v1_pending_blob_source(transfer),
+                    Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+                ));
+                assert_eq!(
+                    fault_state
+                        .result_frames_after_fault
+                        .load(Ordering::Acquire),
+                    0,
+                    "{label}: no result/ACK follows post-stage withholding"
+                );
+            }
+            FiniteBlobLateLoadWindow::CompletedPostStageCapability
+            | FiniteBlobLateLoadWindow::CompletedPostStageFinalComparison => {
+                assert_eq!(
+                    receiver_store.test_blob_logical_digest(),
+                    fault_digest,
+                    "{label}: completed post-stage withholding cannot mutate after its fault boundary"
+                );
+                assert_eq!(receiver_stats_after.pending_sources, 0, "{label}");
+                assert_eq!(receiver_stats_after.carrier_prefixes, 0, "{label}");
+                assert_eq!(
+                    receiver_stats_after.publications,
+                    u64::from(
+                        fault != TestBlobContactFault::CompletedPostStageCapabilityLifetimeExpiry
+                    ),
+                    "{label}: only pre-capability expiry performs deterministic retirement"
+                );
+                assert!(
+                    !receiver_cache.has_blob_claim_for_test(transfer),
+                    "{label}: lifetime-withheld completed duplicate cannot cache the source"
+                );
+                assert!(matches!(
+                    receiver_store.get_blob(transfer),
+                    Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+                ));
+                assert_eq!(
+                    fault_state
+                        .result_frames_after_fault
+                        .load(Ordering::Acquire),
+                    0,
+                    "{label}: no result/ACK follows completed post-stage withholding"
+                );
+            }
+            FiniteBlobLateLoadWindow::ServiceLoad => {
+                assert_eq!(
+                    source_store.test_blob_logical_digest(),
+                    fault_digest,
+                    "{label}"
+                );
+                assert_eq!(
+                    receiver_store.test_blob_logical_digest(),
+                    receiver_digest_before,
+                    "{label}: unavailable exact range cannot mutate the requester"
+                );
+                assert_eq!(receiver_stats_after, receiver_stats_before, "{label}");
+                assert!(receiver_cache.has_blob_claim_for_test(transfer), "{label}");
                 assert!(
                     receiver_store
                         .pending_blob_source(transfer)
-                        .expect("service-loss requester pending lookup")
-                        .is_some()
+                        .expect("late service requester pending lookup")
+                        .is_some(),
+                    "{label}: requester retains pending source and prefix"
                 );
                 assert_eq!(
                     fault_state
@@ -51149,758 +51751,92 @@ mod tests {
                     0,
                     "{label}: multi-range unavailability emits no removed result/ACK frame"
                 );
-            } else if !receiver_settles_lifetime {
+            }
+            FiniteBlobLateLoadWindow::PendingCacheRepair => {
+                assert_eq!(
+                    receiver_store.test_blob_logical_digest(),
+                    fault_digest,
+                    "{label}: cache repair cannot mutate retained pending state"
+                );
+                assert_eq!(receiver_stats_after, receiver_stats_before, "{label}");
+                assert!(
+                    !receiver_cache.has_blob_claim_for_test(transfer),
+                    "{label}: lifetime-withheld repair cannot cache the pending source"
+                );
+                assert!(matches!(
+                    receiver_store.custody_v1_pending_blob_source(transfer),
+                    Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+                ));
+                assert_eq!(
+                    fault_state
+                        .result_frames_after_fault
+                        .load(Ordering::Acquire),
+                    0,
+                    "{label}: withheld repair emits no Blob result"
+                );
+            }
+            FiniteBlobLateLoadWindow::CompletedCacheRepairCapability
+            | FiniteBlobLateLoadWindow::CompletedCacheRepairFinalComparison => {
+                assert_eq!(
+                    receiver_store.test_blob_logical_digest(),
+                    fault_digest,
+                    "{label}: completed cache repair cannot mutate after its fault boundary"
+                );
+                assert_eq!(receiver_stats_after.pending_sources, 0, "{label}");
+                assert_eq!(receiver_stats_after.carrier_prefixes, 0, "{label}");
+                assert_eq!(
+                    receiver_stats_after.publications,
+                    u64::from(
+                        fault != TestBlobContactFault::CompletedCacheRepairCapabilityLifetimeExpiry
+                    ),
+                    "{label}: only pre-capability expiry performs deterministic retirement"
+                );
+                assert!(
+                    !receiver_cache.has_blob_claim_for_test(transfer),
+                    "{label}: lifetime-withheld completed repair cannot cache the source"
+                );
+                assert!(matches!(
+                    receiver_store.get_blob(transfer),
+                    Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+                ));
+                assert_eq!(
+                    fault_state
+                        .result_frames_after_fault
+                        .load(Ordering::Acquire),
+                    0,
+                    "{label}: withheld completed repair emits no Blob result"
+                );
+            }
+            FiniteBlobLateLoadWindow::PostPromotionLoad => {
                 assert_eq!(
                     receiver_store.test_blob_logical_digest(),
                     fault_digest,
                     "{label}"
                 );
+                assert_eq!(receiver_stats_after.pending_sources, 0, "{label}");
+                assert_eq!(receiver_stats_after.carrier_prefixes, 0, "{label}");
+                assert_eq!(receiver_stats_after.publications, 1, "{label}");
                 assert!(
-                    receiver_store
-                        .pending_blob_source(transfer)
-                        .expect("lifetime-invisible pending lookup")
-                        .is_none(),
-                    "{label}: invisible finite work remains non-forwardable"
+                    !receiver_cache.has_blob_claim_for_test(transfer),
+                    "{label}: stale pending cache proof is withheld after Store commit"
                 );
-                assert_eq!(
-                    fault_state
-                        .result_frames_after_fault
-                        .load(Ordering::Acquire),
-                    0,
-                    "{label}: no result/ACK follows the failed boundary"
-                );
-            } else {
-                assert_ne!(
-                    receiver_store.test_blob_logical_digest(),
-                    fault_digest,
-                    "{label}: terminal lifetime settlement must persist after the injected transition"
-                );
-                assert!(
-                    receiver_store
-                        .pending_blob_source(transfer)
-                        .expect("settled lifetime pending lookup")
-                        .is_none(),
-                    "{label}: settled finite work remains non-forwardable"
-                );
-                assert_eq!(
-                    fault_state
-                        .result_frames_after_fault
-                        .load(Ordering::Acquire),
-                    0,
-                    "{label}: no result/ACK follows the settled boundary"
-                );
-            }
-
-            drop((source_store, receiver_store));
-            fs::remove_dir_all(source_state).expect("lifetime source cleanup");
-            fs::remove_dir_all(receiver_state).expect("lifetime receiver cleanup");
-        }
-    }
-
-    #[tokio::test]
-    async fn finite_blob_late_exact_load_lifetime_loss_is_ordinary() {
-        // Mutation caught: the first contact projection may be visible while a
-        // subsequent exact load observes Store-owned expiry or continuity
-        // loss. Those late transitions withhold this unit; they are not cache
-        // corruption and must not settle a cursor or expose a later item.
-        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-        enum Window {
-            OutboundLoad,
-            PostStage,
-            FinalComparison,
-            PendingCacheRepair,
-            CompletedPostStageCapability,
-            CompletedPostStageFinalComparison,
-            CompletedCacheRepairCapability,
-            CompletedCacheRepairFinalComparison,
-            ServiceLoad,
-            PostPromotionLoad,
-        }
-
-        let cases = [
-            (
-                "outbound-load-expiry",
-                Window::OutboundLoad,
-                TestBlobContactFault::OutboundLoadLifetimeExpiry,
-            ),
-            (
-                "outbound-load-discontinuity",
-                Window::OutboundLoad,
-                TestBlobContactFault::OutboundLoadLifetimeDiscontinuity,
-            ),
-            (
-                "post-stage-expiry",
-                Window::PostStage,
-                TestBlobContactFault::PostStageLifetimeExpiry,
-            ),
-            (
-                "post-stage-discontinuity",
-                Window::PostStage,
-                TestBlobContactFault::PostStageLifetimeDiscontinuity,
-            ),
-            (
-                "final-comparison-expiry",
-                Window::FinalComparison,
-                TestBlobContactFault::FinalComparisonLifetimeExpiry,
-            ),
-            (
-                "final-comparison-discontinuity",
-                Window::FinalComparison,
-                TestBlobContactFault::FinalComparisonLifetimeDiscontinuity,
-            ),
-            (
-                "pending-cache-repair-expiry",
-                Window::PendingCacheRepair,
-                TestBlobContactFault::PendingCacheRepairLifetimeExpiry,
-            ),
-            (
-                "pending-cache-repair-discontinuity",
-                Window::PendingCacheRepair,
-                TestBlobContactFault::PendingCacheRepairLifetimeDiscontinuity,
-            ),
-            (
-                "completed-post-stage-capability-expiry",
-                Window::CompletedPostStageCapability,
-                TestBlobContactFault::CompletedPostStageCapabilityLifetimeExpiry,
-            ),
-            (
-                "completed-post-stage-capability-discontinuity",
-                Window::CompletedPostStageCapability,
-                TestBlobContactFault::CompletedPostStageCapabilityLifetimeDiscontinuity,
-            ),
-            (
-                "completed-post-stage-final-comparison-expiry",
-                Window::CompletedPostStageFinalComparison,
-                TestBlobContactFault::CompletedPostStageFinalComparisonLifetimeExpiry,
-            ),
-            (
-                "completed-post-stage-final-comparison-discontinuity",
-                Window::CompletedPostStageFinalComparison,
-                TestBlobContactFault::CompletedPostStageFinalComparisonLifetimeDiscontinuity,
-            ),
-            (
-                "completed-cache-repair-capability-expiry",
-                Window::CompletedCacheRepairCapability,
-                TestBlobContactFault::CompletedCacheRepairCapabilityLifetimeExpiry,
-            ),
-            (
-                "completed-cache-repair-capability-discontinuity",
-                Window::CompletedCacheRepairCapability,
-                TestBlobContactFault::CompletedCacheRepairCapabilityLifetimeDiscontinuity,
-            ),
-            (
-                "completed-cache-repair-final-comparison-expiry",
-                Window::CompletedCacheRepairFinalComparison,
-                TestBlobContactFault::CompletedCacheRepairFinalComparisonLifetimeExpiry,
-            ),
-            (
-                "completed-cache-repair-final-comparison-discontinuity",
-                Window::CompletedCacheRepairFinalComparison,
-                TestBlobContactFault::CompletedCacheRepairFinalComparisonLifetimeDiscontinuity,
-            ),
-            (
-                "service-load-expiry",
-                Window::ServiceLoad,
-                TestBlobContactFault::ServiceLoadLifetimeExpiry,
-            ),
-            (
-                "service-load-discontinuity",
-                Window::ServiceLoad,
-                TestBlobContactFault::ServiceLoadLifetimeDiscontinuity,
-            ),
-            (
-                "post-promotion-load-expiry",
-                Window::PostPromotionLoad,
-                TestBlobContactFault::PostPromotionLoadLifetimeExpiry,
-            ),
-            (
-                "post-promotion-load-discontinuity",
-                Window::PostPromotionLoad,
-                TestBlobContactFault::PostPromotionLoadLifetimeDiscontinuity,
-            ),
-        ];
-
-        for (case_index, (label, window, fault)) in cases.into_iter().enumerate() {
-            let services = control_test_services([0xa8 + case_index as u8; 32]);
-            let authority = services.member.mission_authority_id();
-            let source_state = root(&format!("finite-late-lifetime-{label}-source"));
-            let receiver_state = root(&format!("finite-late-lifetime-{label}-receiver"));
-            fs::create_dir_all(&source_state).expect("late lifetime source root");
-            fs::create_dir_all(&receiver_state).expect("late lifetime receiver root");
-            let source_store = Arc::new(
-                Store::open_for_mission(source_state.join(STORE_FILE), authority)
-                    .expect("late lifetime source store"),
-            );
-            let receiver_store = Arc::new(
-                Store::open_for_mission(receiver_state.join(STORE_FILE), authority)
-                    .expect("late lifetime receiver store"),
-            );
-            let mut source_verifier = open_test_sealer(&services.member);
-            let transfer = publish_test_finite_blob(
-                &source_store,
-                &mut source_verifier,
-                &services.topic,
-                &services.scope,
-                1,
-                &vec![0xc0 + case_index as u8; 32 * 1024],
-                600_000,
-                25,
-                CustodySample {
-                    clock_id: [0xb1; 16],
-                    tick_ms: 0,
-                },
-            );
-            let interests = || {
-                MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
-                    services.topic.clone(),
-                    services.scope.clone(),
-                    false,
-                )])
-            };
-
-            let completed_source_window = matches!(
-                window,
-                Window::CompletedPostStageCapability
-                    | Window::CompletedPostStageFinalComparison
-                    | Window::CompletedCacheRepairCapability
-                    | Window::CompletedCacheRepairFinalComparison
-            );
-            if completed_source_window {
-                let initial_fault = blob_ranges_stream_test::install_boundary(
-                    &source_store,
-                    &receiver_store,
-                    false,
-                    blob_ranges_stream_test::Boundary::AppendCapacity,
-                );
-                initial_fault.release_sender.notify_one();
-                initial_fault.release_receiver.notify_one();
-                let (first_receiver, _, _, _) = blob_contact_test_pair(
-                    source_store.clone(),
-                    services.member.clone(),
-                    interests(),
-                    receiver_store.clone(),
-                    services.other.clone(),
-                    interests(),
-                )
-                .await;
-                assert!(initial_fault.fired.load(Ordering::Acquire));
-                blob_ranges_stream_test::remove(&source_store);
-                blob_ranges_stream_test::remove(&receiver_store);
-                assert!(
-                    (1..=blob_ranges_stream::MAX_RANGES)
-                        .contains(&first_receiver.blob_ranges_fetched),
-                    "{label}: bounded first multi-range turn"
-                );
-                let fetched = Box::pin(complete_v8_finite_blob_carrier(
-                    true,
-                    &services,
-                    &source_store,
-                    &receiver_store,
-                    transfer,
-                    first_receiver.blob_ranges_fetched,
-                ))
-                .await;
-                assert!(fetched > 1, "{label}: completed-source carrier ranges");
-                let completed = receiver_store
-                    .blob_source_projection(transfer)
-                    .expect("late completed-source receiver projection")
-                    .expect("late completed-source receiver row");
                 assert!(matches!(
-                    completed.retention,
-                    BlobSourceRetention::Completed { .. }
+                    receiver_store.get_blob(transfer),
+                    Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
                 ));
-                source_store
-                    .reconcile_mutable_transfer_cursor_peers(&[])
-                    .expect("reset completed-source sender cursors");
-                receiver_store
-                    .reconcile_mutable_transfer_cursor_peers(&[])
-                    .expect("reset completed-source receiver cursors");
-            } else if !matches!(
-                window,
-                Window::OutboundLoad | Window::PostStage | Window::FinalComparison
-            ) {
-                let initial_fault = blob_ranges_stream_test::install_boundary(
-                    &source_store,
-                    &receiver_store,
-                    false,
-                    blob_ranges_stream_test::Boundary::AppendCapacity,
-                );
-                initial_fault.release_sender.notify_one();
-                initial_fault.release_receiver.notify_one();
-                let (first_receiver, _, _, _) = blob_contact_test_pair(
-                    source_store.clone(),
-                    services.member.clone(),
-                    interests(),
-                    receiver_store.clone(),
-                    services.other.clone(),
-                    interests(),
-                )
-                .await;
-                assert!(initial_fault.fired.load(Ordering::Acquire));
-                blob_ranges_stream_test::remove(&source_store);
-                blob_ranges_stream_test::remove(&receiver_store);
-                assert!(
-                    (1..=blob_ranges_stream::MAX_RANGES)
-                        .contains(&first_receiver.blob_ranges_fetched),
-                    "{label}: bounded first multi-range turn"
-                );
-                assert!(
-                    receiver_store
-                        .pending_blob_source(transfer)
-                        .expect("late lifetime initial pending lookup")
-                        .is_some(),
-                    "{label}: initial contact retains pending carrier authority"
-                );
-            }
-
-            if window == Window::PostPromotionLoad {
-                let hold = install_test_blob_contact_fault(
-                    services.other.identity(),
-                    TestBlobContactFault::HoldPromotion,
-                );
-                let source_cache = test_event_route_cache(&source_store, &services.member);
-                let receiver_cache = test_event_route_cache(&receiver_store, &services.other);
-                for _ in 0..32 {
-                    let held = blob_contact_test_pair_with_caches_results(
-                        source_store.clone(),
-                        services.member.clone(),
-                        interests(),
-                        Arc::clone(&source_cache),
-                        receiver_store.clone(),
-                        services.other.clone(),
-                        interests(),
-                        Arc::clone(&receiver_cache),
-                        None,
-                        None,
-                        None,
-                        None,
-                        0,
-                    )
-                    .await;
-                    assert!(
-                        held.0.is_ok() && held.1.is_ok(),
-                        "{label}: promotion hold contact: client={:?}, server={:?}",
-                        held.0,
-                        held.1
-                    );
-                    if hold.fired.load(Ordering::Acquire) {
-                        break;
-                    }
-                }
-                assert!(hold.fired.load(Ordering::Acquire), "{label}: hold fired");
-            }
-
-            if matches!(
-                window,
-                Window::PendingCacheRepair
-                    | Window::CompletedCacheRepairCapability
-                    | Window::CompletedCacheRepairFinalComparison
-            ) {
-                let source_expiry = matches!(
-                    fault,
-                    TestBlobContactFault::PendingCacheRepairLifetimeExpiry
-                        | TestBlobContactFault::CompletedCacheRepairCapabilityLifetimeExpiry
-                        | TestBlobContactFault::CompletedCacheRepairFinalComparisonLifetimeExpiry
-                );
-                let source_sample = if source_expiry {
-                    CustodySample {
-                        clock_id: [0xb1; 16],
-                        tick_ms: 1_000_000,
-                    }
-                } else {
-                    let mut clock_id = [0xb1; 16];
-                    clock_id[0] ^= 0x80;
-                    CustodySample {
-                        clock_id,
-                        tick_ms: 0,
-                    }
-                };
-                source_store
-                    .test_observe_blob_custody_sample(source_sample)
-                    .expect("late cache repair source lifetime observation");
-            }
-
-            let receiver_stats_before = receiver_store
-                .blob_stats()
-                .expect("late lifetime receiver stats before fault");
-            match window {
-                Window::OutboundLoad => {
-                    assert_eq!(receiver_stats_before.pending_sources, 0, "{label}");
-                    assert_eq!(receiver_stats_before.carrier_prefixes, 0, "{label}");
-                }
-                Window::PostStage | Window::FinalComparison => {
-                    assert_eq!(receiver_stats_before.pending_sources, 0, "{label}");
-                    assert_eq!(receiver_stats_before.carrier_prefixes, 0, "{label}");
-                }
-                Window::CompletedPostStageCapability
-                | Window::CompletedPostStageFinalComparison
-                | Window::CompletedCacheRepairCapability
-                | Window::CompletedCacheRepairFinalComparison => {
-                    assert_eq!(receiver_stats_before.pending_sources, 0, "{label}");
-                    assert_eq!(receiver_stats_before.carrier_prefixes, 0, "{label}");
-                    assert_eq!(receiver_stats_before.publications, 1, "{label}");
-                }
-                Window::ServiceLoad => {
-                    assert_eq!(receiver_stats_before.pending_sources, 1, "{label}");
-                    assert_ne!(receiver_stats_before.carrier_prefixes, 0, "{label}");
-                }
-                Window::PendingCacheRepair => {
-                    assert_eq!(receiver_stats_before.pending_sources, 1, "{label}");
-                    assert_ne!(receiver_stats_before.carrier_prefixes, 0, "{label}");
-                }
-                Window::PostPromotionLoad => {
-                    assert_eq!(receiver_stats_before.pending_sources, 1, "{label}");
-                    assert_eq!(receiver_stats_before.carrier_prefixes, 0, "{label}");
-                }
-            }
-            let source_offer_before = source_store
-                .mutable_transfer_cursor(
-                    services.other.identity(),
-                    MutableTransferCursorClass::Blob,
-                    MutableTransferCursorMode::OfferToPeer,
-                )
-                .expect("late lifetime source offer cursor before fault");
-            let receiver_fetch_before = receiver_store
-                .mutable_transfer_cursor(
-                    services.member.identity(),
-                    MutableTransferCursorClass::Blob,
-                    MutableTransferCursorMode::FetchFromPeer,
-                )
-                .expect("late lifetime receiver fetch cursor before fault");
-            let carrier_cursor_before = receiver_store
-                .blob_carrier_fetch_cursor(services.member.identity())
-                .expect("late lifetime carrier cursor before fault");
-            let receiver_digest_before = receiver_store.test_blob_logical_digest();
-            let fault_identity = if matches!(
-                window,
-                Window::PendingCacheRepair
-                    | Window::CompletedCacheRepairCapability
-                    | Window::CompletedCacheRepairFinalComparison
-                    | Window::PostPromotionLoad
-                    | Window::PostStage
-                    | Window::FinalComparison
-                    | Window::CompletedPostStageCapability
-                    | Window::CompletedPostStageFinalComparison
-            ) {
-                services.other.identity()
-            } else {
-                services.member.identity()
-            };
-            let fault_state = install_test_blob_contact_fault(fault_identity, fault);
-            let source_cache = test_event_route_cache(&source_store, &services.member);
-            let receiver_cache = if matches!(
-                window,
-                Window::PendingCacheRepair
-                    | Window::CompletedPostStageCapability
-                    | Window::CompletedPostStageFinalComparison
-                    | Window::CompletedCacheRepairCapability
-                    | Window::CompletedCacheRepairFinalComparison
-            ) {
-                let receiver_verifier = open_test_sealer(&services.other);
-                Arc::new(
-                    AuthenticatedEventRouteCache::empty_for_store(
-                        &receiver_verifier,
-                        &receiver_store,
-                    )
-                    .expect("late pending repair empty receiver cache"),
-                )
-            } else {
-                test_event_route_cache(&receiver_store, &services.other)
-            };
-            let (client_result, server_result) = blob_contact_test_pair_with_caches_results(
-                source_store.clone(),
-                services.member.clone(),
-                interests(),
-                Arc::clone(&source_cache),
-                receiver_store.clone(),
-                services.other.clone(),
-                interests(),
-                Arc::clone(&receiver_cache),
-                None,
-                None,
-                None,
-                None,
-                0,
-            )
-            .await;
-
-            assert!(
-                fault_state.fired.load(Ordering::Acquire),
-                "{label}: fault fired"
-            );
-            if let Err(error) = &client_result {
-                assert!(
-                    !actor_fatal_contact_error(error, services.other.identity()),
-                    "{label}: client late lifetime loss became actor-fatal: {error}"
-                );
-            }
-            if let Err(error) = &server_result {
-                assert!(
-                    !actor_fatal_contact_error(error, services.member.identity()),
-                    "{label}: server late lifetime loss became actor-fatal: {error}"
-                );
-            }
-            if matches!(
-                window,
-                Window::PendingCacheRepair
-                    | Window::CompletedCacheRepairCapability
-                    | Window::CompletedCacheRepairFinalComparison
-                    | Window::ServiceLoad
-            ) {
-                assert!(
-                    client_result.is_ok() && server_result.is_ok(),
-                    "{label}: service Unavailable settles normally: client={client_result:?}, server={server_result:?}"
-                );
                 assert_eq!(
-                    client_result
-                        .as_ref()
-                        .expect("checked successful late lifetime contact")
-                        .receipt
-                        .blob_ranges_fetched,
+                    fault_state
+                        .result_frames_after_fault
+                        .load(Ordering::Acquire),
                     0,
-                    "{label}: no later carrier unit is exposed"
-                );
-            } else {
-                assert!(
-                    client_result.is_err() || server_result.is_err(),
-                    "{label}: withheld exact unit must not be acknowledged"
+                    "{label}: no success result follows post-commit withholding"
                 );
             }
-
-            assert_eq!(
-                source_store
-                    .mutable_transfer_cursor(
-                        services.other.identity(),
-                        MutableTransferCursorClass::Blob,
-                        MutableTransferCursorMode::OfferToPeer,
-                    )
-                    .expect("late lifetime source offer cursor after fault"),
-                source_offer_before,
-                "{label}: failed source unit cannot advance its offer cursor"
-            );
-            assert_eq!(
-                receiver_store
-                    .mutable_transfer_cursor(
-                        services.member.identity(),
-                        MutableTransferCursorClass::Blob,
-                        MutableTransferCursorMode::FetchFromPeer,
-                    )
-                    .expect("late lifetime receiver fetch cursor after fault"),
-                receiver_fetch_before,
-                "{label}: failed source unit cannot advance its fetch cursor"
-            );
-            assert_eq!(
-                receiver_store
-                    .blob_carrier_fetch_cursor(services.member.identity())
-                    .expect("late lifetime carrier cursor after fault"),
-                carrier_cursor_before,
-                "{label}: failed carrier unit cannot advance its carrier cursor"
-            );
-            let fault_digest = fault_state
-                .logical_digest_after_fault()
-                .unwrap_or_else(|| panic!("{label}: late lifetime logical digest"));
-            let receiver_stats_after = receiver_store
-                .blob_stats()
-                .expect("late lifetime receiver stats after fault");
-            match window {
-                Window::OutboundLoad => {
-                    assert_eq!(
-                        source_store.test_blob_logical_digest(),
-                        fault_digest,
-                        "{label}"
-                    );
-                    assert_eq!(
-                        receiver_store.test_blob_logical_digest(),
-                        receiver_digest_before,
-                        "{label}: skipped outbound load cannot mutate the receiver"
-                    );
-                    assert_eq!(receiver_stats_after, receiver_stats_before, "{label}");
-                    assert!(source_cache.has_blob_claim_for_test(transfer), "{label}");
-                    assert!(matches!(
-                        source_store.get_blob(transfer),
-                        Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
-                    ));
-                    assert_eq!(
-                        fault_state
-                            .result_frames_after_fault
-                            .load(Ordering::Acquire),
-                        0,
-                        "{label}: skipped exact load emits no result"
-                    );
-                }
-                Window::PostStage | Window::FinalComparison => {
-                    assert_eq!(
-                        receiver_store.test_blob_logical_digest(),
-                        fault_digest,
-                        "{label}: post-stage comparison cannot mutate retained state"
-                    );
-                    assert_eq!(receiver_stats_after.pending_sources, 1, "{label}");
-                    assert_eq!(receiver_stats_after.carrier_prefixes, 0, "{label}");
-                    assert_eq!(receiver_stats_after.publications, 0, "{label}");
-                    assert!(
-                        !receiver_cache.has_blob_claim_for_test(transfer),
-                        "{label}: lifetime-withheld stage cannot cache the source"
-                    );
-                    assert!(matches!(
-                        receiver_store.custody_v1_pending_blob_source(transfer),
-                        Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
-                    ));
-                    assert_eq!(
-                        fault_state
-                            .result_frames_after_fault
-                            .load(Ordering::Acquire),
-                        0,
-                        "{label}: no result/ACK follows post-stage withholding"
-                    );
-                }
-                Window::CompletedPostStageCapability
-                | Window::CompletedPostStageFinalComparison => {
-                    assert_eq!(
-                        receiver_store.test_blob_logical_digest(),
-                        fault_digest,
-                        "{label}: completed post-stage withholding cannot mutate after its fault boundary"
-                    );
-                    assert_eq!(receiver_stats_after.pending_sources, 0, "{label}");
-                    assert_eq!(receiver_stats_after.carrier_prefixes, 0, "{label}");
-                    assert_eq!(
-                        receiver_stats_after.publications,
-                        u64::from(
-                            fault
-                                != TestBlobContactFault::CompletedPostStageCapabilityLifetimeExpiry
-                        ),
-                        "{label}: only pre-capability expiry performs deterministic retirement"
-                    );
-                    assert!(
-                        !receiver_cache.has_blob_claim_for_test(transfer),
-                        "{label}: lifetime-withheld completed duplicate cannot cache the source"
-                    );
-                    assert!(matches!(
-                        receiver_store.get_blob(transfer),
-                        Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
-                    ));
-                    assert_eq!(
-                        fault_state
-                            .result_frames_after_fault
-                            .load(Ordering::Acquire),
-                        0,
-                        "{label}: no result/ACK follows completed post-stage withholding"
-                    );
-                }
-                Window::ServiceLoad => {
-                    assert_eq!(
-                        source_store.test_blob_logical_digest(),
-                        fault_digest,
-                        "{label}"
-                    );
-                    assert_eq!(
-                        receiver_store.test_blob_logical_digest(),
-                        receiver_digest_before,
-                        "{label}: unavailable exact range cannot mutate the requester"
-                    );
-                    assert_eq!(receiver_stats_after, receiver_stats_before, "{label}");
-                    assert!(receiver_cache.has_blob_claim_for_test(transfer), "{label}");
-                    assert!(
-                        receiver_store
-                            .pending_blob_source(transfer)
-                            .expect("late service requester pending lookup")
-                            .is_some(),
-                        "{label}: requester retains pending source and prefix"
-                    );
-                    assert_eq!(
-                        fault_state
-                            .result_frames_after_fault
-                            .load(Ordering::Acquire),
-                        0,
-                        "{label}: multi-range unavailability emits no removed result/ACK frame"
-                    );
-                }
-                Window::PendingCacheRepair => {
-                    assert_eq!(
-                        receiver_store.test_blob_logical_digest(),
-                        fault_digest,
-                        "{label}: cache repair cannot mutate retained pending state"
-                    );
-                    assert_eq!(receiver_stats_after, receiver_stats_before, "{label}");
-                    assert!(
-                        !receiver_cache.has_blob_claim_for_test(transfer),
-                        "{label}: lifetime-withheld repair cannot cache the pending source"
-                    );
-                    assert!(matches!(
-                        receiver_store.custody_v1_pending_blob_source(transfer),
-                        Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
-                    ));
-                    assert_eq!(
-                        fault_state
-                            .result_frames_after_fault
-                            .load(Ordering::Acquire),
-                        0,
-                        "{label}: withheld repair emits no Blob result"
-                    );
-                }
-                Window::CompletedCacheRepairCapability
-                | Window::CompletedCacheRepairFinalComparison => {
-                    assert_eq!(
-                        receiver_store.test_blob_logical_digest(),
-                        fault_digest,
-                        "{label}: completed cache repair cannot mutate after its fault boundary"
-                    );
-                    assert_eq!(receiver_stats_after.pending_sources, 0, "{label}");
-                    assert_eq!(receiver_stats_after.carrier_prefixes, 0, "{label}");
-                    assert_eq!(
-                        receiver_stats_after.publications,
-                        u64::from(
-                            fault
-                                != TestBlobContactFault::CompletedCacheRepairCapabilityLifetimeExpiry
-                        ),
-                        "{label}: only pre-capability expiry performs deterministic retirement"
-                    );
-                    assert!(
-                        !receiver_cache.has_blob_claim_for_test(transfer),
-                        "{label}: lifetime-withheld completed repair cannot cache the source"
-                    );
-                    assert!(matches!(
-                        receiver_store.get_blob(transfer),
-                        Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
-                    ));
-                    assert_eq!(
-                        fault_state
-                            .result_frames_after_fault
-                            .load(Ordering::Acquire),
-                        0,
-                        "{label}: withheld completed repair emits no Blob result"
-                    );
-                }
-                Window::PostPromotionLoad => {
-                    assert_eq!(
-                        receiver_store.test_blob_logical_digest(),
-                        fault_digest,
-                        "{label}"
-                    );
-                    assert_eq!(receiver_stats_after.pending_sources, 0, "{label}");
-                    assert_eq!(receiver_stats_after.carrier_prefixes, 0, "{label}");
-                    assert_eq!(receiver_stats_after.publications, 1, "{label}");
-                    assert!(
-                        !receiver_cache.has_blob_claim_for_test(transfer),
-                        "{label}: stale pending cache proof is withheld after Store commit"
-                    );
-                    assert!(matches!(
-                        receiver_store.get_blob(transfer),
-                        Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
-                    ));
-                    assert_eq!(
-                        fault_state
-                            .result_frames_after_fault
-                            .load(Ordering::Acquire),
-                        0,
-                        "{label}: no success result follows post-commit withholding"
-                    );
-                }
-            }
-
-            drop((source_store, receiver_store));
-            fs::remove_dir_all(source_state).expect("late lifetime source cleanup");
-            fs::remove_dir_all(receiver_state).expect("late lifetime receiver cleanup");
         }
+
+        drop((source_store, receiver_store));
+        fs::remove_dir_all(source_state).expect("late lifetime source cleanup");
+        fs::remove_dir_all(receiver_state).expect("late lifetime receiver cleanup");
     }
 
     #[tokio::test]
@@ -51991,607 +51927,812 @@ mod tests {
         fs::remove_dir_all(client_state).expect("durable settlement client cleanup");
     }
 
-    #[tokio::test]
-    async fn blob_wrong_settlement_matrix_uses_real_claims_and_production_handlers() {
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum BlobWrongSettlementCase {
+        ApplyMissingDigest,
+        ApplyStaleRealDigest,
+        ApplyForgedDisposition,
+        FetchResultCrossDirectionDigest,
+        FetchResultForgedDisposition,
+        FetchAckCrossTransferDigest,
+        FetchAckWrongDisposition,
+    }
+
+    macro_rules! blob_wrong_settlement_cases {
+        ($($name:ident => $case:expr),+ $(,)?) => {
+            $(
+                #[tokio::test]
+                async fn $name() {
+                    assert_blob_wrong_settlement_case($case).await;
+                }
+            )+
+        };
+    }
+
+    blob_wrong_settlement_cases! {
+        blob_apply_missing_digest_uses_real_claim_and_production_handler => BlobWrongSettlementCase::ApplyMissingDigest,
+        blob_apply_stale_real_digest_uses_real_claim_and_production_handler => BlobWrongSettlementCase::ApplyStaleRealDigest,
+        blob_apply_forged_disposition_uses_real_claim_and_production_handler => BlobWrongSettlementCase::ApplyForgedDisposition,
+        blob_fetch_result_cross_direction_digest_uses_real_claim_and_production_handler => BlobWrongSettlementCase::FetchResultCrossDirectionDigest,
+        blob_fetch_result_forged_disposition_uses_real_claim_and_production_handler => BlobWrongSettlementCase::FetchResultForgedDisposition,
+        blob_fetch_ack_cross_transfer_digest_uses_real_claim_and_production_handler => BlobWrongSettlementCase::FetchAckCrossTransferDigest,
+        blob_fetch_ack_wrong_disposition_uses_real_claim_and_production_handler => BlobWrongSettlementCase::FetchAckWrongDisposition,
+    }
+
+    async fn real_blob_settlement_digest(seed: u8, kind: TestBlobSettlementKind) -> [u8; 32] {
+        let source_is_server = kind != TestBlobSettlementKind::ApplyResult;
+        let services = control_test_services([0x70_u8.wrapping_add(seed); 32]);
+        let authority = services.member.mission_authority_id();
+        let source_state = root(&format!("settlement-donor-{seed}-{kind:?}-source"));
+        let receiver_state = root(&format!("settlement-donor-{seed}-{kind:?}-receiver"));
+        fs::create_dir_all(&source_state).expect("settlement donor source root");
+        fs::create_dir_all(&receiver_state).expect("settlement donor receiver root");
+        let source_store = Arc::new(
+            Store::open_for_mission(source_state.join(STORE_FILE), authority)
+                .expect("settlement donor source store"),
+        );
+        let receiver_store = Arc::new(
+            Store::open_for_mission(receiver_state.join(STORE_FILE), authority)
+                .expect("settlement donor receiver store"),
+        );
+        let mut source_sealer = open_test_sealer(&services.member);
+        let source_clock_id = if source_is_server {
+            [0xb1; 16]
+        } else {
+            BLOB_CONTACT_TEST_CLIENT_CLOCK_ID
+        };
+        publish_test_finite_blob(
+            &source_store,
+            &mut source_sealer,
+            &services.topic,
+            &services.scope,
+            1,
+            format!("settlement-donor-{seed}-{kind:?}").as_bytes(),
+            600_000,
+            25,
+            CustodySample {
+                clock_id: source_clock_id,
+                tick_ms: 0,
+            },
+        );
+        let interests = || {
+            MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
+                services.topic.clone(),
+                services.scope.clone(),
+                false,
+            )])
+        };
+        let server_harness = TestBlobSettlementHarness::default();
+        let client_harness = TestBlobSettlementHarness::default();
+        let (client_result, server_result) = if source_is_server {
+            blob_contact_test_pair_with_settlement_harness(
+                source_store.clone(),
+                services.member.clone(),
+                interests(),
+                test_event_route_cache(&source_store, &services.member),
+                receiver_store.clone(),
+                services.other.clone(),
+                interests(),
+                test_event_route_cache(&receiver_store, &services.other),
+                server_harness.clone(),
+                client_harness.clone(),
+            )
+            .await
+        } else {
+            blob_contact_test_pair_with_settlement_harness(
+                receiver_store.clone(),
+                services.other.clone(),
+                interests(),
+                test_event_route_cache(&receiver_store, &services.other),
+                source_store.clone(),
+                services.member.clone(),
+                interests(),
+                test_event_route_cache(&source_store, &services.member),
+                server_harness.clone(),
+                client_harness.clone(),
+            )
+            .await
+        };
+        assert!(
+            client_result.is_ok() && server_result.is_ok(),
+            "settlement donor contact failed: client={client_result:?}, server={server_result:?}"
+        );
+        let observation = server_harness
+            .observations()
+            .into_iter()
+            .chain(client_harness.observations())
+            .find(|observation| observation.kind == kind)
+            .unwrap_or_else(|| panic!("settlement donor omitted {kind:?}"));
+        let digest = observation
+            .authority_digest
+            .unwrap_or_else(|| panic!("settlement donor {kind:?} omitted its real claim digest"));
+        assert_eq!(observation.emitted_digest, Some(digest));
+        drop((source_store, receiver_store));
+        fs::remove_dir_all(source_state).expect("settlement donor source cleanup");
+        fs::remove_dir_all(receiver_state).expect("settlement donor receiver cleanup");
+        digest
+    }
+
+    async fn assert_blob_wrong_settlement_case(case: BlobWrongSettlementCase) {
         // Mutation caught: a helper-only validator test can pass while a live
         // call site emits the wrong claim digest/disposition, advances a
         // cursor, or continues to a later item after rejection.
-        let cases = [
-            (
+        let (label, kind, configured_mutation) = match case {
+            BlobWrongSettlementCase::ApplyMissingDigest => (
                 "apply-missing-digest",
                 TestBlobSettlementKind::ApplyResult,
                 TestBlobSettlementMutation::MissingDigest,
             ),
-            (
+            BlobWrongSettlementCase::ApplyStaleRealDigest => (
                 "apply-stale-real-digest",
                 TestBlobSettlementKind::ApplyResult,
                 TestBlobSettlementMutation::ReplaceDigest([0xa1; 32]),
             ),
-            (
+            BlobWrongSettlementCase::ApplyForgedDisposition => (
                 "apply-forged-disposition",
                 TestBlobSettlementKind::ApplyResult,
                 TestBlobSettlementMutation::CorruptProtectedDisposition,
             ),
-            (
+            BlobWrongSettlementCase::FetchResultCrossDirectionDigest => (
                 "fetch-result-cross-direction-digest",
                 TestBlobSettlementKind::FetchResult,
                 TestBlobSettlementMutation::ReplaceDigest([0xa2; 32]),
             ),
-            (
+            BlobWrongSettlementCase::FetchResultForgedDisposition => (
                 "fetch-result-forged-disposition",
                 TestBlobSettlementKind::FetchResult,
                 TestBlobSettlementMutation::CorruptProtectedDisposition,
             ),
-            (
+            BlobWrongSettlementCase::FetchAckCrossTransferDigest => (
                 "fetch-ack-cross-transfer-digest",
                 TestBlobSettlementKind::FetchResultAck,
                 TestBlobSettlementMutation::ReplaceDigest([0xa3; 32]),
             ),
-            (
+            BlobWrongSettlementCase::FetchAckWrongDisposition => (
                 "fetch-ack-wrong-disposition",
                 TestBlobSettlementKind::FetchResultAck,
                 TestBlobSettlementMutation::ReplaceDisposition(MutableApplyDisposition::Duplicate),
             ),
-        ];
+        };
 
-        let mut actual_digests = Vec::new();
-        for (case_index, (label, kind, configured_mutation)) in cases.into_iter().enumerate() {
-            let mutation = match configured_mutation {
-                TestBlobSettlementMutation::ReplaceDigest(_) => {
-                    TestBlobSettlementMutation::ReplaceDigest(
-                        *actual_digests
-                            .last()
-                            .expect("wrong digest comes from a prior real verified claim"),
-                    )
-                }
-                mutation => mutation,
-            };
-            let source_is_server = kind != TestBlobSettlementKind::ApplyResult;
-            let services = control_test_services([0xe0 + case_index as u8; 32]);
-            let authority = services.member.mission_authority_id();
-            let source_state = root(&format!("settlement-{label}-source"));
-            let receiver_state = root(&format!("settlement-{label}-receiver"));
-            fs::create_dir_all(&source_state).expect("wrong settlement source root");
-            fs::create_dir_all(&receiver_state).expect("wrong settlement receiver root");
-            let source_store = Arc::new(
-                Store::open_for_mission(source_state.join(STORE_FILE), authority)
-                    .expect("wrong settlement source store"),
-            );
-            let receiver_store = Arc::new(
-                Store::open_for_mission(receiver_state.join(STORE_FILE), authority)
-                    .expect("wrong settlement receiver store"),
-            );
-            let mut source_sealer = open_test_sealer(&services.member);
-            let source_clock_id = if source_is_server {
-                [0xb1; 16]
-            } else {
-                BLOB_CONTACT_TEST_CLIENT_CLOCK_ID
-            };
-            let first = publish_test_finite_blob(
-                &source_store,
-                &mut source_sealer,
-                &services.topic,
-                &services.scope,
-                1,
-                format!("{label}-first").as_bytes(),
-                600_000,
-                25,
-                CustodySample {
-                    clock_id: source_clock_id,
-                    tick_ms: 0,
-                },
-            );
-            let second = publish_test_finite_blob(
-                &source_store,
-                &mut source_sealer,
-                &services.topic,
-                &services.scope,
-                1,
-                format!("{label}-later").as_bytes(),
-                600_000,
-                25,
-                CustodySample {
-                    clock_id: source_clock_id,
-                    tick_ms: 0,
-                },
-            );
-            let mut ordered = [first, second];
-            ordered.sort();
-            let interests = || {
-                MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
-                    services.topic.clone(),
-                    services.scope.clone(),
-                    false,
-                )])
-            };
-            let fault = TestBlobSettlementFault { kind, mutation };
-            let server_harness = if kind == TestBlobSettlementKind::ApplyResult
-                || kind == TestBlobSettlementKind::FetchResultAck
-            {
-                TestBlobSettlementHarness::with_fault(fault)
-            } else {
-                TestBlobSettlementHarness::default()
-            };
-            let client_harness = if kind == TestBlobSettlementKind::FetchResult {
-                TestBlobSettlementHarness::with_fault(fault)
-            } else {
-                TestBlobSettlementHarness::default()
-            };
-            let (client_result, server_result) = if source_is_server {
-                blob_contact_test_pair_with_settlement_harness(
-                    source_store.clone(),
-                    services.member.clone(),
-                    interests(),
-                    test_event_route_cache(&source_store, &services.member),
-                    receiver_store.clone(),
-                    services.other.clone(),
-                    interests(),
-                    test_event_route_cache(&receiver_store, &services.other),
-                    server_harness.clone(),
-                    client_harness.clone(),
-                )
-                .await
-            } else {
-                blob_contact_test_pair_with_settlement_harness(
-                    receiver_store.clone(),
-                    services.other.clone(),
-                    interests(),
-                    test_event_route_cache(&receiver_store, &services.other),
-                    source_store.clone(),
-                    services.member.clone(),
-                    interests(),
-                    test_event_route_cache(&source_store, &services.member),
-                    server_harness.clone(),
-                    client_harness.clone(),
-                )
-                .await
-            };
-            assert!(
-                client_result.is_err() || server_result.is_err(),
-                "{label} must fail through the real protected lane"
-            );
-            let observations = server_harness
-                .observations()
-                .into_iter()
-                .chain(client_harness.observations())
-                .collect::<Vec<_>>();
-            let targeted = observations
-                .iter()
-                .find(|observation| observation.kind == kind)
-                .unwrap_or_else(|| panic!("{label}: targeted production frame observed"));
-            let current_digest = targeted
-                .authority_digest
-                .unwrap_or_else(|| panic!("{label}: verified/minted claim digest"));
-            assert_eq!(targeted.emitted_digest, Some(current_digest));
-            actual_digests.push(current_digest);
-            let staged = observations
-                .iter()
-                .find(|observation| {
-                    observation.kind
-                        == if source_is_server {
-                            TestBlobSettlementKind::FetchResult
-                        } else {
-                            TestBlobSettlementKind::ApplyResult
-                        }
-                })
-                .expect("receiver staging boundary observation");
-            assert_eq!(
-                receiver_store.test_blob_logical_digest(),
-                staged.logical_digest,
-                "{label}: rejection permits only the preceding authenticated stage"
-            );
-            assert!(
-                receiver_store
-                    .pending_blob_source(ordered[0])
-                    .expect("staged source after wrong settlement")
-                    .is_some(),
-                "{label}: legitimate staging precedes the forged settlement"
-            );
-            assert!(
-                receiver_store
-                    .pending_blob_source(ordered[1])
-                    .expect("later source after wrong settlement")
-                    .is_none(),
-                "{label}: no later item may mutate"
-            );
-            for (store, peer) in [
-                (&source_store, services.other.identity()),
-                (&receiver_store, services.member.identity()),
-            ] {
-                for mode in [
-                    MutableTransferCursorMode::OfferToPeer,
-                    MutableTransferCursorMode::FetchFromPeer,
-                ] {
-                    assert_eq!(
-                        store
-                            .mutable_transfer_cursor(peer, MutableTransferCursorClass::Blob, mode,)
-                            .expect("wrong settlement cursor"),
-                        None,
-                        "{label}: all four cursor coordinates remain unchanged"
-                    );
-                }
-            }
-            drop((source_store, receiver_store));
-            fs::remove_dir_all(source_state).expect("wrong settlement source cleanup");
-            fs::remove_dir_all(receiver_state).expect("wrong settlement receiver cleanup");
-        }
-        assert!(
-            actual_digests.windows(2).all(|pair| pair[0] != pair[1]),
-            "each fault originates in a distinct real verified claim context"
+        let wrong_real_digest = if matches!(
+            configured_mutation,
+            TestBlobSettlementMutation::ReplaceDigest(_)
+        ) {
+            Some(real_blob_settlement_digest(case as u8, kind).await)
+        } else {
+            None
+        };
+        let mutation = wrong_real_digest.map_or(configured_mutation, |digest| {
+            TestBlobSettlementMutation::ReplaceDigest(digest)
+        });
+        let source_is_server = kind != TestBlobSettlementKind::ApplyResult;
+        let services = control_test_services([0xe0_u8.wrapping_add(case as u8); 32]);
+        let authority = services.member.mission_authority_id();
+        let source_state = root(&format!("settlement-{label}-source"));
+        let receiver_state = root(&format!("settlement-{label}-receiver"));
+        fs::create_dir_all(&source_state).expect("wrong settlement source root");
+        fs::create_dir_all(&receiver_state).expect("wrong settlement receiver root");
+        let source_store = Arc::new(
+            Store::open_for_mission(source_state.join(STORE_FILE), authority)
+                .expect("wrong settlement source store"),
         );
+        let receiver_store = Arc::new(
+            Store::open_for_mission(receiver_state.join(STORE_FILE), authority)
+                .expect("wrong settlement receiver store"),
+        );
+        let mut source_sealer = open_test_sealer(&services.member);
+        let source_clock_id = if source_is_server {
+            [0xb1; 16]
+        } else {
+            BLOB_CONTACT_TEST_CLIENT_CLOCK_ID
+        };
+        let first = publish_test_finite_blob(
+            &source_store,
+            &mut source_sealer,
+            &services.topic,
+            &services.scope,
+            1,
+            format!("{label}-first").as_bytes(),
+            600_000,
+            25,
+            CustodySample {
+                clock_id: source_clock_id,
+                tick_ms: 0,
+            },
+        );
+        let second = publish_test_finite_blob(
+            &source_store,
+            &mut source_sealer,
+            &services.topic,
+            &services.scope,
+            1,
+            format!("{label}-later").as_bytes(),
+            600_000,
+            25,
+            CustodySample {
+                clock_id: source_clock_id,
+                tick_ms: 0,
+            },
+        );
+        let mut ordered = [first, second];
+        ordered.sort();
+        let interests = || {
+            MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
+                services.topic.clone(),
+                services.scope.clone(),
+                false,
+            )])
+        };
+        let fault = TestBlobSettlementFault { kind, mutation };
+        let server_harness = if kind == TestBlobSettlementKind::ApplyResult
+            || kind == TestBlobSettlementKind::FetchResultAck
+        {
+            TestBlobSettlementHarness::with_fault(fault)
+        } else {
+            TestBlobSettlementHarness::default()
+        };
+        let client_harness = if kind == TestBlobSettlementKind::FetchResult {
+            TestBlobSettlementHarness::with_fault(fault)
+        } else {
+            TestBlobSettlementHarness::default()
+        };
+        let (client_result, server_result) = if source_is_server {
+            blob_contact_test_pair_with_settlement_harness(
+                source_store.clone(),
+                services.member.clone(),
+                interests(),
+                test_event_route_cache(&source_store, &services.member),
+                receiver_store.clone(),
+                services.other.clone(),
+                interests(),
+                test_event_route_cache(&receiver_store, &services.other),
+                server_harness.clone(),
+                client_harness.clone(),
+            )
+            .await
+        } else {
+            blob_contact_test_pair_with_settlement_harness(
+                receiver_store.clone(),
+                services.other.clone(),
+                interests(),
+                test_event_route_cache(&receiver_store, &services.other),
+                source_store.clone(),
+                services.member.clone(),
+                interests(),
+                test_event_route_cache(&source_store, &services.member),
+                server_harness.clone(),
+                client_harness.clone(),
+            )
+            .await
+        };
+        assert!(
+            client_result.is_err() || server_result.is_err(),
+            "{label} must fail through the real protected lane"
+        );
+        let observations = server_harness
+            .observations()
+            .into_iter()
+            .chain(client_harness.observations())
+            .collect::<Vec<_>>();
+        let targeted = observations
+            .iter()
+            .find(|observation| observation.kind == kind)
+            .unwrap_or_else(|| panic!("{label}: targeted production frame observed"));
+        let current_digest = targeted
+            .authority_digest
+            .unwrap_or_else(|| panic!("{label}: verified/minted claim digest"));
+        assert_eq!(targeted.emitted_digest, Some(current_digest));
+        if let Some(wrong_digest) = wrong_real_digest {
+            assert_ne!(
+                wrong_digest, current_digest,
+                "{label}: replacement must come from a distinct real claim context"
+            );
+        }
+        let staged = observations
+            .iter()
+            .find(|observation| {
+                observation.kind
+                    == if source_is_server {
+                        TestBlobSettlementKind::FetchResult
+                    } else {
+                        TestBlobSettlementKind::ApplyResult
+                    }
+            })
+            .expect("receiver staging boundary observation");
+        assert_eq!(
+            receiver_store.test_blob_logical_digest(),
+            staged.logical_digest,
+            "{label}: rejection permits only the preceding authenticated stage"
+        );
+        assert!(
+            receiver_store
+                .pending_blob_source(ordered[0])
+                .expect("staged source after wrong settlement")
+                .is_some(),
+            "{label}: legitimate staging precedes the forged settlement"
+        );
+        assert!(
+            receiver_store
+                .pending_blob_source(ordered[1])
+                .expect("later source after wrong settlement")
+                .is_none(),
+            "{label}: no later item may mutate"
+        );
+        for (store, peer) in [
+            (&source_store, services.other.identity()),
+            (&receiver_store, services.member.identity()),
+        ] {
+            for mode in [
+                MutableTransferCursorMode::OfferToPeer,
+                MutableTransferCursorMode::FetchFromPeer,
+            ] {
+                assert_eq!(
+                    store
+                        .mutable_transfer_cursor(peer, MutableTransferCursorClass::Blob, mode,)
+                        .expect("wrong settlement cursor"),
+                    None,
+                    "{label}: all four cursor coordinates remain unchanged"
+                );
+            }
+        }
+        drop((source_store, receiver_store));
+        fs::remove_dir_all(source_state).expect("wrong settlement source cleanup");
+        fs::remove_dir_all(receiver_state).expect("wrong settlement receiver cleanup");
     }
 
-    #[tokio::test]
-    async fn v8_blob_carrier_adjacent_finalization_rejects_overrun_and_expiry_then_retries() {
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum BlobTestDirection {
+        SourceObject,
+        SourceOffer,
+    }
+
+    impl BlobTestDirection {
+        fn source_is_server(self) -> bool {
+            self == Self::SourceObject
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum BlobFinalizationKind {
+        Overrun,
+        Expiry,
+    }
+
+    macro_rules! blob_finalization_cases {
+        ($($name:ident => ($kind:expr, $direction:expr)),+ $(,)?) => {
+            $(
+                #[tokio::test]
+                async fn $name() {
+                    assert_blob_finalization_case($kind, $direction).await;
+                }
+            )+
+        };
+    }
+
+    blob_finalization_cases! {
+        v8_blob_object_finalization_rejects_overrun_then_retries => (BlobFinalizationKind::Overrun, BlobTestDirection::SourceObject),
+        v8_blob_offer_finalization_rejects_overrun_then_retries => (BlobFinalizationKind::Overrun, BlobTestDirection::SourceOffer),
+        v8_blob_object_finalization_rejects_expiry => (BlobFinalizationKind::Expiry, BlobTestDirection::SourceObject),
+        v8_blob_offer_finalization_rejects_expiry => (BlobFinalizationKind::Expiry, BlobTestDirection::SourceOffer),
+    }
+
+    async fn assert_blob_finalization_case(
+        kind: BlobFinalizationKind,
+        direction: BlobTestDirection,
+    ) {
         // Mutation caught: sampling only when the claim is built would let a
         // delayed sealed offer/object escape after its authenticated age
         // charge, while reusing the consumed claim would make retry unsafe.
-        for (case, ttl_ms, delay_ms) in [
-            ("overrun", 600_000, MAX_CUSTODY_FINALIZATION_CHARGE_MS + 1),
-            ("expiry", 80, 30),
-        ] {
-            for source_is_server in [true, false] {
-                let services = control_test_services(if source_is_server {
-                    [0xd3; 32]
-                } else {
-                    [0xd4; 32]
-                });
-                let authority = services.member.mission_authority_id();
-                let side = if source_is_server { "object" } else { "offer" };
-                let source_state = root(&format!("v8-final-{case}-{side}-source"));
-                let receiver_state = root(&format!("v8-final-{case}-{side}-receiver"));
-                fs::create_dir_all(&source_state).expect("finalization source state");
-                fs::create_dir_all(&receiver_state).expect("finalization receiver state");
-                let source_store = Arc::new(
-                    Store::open_for_mission(source_state.join(STORE_FILE), authority)
-                        .expect("finalization source store"),
-                );
-                let receiver_store = Arc::new(
-                    Store::open_for_mission(receiver_state.join(STORE_FILE), authority)
-                        .expect("finalization receiver store"),
-                );
-                let source_cache = test_event_route_cache(&source_store, &services.member);
-                let receiver_cache = test_event_route_cache(&receiver_store, &services.other);
-                let source_clock_id = if source_is_server {
-                    [0xb1; 16]
-                } else {
-                    BLOB_CONTACT_TEST_CLIENT_CLOCK_ID
-                };
-                let mut source_sealer = open_test_sealer(&services.member);
-                let finite = publish_test_finite_blob(
-                    &source_store,
-                    &mut source_sealer,
-                    &services.topic,
-                    &services.scope,
-                    1,
-                    b"carrier-adjacent finite Blob source",
-                    ttl_ms,
-                    25,
-                    CustodySample {
-                        clock_id: source_clock_id,
-                        tick_ms: 0,
-                    },
-                );
-                let interests = || {
-                    MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
-                        services.topic.clone(),
-                        services.scope.clone(),
-                        false,
-                    )])
-                };
-                let (
+        let (case, ttl_ms, delay_ms) = match kind {
+            BlobFinalizationKind::Overrun => {
+                ("overrun", 600_000, MAX_CUSTODY_FINALIZATION_CHARGE_MS + 1)
+            }
+            BlobFinalizationKind::Expiry => ("expiry", 80, 30),
+        };
+        let source_is_server = direction.source_is_server();
+        let services = control_test_services(if source_is_server {
+            [0xd3; 32]
+        } else {
+            [0xd4; 32]
+        });
+        let authority = services.member.mission_authority_id();
+        let side = if source_is_server { "object" } else { "offer" };
+        let source_state = root(&format!("v8-final-{case}-{side}-source"));
+        let receiver_state = root(&format!("v8-final-{case}-{side}-receiver"));
+        fs::create_dir_all(&source_state).expect("finalization source state");
+        fs::create_dir_all(&receiver_state).expect("finalization receiver state");
+        let source_store = Arc::new(
+            Store::open_for_mission(source_state.join(STORE_FILE), authority)
+                .expect("finalization source store"),
+        );
+        let receiver_store = Arc::new(
+            Store::open_for_mission(receiver_state.join(STORE_FILE), authority)
+                .expect("finalization receiver store"),
+        );
+        let source_cache = test_event_route_cache(&source_store, &services.member);
+        let receiver_cache = test_event_route_cache(&receiver_store, &services.other);
+        let source_clock_id = if source_is_server {
+            [0xb1; 16]
+        } else {
+            BLOB_CONTACT_TEST_CLIENT_CLOCK_ID
+        };
+        let mut source_sealer = open_test_sealer(&services.member);
+        let finite = publish_test_finite_blob(
+            &source_store,
+            &mut source_sealer,
+            &services.topic,
+            &services.scope,
+            1,
+            b"carrier-adjacent finite Blob source",
+            ttl_ms,
+            25,
+            CustodySample {
+                clock_id: source_clock_id,
+                tick_ms: 0,
+            },
+        );
+        let interests = || {
+            MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
+                services.topic.clone(),
+                services.scope.clone(),
+                false,
+            )])
+        };
+        let (
+            server_store,
+            server_mission,
+            server_cache,
+            client_store,
+            client_mission,
+            client_cache,
+        ) = if source_is_server {
+            (
+                Arc::clone(&source_store),
+                services.member.clone(),
+                Arc::clone(&source_cache),
+                Arc::clone(&receiver_store),
+                services.other.clone(),
+                Arc::clone(&receiver_cache),
+            )
+        } else {
+            (
+                Arc::clone(&receiver_store),
+                services.other.clone(),
+                Arc::clone(&receiver_cache),
+                Arc::clone(&source_store),
+                services.member.clone(),
+                Arc::clone(&source_cache),
+            )
+        };
+        let (client_result, server_result) =
+            blob_contact_test_pair_with_caches_results_and_finalization_delays(
+                Arc::clone(&server_store),
+                server_mission.clone(),
+                interests(),
+                Arc::clone(&server_cache),
+                Arc::clone(&client_store),
+                client_mission.clone(),
+                interests(),
+                Arc::clone(&client_cache),
+                None,
+                None,
+                None,
+                None,
+                0,
+                source_is_server.then_some(delay_ms),
+                (!source_is_server).then_some(delay_ms),
+                0,
+                0,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+        assert!(
+            client_result.is_err() || server_result.is_err(),
+            "{case} {side} must abandon the sealed frame"
+        );
+        assert!(
+            receiver_store
+                .blob_source_projection(finite)
+                .expect("rejected finalization receiver projection")
+                .is_none(),
+            "{case} {side} must reject before any wire Blob source reaches the peer"
+        );
+        assert!(
+            receiver_store
+                .pending_blob_source(finite)
+                .expect("rejected finalization pending projection")
+                .is_none()
+        );
+
+        if case == "overrun" {
+            let (retry_client, retry_server) =
+                blob_contact_test_pair_with_caches_results_and_finalization_delays(
                     server_store,
                     server_mission,
+                    interests(),
                     server_cache,
                     client_store,
                     client_mission,
+                    interests(),
                     client_cache,
-                ) = if source_is_server {
-                    (
-                        Arc::clone(&source_store),
-                        services.member.clone(),
-                        Arc::clone(&source_cache),
-                        Arc::clone(&receiver_store),
-                        services.other.clone(),
-                        Arc::clone(&receiver_cache),
-                    )
-                } else {
-                    (
-                        Arc::clone(&receiver_store),
-                        services.other.clone(),
-                        Arc::clone(&receiver_cache),
-                        Arc::clone(&source_store),
-                        services.member.clone(),
-                        Arc::clone(&source_cache),
-                    )
-                };
-                let (client_result, server_result) =
-                    blob_contact_test_pair_with_caches_results_and_finalization_delays(
-                        Arc::clone(&server_store),
-                        server_mission.clone(),
-                        interests(),
-                        Arc::clone(&server_cache),
-                        Arc::clone(&client_store),
-                        client_mission.clone(),
-                        interests(),
-                        Arc::clone(&client_cache),
-                        None,
-                        None,
-                        None,
-                        None,
-                        0,
-                        source_is_server.then_some(delay_ms),
-                        (!source_is_server).then_some(delay_ms),
-                        0,
-                        0,
-                        None,
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
-                assert!(
-                    client_result.is_err() || server_result.is_err(),
-                    "{case} {side} must abandon the sealed frame"
-                );
-                assert!(
-                    receiver_store
-                        .blob_source_projection(finite)
-                        .expect("rejected finalization receiver projection")
-                        .is_none(),
-                    "{case} {side} must reject before any wire Blob source reaches the peer"
-                );
-                assert!(
-                    receiver_store
-                        .pending_blob_source(finite)
-                        .expect("rejected finalization pending projection")
-                        .is_none()
-                );
-
-                if case == "overrun" {
-                    let (retry_client, retry_server) =
-                        blob_contact_test_pair_with_caches_results_and_finalization_delays(
-                            server_store,
-                            server_mission,
-                            interests(),
-                            server_cache,
-                            client_store,
-                            client_mission,
-                            interests(),
-                            client_cache,
-                            None,
-                            None,
-                            None,
-                            None,
-                            0,
-                            None,
-                            None,
-                            if source_is_server { delay_ms } else { 0 },
-                            if source_is_server { 0 } else { delay_ms },
-                            None,
-                            None,
-                            None,
-                            None,
-                        )
-                        .await;
-                    assert!(
-                        retry_client.is_ok() && retry_server.is_ok(),
-                        "fresh {case} {side} claim must retry safely: client={retry_client:?}, server={retry_server:?}"
-                    );
-                    assert!(
-                        receiver_store
-                            .blob_source_projection(finite)
-                            .expect("retry retained projection")
-                            .is_some(),
-                        "fresh retry must retain the source after the consumed rejected claim; Slice 5D may also complete its bounded carrier"
-                    );
-                }
-                drop(source_store);
-                drop(receiver_store);
-                fs::remove_dir_all(source_state).expect("finalization source cleanup");
-                fs::remove_dir_all(receiver_state).expect("finalization receiver cleanup");
-            }
+                    None,
+                    None,
+                    None,
+                    None,
+                    0,
+                    None,
+                    None,
+                    if source_is_server { delay_ms } else { 0 },
+                    if source_is_server { 0 } else { delay_ms },
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+            assert!(
+                retry_client.is_ok() && retry_server.is_ok(),
+                "fresh {case} {side} claim must retry safely: client={retry_client:?}, server={retry_server:?}"
+            );
+            assert!(
+                receiver_store
+                    .blob_source_projection(finite)
+                    .expect("retry retained projection")
+                    .is_some(),
+                "fresh retry must retain the source after the consumed rejected claim; Slice 5D may also complete its bounded carrier"
+            );
         }
+        drop(source_store);
+        drop(receiver_store);
+        fs::remove_dir_all(source_state).expect("finalization source cleanup");
+        fs::remove_dir_all(receiver_state).expect("finalization receiver cleanup");
+    }
+
+    macro_rules! blob_receive_rejection_cases {
+        ($($name:ident => ($direction:expr, $fault:expr)),+ $(,)?) => {
+            $(
+                #[tokio::test]
+                async fn $name() {
+                    assert_blob_receive_rejection_case($direction, $fault).await;
+                }
+            )+
+        };
+    }
+
+    blob_receive_rejection_cases! {
+        v8_blob_object_missing_rejection_is_receiver_state_neutral => (BlobTestDirection::SourceObject, TestBlobReceiveFault::Missing),
+        v8_blob_object_tampered_rejection_is_receiver_state_neutral => (BlobTestDirection::SourceObject, TestBlobReceiveFault::Tampered),
+        v8_blob_object_cross_session_rejection_is_receiver_state_neutral => (BlobTestDirection::SourceObject, TestBlobReceiveFault::CrossSession),
+        v8_blob_object_cross_direction_rejection_is_receiver_state_neutral => (BlobTestDirection::SourceObject, TestBlobReceiveFault::CrossDirection),
+        v8_blob_object_cross_exchange_rejection_is_receiver_state_neutral => (BlobTestDirection::SourceObject, TestBlobReceiveFault::CrossExchange),
+        v8_blob_object_cross_transfer_rejection_is_receiver_state_neutral => (BlobTestDirection::SourceObject, TestBlobReceiveFault::CrossTransfer),
+        v8_blob_object_cross_length_rejection_is_receiver_state_neutral => (BlobTestDirection::SourceObject, TestBlobReceiveFault::CrossLength),
+        v8_blob_object_immutable_mismatch_rejection_is_receiver_state_neutral => (BlobTestDirection::SourceObject, TestBlobReceiveFault::ImmutableMismatch),
+        v8_blob_object_replay_rejection_is_receiver_state_neutral => (BlobTestDirection::SourceObject, TestBlobReceiveFault::Replay),
+        v8_blob_offer_missing_rejection_is_receiver_state_neutral => (BlobTestDirection::SourceOffer, TestBlobReceiveFault::Missing),
+        v8_blob_offer_tampered_rejection_is_receiver_state_neutral => (BlobTestDirection::SourceOffer, TestBlobReceiveFault::Tampered),
+        v8_blob_offer_cross_session_rejection_is_receiver_state_neutral => (BlobTestDirection::SourceOffer, TestBlobReceiveFault::CrossSession),
+        v8_blob_offer_cross_direction_rejection_is_receiver_state_neutral => (BlobTestDirection::SourceOffer, TestBlobReceiveFault::CrossDirection),
+        v8_blob_offer_cross_exchange_rejection_is_receiver_state_neutral => (BlobTestDirection::SourceOffer, TestBlobReceiveFault::CrossExchange),
+        v8_blob_offer_cross_transfer_rejection_is_receiver_state_neutral => (BlobTestDirection::SourceOffer, TestBlobReceiveFault::CrossTransfer),
+        v8_blob_offer_cross_length_rejection_is_receiver_state_neutral => (BlobTestDirection::SourceOffer, TestBlobReceiveFault::CrossLength),
+        v8_blob_offer_immutable_mismatch_rejection_is_receiver_state_neutral => (BlobTestDirection::SourceOffer, TestBlobReceiveFault::ImmutableMismatch),
+        v8_blob_offer_replay_rejection_is_receiver_state_neutral => (BlobTestDirection::SourceOffer, TestBlobReceiveFault::Replay),
     }
 
     #[tokio::test]
-    async fn v8_blob_protected_contact_rejection_matrix_is_receiver_state_neutral() {
+    async fn split_blob_fault_case_cleanup_allows_a_second_case_after_injected_error() {
+        assert_blob_receive_rejection_case_named(
+            "cleanup-first",
+            BlobTestDirection::SourceObject,
+            TestBlobReceiveFault::Missing,
+        )
+        .await;
+        assert_blob_receive_rejection_case_named(
+            "cleanup-second",
+            BlobTestDirection::SourceOffer,
+            TestBlobReceiveFault::Tampered,
+        )
+        .await;
+    }
+
+    async fn assert_blob_receive_rejection_case(
+        direction: BlobTestDirection,
+        fault: TestBlobReceiveFault,
+    ) {
+        assert_blob_receive_rejection_case_named("standalone", direction, fault).await;
+    }
+
+    async fn assert_blob_receive_rejection_case_named(
+        fixture: &str,
+        direction: BlobTestDirection,
+        fault: TestBlobReceiveFault,
+    ) {
         // Task-2 owns byte-grammar permutations. This real-contact matrix starts
         // after a successful protected open (except the explicit replay case)
         // and proves every context rejection precedes durable staging.
-        let faults = [
-            TestBlobReceiveFault::Missing,
-            TestBlobReceiveFault::Tampered,
-            TestBlobReceiveFault::CrossSession,
-            TestBlobReceiveFault::CrossDirection,
-            TestBlobReceiveFault::CrossExchange,
-            TestBlobReceiveFault::CrossTransfer,
-            TestBlobReceiveFault::CrossLength,
-            TestBlobReceiveFault::ImmutableMismatch,
-            TestBlobReceiveFault::Replay,
-        ];
-        for source_is_server in [true, false] {
-            let services = control_test_services(if source_is_server {
-                [0xd5; 32]
-            } else {
-                [0xd6; 32]
-            });
-            let authority = services.member.mission_authority_id();
-            let side = if source_is_server { "object" } else { "offer" };
-            let source_state = root(&format!("v8-negative-{side}-source"));
-            fs::create_dir_all(&source_state).expect("negative source state");
-            let source_store = Arc::new(
-                Store::open_for_mission(source_state.join(STORE_FILE), authority)
-                    .expect("negative source store"),
-            );
-            let source_cache = test_event_route_cache(&source_store, &services.member);
-            let source_clock_id = if source_is_server {
-                [0xb1; 16]
-            } else {
-                BLOB_CONTACT_TEST_CLIENT_CLOCK_ID
-            };
-            let mut source_sealer = open_test_sealer(&services.member);
-            let finite = publish_test_finite_blob(
-                &source_store,
-                &mut source_sealer,
-                &services.topic,
-                &services.scope,
-                1,
-                b"protected Blob rejection matrix source",
-                600_000,
-                25,
-                CustodySample {
-                    clock_id: source_clock_id,
-                    tick_ms: 0,
-                },
-            );
-            let interests = || {
-                MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
-                    services.topic.clone(),
-                    services.scope.clone(),
-                    false,
-                )])
-            };
-            for fault in faults {
-                let receiver_state = root(&format!("v8-negative-{side}-{fault:?}-receiver"));
-                fs::create_dir_all(&receiver_state).expect("negative receiver state");
-                let receiver_path = receiver_state.join(STORE_FILE);
-                let receiver_store = Arc::new(
-                    Store::open_for_mission(&receiver_path, authority)
-                        .expect("negative receiver store"),
-                );
-                let receiver_cache = test_event_route_cache(&receiver_store, &services.other);
-                let receiver_peer = services.member.identity();
-                let blob_digest_before = receiver_store.test_blob_logical_digest();
-                let stats_before = receiver_store.blob_stats().expect("negative stats before");
-                let offer_cursor_before = receiver_store
-                    .mutable_transfer_cursor(
-                        receiver_peer,
-                        MutableTransferCursorClass::Blob,
-                        MutableTransferCursorMode::OfferToPeer,
-                    )
-                    .expect("negative offer cursor before");
-                let fetch_cursor_before = receiver_store
-                    .mutable_transfer_cursor(
-                        receiver_peer,
-                        MutableTransferCursorClass::Blob,
-                        MutableTransferCursorMode::FetchFromPeer,
-                    )
-                    .expect("negative fetch cursor before");
-                let carrier_cursor_before = receiver_store
-                    .blob_carrier_fetch_cursor(receiver_peer)
-                    .expect("negative carrier cursor before");
+        let source_is_server = direction.source_is_server();
+        let services = control_test_services(if source_is_server {
+            [0xd5; 32]
+        } else {
+            [0xd6; 32]
+        });
+        let authority = services.member.mission_authority_id();
+        let side = if source_is_server { "object" } else { "offer" };
+        let source_state = root(&format!("v8-negative-{fixture}-{side}-{fault:?}-source"));
+        fs::create_dir_all(&source_state).expect("negative source state");
+        let source_store = Arc::new(
+            Store::open_for_mission(source_state.join(STORE_FILE), authority)
+                .expect("negative source store"),
+        );
+        let source_cache = test_event_route_cache(&source_store, &services.member);
+        let source_clock_id = if source_is_server {
+            [0xb1; 16]
+        } else {
+            BLOB_CONTACT_TEST_CLIENT_CLOCK_ID
+        };
+        let mut source_sealer = open_test_sealer(&services.member);
+        let finite = publish_test_finite_blob(
+            &source_store,
+            &mut source_sealer,
+            &services.topic,
+            &services.scope,
+            1,
+            b"protected Blob rejection matrix source",
+            600_000,
+            25,
+            CustodySample {
+                clock_id: source_clock_id,
+                tick_ms: 0,
+            },
+        );
+        let interests = || {
+            MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
+                services.topic.clone(),
+                services.scope.clone(),
+                false,
+            )])
+        };
+        let receiver_state = root(&format!("v8-negative-{fixture}-{side}-{fault:?}-receiver"));
+        fs::create_dir_all(&receiver_state).expect("negative receiver state");
+        let receiver_path = receiver_state.join(STORE_FILE);
+        let receiver_store = Arc::new(
+            Store::open_for_mission(&receiver_path, authority).expect("negative receiver store"),
+        );
+        let receiver_cache = test_event_route_cache(&receiver_store, &services.other);
+        let receiver_peer = services.member.identity();
+        let blob_digest_before = receiver_store.test_blob_logical_digest();
+        let stats_before = receiver_store.blob_stats().expect("negative stats before");
+        let offer_cursor_before = receiver_store
+            .mutable_transfer_cursor(
+                receiver_peer,
+                MutableTransferCursorClass::Blob,
+                MutableTransferCursorMode::OfferToPeer,
+            )
+            .expect("negative offer cursor before");
+        let fetch_cursor_before = receiver_store
+            .mutable_transfer_cursor(
+                receiver_peer,
+                MutableTransferCursorClass::Blob,
+                MutableTransferCursorMode::FetchFromPeer,
+            )
+            .expect("negative fetch cursor before");
+        let carrier_cursor_before = receiver_store
+            .blob_carrier_fetch_cursor(receiver_peer)
+            .expect("negative carrier cursor before");
 
-                let (
-                    server_store,
-                    server_mission,
-                    server_cache,
-                    client_store,
-                    client_mission,
-                    client_cache,
-                ) = if source_is_server {
-                    (
-                        Arc::clone(&source_store),
-                        services.member.clone(),
-                        Arc::clone(&source_cache),
-                        Arc::clone(&receiver_store),
-                        services.other.clone(),
-                        Arc::clone(&receiver_cache),
-                    )
-                } else {
-                    (
-                        Arc::clone(&receiver_store),
-                        services.other.clone(),
-                        Arc::clone(&receiver_cache),
-                        Arc::clone(&source_store),
-                        services.member.clone(),
-                        Arc::clone(&source_cache),
-                    )
-                };
-                let (client_result, server_result) =
-                    blob_contact_test_pair_with_caches_results_and_finalization_delays(
-                        server_store,
-                        server_mission,
-                        interests(),
-                        server_cache,
-                        client_store,
-                        client_mission,
-                        interests(),
-                        client_cache,
-                        None,
-                        None,
-                        None,
-                        None,
-                        0,
-                        None,
-                        None,
-                        0,
-                        0,
-                        (!source_is_server).then_some(fault),
-                        source_is_server.then_some(fault),
-                        None,
-                        None,
-                    )
-                    .await;
-                assert!(
-                    client_result.is_err() || server_result.is_err(),
-                    "{fault:?} {side} must reject the protected source"
-                );
-                assert_eq!(
-                    receiver_store.blob_stats().expect("negative stats after"),
-                    stats_before,
-                    "{fault:?} {side} changed the receiver Blob projection"
-                );
-                assert!(
-                    receiver_store
-                        .blob_source_projection(finite)
-                        .expect("negative source projection")
-                        .is_none()
-                );
-                assert!(
-                    receiver_store
-                        .pending_blob_source(finite)
-                        .expect("negative pending projection")
-                        .is_none()
-                );
-                assert!(!receiver_cache.has_blob_claim_for_test(finite));
-                assert_eq!(
-                    receiver_store
-                        .mutable_transfer_cursor(
-                            receiver_peer,
-                            MutableTransferCursorClass::Blob,
-                            MutableTransferCursorMode::OfferToPeer,
-                        )
-                        .expect("negative offer cursor after"),
-                    offer_cursor_before,
-                );
-                assert_eq!(
-                    receiver_store
-                        .mutable_transfer_cursor(
-                            receiver_peer,
-                            MutableTransferCursorClass::Blob,
-                            MutableTransferCursorMode::FetchFromPeer,
-                        )
-                        .expect("negative fetch cursor after"),
-                    fetch_cursor_before,
-                );
-                assert_eq!(
-                    receiver_store
-                        .blob_carrier_fetch_cursor(receiver_peer)
-                        .expect("negative carrier cursor after"),
-                    carrier_cursor_before,
-                );
-                assert_eq!(
-                    receiver_store.test_blob_logical_digest(),
-                    blob_digest_before,
-                    "{fault:?} {side} changed exact Blob logical state"
-                );
-                drop(receiver_store);
-                fs::remove_dir_all(receiver_state).expect("negative receiver cleanup");
-            }
-            drop(source_store);
-            fs::remove_dir_all(source_state).expect("negative source cleanup");
-        }
+        let (
+            server_store,
+            server_mission,
+            server_cache,
+            client_store,
+            client_mission,
+            client_cache,
+        ) = if source_is_server {
+            (
+                Arc::clone(&source_store),
+                services.member.clone(),
+                Arc::clone(&source_cache),
+                Arc::clone(&receiver_store),
+                services.other.clone(),
+                Arc::clone(&receiver_cache),
+            )
+        } else {
+            (
+                Arc::clone(&receiver_store),
+                services.other.clone(),
+                Arc::clone(&receiver_cache),
+                Arc::clone(&source_store),
+                services.member.clone(),
+                Arc::clone(&source_cache),
+            )
+        };
+        let (client_result, server_result) =
+            blob_contact_test_pair_with_caches_results_and_finalization_delays(
+                server_store,
+                server_mission,
+                interests(),
+                server_cache,
+                client_store,
+                client_mission,
+                interests(),
+                client_cache,
+                None,
+                None,
+                None,
+                None,
+                0,
+                None,
+                None,
+                0,
+                0,
+                (!source_is_server).then_some(fault),
+                source_is_server.then_some(fault),
+                None,
+                None,
+            )
+            .await;
+        assert!(
+            client_result.is_err() || server_result.is_err(),
+            "{fault:?} {side} must reject the protected source"
+        );
+        assert_eq!(
+            receiver_store.blob_stats().expect("negative stats after"),
+            stats_before,
+            "{fault:?} {side} changed the receiver Blob projection"
+        );
+        assert!(
+            receiver_store
+                .blob_source_projection(finite)
+                .expect("negative source projection")
+                .is_none()
+        );
+        assert!(
+            receiver_store
+                .pending_blob_source(finite)
+                .expect("negative pending projection")
+                .is_none()
+        );
+        assert!(!receiver_cache.has_blob_claim_for_test(finite));
+        assert_eq!(
+            receiver_store
+                .mutable_transfer_cursor(
+                    receiver_peer,
+                    MutableTransferCursorClass::Blob,
+                    MutableTransferCursorMode::OfferToPeer,
+                )
+                .expect("negative offer cursor after"),
+            offer_cursor_before,
+        );
+        assert_eq!(
+            receiver_store
+                .mutable_transfer_cursor(
+                    receiver_peer,
+                    MutableTransferCursorClass::Blob,
+                    MutableTransferCursorMode::FetchFromPeer,
+                )
+                .expect("negative fetch cursor after"),
+            fetch_cursor_before,
+        );
+        assert_eq!(
+            receiver_store
+                .blob_carrier_fetch_cursor(receiver_peer)
+                .expect("negative carrier cursor after"),
+            carrier_cursor_before,
+        );
+        assert_eq!(
+            receiver_store.test_blob_logical_digest(),
+            blob_digest_before,
+            "{fault:?} {side} changed exact Blob logical state"
+        );
+        drop(receiver_store);
+        fs::remove_dir_all(receiver_state).expect("negative receiver cleanup");
+        drop(source_store);
+        fs::remove_dir_all(source_state).expect("negative source cleanup");
     }
 
     #[tokio::test]
@@ -56217,7 +56358,7 @@ mod tests {
 
     #[tokio::test]
     async fn v7_pages_authenticate_finite_sources_before_custody_finalization_window() {
-        const EVENT_COUNT: usize = 100;
+        const EVENT_COUNT: usize = FINITE_EVENT_PAGE_SENDER_TARGET_ENTRIES + 1;
 
         let services = control_test_services([0xf2; 32]);
         let source_state = root("v7-finite-page-scale-source");
@@ -56786,20 +56927,49 @@ mod tests {
         fs::remove_dir_all(receiver_state).expect("receiver cleanup");
     }
 
-    #[tokio::test]
-    async fn event_page_boundary_authorization_selector_and_emission_races_fail_closed() {
-        let revocation = control_test_services([0xe5; 32]);
-        let mut authority = open_test_sealer(&revocation.authority);
-        let exact = authority
-            .seal_chained_revocation_control(revocation.other.identity(), 1, 1, None)
-            .expect("seal receiver revocation");
-        let transfer_id = ControlTransferId::new(
-            authority
-                .verify_control(&exact)
-                .expect("verify receiver revocation")
-                .envelope_id(),
-        );
-        assert_event_page_boundary_sender_race(
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum EventPageSenderRaceCase {
+        Revocation,
+        Epoch,
+        RouteGrant,
+        Selector,
+        Emission,
+    }
+
+    macro_rules! event_page_sender_race_cases {
+        ($($name:ident => $case:expr),+ $(,)?) => {
+            $(
+                #[tokio::test]
+                async fn $name() {
+                    assert_event_page_sender_race_case($case).await;
+                }
+            )+
+        };
+    }
+
+    event_page_sender_race_cases! {
+        event_page_revocation_race_fails_closed => EventPageSenderRaceCase::Revocation,
+        event_page_epoch_race_fails_closed => EventPageSenderRaceCase::Epoch,
+        event_page_route_grant_race_fails_closed => EventPageSenderRaceCase::RouteGrant,
+        event_page_selector_race_fails_closed => EventPageSenderRaceCase::Selector,
+        event_page_emission_race_fails_closed => EventPageSenderRaceCase::Emission,
+    }
+
+    async fn assert_event_page_sender_race_case(case: EventPageSenderRaceCase) {
+        match case {
+            EventPageSenderRaceCase::Revocation => {
+                let revocation = control_test_services([0xe5; 32]);
+                let mut authority = open_test_sealer(&revocation.authority);
+                let exact = authority
+                    .seal_chained_revocation_control(revocation.other.identity(), 1, 1, None)
+                    .expect("seal receiver revocation");
+                let transfer_id = ControlTransferId::new(
+                    authority
+                        .verify_control(&exact)
+                        .expect("verify receiver revocation")
+                        .envelope_id(),
+                );
+                assert_event_page_boundary_sender_race(
             "page-boundary-revocation",
             &revocation,
             TestCustodyPreopenRace::PageControlChangeBeforeEventPage {
@@ -56812,116 +56982,128 @@ mod tests {
             false,
         )
         .await;
-
-        let epoch = control_test_services([0xe6; 32]);
-        let recipients = vec![
-            ScopeRekeyRecipient::member(epoch.authority.identity(), vec![epoch.topic.clone()])
-                .expect("authority epoch recipient"),
-            ScopeRekeyRecipient::member(epoch.member.identity(), vec![epoch.topic.clone()])
-                .expect("source epoch recipient"),
-            ScopeRekeyRecipient::member(epoch.other.identity(), vec![epoch.topic.clone()])
-                .expect("receiver epoch recipient"),
-        ];
-        let mut authority = open_test_sealer(&epoch.authority);
-        let (exact, _) = authority
-            .seal_chained_scope_rekey_control_from_registry(
-                &epoch.registry,
-                0,
-                epoch.scope.clone(),
-                2,
-                recipients,
-                1,
-                None,
-            )
-            .expect("seal epoch advance");
-        let transfer_id = ControlTransferId::new(
-            authority
-                .verify_control(&exact)
-                .expect("verify epoch advance")
-                .envelope_id(),
-        );
-        assert_event_page_boundary_sender_race(
-            "page-boundary-epoch",
-            &epoch,
-            TestCustodyPreopenRace::PageControlChangeBeforeEventPage {
-                remaining: 2,
-                authority: epoch.authority.identity(),
-                transfer_id,
-                exact,
-            },
-            |error| matches!(error, NodeError::Store(StoreError::ControlPolicyChanged)),
-            false,
-        )
-        .await;
-
-        let route = control_test_services([0xe7; 32]);
-        let recipients = vec![
-            ScopeRekeyRecipient::member(route.authority.identity(), vec![route.topic.clone()])
-                .expect("authority route recipient"),
-            ScopeRekeyRecipient::member(route.member.identity(), vec![route.topic.clone()])
-                .expect("source route recipient"),
-        ];
-        let mut authority = open_test_sealer(&route.authority);
-        let (exact, _) = authority
-            .seal_chained_scope_rekey_control_from_registry(
-                &route.registry,
-                0,
-                route.scope.clone(),
-                1,
-                recipients,
-                1,
-                None,
-            )
-            .expect("seal receiver route replacement");
-        let transfer_id = ControlTransferId::new(
-            authority
-                .verify_control(&exact)
-                .expect("verify receiver route replacement")
-                .envelope_id(),
-        );
-        assert_event_page_boundary_sender_race(
-            "page-boundary-route-grant",
-            &route,
-            TestCustodyPreopenRace::PageControlChangeBeforeEventPage {
-                remaining: 2,
-                authority: route.authority.identity(),
-                transfer_id,
-                exact,
-            },
-            |error| matches!(error, NodeError::Store(StoreError::ControlPolicyChanged)),
-            false,
-        )
-        .await;
-
-        let selector = control_test_services([0xe8; 32]);
-        assert_event_page_boundary_sender_race(
-            "page-boundary-selector",
-            &selector,
-            TestCustodyPreopenRace::PageSelectorChangeBeforeEventPage {
-                remaining: 2,
-                topic: selector.topic.clone(),
-                scope: selector.scope.clone(),
-                key: b"page-boundary-selector-change".to_vec(),
-            },
-            |error| {
-                matches!(
-                    error,
-                    NodeError::Store(StoreError::EventSelectorRevisionChanged)
+            }
+            EventPageSenderRaceCase::Epoch => {
+                let epoch = control_test_services([0xe6; 32]);
+                let recipients = vec![
+                    ScopeRekeyRecipient::member(
+                        epoch.authority.identity(),
+                        vec![epoch.topic.clone()],
+                    )
+                    .expect("authority epoch recipient"),
+                    ScopeRekeyRecipient::member(epoch.member.identity(), vec![epoch.topic.clone()])
+                        .expect("source epoch recipient"),
+                    ScopeRekeyRecipient::member(epoch.other.identity(), vec![epoch.topic.clone()])
+                        .expect("receiver epoch recipient"),
+                ];
+                let mut authority = open_test_sealer(&epoch.authority);
+                let (exact, _) = authority
+                    .seal_chained_scope_rekey_control_from_registry(
+                        &epoch.registry,
+                        0,
+                        epoch.scope.clone(),
+                        2,
+                        recipients,
+                        1,
+                        None,
+                    )
+                    .expect("seal epoch advance");
+                let transfer_id = ControlTransferId::new(
+                    authority
+                        .verify_control(&exact)
+                        .expect("verify epoch advance")
+                        .envelope_id(),
+                );
+                assert_event_page_boundary_sender_race(
+                    "page-boundary-epoch",
+                    &epoch,
+                    TestCustodyPreopenRace::PageControlChangeBeforeEventPage {
+                        remaining: 2,
+                        authority: epoch.authority.identity(),
+                        transfer_id,
+                        exact,
+                    },
+                    |error| matches!(error, NodeError::Store(StoreError::ControlPolicyChanged)),
+                    false,
                 )
-            },
-            true,
-        )
-        .await;
-
-        let emission = control_test_services([0xe9; 32]);
-        assert_event_page_boundary_sender_race(
-            "page-boundary-emission",
-            &emission,
-            TestCustodyPreopenRace::FinalPolicyChangeBeforeEventPage(2),
-            |error| matches!(error, NodeError::EmissionPolicyChanged),
-            true,
-        )
-        .await;
+                .await;
+            }
+            EventPageSenderRaceCase::RouteGrant => {
+                let route = control_test_services([0xe7; 32]);
+                let recipients = vec![
+                    ScopeRekeyRecipient::member(
+                        route.authority.identity(),
+                        vec![route.topic.clone()],
+                    )
+                    .expect("authority route recipient"),
+                    ScopeRekeyRecipient::member(route.member.identity(), vec![route.topic.clone()])
+                        .expect("source route recipient"),
+                ];
+                let mut authority = open_test_sealer(&route.authority);
+                let (exact, _) = authority
+                    .seal_chained_scope_rekey_control_from_registry(
+                        &route.registry,
+                        0,
+                        route.scope.clone(),
+                        1,
+                        recipients,
+                        1,
+                        None,
+                    )
+                    .expect("seal receiver route replacement");
+                let transfer_id = ControlTransferId::new(
+                    authority
+                        .verify_control(&exact)
+                        .expect("verify receiver route replacement")
+                        .envelope_id(),
+                );
+                assert_event_page_boundary_sender_race(
+                    "page-boundary-route-grant",
+                    &route,
+                    TestCustodyPreopenRace::PageControlChangeBeforeEventPage {
+                        remaining: 2,
+                        authority: route.authority.identity(),
+                        transfer_id,
+                        exact,
+                    },
+                    |error| matches!(error, NodeError::Store(StoreError::ControlPolicyChanged)),
+                    false,
+                )
+                .await;
+            }
+            EventPageSenderRaceCase::Selector => {
+                let selector = control_test_services([0xe8; 32]);
+                assert_event_page_boundary_sender_race(
+                    "page-boundary-selector",
+                    &selector,
+                    TestCustodyPreopenRace::PageSelectorChangeBeforeEventPage {
+                        remaining: 2,
+                        topic: selector.topic.clone(),
+                        scope: selector.scope.clone(),
+                        key: b"page-boundary-selector-change".to_vec(),
+                    },
+                    |error| {
+                        matches!(
+                            error,
+                            NodeError::Store(StoreError::EventSelectorRevisionChanged)
+                        )
+                    },
+                    true,
+                )
+                .await;
+            }
+            EventPageSenderRaceCase::Emission => {
+                let emission = control_test_services([0xe9; 32]);
+                assert_event_page_boundary_sender_race(
+                    "page-boundary-emission",
+                    &emission,
+                    TestCustodyPreopenRace::FinalPolicyChangeBeforeEventPage(2),
+                    |error| matches!(error, NodeError::EmissionPolicyChanged),
+                    true,
+                )
+                .await;
+            }
+        }
     }
 
     #[tokio::test]
