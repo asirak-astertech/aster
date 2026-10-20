@@ -267,6 +267,44 @@ receiver publication promotion. It does not include a receiver application
 RPC read; that boundary remains represented by the separate exact 1-GiB RPC
 measurements above.
 
+## Readiness requalification: bounded credit and checkpoint cadence
+
+The readiness refactor retained the authenticated 1-MiB canonical segment but
+removed a second full-body sender copy, rounded receive credit to complete pack
+extents, and raised the maximum completed-pack checkpoint batch from 8 MiB to
+128 MiB. The larger batch changes durability cadence, not framing: a peer may
+select a smaller accepted batch, and interrupted work remains resumable from
+the last receiver-authoritative checkpoint. The cost is a maximum 128-MiB
+uncheckpointed replay suffix at the selected maximum. A segment-size sweep is
+still required before any alternative to the 1-MiB protocol profile is added.
+
+The uncommitted validation artifact was an ARM64 release binary with SHA-256
+`c654b9fe0d7e197ab3252bcc47f139326f975765d134f097adb036c6525f7f0e`.
+It was copied over ZeroTier for test control only. Both Aster endpoints were
+explicitly bound to WLAN (`192.168.60.80 -> 192.168.60.79`) and reported
+`Direct`.
+
+| Size | Aster send/receive | Checkpoints | Raw TCP | Ratio | Result |
+| ---: | ---: | ---: | ---: | ---: | --- |
+| 256 MiB | 8.317 / 8.318 MiB/s | 2 | 9.561 MiB/s | 87.0% | pass |
+| 1 GiB | 8.099 / 8.100 MiB/s | 8 | 9.344 MiB/s | 86.7% | pass |
+
+The exact 1-GiB network phase took 126.445 seconds (2 minutes 6.45 seconds)
+for 1,073,879,040 wire bytes. Sender and receiver agreed on plaintext root
+`d9de26cb30ee248f1134710adb690d098eca0d29860722d9c31a9bae2852a857`
+and ciphertext root
+`a160a52680e6256c48e3eaa2717db9c1ebeabe8248cedd9d69a5a16c1a237c56`.
+Receiver pipeline occupancy peaked at four items, 4,194,840 bytes, and two
+reorder entries. The pipeline reported 146.048 CPU-seconds of map service and
+12.596 seconds of sequential sink service across the 126.442-second transfer;
+those cumulative stage counters overlap and must not be added to wall time.
+
+The first full-size benchmark attempt failed before networking because the
+device's `/tmp` is a 463-MiB tmpfs. Directing the benchmark's temporary pack to
+`/var/tmp` exposed the available filesystem capacity and the next attempt
+completed. Production pack roots are explicit store-owned paths; this is a
+benchmark/device-configuration UX issue, not a protocol dependency.
+
 ## Qualification boundary
 
 This evidence establishes that:

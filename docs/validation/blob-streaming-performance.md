@@ -101,3 +101,44 @@ Alternative sizes must be separate negotiated protocol profiles and must bind
 the selected canonical size into the authenticated open. A unilateral
 configuration setting is invalid because peers using different sizes would
 derive different records, checkpoints, roots, and Blob identities.
+
+## 2026-10-20 CM4 checkpoint and sender-copy requalification
+
+The completed-pack sender now writes the small protected record prefix and the
+owned canonical pack body as one carrier frame without first copying the body
+into a second payload-sized allocation. The receiver's absolute-credit window
+also rounds up to a whole canonical extent. That rule fixes the deadlock where
+an exact byte window admitted too few slightly-over-1-MiB pack records to reach
+the next checkpoint.
+
+The checkpoint batch is a durability/performance policy, independent of the
+1-MiB authenticated segment boundary. A receiver may negotiate a smaller batch;
+the profile-5 implementation caps the current batch at 128 MiB. Larger batches
+reduce synchronization and reverse-control overhead but increase the maximum
+uncheckpointed suffix that an interrupted attempt may replay. The attempt's
+control allocation therefore uses the bounded worst case of one checkpoint per
+admitted extent rather than assuming that every peer selects the maximum batch.
+
+Successive 256-MiB CM4 runs on `rpi4-2 -> rpi4-1` showed:
+
+| Candidate | Checkpoints | Aster MiB/s | Adjacent raw MiB/s | Raw ratio |
+| --- | ---: | ---: | ---: | ---: |
+| 8-MiB batch, instrumented pipeline | 32 | 6.147 | 9.400 | 65.4% |
+| 64-MiB batch and split-frame sender | 4 | 7.376 | 9.400 retained sample | 78.5% |
+| 128-MiB batch and split-frame sender | 2 | 8.317 | 9.561 | 87.0% |
+
+These are integrated candidate measurements, not an isolated single-variable
+benchmark; they support the selected combination but do not attribute all gain
+to checkpoint cadence. The exact 1-GiB confirmation transferred 1,073,879,040
+wire bytes in 126.445 seconds at 8.099 MiB/s, with eight checkpoints and
+matching terminal roots. The immediately adjacent 1-GiB raw TCP run sustained
+9.344 MiB/s, so the integrated path achieved 86.7% of available throughput and
+passed the 80% floor. Receiver occupancy remained bounded at four items and
+4,194,840 bytes.
+
+This requalification still does not prove that the 1-MiB canonical segment is
+optimal. It does show that changing segment size is not required to remove the
+observed transport gap: the retained 1-MiB format exceeded the acceptance floor
+after credit, durability cadence, and sender ownership were corrected. The
+segment-size matrix above remains required before defining another negotiated
+profile.

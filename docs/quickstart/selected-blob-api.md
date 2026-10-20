@@ -2,7 +2,7 @@
 
 This is the shortest path to Aster's **selected live Blob application surface**,
 its durable metadata-delivery queue, its exclusive stopped streaming facade,
-and the semantic-v7/v8 receipt-free streaming boundary for Blob transfer.
+and the semantic-v9/profile-5 streaming boundary for large Blob transfer.
 `RunningNode::selected_blobs()` returns a cloneable `SelectedBlobHandle`: an
 application may publish a durable or finite-TTL owned regular file while the
 node has no peers, read one freshly authenticated plaintext page at a time,
@@ -18,14 +18,15 @@ status; `delivery_status` reports local selector/delivery-ledger counts, while
 `transfer_status` reports audited local durable storage and receive progress.
 The exclusive `SelectedBlobNode` remains available when no runtime owns the same
 store and provides the same delivery lifecycle plus synchronous seekable-source
-publication and streaming `read_into`. Separately, semantic v7/v8 profile 4
-reconciles Blob sources and direct carrier ranges between current
-content-capable peers. V7 admits durable work only; v8 also admits finite work
-with exact authenticated custody provenance. Both endpoints must support
-`BlobRangesStreamV1`; old Blob transfer has no fallback. Incompatible profile
-offers and v5/v6 carrier attempts fail before carrier IO. `EventPagesV1` is
-Event-only. The default semantic offer is `[8, 7, 6, 5, 4, 3, 2, 1]`; stable
-wire/ABI, source, manifest, and `ASTRBT01` formats remain version 1.
+publication and streaming `read_into`. Semantic v9 selects `BlobStreamV1`:
+independently authenticated 1-MiB segments move through a bounded ordered
+pipeline over concurrent Iroh data and control streams, and durable receiver
+checkpoints authorize resume. Semantic v7/v8 profile 4 remains a compatibility
+path for `BlobRangesStreamV1`; v7 admits durable work only and v8 also admits
+authenticated finite custody. A profile-5 attempt never falls back in place to
+profile 4. `EventPagesV1` is Event-only. The default semantic offer is
+`[9, 8, 7, 6, 5, 4, 3, 2, 1]`; stable wire/ABI, source, manifest, and
+`ASTRBT01` formats remain version 1.
 
 ## Use the live actor API
 
@@ -191,6 +192,12 @@ The agent and CLI provide Blob publish and read, not Blob subscription, poll,
 acknowledgement, transfer status, peer/convergence status, or FFI lifetime
 controls. The Rust subscription API below remains a separate application
 surface.
+
+For 800-MiB through 1-GiB engineering runs, including local-publication versus
+peer-transfer lifecycle, exact WLAN binding, checkpoint/credit semantics,
+pipeline receipt fields, capacity checks, raw baselines, and the ARM64
+completed-pack example, use the
+[Blob streaming engineering runbook](../validation/blob-streaming-engineering-runbook.md).
 
 ## Subscribe to immutable publication metadata
 
@@ -397,7 +404,7 @@ let read = blobs.read_into(
 assert_eq!(read.id, published.id);
 ```
 
-## Opt in to semantic-v7/v8 transfer
+## Opt in to Blob transfer
 
 The runtime does not infer Blob receive intent from State/Record interests. Add
 an exact Blob selector to `NodeConfig::mutable_interests`; descendant scope is
@@ -411,11 +418,15 @@ let mutable_interests = MutableSourceInterests::new(state, record).with_blob(vec
 
 This composes with peerless live publication rather than changing its success
 condition. A source may publish through `selected_blobs()` with no peers, shut
-down, and later restart with an exact configured peer. On a v7 or v8 profile-4
-contact, a content-capable interested receiver can durably stage the source and
-missing carrier ranges, promote only after whole-Blob verification, and read
-the Blob through its own live handle. The receiver's completed publication and
-page reads survive another peerless restart.
+down, and later restart with an exact configured peer. A semantic-v9/profile-5
+contact transfers independently authenticated canonical segments through the
+bounded pipeline, checkpoints only recoverable receiver progress, and promotes
+only after terminal-root verification and settlement. Interrupted attempts
+resume from that receiver-authoritative checkpoint. Semantic-v7/v8 profile 4
+remains the compatibility path described below. The receiver's completed
+publication and page reads survive another peerless restart.
+
+### Semantic-v7/v8 profile-4 compatibility
 
 The provider turns that exact topic/scope and the current epoch into an opaque
 32-byte peer proof inside the protected v7/v8 contact. Every Blob inventory,

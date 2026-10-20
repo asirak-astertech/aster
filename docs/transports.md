@@ -57,12 +57,13 @@ whole-key active-head queue. Neither application selector mutates its separately
 configured network receive interest. The runtime also
 exposes a cloneable live Blob handle: publish accepts an already-open regular
 file at cursor zero, bounded to 64 MiB and 1,024 canonical 64-KiB chunks, and a
-live read returns at most 64 KiB of plaintext per zeroize-on-drop page. Under
-semantic v7/v8 profile 4, the same selected runtime automatically reconciles
-Blob sources and transfers peer-neutral contiguous carrier ranges of at most
-16 KiB directly between content-capable peers. V7 is durable-only. V8 also
-implements authenticated finite-TTL custody and bounded lower-priority pressure
-recovery internally. The broader
+live read returns at most 64 KiB of plaintext per zeroize-on-drop page. Semantic
+v9/profile 5 adds bounded, checkpointed streaming of canonical independently
+authenticated 1-MiB segments with receiver-authoritative resume. Semantic
+v7/v8 profile 4 remains the compatibility path for peer-neutral contiguous
+carrier ranges of at most 16 KiB; v7 is durable-only, while v8 also implements
+authenticated finite-TTL custody and bounded lower-priority pressure recovery
+internally. The broader
 semantic implementation remains the migration source for behavior that has not
 yet moved into this composition.
 
@@ -73,7 +74,7 @@ yet moved into this composition.
 | Selected direct Iroh | Manually admitted exact endpoint ID and socket, authenticated direct UDP/QUIC, and bounded exchange | Carrier identity is separate from mission and data authorization; no address discovery, port mapping, dynamic-NAT policy, or multi-carrier failover |
 | Selected nearby Iroh discovery | Feature-gated Iroh mDNS lookup using an exact roster or mission-authenticated `--discover-lan`; each window is at most 30 seconds | Default off; upstream observations are not globally capped, so this is not a hostile-LAN or production discovery service |
 | Selected controlled Iroh relay | One operator-pinned HTTPS relay with explicit trust, alongside an initial direct locator or with IP disabled | No public/default relay selection; the relay is transport infrastructure rather than an Aster mission or payload-blind application relay |
-| Selected node and CLI | Networked Event, State, and Record reconciliation; semantic-v7/v8 profile-4 direct Blob transfer, with v7 durable-only and v8 authenticated finite-TTL custody plus bounded lower-priority pressure recovery; live and stopped Rust APIs; bounded application delivery; payload-blind Event relay; restart/idempotency; Unix zeroization | Reference provisioning; no dynamic application-driven network interests, automatic Record merge, route-only Blob custody, finite State/Record TTL, public Blob lifecycle controls, generalized control administration, or production authorization |
+| Selected node and CLI | Networked Event, State, and Record reconciliation; semantic-v9/profile-5 checkpointed Blob streaming plus semantic-v7/v8 profile-4 compatibility; live and stopped Rust APIs; bounded application delivery; payload-blind Event relay; restart/idempotency; Unix zeroization | Reference provisioning; no cross-transport failover, dynamic application-driven network interests, automatic Record merge, route-only Blob custody, finite State/Record TTL, public Blob lifecycle controls, generalized control administration, or production authorization |
 | Current semantic in-memory link | High-level host contact, authentication, reconciliation, resume, and failure behavior | Reference carrier; not wired to the selected composition |
 | Current semantic UDP/IP | Nonblocking link, manual endpoint mapping, protected local discovery, rendezvous helpers, opaque relay components | Migration onto the selected node; full host acceptance on physical or operational networks |
 | Current semantic NAT/rendezvous and relay | Bounded rendezvous, endpoint-punching, and opaque-relay helpers | Not integrated into the selected node |
@@ -491,9 +492,11 @@ descending order:
   selects Blob profile 5 `BlobStreamV1`. Profile 5 is a distinct allocation,
   never a reinterpretation or in-attempt downgrade of profile 4. Its
   `0xd6..0xdc` records, v9 custody/record protection, concurrent Iroh
-  data/control pair, and internal one-adapter selector are implemented. The
-  selected runtime still fails closed until its storage/lifecycle stream driver
-  is active.
+  data/control pair, internal one-adapter selector, bounded parallel segment
+  verification, durable pack checkpoints, resume, and lifecycle promotion are
+  implemented. The current production stream-adapter set contains only
+  `IrohQuicV1`; automatic selection therefore does not yet mean
+  cross-transport failover.
 - **Semantic version 8** inherits semantic-v7 profile
   negotiation and receipt-free Event pages, while profile 4 adds authenticated
   finite-TTL Blob custody and bounded lower-priority pressure recovery.

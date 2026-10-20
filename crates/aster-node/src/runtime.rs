@@ -1131,7 +1131,7 @@ pub struct NodeConfig {
     pub mission: UnprotectedReferenceMission,
     /// Exact manually admitted carrier-to-mission peer bindings.
     pub peers: Vec<MissionExpectedPeer>,
-    /// Explicit class-separated State, Record, and opt-in v7/v8 Blob interests.
+    /// Explicit class-separated State, Record, and opt-in Blob interests.
     pub mutable_interests: MutableSourceInterests,
     /// Delay between bounded contacts.
     pub sync_interval: Duration,

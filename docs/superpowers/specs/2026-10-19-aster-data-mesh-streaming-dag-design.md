@@ -223,6 +223,16 @@ selected canonical size into the authenticated open. Runtime adaptation remains
 free to tune worker concurrency, bounded in-flight extents, credit, batching,
 and transport selection without changing the format.
 
+The current completed-pack policy permits a negotiated checkpoint batch up to
+128 MiB. Credit is an absolute byte offset rounded up to the smallest number of
+whole canonical extents that reaches the selected checkpoint batch; otherwise
+record overhead can leave the sender unable to transmit the extent that crosses
+the checkpoint threshold. Batch size is not the segment size. It trades
+durability-barrier/control frequency against the maximum suffix replayed after
+interruption, and receivers remain free to select a smaller batch within the
+profile. Memory remains bounded by the independently negotiated in-flight
+extent window, not by the checkpoint batch.
+
 A map result is immutable and includes:
 
 - the complete expected job and partition identities;

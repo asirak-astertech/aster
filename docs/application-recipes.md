@@ -83,14 +83,23 @@ delivery guides.
 
 ## Stream Blob content safely
 
-The broad bindings use `blob_writer`/`BlobWriter`-style streaming. The selected
-Rust runtime publishes an owned regular file and reads authenticated pages of
-at most 64 KiB. A live publication is nonempty and at most 64 MiB.
+The broad bindings use `blob_writer`/`BlobWriter`-style streaming. The legacy
+selected Rust live-file facade publishes an owned regular file, reads
+authenticated pages of at most 64 KiB, and retains its 64-MiB ceiling. The
+Linux local agent and `asterctl` use resumable 512-KiB application frames over
+independently authenticated 1-MiB segments and admit objects through 8 GiB.
 
 Each returned chunk or page is authenticated, but whole-content verification
 finishes only at end-of-file. Write to a temporary destination and rename it
 only after the final read succeeds. Caller-owned files and copied plaintext
 remain outside node zeroization.
+
+Local publication is independent of peer availability. The sync scheduler
+opens a bounded profile-5 transfer when an eligible destination becomes
+available, and interruption resumes from receiver-authoritative durable
+progress. See the
+[Blob streaming engineering runbook](validation/blob-streaming-engineering-runbook.md)
+for large-object commands, network-path checks, and performance diagnostics.
 
 ## Resolve Record conflicts
 
