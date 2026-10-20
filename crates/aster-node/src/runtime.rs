@@ -272,7 +272,22 @@ fn inherit_node_output<F>(future: F) -> impl Future<Output = F::Output>
 where
     F: Future,
 {
-    NODE_OPERATOR_OUTPUT.scope(current_node_output(), future)
+    let output = current_node_output();
+    #[cfg(test)]
+    let semantic_version = TEST_SEMANTIC_VERSION
+        .try_with(std::cell::Cell::get)
+        .ok()
+        .flatten();
+    async move {
+        let future = NODE_OPERATOR_OUTPUT.scope(output, future);
+        #[cfg(test)]
+        if let Some(semantic_version) = semantic_version {
+            return TEST_SEMANTIC_VERSION
+                .scope(std::cell::Cell::new(Some(semantic_version)), future)
+                .await;
+        }
+        future.await
+    }
 }
 
 macro_rules! node_stdout {
@@ -15365,13 +15380,13 @@ async fn start_node_with_shutdown_ownership(
     channels.handle_sigint = handle_sigint;
     #[cfg(test)]
     let contact_activity = channels.contact_activity.clone();
-    let task = tokio::spawn(run_node_actor_with_forwarding_output(
+    let task = tokio::spawn(inherit_node_output(run_node_actor_with_forwarding_output(
         config,
         forwarding,
         emission_policy.clone(),
         output,
         channels,
-    ));
+    )));
     let ready = match ready_receiver.await {
         Ok(ready) => ready,
         Err(_) => {
@@ -44197,16 +44212,19 @@ mod tests {
         let topic = Topic::new("opaque").expect("direct-Iroh Blob topic");
         let scope = Scope::new("test/runtime-contact").expect("direct-Iroh Blob scope");
         let request = live_blob_request(b"direct-iroh-blob", &topic, &scope);
-        let offline = start_node(NodeConfig {
-            state: source_state.clone(),
-            bind: SocketAddr::from(([127, 0, 0, 1], 0)),
-            mission: source_mission.credentials.clone(),
-            peers: Vec::new(),
-            mutable_interests: Default::default(),
-            sync_interval: Duration::from_millis(10),
-            run_for: None,
-            application: NodeApplication::Relay,
-        })
+        let offline = with_test_semantic_version(
+            SEMANTIC_PROTOCOL_V8,
+            Box::pin(start_node(NodeConfig {
+                state: source_state.clone(),
+                bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+                mission: source_mission.credentials.clone(),
+                peers: Vec::new(),
+                mutable_interests: Default::default(),
+                sync_interval: Duration::from_millis(10),
+                run_for: None,
+                application: NodeApplication::Relay,
+            })),
+        )
         .await
         .expect("start peerless direct-Iroh Blob source");
         let published = offline
@@ -44269,11 +44287,14 @@ mod tests {
             published.publisher_counter,
             *published.id.as_bytes(),
         );
-        let (source_running, receiver_running) = start_test_pair(
-            source_config,
-            receiver_config,
-            source_carrier,
-            receiver_carrier,
+        let (source_running, receiver_running) = with_test_semantic_version(
+            SEMANTIC_PROTOCOL_V8,
+            Box::pin(start_test_pair(
+                source_config,
+                receiver_config,
+                source_carrier,
+                receiver_carrier,
+            )),
         )
         .await;
         let receiver_blobs = receiver_running.selected_blobs();
@@ -44363,16 +44384,19 @@ mod tests {
         assert_eq!(receiver_receipt.blobs, 1);
         assert_eq!(receiver_receipt.blob_finalized_variants, 1);
 
-        let reopened = start_node(NodeConfig {
-            state: receiver_state,
-            bind: SocketAddr::from(([127, 0, 0, 1], 0)),
-            mission: receiver_mission.credentials,
-            peers: Vec::new(),
-            mutable_interests: Default::default(),
-            sync_interval: Duration::from_millis(10),
-            run_for: None,
-            application: NodeApplication::Relay,
-        })
+        let reopened = with_test_semantic_version(
+            SEMANTIC_PROTOCOL_V8,
+            Box::pin(start_node(NodeConfig {
+                state: receiver_state,
+                bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+                mission: receiver_mission.credentials,
+                peers: Vec::new(),
+                mutable_interests: Default::default(),
+                sync_interval: Duration::from_millis(10),
+                run_for: None,
+                application: NodeApplication::Relay,
+            })),
+        )
         .await
         .expect("restart direct-Iroh receiver peerless");
         assert_eq!(
@@ -49580,16 +49604,19 @@ mod tests {
             };
             let topic = services.topic;
             let scope = services.scope;
-            let offline = start_node(NodeConfig {
-                state: source_state.clone(),
-                bind: SocketAddr::from(([127, 0, 0, 1], 0)),
-                mission: source_mission.credentials.clone(),
-                peers: Vec::new(),
-                mutable_interests: Default::default(),
-                sync_interval: Duration::from_millis(10),
-                run_for: None,
-                application: NodeApplication::Relay,
-            })
+            let offline = with_test_semantic_version(
+                SEMANTIC_PROTOCOL_V8,
+                Box::pin(start_node(NodeConfig {
+                    state: source_state.clone(),
+                    bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+                    mission: source_mission.credentials.clone(),
+                    peers: Vec::new(),
+                    mutable_interests: Default::default(),
+                    sync_interval: Duration::from_millis(10),
+                    run_for: None,
+                    application: NodeApplication::Relay,
+                })),
+            )
             .await
             .expect("start contact-fatal source fixture");
             offline
@@ -49663,11 +49690,14 @@ mod tests {
                 run_for: None,
                 application: NodeApplication::Relay,
             };
-            let (source_running, receiver_running) = start_test_pair(
-                source_config,
-                receiver_config,
-                source_carrier,
-                receiver_carrier,
+            let (source_running, receiver_running) = with_test_semantic_version(
+                SEMANTIC_PROTOCOL_V8,
+                Box::pin(start_test_pair(
+                    source_config,
+                    receiver_config,
+                    source_carrier,
+                    receiver_carrier,
+                )),
             )
             .await;
             let (faulted, peer) = if target_is_source {
