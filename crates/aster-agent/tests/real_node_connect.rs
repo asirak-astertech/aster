@@ -337,6 +337,30 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
             .expect_err("an incomplete upload must obey the client deadline");
         assert_eq!(deadline.code, ErrorCode::DeadlineExceeded);
 
+        // The client deadline can finish before server-side staging cleanup.
+        // Recover the exact key through the ordinary client before testing
+        // gRPC-Web rejection, so cleanup cannot occupy that case's permit.
+        let recovered_deadline = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match client
+                    .publish_blob(connectrpc::stream_iter(one_byte_upload(
+                        b"real-node-blob-deadline",
+                        1,
+                    )))
+                    .await
+                {
+                    Ok(response) => break response.into_owned(),
+                    Err(error) if error.code == ErrorCode::ResourceExhausted => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(error) => panic!("deadline recovery failed: {error:?}"),
+                }
+            }
+        })
+        .await
+        .expect("deadline releases staging and capacity after cleanup");
+        assert!(recovered_deadline.inserted);
+
         let grpc_web_client = api::AsterApplicationServiceClient::new(
             HttpClient::plaintext(),
             ClientConfig::new(
