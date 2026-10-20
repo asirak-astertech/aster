@@ -93,6 +93,8 @@ const EVENT_TURN_PLAN_V1: u8 = 0xd2;
 const CHANGE_TURN_HEADER_V1: u8 = 0xd3;
 const CHANGE_PAGE_V7: u8 = 0xd4;
 const CHANGE_TURN_FINISHED_V1: u8 = 0xd5;
+const BLOB_STREAM_PLAN_V1: u8 = 0xe1;
+const BLOB_STREAM_PLAN_ACK_V1: u8 = 0xe2;
 pub(crate) const MAX_OBJECT_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_BLOB_RANGE_BYTES: usize = 16 * 1024;
 pub(crate) const BLOB_CONTENT_PROOF_BYTES: usize = 32;
@@ -885,6 +887,16 @@ pub(crate) enum Frame {
     ChangeTurnHeader(ChangeTurnHeaderV1),
     ChangePage(ChangePageV7),
     ChangeTurnFinished(ChangeTurnFinishedV1),
+    /// Announces whether one direction will open a profile-5 transport
+    /// attempt. A present nonce bootstraps the attempt-bound record context.
+    BlobStreamPlan {
+        direction: EventDirection,
+        attempt_nonce: Option<[u8; 32]>,
+    },
+    BlobStreamPlanAck {
+        direction: EventDirection,
+        attempt_nonce: Option<[u8; 32]>,
+    },
     #[allow(dead_code)] // Activated by the profile-5 runtime driver.
     Stream(StreamFrame),
 }
@@ -1519,6 +1531,24 @@ impl Frame {
                         .map_err(|error| NodeError::Protocol(error.to_string()))?,
                 );
             }
+            Self::BlobStreamPlan {
+                direction,
+                attempt_nonce,
+            } => encode_blob_stream_plan(
+                &mut output,
+                BLOB_STREAM_PLAN_V1,
+                *direction,
+                *attempt_nonce,
+            )?,
+            Self::BlobStreamPlanAck {
+                direction,
+                attempt_nonce,
+            } => encode_blob_stream_plan(
+                &mut output,
+                BLOB_STREAM_PLAN_ACK_V1,
+                *direction,
+                *attempt_nonce,
+            )?,
             Self::Stream(_) => {
                 return Err(NodeError::Protocol(
                     "stream frame requires an authenticated semantic/profile context".into(),
@@ -1536,6 +1566,11 @@ impl Frame {
         if semantic_version < crate::event_pages::SEMANTIC_PROTOCOL_V7 && self.is_v7_only() {
             return Err(NodeError::Protocol(
                 "semantic v1-v6 session cannot emit a v7-only mechanics frame".into(),
+            ));
+        }
+        if semantic_version != crate::event_pages::SEMANTIC_PROTOCOL_V9 && self.is_v9_only() {
+            return Err(NodeError::Protocol(
+                "Blob stream plan requires semantic v9".into(),
             ));
         }
         if semantic_version >= crate::event_pages::SEMANTIC_PROTOCOL_V8 {
@@ -1586,6 +1621,12 @@ impl Frame {
         if semantic_version < crate::event_pages::SEMANTIC_PROTOCOL_V7 && is_v7_only_tag(input[4]) {
             return Err(NodeError::Protocol(
                 "semantic v1-v6 session rejected a v7-only mechanics frame".into(),
+            ));
+        }
+        if semantic_version != crate::event_pages::SEMANTIC_PROTOCOL_V9 && is_v9_only_tag(input[4])
+        {
+            return Err(NodeError::Protocol(
+                "semantic session rejected a v9-only mechanics frame".into(),
             ));
         }
         if semantic_version >= crate::event_pages::SEMANTIC_PROTOCOL_V8 {
@@ -1674,6 +1715,13 @@ impl Frame {
                 | Self::ChangeTurnHeader(_)
                 | Self::ChangePage(_)
                 | Self::ChangeTurnFinished(_)
+        )
+    }
+
+    const fn is_v9_only(&self) -> bool {
+        matches!(
+            self,
+            Self::BlobStreamPlan { .. } | Self::BlobStreamPlanAck { .. } | Self::Stream(_)
         )
     }
 
@@ -2256,6 +2304,20 @@ impl Frame {
             CHANGE_TURN_FINISHED_V1 => Ok(Self::ChangeTurnFinished(
                 ChangeTurnFinishedV1::decode(body).map_err(event_pages_protocol_error)?,
             )),
+            BLOB_STREAM_PLAN_V1 | BLOB_STREAM_PLAN_ACK_V1 => {
+                let (direction, attempt_nonce) = decode_blob_stream_plan(body)?;
+                if tag == BLOB_STREAM_PLAN_V1 {
+                    Ok(Self::BlobStreamPlan {
+                        direction,
+                        attempt_nonce,
+                    })
+                } else {
+                    Ok(Self::BlobStreamPlanAck {
+                        direction,
+                        attempt_nonce,
+                    })
+                }
+            }
             _ => Err(NodeError::Protocol(
                 "unknown or malformed mechanics frame".into(),
             )),
@@ -2288,13 +2350,59 @@ const fn is_v7_only_tag(tag: u8) -> bool {
     )
 }
 
+const fn is_v9_only_tag(tag: u8) -> bool {
+    matches!(tag, BLOB_STREAM_PLAN_V1 | BLOB_STREAM_PLAN_ACK_V1)
+}
+
 fn validate_semantic_version(semantic_version: u16) -> Result<(), NodeError> {
-    if !(1..=crate::event_pages::SEMANTIC_PROTOCOL_V8).contains(&semantic_version) {
+    if !(1..=crate::event_pages::SEMANTIC_PROTOCOL_V9).contains(&semantic_version) {
         return Err(NodeError::Protocol(format!(
             "unsupported semantic protocol version {semantic_version}"
         )));
     }
     Ok(())
+}
+
+fn encode_blob_stream_plan(
+    output: &mut Vec<u8>,
+    tag: u8,
+    direction: EventDirection,
+    attempt_nonce: Option<[u8; 32]>,
+) -> Result<(), NodeError> {
+    output.push(tag);
+    output.push(direction.encode());
+    match attempt_nonce {
+        None => output.push(0),
+        Some(nonce) if nonce != [0; 32] => {
+            output.push(1);
+            output.extend_from_slice(&nonce);
+        }
+        Some(_) => {
+            return Err(NodeError::Protocol(
+                "Blob stream plan attempt nonce is zero".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn decode_blob_stream_plan(body: &[u8]) -> Result<(EventDirection, Option<[u8; 32]>), NodeError> {
+    let (&direction, body) = body
+        .split_first()
+        .ok_or_else(|| NodeError::Protocol("Blob stream plan direction is missing".into()))?;
+    let direction = EventDirection::decode(direction)?;
+    match body {
+        [0] => Ok((direction, None)),
+        [1, nonce @ ..] if nonce.len() == 32 && nonce.iter().any(|byte| *byte != 0) => Ok((
+            direction,
+            Some(nonce.try_into().map_err(|_| {
+                NodeError::Protocol("Blob stream plan nonce length differs".into())
+            })?),
+        )),
+        _ => Err(NodeError::Protocol(
+            "Blob stream plan nonce field is not canonical".into(),
+        )),
+    }
 }
 
 fn encode_bridge_remaining(output: &mut Vec<u8>, tag: u8, remaining: u64) -> Result<(), NodeError> {
@@ -4864,12 +4972,12 @@ mod tests {
     }
 
     #[test]
-    fn semantic_v7_keeps_legacy_frame_bytes_and_acceptance_unchanged() {
+    fn semantic_v7_through_v9_keep_legacy_frame_bytes_and_acceptance_unchanged() {
         let frame = Frame::Finish {
             direction: EventDirection::ToSessionInitiator,
         };
         let raw = frame.encode().unwrap();
-        for semantic_version in 1..=8 {
+        for semantic_version in 1..=9 {
             assert_eq!(
                 frame.encode_for_semantic_version(semantic_version).unwrap(),
                 raw
@@ -4879,6 +4987,39 @@ mod tests {
                 frame
             );
         }
-        assert!(Frame::decode_for_semantic_version(&raw, 9).is_err());
+    }
+
+    #[test]
+    fn v9_blob_stream_plan_is_bounded_and_version_scoped() {
+        for frame in [
+            Frame::BlobStreamPlan {
+                direction: EventDirection::ToSessionResponder,
+                attempt_nonce: Some([0x71; 32]),
+            },
+            Frame::BlobStreamPlanAck {
+                direction: EventDirection::ToSessionResponder,
+                attempt_nonce: Some([0x71; 32]),
+            },
+            Frame::BlobStreamPlan {
+                direction: EventDirection::ToSessionInitiator,
+                attempt_nonce: None,
+            },
+        ] {
+            let encoded = frame.encode_for_semantic_version(9).expect("v9 plan");
+            assert_eq!(
+                Frame::decode_for_semantic_version(&encoded, 9).expect("v9 plan decode"),
+                frame
+            );
+            assert!(frame.encode_for_semantic_version(8).is_err());
+            assert!(Frame::decode_for_semantic_version(&encoded, 8).is_err());
+        }
+        let mut zero_nonce = Frame::BlobStreamPlan {
+            direction: EventDirection::ToSessionResponder,
+            attempt_nonce: Some([1; 32]),
+        }
+        .encode_for_semantic_version(9)
+        .expect("nonzero nonce");
+        zero_nonce[7..].fill(0);
+        assert!(Frame::decode_for_semantic_version(&zero_nonce, 9).is_err());
     }
 }
