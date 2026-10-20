@@ -77,7 +77,18 @@ fn serve(
             request.push(byte[0]);
             assert!(request.len() <= 8192);
         }
-        sender.send(String::from_utf8(request).unwrap()).unwrap();
+        let request = String::from_utf8(request).unwrap();
+        let content_length = request
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find_map(|(name, value)| {
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap_or(0);
+        let mut request_body = vec![0; content_length];
+        connection.read_exact(&mut request_body).unwrap();
+        sender.send(request).unwrap();
         thread::sleep(delay);
         // The client may close early after its deadline or a response limit.
         let _ = connection.write_all(reply.as_bytes());
