@@ -57424,7 +57424,10 @@ mod tests {
 
     #[tokio::test]
     async fn v7_pages_authenticate_finite_sources_before_custody_finalization_window() {
-        const EVENT_COUNT: usize = 100;
+        // One full finite page makes the injected source-preparation time exceed
+        // each Event's finalization charge; the trailing Event proves that the
+        // same ordering holds across a page boundary.
+        const EVENT_COUNT: usize = FINITE_EVENT_PAGE_SENDER_TARGET_ENTRIES + 1;
 
         let services = control_test_services([0xf2; 32]);
         let source_state = root("v7-finite-page-scale-source");
