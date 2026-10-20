@@ -26347,7 +26347,10 @@ async fn send_profile5_blob_direction(
         *publication.commitment().plaintext_root(),
         *publication.commitment().ciphertext_root(),
     );
-    let report = blob_stream::send_completed_pack_protected(
+    // Keep the profile-5 state machine off the contact worker's stack. Debug
+    // builds on smaller-stack targets still retain scoped cancellation inside
+    // the boxed operation.
+    let report = Box::pin(blob_stream::send_completed_pack_protected(
         connection.clone(),
         mission,
         profiles.digest,
@@ -26358,7 +26361,7 @@ async fn send_profile5_blob_direction(
         &pack_root,
         roots,
         publication.authenticated_commitment().to_vec(),
-    )
+    ))
     .await
     .map_err(profile5_blob_network_error)?;
     record_blob_stream_report(receipt, &report, BlobStreamReportDirection::Sent)?;
@@ -26490,7 +26493,7 @@ async fn receive_profile5_blob_direction(
     let pack_root = aster_redb_store::pack::PinnedBlobPackRoot::open(&store)?;
     let limits = crate::stream_pipeline::PipelineLimits::new(2, 4, 5 * 1024 * 1024, 4)
         .map_err(|error| blob_stream_error("configure Blob stream pipeline", error))?;
-    let report = blob_stream::receive_completed_pack_with_store_protected(
+    let report = Box::pin(blob_stream::receive_completed_pack_with_store_protected(
         connection.clone(),
         mission,
         profiles.digest,
@@ -26501,7 +26504,7 @@ async fn receive_profile5_blob_direction(
         &pack_root,
         wire_len,
         limits,
-    )
+    ))
     .await
     .map_err(profile5_blob_network_error)?;
     record_blob_stream_report(receipt, &report, BlobStreamReportDirection::Received)?;

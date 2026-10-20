@@ -1158,7 +1158,7 @@ async fn receive_completed_pack_inner(
             .try_into()
             .expect("job ID"),
     );
-    let pipeline = async move {
+    let pipeline = Box::pin(async move {
         #[cfg(test)]
         let _lifetime = ReceivePipelineGuard::enter(stream_job);
         let mut last_checkpoint_wire = resume.durable_wire_offset();
@@ -1213,13 +1213,13 @@ async fn receive_completed_pack_inner(
             .finish()
             .map_err(|error| PipelineError::SinkFailed(error.to_string()))?;
         Ok::<_, PipelineError>((report, roots))
-    };
+    });
 
     let mut partitioner = RecordPartitioner::new(resume.next_segment_index(), durable_wire);
     let mut received = durable_wire;
     let mut durable_wire = durable_wire;
     let mut checkpoints = 0_u64;
-    let receive = async {
+    let receive = Box::pin(async {
         while received < wire_len {
             let frame = attempt
                 .receive_data()
@@ -1275,12 +1275,12 @@ async fn receive_completed_pack_inner(
         partitioner.finish(wire_len)?;
         drop(partition_tx);
         Ok::<(), BlobNetworkError>(())
-    };
-    let verify = async {
+    });
+    let verify = Box::pin(async move {
         pipeline
             .await
             .map_err(|error| verification_failure("verification pipeline", error))
-    };
+    });
     let ((), (pipeline, roots)) = tokio::try_join!(receive, verify)?;
     let finish = attempt
         .receive_data()
