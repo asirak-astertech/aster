@@ -2932,6 +2932,239 @@ fn interrupted_terminal_marker_resumes_without_losing_data_rows() {
     std::fs::remove_dir_all(root).expect("cleanup interrupted zeroization root");
 }
 
+#[cfg(unix)]
+#[test]
+fn public_binary_relay_secrecy_and_consumer_ack_survive_reopen() {
+    use aster_mesh::EventContentVerification;
+    use aster_node::application::{EventQuery, SelectedEventNode};
+    use aster_node::publication_journal::{Intent, Journal};
+    use aster_redb_store::{
+        EventSubscriptionKey, EventSubscriptionMode, EventSubscriptionSpec, StoredEventTransfer,
+    };
+    use sha2::{Digest, Sha256};
+    use std::net::UdpSocket;
+
+    let _process_test = serialize_process_test();
+    let root = fresh_root("compact-relay-secrecy-ack");
+    std::fs::create_dir_all(&root).unwrap();
+    make_owner_only_directory(&root);
+    let scope = Scope::new("test/compact-relay").unwrap();
+    let topic = Topic::new("compact-relay").unwrap();
+    let mut provisioner = ReferenceProvisioner::from_seed([0xa8; 32]).unwrap();
+    let mut nodes = Vec::new();
+    for index in 0..3u64 {
+        let state = root.join(format!("node-{index}"));
+        let carrier = NodeIdentity::load_or_create(&state).unwrap().id();
+        make_owner_only_directory(&state);
+        let access = if index == 1 {
+            ProvisioningAccess::relay(scope.clone(), vec![1]).unwrap()
+        } else {
+            ProvisioningAccess::member(scope.clone(), vec![1], vec![topic.clone()]).unwrap()
+        };
+        let bundle = provisioner.issue_node(index + 1, &[access]).unwrap();
+        let mission_path = state.join("mission.bundle");
+        let mission =
+            UnprotectedReferenceMission::persist(&mission_path, bundle.to_bytes().unwrap())
+                .unwrap();
+        let sealer = ReferenceEnvelopeSealer::open(bundle).unwrap();
+        {
+            let store =
+                Store::open_for_mission(state.join("mesh.redb"), mission.mission_authority_id())
+                    .unwrap();
+            store
+                .create_event_subscription_with_policy(
+                    &store.control_policy_snapshot().unwrap(),
+                    &EventSubscriptionKey::new(b"compact-selector".to_vec()).unwrap(),
+                    EventSubscriptionSpec {
+                        mode: if index == 1 {
+                            EventSubscriptionMode::Carry
+                        } else {
+                            EventSubscriptionMode::Consume
+                        },
+                        topic: topic.clone(),
+                        scope: scope.clone(),
+                        include_descendant_scopes: false,
+                    },
+                )
+                .unwrap();
+        }
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let address = socket.local_addr().unwrap();
+        nodes.push((
+            state,
+            mission_path,
+            (mission.identity(), mission.mission_authority_id()),
+            carrier,
+            address,
+            Some(socket),
+            sealer,
+        ));
+    }
+    let payload = b"compact-relay-secret-payload-canary-2026";
+    let published = {
+        let mut source =
+            SelectedEventNode::open_unprotected_reference(&nodes[0].0, &nodes[0].1).unwrap();
+        let journal_path = nodes[0].0.join("publication.redb");
+        Journal::initialize(&journal_path, b"compact-source").unwrap();
+        let mut journal = Journal::open(&journal_path, b"compact-source").unwrap();
+        journal.recover_stopped(&mut source).unwrap();
+        let published = journal
+            .publish_metadata_stopped(
+                &mut source,
+                Intent {
+                    predecessor: None,
+                    topic: topic.as_str().to_owned(),
+                    scope: scope.as_str().to_owned(),
+                    priority: Priority::Routine as u8,
+                    logical_key: b"compact-key".to_vec(),
+                    payload: payload.to_vec(),
+                    tombstone: false,
+                    ttl_ms: None,
+                },
+            )
+            .unwrap();
+        journal.acknowledge_stopped(&mut source).unwrap();
+        published
+    };
+    let (transfer_id, sealed) = {
+        let store = Store::open_for_mission(nodes[0].0.join("mesh.redb"), nodes[0].2.1).unwrap();
+        let policy = store.control_policy_snapshot().unwrap();
+        let inventory = store.transfer_inventory_with_policy(&policy).unwrap();
+        assert_eq!(inventory.len(), 1);
+        let Some(StoredEventTransfer::Accepted(event)) = store
+            .get_transfer_with_policy(&policy, *inventory.iter().next().unwrap())
+            .unwrap()
+        else {
+            panic!("source Event missing")
+        };
+        (*inventory.iter().next().unwrap(), event.sealed)
+    };
+    // Two separately stopped real-process hops. The producer is absent from
+    // the second hop; no direct source/destination contact is configured.
+    for (left, right) in [(0, 1), (1, 2)] {
+        nodes[left].5.take();
+        nodes[right].5.take();
+        let peer = |index: usize| {
+            format!(
+                "{}@{}={}",
+                nodes[index].3,
+                nodes[index].4,
+                aster_node::format_node_id(nodes[index].2.0)
+            )
+        };
+        let a = public_node_command(
+            &nodes[left].0,
+            &nodes[left].1,
+            nodes[left].4,
+            Some(&peer(right)),
+            30,
+        )
+        .spawn()
+        .unwrap();
+        let b = public_node_command(
+            &nodes[right].0,
+            &nodes[right].1,
+            nodes[right].4,
+            Some(&peer(left)),
+            30,
+        )
+        .spawn()
+        .unwrap();
+        let (a, b) = wait_for_public_direct_contacts(a, b);
+        for output in [a, b] {
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+    {
+        let relay = &mut nodes[1];
+        let store = Store::open_for_mission(relay.0.join("mesh.redb"), relay.2.1).unwrap();
+        let stats = store.event_stats().unwrap();
+        assert_eq!(stats.events, 0);
+        assert_eq!(stats.acceptance_markers, 0);
+        assert_eq!(stats.route_cached, 1);
+        let Some(StoredEventTransfer::RouteCached(event)) = store
+            .get_transfer_with_policy(&store.control_policy_snapshot().unwrap(), transfer_id)
+            .unwrap()
+        else {
+            panic!("relay lost exact route cache")
+        };
+        assert_eq!(event.sealed, sealed);
+        let route = relay.6.verify_event(&event.sealed).unwrap();
+        assert!(matches!(
+            relay.6.verify_event_content(route, &event.sealed).unwrap(),
+            EventContentVerification::RouteOnly(_)
+        ));
+    }
+    let mut pending = vec![nodes[1].0.clone()];
+    let mut files = 0;
+    let digest = Sha256::digest(payload);
+    while let Some(path) = pending.pop() {
+        if path.is_dir() {
+            pending.extend(
+                std::fs::read_dir(path)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path()),
+            );
+        } else {
+            let bytes = std::fs::read(path).unwrap();
+            files += 1;
+            assert!(!bytes.windows(payload.len()).any(|window| window == payload));
+            assert!(
+                !bytes
+                    .windows(digest.len())
+                    .any(|window| window == digest.as_slice())
+            );
+        }
+    }
+    assert!(files > 0);
+    let mut destination =
+        SelectedEventNode::open_unprotected_reference(&nodes[2].0, &nodes[2].1).unwrap();
+    let items = destination.query(EventQuery::default()).unwrap().items;
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].id, published.id);
+    assert_eq!(items[0].payload, payload);
+    assert_eq!(items[0].logical_key, b"compact-key");
+    let subscription = destination
+        .subscribe(EventSubscriptionRequest {
+            operation_key: b"compact-public-consumer".to_vec(),
+            topic,
+            scope,
+            include_descendant_scopes: false,
+        })
+        .unwrap();
+    let poll = EventPollRequest {
+        subscription: subscription.id,
+        delivery_limit: 8,
+        scan_limit: 8,
+    };
+    let deliveries = destination.poll(poll).unwrap().deliveries;
+    assert_eq!(deliveries.len(), 1);
+    assert_eq!(deliveries[0].event.id, published.id);
+    assert_eq!(deliveries[0].event.payload, payload);
+    assert_eq!(
+        destination
+            .acknowledge(subscription.id, published.id)
+            .unwrap(),
+        EventAcknowledgement::Acknowledged
+    );
+    assert!(destination.poll(poll).unwrap().deliveries.is_empty());
+    drop(destination);
+    let mut destination =
+        SelectedEventNode::open_unprotected_reference(&nodes[2].0, &nodes[2].1).unwrap();
+    assert!(destination.poll(poll).unwrap().deliveries.is_empty());
+    assert_eq!(
+        destination.query(EventQuery::default()).unwrap().items[0].payload,
+        payload
+    );
+    drop(destination);
+    drop(nodes);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 #[ignore = "qualification runs the complete 18-process four-node Ping/Pong demo; use `mise run qualify-ping-pong-mesh`"]
 fn four_real_processes_default_to_ping_pong_and_restart_cleanly() {
@@ -3112,6 +3345,99 @@ fn four_real_processes_default_to_ping_pong_and_restart_cleanly() {
     for node in 0..4 {
         assert_default_noop_node(&root, node, node == 0 || node == 3);
     }
+    // The demo has already stopped/reopened each relay between real Iroh hops,
+    // checked exact sealed bytes, and proved its relay-only content grants.
+    // Inspect every retained relay file, not just the logical Store rows.
+    use sha2::{Digest, Sha256};
+    for relay in [1, 2] {
+        let mut pending = vec![root.join(format!("node-{relay}"))];
+        let mut files = 0;
+        while let Some(path) = pending.pop() {
+            if path.is_dir() {
+                pending.extend(
+                    std::fs::read_dir(path)
+                        .expect("relay directory")
+                        .map(|entry| entry.expect("relay entry").path()),
+                );
+            } else {
+                let bytes = std::fs::read(&path).expect("retained relay file");
+                files += 1;
+                for payload in [b"ASTER_SAMPLE_PING_V1", b"ASTER_SAMPLE_PONG_V1"] {
+                    let digest = Sha256::digest(payload);
+                    assert!(!bytes.windows(payload.len()).any(|window| window == payload));
+                    assert!(
+                        !bytes
+                            .windows(digest.len())
+                            .any(|window| window == digest.as_slice())
+                    );
+                }
+            }
+        }
+        assert!(files > 0, "relay disk scan must not be vacuous");
+    }
+
+    // Exercise the public consumer ledger on the destination's same durable
+    // Event, independently of the demo application's reaction bookkeeping.
+    use aster_node::application::{EventQuery, SelectedEventNode};
+    let state = root.join("node-3");
+    let mission = state.join("mission.unprotected-reference.bundle");
+    let mut consumer = SelectedEventNode::open_unprotected_reference(&state, &mission)
+        .expect("reopen destination consumer");
+    let items = consumer
+        .query(EventQuery::default())
+        .expect("query destination");
+    let ping = items
+        .items
+        .iter()
+        .find(|item| item.payload == b"ASTER_SAMPLE_PING_V1")
+        .expect("exact delivered Ping");
+    let subscription = consumer
+        .subscribe(EventSubscriptionRequest {
+            operation_key: b"relay-public-consumer".to_vec(),
+            topic: ping.topic.clone(),
+            scope: ping.scope.clone(),
+            include_descendant_scopes: false,
+        })
+        .expect("subscribe destination");
+    let poll = EventPollRequest {
+        subscription: subscription.id,
+        delivery_limit: 8,
+        scan_limit: 8,
+    };
+    let deliveries = consumer.poll(poll).expect("poll forwarded Events");
+    assert_eq!(deliveries.deliveries.len(), 2);
+    assert!(
+        deliveries
+            .deliveries
+            .iter()
+            .any(|delivery| delivery.event.id == ping.id && delivery.event.payload == ping.payload)
+    );
+    for delivery in deliveries.deliveries {
+        assert_eq!(
+            consumer
+                .acknowledge(subscription.id, delivery.event.id)
+                .expect("ack forwarded Event"),
+            EventAcknowledgement::Acknowledged
+        );
+    }
+    assert!(
+        consumer
+            .poll(poll)
+            .expect("poll after ack")
+            .deliveries
+            .is_empty()
+    );
+    drop(consumer);
+    let mut consumer = SelectedEventNode::open_unprotected_reference(&state, &mission)
+        .expect("reopen acknowledged consumer");
+    assert!(
+        consumer
+            .poll(poll)
+            .expect("poll persisted ack")
+            .deliveries
+            .is_empty()
+    );
+    drop(consumer);
     std::fs::remove_dir_all(&root).expect("remove successful demo root");
 }
 
