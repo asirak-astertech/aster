@@ -15,12 +15,21 @@ four independent two-agent workloads by default:
 
 Each endpoint attempts 600 durable 1-KiB Events at 10 Events/second, continuously
 polls and acknowledges deliveries, and requires every admitted Event's exact ID,
-logical key and payload at its peer. Explicit HTTP 429 publication rejections
-are retained separately; transport errors and uncertain publication outcomes
-fail the run. A run with no admitted Events cannot pass. The outage publishes
+logical key and payload at its peer. Each publishing lane owns a durable SDK
+journal and stable client identity. Lost replies are recovered through the
+numbered session and original journaled intent, never a new publication. The
+CLI does not expose structured capacity-rejection details, so resource
+exhaustion alone is not counted as a definite rejection; unresolved outcomes
+fail the run. Journals remain available to the helper's recovery path during the
+run; final owned-state cleanup removes them together with the disposable mission
+credentials, including on failure. Retained receipts are not resumable journals.
+A run with no admitted Events cannot pass. The outage publishes
 new witness Events only after both 100%-loss qdiscs are read back, checks them
 absent at the peer before restoration, and allows 120 seconds after restoration
-for delivery. Finally both agents stop, reopen **without peers**, with WAN still
+for delivery. Restoration is armed after the loss replacements, before qdisc
+readback; late or failed readback cannot extend the timer or establish negative
+witness evidence. Both interface change times are retained. Finally both agents
+stop, reopen **without peers**, with WAN still
 cut, and query every accepted Event using bounded advancing pagination.
 
 ```sh
@@ -66,7 +75,10 @@ smoke, the three setup helpers and CHOWN-only provisioner remain for the bounded
 run, so they can change impairments and reclaim private credentials. Agents and
 namespace holders remain UID/GID 10001 with all capabilities dropped. No network
 path bypasses WAN. The diagnostic source helper is bound read-only into nodes;
-the production executable comes from the delivery image.
+the production executable comes from the delivery image. All four local Python
+helpers (diagnostic, numbered publisher, Connect client, and Docker controller)
+are copied at campaign start and mounted read-only; every container is created
+from the resolved immutable image ID, not the mutable tag.
 
 `--help` lists bounded workload, impairment, sampling and recovery parameters.
 `--profiles baseline` selects a shorter development run; the default runs all
@@ -75,14 +87,20 @@ status counters/capacities. Application delivery backlog is **not an Iroh send
 queue**. Monotonic phase timings, configured arguments, qdisc readback, accepted
 and rejected publications, exact deliveries, restart results and cleanup errors
 are retained in JSON even when a profile fails. `receipt.json` records the image
-ID, source HEAD/diff and helper digest. The provisioner wipes private credentials;
+ID, source HEAD, complete tracked delta against HEAD (including staged changes),
+and individual helper digests (including relevant untracked helpers). Source
+and helper identities are rechecked throughout and after cleanup; profile PASS
+receipts are withheld until final campaign validation succeeds. The provisioner
+wipes private credentials;
 owned-resource cleanup must then succeed before ownership metadata is removed.
 Failed cleanup retains its ownership locator. No credentials are included in the receipt.
 
 The publisher schedules locally inside each persistent helper, independently of
 continuous polling/acknowledgement. At most 48 publication RPCs per endpoint may
 be outstanding; exhausting that diagnostic bound fails instead of silently
-slowing the requested pace. RPCs have a 30-second deadline. The peerless query
+slowing the requested pace. Connect JSON calls have a 30-second timeout; numbered
+publication uses `asterctl --timeout 10` with a 35-second subprocess bound per
+CLI invocation (recovery may require several invocations). The peerless query
 has a separate 180-second deadline per node, and each profile has an overall
 publication + restoration + 420-second deadline. These are diagnostic bounds,
 not changed application capacities.
