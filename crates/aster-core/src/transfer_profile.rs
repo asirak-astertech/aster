@@ -87,9 +87,7 @@ pub fn blob_profile_for_canonical_shape(
     chunk_size: u32,
     chunk_count: u64,
 ) -> Option<TransferProfileId> {
-    if total_len == 0
-        || chunk_size != crate::MAX_BLOB_CHUNK_SIZE
-        || chunk_count == 0
+    if chunk_size != crate::MAX_BLOB_CHUNK_SIZE
         || chunk_count != total_len.div_ceil(u64::from(chunk_size))
         || chunk_count > crate::MAX_BLOB_CHUNKS
     {
@@ -97,7 +95,8 @@ pub fn blob_profile_for_canonical_shape(
     }
     match semantic_version {
         SEMANTIC_PROTOCOL_V7 | SEMANTIC_PROTOCOL_V8
-            if total_len <= PROFILE4_MAX_CANONICAL_BLOB_BYTES
+            if total_len > 0
+                && total_len <= PROFILE4_MAX_CANONICAL_BLOB_BYTES
                 && chunk_count <= PROFILE4_MAX_CANONICAL_BLOB_CHUNKS =>
         {
             Some(TransferProfileId::BlobRangesStreamV1)
@@ -602,6 +601,37 @@ mod tests {
         );
         assert_eq!(
             blob_profile_for_canonical_shape(9, profile5_max + 1, 64 * 1024, 131_073,),
+            None
+        );
+    }
+
+    #[test]
+    fn empty_canonical_blob_is_profile5_only() {
+        assert_eq!(
+            blob_profile_for_canonical_shape(
+                SEMANTIC_PROTOCOL_V9,
+                0,
+                crate::MAX_BLOB_CHUNK_SIZE,
+                0,
+            ),
+            Some(TransferProfileId::BlobStreamV1)
+        );
+        assert_eq!(
+            blob_profile_for_canonical_shape(
+                SEMANTIC_PROTOCOL_V8,
+                0,
+                crate::MAX_BLOB_CHUNK_SIZE,
+                0,
+            ),
+            None
+        );
+        assert_eq!(
+            blob_profile_for_canonical_shape(
+                SEMANTIC_PROTOCOL_V9,
+                0,
+                crate::MAX_BLOB_CHUNK_SIZE,
+                1,
+            ),
             None
         );
     }

@@ -155,8 +155,8 @@ use crate::{
     format_node_id, format_path_field, format_receipt_field,
     frame::{
         BlobInterest, BlobInterestSelector, BlobObjectId, BlobRangeDisposition,
-        BridgeRouteDisposition, EventApplyDisposition, EventDirection, EventInterest,
-        EventInterestSelector, Frame, FrameEmissionPolicy, MAX_EVENT_INTEREST_BYTES,
+        BlobStreamSourceOfferV1, BridgeRouteDisposition, EventApplyDisposition, EventDirection,
+        EventInterest, EventInterestSelector, Frame, FrameEmissionPolicy, MAX_EVENT_INTEREST_BYTES,
         MAX_OBJECT_BYTES, MutableApplyDisposition, MutableClass, MutableTransferId,
     },
     mission::{
@@ -26830,6 +26830,7 @@ fn profile5_blob_network_error(error: blob_stream::BlobNetworkError) -> NodeErro
 }
 
 #[derive(Clone, Copy)]
+#[allow(dead_code)] // Task 5 reconnects the authenticated profile-5 receive path.
 enum BlobStreamReportDirection {
     Sent,
     Received,
@@ -27064,16 +27065,20 @@ async fn send_profile5_blob_direction(
     if let Some(nonce) = attempt_nonce.as_mut() {
         getrandom::fill(nonce).map_err(|error| blob_stream_error("Blob stream nonce", error))?;
     }
-    let authenticated_open = publication.as_ref().map_or_else(Vec::new, |publication| {
-        publication.authenticated_open().to_vec()
-    });
+    let source = publication
+        .as_ref()
+        .map(|publication| BlobStreamSourceOfferV1 {
+            transfer_id: *publication.publication().as_bytes(),
+            source_len: u32::try_from(publication.authenticated_open().len()).unwrap_or(u32::MAX),
+            source_digest: Sha256::digest(publication.authenticated_open()).into(),
+        });
     let response = request_mission_frame(
         connection,
         mission,
         Frame::BlobStreamPlan {
             direction,
             attempt_nonce,
-            authenticated_open,
+            source,
         },
         receipt,
     )
@@ -27155,10 +27160,10 @@ async fn receive_profile5_blob_direction(
     store: Arc<Store>,
     connection: &aster_iroh::Connection,
     mission: &mut MissionSession,
-    profiles: &V7TransferProfiles,
+    _profiles: &V7TransferProfiles,
     guard: &EventLaneGuard,
-    verifier: Arc<ReferenceEnvelopeSealer>,
-    local_interest: &BlobInterest,
+    _verifier: Arc<ReferenceEnvelopeSealer>,
+    _local_interest: &BlobInterest,
     direction: EventDirection,
     receipt: &mut PeerReceipt,
 ) -> Result<(), NodeError> {
@@ -27170,7 +27175,7 @@ async fn receive_profile5_blob_direction(
             let Frame::BlobStreamPlan {
                 direction: offered_direction,
                 attempt_nonce,
-                authenticated_open,
+                source,
             } = frame
             else {
                 return Err(NodeError::Protocol(
@@ -27182,44 +27187,16 @@ async fn receive_profile5_blob_direction(
                     "Blob stream offer crossed directions".into(),
                 ));
             }
-            let acknowledged_nonce = match attempt_nonce {
-                None => None,
-                Some(nonce) => {
-                    let verified = verifier
-                        .verify_blob_stream_open(&authenticated_open)
-                        .map_err(|error| blob_stream_error("verify Blob stream open", error))?;
-                    if local_interest
-                        .selector(verified.open().topic(), verified.open().scope())
-                        .is_some_and(|selector| selector.epoch() == verified.open().content_epoch())
-                    {
-                        let existing = store
-                            .blob_stream_publications_with_policy(guard.policy())?
-                            .into_iter()
-                            .find(|publication| {
-                                publication.stream_id() == verified.open().stream_id()
-                            });
-                        match existing {
-                            Some(publication)
-                                if publication.open() == verified.open()
-                                    && publication.authenticated_open()
-                                        == authenticated_open.as_slice() =>
-                            {
-                                None
-                            }
-                            Some(_) => {
-                                return Err(NodeError::Protocol(
-                                    "Blob stream offer conflicts with an existing publication"
-                                        .into(),
-                                ));
-                            }
-                            None => {
-                                accepted = Some((nonce, authenticated_open, verified));
-                                Some(nonce)
-                            }
-                        }
-                    } else {
-                        None
-                    }
+            let acknowledged_nonce = match (attempt_nonce, source) {
+                (None, None) => None,
+                (Some(nonce), Some(source)) => {
+                    accepted = Some((nonce, source));
+                    Some(nonce)
+                }
+                _ => {
+                    return Err(NodeError::Protocol(
+                        "Blob stream plan source presence differs from its nonce".into(),
+                    ));
                 }
             };
             Ok((
@@ -27237,53 +27214,12 @@ async fn receive_profile5_blob_direction(
             "Blob stream plan exchange did not complete".into(),
         ));
     }
-    let Some((nonce, authenticated_open, verified_open)) = accepted else {
+    let Some((_nonce, _source)) = accepted else {
         return Ok(());
     };
-    guard.check(&store)?;
-    let opener = verifier
-        .blob_stream_segment_opener(&verified_open)
-        .map_err(|error| blob_stream_error("open Blob stream content", error))?;
-    let commitment_verifier = {
-        let verifier = Arc::clone(&verifier);
-        Arc::new(
-            move |open: &aster_mesh::VerifiedBlobStreamOpen, bytes: &[u8]| {
-                verifier
-                    .verify_blob_stream_commitment(open, bytes)
-                    .map_err(|error| error.to_string())
-            },
-        ) as blob_stream::BlobCommitmentVerifier
-    };
-    let session = blob_stream::BlobReceiveStoreSession::new(
-        Arc::clone(&store),
-        *guard.policy(),
-        verified_open.clone(),
-        authenticated_open,
-        mission.peer().mission_id(),
-        commitment_verifier,
-    )
-    .map_err(profile5_blob_network_error)?;
-    let wire_len = blob_stream::expected_pack_wire_len(verified_open.open().total_len())
-        .map_err(profile5_blob_network_error)?;
-    let pack_root = aster_redb_store::pack::PinnedBlobPackRoot::open(&store)?;
-    let limits = crate::stream_pipeline::PipelineLimits::new(2, 4, 5 * 1024 * 1024, 4)
-        .map_err(|error| blob_stream_error("configure Blob stream pipeline", error))?;
-    let report = Box::pin(blob_stream::receive_completed_pack_with_store_protected(
-        connection.clone(),
-        mission,
-        profiles.digest,
-        direction,
-        nonce,
-        session,
-        opener,
-        &pack_root,
-        wire_len,
-        limits,
+    Err(NodeError::Protocol(
+        "canonical profile-5 receiver is introduced by Task 5".into(),
     ))
-    .await
-    .map_err(profile5_blob_network_error)?;
-    record_blob_stream_report(receipt, &report, BlobStreamReportDirection::Received)?;
-    guard.check(&store)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -39896,7 +39832,7 @@ mod tests {
                     Frame::BlobStreamPlan {
                         direction: EventDirection::ToSessionResponder,
                         attempt_nonce: None,
-                        authenticated_open: Vec::new(),
+                        source: None,
                     },
                     receipt,
                 )
@@ -39914,8 +39850,8 @@ mod tests {
                         Frame::BlobStreamPlan {
                             direction: EventDirection::ToSessionInitiator,
                             attempt_nonce: None,
-                            authenticated_open,
-                        } if authenticated_open.is_empty() => Ok((
+                            source: None,
+                        } => Ok((
                             Frame::BlobStreamPlanAck {
                                 direction: EventDirection::ToSessionInitiator,
                                 attempt_nonce: None,

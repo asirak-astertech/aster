@@ -9,17 +9,18 @@ use crate::{
         StreamPartition, run_ordered_channel_pipeline_from,
     },
     stream_transfer::{
-        MAX_STREAM_CHECKPOINT_BATCH_BYTES, PROFILE5_ATTEMPT_TIMEOUT,
-        PROFILE5_CANONICAL_CARRIER_RECORD_BYTES, PROFILE5_CANONICAL_EXTENT_BYTES,
-        PROFILE5_EXTENT_BYTES, PROFILE5_MAX_RECORD_BYTES, StreamAction, StreamClass,
-        StreamDirection, StreamExtentAction, StreamFrame, StreamOpenV1, StreamReceiverState,
-        StreamResultCode, StreamSenderState, blob_pack_wire_len, encode_composite_data_prefix,
-        profile5_attempt_bounds, profile5_receive_limit, split_composite_data_record,
+        CanonicalBlobExtentV1, MAX_STREAM_CHECKPOINT_BATCH_BYTES, PROFILE5_ATTEMPT_TIMEOUT,
+        PROFILE5_CANONICAL_EXTENT_BYTES, PROFILE5_EXTENT_BYTES, PROFILE5_IDLE_TIMEOUT,
+        PROFILE5_MAX_RECORD_BYTES, StreamAction, StreamClass, StreamDirection, StreamExtentAction,
+        StreamFrame, StreamOpenV1, StreamReceiverState, StreamResultCode, StreamSenderState,
+        blob_pack_wire_len, encode_composite_data_prefix, profile5_attempt_bounds,
+        profile5_attempt_hard_timeout, profile5_receive_limit, split_composite_data_record,
     },
     stream_transport::{
         AttemptOpenRequest, AuthenticatedPeerSupport, AuthenticatedSupportSource,
-        IrohQuicV1Adapter, StreamTransportAdapter, StreamTransportId, TransferRequirements,
-        TransportAdapterCandidate, TransportCandidate, TransportSelector,
+        IrohQuicV1Adapter, StreamAttempt, StreamReceiveAttempt, StreamTransportAdapter,
+        StreamTransportId, TransferRequirements, TransportAdapterCandidate, TransportCandidate,
+        TransportSelector,
     },
 };
 use aster_iroh::Connection;
@@ -34,142 +35,8 @@ use aster_redb_store::{
     pack::{BlobPackCheckpoint, BlobPackReader, BlobPackWriter, PinnedBlobPackRoot},
 };
 use sha2::{Digest, Sha256};
-use std::{path::Path, sync::Arc};
+use std::{future::Future, path::Path, sync::Arc};
 use tokio::{sync::mpsc, time::Instant};
-
-const CANONICAL_CARRIER_EXTENT_MAGIC: &[u8; 4] = b"ABC1";
-const CANONICAL_CARRIER_EXTENT_HEADER_BYTES: usize = 4 + 8 + 4;
-
-/// One bounded transport batch of complete canonical `ASTRBT01` objects.
-/// Carrier objects remain byte-identical to profile 4; only their batching is
-/// profile-5-specific.
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct CanonicalCarrierExtentV1 {
-    first_chunk_index: u64,
-    carriers: Vec<Vec<u8>>,
-}
-
-impl CanonicalCarrierExtentV1 {
-    fn encode(&self) -> Result<Vec<u8>, BlobNetworkError> {
-        if self.carriers.is_empty()
-            || self
-                .first_chunk_index
-                .checked_add(self.carriers.len() as u64)
-                .is_none_or(|end| end > aster_mesh::MAX_BLOB_CHUNKS)
-        {
-            return Err(BlobNetworkError::new(
-                BlobNetworkStage::Framing,
-                "encode canonical carrier extent",
-                "carrier index range is invalid",
-            ));
-        }
-        let mut encoded_len = CANONICAL_CARRIER_EXTENT_HEADER_BYTES;
-        for carrier in &self.carriers {
-            if carrier.is_empty() || carrier.len() > PROFILE5_CANONICAL_CARRIER_RECORD_BYTES {
-                return Err(BlobNetworkError::new(
-                    BlobNetworkStage::Framing,
-                    "encode canonical carrier extent",
-                    "canonical carrier length is invalid",
-                ));
-            }
-            encoded_len = encoded_len
-                .checked_add(4)
-                .and_then(|length| length.checked_add(carrier.len()))
-                .ok_or("canonical carrier extent overflows")?;
-        }
-        if encoded_len > PROFILE5_CANONICAL_EXTENT_BYTES {
-            return Err(BlobNetworkError::new(
-                BlobNetworkStage::Framing,
-                "encode canonical carrier extent",
-                "canonical carrier extent exceeds profile-5 bound",
-            ));
-        }
-        let mut output = Vec::with_capacity(encoded_len);
-        output.extend_from_slice(CANONICAL_CARRIER_EXTENT_MAGIC);
-        output.extend_from_slice(&self.first_chunk_index.to_be_bytes());
-        output.extend_from_slice(
-            &u32::try_from(self.carriers.len())
-                .map_err(|_| "canonical carrier count overflows")?
-                .to_be_bytes(),
-        );
-        for carrier in &self.carriers {
-            output.extend_from_slice(
-                &u32::try_from(carrier.len())
-                    .map_err(|_| "canonical carrier length overflows")?
-                    .to_be_bytes(),
-            );
-            output.extend_from_slice(carrier);
-        }
-        Ok(output)
-    }
-
-    #[allow(dead_code, reason = "Task 5 consumes this exact receiver codec")]
-    fn decode(bytes: &[u8]) -> Result<Self, BlobNetworkError> {
-        if bytes.len() < CANONICAL_CARRIER_EXTENT_HEADER_BYTES
-            || bytes.len() > PROFILE5_CANONICAL_EXTENT_BYTES
-            || &bytes[..4] != CANONICAL_CARRIER_EXTENT_MAGIC
-        {
-            return Err(BlobNetworkError::new(
-                BlobNetworkStage::Framing,
-                "decode canonical carrier extent",
-                "carrier extent framing is invalid",
-            ));
-        }
-        let first_chunk_index = u64::from_be_bytes(
-            bytes[4..12]
-                .try_into()
-                .map_err(|_| "canonical carrier extent is truncated")?,
-        );
-        let count = usize::try_from(u32::from_be_bytes(
-            bytes[12..16]
-                .try_into()
-                .map_err(|_| "canonical carrier extent is truncated")?,
-        ))
-        .map_err(|_| "canonical carrier count overflows")?;
-        if count == 0
-            || first_chunk_index
-                .checked_add(count as u64)
-                .is_none_or(|end| end > aster_mesh::MAX_BLOB_CHUNKS)
-        {
-            return Err("canonical carrier extent index range is invalid".into());
-        }
-        let mut offset = CANONICAL_CARRIER_EXTENT_HEADER_BYTES;
-        let mut carriers = Vec::with_capacity(count);
-        for _ in 0..count {
-            let length_end = offset
-                .checked_add(4)
-                .ok_or("canonical carrier extent overflows")?;
-            let length = usize::try_from(u32::from_be_bytes(
-                bytes
-                    .get(offset..length_end)
-                    .ok_or("canonical carrier extent is truncated")?
-                    .try_into()
-                    .map_err(|_| "canonical carrier extent is truncated")?,
-            ))
-            .map_err(|_| "canonical carrier length overflows")?;
-            if length == 0 || length > PROFILE5_CANONICAL_CARRIER_RECORD_BYTES {
-                return Err("canonical carrier length is invalid".into());
-            }
-            let end = length_end
-                .checked_add(length)
-                .ok_or("canonical carrier extent overflows")?;
-            carriers.push(
-                bytes
-                    .get(length_end..end)
-                    .ok_or("canonical carrier extent is truncated")?
-                    .to_vec(),
-            );
-            offset = end;
-        }
-        if offset != bytes.len() {
-            return Err("canonical carrier extent has trailing bytes".into());
-        }
-        Ok(Self {
-            first_chunk_index,
-            carriers,
-        })
-    }
-}
 
 /// Capability-bearing canonical send input. Construction requires the
 /// source/content-verified transfer plan and the Store's nonconstructible
@@ -229,7 +96,7 @@ fn canonical_extent_shape(
     if first_chunk_index >= plan.manifest().chunk_count() {
         return Err("canonical extent starts outside the manifest".into());
     }
-    let mut encoded_len = CANONICAL_CARRIER_EXTENT_HEADER_BYTES as u64;
+    let mut encoded_len = crate::stream_transfer::CANONICAL_BLOB_EXTENT_HEADER_BYTES as u64;
     let mut count = 0_u64;
     for index in first_chunk_index..plan.manifest().chunk_count() {
         let carrier = plan
@@ -332,11 +199,14 @@ impl<'a> CanonicalCarrierExtentSource<'a> {
                 );
             }
         }
-        let encoded = CanonicalCarrierExtentV1 {
+        let encoded = CanonicalBlobExtentV1 {
             first_chunk_index,
             carriers,
         }
-        .encode()?;
+        .encode()
+        .map_err(|error| {
+            BlobNetworkError::new(BlobNetworkStage::Framing, "encode canonical extent", error)
+        })?;
         if encoded.len() as u64 != expected_len {
             return Err("canonical extent differs from its preflight length".into());
         }
@@ -455,6 +325,16 @@ impl std::fmt::Display for BlobNetworkError {
 }
 
 impl std::error::Error for BlobNetworkError {}
+
+async fn await_authenticated_progress<T>(
+    context: &'static str,
+    future: impl Future<Output = Result<T, crate::stream_transport::StreamTransportError>>,
+) -> Result<T, BlobNetworkError> {
+    tokio::time::timeout(PROFILE5_IDLE_TIMEOUT, future)
+        .await
+        .map_err(|_| transport_failure(context, "authenticated progress idle timeout"))?
+        .map_err(|error| transport_failure(context, format!("{error:?}")))
+}
 
 #[derive(Debug)]
 pub struct BlobNetworkReport {
@@ -655,6 +535,7 @@ struct MissionBlobRecordCodec<'a> {
 fn stream_frame_name(frame: &StreamFrame) -> &'static str {
     match frame {
         StreamFrame::Open(_) => "open",
+        StreamFrame::Source(_) => "source",
         StreamFrame::Accept(_) => "accept",
         StreamFrame::Data(_) => "data",
         StreamFrame::Checkpoint(_) => "checkpoint",
@@ -772,6 +653,93 @@ impl BlobRecordCodec for MissionBlobRecordCodec<'_> {
     }
 }
 
+async fn send_authenticated_source(
+    attempt: &dyn StreamAttempt,
+    codec: &mut dyn BlobRecordCodec,
+    open: &StreamOpenV1,
+    source: &[u8],
+) -> Result<(), BlobNetworkError> {
+    if u32::try_from(source.len()).ok() != Some(open.source_len)
+        || <[u8; 32]>::from(Sha256::digest(source)) != open.source_digest
+    {
+        return Err(authentication_failure(
+            "bind authenticated source phase",
+            "source length or digest differs from open",
+        ));
+    }
+    for (sequence, chunk) in source
+        .chunks(crate::stream_transfer::PROFILE5_SOURCE_CHUNK_BYTES)
+        .enumerate()
+    {
+        let offset = sequence
+            .checked_mul(crate::stream_transfer::PROFILE5_SOURCE_CHUNK_BYTES)
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or("authenticated source offset overflows")?;
+        let frame = StreamFrame::Source(crate::stream_transfer::StreamSourceV1 {
+            transfer_id: open.transfer_id,
+            attempt_nonce: open.attempt_nonce,
+            sequence: u64::try_from(sequence)
+                .map_err(|_| "authenticated source sequence overflows")?,
+            offset,
+            total_len: open.source_len,
+            bytes: chunk.to_vec(),
+        });
+        await_authenticated_progress(
+            "send authenticated source chunk",
+            attempt.send_data(&codec.encode(frame)?),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn receive_authenticated_source(
+    attempt: &dyn StreamReceiveAttempt,
+    codec: &mut dyn BlobRecordCodec,
+    open: &StreamOpenV1,
+) -> Result<Vec<u8>, BlobNetworkError> {
+    let capacity =
+        usize::try_from(open.source_len).map_err(|_| "authenticated source length overflows")?;
+    if capacity == 0 || capacity > crate::stream_transfer::MAX_STREAM_AUTHENTICATED_OPEN_BYTES {
+        return Err("authenticated source length is out of bounds".into());
+    }
+    let mut source = Vec::with_capacity(capacity);
+    let mut sequence = 0_u64;
+    while source.len() < capacity {
+        let encoded = await_authenticated_progress(
+            "receive authenticated source chunk",
+            attempt.receive_data(),
+        )
+        .await?
+        .ok_or("data stream closed during authenticated source")?;
+        let StreamFrame::Source(chunk) = codec.decode(&encoded)? else {
+            return Err("authenticated source phase received another frame kind".into());
+        };
+        if chunk.transfer_id != open.transfer_id
+            || chunk.attempt_nonce != open.attempt_nonce
+            || chunk.sequence != sequence
+            || usize::try_from(chunk.offset).ok() != Some(source.len())
+            || chunk.total_len != open.source_len
+        {
+            return Err(authentication_failure(
+                "validate authenticated source chunk",
+                "source order or attempt binding differs",
+            ));
+        }
+        source.extend_from_slice(&chunk.bytes);
+        sequence = sequence
+            .checked_add(1)
+            .ok_or("authenticated source sequence overflows")?;
+    }
+    if source.len() != capacity || <[u8; 32]>::from(Sha256::digest(&source)) != open.source_digest {
+        return Err(authentication_failure(
+            "validate authenticated source",
+            "source length or digest differs from open",
+        ));
+    }
+    Ok(source)
+}
+
 fn result_digest(open: &BlobStreamOpen, roots: ([u8; 32], [u8; 32])) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(b"aster/blob-network-result/v1");
@@ -807,6 +775,7 @@ pub(crate) fn completed_pack_wire_len(
     Ok(reader.checkpoint().payload_len())
 }
 
+#[allow(dead_code)] // The pinned receiver arm is reconnected by Task 5.
 enum PackAccess<'a> {
     Path(&'a Path),
     Pinned(&'a PinnedBlobPackRoot),
@@ -933,11 +902,13 @@ impl PackExtentSource {
 
 fn protocol_open(
     open: &BlobStreamOpen,
-    authenticated_open: Vec<u8>,
+    authenticated_open: &[u8],
     wire_len: u64,
     attempt_nonce: [u8; 32],
     direction: StreamDirection,
 ) -> StreamOpenV1 {
+    let source_len = u32::try_from(authenticated_open.len()).unwrap_or(u32::MAX);
+    let source_digest = Sha256::digest(&authenticated_open).into();
     StreamOpenV1 {
         class: StreamClass::Blob,
         direction,
@@ -951,7 +922,8 @@ fn protocol_open(
         attempt_nonce,
         checkpoint_generation: 0,
         custody_digest: None,
-        authenticated_open,
+        source_len,
+        source_digest,
     }
 }
 
@@ -1057,16 +1029,15 @@ pub(crate) async fn send_canonical_blob_profile5(
         profile5_attempt_bounds(wire_len).map_err(|error| {
             BlobNetworkError::new(BlobNetworkStage::Framing, "bound canonical stream", error)
         })?;
-    let attempt = adapter
-        .open_attempt(AttemptOpenRequest {
-            deadline: Instant::now() + PROFILE5_ATTEMPT_TIMEOUT,
+    let attempt = await_authenticated_progress(
+        "open canonical transport attempt",
+        adapter.open_attempt(AttemptOpenRequest {
+            deadline: Instant::now() + profile5_attempt_hard_timeout(wire_len),
             max_data_bytes,
             max_control_bytes,
-        })
-        .await
-        .map_err(|error| {
-            transport_failure("open canonical transport attempt", format!("{error:?}"))
-        })?;
+        }),
+    )
+    .await?;
     let stream_direction = match direction {
         EventDirection::ToSessionInitiator => StreamDirection::ToSessionInitiator,
         EventDirection::ToSessionResponder => StreamDirection::ToSessionResponder,
@@ -1084,7 +1055,14 @@ pub(crate) async fn send_canonical_blob_profile5(
         attempt_nonce,
         checkpoint_generation: 0,
         custody_digest: None,
-        authenticated_open: source.stored.sealed.clone(),
+        source_len: u32::try_from(source.stored.sealed.len()).map_err(|_| {
+            BlobNetworkError::new(
+                BlobNetworkStage::Framing,
+                "bind canonical source",
+                "authenticated source length overflows",
+            )
+        })?,
+        source_digest: Sha256::digest(&source.stored.sealed).into(),
     };
     let mut codec = MissionBlobRecordCodec {
         mission: session,
@@ -1092,15 +1070,22 @@ pub(crate) async fn send_canonical_blob_profile5(
         direction,
         attempt_nonce,
     };
-    attempt
-        .send_data(&codec.encode(StreamFrame::Open(transfer_open.clone()))?)
-        .await
-        .map_err(|error| transport_failure("send canonical open", format!("{error:?}")))?;
-    let accept = attempt
-        .receive_control()
-        .await
-        .map_err(|error| transport_failure("receive canonical accept", format!("{error:?}")))?
-        .ok_or("control stream closed before canonical accept")?;
+    await_authenticated_progress(
+        "send canonical open",
+        attempt.send_data(&codec.encode(StreamFrame::Open(transfer_open.clone()))?),
+    )
+    .await?;
+    send_authenticated_source(
+        attempt.as_ref(),
+        &mut codec,
+        &transfer_open,
+        &source.stored.sealed,
+    )
+    .await?;
+    let accept =
+        await_authenticated_progress("receive canonical accept", attempt.receive_control())
+            .await?
+            .ok_or("control stream closed before canonical accept")?;
     let StreamFrame::Accept(accept) = codec.decode(&accept)? else {
         return Err("first canonical control frame was not accept".into());
     };
@@ -1119,25 +1104,23 @@ pub(crate) async fn send_canonical_blob_profile5(
         {
             StreamExtentAction::Send(data) => {
                 let (prefix, body) = codec.encode_data_parts(data)?;
-                attempt
-                    .send_data_parts(&prefix, &body)
-                    .await
-                    .map_err(|error| {
-                        transport_failure("send canonical data", format!("{error:?}"))
-                    })?;
+                await_authenticated_progress(
+                    "send canonical data",
+                    attempt.send_data_parts(&prefix, &body),
+                )
+                .await?;
                 pending = extent_source.next_extent()?;
             }
             StreamExtentAction::Retry {
                 reason: crate::stream_transfer::StreamRetry::CreditBlocked,
                 bytes,
             } => {
-                let checkpoint = attempt
-                    .receive_control()
-                    .await
-                    .map_err(|error| {
-                        transport_failure("receive canonical checkpoint", format!("{error:?}"))
-                    })?
-                    .ok_or("control stream closed before canonical checkpoint")?;
+                let checkpoint = await_authenticated_progress(
+                    "receive canonical checkpoint",
+                    attempt.receive_control(),
+                )
+                .await?
+                .ok_or("control stream closed before canonical checkpoint")?;
                 let StreamFrame::Checkpoint(checkpoint) = codec.decode(&checkpoint)? else {
                     return Err("canonical credit wait received a non-checkpoint frame".into());
                 };
@@ -1152,35 +1135,36 @@ pub(crate) async fn send_canonical_blob_profile5(
             }
         }
     }
-    let checkpoint = attempt
-        .receive_control()
-        .await
-        .map_err(|error| {
-            transport_failure("receive final canonical checkpoint", format!("{error:?}"))
-        })?
+    if wire_len != 0 {
+        let checkpoint = await_authenticated_progress(
+            "receive final canonical checkpoint",
+            attempt.receive_control(),
+        )
+        .await?
         .ok_or("control stream closed before final canonical checkpoint")?;
-    let StreamFrame::Checkpoint(checkpoint) = codec.decode(&checkpoint)? else {
-        return Err("final canonical control frame was not checkpoint".into());
-    };
-    state
-        .checkpoint(checkpoint)
-        .map_err(|error| failure("advance final canonical checkpoint", error))?;
-    checkpoints += 1;
+        let StreamFrame::Checkpoint(checkpoint) = codec.decode(&checkpoint)? else {
+            return Err("final canonical control frame was not checkpoint".into());
+        };
+        state
+            .checkpoint(checkpoint)
+            .map_err(|error| failure("advance final canonical checkpoint", error))?;
+        checkpoints += 1;
+    }
     let StreamAction::Send(finish) = state
         .finish(source.stored.manifest_digest.to_vec())
         .map_err(|error| failure("finish canonical sender state", error))?
     else {
         return Err("canonical sender did not produce finish".into());
     };
-    attempt
-        .send_data(&codec.encode(finish)?)
-        .await
-        .map_err(|error| transport_failure("send canonical finish", format!("{error:?}")))?;
-    let result = attempt
-        .receive_control()
-        .await
-        .map_err(|error| transport_failure("receive canonical result", format!("{error:?}")))?
-        .ok_or("control stream closed before canonical result")?;
+    await_authenticated_progress(
+        "send canonical finish",
+        attempt.send_data(&codec.encode(finish)?),
+    )
+    .await?;
+    let result =
+        await_authenticated_progress("receive canonical result", attempt.receive_control())
+            .await?
+            .ok_or("control stream closed before canonical result")?;
     let StreamFrame::Result(result) = codec.decode(&result)? else {
         return Err("terminal canonical control frame was not result".into());
     };
@@ -1214,23 +1198,14 @@ pub(crate) async fn send_canonical_blob_profile5(
             "result code differed",
         ));
     }
-    attempt
-        .send_data(&codec.encode(ack)?)
-        .await
-        .map_err(|error| {
-            transport_failure(
-                "send canonical result acknowledgement",
-                format!("{error:?}"),
-            )
-        })?;
-    attempt
-        .finish_data()
-        .await
-        .map_err(|error| transport_failure("finish canonical data stream", format!("{error:?}")))?;
-    if attempt
-        .receive_control()
-        .await
-        .map_err(|error| transport_failure("receive canonical control EOF", format!("{error:?}")))?
+    await_authenticated_progress(
+        "send canonical result acknowledgement",
+        attempt.send_data(&codec.encode(ack)?),
+    )
+    .await?;
+    await_authenticated_progress("finish canonical data stream", attempt.finish_data()).await?;
+    if await_authenticated_progress("receive canonical control EOF", attempt.receive_control())
+        .await?
         .is_some()
     {
         return Err("canonical control stream contained data after terminal result".into());
@@ -1282,11 +1257,18 @@ async fn send_completed_pack_inner(
         getrandom::fill(&mut attempt_nonce)
             .map_err(|error| authentication_failure("attempt nonce", error))?;
     }
-    let transfer_open = protocol_open(open, authenticated_open, wire_len, attempt_nonce, direction);
+    let transfer_open = protocol_open(
+        open,
+        &authenticated_open,
+        wire_len,
+        attempt_nonce,
+        direction,
+    );
     attempt
         .send_data(&codec.encode(StreamFrame::Open(transfer_open.clone()))?)
         .await
         .map_err(|error| transport_failure("send open", format!("{error:?}")))?;
+    send_authenticated_source(attempt.as_ref(), codec, &transfer_open, &authenticated_open).await?;
     let accept = attempt
         .receive_control()
         .await
@@ -1588,6 +1570,7 @@ pub async fn receive_completed_pack_with_store(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)] // Task 5 supplies profile-5 source acceptance before this receiver.
 pub(crate) async fn receive_completed_pack_with_store_protected(
     connection: Connection,
     mission: &mut MissionSession,
@@ -1659,6 +1642,8 @@ async fn receive_completed_pack_inner(
     let StreamFrame::Open(transfer_open) = codec.decode(&frame)? else {
         return Err("first data frame was not open".into());
     };
+    let authenticated_source =
+        receive_authenticated_source(attempt.as_ref(), codec, &transfer_open).await?;
     if transfer_open.class != StreamClass::Blob
         || transfer_open.direction != direction
         || transfer_open.total_len != wire_len
@@ -1666,7 +1651,7 @@ async fn receive_completed_pack_inner(
         || transfer_open.publication_id != *open.stream_id().as_bytes()
         || store_session
             .as_ref()
-            .is_some_and(|session| session.authenticated_open != transfer_open.authenticated_open)
+            .is_some_and(|session| session.authenticated_open != authenticated_source)
         || planned_nonce.is_some_and(|nonce| nonce != transfer_open.attempt_nonce)
     {
         return Err(authentication_failure(
@@ -1918,6 +1903,7 @@ async fn receive_completed_pack_inner(
 mod tests {
     use super::*;
     use crate::mission::{MissionPeerBinding, MissionSessionInitiator, MissionSessionResponder};
+    use crate::stream_transfer::PROFILE5_SOURCE_CHUNK_BYTES;
     use crate::stream_transport::{
         AdapterFuture, CandidateHealth, StreamAttempt, StreamReceiveAttempt,
         StreamTransportAdapter, StreamTransportError, StreamTransportId, TransferRequirements,
@@ -1945,19 +1931,19 @@ mod tests {
         // Mutation caught: concatenating carriers without lengths, splitting a
         // carrier at the transport ceiling, or accepting trailing bytes would
         // destroy canonical resume boundaries.
-        let extent = CanonicalCarrierExtentV1 {
+        let extent = CanonicalBlobExtentV1 {
             first_chunk_index: 9,
             carriers: vec![vec![0x11; 65_000], vec![0x22; 66_000]],
         };
         let encoded = extent.encode().expect("canonical carrier extent");
         assert!(encoded.len() <= PROFILE5_CANONICAL_EXTENT_BYTES);
-        assert_eq!(CanonicalCarrierExtentV1::decode(&encoded).unwrap(), extent);
+        assert_eq!(CanonicalBlobExtentV1::decode(&encoded).unwrap(), extent);
 
         let mut trailing = encoded.clone();
         trailing.push(0);
-        assert!(CanonicalCarrierExtentV1::decode(&trailing).is_err());
+        assert!(CanonicalBlobExtentV1::decode(&trailing).is_err());
         assert!(
-            CanonicalCarrierExtentV1 {
+            CanonicalBlobExtentV1 {
                 first_chunk_index: 0,
                 carriers: vec![vec![0; PROFILE5_CANONICAL_EXTENT_BYTES]],
             }
@@ -1974,6 +1960,31 @@ mod tests {
         assert!(error.to_string().contains("wire length overflow"));
         assert_eq!(error.public_message(), "profile-5 Blob framing failed");
         assert!(!error.public_message().contains("overflow"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn authenticated_progress_keeps_large_attempt_alive_past_ten_minutes() {
+        let started = tokio::time::Instant::now();
+        for _ in 0..8 {
+            let value = await_authenticated_progress("slow progress", async {
+                tokio::time::sleep(std::time::Duration::from_secs(90)).await;
+                Ok::<_, StreamTransportError>(())
+            })
+            .await;
+            assert!(value.is_ok());
+        }
+        assert!(started.elapsed() >= std::time::Duration::from_secs(12 * 60));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_authenticated_transfer_times_out_retryably() {
+        let error = await_authenticated_progress("stalled progress", async {
+            std::future::pending::<Result<(), StreamTransportError>>().await
+        })
+        .await
+        .expect_err("idle transfer must time out");
+        assert_eq!(error.stage(), BlobNetworkStage::Transport);
+        assert!(error.to_string().contains("idle timeout"));
     }
 
     fn mission_pair() -> (MissionSession, MissionSession, [u8; 32]) {
@@ -2033,6 +2044,129 @@ mod tests {
         let negotiated = crate::event_pages::negotiate_transfer_profiles(&offer, &offer).unwrap();
         let digest = crate::event_pages::transfer_profile_digest(&offer, &offer, &negotiated);
         (initiator, responder, digest)
+    }
+
+    #[test]
+    fn maximum_canonical_manifest_and_production_extent_fit_iroh_frames() {
+        let (mut sender, mut receiver, profile_digest) = mission_pair();
+        let attempt_nonce = [0x61; 32];
+        let source = vec![0x5a; usize::try_from(aster_mesh::MAX_BLOB_MANIFEST_BYTES).unwrap()];
+        let source_digest = Sha256::digest(&source).into();
+        let source_len = u32::try_from(source.len()).unwrap();
+        let plan = crate::frame::Frame::BlobStreamPlan {
+            direction: EventDirection::ToSessionResponder,
+            attempt_nonce: Some(attempt_nonce),
+            source: Some(crate::frame::BlobStreamSourceOfferV1 {
+                transfer_id: [0x62; 32],
+                source_len,
+                source_digest,
+            }),
+        }
+        .encode_for_semantic_version(9)
+        .expect("bounded production plan");
+        let protected_plan = sender.seal_application_frame(&plan).expect("protect plan");
+        assert!(protected_plan.len() <= aster_iroh::DEFAULT_MAX_EXCHANGE_BYTES);
+        assert_eq!(
+            receiver.open_application_frame(&protected_plan).unwrap(),
+            plan
+        );
+
+        let open = StreamOpenV1 {
+            class: StreamClass::Blob,
+            direction: StreamDirection::ToSessionResponder,
+            session_transcript: sender.session_id(),
+            exchange_id: 1,
+            transfer_id: [0x62; 32],
+            source_transfer_id: [0x62; 32],
+            publication_id: [0x63; 32],
+            variant_id: [0x64; 32],
+            total_len: 8 * 1024 * 1024 * 1024,
+            attempt_nonce,
+            checkpoint_generation: 0,
+            custody_digest: None,
+            source_len,
+            source_digest,
+        };
+        let mut send_codec = MissionBlobRecordCodec {
+            mission: &mut sender,
+            profile_digest,
+            direction: EventDirection::ToSessionResponder,
+            attempt_nonce,
+        };
+        let protected_open = send_codec
+            .encode(StreamFrame::Open(open.clone()))
+            .expect("protect open");
+        assert!(protected_open.len() <= aster_iroh::DEFAULT_MAX_EXCHANGE_BYTES);
+
+        let mut protected_sources = Vec::new();
+        for (sequence, chunk) in source
+            .chunks(crate::stream_transfer::PROFILE5_SOURCE_CHUNK_BYTES)
+            .enumerate()
+        {
+            let offset =
+                u32::try_from(sequence * crate::stream_transfer::PROFILE5_SOURCE_CHUNK_BYTES)
+                    .unwrap();
+            let protected = send_codec
+                .encode(StreamFrame::Source(
+                    crate::stream_transfer::StreamSourceV1 {
+                        transfer_id: open.transfer_id,
+                        attempt_nonce,
+                        sequence: sequence as u64,
+                        offset,
+                        total_len: source_len,
+                        bytes: chunk.to_vec(),
+                    },
+                ))
+                .expect("protect source chunk");
+            assert!(protected.len() <= aster_iroh::DEFAULT_MAX_EXCHANGE_BYTES);
+            assert!(protected.len() + 4 <= aster_iroh::DEFAULT_MAX_EXCHANGE_BYTES + 4);
+            protected_sources.push(protected);
+        }
+
+        let carrier_len = aster_mesh::MAX_BLOB_TRANSFER_OBJECT_BYTES;
+        let extent = CanonicalBlobExtentV1 {
+            first_chunk_index: 0,
+            carriers: vec![vec![0xa5; carrier_len]; 15],
+        };
+        let extent_bytes = extent.encode().expect("production canonical extent");
+        let data = crate::stream_transfer::StreamDataV1 {
+            transfer_id: open.transfer_id,
+            attempt_nonce,
+            sequence: protected_sources.len() as u64,
+            offset: 0,
+            bytes: extent_bytes.clone(),
+        };
+        let (prefix, body) = send_codec
+            .encode_data_parts(data)
+            .expect("protect data extent");
+        assert!(prefix.len() + body.len() <= aster_iroh::DEFAULT_MAX_EXCHANGE_BYTES);
+        assert!(prefix.len() + body.len() + 4 <= aster_iroh::DEFAULT_MAX_EXCHANGE_BYTES + 4);
+
+        let mut receive_codec = MissionBlobRecordCodec {
+            mission: &mut receiver,
+            profile_digest,
+            direction: EventDirection::ToSessionResponder,
+            attempt_nonce,
+        };
+        assert_eq!(
+            receive_codec.decode(&protected_open).unwrap(),
+            StreamFrame::Open(open)
+        );
+        for protected in protected_sources {
+            assert!(matches!(
+                receive_codec.decode(&protected).unwrap(),
+                StreamFrame::Source(_)
+            ));
+        }
+        let mut emitted = prefix;
+        emitted.extend_from_slice(&body);
+        let StreamFrame::Data(decoded) = receive_codec.decode(&emitted).unwrap() else {
+            panic!("production data frame decoded as another kind");
+        };
+        assert_eq!(
+            CanonicalBlobExtentV1::decode(&decoded.bytes).unwrap(),
+            extent
+        );
     }
 
     #[test]
@@ -2343,6 +2477,108 @@ mod tests {
             let receiver = Arc::clone(&self.receiver);
             Box::pin(async move { Ok(receiver as Arc<dyn StreamReceiveAttempt>) })
         }
+    }
+
+    #[tokio::test]
+    async fn authenticated_source_reassembly_binds_order_length_and_digest() {
+        fn receiver_with(frames: Vec<Vec<u8>>) -> Arc<MemoryReceiverAttempt> {
+            let (data, receive) = mpsc::unbounded_channel();
+            for frame in frames {
+                data.send(Some(frame)).unwrap();
+            }
+            let (control, _control_receive) = mpsc::unbounded_channel();
+            Arc::new(MemoryReceiverAttempt {
+                data: tokio::sync::Mutex::new(receive),
+                control,
+                fail_after_receives: None,
+                receives: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+
+        let source = vec![0x91; PROFILE5_SOURCE_CHUNK_BYTES + 3];
+        let open = StreamOpenV1 {
+            class: StreamClass::Blob,
+            direction: StreamDirection::ToSessionResponder,
+            session_transcript: [0x92; 32],
+            exchange_id: 1,
+            transfer_id: [0x93; 32],
+            source_transfer_id: [0x93; 32],
+            publication_id: [0x94; 32],
+            variant_id: [0x95; 32],
+            total_len: 0,
+            attempt_nonce: [0x96; 32],
+            checkpoint_generation: 0,
+            custody_digest: None,
+            source_len: source.len() as u32,
+            source_digest: Sha256::digest(&source).into(),
+        };
+        let frames = source
+            .chunks(PROFILE5_SOURCE_CHUNK_BYTES)
+            .enumerate()
+            .map(|(sequence, bytes)| {
+                encoded(StreamFrame::Source(
+                    crate::stream_transfer::StreamSourceV1 {
+                        transfer_id: open.transfer_id,
+                        attempt_nonce: open.attempt_nonce,
+                        sequence: sequence as u64,
+                        offset: (sequence * PROFILE5_SOURCE_CHUNK_BYTES) as u32,
+                        total_len: open.source_len,
+                        bytes: bytes.to_vec(),
+                    },
+                ))
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            receive_authenticated_source(
+                receiver_with(frames.clone()).as_ref(),
+                &mut PlainBlobRecordCodec,
+                &open,
+            )
+            .await
+            .unwrap(),
+            source
+        );
+
+        let mut out_of_order = frames;
+        out_of_order.swap(0, 1);
+        let error = receive_authenticated_source(
+            receiver_with(out_of_order).as_ref(),
+            &mut PlainBlobRecordCodec,
+            &open,
+        )
+        .await
+        .expect_err("out-of-order source must fail closed");
+        assert_eq!(error.stage(), BlobNetworkStage::Authentication);
+
+        let mut wrong_digest = open;
+        wrong_digest.source_digest = [0x97; 32];
+        let valid_frames = source
+            .chunks(PROFILE5_SOURCE_CHUNK_BYTES)
+            .enumerate()
+            .map(|(sequence, bytes)| {
+                encoded(StreamFrame::Source(
+                    crate::stream_transfer::StreamSourceV1 {
+                        transfer_id: wrong_digest.transfer_id,
+                        attempt_nonce: wrong_digest.attempt_nonce,
+                        sequence: sequence as u64,
+                        offset: (sequence * PROFILE5_SOURCE_CHUNK_BYTES) as u32,
+                        total_len: wrong_digest.source_len,
+                        bytes: bytes.to_vec(),
+                    },
+                ))
+                .unwrap()
+            })
+            .collect();
+        assert!(
+            receive_authenticated_source(
+                receiver_with(valid_frames).as_ref(),
+                &mut PlainBlobRecordCodec,
+                &wrong_digest,
+            )
+            .await
+            .is_err()
+        );
     }
 
     impl StreamReceiveAttempt for TerminalReceiveAttempt {

@@ -279,9 +279,7 @@ pub(super) fn blob_source_shape_read(
         || import.blob_id != blob_id
         || import.epoch != epoch
         || import.physical_lineage != Some(physical_lineage)
-        || import.total_len == 0
         || import.chunk_size != SELECTED_BLOB_CHUNK_SIZE
-        || import.chunk_count == 0
         || import.chunk_count != route_chunk_count
         || expected_chunks != Some(import.chunk_count)
         || (completed && import.finalized_manifest_digest != Some(manifest_digest))
@@ -330,9 +328,7 @@ pub(super) fn blob_source_shape_write(
         || import.blob_id != blob_id
         || import.epoch != epoch
         || import.physical_lineage != Some(physical_lineage)
-        || import.total_len == 0
         || import.chunk_size != SELECTED_BLOB_CHUNK_SIZE
-        || import.chunk_count == 0
         || import.chunk_count != route_chunk_count
         || expected_chunks != Some(import.chunk_count)
         || (completed && import.finalized_manifest_digest != Some(manifest_digest))
@@ -521,9 +517,7 @@ impl ImportRecord {
         manifest: &BlobManifest,
         physical_lineage: Option<BlobPhysicalLineage>,
     ) -> Result<Self, StoreError> {
-        if manifest.total_len() == 0
-            || manifest.chunk_size() != SELECTED_BLOB_CHUNK_SIZE
-            || manifest.chunk_count() == 0
+        if manifest.chunk_size() != SELECTED_BLOB_CHUNK_SIZE
             || manifest.chunk_count() > MAX_SELECTED_BLOB_CHUNKS
             || manifest.content_epoch() == 0
         {
@@ -5190,13 +5184,9 @@ fn decode_import(bytes: &[u8]) -> Result<ImportRecord, StoreError> {
     let schema_len = usize::from(cursor.u16()?);
     let schema_id = cursor.take(schema_len)?.to_vec();
     cursor.finish()?;
-    let canonical_chunk_count = total_len
-        .checked_sub(1)
-        .map(|last| 1 + last / u64::from(SELECTED_BLOB_CHUNK_SIZE));
+    let canonical_chunk_count = Some(total_len.div_ceil(u64::from(SELECTED_BLOB_CHUNK_SIZE)));
     let metadata_valid = CoreBlobMetadata::new(media_type.clone(), schema_id.clone()).is_ok();
-    if total_len == 0
-        || chunk_size != SELECTED_BLOB_CHUNK_SIZE
-        || chunk_count == 0
+    if chunk_size != SELECTED_BLOB_CHUNK_SIZE
         || Some(chunk_count) != canonical_chunk_count
         || chunk_count > MAX_SELECTED_BLOB_CHUNKS
         || epoch == 0

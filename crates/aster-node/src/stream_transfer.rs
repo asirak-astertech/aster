@@ -6,9 +6,9 @@ use std::{
 const MAGIC: &[u8; 4] = b"ASM\x01";
 const COMPOSITE_DATA_MAGIC: &[u8; 4] = b"ASD1";
 const CANONICAL_BLOB_EXTENT_MAGIC: &[u8; 4] = b"ABX1";
+pub(crate) const PROFILE5_SOURCE_CHUNK_BYTES: usize = 1024 * 1024;
 pub(crate) const PROFILE5_CANONICAL_PLAINTEXT_CHUNK_BYTES: usize =
     aster_mesh::MAX_BLOB_CHUNK_SIZE as usize;
-pub(crate) const PROFILE5_CANONICAL_CHUNK_RECORD_BYTES: usize = 72;
 pub(crate) const PROFILE5_CANONICAL_CARRIER_RECORD_BYTES: usize =
     aster_mesh::MAX_BLOB_TRANSFER_OBJECT_BYTES;
 /// Target encoded batch ceiling. Stream framing retains its independently
@@ -26,7 +26,13 @@ pub(crate) const PROFILE5_EXTENT_BYTES: usize = PROFILE5_RECORD_PREFIX_BYTES
     + aster_mesh::BLOB_STREAM_SEGMENT_ENCODED_OVERHEAD_BYTES;
 pub(crate) const PROFILE5_MAX_RECORD_BYTES: usize =
     PROFILE5_EXTENT_BYTES - PROFILE5_RECORD_PREFIX_BYTES;
+/// No authenticated protocol progress for this long is a retryable stall.
+pub(crate) const PROFILE5_IDLE_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+/// Legacy pack paths retain their bounded attempt while profile-5 canonical
+/// streams use the size-derived hard bound below.
 pub(crate) const PROFILE5_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const PROFILE5_MIN_USEFUL_BYTES_PER_SECOND: u64 = 128 * 1024;
+const PROFILE5_SETTLEMENT_HEADROOM: Duration = Duration::from_secs(20 * 60);
 pub(crate) const MAX_STREAM_EXTENT_BYTES: usize = PROFILE5_EXTENT_BYTES;
 pub(crate) const MAX_STREAM_CHECKPOINT_BATCH_BYTES: u32 = 128 * 1_048_576;
 pub(crate) const STREAM_DATA_FIXED_BYTES: usize = 89;
@@ -37,7 +43,7 @@ pub(crate) const MAX_STREAM_SEMANTIC_COMMITMENT_BYTES: usize = 64 * 1024;
 /// Signed canonical source envelope, including the maximum 8-GiB Blob's
 /// bounded ~9-MiB manifest plus route and signature material.
 pub(crate) const MAX_STREAM_AUTHENTICATED_OPEN_BYTES: usize = 16 * 1024 * 1024;
-pub(crate) const STREAM_TAGS: std::ops::RangeInclusive<u8> = 0xd6..=0xdc;
+pub(crate) const STREAM_TAGS: std::ops::RangeInclusive<u8> = 0xd6..=0xdd;
 
 pub(crate) fn profile5_receive_limit(total: u64, durable: u64, checkpoint_batch: u32) -> u64 {
     let extent = PROFILE5_EXTENT_BYTES as u64;
@@ -73,6 +79,14 @@ pub(crate) fn profile5_attempt_bounds(bytes: u64) -> Result<(usize, usize), Stre
     Ok((data, control))
 }
 
+/// Hard cancellation bound for one canonical attempt. The 128-KiB/s floor is
+/// more than an order of magnitude below the measured 1.5-MiB/s CM4 result;
+/// idle progress is governed independently by `PROFILE5_IDLE_TIMEOUT`.
+pub(crate) fn profile5_attempt_hard_timeout(bytes: u64) -> Duration {
+    Duration::from_secs(bytes.div_ceil(PROFILE5_MIN_USEFUL_BYTES_PER_SECOND))
+        .saturating_add(PROFILE5_SETTLEMENT_HEADROOM)
+}
+
 pub(crate) fn blob_pack_wire_len(plaintext_len: u64) -> Result<u64, StreamError> {
     let segments = plaintext_len.div_ceil(aster_mesh::BLOB_STREAM_SEGMENT_BYTES as u64);
     plaintext_len
@@ -101,37 +115,37 @@ impl Display for StreamError {
 }
 impl std::error::Error for StreamError {}
 
-/// One ordered batch of complete canonical manifest chunk records.
-///
-/// The encrypted carrier bytes for these records are transported by the same
-/// index range, but remain outside this compact manifest codec so callers can
-/// stream ciphertext without retaining an entire Blob in memory.
+/// One ordered batch of complete, byte-identical canonical encrypted carriers.
+/// Manifest records arrive authenticated in the bounded SOURCE phase; the
+/// receiver indexes these carriers against that verified manifest.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CanonicalBlobExtentV1 {
     pub first_chunk_index: u64,
-    pub records: Vec<aster_mesh::BlobChunkRecord>,
+    pub carriers: Vec<Vec<u8>>,
 }
 
 impl CanonicalBlobExtentV1 {
     pub(crate) fn encode(&self) -> Result<Vec<u8>, StreamError> {
-        if self.records.is_empty()
+        if self.carriers.is_empty()
             || self
                 .first_chunk_index
-                .checked_add(self.records.len() as u64)
+                .checked_add(self.carriers.len() as u64)
                 .is_none_or(|end| end > aster_mesh::MAX_BLOB_CHUNKS)
         {
             return Err(StreamError::invalid(
                 "canonical Blob extent index range is invalid",
             ));
         }
-        let encoded_len = CANONICAL_BLOB_EXTENT_HEADER_BYTES
-            .checked_add(
-                self.records
-                    .len()
-                    .checked_mul(PROFILE5_CANONICAL_CHUNK_RECORD_BYTES)
-                    .ok_or_else(|| StreamError::invalid("canonical Blob extent overflow"))?,
-            )
-            .ok_or_else(|| StreamError::invalid("canonical Blob extent overflow"))?;
+        let mut encoded_len = CANONICAL_BLOB_EXTENT_HEADER_BYTES;
+        for carrier in &self.carriers {
+            if carrier.is_empty() || carrier.len() > PROFILE5_CANONICAL_CARRIER_RECORD_BYTES {
+                return Err(StreamError::invalid("canonical carrier length is invalid"));
+            }
+            encoded_len = encoded_len
+                .checked_add(4)
+                .and_then(|length| length.checked_add(carrier.len()))
+                .ok_or_else(|| StreamError::invalid("canonical Blob extent overflow"))?;
+        }
         if encoded_len > PROFILE5_CANONICAL_EXTENT_BYTES {
             return Err(StreamError::invalid(
                 "canonical Blob extent exceeds profile-5 bound",
@@ -141,15 +155,17 @@ impl CanonicalBlobExtentV1 {
         output.extend_from_slice(CANONICAL_BLOB_EXTENT_MAGIC);
         output.extend_from_slice(&self.first_chunk_index.to_be_bytes());
         output.extend_from_slice(
-            &u32::try_from(self.records.len())
+            &u32::try_from(self.carriers.len())
                 .map_err(|_| StreamError::invalid("canonical Blob extent count overflows"))?
                 .to_be_bytes(),
         );
-        for record in &self.records {
-            output.extend_from_slice(record.plaintext_sha256());
-            output.extend_from_slice(record.ciphertext_sha256());
-            output.extend_from_slice(&record.plaintext_len().to_be_bytes());
-            output.extend_from_slice(&record.ciphertext_len().to_be_bytes());
+        for carrier in &self.carriers {
+            output.extend_from_slice(
+                &u32::try_from(carrier.len())
+                    .map_err(|_| StreamError::invalid("canonical carrier length overflows"))?
+                    .to_be_bytes(),
+            );
+            output.extend_from_slice(carrier);
         }
         Ok(output)
     }
@@ -174,11 +190,6 @@ impl CanonicalBlobExtentV1 {
             )?))
             .map_err(|_| StreamError::invalid("canonical Blob extent count overflows"))?;
         if count == 0
-            || CANONICAL_BLOB_EXTENT_HEADER_BYTES.checked_add(
-                count
-                    .checked_mul(PROFILE5_CANONICAL_CHUNK_RECORD_BYTES)
-                    .ok_or_else(|| StreamError::invalid("canonical Blob extent overflows"))?,
-            ) != Some(bytes.len())
             || first_chunk_index
                 .checked_add(count as u64)
                 .is_none_or(|end| end > aster_mesh::MAX_BLOB_CHUNKS)
@@ -187,35 +198,42 @@ impl CanonicalBlobExtentV1 {
                 "canonical Blob extent length or range is invalid",
             ));
         }
-        let mut records = Vec::with_capacity(count);
-        for encoded in bytes[CANONICAL_BLOB_EXTENT_HEADER_BYTES..]
-            .chunks_exact(PROFILE5_CANONICAL_CHUNK_RECORD_BYTES)
-        {
-            records.push(
-                aster_mesh::BlobChunkRecord::from_parts(
-                    encoded[..32]
-                        .try_into()
-                        .map_err(|_| StreamError::invalid("canonical Blob record is truncated"))?,
-                    encoded[32..64]
-                        .try_into()
-                        .map_err(|_| StreamError::invalid("canonical Blob record is truncated"))?,
-                    u32::from_be_bytes(
-                        encoded[64..68].try_into().map_err(|_| {
-                            StreamError::invalid("canonical Blob record is truncated")
-                        })?,
-                    ),
-                    u32::from_be_bytes(
-                        encoded[68..72].try_into().map_err(|_| {
-                            StreamError::invalid("canonical Blob record is truncated")
-                        })?,
-                    ),
-                )
-                .map_err(|error| StreamError::invalid(error.to_string()))?,
+        let mut carriers = Vec::with_capacity(count);
+        let mut offset = CANONICAL_BLOB_EXTENT_HEADER_BYTES;
+        for _ in 0..count {
+            let length_end = offset
+                .checked_add(4)
+                .ok_or_else(|| StreamError::invalid("canonical carrier extent overflows"))?;
+            let length = usize::try_from(u32::from_be_bytes(
+                bytes
+                    .get(offset..length_end)
+                    .ok_or_else(|| StreamError::invalid("canonical carrier extent is truncated"))?
+                    .try_into()
+                    .map_err(|_| StreamError::invalid("canonical carrier extent is truncated"))?,
+            ))
+            .map_err(|_| StreamError::invalid("canonical carrier length overflows"))?;
+            if length == 0 || length > PROFILE5_CANONICAL_CARRIER_RECORD_BYTES {
+                return Err(StreamError::invalid("canonical carrier length is invalid"));
+            }
+            let end = length_end
+                .checked_add(length)
+                .ok_or_else(|| StreamError::invalid("canonical carrier extent overflows"))?;
+            carriers.push(
+                bytes
+                    .get(length_end..end)
+                    .ok_or_else(|| StreamError::invalid("canonical carrier extent is truncated"))?
+                    .to_vec(),
             );
+            offset = end;
+        }
+        if offset != bytes.len() {
+            return Err(StreamError::invalid(
+                "canonical carrier extent has trailing bytes",
+            ));
         }
         Ok(Self {
             first_chunk_index,
-            records,
+            carriers,
         })
     }
 }
@@ -287,9 +305,17 @@ pub(crate) struct StreamOpenV1 {
     pub attempt_nonce: [u8; 32],
     pub checkpoint_generation: u64,
     pub custody_digest: Option<[u8; 32]>,
-    /// Source-authenticated semantic admission object. Transport identity
-    /// alone is not authority to reserve or promote receiver storage.
-    pub authenticated_open: Vec<u8>,
+    pub source_len: u32,
+    pub source_digest: [u8; 32],
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StreamSourceV1 {
+    pub transfer_id: [u8; 32],
+    pub attempt_nonce: [u8; 32],
+    pub sequence: u64,
+    pub offset: u32,
+    pub total_len: u32,
+    pub bytes: Vec<u8>,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StreamAcceptV1 {
@@ -354,6 +380,7 @@ pub(crate) struct StreamResultAckV1 {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum StreamFrame {
     Open(StreamOpenV1),
+    Source(StreamSourceV1),
     Accept(StreamAcceptV1),
     Data(StreamDataV1),
     Checkpoint(StreamCheckpointV1),
@@ -423,7 +450,8 @@ impl StreamFrame {
     pub(crate) fn declared_direction(&self) -> Option<StreamDirection> {
         match self {
             Self::Open(value) => Some(value.direction),
-            Self::Accept(_)
+            Self::Source(_)
+            | Self::Accept(_)
             | Self::Data(_)
             | Self::Checkpoint(_)
             | Self::Finish(_)
@@ -435,6 +463,7 @@ impl StreamFrame {
     pub(crate) fn attempt_binding(&self) -> ([u8; 32], Option<u64>) {
         match self {
             Self::Open(value) => (value.attempt_nonce, None),
+            Self::Source(value) => (value.attempt_nonce, Some(value.sequence)),
             Self::Accept(value) => (value.attempt_nonce, Some(value.sequence)),
             Self::Data(value) => (value.attempt_nonce, Some(value.sequence)),
             Self::Checkpoint(value) => (value.attempt_nonce, Some(value.sequence)),
@@ -450,7 +479,15 @@ impl StreamFrame {
         match self {
             Self::Open(x) => {
                 nonce(&x.attempt_nonce)?;
-                validate_authenticated_open(&x.authenticated_open)?;
+                if x.source_len == 0
+                    || usize::try_from(x.source_len)
+                        .ok()
+                        .is_none_or(|length| length > MAX_STREAM_AUTHENTICATED_OPEN_BYTES)
+                {
+                    return Err(StreamError::invalid(
+                        "authenticated source length is out of bounds",
+                    ));
+                }
                 o.push(0xd6);
                 o.extend([x.class as u8, x.direction as u8]);
                 o.extend(9u16.to_be_bytes());
@@ -471,12 +508,37 @@ impl StreamFrame {
                         o.extend(d)
                     }
                 }
+                o.extend(x.source_len.to_be_bytes());
+                o.extend(x.source_digest);
+            }
+            Self::Source(x) => {
+                nonce(&x.attempt_nonce)?;
+                if x.bytes.is_empty()
+                    || x.bytes.len() > PROFILE5_SOURCE_CHUNK_BYTES
+                    || x.total_len == 0
+                    || usize::try_from(x.total_len)
+                        .ok()
+                        .is_none_or(|length| length > MAX_STREAM_AUTHENTICATED_OPEN_BYTES)
+                    || x.offset
+                        .checked_add(u32::try_from(x.bytes.len()).map_err(|_| {
+                            StreamError::invalid("authenticated source chunk overflows")
+                        })?)
+                        .is_none_or(|end| end > x.total_len)
+                {
+                    return Err(StreamError::invalid(
+                        "authenticated source chunk is out of bounds",
+                    ));
+                }
+                o.push(0xdd);
+                put_attempt(&mut o, &x.transfer_id, &x.attempt_nonce, x.sequence);
+                o.extend(x.offset.to_be_bytes());
+                o.extend(x.total_len.to_be_bytes());
                 o.extend(
-                    u32::try_from(x.authenticated_open.len())
-                        .map_err(|_| StreamError::invalid("authenticated open overflow"))?
+                    u32::try_from(x.bytes.len())
+                        .map_err(|_| StreamError::invalid("authenticated source chunk overflows"))?
                         .to_be_bytes(),
                 );
-                o.extend(&x.authenticated_open);
+                o.extend(&x.bytes);
             }
             Self::Accept(x) => {
                 nonce(&x.attempt_nonce)?;
@@ -583,16 +645,17 @@ impl StreamFrame {
                     1 => Some(r.array()?),
                     _ => return Err(StreamError::invalid("noncanonical custody presence")),
                 };
-                let authenticated_open_len = usize::try_from(r.u32()?)
-                    .map_err(|_| StreamError::invalid("authenticated open overflow"))?;
-                if authenticated_open_len == 0
-                    || authenticated_open_len > MAX_STREAM_AUTHENTICATED_OPEN_BYTES
+                let source_len = r.u32()?;
+                if source_len == 0
+                    || usize::try_from(source_len)
+                        .ok()
+                        .is_none_or(|length| length > MAX_STREAM_AUTHENTICATED_OPEN_BYTES)
                 {
                     return Err(StreamError::invalid(
-                        "authenticated open length is out of bounds",
+                        "authenticated source length is out of bounds",
                     ));
                 }
-                let authenticated_open = r.take(authenticated_open_len)?.to_vec();
+                let source_digest = r.array()?;
                 Self::Open(StreamOpenV1 {
                     class,
                     direction,
@@ -606,7 +669,39 @@ impl StreamFrame {
                     attempt_nonce,
                     checkpoint_generation,
                     custody_digest,
-                    authenticated_open,
+                    source_len,
+                    source_digest,
+                })
+            }
+            0xdd => {
+                let (transfer_id, attempt_nonce, sequence) = r.attempt()?;
+                let offset = r.u32()?;
+                let total_len = r.u32()?;
+                let chunk_len = usize::try_from(r.u32()?)
+                    .map_err(|_| StreamError::invalid("authenticated source chunk overflows"))?;
+                if chunk_len == 0
+                    || chunk_len > PROFILE5_SOURCE_CHUNK_BYTES
+                    || total_len == 0
+                    || usize::try_from(total_len)
+                        .ok()
+                        .is_none_or(|length| length > MAX_STREAM_AUTHENTICATED_OPEN_BYTES)
+                    || offset
+                        .checked_add(u32::try_from(chunk_len).map_err(|_| {
+                            StreamError::invalid("authenticated source chunk overflows")
+                        })?)
+                        .is_none_or(|end| end > total_len)
+                {
+                    return Err(StreamError::invalid(
+                        "authenticated source chunk is out of bounds",
+                    ));
+                }
+                Self::Source(StreamSourceV1 {
+                    transfer_id,
+                    attempt_nonce,
+                    sequence,
+                    offset,
+                    total_len,
+                    bytes: r.take(chunk_len)?.to_vec(),
                 })
             }
             0xd7 => {
@@ -1299,7 +1394,8 @@ pub(crate) fn fuzz_decode(input: &[u8]) {
             attempt_nonce,
             checkpoint_generation: 0,
             custody_digest: None,
-            authenticated_open: vec![7],
+            source_len: 1,
+            source_digest: [7; 32],
         })),
         b"d7" => Some(StreamFrame::Accept(StreamAcceptV1 {
             transfer_id: id,
@@ -1370,7 +1466,8 @@ pub(crate) fn fuzz_decode(input: &[u8]) {
             attempt_nonce,
             checkpoint_generation: 0,
             custody_digest: None,
-            authenticated_open: vec![7],
+            source_len: 1,
+            source_digest: [7; 32],
         };
         if let Ok(mut receiver) = StreamReceiverState::new(&open, 0, 0, 1, 1) {
             let _ = receiver.data(&data);
@@ -1381,7 +1478,6 @@ pub(crate) fn fuzz_decode(input: &[u8]) {
 #[cfg(test)]
 mod stream_frame_codec {
     use super::*;
-    use aster_mesh::BlobChunkRecord;
     use sha2::{Digest, Sha256};
 
     #[test]
@@ -1398,38 +1494,19 @@ mod stream_frame_codec {
         assert!(control_bytes >= usize::try_from(extents).expect("extents") * 192 + 8192);
     }
 
-    fn canonical_record(seed: u8, plaintext_len: u32) -> BlobChunkRecord {
-        BlobChunkRecord::from_parts(
-            [seed; 32],
-            [seed.wrapping_add(1); 32],
-            plaintext_len,
-            plaintext_len + 16,
-        )
-        .expect("canonical record")
-    }
-
     #[test]
-    fn profile5_extent_batches_complete_canonical_chunk_records() {
-        // Mutations caught: using the plaintext chunk bound as the encoded-record
-        // bound, splitting a 72-byte record at an extent edge, or accepting a
-        // noncanonical/trailing extent encoding.
+    fn profile5_extent_batches_complete_canonical_carriers() {
+        // Mutations caught: splitting a canonical carrier at an extent edge or
+        // accepting a noncanonical/trailing extent encoding.
         assert_eq!(PROFILE5_CANONICAL_PLAINTEXT_CHUNK_BYTES, 64 * 1024);
-        assert_eq!(PROFILE5_CANONICAL_CHUNK_RECORD_BYTES, 72);
         assert!(PROFILE5_CANONICAL_CARRIER_RECORD_BYTES > 64 * 1024);
         assert!(PROFILE5_CANONICAL_EXTENT_BYTES > PROFILE5_CANONICAL_CARRIER_RECORD_BYTES);
 
         let extent = CanonicalBlobExtentV1 {
             first_chunk_index: 17,
-            records: vec![
-                canonical_record(0x11, 64 * 1024),
-                canonical_record(0x22, 31),
-            ],
+            carriers: vec![vec![0x11; 65_000], vec![0x22; 66_000]],
         };
         let encoded = extent.encode().expect("encode canonical extent");
-        assert_eq!(
-            encoded.len(),
-            CANONICAL_BLOB_EXTENT_HEADER_BYTES + 2 * PROFILE5_CANONICAL_CHUNK_RECORD_BYTES
-        );
         assert_eq!(CanonicalBlobExtentV1::decode(&encoded).unwrap(), extent);
 
         for split in 0..encoded.len() {
@@ -1438,6 +1515,80 @@ mod stream_frame_codec {
         let mut trailing = encoded;
         trailing.push(0);
         assert!(CanonicalBlobExtentV1::decode(&trailing).is_err());
+    }
+
+    #[test]
+    fn authenticated_source_chunks_are_ordered_and_bounded() {
+        let source = StreamSourceV1 {
+            transfer_id: [0x31; 32],
+            attempt_nonce: [0x32; 32],
+            sequence: 3,
+            offset: PROFILE5_SOURCE_CHUNK_BYTES as u32,
+            total_len: (PROFILE5_SOURCE_CHUNK_BYTES + 7) as u32,
+            bytes: vec![0x33; 7],
+        };
+        let frame = StreamFrame::Source(source.clone());
+        let encoded = frame.encode_for_context(9, 5).unwrap();
+        assert_eq!(
+            StreamFrame::decode_for_context(9, 5, &encoded).unwrap(),
+            frame
+        );
+        assert!(encoded.len() <= aster_iroh::DEFAULT_MAX_EXCHANGE_BYTES);
+
+        let oversized = StreamFrame::Source(StreamSourceV1 {
+            bytes: vec![0; PROFILE5_SOURCE_CHUNK_BYTES + 1],
+            ..source
+        });
+        assert!(oversized.encode_for_context(9, 5).is_err());
+    }
+
+    #[test]
+    fn empty_profile5_sender_settles_without_data_extents() {
+        let transfer_id = [0x81; 32];
+        let attempt_nonce = [0x82; 32];
+        let mut sender = StreamSenderState::new(transfer_id, attempt_nonce, 0);
+        sender
+            .accept(StreamAcceptV1 {
+                transfer_id,
+                attempt_nonce,
+                sequence: 0,
+                durable_offset: 0,
+                checkpoint_generation: 0,
+                absolute_receive_limit: 0,
+                max_extent_bytes: PROFILE5_CANONICAL_EXTENT_BYTES as u32,
+                checkpoint_batch_bytes: MAX_STREAM_CHECKPOINT_BATCH_BYTES,
+            })
+            .expect("accept empty stream");
+        let StreamAction::Send(StreamFrame::Finish(finish)) =
+            sender.finish(vec![0x83; 32]).expect("finish empty stream")
+        else {
+            panic!("empty sender did not emit FINISH");
+        };
+        assert_eq!(finish.final_offset, 0);
+        assert_eq!(finish.sequence, 0);
+
+        let result = StreamResultV1 {
+            transfer_id,
+            attempt_nonce,
+            sequence: 1,
+            final_offset: 0,
+            code: StreamResultCode::Promoted,
+            result_digest: [0x84; 32],
+        };
+        let (StreamAction::Send(StreamFrame::ResultAck(ack)), StreamAction::Terminal(code)) =
+            sender.result(result.clone()).expect("settle empty stream")
+        else {
+            panic!("empty sender settlement differed");
+        };
+        assert_eq!(ack.result_digest, result.result_digest);
+        assert_eq!(code, StreamResultCode::Promoted);
+        assert_eq!(
+            sender.result(result).expect("replay exact result"),
+            (
+                StreamAction::Send(StreamFrame::ResultAck(ack)),
+                StreamAction::Terminal(StreamResultCode::Promoted),
+            )
+        );
     }
 
     fn frames() -> Vec<StreamFrame> {
@@ -1457,7 +1608,8 @@ mod stream_frame_codec {
                 attempt_nonce: n,
                 checkpoint_generation: 8,
                 custody_digest: Some([9; 32]),
-                authenticated_open: vec![0xa5; 257],
+                source_len: 257,
+                source_digest: [0xa5; 32],
             }),
             StreamFrame::Accept(StreamAcceptV1 {
                 transfer_id: id,
@@ -1701,18 +1853,14 @@ mod stream_frame_codec {
             );
         }
         let mut open = frames()[0].encode_for_context(9, 5).unwrap();
-        let authenticated_open_len = match &frames()[0] {
-            StreamFrame::Open(open) => open.authenticated_open.len(),
-            _ => unreachable!(),
-        };
-        let custody_presence = open.len() - authenticated_open_len - 4 - 33;
+        let custody_presence = open.len() - 37;
         open[custody_presence] = 2;
         assert!(StreamFrame::decode_for_context(9, 5, &open).is_err());
         let mut open = match frames().remove(0) {
             StreamFrame::Open(open) => open,
             _ => unreachable!(),
         };
-        open.authenticated_open.clear();
+        open.source_len = 0;
         assert!(
             StreamFrame::Open(open.clone())
                 .encode_for_context(9, 5)
@@ -1727,7 +1875,7 @@ mod stream_frame_codec {
     }
 
     #[test]
-    fn authenticated_open_enforces_the_production_bound_with_a_small_fixture() {
+    fn authenticated_source_enforces_the_production_bound_with_a_small_fixture() {
         assert_eq!(MAX_STREAM_AUTHENTICATED_OPEN_BYTES, 16 * 1024 * 1024);
         assert!(validate_authenticated_open_with_max(&[], 4).is_err());
         assert!(validate_authenticated_open_with_max(&[0; 4], 4).is_ok());
@@ -1795,7 +1943,8 @@ mod stream_state {
             attempt_nonce: nonce,
             checkpoint_generation: 1,
             custody_digest: None,
-            authenticated_open: vec![7],
+            source_len: 1,
+            source_digest: [7; 32],
         }
     }
 

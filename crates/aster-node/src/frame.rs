@@ -125,6 +125,13 @@ pub(crate) enum FrameEmissionPolicy {
     ReceiveOnly,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BlobStreamSourceOfferV1 {
+    pub transfer_id: [u8; 32],
+    pub source_len: u32,
+    pub source_digest: [u8; 32],
+}
+
 /// Receiver-relative result for one authenticated semantic-v3 Event offer.
 ///
 /// This reports whether the exact bytes satisfied the receiver's requested
@@ -892,7 +899,7 @@ pub(crate) enum Frame {
     BlobStreamPlan {
         direction: EventDirection,
         attempt_nonce: Option<[u8; 32]>,
-        authenticated_open: Vec<u8>,
+        source: Option<BlobStreamSourceOfferV1>,
     },
     BlobStreamPlanAck {
         direction: EventDirection,
@@ -1535,13 +1542,8 @@ impl Frame {
             Self::BlobStreamPlan {
                 direction,
                 attempt_nonce,
-                authenticated_open,
-            } => encode_blob_stream_plan_offer(
-                &mut output,
-                *direction,
-                *attempt_nonce,
-                authenticated_open,
-            )?,
+                source,
+            } => encode_blob_stream_plan_offer(&mut output, *direction, *attempt_nonce, *source)?,
             Self::BlobStreamPlanAck {
                 direction,
                 attempt_nonce,
@@ -2308,12 +2310,11 @@ impl Frame {
             )),
             BLOB_STREAM_PLAN_V1 | BLOB_STREAM_PLAN_ACK_V1 => {
                 if tag == BLOB_STREAM_PLAN_V1 {
-                    let (direction, attempt_nonce, authenticated_open) =
-                        decode_blob_stream_plan_offer(body)?;
+                    let (direction, attempt_nonce, source) = decode_blob_stream_plan_offer(body)?;
                     Ok(Self::BlobStreamPlan {
                         direction,
                         attempt_nonce,
-                        authenticated_open,
+                        source,
                     })
                 } else {
                     let (direction, attempt_nonce) = decode_blob_stream_plan(body)?;
@@ -2395,26 +2396,30 @@ fn encode_blob_stream_plan_offer(
     output: &mut Vec<u8>,
     direction: EventDirection,
     attempt_nonce: Option<[u8; 32]>,
-    authenticated_open: &[u8],
+    source: Option<BlobStreamSourceOfferV1>,
 ) -> Result<(), NodeError> {
     output.push(BLOB_STREAM_PLAN_V1);
     output.push(direction.encode());
     match attempt_nonce {
-        None if authenticated_open.is_empty() => output.push(0),
-        Some(nonce)
-            if nonce != [0; 32]
-                && !authenticated_open.is_empty()
-                && authenticated_open.len()
-                    <= crate::stream_transfer::MAX_STREAM_AUTHENTICATED_OPEN_BYTES =>
-        {
+        None if source.is_none() => output.push(0),
+        Some(nonce) if nonce != [0; 32] && source.is_some() => {
+            let source = source.expect("source presence checked");
+            if source.source_len == 0
+                || usize::try_from(source.source_len)
+                    .ok()
+                    .is_none_or(|length| {
+                        length > crate::stream_transfer::MAX_STREAM_AUTHENTICATED_OPEN_BYTES
+                    })
+            {
+                return Err(NodeError::Protocol(
+                    "Blob stream source length is out of bounds".into(),
+                ));
+            }
             output.push(1);
             output.extend_from_slice(&nonce);
-            output.extend_from_slice(
-                &u32::try_from(authenticated_open.len())
-                    .map_err(|_| NodeError::Protocol("Blob stream open length overflows".into()))?
-                    .to_be_bytes(),
-            );
-            output.extend_from_slice(authenticated_open);
+            output.extend_from_slice(&source.transfer_id);
+            output.extend_from_slice(&source.source_len.to_be_bytes());
+            output.extend_from_slice(&source.source_digest);
         }
         _ => {
             return Err(NodeError::Protocol(
@@ -2425,7 +2430,11 @@ fn encode_blob_stream_plan_offer(
     Ok(())
 }
 
-type DecodedBlobStreamPlanOffer = (EventDirection, Option<[u8; 32]>, Vec<u8>);
+type DecodedBlobStreamPlanOffer = (
+    EventDirection,
+    Option<[u8; 32]>,
+    Option<BlobStreamSourceOfferV1>,
+);
 
 fn decode_blob_stream_plan_offer(body: &[u8]) -> Result<DecodedBlobStreamPlanOffer, NodeError> {
     let (&direction, body) = body
@@ -2433,26 +2442,40 @@ fn decode_blob_stream_plan_offer(body: &[u8]) -> Result<DecodedBlobStreamPlanOff
         .ok_or_else(|| NodeError::Protocol("Blob stream plan direction is missing".into()))?;
     let direction = EventDirection::decode(direction)?;
     match body {
-        [0] => Ok((direction, None, Vec::new())),
-        [1, rest @ ..] if rest.len() >= 36 => {
+        [0] => Ok((direction, None, None)),
+        [1, rest @ ..] if rest.len() == 100 => {
             let nonce: [u8; 32] = rest[..32]
                 .try_into()
                 .map_err(|_| NodeError::Protocol("Blob stream plan nonce length differs".into()))?;
-            let open_len = usize::try_from(u32::from_be_bytes(rest[32..36].try_into().map_err(
-                |_| NodeError::Protocol("Blob stream plan open length differs".into()),
-            )?))
-            .map_err(|_| NodeError::Protocol("Blob stream plan open length overflows".into()))?;
-            let authenticated_open = &rest[36..];
+            let transfer_id = rest[32..64]
+                .try_into()
+                .map_err(|_| NodeError::Protocol("Blob stream source id differs".into()))?;
+            let source_len =
+                u32::from_be_bytes(rest[64..68].try_into().map_err(|_| {
+                    NodeError::Protocol("Blob stream source length differs".into())
+                })?);
+            let source_digest = rest[68..100]
+                .try_into()
+                .map_err(|_| NodeError::Protocol("Blob stream source digest differs".into()))?;
             if nonce == [0; 32]
-                || open_len == 0
-                || open_len > crate::stream_transfer::MAX_STREAM_AUTHENTICATED_OPEN_BYTES
-                || authenticated_open.len() != open_len
+                || source_len == 0
+                || usize::try_from(source_len).ok().is_none_or(|length| {
+                    length > crate::stream_transfer::MAX_STREAM_AUTHENTICATED_OPEN_BYTES
+                })
             {
                 return Err(NodeError::Protocol(
                     "Blob stream plan offer is not canonical".into(),
                 ));
             }
-            Ok((direction, Some(nonce), authenticated_open.to_vec()))
+            Ok((
+                direction,
+                Some(nonce),
+                Some(BlobStreamSourceOfferV1 {
+                    transfer_id,
+                    source_len,
+                    source_digest,
+                }),
+            ))
         }
         _ => Err(NodeError::Protocol(
             "Blob stream plan offer is not canonical".into(),
@@ -5069,7 +5092,14 @@ mod tests {
             Frame::BlobStreamPlan {
                 direction: EventDirection::ToSessionResponder,
                 attempt_nonce: Some([0x71; 32]),
-                authenticated_open: vec![0xa5; 257],
+                source: Some(BlobStreamSourceOfferV1 {
+                    transfer_id: [0xa4; 32],
+                    source_len: u32::try_from(
+                        crate::stream_transfer::MAX_STREAM_AUTHENTICATED_OPEN_BYTES,
+                    )
+                    .unwrap(),
+                    source_digest: [0xa5; 32],
+                }),
             },
             Frame::BlobStreamPlanAck {
                 direction: EventDirection::ToSessionResponder,
@@ -5078,7 +5108,7 @@ mod tests {
             Frame::BlobStreamPlan {
                 direction: EventDirection::ToSessionInitiator,
                 attempt_nonce: None,
-                authenticated_open: Vec::new(),
+                source: None,
             },
         ] {
             let encoded = frame.encode_for_semantic_version(9).expect("v9 plan");
@@ -5092,7 +5122,11 @@ mod tests {
         let mut zero_nonce = Frame::BlobStreamPlan {
             direction: EventDirection::ToSessionResponder,
             attempt_nonce: Some([1; 32]),
-            authenticated_open: vec![1],
+            source: Some(BlobStreamSourceOfferV1 {
+                transfer_id: [2; 32],
+                source_len: 1,
+                source_digest: [3; 32],
+            }),
         }
         .encode_for_semantic_version(9)
         .expect("nonzero nonce");

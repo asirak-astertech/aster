@@ -745,7 +745,8 @@ mod tests {
                 attempt_nonce: nonce,
                 checkpoint_generation: 1,
                 custody_digest: None,
-                authenticated_open: vec![8],
+                source_len: 1,
+                source_digest: [8; 32],
             }
         }
 

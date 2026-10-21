@@ -1221,7 +1221,7 @@ impl SelectedBlobHandle {
         request: BlobPublishStreamRequest,
     ) -> Result<SelectedBlobPublishStream, ApplicationError> {
         validate_live_publish_request(&request.publication)?;
-        if request.total_len == 0 || request.total_len > MAX_SELECTED_BLOB_STREAM_BYTES {
+        if request.total_len > MAX_SELECTED_BLOB_STREAM_BYTES {
             return Err(ApplicationError::new(
                 ApplicationErrorKind::ResourceLimit,
                 "blob stream open",
@@ -1933,7 +1933,7 @@ impl BlobFinalizeJob {
             UploadPackPlainReader::open(root, &current, &checkpoint, opener.clone())?;
         let prepared = prepare_blob(&mut preparation_source, SELECTED_BLOB_CHUNK_SIZE, metadata)
             .map_err(blob_prepare_error)?;
-        if prepared.total_len() != request.total_len || prepared.chunk_count() == 0 {
+        if prepared.total_len() != request.total_len {
             return Err(ApplicationError::new(
                 ApplicationErrorKind::Integrity,
                 "blob stream finish",
@@ -2519,7 +2519,7 @@ impl SelectedBlobNode {
         request: BlobPublishStreamRequest,
     ) -> Result<OpenedBlobPublishStream, ApplicationError> {
         validate_live_publish_request(&request.publication)?;
-        if request.total_len == 0 || request.total_len > MAX_SELECTED_BLOB_STREAM_BYTES {
+        if request.total_len > MAX_SELECTED_BLOB_STREAM_BYTES {
             return Err(ApplicationError::new(
                 ApplicationErrorKind::ResourceLimit,
                 "blob stream open",
@@ -2776,6 +2776,22 @@ impl SelectedBlobNode {
             .expect("open stream map pool")
             .shutdown()
             .map_err(blob_stream_pipeline_error)?;
+        if stream.checkpoint.durable_pack_checkpoint().is_none() {
+            let policy = self.current_policy("blob stream finish")?;
+            let durable = stream
+                .writer
+                .checkpoint()
+                .map_err(|error| blob_pack_application_error("blob stream finish", error))?;
+            stream.checkpoint = self
+                .store
+                .checkpoint_blob_upload(
+                    &policy,
+                    &stream.reservation,
+                    stream.checkpoint.clone(),
+                    durable,
+                )
+                .map_err(|error| application_error("blob stream finish", error.into()))?;
+        }
         stream
             .writer
             .finish()
@@ -5353,7 +5369,6 @@ impl SelectedBlobNode {
             || blob.manifest_digest() != &stored.manifest_digest
             || stored.route_lineage != Some(*blob.route_lineage().binding())
             || stored.physical_lineage != Some(*blob.physical_lineage().binding())
-            || blob.manifest().total_len() == 0
             || blob.manifest().chunk_size() != SELECTED_BLOB_CHUNK_SIZE
         {
             return Err(ApplicationError::new(
@@ -6996,8 +7011,8 @@ mod tests {
 
     #[test]
     fn stream_upload_handles_empty_exact_chunk_and_maximum_boundaries() {
-        // Break caught: boundary validation must reject impossible empty/oversize
-        // uploads while an exact canonical 64-KiB payload finalizes normally.
+        // Break caught: empty canonical publication must settle without data,
+        // replay exactly, and leave no provisional capacity behind.
         let root = TestRoot::new("stream-upload-boundaries");
         let mut node = selected_node(&root);
         assert_eq!(
@@ -7005,23 +7020,39 @@ mod tests {
             8 * 1024 * 1024 * 1024,
             "public stream ceiling remains 8 GiB"
         );
-        for (operation, total_len) in [
-            (b"blob/stream/empty".as_slice(), 0),
-            (
-                b"blob/stream/oversize".as_slice(),
-                MAX_SELECTED_BLOB_STREAM_BYTES + 1,
-            ),
-        ] {
-            let error = match node.open_publish_stream_inner(BlobPublishStreamRequest {
-                publication: request(operation),
-                options: BlobPublishOptions::durable(),
-                total_len,
-            }) {
-                Ok(_) => panic!("invalid stream boundary was admitted"),
-                Err(error) => error,
-            };
-            assert_eq!(error.kind(), ApplicationErrorKind::ResourceLimit);
-        }
+        let error = match node.open_publish_stream_inner(BlobPublishStreamRequest {
+            publication: request(b"blob/stream/oversize"),
+            options: BlobPublishOptions::durable(),
+            total_len: MAX_SELECTED_BLOB_STREAM_BYTES + 1,
+        }) {
+            Ok(_) => panic!("invalid stream boundary was admitted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), ApplicationErrorKind::ResourceLimit);
+
+        let empty = BlobPublishStreamRequest {
+            publication: request(b"blob/stream/empty"),
+            options: BlobPublishOptions::durable(),
+            total_len: 0,
+        };
+        let opened = node
+            .open_publish_stream_inner(empty.clone())
+            .expect("open empty stream");
+        let empty_result = node
+            .finish_publish_stream_inner(opened.token)
+            .expect("finish empty stream without data");
+        let before_retry = node.capacity_status().expect("capacity after empty finish");
+        assert_eq!(before_retry.pending_sources, 0);
+        assert_eq!(before_retry.network_staging_bytes, 0);
+        let retry = node
+            .open_publish_stream_inner(empty)
+            .expect("reopen exact empty stream");
+        let replay = node
+            .finish_publish_stream_inner(retry.token)
+            .expect("replay empty stream");
+        assert_eq!(replay.id, empty_result.id);
+        assert!(!replay.inserted);
+        assert_eq!(node.capacity_status().unwrap(), before_retry);
 
         let bytes = payload(SELECTED_BLOB_CHUNK_SIZE as usize);
         let exact = BlobPublishStreamRequest {

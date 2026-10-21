@@ -453,7 +453,7 @@ pub struct BlobRouteCommitment {
 }
 
 impl BlobRouteCommitment {
-    /// Reconstructs a persisted nonempty selected route commitment.
+    /// Reconstructs a persisted selected route commitment.
     ///
     /// Source authenticity still requires a [`crate::ContentVerifiedBlobEnvelope`];
     /// this constructor checks only context-free structural bounds.
@@ -462,7 +462,7 @@ impl BlobRouteCommitment {
         chunk_count: u64,
         root: [u8; 32],
     ) -> Result<Self, BlobError> {
-        if chunk_count == 0 || chunk_count > MAX_BLOB_CHUNKS || root == [0_u8; 32] {
+        if chunk_count > MAX_BLOB_CHUNKS || root == [0_u8; 32] {
             return Err(BlobError::InvalidManifest);
         }
         Ok(Self {
@@ -1185,9 +1185,7 @@ pub(crate) fn inspect_selected_blob_manifest(
     let mut input = io::Cursor::new(bytes);
     let (inspected, route) = inspect_manifest_route(&mut input)?;
     validate_selected_manifest(inspected.manifest())?;
-    if route.chunk_count == 0
-        || route.blob_id != inspected.manifest.id
-        || route.chunk_count != inspected.manifest.chunk_count
+    if route.blob_id != inspected.manifest.id || route.chunk_count != inspected.manifest.chunk_count
     {
         return Err(BlobError::InvalidManifest);
     }
@@ -2697,14 +2695,12 @@ impl<S: BlobStore> ReferenceBlobService<S> {
     /// Installs a store-independent preparation result into this exact
     /// provider-owned scope/topic/epoch service.
     ///
-    /// The selected application seam rejects empty content and requires the
-    /// canonical 64 KiB chunk size. Repeating an identical installation is
+    /// The selected application seam requires the canonical 64 KiB chunk
+    /// size. Repeating an identical installation is
     /// idempotent when the backing store follows [`BlobStore`]'s contract.
     pub fn install_prepared(&mut self, prepared: &PreparedBlob) -> Result<BlobManifest, BlobError> {
         self.ensure_live()?;
-        if prepared.total_len == 0
-            || prepared.chunk_count == 0
-            || prepared.chunk_size != SELECTED_BLOB_CHUNK_SIZE
+        if prepared.chunk_size != SELECTED_BLOB_CHUNK_SIZE
             || usize::try_from(prepared.chunk_count).ok() != Some(prepared.plaintext_digests.len())
         {
             return Err(BlobError::InvalidManifest);
@@ -3455,7 +3451,7 @@ impl<'a, S: BlobStore> BlobWriter<'a, S> {
         manifest: &BlobManifest,
         max_new_chunks: u64,
     ) -> Result<BlobWriteProgress, BlobError> {
-        if max_new_chunks == 0 {
+        if max_new_chunks == 0 && manifest.chunk_count != 0 {
             return Err(BlobError::WorkLimitZero);
         }
         self.validate_access(manifest)?;
@@ -3942,10 +3938,7 @@ fn validate_manifest(manifest: &BlobManifest) -> Result<(), BlobError> {
 
 fn validate_selected_manifest(manifest: &BlobManifest) -> Result<(), BlobError> {
     validate_manifest(manifest)?;
-    if manifest.total_len == 0
-        || manifest.chunk_count == 0
-        || manifest.chunk_size != SELECTED_BLOB_CHUNK_SIZE
-    {
+    if manifest.chunk_size != SELECTED_BLOB_CHUNK_SIZE {
         return Err(BlobError::InvalidManifest);
     }
     Ok(())

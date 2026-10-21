@@ -142,7 +142,8 @@ pub async fn send(connection: Connection, bytes: u64) -> Result<StreamValidation
         attempt_nonce,
         checkpoint_generation: 0,
         custody_digest: None,
-        authenticated_open: vec![0x35],
+        source_len: 1,
+        source_digest: [0x35; 32],
     };
     attempt
         .send_data(&encoded(StreamFrame::Open(open))?)

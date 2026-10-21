@@ -7697,7 +7697,7 @@ fn validate_header_for_seal(
 ) -> Result<(), EnvelopeError> {
     let blob_route_valid = match (header.class, header.blob_route) {
         (DataClass::Blob, Some(route)) => {
-            route.chunk_count() > 0 && header.logical_key.as_slice() == route.blob_id().as_bytes()
+            header.logical_key.as_slice() == route.blob_id().as_bytes()
         }
         (DataClass::Blob, None) => false,
         (_, None) => true,
@@ -7787,9 +7787,7 @@ fn decode_header(reader: &mut Reader<'_>) -> Result<EnvelopeHeader, EnvelopeErro
     let tombstone = reader.boolean()?;
     let key_epoch = reader.u64()?;
     let blob_route_valid = match (class, blob_route) {
-        (DataClass::Blob, Some(route)) => {
-            route.chunk_count() > 0 && logical_key.as_slice() == route.blob_id().as_bytes()
-        }
+        (DataClass::Blob, Some(route)) => logical_key.as_slice() == route.blob_id().as_bytes(),
         (DataClass::Blob, None) => false,
         (_, None) => true,
         (_, Some(_)) => false,

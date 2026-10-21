@@ -14071,9 +14071,7 @@ fn blob_source_projection(
         .checked_add(u64::from(shape.chunk_size).saturating_sub(1))
         .filter(|_| shape.chunk_size != 0)
         .map(|bytes| bytes / u64::from(shape.chunk_size));
-    if shape.total_len == 0
-        || shape.chunk_size != SELECTED_BLOB_CHUNK_SIZE
-        || shape.chunk_count == 0
+    if shape.chunk_size != SELECTED_BLOB_CHUNK_SIZE
         || shape.chunk_count != route.chunk_count()
         || expected_chunks != Some(shape.chunk_count)
     {
@@ -17289,7 +17287,6 @@ fn validate_blob_header(header: &EnvelopeHeader) -> Result<(), StoreError> {
         || header.content_len == 0
         || header.content_len > MAX_BLOB_MANIFEST_BYTES
         || header.key_epoch == 0
-        || route.chunk_count() == 0
         || route.chunk_count() > MAX_SELECTED_BLOB_CHUNKS
         || header.logical_key.as_slice() != route.blob_id().as_bytes()
         || header.stamp.dot.counter == 0

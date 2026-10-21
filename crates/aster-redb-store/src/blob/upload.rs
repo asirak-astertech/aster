@@ -441,11 +441,6 @@ impl DurableBlobUpload {
 }
 
 fn validate_request(request: &BlobUploadRequest) -> Result<(), StoreError> {
-    if request.total_len == 0 {
-        return Err(blob_error(BlobStoreError::InvalidPublication(
-            "Blob upload length must be positive",
-        )));
-    }
     if request.ttl_ms == Some(0) {
         return Err(blob_error(BlobStoreError::InvalidPublication(
             "finite Blob TTL must be positive",

@@ -1396,6 +1396,17 @@ impl PressureFraction {
     }
 }
 
+fn authenticated_progress_fraction(
+    numerator: u64,
+    denominator: u64,
+) -> Result<PressureFraction, StoreError> {
+    if numerator == 0 && denominator == 0 {
+        Ok(PressureFraction::ONE)
+    } else {
+        PressureFraction::new(numerator, denominator)
+    }
+}
+
 /// Exact progress ordering shared by pending-source and whole-variant selection.
 ///
 /// Both products are widened before multiplication; a product of two `u64`
@@ -3536,7 +3547,7 @@ fn pending_progress(
             .checked_add(prefix)
             .ok_or(StoreError::PayloadByteAccountingOverflow)?;
     }
-    PressureFraction::new(durable, total)
+    authenticated_progress_fraction(durable, total)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3767,7 +3778,7 @@ fn build_pressure_image(
         let summary = PressureVariantSummary {
             effective_priority,
             minimum_root_acceptance_order,
-            committed_progress: PressureFraction::new(numerator, fact.total_len)?,
+            committed_progress: authenticated_progress_fraction(numerator, fact.total_len)?,
             finalized: fact.finalized_root.is_some(),
             publication_roots,
             pending_roots,
@@ -4811,7 +4822,10 @@ fn variant_progress_write(
     }
     let finalized = fact.finalized_root.is_some();
     let numerator = if finalized { fact.total_len } else { committed };
-    Ok((PressureFraction::new(numerator, fact.total_len)?, finalized))
+    Ok((
+        authenticated_progress_fraction(numerator, fact.total_len)?,
+        finalized,
+    ))
 }
 
 pub(super) fn insert_pending_source_write(
@@ -5639,7 +5653,7 @@ fn bounded_pending_progress_write(
                 .ok_or(StoreError::PayloadByteAccountingOverflow)?;
         }
     }
-    PressureFraction::new(durable, total).map(Some)
+    authenticated_progress_fraction(durable, total).map(Some)
 }
 
 fn bounded_pending_root_write(
@@ -5790,7 +5804,8 @@ fn bounded_variant_progress_write(
     }
     let finalized = fact.finalized_root.is_some();
     let numerator = if finalized { fact.total_len } else { committed };
-    PressureFraction::new(numerator, fact.total_len).map(|progress| Some((progress, finalized)))
+    authenticated_progress_fraction(numerator, fact.total_len)
+        .map(|progress| Some((progress, finalized)))
 }
 
 pub(crate) fn require_variant_with_references_bounded_write(

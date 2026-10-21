@@ -85,11 +85,7 @@ impl BlobUploadDescriptor {
         total_len: u64,
         content_epoch: u64,
     ) -> Result<Self, BlobError> {
-        if request_digest == [0; 32]
-            || total_len == 0
-            || total_len > MAX_BLOB_STREAM_BYTES
-            || content_epoch == 0
-        {
+        if request_digest == [0; 32] || total_len > MAX_BLOB_STREAM_BYTES || content_epoch == 0 {
             return Err(BlobError::InvalidManifest);
         }
         Ok(Self {
@@ -168,7 +164,6 @@ impl BlobStreamOpen {
             || causal_context.iter().any(|(node, counter)| {
                 *counter == 0 || (*node == publisher && *counter >= publisher_counter)
             })
-            || total_len == 0
             || total_len > MAX_BLOB_STREAM_BYTES
             || content_epoch == 0
             || policy_revision == 0
@@ -526,8 +521,7 @@ impl BlobStreamFinalCommitment {
             .checked_add(BLOB_STREAM_SEGMENT_BYTES as u64 - 1)
             .ok_or(BlobError::LengthOverflow)?
             / BLOB_STREAM_SEGMENT_BYTES as u64;
-        if total_len == 0
-            || segment_count != expected
+        if segment_count != expected
             || open_digest == [0; 32]
             || plaintext_root == [0; 32]
             || ciphertext_root == [0; 32]
@@ -1610,7 +1604,23 @@ impl BlobStreamFrontier {
     }
 
     pub fn finish(self, total_len: u64) -> Result<([u8; 32], [u8; 32]), BlobError> {
-        if self.checkpoint.next_index == 0 || self.checkpoint.plaintext_len != total_len {
+        if self.checkpoint.plaintext_len != total_len {
+            return Err(BlobError::InvalidManifest);
+        }
+        if total_len == 0 {
+            if self.checkpoint.next_index != 0
+                || self.checkpoint.ciphertext_len != 0
+                || self.checkpoint.levels.iter().any(Option::is_some)
+            {
+                return Err(BlobError::InvalidManifest);
+            }
+            let fields = [0_u8; 24];
+            return Ok((
+                hash_parts(b"ASTER/blob-stream/plain-root/v2\0", &[&fields, &[]]),
+                hash_parts(b"ASTER/blob-stream/cipher-root/v2\0", &[&fields, &[]]),
+            ));
+        }
+        if self.checkpoint.next_index == 0 {
             return Err(BlobError::InvalidManifest);
         }
         let mut roots = self

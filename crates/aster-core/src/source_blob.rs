@@ -991,7 +991,6 @@ fn validate_selected_blob_header(header: &EnvelopeHeader) -> Result<(), Envelope
         || header.ttl_ms == Some(0)
         || header.content_len == 0
         || header.content_len > MAX_BLOB_MANIFEST_BYTES
-        || route.chunk_count() == 0
         || header.logical_key.as_slice() != route.blob_id().as_bytes()
     {
         return Err(EnvelopeError(
@@ -1160,7 +1159,9 @@ mod tests {
         }
 
         fn finalize_blob(&mut self, id: BlobId, manifest_digest: [u8; 32]) -> io::Result<()> {
-            let _ = self.slot(id, 0)?;
+            if self.manifest.as_ref().map(BlobManifest::id) != Some(id) {
+                return Err(io::Error::other("Blob key outside manifest"));
+            }
             if self
                 .finalized
                 .is_some_and(|existing| existing != manifest_digest)
@@ -1759,7 +1760,15 @@ mod tests {
         let mut selected_service = publisher
             .blob_service_with_store(&scope(), &topic(), 1, TestBlobStore::default())
             .expect("selected service");
-        assert!(selected_service.install_prepared(&empty).is_err());
+        let empty_manifest = selected_service
+            .install_prepared(&empty)
+            .expect("selected empty manifest");
+        let empty_finished = selected_service
+            .finish_manifest(&empty_manifest)
+            .expect("finish selected empty manifest");
+        assert_eq!(empty_manifest.total_len(), 0);
+        assert_eq!(empty_manifest.chunk_count(), 0);
+        assert!(!empty_finished.manifest_bytes().is_empty());
 
         let noncanonical = prepare_blob(
             &mut Cursor::new(vec![1_u8; 4097]),
