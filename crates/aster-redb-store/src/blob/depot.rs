@@ -1503,13 +1503,12 @@ impl<'a> BlobDepot<'a> {
             }
             Some(_) => {
                 if let Some(claim) = self.upload_credit.as_ref() {
-                    super::upload::bind_and_consume_upload_credit_write(
+                    super::upload::bind_upload_credit_to_existing_write(
                         &write,
                         self.store,
                         claim,
                         incoming.variant_id,
-                        Some(manifest),
-                        super::upload::BlobUploadCapacity::default(),
+                        manifest,
                     )?;
                 }
                 if let (Some(physical_lineage), Some(owner_binding)) =
@@ -2382,7 +2381,8 @@ pub(super) fn blob_upload_capacity(
     let staging = super::pack::reserved_upload_pack_bytes(total_len)?;
     Ok(super::upload::BlobUploadCapacity {
         bytes: staging
-            .checked_add(conversion_overhead)
+            .checked_add(total_len)
+            .and_then(|value| value.checked_add(conversion_overhead))
             .ok_or(StoreError::PayloadByteAccountingOverflow)?,
         chunks,
         variants: 1,
@@ -2397,7 +2397,104 @@ pub(super) fn blob_upload_conversion_overhead(total_len: u64) -> Result<u64, Sto
     let total = blob_upload_capacity(total_len)?.bytes;
     total
         .checked_sub(blob_upload_staging_charge(total_len)?)
+        .and_then(|value| value.checked_sub(total_len))
         .ok_or(StoreError::PayloadByteAccountingOverflow)
+}
+
+fn reconstruct_upload_capacity_tables(
+    imports: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    chunks: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    variant: super::BlobVariantId,
+    total_len: u64,
+    epoch: u64,
+    media_type: Option<&str>,
+    schema_id: &[u8],
+) -> Result<super::upload::BlobUploadCapacity, StoreError> {
+    let import = imports
+        .get(variant.as_bytes().as_slice())?
+        .map(|value| decode_import(value.value()))
+        .transpose()?
+        .ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "Blob upload credit is bound to a missing canonical import",
+            ))
+        })?;
+    if import.variant_id != variant
+        || import.total_len != total_len
+        || import.epoch != epoch
+        || import.media_type.as_deref() != media_type
+        || import.schema_id != schema_id
+    {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "Blob upload credit differs from its canonical import",
+        )));
+    }
+    let mut capacity = super::upload::BlobUploadCapacity {
+        bytes: 0,
+        chunks: 0,
+        variants: 1,
+    };
+    for row in chunks.iter()? {
+        let (key, value) = row?;
+        let (chunk_variant, index) = parse_chunk_key(key.value())?;
+        if chunk_variant != variant {
+            continue;
+        }
+        if index >= import.chunk_count {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "Blob upload credit chunk lies outside its canonical import",
+            )));
+        }
+        let state = decode_chunk_state(value.value())?;
+        validate_chunk_state_lengths(&import, index, state)?;
+        capacity.chunks = capacity
+            .chunks
+            .checked_add(1)
+            .ok_or(StoreError::ItemCountAccountingOverflow)?;
+        capacity.bytes = capacity
+            .bytes
+            .checked_add(state.expected.map(chunk_file_len).transpose()?.unwrap_or(0))
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+    }
+    Ok(capacity)
+}
+
+pub(super) fn reconstruct_upload_capacity_write(
+    write: &redb::WriteTransaction,
+    variant: super::BlobVariantId,
+    total_len: u64,
+    epoch: u64,
+    media_type: Option<&str>,
+    schema_id: &[u8],
+) -> Result<super::upload::BlobUploadCapacity, StoreError> {
+    reconstruct_upload_capacity_tables(
+        &write.open_table(BLOB_IMPORTS)?,
+        &write.open_table(BLOB_CHUNKS)?,
+        variant,
+        total_len,
+        epoch,
+        media_type,
+        schema_id,
+    )
+}
+
+pub(super) fn reconstruct_upload_capacity_read(
+    read: &redb::ReadTransaction,
+    variant: super::BlobVariantId,
+    total_len: u64,
+    epoch: u64,
+    media_type: Option<&str>,
+    schema_id: &[u8],
+) -> Result<super::upload::BlobUploadCapacity, StoreError> {
+    reconstruct_upload_capacity_tables(
+        &read.open_table(BLOB_IMPORTS)?,
+        &read.open_table(BLOB_CHUNKS)?,
+        variant,
+        total_len,
+        epoch,
+        media_type,
+        schema_id,
+    )
 }
 
 /// Capacity admission retains every physical resource through resumable
@@ -2947,11 +3044,13 @@ pub(crate) fn audit_depot_write(
     let owner_binding =
         require_depot_owner_binding_write(write, store_path, backing_identity, owner_token)?;
     let deletion = super::deletion::audit_blob_deletion_write(write, Some(owner_binding))?;
+    let upload_packs = super::upload::upload_pack_identities_write(write)?;
     if expected == BlobStoreStats::default() {
         if let Some(root) = OwnedDirectory::open_root_if_present(store_path)? {
             match root.read_owner_marker()? {
                 Some(_) => {
                     root.require_store_binding(store_path, backing_identity, owner_token)?;
+                    super::pack::audit_upload_packs_write(&root, &upload_packs)?;
                     reclaim_unmarked_artifacts(write, &root, &BTreeMap::new(), &deletion)?;
                 }
                 None => {
@@ -2969,6 +3068,7 @@ pub(crate) fn audit_depot_write(
         ))
     })?;
     root.require_store_binding(store_path, backing_identity, owner_token)?;
+    super::pack::audit_upload_packs_write(&root, &upload_packs)?;
     audit_deletion_storage(&root, &deletion, false)?;
     let mut committed = committed_chunk_map_write(write)?;
     let deletion_variants = protect_queued_deletion_chunks(&mut committed, &deletion)?;
@@ -2987,6 +3087,7 @@ pub(crate) fn audit_depot_read(
     let owner_binding =
         require_depot_owner_binding_read(read, store_path, backing_identity, owner_token)?;
     let deletion = super::deletion::inspect_blob_deletion_read(read, Some(owner_binding))?;
+    let upload_packs = super::upload::upload_pack_identities_read(read)?;
     let Some(root) = OwnedDirectory::open_root_if_present(store_path)? else {
         if expected.variants == 0 {
             return Ok(());
@@ -2996,6 +3097,7 @@ pub(crate) fn audit_depot_read(
         )));
     };
     root.require_store_binding(store_path, backing_identity, owner_token)?;
+    super::pack::audit_upload_packs_read(&root, &upload_packs)?;
     audit_deletion_storage(&root, &deletion, true)?;
     let mut committed = committed_chunk_map_read(read)?;
     let deletion_variants = protect_queued_deletion_chunks(&mut committed, &deletion)?;
@@ -5572,6 +5674,10 @@ fn read_manifest_deletion_file(
 }
 
 impl OwnedDirectory {
+    pub(super) fn path(&self) -> &Path {
+        &self.path
+    }
+
     pub(super) fn read_private_file_if_present(
         &self,
         name: &str,
@@ -6584,6 +6690,21 @@ impl OwnedDirectory {
         })
     }
 
+    pub(super) fn open_child_directory_if_present(
+        &self,
+        name: &str,
+    ) -> Result<Option<Self>, StoreError> {
+        match self.open_child_directory(name, false) {
+            Ok(directory) => Ok(Some(directory)),
+            Err(StoreError::Blob(BlobStoreError::Io(error)))
+                if error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     #[cfg(unix)]
     pub(super) fn write_atomic(&self, final_name: &str, bytes: &[u8]) -> Result<(), StoreError> {
         let temp_name = format!(
@@ -6963,7 +7084,7 @@ impl OwnedDirectory {
     }
 
     #[cfg(unix)]
-    fn entry_names(&self) -> Result<Vec<String>, StoreError> {
+    pub(super) fn entry_names(&self) -> Result<Vec<String>, StoreError> {
         let directory = rustix::fs::Dir::read_from(&self.file)
             .map_err(|error| blob_error(BlobStoreError::Io(error.into())))?;
         directory
@@ -6980,7 +7101,7 @@ impl OwnedDirectory {
     }
 
     #[cfg(not(unix))]
-    fn entry_names(&self) -> Result<Vec<String>, StoreError> {
+    pub(super) fn entry_names(&self) -> Result<Vec<String>, StoreError> {
         std::fs::read_dir(&self.path)?
             .map(|entry| {
                 entry
@@ -6997,7 +7118,7 @@ impl OwnedDirectory {
     }
 
     #[cfg(unix)]
-    fn remove_if_exists(&self, name: &str, directory: bool) -> Result<(), StoreError> {
+    pub(super) fn remove_if_exists(&self, name: &str, directory: bool) -> Result<(), StoreError> {
         let flags = if directory {
             rustix::fs::AtFlags::REMOVEDIR
         } else {
@@ -7050,7 +7171,7 @@ impl OwnedDirectory {
     }
 
     #[cfg(not(unix))]
-    fn remove_if_exists(&self, name: &str, directory: bool) -> Result<(), StoreError> {
+    pub(super) fn remove_if_exists(&self, name: &str, directory: bool) -> Result<(), StoreError> {
         let result = if directory {
             std::fs::remove_dir(self.path.join(name))
         } else {

@@ -12,9 +12,11 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use super::depot::{OwnedDirectory, open_blob_pack_root};
+use super::{BlobStoreError, blob_error};
 use crate::{Store, StoreError};
 
 const PACK_MAGIC: &[u8; 8] = b"ASTRPK02";
@@ -26,6 +28,52 @@ const CHECKPOINT_ONE: &str = "checkpoint.1";
 const PACK_HEADER_LEN: u64 = 8 + 2 + 32 + 32 + 8;
 const MAX_RECORD_BYTES: usize = 2 * 1024 * 1024;
 const PACK_FIXED_RESERVATION_BYTES: u64 = 64 * 1024;
+const UPLOAD_MARKER: &str = ".aster-upload-v1";
+const UPLOAD_MARKER_MAGIC: &[u8; 8] = b"ASTRUM01";
+const PACK_TEMP_PREFIX: &str = ".aster-blob-tmp-";
+const PACK_DIRECTORY: &str = "stream-packs-v2";
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum BlobPackFaultPoint {
+    DataSynced,
+    CheckpointZeroSynced,
+    CheckpointOneSynced,
+    CleanupDurable,
+}
+
+#[cfg(test)]
+static TEST_PACK_FAULTS: std::sync::Mutex<Vec<(PathBuf, BlobPackFaultPoint)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(super) fn inject_test_fault(root: &PinnedBlobPackRoot, point: BlobPackFaultPoint) {
+    TEST_PACK_FAULTS
+        .lock()
+        .expect("Blob pack test fault lock")
+        .push((root.directory.path().to_owned(), point));
+}
+
+#[cfg(test)]
+fn maybe_inject_fault(path: &Path, point: BlobPackFaultPoint) -> Result<(), BlobPackError> {
+    let mut faults = TEST_PACK_FAULTS
+        .lock()
+        .map_err(|_| BlobPackError::Invalid("Blob pack test fault lock is poisoned"))?;
+    if let Some(index) = faults.iter().position(|(expected, expected_point)| {
+        (expected == path || path.parent() == Some(expected.as_path())) && *expected_point == point
+    }) {
+        faults.swap_remove(index);
+        return Err(BlobPackError::Io(std::io::Error::other(
+            "injected Blob pack crash boundary",
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn maybe_inject_fault(_path: &Path, _point: ()) -> Result<(), BlobPackError> {
+    Ok(())
+}
 
 pub(crate) fn reserved_upload_pack_bytes(total_len: u64) -> Result<u64, StoreError> {
     let segments = total_len
@@ -77,12 +125,14 @@ impl From<StoreError> for BlobPackError {
 #[doc(hidden)]
 pub struct PinnedBlobPackRoot {
     directory: OwnedDirectory,
+    authority: Arc<()>,
 }
 
 impl PinnedBlobPackRoot {
     pub fn open(store: &Store) -> Result<Self, StoreError> {
         Ok(Self {
             directory: open_blob_pack_root(store)?,
+            authority: Arc::clone(&store.blob_completion_authority),
         })
     }
 
@@ -91,20 +141,192 @@ impl PinnedBlobPackRoot {
         stream_id: BlobPublicationStreamId,
         create: bool,
     ) -> Result<BlobPackRoot, BlobPackError> {
-        Ok(BlobPackRoot::Pinned(self.directory.open_child_directory(
-            &hex32(stream_id.as_bytes()),
-            create,
-        )?))
+        Ok(BlobPackRoot::Pinned(
+            self.directory
+                .open_child_directory(&hex32(stream_id.as_bytes()), create)?,
+            Arc::clone(&self.authority),
+        ))
     }
 
     fn stream(&self, open: &BlobStreamOpen, create: bool) -> Result<BlobPackRoot, BlobPackError> {
         self.stream_id(open.stream_id(), create)
     }
+
+    fn upload(
+        &self,
+        identity: &BlobPackIdentity,
+        create: bool,
+    ) -> Result<BlobPackRoot, BlobPackError> {
+        let root = self.stream_id(identity.upload_id, create)?;
+        let BlobPackRoot::Pinned(directory, _) = &root else {
+            unreachable!("pinned upload root")
+        };
+        let expected = encode_upload_marker(*identity);
+        match directory.read_private_file_if_present(UPLOAD_MARKER, 82)? {
+            Some(marker) if marker == expected => {}
+            Some(_) => return Err(BlobPackError::Invalid("Blob upload pack marker mismatch")),
+            None if create => directory.write_atomic(UPLOAD_MARKER, &expected)?,
+            None => return Err(BlobPackError::Invalid("Blob upload pack marker is missing")),
+        }
+        Ok(root)
+    }
+}
+
+fn encode_upload_marker(identity: BlobPackIdentity) -> [u8; 80] {
+    let mut marker = [0_u8; 80];
+    marker[..8].copy_from_slice(UPLOAD_MARKER_MAGIC);
+    marker[8..40].copy_from_slice(identity.upload_id.as_bytes());
+    marker[40..72].copy_from_slice(&identity.request_digest);
+    marker[72..].copy_from_slice(&identity.total_len.to_be_bytes());
+    marker
+}
+
+fn decode_upload_marker(marker: &[u8]) -> Result<BlobPackIdentity, BlobPackError> {
+    if marker.len() != 80 || &marker[..8] != UPLOAD_MARKER_MAGIC {
+        return Err(BlobPackError::Invalid("Blob upload pack marker is invalid"));
+    }
+    let upload_id = BlobPublicationStreamId::from_bytes(
+        marker[8..40]
+            .try_into()
+            .map_err(|_| BlobPackError::Invalid("Blob upload pack marker is invalid"))?,
+    )
+    .map_err(|_| BlobPackError::Invalid("Blob upload pack marker is invalid"))?;
+    let request_digest = marker[40..72]
+        .try_into()
+        .map_err(|_| BlobPackError::Invalid("Blob upload pack marker is invalid"))?;
+    let total_len = u64::from_be_bytes(
+        marker[72..80]
+            .try_into()
+            .map_err(|_| BlobPackError::Invalid("Blob upload pack marker is invalid"))?,
+    );
+    Ok(BlobPackIdentity::new(upload_id, request_digest, total_len))
+}
+
+/// Removes exactly one authenticated provisional-upload pack. Every unlink is
+/// directory-synchronized, and callers retain the redb reservation until this
+/// function has durably removed the final directory entry.
+pub(super) fn remove_upload_pack(
+    root: &PinnedBlobPackRoot,
+    identity: &BlobPackIdentity,
+) -> Result<(), BlobPackError> {
+    remove_upload_pack_directory(&root.directory, identity)?;
+    #[cfg(test)]
+    maybe_inject_fault(root.directory.path(), BlobPackFaultPoint::CleanupDurable)?;
+    Ok(())
+}
+
+fn remove_upload_pack_directory(
+    parent: &OwnedDirectory,
+    identity: &BlobPackIdentity,
+) -> Result<(), StoreError> {
+    let name = hex32(identity.upload_id.as_bytes());
+    let Some(directory) = parent.open_child_directory_if_present(&name)? else {
+        return Ok(());
+    };
+    let entries = directory.entry_names()?;
+    let Some(marker) = directory.read_private_file_if_present(UPLOAD_MARKER, 80)? else {
+        if entries.is_empty() {
+            drop(directory);
+            parent.remove_if_exists(&name, true)?;
+            return Ok(());
+        }
+        return Err(blob_error(BlobStoreError::DepotIntegrity(
+            "Blob upload pack marker is missing",
+        )));
+    };
+    if decode_upload_marker(&marker).map_err(pack_marker_store_error)? != *identity {
+        return Err(blob_error(BlobStoreError::DepotIntegrity(
+            "Blob upload pack marker mismatch",
+        )));
+    }
+    for entry in &entries {
+        if entry != PACK_FILE
+            && entry != CHECKPOINT_ZERO
+            && entry != CHECKPOINT_ONE
+            && entry != UPLOAD_MARKER
+            && !entry.starts_with(PACK_TEMP_PREFIX)
+        {
+            return Err(blob_error(BlobStoreError::DepotIntegrity(
+                "Blob upload pack contains a foreign artifact",
+            )));
+        }
+    }
+    // The marker is the durable cleanup authority. Remove every other entry
+    // first; a crash while doing so leaves the marker for exact retry. Once
+    // only the marker remains, removing it leaves an empty directory that the
+    // same exact identity may safely finish deleting on retry.
+    for entry in entries
+        .iter()
+        .filter(|entry| entry.as_str() != UPLOAD_MARKER)
+    {
+        directory.remove_if_exists(entry, false)?;
+    }
+    directory.remove_if_exists(UPLOAD_MARKER, false)?;
+    drop(directory);
+    parent.remove_if_exists(&name, true)?;
+    Ok(())
+}
+
+fn pack_marker_store_error(error: BlobPackError) -> StoreError {
+    match error {
+        BlobPackError::Store(error) => error,
+        BlobPackError::Io(error) => blob_error(BlobStoreError::Io(error)),
+        BlobPackError::Invalid(message) => blob_error(BlobStoreError::DepotIntegrity(message)),
+    }
+}
+
+fn audit_upload_packs(
+    depot_root: &OwnedDirectory,
+    expected: &[BlobPackIdentity],
+    reclaim_orphans: bool,
+) -> Result<(), StoreError> {
+    let Some(pack_root) = depot_root.open_child_directory_if_present(PACK_DIRECTORY)? else {
+        return Ok(());
+    };
+    for name in pack_root.entry_names()? {
+        let directory = pack_root.open_child_directory(&name, false)?;
+        let Some(marker) = directory.read_private_file_if_present(UPLOAD_MARKER, 80)? else {
+            // Legacy stream packs are transitional and intentionally outside
+            // provisional-upload authority in this task.
+            continue;
+        };
+        let identity = decode_upload_marker(&marker).map_err(pack_marker_store_error)?;
+        if name != hex32(identity.upload_id.as_bytes()) {
+            return Err(blob_error(BlobStoreError::DepotIntegrity(
+                "Blob upload pack directory differs from its marker",
+            )));
+        }
+        if expected.contains(&identity) {
+            continue;
+        }
+        drop(directory);
+        if !reclaim_orphans {
+            return Err(blob_error(BlobStoreError::DepotIntegrity(
+                "orphaned Blob upload pack remains after charge release",
+            )));
+        }
+        remove_upload_pack_directory(&pack_root, &identity)?;
+    }
+    Ok(())
+}
+
+pub(super) fn audit_upload_packs_write(
+    depot_root: &OwnedDirectory,
+    expected: &[BlobPackIdentity],
+) -> Result<(), StoreError> {
+    audit_upload_packs(depot_root, expected, true)
+}
+
+pub(super) fn audit_upload_packs_read(
+    depot_root: &OwnedDirectory,
+    expected: &[BlobPackIdentity],
+) -> Result<(), StoreError> {
+    audit_upload_packs(depot_root, expected, false)
 }
 
 enum BlobPackRoot {
     Path(PathBuf),
-    Pinned(OwnedDirectory),
+    Pinned(OwnedDirectory, Arc<()>),
 }
 
 impl BlobPackRoot {
@@ -115,7 +337,7 @@ impl BlobPackRoot {
                 .write(true)
                 .create_new(create_new)
                 .open(root.join(PACK_FILE))?),
-            Self::Pinned(root) => Ok(root.open_private_rw_file(PACK_FILE, create_new)?),
+            Self::Pinned(root, _) => Ok(root.open_private_rw_file(PACK_FILE, create_new)?),
         }
     }
 
@@ -130,7 +352,7 @@ impl BlobPackRoot {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
                 Err(error) => Err(error.into()),
             },
-            Self::Pinned(root) => Ok(root.open_private_rw_file_if_present(PACK_FILE)?),
+            Self::Pinned(root, _) => Ok(root.open_private_rw_file_if_present(PACK_FILE)?),
         }
     }
 
@@ -141,7 +363,7 @@ impl BlobPackRoot {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
                 Err(error) => Err(error.into()),
             },
-            Self::Pinned(root) => Ok(root.read_private_file_if_present(name, 16 * 1024)?),
+            Self::Pinned(root, _) => Ok(root.read_private_file_if_present(name, 16 * 1024)?),
         }
     }
 
@@ -157,7 +379,21 @@ impl BlobPackRoot {
                 journal.sync_all()?;
                 Ok(())
             }
-            Self::Pinned(root) => Ok(root.write_atomic(name, bytes)?),
+            Self::Pinned(root, _) => Ok(root.write_atomic(name, bytes)?),
+        }
+    }
+
+    fn authority(&self) -> Option<Arc<()>> {
+        match self {
+            Self::Path(_) => None,
+            Self::Pinned(_, authority) => Some(Arc::clone(authority)),
+        }
+    }
+
+    fn path(&self) -> &Path {
+        match self {
+            Self::Path(path) => path,
+            Self::Pinned(root, _) => root.path(),
         }
     }
 }
@@ -186,9 +422,21 @@ impl BlobPackIdentity {
     fn from_stream(open: &BlobStreamOpen) -> Self {
         Self::new(open.stream_id(), open.digest(), open.total_len())
     }
+
+    pub const fn upload_id(&self) -> BlobPublicationStreamId {
+        self.upload_id
+    }
+
+    pub const fn request_digest(&self) -> &[u8; 32] {
+        &self.request_digest
+    }
+
+    pub const fn total_len(&self) -> u64 {
+        self.total_len
+    }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct BlobPackCheckpoint {
     generation: u64,
     open_digest: [u8; 32],
@@ -198,7 +446,23 @@ pub struct BlobPackCheckpoint {
     plaintext_offset: u64,
     pack_len: u64,
     frontier: BlobStreamCheckpoint,
+    authority: Option<Arc<()>>,
 }
+
+impl PartialEq for BlobPackCheckpoint {
+    fn eq(&self, other: &Self) -> bool {
+        self.generation == other.generation
+            && self.open_digest == other.open_digest
+            && self.stream_id == other.stream_id
+            && self.total_len == other.total_len
+            && self.next_index == other.next_index
+            && self.plaintext_offset == other.plaintext_offset
+            && self.pack_len == other.pack_len
+            && self.frontier == other.frontier
+    }
+}
+
+impl Eq for BlobPackCheckpoint {}
 
 impl BlobPackCheckpoint {
     pub const fn generation(&self) -> u64 {
@@ -240,6 +504,16 @@ impl BlobPackCheckpoint {
 
     pub const fn total_len(&self) -> u64 {
         self.total_len
+    }
+
+    pub(crate) fn bind_authority(&mut self, authority: Arc<()>) {
+        self.authority = Some(authority);
+    }
+
+    pub(crate) fn is_bound_to(&self, authority: &Arc<()>) -> bool {
+        self.authority
+            .as_ref()
+            .is_some_and(|bound| Arc::ptr_eq(bound, authority))
     }
 
     pub(crate) fn encode(&self) -> Vec<u8> {
@@ -306,6 +580,7 @@ impl BlobPackCheckpoint {
             plaintext_offset,
             pack_len,
             frontier,
+            authority: None,
         })
     }
 }
@@ -355,7 +630,7 @@ impl BlobPackWriter {
         root: &PinnedBlobPackRoot,
         identity: &BlobPackIdentity,
     ) -> Result<Self, BlobPackError> {
-        Self::create_in(root.stream_id(identity.upload_id, true)?, *identity)
+        Self::create_in(root.upload(identity, true)?, *identity)
     }
 
     fn create_in(root: BlobPackRoot, identity: BlobPackIdentity) -> Result<Self, BlobPackError> {
@@ -461,7 +736,12 @@ impl BlobPackWriter {
         identity: &BlobPackIdentity,
         projected: Option<&BlobPackCheckpoint>,
     ) -> Result<Self, BlobPackError> {
-        let root = root.stream_id(identity.upload_id, projected.is_none())?;
+        if projected.is_some_and(|checkpoint| !checkpoint.is_bound_to(&root.authority)) {
+            return Err(BlobPackError::Invalid(
+                "Blob upload checkpoint belongs to another Store",
+            ));
+        }
+        let root = root.upload(identity, projected.is_none())?;
         let (generation, next_index, plaintext_offset, pack_len, payload_len) =
             projected.map_or((0, 0, 0, 0, 0), |checkpoint| {
                 (
@@ -611,6 +891,8 @@ impl BlobPackWriter {
 
     pub fn checkpoint(&mut self) -> Result<BlobPackCheckpoint, BlobPackError> {
         self.data.sync_data()?;
+        #[cfg(test)]
+        maybe_inject_fault(self.root.path(), BlobPackFaultPoint::DataSynced)?;
         let generation = self
             .generation
             .checked_add(1)
@@ -624,6 +906,7 @@ impl BlobPackWriter {
             plaintext_offset: self.plaintext_offset,
             pack_len: self.pack_len,
             frontier: self.frontier.checkpoint(),
+            authority: self.root.authority(),
         };
         let name = if generation % 2 == 0 {
             CHECKPOINT_ZERO
@@ -631,6 +914,15 @@ impl BlobPackWriter {
             CHECKPOINT_ONE
         };
         self.root.write_checkpoint(name, &checkpoint.encode())?;
+        #[cfg(test)]
+        maybe_inject_fault(
+            self.root.path(),
+            if generation % 2 == 0 {
+                BlobPackFaultPoint::CheckpointZeroSynced
+            } else {
+                BlobPackFaultPoint::CheckpointOneSynced
+            },
+        )?;
         self.generation = generation;
         Ok(checkpoint)
     }
@@ -679,6 +971,42 @@ impl BlobPackReader {
         open: &BlobStreamOpen,
     ) -> Result<Self, BlobPackError> {
         Self::open_in(root.stream(open, false)?, open)
+    }
+
+    /// Opens exactly the Store-projected provisional upload checkpoint. Later
+    /// journal progress is intentionally invisible to canonical conversion.
+    pub fn open_projected_upload_pinned(
+        root: &PinnedBlobPackRoot,
+        identity: &BlobPackIdentity,
+        checkpoint: &BlobPackCheckpoint,
+    ) -> Result<Self, BlobPackError> {
+        if !checkpoint.is_bound_to(&root.authority)
+            || checkpoint.upload_id() != identity.upload_id
+            || checkpoint.request_digest() != &identity.request_digest
+            || checkpoint.total_len() != identity.total_len
+        {
+            return Err(BlobPackError::Invalid(
+                "Blob upload reader checkpoint is not Store-bound",
+            ));
+        }
+        let root = root.upload(identity, false)?;
+        let mut data = root
+            .open_existing_data()?
+            .ok_or(BlobPackError::Invalid("Blob pack data is unavailable"))?;
+        validate_header(&mut data, *identity)?;
+        let data_len = data.metadata()?.len();
+        let recovered = recover_checkpoints(&root, *identity, data_len)?;
+        if !recovered.iter().any(|candidate| candidate == checkpoint) {
+            return Err(BlobPackError::Invalid(
+                "store-projected Blob pack checkpoint is unavailable",
+            ));
+        }
+        data.seek(SeekFrom::Start(PACK_HEADER_LEN))?;
+        Ok(Self {
+            data,
+            checkpoint: checkpoint.clone(),
+            next_index: 0,
+        })
     }
 
     fn open_in(root: BlobPackRoot, open: &BlobStreamOpen) -> Result<Self, BlobPackError> {
