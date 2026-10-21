@@ -19,11 +19,15 @@ const TOKEN: &str = "asterctl-test-token-00000000000000";
 const ID: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
 
 fn cli(args: &[&str]) -> Output {
+    cli_with_stdout(args, Stdio::piped())
+}
+
+fn cli_with_stdout(args: &[&str], stdout: Stdio) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_asterctl"))
         .args(args)
         // Keep stdin open: deleting subscriptions must not wait for input.
         .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
+        .stdout(stdout)
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
@@ -40,6 +44,10 @@ fn cli(args: &[&str]) -> Output {
 }
 
 fn run(port: u16, args: &[&str]) -> Output {
+    run_with_stdout(port, args, Stdio::piped())
+}
+
+fn run_with_stdout(port: u16, args: &[&str], stdout: Stdio) -> Output {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let path = std::env::temp_dir().join(format!(
         "asterctl-owned-fixture-{}-{}-unsubscribe.redb",
@@ -62,13 +70,16 @@ fn run(port: u16, args: &[&str]) -> Output {
         .iter()
         .position(|arg| *arg == "--")
         .unwrap_or(args.len());
-    let output = cli(&[
-        &["--token", TOKEN, "--port", &port.to_string()][..],
-        &args[..split],
-        &["--journal", journal, "--client-id", "fixture-client"],
-        &args[split..],
-    ]
-    .concat());
+    let output = cli_with_stdout(
+        &[
+            &["--token", TOKEN, "--port", &port.to_string()][..],
+            &args[..split],
+            &["--journal", journal, "--client-id", "fixture-client"],
+            &args[split..],
+        ]
+        .concat(),
+        stdout,
+    );
     let _ = std::fs::remove_file(path);
     output
 }
@@ -340,18 +351,7 @@ fn closed_stdout_succeeds_and_other_output_errors_fail() {
                     .unwrap(),
             )
         };
-        let output = Command::new(env!("CARGO_BIN_EXE_asterctl"))
-            .args([
-                "--token",
-                TOKEN,
-                "--port",
-                &address.port().to_string(),
-                "unsubscribe",
-                ID,
-            ])
-            .stdout(stdout)
-            .output()
-            .unwrap();
+        let output = run_with_stdout(address.port(), &["unsubscribe", ID], stdout);
         assert_eq!(output.status.code(), Some(if broken_pipe { 0 } else { 1 }));
         requests.recv_timeout(Duration::from_secs(1)).unwrap();
         server.join().unwrap();
