@@ -16881,7 +16881,12 @@ async fn run_node_actor_inner(
         application_control_head,
         event_route_cache.clone(),
         custody_clock.clone(),
-    );
+    )
+    .map_err(|error| {
+        NodeError::Protocol(format!(
+            "selected Blob finalization pool failed to start: {error}"
+        ))
+    })?;
     let initial_status_metrics = SelectedEventStoreMetrics::read(&store)?;
     let identity = NodeIdentity::load_or_create(&state_root.path)?;
     let local_id = identity.id();

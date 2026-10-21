@@ -18,7 +18,7 @@ use std::{
     path::Path,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
 };
 
@@ -1668,12 +1668,26 @@ impl VerifiedBlobDeliveryMetadata {
     }
 }
 
+// Two finalizers bound the simultaneous two-pass decrypt/encrypt memory and
+// CPU cost. Two additional queued jobs absorb a short burst without creating
+// an application-visible configuration contract in this increment.
+const BLOB_FINALIZE_WORKERS: usize = 2;
+const BLOB_FINALIZE_QUEUE_CAPACITY: usize = 2;
+
+pub(crate) type BlobFinalizeCompletion =
+    oneshot::Receiver<Result<BlobPublishResult, ApplicationError>>;
+
 pub(crate) enum BlobPublishFinalization {
+    Completed(BlobPublishResult),
+    Scheduled(BlobFinalizeCompletion),
+}
+
+enum PreparedBlobPublishFinalization {
     Completed(BlobPublishResult),
     Pending(BlobFinalizeJob),
 }
 
-pub(crate) struct BlobFinalizeJob {
+struct BlobFinalizeJob {
     mission: UnprotectedReferenceMission,
     store: Arc<Store>,
     source_route_cache: Arc<AuthenticatedEventRouteCache>,
@@ -1681,22 +1695,187 @@ pub(crate) struct BlobFinalizeJob {
     reservation: BlobUploadReservation,
     cleanup_upload: bool,
     #[cfg(test)]
-    gate: Option<(
-        std::sync::mpsc::SyncSender<()>,
-        std::sync::mpsc::Receiver<()>,
-    )>,
+    gate: Option<BlobFinalizeTestGate>,
+}
+
+struct BlobFinalizeWork {
+    job: BlobFinalizeJob,
+    completion: oneshot::Sender<Result<BlobPublishResult, ApplicationError>>,
+}
+
+#[derive(Default)]
+struct BlobFinalizeCounts {
+    accepted: AtomicU64,
+    completed: AtomicU64,
+    active: AtomicUsize,
+    peak_active: AtomicUsize,
+}
+
+struct BlobFinalizePool {
+    sender: Option<std::sync::mpsc::SyncSender<BlobFinalizeWork>>,
+    workers: Vec<std::thread::JoinHandle<()>>,
+    counts: Arc<BlobFinalizeCounts>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct BlobFinalizeTestGate {
+    started: std::sync::mpsc::SyncSender<()>,
+    finished: std::sync::mpsc::SyncSender<()>,
+    release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    panic_remaining: Arc<AtomicUsize>,
+}
+
+#[cfg(test)]
+impl BlobFinalizeTestGate {
+    fn enter(&self) {
+        _ = self.started.try_send(());
+        let (released, wake) = &*self.release;
+        let mut released = released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !*released {
+            released = wake
+                .wait(released)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        if self
+            .panic_remaining
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                if remaining > 0 {
+                    Some(remaining - 1)
+                } else {
+                    None
+                }
+            })
+            .is_ok()
+        {
+            panic!("injected Blob finalizer worker panic");
+        }
+    }
+
+    fn observe_finished(&self) {
+        _ = self.finished.try_send(());
+    }
+}
+
+impl BlobFinalizePool {
+    fn new() -> Result<Self, ApplicationError> {
+        let (sender, receiver) =
+            std::sync::mpsc::sync_channel::<BlobFinalizeWork>(BLOB_FINALIZE_QUEUE_CAPACITY);
+        let receiver = Arc::new(std::sync::Mutex::new(receiver));
+        let counts = Arc::new(BlobFinalizeCounts::default());
+        let mut workers: Vec<std::thread::JoinHandle<()>> =
+            Vec::with_capacity(BLOB_FINALIZE_WORKERS);
+        for worker_index in 0..BLOB_FINALIZE_WORKERS {
+            let receiver = Arc::clone(&receiver);
+            let counts = Arc::clone(&counts);
+            let worker = match std::thread::Builder::new()
+                .name(format!("aster-blob-finalize-{worker_index}"))
+                .spawn(move || {
+                    loop {
+                        let work = receiver
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .recv();
+                        let Ok(work) = work else { break };
+                        let active = counts.active.fetch_add(1, Ordering::AcqRel) + 1;
+                        counts.peak_active.fetch_max(active, Ordering::AcqRel);
+                        #[cfg(test)]
+                        let gate = work.job.gate.clone();
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            work.job.run()
+                        }))
+                        .unwrap_or_else(|_| {
+                            Err(ApplicationError::new(
+                                ApplicationErrorKind::StateUnavailable,
+                                "blob stream finish",
+                            ))
+                        });
+                        counts.active.fetch_sub(1, Ordering::AcqRel);
+                        counts.completed.fetch_add(1, Ordering::AcqRel);
+                        #[cfg(test)]
+                        if let Some(gate) = gate {
+                            gate.observe_finished();
+                        }
+                        _ = work.completion.send(result);
+                    }
+                }) {
+                Ok(worker) => worker,
+                Err(_) => {
+                    drop(sender);
+                    for worker in workers {
+                        _ = worker.join();
+                    }
+                    return Err(ApplicationError::new(
+                        ApplicationErrorKind::StateUnavailable,
+                        "blob finalization pool",
+                    ));
+                }
+            };
+            workers.push(worker);
+        }
+        Ok(Self {
+            sender: Some(sender),
+            workers,
+            counts,
+        })
+    }
+
+    fn try_submit(&self, job: BlobFinalizeJob) -> Result<BlobFinalizeCompletion, ApplicationError> {
+        let (completion, received) = oneshot::channel();
+        let work = BlobFinalizeWork { job, completion };
+        match self
+            .sender
+            .as_ref()
+            .ok_or_else(|| {
+                ApplicationError::new(ApplicationErrorKind::StateUnavailable, "blob stream finish")
+            })?
+            .try_send(work)
+        {
+            Ok(()) => {
+                self.counts.accepted.fetch_add(1, Ordering::AcqRel);
+                Ok(received)
+            }
+            Err(std::sync::mpsc::TrySendError::Full(_)) => Err(ApplicationError::new(
+                ApplicationErrorKind::ResourceLimit,
+                "blob stream finish",
+            )),
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => Err(ApplicationError::new(
+                ApplicationErrorKind::StateUnavailable,
+                "blob stream finish",
+            )),
+        }
+    }
+
+    fn shutdown(&mut self) {
+        drop(self.sender.take());
+        for worker in self.workers.drain(..) {
+            _ = worker.join();
+        }
+        debug_assert_eq!(self.counts.active.load(Ordering::Acquire), 0);
+        debug_assert_eq!(
+            self.counts.accepted.load(Ordering::Acquire),
+            self.counts.completed.load(Ordering::Acquire)
+        );
+        debug_assert!(self.counts.peak_active.load(Ordering::Acquire) <= BLOB_FINALIZE_WORKERS);
+    }
+}
+
+impl Drop for BlobFinalizePool {
+    fn drop(&mut self) {
+        // Finalizer jobs are synchronous and never await the Tokio runtime or
+        // application actor, so joining here is safe even when facade teardown
+        // originates on a runtime thread.
+        self.shutdown();
+    }
 }
 
 impl BlobFinalizeJob {
-    pub(super) fn run(self) -> Result<BlobPublishResult, ApplicationError> {
+    fn run(self) -> Result<BlobPublishResult, ApplicationError> {
         #[cfg(test)]
-        if let Some((reached, release)) = &self.gate {
-            reached
-                .send(())
-                .map_err(|_| actor_unavailable("blob stream finish"))?;
-            release
-                .recv()
-                .map_err(|_| actor_unavailable("blob stream finish"))?;
+        if let Some(gate) = &self.gate {
+            gate.enter();
         }
 
         // Replay current authority inside this owned job. This deliberately
@@ -1898,6 +2077,7 @@ impl BlobFinalizeJob {
 /// State, Record, and the live runtime. Blob network reconciliation is absent
 /// from this stopped local slice.
 pub struct SelectedBlobNode {
+    finalize_pool: BlobFinalizePool,
     mission: UnprotectedReferenceMission,
     store: Arc<Store>,
     verifier: ReferenceEnvelopeSealer,
@@ -1912,10 +2092,7 @@ pub struct SelectedBlobNode {
     #[cfg(test)]
     live_publish_pass_two_gate: Option<LivePublishPassTwoTestGate>,
     #[cfg(test)]
-    stream_finalize_gate: Option<(
-        std::sync::mpsc::SyncSender<()>,
-        std::sync::mpsc::Receiver<()>,
-    )>,
+    stream_finalize_gate: Option<BlobFinalizeTestGate>,
     #[cfg(test)]
     live_publish_retry_rewind_failure: bool,
     #[cfg(test)]
@@ -1996,6 +2173,7 @@ impl SelectedBlobNode {
         let custody_clock = NodeCustodyClock::open(verifier.identity())
             .map_err(|error| application_error("blob open", error))?;
         let mut selected = Self {
+            finalize_pool: BlobFinalizePool::new()?,
             mission,
             store: Arc::new(store),
             verifier,
@@ -2045,8 +2223,9 @@ impl SelectedBlobNode {
         verifier_head: Option<(u64, ControlTransferId)>,
         source_route_cache: Arc<AuthenticatedEventRouteCache>,
         custody_clock: NodeCustodyClock,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, ApplicationError> {
+        Ok(Self {
+            finalize_pool: BlobFinalizePool::new()?,
             mission,
             store,
             verifier,
@@ -2084,7 +2263,7 @@ impl SelectedBlobNode {
             publish_attempts: 0,
             #[cfg(test)]
             last_live_publish_source_bytes_read: 0,
-        }
+        })
     }
 
     #[cfg(test)]
@@ -2108,10 +2287,25 @@ impl SelectedBlobNode {
     #[cfg(test)]
     fn set_stream_finalize_gate_for_test(
         &mut self,
-        reached: std::sync::mpsc::SyncSender<()>,
-        release: std::sync::mpsc::Receiver<()>,
+        started: std::sync::mpsc::SyncSender<()>,
+        finished: std::sync::mpsc::SyncSender<()>,
+        release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
     ) {
-        self.stream_finalize_gate = Some((reached, release));
+        self.stream_finalize_gate = Some(BlobFinalizeTestGate {
+            started,
+            finished,
+            release,
+            panic_remaining: Arc::new(AtomicUsize::new(0)),
+        });
+    }
+
+    #[cfg(test)]
+    fn panic_stream_finalizations_for_test(&mut self, count: usize) {
+        self.stream_finalize_gate
+            .as_ref()
+            .expect("finalization panic injection requires a gate")
+            .panic_remaining
+            .store(count, Ordering::Release);
     }
 
     #[cfg(test)]
@@ -2193,7 +2387,7 @@ impl SelectedBlobNode {
                 )
             }
             SelectedBlobCommand::FinishPublishStream { token, response } => {
-                let result = self.prepare_publish_stream_finalization(token);
+                let result = self.schedule_publish_stream_finalization(token);
                 finish_live_blob_ledger_command(
                     result,
                     response,
@@ -2532,18 +2726,35 @@ impl SelectedBlobNode {
         &mut self,
         token: [u8; 32],
     ) -> Result<BlobPublishResult, ApplicationError> {
-        match self.prepare_publish_stream_finalization(token)? {
+        match self.schedule_publish_stream_finalization(token)? {
             BlobPublishFinalization::Completed(result) => Ok(result),
-            BlobPublishFinalization::Pending(job) => job.run(),
+            BlobPublishFinalization::Scheduled(completion) => completion
+                .blocking_recv()
+                .map_err(|_| actor_unavailable("blob stream finish"))?,
+        }
+    }
+
+    fn schedule_publish_stream_finalization(
+        &mut self,
+        token: [u8; 32],
+    ) -> Result<BlobPublishFinalization, ApplicationError> {
+        match self.prepare_publish_stream_finalization(token)? {
+            PreparedBlobPublishFinalization::Completed(result) => {
+                Ok(BlobPublishFinalization::Completed(result))
+            }
+            PreparedBlobPublishFinalization::Pending(job) => self
+                .finalize_pool
+                .try_submit(job)
+                .map(BlobPublishFinalization::Scheduled),
         }
     }
 
     fn prepare_publish_stream_finalization(
         &mut self,
         token: [u8; 32],
-    ) -> Result<BlobPublishFinalization, ApplicationError> {
+    ) -> Result<PreparedBlobPublishFinalization, ApplicationError> {
         if let Some((_, result)) = self.completed_publish_streams.remove(&token) {
-            return Ok(BlobPublishFinalization::Completed(result));
+            return Ok(PreparedBlobPublishFinalization::Completed(result));
         }
         let mut stream = self.publish_streams.remove(&token).ok_or_else(|| {
             ApplicationError::new(ApplicationErrorKind::NotFound, "blob stream finish")
@@ -2569,7 +2780,7 @@ impl SelectedBlobNode {
             .writer
             .finish()
             .map_err(|error| blob_pack_application_error("blob stream finish", error))?;
-        Ok(BlobPublishFinalization::Pending(BlobFinalizeJob {
+        Ok(PreparedBlobPublishFinalization::Pending(BlobFinalizeJob {
             mission: self.mission.clone(),
             store: Arc::clone(&self.store),
             source_route_cache: Arc::clone(&self.source_route_cache),
@@ -2577,7 +2788,7 @@ impl SelectedBlobNode {
             reservation: stream.reservation,
             cleanup_upload: true,
             #[cfg(test)]
-            gate: self.stream_finalize_gate.take(),
+            gate: self.stream_finalize_gate.clone(),
         }))
     }
 
@@ -2587,8 +2798,8 @@ impl SelectedBlobNode {
         token: [u8; 32],
     ) -> Result<BlobPublishResult, ApplicationError> {
         match self.prepare_publish_stream_finalization(token)? {
-            BlobPublishFinalization::Completed(result) => Ok(result),
-            BlobPublishFinalization::Pending(mut job) => {
+            PreparedBlobPublishFinalization::Completed(result) => Ok(result),
+            PreparedBlobPublishFinalization::Pending(mut job) => {
                 job.cleanup_upload = false;
                 job.run()
             }
@@ -6420,7 +6631,8 @@ mod tests {
             verifier_head,
             cache,
             custody_clock,
-        );
+        )
+        .expect("open selected Blob finalization pool");
         selected
             .current_policy("blob test open")
             .expect("load selected Blob test policy");
@@ -6449,6 +6661,52 @@ mod tests {
 
     fn payload(length: usize) -> Vec<u8> {
         (0..length).map(|index| (index % 251) as u8).collect()
+    }
+
+    fn prepare_ready_stream(
+        node: &mut SelectedBlobNode,
+        operation: &[u8],
+        bytes: &[u8],
+    ) -> ([u8; 32], BlobPublishStreamRequest) {
+        let request = BlobPublishStreamRequest {
+            publication: request(operation),
+            options: BlobPublishOptions::durable(),
+            total_len: bytes.len() as u64,
+        };
+        let opened = node
+            .open_publish_stream_inner(request.clone())
+            .expect("open ready stream");
+        for (index, chunk) in bytes.chunks(64 * 1024).enumerate() {
+            node.append_publish_stream_inner(
+                opened.token,
+                (index * 64 * 1024) as u64,
+                Zeroizing::new(chunk.to_vec()),
+            )
+            .expect("append ready stream");
+        }
+        (opened.token, request)
+    }
+
+    async fn schedule_stream_finalization_for_test(
+        commands: &mpsc::Sender<SelectedApplicationCommand>,
+        token: [u8; 32],
+    ) -> Result<BlobFinalizeCompletion, ApplicationError> {
+        let (response, received) = oneshot::channel();
+        commands
+            .send(SelectedApplicationCommand::Blob(
+                SelectedBlobCommand::FinishPublishStream { token, response },
+            ))
+            .await
+            .expect("send stream finish command");
+        match received
+            .await
+            .expect("receive stream finish scheduling ack")?
+        {
+            BlobPublishFinalization::Scheduled(completion) => Ok(completion),
+            BlobPublishFinalization::Completed(_) => {
+                panic!("fresh ready stream unexpectedly completed before scheduling")
+            }
+        }
     }
 
     #[test]
@@ -6826,9 +7084,10 @@ mod tests {
         let root = TestRoot::new("stream-finalize-worker");
         let bytes = payload(SELECTED_BLOB_CHUNK_SIZE as usize + 19);
         let mut node = selected_node(&root);
-        let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(0);
-        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
-        node.set_stream_finalize_gate_for_test(reached_tx, release_rx);
+        let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(1);
+        let (finished_tx, _finished_rx) = std::sync::mpsc::sync_channel(1);
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        node.set_stream_finalize_gate_for_test(reached_tx, finished_tx, Arc::clone(&release));
         let identity = node.identity();
         let mission_authority = node.mission_authority();
         let admission = Arc::new(AtomicBool::new(true));
@@ -6866,13 +7125,321 @@ mod tests {
             .await
             .expect("actor services capacity command while finalizer is held")
             .expect("capacity status");
-        release_tx.send(()).expect("release finalizer");
+        {
+            let (released, wake) = &*release;
+            *released.lock().expect("finalizer release lock") = true;
+            wake.notify_all();
+        }
         finishing
             .await
             .expect("join finish task")
             .expect("finish live upload");
         drop(handle);
         worker.await.expect("join live application actor");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stream_finalize_pool_bounds_active_and_queued_jobs_and_retry_after_saturation() {
+        // Break caught: delegating each finish to Tokio's global blocking pool
+        // admits an unbounded number of expensive canonical finalizations.
+        let root = TestRoot::new("stream-finalize-saturation");
+        let bytes = payload(SELECTED_BLOB_CHUNK_SIZE as usize + 29);
+        let (mut node, ready) = tokio::task::block_in_place(|| {
+            let mut node = selected_node(&root);
+            let mut ready = Vec::new();
+            for index in 0..5 {
+                ready.push(prepare_ready_stream(
+                    &mut node,
+                    format!("blob/stream/finalize-saturation-{index}").as_bytes(),
+                    &bytes,
+                ));
+            }
+            (node, ready)
+        });
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(8);
+        let (finished_tx, _finished_rx) = std::sync::mpsc::sync_channel(8);
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        node.set_stream_finalize_gate_for_test(started_tx, finished_tx, Arc::clone(&release));
+        let identity = node.identity();
+        let mission_authority = node.mission_authority();
+        let admission = Arc::new(AtomicBool::new(true));
+        let worker_admission = Arc::clone(&admission);
+        let (commands, mut received) = mpsc::channel(16);
+        let direct = commands.clone();
+        let handle = SelectedBlobHandle::new(commands, admission, identity, mission_authority);
+        let worker = tokio::task::spawn_blocking(move || {
+            while let Some(command) = received.blocking_recv() {
+                let SelectedApplicationCommand::Blob(command) = command else {
+                    panic!("finalize saturation test received another application class");
+                };
+                node.execute_live(command, &worker_admission)
+                    .expect("execute finalize saturation command");
+            }
+        });
+
+        let mut completions = Vec::new();
+        completions.push(
+            schedule_stream_finalization_for_test(&direct, ready[0].0)
+                .await
+                .expect("admit first active finalizer"),
+        );
+        completions.push(
+            schedule_stream_finalization_for_test(&direct, ready[1].0)
+                .await
+                .expect("admit second active finalizer"),
+        );
+        tokio::task::spawn_blocking(move || {
+            started_rx.recv().expect("first finalizer started");
+            started_rx.recv().expect("second finalizer started");
+        })
+        .await
+        .expect("observe bounded active finalizers");
+        completions.push(
+            schedule_stream_finalization_for_test(&direct, ready[2].0)
+                .await
+                .expect("admit first queued finalizer"),
+        );
+        completions.push(
+            schedule_stream_finalization_for_test(&direct, ready[3].0)
+                .await
+                .expect("admit second queued finalizer"),
+        );
+        let saturated = schedule_stream_finalization_for_test(&direct, ready[4].0)
+            .await
+            .expect_err("fifth finalizer exceeds two workers plus two queued jobs");
+        assert_eq!(saturated.kind(), ApplicationErrorKind::ResourceLimit);
+        tokio::time::timeout(std::time::Duration::from_secs(1), handle.capacity_status())
+            .await
+            .expect("actor remains responsive while finalization pool is saturated")
+            .expect("capacity status while saturated");
+
+        {
+            let (released, wake) = &*release;
+            *released.lock().expect("finalizer release lock") = true;
+            wake.notify_all();
+        }
+        for completion in completions {
+            tokio::time::timeout(std::time::Duration::from_secs(10), completion)
+                .await
+                .expect("admitted finalizer completes")
+                .expect("completion sender retained")
+                .expect("canonical finalization succeeds");
+        }
+        let retry = handle
+            .open_publish_stream(ready[4].1.clone())
+            .await
+            .expect("saturated upload remains retry-safe");
+        assert_eq!(retry.durable_offset(), bytes.len() as u64);
+        assert!(
+            retry
+                .finish()
+                .await
+                .expect("retry after pool drain")
+                .inserted
+        );
+
+        drop(handle);
+        drop(direct);
+        worker.await.expect("join saturated application actor");
+    }
+
+    #[test]
+    fn stream_finalize_closed_pool_leaves_sealed_upload_retry_safe() {
+        // Break caught: closed admission must not consume the durable upload
+        // reservation after the actor seals and removes the in-memory stream.
+        let root = TestRoot::new("stream-finalize-closed-pool");
+        let bytes = payload(SELECTED_BLOB_CHUNK_SIZE as usize + 31);
+        let mut node = selected_node(&root);
+        let (token, request) =
+            prepare_ready_stream(&mut node, b"blob/stream/finalize-closed-pool", &bytes);
+        node.finalize_pool.shutdown();
+
+        let error = node
+            .finish_publish_stream_inner(token)
+            .expect_err("closed finalization pool rejects admission");
+        assert_eq!(error.kind(), ApplicationErrorKind::StateUnavailable);
+        drop(node);
+
+        let mut reopened = selected_node(&root);
+        let retry = reopened
+            .open_publish_stream_inner(request)
+            .expect("closed admission leaves exact durable upload retry-safe");
+        assert_eq!(retry.progress.durable_offset, bytes.len() as u64);
+        assert!(
+            reopened
+                .finish_publish_stream_inner(retry.token)
+                .expect("reopened pool finalizes retained upload")
+                .inserted
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn stream_finalize_survives_caller_drop_after_scheduling_ack() {
+        // Break caught: returning the owned job through the response lets a
+        // cancelled finish future drop it after the actor removed the stream.
+        let root = TestRoot::new("stream-finalize-caller-drop");
+        let bytes = payload(SELECTED_BLOB_CHUNK_SIZE as usize + 37);
+        let (mut node, (token, request)) = tokio::task::block_in_place(|| {
+            let mut node = selected_node(&root);
+            let ready =
+                prepare_ready_stream(&mut node, b"blob/stream/finalize-caller-drop", &bytes);
+            (node, ready)
+        });
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (finished_tx, finished_rx) = std::sync::mpsc::sync_channel(1);
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        node.set_stream_finalize_gate_for_test(started_tx, finished_tx, Arc::clone(&release));
+        let identity = node.identity();
+        let mission_authority = node.mission_authority();
+        let admission = Arc::new(AtomicBool::new(true));
+        let worker_admission = Arc::clone(&admission);
+        let (commands, mut received) = mpsc::channel(4);
+        let direct = commands.clone();
+        let handle = SelectedBlobHandle::new(commands, admission, identity, mission_authority);
+        let worker = tokio::task::spawn_blocking(move || {
+            while let Some(command) = received.blocking_recv() {
+                let SelectedApplicationCommand::Blob(command) = command else {
+                    panic!("caller-drop test received another application class");
+                };
+                node.execute_live(command, &worker_admission)
+                    .expect("execute caller-drop command");
+            }
+        });
+
+        let completion = schedule_stream_finalization_for_test(&direct, token)
+            .await
+            .expect("actor schedules finalizer before acknowledging");
+        tokio::task::spawn_blocking(move || started_rx.recv().expect("finalizer started"))
+            .await
+            .expect("observe retained finalizer");
+        drop(completion);
+        drop(handle);
+        drop(direct);
+        let mut worker = worker;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut worker)
+                .await
+                .is_err(),
+            "actor shutdown joins rather than abandons the accepted finalizer"
+        );
+        {
+            let (released, wake) = &*release;
+            *released.lock().expect("finalizer release lock") = true;
+            wake.notify_all();
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(10), &mut worker)
+            .await
+            .expect("joined shutdown completes after finalizer release")
+            .expect("join caller-drop application actor");
+        tokio::task::spawn_blocking(move || finished_rx.recv().expect("finalizer completed"))
+            .await
+            .expect("join retained finalizer observation");
+
+        let publication_id = BlobStreamPublicationId::from_bytes(token).expect("publication id");
+        let (available, before_retry, replay, after_retry) = tokio::task::block_in_place(|| {
+            let mut reopened = selected_node(&root);
+            let available = reopened
+                .inspect_publication(BlobPublicationInspectionRequest {
+                    publication_id,
+                    topic: blob_topic(),
+                    scope: blob_scope(),
+                })
+                .expect("cancelled caller still observes terminal publication");
+            let before_retry = reopened.capacity_status().expect("capacity after finish");
+            let opened = reopened
+                .open_publish_stream_inner(request)
+                .expect("open exact operation after caller cancellation");
+            let replay = reopened
+                .finish_publish_stream_inner(opened.token)
+                .expect("replay exact operation after caller cancellation");
+            let after_retry = reopened.capacity_status().expect("capacity after replay");
+            (available, before_retry, replay, after_retry)
+        });
+        assert_eq!(available.phase, BlobPublicationPhase::Available);
+        assert!(!replay.inserted);
+        assert_eq!(
+            after_retry, before_retry,
+            "exact retry does not leak upload authority or capacity"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn stream_finalize_worker_panics_resolve_completions_and_reclaim_both_slots() {
+        // Break caught: an unwound finalizer must not strand its completion or
+        // permanently consume one of the two application-owned worker slots.
+        let root = TestRoot::new("stream-finalize-worker-panic");
+        let bytes = payload(SELECTED_BLOB_CHUNK_SIZE as usize + 41);
+        let (mut node, first, second) = tokio::task::block_in_place(|| {
+            let mut node = selected_node(&root);
+            let first = prepare_ready_stream(
+                &mut node,
+                b"blob/stream/finalize-worker-panic-first",
+                &bytes,
+            );
+            let second = prepare_ready_stream(
+                &mut node,
+                b"blob/stream/finalize-worker-panic-second",
+                &bytes,
+            );
+            (node, first, second)
+        });
+        let (started_tx, _started_rx) = std::sync::mpsc::sync_channel(2);
+        let (finished_tx, finished_rx) = std::sync::mpsc::sync_channel(2);
+        let release = Arc::new((std::sync::Mutex::new(true), std::sync::Condvar::new()));
+        node.set_stream_finalize_gate_for_test(started_tx, finished_tx, release);
+        node.panic_stream_finalizations_for_test(2);
+        let identity = node.identity();
+        let mission_authority = node.mission_authority();
+        let admission = Arc::new(AtomicBool::new(true));
+        let worker_admission = Arc::clone(&admission);
+        let (commands, mut received) = mpsc::channel(4);
+        let direct = commands.clone();
+        let handle = SelectedBlobHandle::new(commands, admission, identity, mission_authority);
+        let worker = tokio::task::spawn_blocking(move || {
+            while let Some(command) = received.blocking_recv() {
+                let SelectedApplicationCommand::Blob(command) = command else {
+                    panic!("finalizer panic test received another application class");
+                };
+                node.execute_live(command, &worker_admission)
+                    .expect("execute finalizer panic command");
+            }
+        });
+
+        let first_completion = schedule_stream_finalization_for_test(&direct, first.0)
+            .await
+            .expect("schedule first panicking finalizer");
+        let second_completion = schedule_stream_finalization_for_test(&direct, second.0)
+            .await
+            .expect("schedule second panicking finalizer");
+        for completion in [first_completion, second_completion] {
+            let error = completion
+                .await
+                .expect("panicking worker resolves completion sender")
+                .expect_err("injected worker panic is reported");
+            assert_eq!(error.kind(), ApplicationErrorKind::StateUnavailable);
+        }
+        tokio::task::spawn_blocking(move || {
+            finished_rx.recv().expect("first panic accounted");
+            finished_rx.recv().expect("second panic accounted");
+        })
+        .await
+        .expect("join panic accounting observer");
+
+        let retry = handle
+            .open_publish_stream(first.1)
+            .await
+            .expect("panicked finalizer leaves exact upload retry-safe");
+        assert!(
+            retry
+                .finish()
+                .await
+                .expect("reclaimed pool runs retry")
+                .inserted
+        );
+
+        drop(handle);
+        drop(direct);
+        worker.await.expect("join panic application actor");
     }
 
     #[test]

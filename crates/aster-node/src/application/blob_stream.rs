@@ -401,14 +401,9 @@ impl SelectedBlobPublishStream {
             .map_err(|_| actor_unavailable("blob stream finish"))??;
         match finalization {
             BlobPublishFinalization::Completed(result) => Ok(result),
-            BlobPublishFinalization::Pending(job) => tokio::task::spawn_blocking(move || job.run())
+            BlobPublishFinalization::Scheduled(completion) => completion
                 .await
-                .map_err(|_| {
-                    ApplicationError::new(
-                        ApplicationErrorKind::StateUnavailable,
-                        "blob stream finish",
-                    )
-                })?,
+                .map_err(|_| actor_unavailable("blob stream finish"))?,
         }
     }
 }
