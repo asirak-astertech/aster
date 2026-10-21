@@ -37,12 +37,12 @@ allow = [
 [[licenses.exceptions]]
 allow = ["CDLA-Permissive-2.0"]
 name = "webpki-root-certs"
-version = "=1.0.9"
+version = "=1.0.10"
 
 [[licenses.exceptions]]
 allow = ["CDLA-Permissive-2.0"]
 name = "webpki-roots"
-version = "=1.0.9"
+version = "=1.0.10"
 
 [[licenses.exceptions]]
 allow = ["Unlicense"]
