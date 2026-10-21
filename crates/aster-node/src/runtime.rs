@@ -12099,6 +12099,23 @@ fn blob_projection_fits_network_bound(projection: &BlobSourceProjection) -> bool
             == projection
                 .total_len
                 .div_ceil(u64::from(projection.chunk_size))
+        && aster_mesh::blob_profile_for_canonical_shape(
+            SEMANTIC_PROTOCOL_V8,
+            projection.total_len,
+            projection.chunk_size,
+            projection.chunk_count,
+        ) == Some(TransferProfileId::BlobRangesStreamV1)
+}
+
+fn blob_projection_fits_profile5_bound(projection: &BlobSourceProjection) -> bool {
+    usize::try_from(projection.sealed_len)
+        .is_ok_and(|length| length <= crate::stream_transfer::MAX_STREAM_AUTHENTICATED_OPEN_BYTES)
+        && aster_mesh::blob_profile_for_canonical_shape(
+            SEMANTIC_PROTOCOL_V9,
+            projection.total_len,
+            projection.chunk_size,
+            projection.chunk_count,
+        ) == Some(TransferProfileId::BlobStreamV1)
 }
 
 fn blob_claim_fits_network_bound(claim: &AuthenticatedBlobRouteClaim) -> bool {
@@ -26913,36 +26930,97 @@ fn protocol_stage_error(context: &str, error: impl fmt::Display) -> NodeError {
     NodeError::Protocol(format!("{context}: {error}"))
 }
 
-struct SelectedBlobStreamPublication {
+struct SelectedCanonicalBlobPublication {
     expected_cursor: Option<[u8; 32]>,
-    publication: aster_redb_store::BlobStreamPublication,
+    source: blob_stream::CanonicalBlobSendSource,
 }
 
-fn next_blob_stream_publication(
+fn next_canonical_blob_publication(
     store: &Store,
     policy: &ControlPolicySnapshot,
+    verifier: &mut ReferenceEnvelopeSealer,
     peer: NodeId,
     direction: EventDirection,
-) -> Result<Option<SelectedBlobStreamPublication>, NodeError> {
+) -> Result<Option<SelectedCanonicalBlobPublication>, NodeError> {
     let cursor = store.mutable_transfer_cursor(
         peer,
         MutableTransferCursorClass::BlobStream,
         mutable_transfer_cursor_mode(direction),
     )?;
-    let mut publications = store.blob_stream_publications_with_policy(policy)?;
-    publications.sort_unstable_by_key(|publication| *publication.stream_id().as_bytes());
-    let selected = cursor
+    let mut publications = Vec::new();
+    // A missing custody digest is truthful only for durable sources. Task 5
+    // enables finite profile-5 inventory after adding the v9 custody
+    // authorization/finalization path on both sides of the contact.
+    store.visit_durable_retained_blob_sources(Some(policy), |retained| {
+        if matches!(retained.retention, BlobSourceRetention::Completed { .. })
+            && blob_projection_fits_profile5_bound(&retained.source)
+        {
+            publications.push(retained.clone());
+        }
+    })?;
+    publications.sort_unstable_by_key(|publication| *publication.source.transfer_id.as_bytes());
+    let start = cursor
         .and_then(|cursor| {
             publications
                 .iter()
-                .position(|publication| publication.stream_id().as_bytes() > &cursor)
+                .position(|publication| publication.source.transfer_id.as_bytes() > &cursor)
         })
-        .and_then(|index| publications.get(index).cloned())
-        .or_else(|| publications.into_iter().next());
-    Ok(selected.map(|publication| SelectedBlobStreamPublication {
-        expected_cursor: cursor,
-        publication,
-    }))
+        .unwrap_or(0);
+    publications.rotate_left(start);
+    for retained in publications {
+        let stored = store
+            .get_blob(retained.source.transfer_id)?
+            .ok_or_else(|| {
+                NodeError::FatalBlobCoherence(
+                    "profile-5 inventory lost its exact canonical source row".into(),
+                )
+            })?;
+        let claim = authenticate_blob_source(
+            store,
+            verifier,
+            &stored.sealed,
+            &retained.source,
+            retained.retention,
+            None,
+        )?;
+        if !verifier.is_current_source_route_lineage(
+            &claim.scope,
+            claim.key_epoch,
+            claim.route_lineage,
+        ) || !verifier.is_current_blob_physical_lineage(
+            &claim.scope,
+            &claim.topic,
+            claim.key_epoch,
+            claim.physical_lineage,
+        ) {
+            continue;
+        }
+        let route = verifier.verify_blob(&stored.sealed)?;
+        let BlobContentVerification::ContentVerified {
+            blob,
+            manifest_bytes,
+        } = verifier.verify_blob_content(route, &stored.sealed)?
+        else {
+            return Err(NodeError::FatalBlobCoherence(
+                "profile-5 canonical source lost its content grant".into(),
+            ));
+        };
+        let plan = blob.transfer_plan(&manifest_bytes).map_err(|error| {
+            NodeError::Protocol(format!("profile-5 canonical manifest plan failed: {error}"))
+        })?;
+        let completion = claim.depot_completion.ok_or_else(|| {
+            NodeError::FatalBlobCoherence(
+                "profile-5 canonical source lacks its completed depot capability".into(),
+            )
+        })?;
+        let source = blob_stream::CanonicalBlobSendSource::new(stored, plan, completion)
+            .map_err(profile5_blob_network_error)?;
+        return Ok(Some(SelectedCanonicalBlobPublication {
+            expected_cursor: cursor,
+            source,
+        }));
+    }
+    Ok(None)
 }
 
 fn settle_blob_stream_cursor(
@@ -26950,14 +27028,14 @@ fn settle_blob_stream_cursor(
     peer: NodeId,
     direction: EventDirection,
     expected: Option<[u8; 32]>,
-    stream_id: aster_mesh::BlobPublicationStreamId,
+    publication: BlobTransferId,
 ) -> Result<(), NodeError> {
     if store.compare_and_advance_mutable_transfer_cursor(
         peer,
         MutableTransferCursorClass::BlobStream,
         mutable_transfer_cursor_mode(direction),
         expected,
-        *stream_id.as_bytes(),
+        *publication.as_bytes(),
     )? {
         Ok(())
     } else {
@@ -26973,13 +27051,15 @@ async fn send_profile5_blob_direction(
     mission: &mut MissionSession,
     profiles: &V7TransferProfiles,
     guard: &EventLaneGuard,
+    verifier: &mut ReferenceEnvelopeSealer,
     direction: EventDirection,
     receipt: &mut PeerReceipt,
 ) -> Result<(), NodeError> {
     guard.check(store)?;
     let peer = mission.peer().mission_id();
-    let selected = next_blob_stream_publication(store, guard.policy(), peer, direction)?;
-    let publication = selected.as_ref().map(|selected| &selected.publication);
+    let selected =
+        next_canonical_blob_publication(store, guard.policy(), verifier, peer, direction)?;
+    let publication = selected.as_ref().map(|selected| &selected.source);
     let mut attempt_nonce = publication.as_ref().map(|_| [0; 32]);
     if let Some(nonce) = attempt_nonce.as_mut() {
         getrandom::fill(nonce).map_err(|error| blob_stream_error("Blob stream nonce", error))?;
@@ -27012,9 +27092,9 @@ async fn send_profile5_blob_direction(
             "Blob stream plan acknowledgement crossed directions".into(),
         ));
     }
-    let Some(SelectedBlobStreamPublication {
+    let Some(SelectedCanonicalBlobPublication {
         expected_cursor,
-        publication,
+        source,
     }) = selected
     else {
         return if acknowledged_nonce.is_none() {
@@ -27032,7 +27112,7 @@ async fn send_profile5_blob_direction(
             peer,
             direction,
             expected_cursor,
-            publication.stream_id(),
+            source.publication(),
         )?;
         return Ok(());
     }
@@ -27042,25 +27122,20 @@ async fn send_profile5_blob_direction(
         ));
     }
     guard.check(store)?;
-    let pack_root = aster_redb_store::pack::PinnedBlobPackRoot::open(store)?;
-    let roots = (
-        *publication.commitment().plaintext_root(),
-        *publication.commitment().ciphertext_root(),
-    );
     // Keep the profile-5 state machine off the contact worker's stack. Debug
     // builds on smaller-stack targets still retain scoped cancellation inside
     // the boxed operation.
-    let report = Box::pin(blob_stream::send_completed_pack_protected(
-        connection.clone(),
+    let transport = blob_stream::select_stream_transport(connection.clone())
+        .map_err(profile5_blob_network_error)?;
+    let report = Box::pin(blob_stream::send_canonical_blob_profile5(
+        transport.as_ref(),
+        store,
+        guard.policy(),
+        &source,
         mission,
         profiles.digest,
         direction,
         nonce,
-        publication.open(),
-        publication.authenticated_open().to_vec(),
-        &pack_root,
-        roots,
-        publication.authenticated_commitment().to_vec(),
     ))
     .await
     .map_err(profile5_blob_network_error)?;
@@ -27070,7 +27145,7 @@ async fn send_profile5_blob_direction(
         peer,
         direction,
         expected_cursor,
-        publication.stream_id(),
+        source.publication(),
     )?;
     guard.check(store)
 }
@@ -27220,7 +27295,7 @@ async fn sync_profile5_blob_lane_if_selected(
     profiles: Option<&V7TransferProfiles>,
     mode: BlobTransferMode,
     guard: &EventLaneGuard,
-    verifier: ReferenceEnvelopeSealer,
+    mut verifier: ReferenceEnvelopeSealer,
     interests: &MutableSourceInterests,
     send_enabled: bool,
     receive_enabled: bool,
@@ -27240,6 +27315,7 @@ async fn sync_profile5_blob_lane_if_selected(
             mission,
             profiles,
             guard,
+            &mut verifier,
             EventDirection::ToSessionResponder,
             receipt,
         )
@@ -27301,12 +27377,18 @@ async fn serve_profile5_blob_lane_if_selected(
         .map_err(|error| blob_stream_error("profile-5 responder receive phase", error))?;
     }
     if send_enabled {
+        let mut verifier = Arc::try_unwrap(verifier).map_err(|_| {
+            NodeError::Protocol(
+                "profile-5 receiver retained the verifier after its phase completed".into(),
+            )
+        })?;
         send_profile5_blob_direction(
             &store,
             connection,
             mission,
             profiles,
             guard,
+            &mut verifier,
             EventDirection::ToSessionInitiator,
             receipt,
         )
@@ -51711,6 +51793,193 @@ mod tests {
                 .expect("v9 streaming Blob mode");
         assert_eq!(stream_mode, BlobTransferMode::StreamV1);
         assert!(stream_mode.legacy().is_none());
+    }
+
+    #[test]
+    fn pre_profile5_blob_is_profile5_sender_eligible() {
+        // Mutation caught: reading the removed split stream-publication table
+        // would return no work for an ordinary pre-profile-5 canonical Blob.
+        let services = control_test_services([0xa4; 32]);
+        let state = root("canonical-profile5-inventory");
+        fs::create_dir_all(&state).expect("canonical inventory state");
+        let store = Store::open_for_mission(
+            state.join(STORE_FILE),
+            services.member.mission_authority_id(),
+        )
+        .expect("canonical inventory store");
+        let mut verifier = open_test_sealer(&services.member);
+        let publication = publish_test_blob(
+            &store,
+            &mut verifier,
+            &services.topic,
+            &services.scope,
+            1,
+            b"ordinary canonical Blob predating profile 5",
+        );
+        let policy = store.control_policy_snapshot().expect("canonical policy");
+
+        let selected = next_canonical_blob_publication(
+            &store,
+            &policy,
+            &mut verifier,
+            services.other.identity(),
+            EventDirection::ToSessionResponder,
+        )
+        .expect("canonical profile-5 inventory")
+        .expect("canonical publication selected");
+        assert_eq!(selected.source.publication(), publication);
+
+        drop(store);
+        fs::remove_dir_all(state).expect("canonical inventory cleanup");
+    }
+
+    #[test]
+    fn profile5_sender_withholds_finite_source_until_v9_custody_authority_exists() {
+        // Mutation caught: the all-visible canonical visitor would advertise a
+        // finite publication while StreamOpenV1 truthfully has no v9 custody
+        // digest yet. Task 5 adds that authority before enabling this case.
+        let services = control_test_services([0xa7; 32]);
+        let state = root("canonical-profile5-finite-inventory");
+        fs::create_dir_all(&state).expect("finite canonical inventory state");
+        let store = Store::open_for_mission(
+            state.join(STORE_FILE),
+            services.member.mission_authority_id(),
+        )
+        .expect("finite canonical inventory store");
+        let mut verifier = open_test_sealer(&services.member);
+        let publication = publish_test_finite_blob(
+            &store,
+            &mut verifier,
+            &services.topic,
+            &services.scope,
+            1,
+            b"finite canonical Blob awaiting profile-5 custody",
+            600_000,
+            25,
+            CustodySample {
+                clock_id: [0xa7; 16],
+                tick_ms: 0,
+            },
+        );
+        assert!(store.get_blob(publication).unwrap().is_some());
+        let policy = store.control_policy_snapshot().expect("finite policy");
+
+        let selected = next_canonical_blob_publication(
+            &store,
+            &policy,
+            &mut verifier,
+            services.other.identity(),
+            EventDirection::ToSessionResponder,
+        )
+        .expect("finite profile-5 inventory");
+        assert!(selected.is_none());
+
+        drop(store);
+        fs::remove_dir_all(state).expect("finite canonical inventory cleanup");
+    }
+
+    #[test]
+    fn stream_published_blob_remains_profile4_eligible_for_v8() {
+        // Task 3 commits stream uploads through this same canonical projection;
+        // profile choice therefore depends on authenticated shape/version, not
+        // which application API produced the publication.
+        let services = control_test_services([0xa6; 32]);
+        let state = root("canonical-dual-profile-eligibility");
+        fs::create_dir_all(&state).expect("dual-profile state");
+        let store = Store::open_for_mission(
+            state.join(STORE_FILE),
+            services.member.mission_authority_id(),
+        )
+        .expect("dual-profile store");
+        let mut verifier = open_test_sealer(&services.member);
+        let publication = publish_test_blob(
+            &store,
+            &mut verifier,
+            &services.topic,
+            &services.scope,
+            1,
+            &[0x7a; 2 * 64 * 1024],
+        );
+        let retained = store
+            .blob_source_projection(publication)
+            .expect("dual-profile projection")
+            .expect("dual-profile retained source");
+
+        assert!(blob_projection_fits_network_bound(&retained.source));
+        assert!(blob_projection_fits_profile5_bound(&retained.source));
+
+        let mut over_profile4 = retained.source;
+        over_profile4.total_len = MAX_NETWORK_BLOB_BYTES + 1;
+        over_profile4.chunk_count = over_profile4
+            .total_len
+            .div_ceil(u64::from(over_profile4.chunk_size));
+        assert!(!blob_projection_fits_network_bound(&over_profile4));
+        assert!(blob_projection_fits_profile5_bound(&over_profile4));
+
+        drop(store);
+        fs::remove_dir_all(state).expect("dual-profile cleanup");
+    }
+
+    #[test]
+    fn canonical_sender_rejects_a_completion_for_another_verified_blob() {
+        // Mutation caught: accepting Store + transfer ID, or checking only that
+        // some finalized depot exists, would let source A read variant B.
+        let services = control_test_services([0xa5; 32]);
+        let state = root("canonical-profile5-capability");
+        fs::create_dir_all(&state).expect("canonical capability state");
+        let store = Store::open_for_mission(
+            state.join(STORE_FILE),
+            services.member.mission_authority_id(),
+        )
+        .expect("canonical capability store");
+        let mut verifier = open_test_sealer(&services.member);
+        let first = publish_test_blob(
+            &store,
+            &mut verifier,
+            &services.topic,
+            &services.scope,
+            1,
+            b"canonical capability first",
+        );
+        let second = publish_test_blob(
+            &store,
+            &mut verifier,
+            &services.topic,
+            &services.scope,
+            1,
+            b"canonical capability second",
+        );
+        let first_stored = store.get_blob(first).unwrap().unwrap();
+        let first_plan = completed_test_blob_plan(&store, &mut verifier, first);
+        let second_stored = store.get_blob(second).unwrap().unwrap();
+        let second_retained = store.blob_source_projection(second).unwrap().unwrap();
+        let second_route = verifier.verify_blob(&second_stored.sealed).unwrap();
+        let BlobContentVerification::ContentVerified {
+            blob: second_blob,
+            manifest_bytes: second_manifest,
+        } = verifier
+            .verify_blob_content(second_route, &second_stored.sealed)
+            .unwrap()
+        else {
+            panic!("second canonical Blob lost content access")
+        };
+        let second_completion = store
+            .completed_retained_blob(
+                &second_retained.source,
+                second_retained.retention,
+                &second_blob,
+                &second_manifest,
+                &second_stored.sealed,
+            )
+            .expect("second canonical completion");
+
+        assert!(
+            blob_stream::CanonicalBlobSendSource::new(first_stored, first_plan, second_completion,)
+                .is_err()
+        );
+
+        drop(store);
+        fs::remove_dir_all(state).expect("canonical capability cleanup");
     }
 
     #[tokio::test]

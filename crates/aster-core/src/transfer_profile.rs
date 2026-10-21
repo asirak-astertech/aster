@@ -11,6 +11,12 @@ const CRITICAL_ID_MASK: u16 = 0x8000;
 const SEMANTIC_PROTOCOL_V7: u16 = 7;
 const SEMANTIC_PROTOCOL_V8: u16 = 8;
 const SEMANTIC_PROTOCOL_V9: u16 = 9;
+/// Historical semantic-v7/v8 profile-4 publication ceiling. This remains
+/// version-scoped even though v9/profile-5 can carry the full canonical Blob
+/// ceiling.
+pub const PROFILE4_MAX_CANONICAL_BLOB_BYTES: u64 = 64 * 1024 * 1024;
+pub const PROFILE4_MAX_CANONICAL_BLOB_CHUNKS: u64 = 1_024;
+pub const PROFILE5_MAX_CANONICAL_BLOB_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 /// Fixed application transfer lanes covered by profile negotiation.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -65,6 +71,41 @@ impl TransferProfileId {
             5 => Some(Self::BlobStreamV1),
             _ => None,
         }
+    }
+}
+
+/// Selects the Blob profile which can represent one exact canonical
+/// publication for an already-authenticated semantic version.
+///
+/// This is sender inventory eligibility, not wire-format migration: a Blob
+/// above the historical profile-4 bound is withheld from v7/v8 peers while
+/// remaining eligible for v9/profile-5.
+#[doc(hidden)]
+pub fn blob_profile_for_canonical_shape(
+    semantic_version: u16,
+    total_len: u64,
+    chunk_size: u32,
+    chunk_count: u64,
+) -> Option<TransferProfileId> {
+    if total_len == 0
+        || chunk_size != crate::MAX_BLOB_CHUNK_SIZE
+        || chunk_count == 0
+        || chunk_count != total_len.div_ceil(u64::from(chunk_size))
+        || chunk_count > crate::MAX_BLOB_CHUNKS
+    {
+        return None;
+    }
+    match semantic_version {
+        SEMANTIC_PROTOCOL_V7 | SEMANTIC_PROTOCOL_V8
+            if total_len <= PROFILE4_MAX_CANONICAL_BLOB_BYTES
+                && chunk_count <= PROFILE4_MAX_CANONICAL_BLOB_CHUNKS =>
+        {
+            Some(TransferProfileId::BlobRangesStreamV1)
+        }
+        SEMANTIC_PROTOCOL_V9 if total_len <= PROFILE5_MAX_CANONICAL_BLOB_BYTES => {
+            Some(TransferProfileId::BlobStreamV1)
+        }
+        _ => None,
     }
 }
 
@@ -502,6 +543,68 @@ impl<'a> OfferReader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pre_profile5_blob_is_profile5_sender_eligible() {
+        // Mutation caught: tying profile-5 inventory to the removed stream
+        // publication table would exclude an ordinary canonical publication.
+        assert_eq!(
+            blob_profile_for_canonical_shape(9, 64 * 1024, 64 * 1024, 1),
+            Some(TransferProfileId::BlobStreamV1)
+        );
+    }
+
+    #[test]
+    fn stream_published_blob_remains_profile4_eligible_for_v8() {
+        // Mutation caught: treating canonical publication as profile-5-only
+        // would break byte-compatible v8/profile-4 delivery for small Blobs.
+        let total_len = 64 * 1024 * 1024;
+        let chunk_count = total_len / (64 * 1024);
+        assert_eq!(
+            blob_profile_for_canonical_shape(8, total_len, 64 * 1024, chunk_count),
+            Some(TransferProfileId::BlobRangesStreamV1)
+        );
+        assert_eq!(
+            blob_profile_for_canonical_shape(9, total_len, 64 * 1024, chunk_count),
+            Some(TransferProfileId::BlobStreamV1)
+        );
+    }
+
+    #[test]
+    fn profile4_and_profile5_size_boundaries_are_version_scoped() {
+        let profile4_max = 64 * 1024 * 1024_u64;
+        let profile5_max = 8 * 1024 * 1024 * 1024_u64;
+        assert_eq!(
+            blob_profile_for_canonical_shape(
+                8,
+                profile4_max + 1,
+                64 * 1024,
+                (profile4_max + 1).div_ceil(64 * 1024),
+            ),
+            None
+        );
+        assert_eq!(
+            blob_profile_for_canonical_shape(
+                9,
+                profile4_max + 1,
+                64 * 1024,
+                (profile4_max + 1).div_ceil(64 * 1024),
+            ),
+            Some(TransferProfileId::BlobStreamV1)
+        );
+        assert_eq!(
+            blob_profile_for_canonical_shape(9, profile5_max, 64 * 1024, 131_072),
+            Some(TransferProfileId::BlobStreamV1)
+        );
+        assert_eq!(
+            blob_profile_for_canonical_shape(8, profile5_max, 64 * 1024, 131_072,),
+            None
+        );
+        assert_eq!(
+            blob_profile_for_canonical_shape(9, profile5_max + 1, 64 * 1024, 131_073,),
+            None
+        );
+    }
 
     #[test]
     fn semantic_v9_selects_blob_stream_without_profile_four_fallback() {

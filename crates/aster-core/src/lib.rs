@@ -269,7 +269,7 @@ pub use store::{BridgeFilter, EventGap, PeerSnapshot, QuotaUsage, SubscriptionId
 #[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
 pub use transfer_profile::{
     NegotiatedTransferProfiles, TransferLaneId, TransferProfileError, TransferProfileId,
-    TransferProfileOfferV1, negotiate_transfer_profiles,
+    TransferProfileOfferV1, blob_profile_for_canonical_shape, negotiate_transfer_profiles,
     negotiate_transfer_profiles_for_semantic_version, transfer_profile_digest,
 };
 

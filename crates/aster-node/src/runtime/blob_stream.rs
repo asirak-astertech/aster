@@ -9,11 +9,12 @@ use crate::{
         StreamPartition, run_ordered_channel_pipeline_from,
     },
     stream_transfer::{
-        MAX_STREAM_CHECKPOINT_BATCH_BYTES, PROFILE5_ATTEMPT_TIMEOUT, PROFILE5_EXTENT_BYTES,
-        PROFILE5_MAX_RECORD_BYTES, StreamAction, StreamClass, StreamDirection, StreamExtentAction,
-        StreamFrame, StreamOpenV1, StreamReceiverState, StreamResultCode, StreamSenderState,
-        blob_pack_wire_len, encode_composite_data_prefix, profile5_attempt_bounds,
-        profile5_receive_limit, split_composite_data_record,
+        MAX_STREAM_CHECKPOINT_BATCH_BYTES, PROFILE5_ATTEMPT_TIMEOUT,
+        PROFILE5_CANONICAL_CARRIER_RECORD_BYTES, PROFILE5_CANONICAL_EXTENT_BYTES,
+        PROFILE5_EXTENT_BYTES, PROFILE5_MAX_RECORD_BYTES, StreamAction, StreamClass,
+        StreamDirection, StreamExtentAction, StreamFrame, StreamOpenV1, StreamReceiverState,
+        StreamResultCode, StreamSenderState, blob_pack_wire_len, encode_composite_data_prefix,
+        profile5_attempt_bounds, profile5_receive_limit, split_composite_data_record,
     },
     stream_transport::{
         AttemptOpenRequest, AuthenticatedPeerSupport, AuthenticatedSupportSource,
@@ -24,16 +25,329 @@ use crate::{
 use aster_iroh::Connection;
 use aster_mesh::{
     BlobStreamOpen, BlobStreamSegmentOpener, NodeId, VerifiedBlobStreamFinalCommitment,
-    VerifiedBlobStreamOpen,
+    VerifiedBlobStreamOpen, VerifiedBlobTransferPlan,
 };
 use aster_redb_store::{
-    BlobOperationKey, BlobStreamReservation, BlobStreamReservationRequest, BlobStreamResume,
-    BlobStreamSource, ControlPolicySnapshot, Store,
+    BlobDepotCompletion, BlobOperationKey, BlobSourceRetention, BlobStreamReservation,
+    BlobStreamReservationRequest, BlobStreamResume, BlobStreamSource, BlobTransferId,
+    ControlPolicySnapshot, Store, StoredBlob,
     pack::{BlobPackCheckpoint, BlobPackReader, BlobPackWriter, PinnedBlobPackRoot},
 };
 use sha2::{Digest, Sha256};
 use std::{path::Path, sync::Arc};
 use tokio::{sync::mpsc, time::Instant};
+
+const CANONICAL_CARRIER_EXTENT_MAGIC: &[u8; 4] = b"ABC1";
+const CANONICAL_CARRIER_EXTENT_HEADER_BYTES: usize = 4 + 8 + 4;
+
+/// One bounded transport batch of complete canonical `ASTRBT01` objects.
+/// Carrier objects remain byte-identical to profile 4; only their batching is
+/// profile-5-specific.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CanonicalCarrierExtentV1 {
+    first_chunk_index: u64,
+    carriers: Vec<Vec<u8>>,
+}
+
+impl CanonicalCarrierExtentV1 {
+    fn encode(&self) -> Result<Vec<u8>, BlobNetworkError> {
+        if self.carriers.is_empty()
+            || self
+                .first_chunk_index
+                .checked_add(self.carriers.len() as u64)
+                .is_none_or(|end| end > aster_mesh::MAX_BLOB_CHUNKS)
+        {
+            return Err(BlobNetworkError::new(
+                BlobNetworkStage::Framing,
+                "encode canonical carrier extent",
+                "carrier index range is invalid",
+            ));
+        }
+        let mut encoded_len = CANONICAL_CARRIER_EXTENT_HEADER_BYTES;
+        for carrier in &self.carriers {
+            if carrier.is_empty() || carrier.len() > PROFILE5_CANONICAL_CARRIER_RECORD_BYTES {
+                return Err(BlobNetworkError::new(
+                    BlobNetworkStage::Framing,
+                    "encode canonical carrier extent",
+                    "canonical carrier length is invalid",
+                ));
+            }
+            encoded_len = encoded_len
+                .checked_add(4)
+                .and_then(|length| length.checked_add(carrier.len()))
+                .ok_or("canonical carrier extent overflows")?;
+        }
+        if encoded_len > PROFILE5_CANONICAL_EXTENT_BYTES {
+            return Err(BlobNetworkError::new(
+                BlobNetworkStage::Framing,
+                "encode canonical carrier extent",
+                "canonical carrier extent exceeds profile-5 bound",
+            ));
+        }
+        let mut output = Vec::with_capacity(encoded_len);
+        output.extend_from_slice(CANONICAL_CARRIER_EXTENT_MAGIC);
+        output.extend_from_slice(&self.first_chunk_index.to_be_bytes());
+        output.extend_from_slice(
+            &u32::try_from(self.carriers.len())
+                .map_err(|_| "canonical carrier count overflows")?
+                .to_be_bytes(),
+        );
+        for carrier in &self.carriers {
+            output.extend_from_slice(
+                &u32::try_from(carrier.len())
+                    .map_err(|_| "canonical carrier length overflows")?
+                    .to_be_bytes(),
+            );
+            output.extend_from_slice(carrier);
+        }
+        Ok(output)
+    }
+
+    #[allow(dead_code, reason = "Task 5 consumes this exact receiver codec")]
+    fn decode(bytes: &[u8]) -> Result<Self, BlobNetworkError> {
+        if bytes.len() < CANONICAL_CARRIER_EXTENT_HEADER_BYTES
+            || bytes.len() > PROFILE5_CANONICAL_EXTENT_BYTES
+            || &bytes[..4] != CANONICAL_CARRIER_EXTENT_MAGIC
+        {
+            return Err(BlobNetworkError::new(
+                BlobNetworkStage::Framing,
+                "decode canonical carrier extent",
+                "carrier extent framing is invalid",
+            ));
+        }
+        let first_chunk_index = u64::from_be_bytes(
+            bytes[4..12]
+                .try_into()
+                .map_err(|_| "canonical carrier extent is truncated")?,
+        );
+        let count = usize::try_from(u32::from_be_bytes(
+            bytes[12..16]
+                .try_into()
+                .map_err(|_| "canonical carrier extent is truncated")?,
+        ))
+        .map_err(|_| "canonical carrier count overflows")?;
+        if count == 0
+            || first_chunk_index
+                .checked_add(count as u64)
+                .is_none_or(|end| end > aster_mesh::MAX_BLOB_CHUNKS)
+        {
+            return Err("canonical carrier extent index range is invalid".into());
+        }
+        let mut offset = CANONICAL_CARRIER_EXTENT_HEADER_BYTES;
+        let mut carriers = Vec::with_capacity(count);
+        for _ in 0..count {
+            let length_end = offset
+                .checked_add(4)
+                .ok_or("canonical carrier extent overflows")?;
+            let length = usize::try_from(u32::from_be_bytes(
+                bytes
+                    .get(offset..length_end)
+                    .ok_or("canonical carrier extent is truncated")?
+                    .try_into()
+                    .map_err(|_| "canonical carrier extent is truncated")?,
+            ))
+            .map_err(|_| "canonical carrier length overflows")?;
+            if length == 0 || length > PROFILE5_CANONICAL_CARRIER_RECORD_BYTES {
+                return Err("canonical carrier length is invalid".into());
+            }
+            let end = length_end
+                .checked_add(length)
+                .ok_or("canonical carrier extent overflows")?;
+            carriers.push(
+                bytes
+                    .get(length_end..end)
+                    .ok_or("canonical carrier extent is truncated")?
+                    .to_vec(),
+            );
+            offset = end;
+        }
+        if offset != bytes.len() {
+            return Err("canonical carrier extent has trailing bytes".into());
+        }
+        Ok(Self {
+            first_chunk_index,
+            carriers,
+        })
+    }
+}
+
+/// Capability-bearing canonical send input. Construction requires the
+/// source/content-verified transfer plan and the Store's nonconstructible
+/// completion proof; a raw `Store + BlobTransferId` is intentionally
+/// insufficient.
+pub(crate) struct CanonicalBlobSendSource {
+    stored: StoredBlob,
+    plan: VerifiedBlobTransferPlan,
+    completion: BlobDepotCompletion,
+}
+
+impl CanonicalBlobSendSource {
+    pub(crate) fn new(
+        stored: StoredBlob,
+        plan: VerifiedBlobTransferPlan,
+        completion: BlobDepotCompletion,
+    ) -> Result<Self, BlobNetworkError> {
+        if *stored.transfer_id.as_bytes() != plan.source_envelope().into_bytes()
+            || stored.blob_id != plan.manifest().id()
+            || stored.manifest_digest != *plan.manifest_digest()
+            || stored.variant_id != completion.variant_id()
+            || stored.blob_id != completion.blob_id()
+            || stored.manifest_digest != *completion.manifest_digest()
+            || stored.header.key_epoch != completion.content_epoch()
+            || stored.header.content_len
+                != u64::try_from(plan.manifest_bytes().len()).unwrap_or(u64::MAX)
+            || completion.total_len() != plan.manifest().total_len()
+            || completion.chunk_size() != plan.manifest().chunk_size()
+            || completion.chunk_count() != plan.manifest().chunk_count()
+            || plan.physical_lineage().binding() != completion.physical_lineage()
+        {
+            return Err(authentication_failure(
+                "bind canonical Blob send source",
+                "verified source, manifest, and depot completion differ",
+            ));
+        }
+        Ok(Self {
+            stored,
+            plan,
+            completion,
+        })
+    }
+
+    pub(crate) const fn publication(&self) -> BlobTransferId {
+        self.stored.transfer_id
+    }
+
+    pub(crate) fn authenticated_open(&self) -> &[u8] {
+        &self.stored.sealed
+    }
+}
+
+fn canonical_extent_shape(
+    plan: &VerifiedBlobTransferPlan,
+    first_chunk_index: u64,
+) -> Result<(u64, u64), BlobNetworkError> {
+    if first_chunk_index >= plan.manifest().chunk_count() {
+        return Err("canonical extent starts outside the manifest".into());
+    }
+    let mut encoded_len = CANONICAL_CARRIER_EXTENT_HEADER_BYTES as u64;
+    let mut count = 0_u64;
+    for index in first_chunk_index..plan.manifest().chunk_count() {
+        let carrier = plan
+            .carrier_id(index)
+            .map_err(|error| verification_failure("derive canonical carrier ID", error))?;
+        let carrier_len = plan
+            .carrier_total_len(&carrier.wire_bytes())
+            .map_err(|error| verification_failure("derive canonical carrier length", error))?;
+        let next = encoded_len
+            .checked_add(4)
+            .and_then(|value| value.checked_add(carrier_len))
+            .ok_or("canonical extent length overflow")?;
+        if next > PROFILE5_CANONICAL_EXTENT_BYTES as u64 {
+            if count == 0 {
+                return Err("one canonical carrier exceeds the profile-5 extent bound".into());
+            }
+            break;
+        }
+        encoded_len = next;
+        count += 1;
+    }
+    Ok((count, encoded_len))
+}
+
+fn canonical_blob_wire_len(plan: &VerifiedBlobTransferPlan) -> Result<u64, BlobNetworkError> {
+    let mut index = 0_u64;
+    let mut total = 0_u64;
+    while index < plan.manifest().chunk_count() {
+        let (count, extent_len) = canonical_extent_shape(plan, index)?;
+        index = index
+            .checked_add(count)
+            .ok_or("canonical Blob chunk index overflow")?;
+        total = total
+            .checked_add(extent_len)
+            .ok_or("canonical Blob wire length overflow")?;
+    }
+    Ok(total)
+}
+
+struct CanonicalCarrierExtentSource<'a> {
+    store: &'a Store,
+    source: &'a CanonicalBlobSendSource,
+    plan: &'a VerifiedBlobTransferPlan,
+    next_chunk_index: u64,
+    wire_offset: u64,
+}
+
+impl<'a> CanonicalCarrierExtentSource<'a> {
+    fn new_at(
+        store: &'a Store,
+        source: &'a CanonicalBlobSendSource,
+        wire_offset: u64,
+    ) -> Result<Self, BlobNetworkError> {
+        let mut next_chunk_index = 0_u64;
+        let mut consumed = 0_u64;
+        while consumed < wire_offset {
+            let (count, extent_len) = canonical_extent_shape(&source.plan, next_chunk_index)?;
+            consumed = consumed
+                .checked_add(extent_len)
+                .ok_or("canonical Blob resume offset overflow")?;
+            next_chunk_index = next_chunk_index
+                .checked_add(count)
+                .ok_or("canonical Blob resume index overflow")?;
+        }
+        if consumed != wire_offset {
+            return Err("profile-5 resume offset is not a canonical extent boundary".into());
+        }
+        Ok(Self {
+            store,
+            source,
+            plan: &source.plan,
+            next_chunk_index,
+            wire_offset,
+        })
+    }
+
+    fn next_extent(&mut self) -> Result<Option<Vec<u8>>, BlobNetworkError> {
+        if self.next_chunk_index == self.plan.manifest().chunk_count() {
+            return Ok(None);
+        }
+        let first_chunk_index = self.next_chunk_index;
+        let (count, expected_len) = canonical_extent_shape(self.plan, first_chunk_index)?;
+        let mut carriers = Vec::with_capacity(
+            usize::try_from(count).map_err(|_| "canonical carrier count overflows")?,
+        );
+        {
+            // The depot lock never crosses a transport await. Each extent is
+            // built and rechecked synchronously, then the capability-gated
+            // read adapter is dropped before backpressure can suspend us.
+            let mut depot = self
+                .store
+                .blob_depot_for_authenticated_read(&self.source.completion)
+                .map_err(|error| durability_failure("open canonical Blob depot", error))?;
+            for index in first_chunk_index..first_chunk_index + count {
+                carriers.push(
+                    self.plan
+                        .build_carrier(&mut depot, index)
+                        .map_err(|error| verification_failure("build canonical carrier", error))?
+                        .into_bytes(),
+                );
+            }
+        }
+        let encoded = CanonicalCarrierExtentV1 {
+            first_chunk_index,
+            carriers,
+        }
+        .encode()?;
+        if encoded.len() as u64 != expected_len {
+            return Err("canonical extent differs from its preflight length".into());
+        }
+        self.next_chunk_index += count;
+        self.wire_offset = self
+            .wire_offset
+            .checked_add(expected_len)
+            .ok_or("canonical wire offset overflow")?;
+        Ok(Some(encoded))
+    }
+}
 
 #[cfg(test)]
 static ACTIVE_RECEIVE_PIPELINES: std::sync::Mutex<Vec<StreamJobId>> =
@@ -250,7 +564,7 @@ fn settlement_failure(
     BlobNetworkError::new(BlobNetworkStage::Settlement, context, error)
 }
 
-fn select_stream_transport(
+pub(crate) fn select_stream_transport(
     connection: Connection,
 ) -> Result<Arc<dyn StreamTransportAdapter>, BlobNetworkError> {
     let adapter: Arc<dyn StreamTransportAdapter> = Arc::new(IrohQuicV1Adapter::new(connection));
@@ -665,41 +979,270 @@ pub async fn send_completed_pack(
     .await
 }
 
+fn canonical_result_digest(open: &StreamOpenV1, roots: ([u8; 32], [u8; 32])) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"aster/canonical-blob-network-result/v1");
+    hasher.update(open.source_transfer_id);
+    hasher.update(open.publication_id);
+    hasher.update(open.variant_id);
+    hasher.update(open.total_len.to_be_bytes());
+    hasher.update(roots.0);
+    hasher.update(roots.1);
+    hasher.finalize().into()
+}
+
+fn require_canonical_send_source(
+    store: &Store,
+    policy: &ControlPolicySnapshot,
+    source: &CanonicalBlobSendSource,
+) -> Result<(), BlobNetworkError> {
+    let exact = store
+        .get_blob(source.publication())
+        .map_err(|error| lifecycle_failure("load canonical Blob source", error))?
+        .ok_or_else(|| lifecycle_failure("load canonical Blob source", "publication is absent"))?;
+    if exact != source.stored {
+        return Err(authentication_failure(
+            "recheck canonical Blob source",
+            "source bytes or metadata changed",
+        ));
+    }
+    let mut authorized = false;
+    store
+        .visit_retained_blob_sources(Some(policy), |retained| {
+            if retained.source.transfer_id == source.publication()
+                && matches!(
+                    retained.retention,
+                    BlobSourceRetention::Completed {
+                        acceptance_marker
+                    } if acceptance_marker == source.stored.acceptance_marker
+                )
+                && retained.source.blob_id == source.stored.blob_id
+                && retained.source.manifest_digest == source.stored.manifest_digest
+                && retained.source.total_len == source.plan.manifest().total_len()
+                && retained.source.chunk_size == source.plan.manifest().chunk_size()
+                && retained.source.chunk_count == source.plan.manifest().chunk_count()
+            {
+                authorized = true;
+            }
+        })
+        .map_err(|error| lifecycle_failure("authorize canonical Blob source", error))?;
+    if !authorized {
+        return Err(lifecycle_failure(
+            "authorize canonical Blob source",
+            "publication is not current and lifecycle-visible",
+        ));
+    }
+    Ok(())
+}
+
+/// Sends one already source/content-authenticated canonical publication.
+///
+/// The capability-bearing `source` is deliberately required in addition to
+/// `Store + BlobTransferId`; callers cannot bypass source verification or the
+/// completion-gated depot read API.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn send_completed_pack_protected(
-    connection: Connection,
-    mission: &mut MissionSession,
+pub(crate) async fn send_canonical_blob_profile5(
+    adapter: &dyn StreamTransportAdapter,
+    store: &Store,
+    policy: &ControlPolicySnapshot,
+    source: &CanonicalBlobSendSource,
+    session: &mut MissionSession,
     profile_digest: [u8; 32],
     direction: EventDirection,
     attempt_nonce: [u8; 32],
-    open: &BlobStreamOpen,
-    authenticated_open: Vec<u8>,
-    root: &PinnedBlobPackRoot,
-    roots: ([u8; 32], [u8; 32]),
-    semantic_commitment: Vec<u8>,
 ) -> Result<BlobNetworkReport, BlobNetworkError> {
+    require_canonical_send_source(store, policy, source)?;
+    let wire_len = canonical_blob_wire_len(&source.plan)?;
+    let (max_data_bytes, max_control_bytes) =
+        profile5_attempt_bounds(wire_len).map_err(|error| {
+            BlobNetworkError::new(BlobNetworkStage::Framing, "bound canonical stream", error)
+        })?;
+    let attempt = adapter
+        .open_attempt(AttemptOpenRequest {
+            deadline: Instant::now() + PROFILE5_ATTEMPT_TIMEOUT,
+            max_data_bytes,
+            max_control_bytes,
+        })
+        .await
+        .map_err(|error| {
+            transport_failure("open canonical transport attempt", format!("{error:?}"))
+        })?;
+    let stream_direction = match direction {
+        EventDirection::ToSessionInitiator => StreamDirection::ToSessionInitiator,
+        EventDirection::ToSessionResponder => StreamDirection::ToSessionResponder,
+    };
+    let transfer_open = StreamOpenV1 {
+        class: StreamClass::Blob,
+        direction: stream_direction,
+        session_transcript: session.session_id(),
+        exchange_id: 1,
+        transfer_id: *source.publication().as_bytes(),
+        source_transfer_id: *source.publication().as_bytes(),
+        publication_id: *source.stored.semantic_id.as_bytes(),
+        variant_id: *source.stored.variant_id.as_bytes(),
+        total_len: wire_len,
+        attempt_nonce,
+        checkpoint_generation: 0,
+        custody_digest: None,
+        authenticated_open: source.stored.sealed.clone(),
+    };
     let mut codec = MissionBlobRecordCodec {
-        mission,
+        mission: session,
         profile_digest,
         direction,
         attempt_nonce,
     };
-    let transport = select_stream_transport(connection)?;
-    send_completed_pack_inner(
-        transport.as_ref(),
-        open,
-        authenticated_open,
-        PackAccess::Pinned(root),
+    attempt
+        .send_data(&codec.encode(StreamFrame::Open(transfer_open.clone()))?)
+        .await
+        .map_err(|error| transport_failure("send canonical open", format!("{error:?}")))?;
+    let accept = attempt
+        .receive_control()
+        .await
+        .map_err(|error| transport_failure("receive canonical accept", format!("{error:?}")))?
+        .ok_or("control stream closed before canonical accept")?;
+    let StreamFrame::Accept(accept) = codec.decode(&accept)? else {
+        return Err("first canonical control frame was not accept".into());
+    };
+    let resume_offset = accept.durable_offset;
+    let mut state = StreamSenderState::new(transfer_open.transfer_id, attempt_nonce, wire_len);
+    state
+        .accept(accept)
+        .map_err(|error| failure("accept canonical stream", error))?;
+    let mut extent_source = CanonicalCarrierExtentSource::new_at(store, source, resume_offset)?;
+    let mut pending = extent_source.next_extent()?;
+    let mut checkpoints = 0_u64;
+    while let Some(extent) = pending.take() {
+        match state
+            .send_extent(extent)
+            .map_err(|error| failure("advance canonical sender extent", error))?
+        {
+            StreamExtentAction::Send(data) => {
+                let (prefix, body) = codec.encode_data_parts(data)?;
+                attempt
+                    .send_data_parts(&prefix, &body)
+                    .await
+                    .map_err(|error| {
+                        transport_failure("send canonical data", format!("{error:?}"))
+                    })?;
+                pending = extent_source.next_extent()?;
+            }
+            StreamExtentAction::Retry {
+                reason: crate::stream_transfer::StreamRetry::CreditBlocked,
+                bytes,
+            } => {
+                let checkpoint = attempt
+                    .receive_control()
+                    .await
+                    .map_err(|error| {
+                        transport_failure("receive canonical checkpoint", format!("{error:?}"))
+                    })?
+                    .ok_or("control stream closed before canonical checkpoint")?;
+                let StreamFrame::Checkpoint(checkpoint) = codec.decode(&checkpoint)? else {
+                    return Err("canonical credit wait received a non-checkpoint frame".into());
+                };
+                state
+                    .checkpoint(checkpoint)
+                    .map_err(|error| failure("advance canonical checkpoint", error))?;
+                checkpoints += 1;
+                pending = Some(bytes);
+            }
+            StreamExtentAction::Retry { .. } => {
+                return Err("canonical sender produced an invalid extent retry".into());
+            }
+        }
+    }
+    let checkpoint = attempt
+        .receive_control()
+        .await
+        .map_err(|error| {
+            transport_failure("receive final canonical checkpoint", format!("{error:?}"))
+        })?
+        .ok_or("control stream closed before final canonical checkpoint")?;
+    let StreamFrame::Checkpoint(checkpoint) = codec.decode(&checkpoint)? else {
+        return Err("final canonical control frame was not checkpoint".into());
+    };
+    state
+        .checkpoint(checkpoint)
+        .map_err(|error| failure("advance final canonical checkpoint", error))?;
+    checkpoints += 1;
+    let StreamAction::Send(finish) = state
+        .finish(source.stored.manifest_digest.to_vec())
+        .map_err(|error| failure("finish canonical sender state", error))?
+    else {
+        return Err("canonical sender did not produce finish".into());
+    };
+    attempt
+        .send_data(&codec.encode(finish)?)
+        .await
+        .map_err(|error| transport_failure("send canonical finish", format!("{error:?}")))?;
+    let result = attempt
+        .receive_control()
+        .await
+        .map_err(|error| transport_failure("receive canonical result", format!("{error:?}")))?
+        .ok_or("control stream closed before canonical result")?;
+    let StreamFrame::Result(result) = codec.decode(&result)? else {
+        return Err("terminal canonical control frame was not result".into());
+    };
+    let roots = (
+        *source.stored.blob_id.as_bytes(),
+        source.stored.manifest_digest,
+    );
+    if !matches!(
+        result.code,
+        StreamResultCode::Promoted | StreamResultCode::AlreadyPresent
+    ) || result.result_digest != canonical_result_digest(&transfer_open, roots)
+    {
+        return Err(settlement_failure(
+            "validate canonical receiver result",
+            "result did not bind the canonical Blob identity",
+        ));
+    }
+    let expected_result = result.code;
+    let (StreamAction::Send(ack), StreamAction::Terminal(settled)) = state
+        .result(result)
+        .map_err(|error| settlement_failure("settle canonical sender state", error))?
+    else {
+        return Err(settlement_failure(
+            "settle canonical sender",
+            "settlement action differed",
+        ));
+    };
+    if settled != expected_result {
+        return Err(settlement_failure(
+            "settle canonical sender",
+            "result code differed",
+        ));
+    }
+    attempt
+        .send_data(&codec.encode(ack)?)
+        .await
+        .map_err(|error| {
+            transport_failure(
+                "send canonical result acknowledgement",
+                format!("{error:?}"),
+            )
+        })?;
+    attempt
+        .finish_data()
+        .await
+        .map_err(|error| transport_failure("finish canonical data stream", format!("{error:?}")))?;
+    if attempt
+        .receive_control()
+        .await
+        .map_err(|error| transport_failure("receive canonical control EOF", format!("{error:?}")))?
+        .is_some()
+    {
+        return Err("canonical control stream contained data after terminal result".into());
+    }
+    Ok(BlobNetworkReport {
+        wire_bytes: wire_len,
+        resumed_from: resume_offset,
+        attempt_bytes: wire_len - resume_offset,
         roots,
-        semantic_commitment,
-        Some(attempt_nonce),
-        match direction {
-            EventDirection::ToSessionInitiator => StreamDirection::ToSessionInitiator,
-            EventDirection::ToSessionResponder => StreamDirection::ToSessionResponder,
-        },
-        &mut codec,
-    )
-    .await
+        checkpoints,
+        pipeline: None,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1396,6 +1939,32 @@ mod tests {
     };
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn canonical_carrier_extent_batches_whole_encrypted_records() {
+        // Mutation caught: concatenating carriers without lengths, splitting a
+        // carrier at the transport ceiling, or accepting trailing bytes would
+        // destroy canonical resume boundaries.
+        let extent = CanonicalCarrierExtentV1 {
+            first_chunk_index: 9,
+            carriers: vec![vec![0x11; 65_000], vec![0x22; 66_000]],
+        };
+        let encoded = extent.encode().expect("canonical carrier extent");
+        assert!(encoded.len() <= PROFILE5_CANONICAL_EXTENT_BYTES);
+        assert_eq!(CanonicalCarrierExtentV1::decode(&encoded).unwrap(), extent);
+
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert!(CanonicalCarrierExtentV1::decode(&trailing).is_err());
+        assert!(
+            CanonicalCarrierExtentV1 {
+                first_chunk_index: 0,
+                carriers: vec![vec![0; PROFILE5_CANONICAL_EXTENT_BYTES]],
+            }
+            .encode()
+            .is_err()
+        );
+    }
 
     #[test]
     fn network_error_retains_stage_but_sanitizes_internal_detail() {
