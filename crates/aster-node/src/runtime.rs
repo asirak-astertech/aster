@@ -634,6 +634,31 @@ fn inbound_contact_collision(local: EndpointId, peer: EndpointId) -> InboundCont
     }
 }
 
+fn inbound_peer_contact_active(
+    contacts: &BTreeMap<EndpointId, (TaskId, AbortHandle)>,
+    peer: EndpointId,
+) -> bool {
+    contacts
+        .get(&peer)
+        .is_some_and(|(_, task)| !task.is_finished())
+}
+
+fn clear_inbound_peer_if_current(
+    contacts: &mut BTreeMap<EndpointId, (TaskId, AbortHandle)>,
+    peer: EndpointId,
+    completed: TaskId,
+) -> bool {
+    if contacts
+        .get(&peer)
+        .is_some_and(|(current, _)| *current == completed)
+    {
+        contacts.remove(&peer);
+        true
+    } else {
+        false
+    }
+}
+
 fn selected_reconciliation_limits() -> Result<ReconciliationLimits, NodeError> {
     Ok(ReconciliationLimits::new(
         DEFAULT_FRAME_SIZE_LIMIT,
@@ -17282,6 +17307,7 @@ async fn run_node_actor_inner(
     let mut inbound: JoinSet<(EndpointId, Result<CompletedPeerContact, NodeError>)> =
         JoinSet::new();
     let mut inbound_peers = BTreeSet::new();
+    let mut inbound_abort_handles = BTreeMap::<EndpointId, (TaskId, AbortHandle)>::new();
     let mut inbound_tasks = BTreeMap::<TaskId, ContactTaskMetadata>::new();
     let mut outbound: JoinSet<(ContactPeer, Result<CompletedPeerContact, NodeError>)> =
         JoinSet::new();
@@ -18130,7 +18156,7 @@ async fn run_node_actor_inner(
                         {
                             peer_contact_activity.insert(peer, Instant::now());
                         }
-                        if inbound_peers.contains(&peer) {
+                        if inbound_peer_contact_active(&inbound_abort_handles, peer) {
                             connection.close();
                             receipt.contact_errors += 1;
                             node_stderr!("CONTACT direction=in carrier_peer={peer} status=error error=duplicate_concurrent_carrier_contact");
@@ -18160,7 +18186,6 @@ async fn run_node_actor_inner(
                             }
                         }
                         let inserted = inbound_peers.insert(peer);
-                        debug_assert!(inserted, "duplicate inbound peer was rejected above");
                         let store = store.clone();
                         let policy_lock = policy_lock.clone();
                         let emission_policy = emission_policy.clone();
@@ -18224,6 +18249,14 @@ async fn run_node_actor_inner(
                                 )
                             },
                         )));
+                        let previous = inbound_abort_handles.insert(
+                            peer,
+                            (task.id(), task.clone()),
+                        );
+                        debug_assert!(
+                            inserted || previous.as_ref().is_some_and(|(_, task)| task.is_finished()),
+                            "only a completed uncollected inbound contact may be replaced"
+                        );
                         inbound_tasks.insert(
                             task.id(),
                             ContactTaskMetadata::inbound(peer, event_inserted),
@@ -18263,6 +18296,15 @@ async fn run_node_actor_inner(
                 };
                 let terminal_metadata =
                     terminal_task.and_then(|task| inbound_tasks.remove(&task));
+                if let (Some(task), Some(metadata)) = (terminal_task, terminal_metadata.as_ref())
+                    && clear_inbound_peer_if_current(
+                        &mut inbound_abort_handles,
+                        metadata.carrying_peer,
+                        task,
+                    )
+                {
+                    inbound_peers.remove(&metadata.carrying_peer);
+                }
                 let event_contact_candidates = if automatic_nearby {
                     automatic_candidates.iter().copied().collect::<Vec<_>>()
                 } else {
@@ -18300,7 +18342,6 @@ async fn run_node_actor_inner(
                 }
                 match completed {
                     Some(Ok((_task, (peer, Ok(server_receipt))))) => {
-                        inbound_peers.remove(&peer);
                         if let Some(last_activity) = peer_contact_activity.get_mut(&peer) {
                             *last_activity = Instant::now();
                         }
@@ -18380,7 +18421,6 @@ async fn run_node_actor_inner(
                         );
                     }
                     Some(Ok((_task, (peer, Err(error))))) => {
-                        inbound_peers.remove(&peer);
                         if let Some(last_activity) = peer_contact_activity.get_mut(&peer) {
                             *last_activity = Instant::now();
                         }
@@ -18395,11 +18435,10 @@ async fn run_node_actor_inner(
                         let peer = terminal_metadata
                             .as_ref()
                             .map(|metadata| metadata.carrying_peer);
-                        if let Some(peer) = peer {
-                            inbound_peers.remove(&peer);
-                            if let Some(last_activity) = peer_contact_activity.get_mut(&peer) {
-                                *last_activity = Instant::now();
-                            }
+                        if let Some(peer) = peer
+                            && let Some(last_activity) = peer_contact_activity.get_mut(&peer)
+                        {
+                            *last_activity = Instant::now();
                         }
                         receipt.contact_errors += 1;
                         node_stderr!("CONTACT direction=in carrier_peer={} status=error error={}", peer.map_or_else(|| "unknown".into(), |peer| peer.to_string()), format_receipt_field(&format!("task failed: {error}")));
@@ -36813,6 +36852,71 @@ mod tests {
 
     fn wake_test_endpoint() -> EndpointId {
         aster_iroh::SecretKey::generate().public()
+    }
+
+    #[tokio::test]
+    async fn inbound_admission_rejects_overlap_but_allows_completed_uncollected_contact() {
+        let peer = wake_test_endpoint();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut inbound = JoinSet::new();
+        let task = inbound.spawn({
+            let release = release.clone();
+            async move {
+                release.notified().await;
+                (
+                    peer,
+                    Err::<CompletedPeerContact, _>(NodeError::Protocol(
+                        "fixture completion".into(),
+                    )),
+                )
+            }
+        });
+        let mut active = BTreeMap::from([(peer, (task.id(), task))]);
+
+        assert!(inbound_peer_contact_active(&active, peer));
+        release.notify_one();
+        timeout(Duration::from_secs(1), async {
+            while inbound_peer_contact_active(&active, peer) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("contact worker completion deadline");
+        assert_eq!(inbound.len(), 1, "completed worker must remain uncollected");
+        assert!(!inbound_peer_contact_active(&active, peer));
+
+        let completed_task = active.get(&peer).expect("completed contact tracked").0;
+        let replacement = inbound.spawn(std::future::pending::<(
+            EndpointId,
+            Result<CompletedPeerContact, NodeError>,
+        )>());
+        let previous = active.insert(peer, (replacement.id(), replacement.clone()));
+        assert!(previous.is_some_and(|(_, task)| task.is_finished()));
+        assert!(!clear_inbound_peer_if_current(
+            &mut active,
+            peer,
+            completed_task
+        ));
+        assert!(inbound_peer_contact_active(&active, peer));
+
+        let (task_id, _) = inbound
+            .join_next_with_id()
+            .await
+            .expect("completed contact")
+            .expect("contact task");
+        assert_eq!(task_id, completed_task);
+        replacement.abort();
+        let cancelled = inbound
+            .join_next_with_id()
+            .await
+            .expect("cancelled replacement");
+        assert!(cancelled.is_err_and(|error| error.is_cancelled()));
+        assert!(clear_inbound_peer_if_current(
+            &mut active,
+            peer,
+            replacement.id()
+        ));
+        assert!(active.is_empty());
     }
 
     #[test]

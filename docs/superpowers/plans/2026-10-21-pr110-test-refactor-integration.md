@@ -65,7 +65,21 @@
 - Consumes: verified integration tree
 - Produces: signed merge commit, updated fork branch, and green current-base CI
 
-- [ ] Create and verify one signed merge commit.
-- [ ] Push once to the fork branch.
+- [x] Create and verify one signed merge commit.
+- [x] Push once to the fork branch.
 - [ ] Wait for all required checks and fix concrete failures without running the full local suite.
 - [ ] Confirm clean merge state, signatures, and current-main ancestry.
+
+### Task 4: Close the completed-contact admission gap
+
+**Files:**
+- Modify: `crates/aster-node/src/runtime.rs`
+
+**Interfaces:**
+- Consumes: issue #116's completed-but-uncollected inbound worker state
+- Produces: generation-safe same-peer admission without allowing live overlap
+
+- [x] Reproduce active versus completed-uncollected worker state deterministically.
+- [x] Reject a genuinely active same-peer worker while allowing its completed predecessor to be replaced.
+- [x] Keep an older completion from clearing the replacement worker's peer ownership.
+- [x] Run the focused regression plus strict formatting, compilation, and Clippy checks.
