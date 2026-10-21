@@ -1,3 +1,12 @@
+#[cfg(test)]
+use crate::application::EventPublishRequest;
+
+#[cfg(test)]
+use aster_redb_store::{
+    EventOnceOutcome, EventOperationKey, EventOperationRequest, EventOperationResolution,
+    ReservedEventOnceCommit,
+};
+
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque, btree_map::Entry},
     error::Error,
@@ -67,9 +76,8 @@ use aster_redb_store::{
     CustodyPeerApplyDisposition, CustodyPeerApplyEvidence, CustodyPeerSelectorRevision,
     CustodyPolicyRevision, CustodyPressureDemand, CustodyQuota, CustodyReconciliationEvidence,
     CustodyReconciliationSelection, CustodySendAuthorization, CustodySenderProjection,
-    CustodyStoreError, CustodyUsage, EventOnceOutcome, EventOperationAuditProgress,
-    EventOperationAuditState, EventOperationAuditStatus, EventOperationKey, EventOperationLimits,
-    EventOperationRequest, EventOperationResolution, EventPageAttemptCursor,
+    CustodyStoreError, CustodyUsage, EventOperationAuditProgress, EventOperationAuditState,
+    EventOperationAuditStatus, EventOperationLimits, EventPageAttemptCursor,
     EventPageAttemptCursorUpdate, EventPublicationIntent, EventPublicationSpec,
     EventReplicationPolicySnapshot, EventSemanticId, EventSubscriptionKey, EventSubscriptionMode,
     EventSubscriptionSpec, EventTransferId, LocalCustodyCheckpoint, MAX_BLOB_NETWORK_RANGE_BYTES,
@@ -79,11 +87,11 @@ use aster_redb_store::{
     MutableTransferCursorClass, MutableTransferCursorMode, NumberedEventOperationRequest,
     NumberedEventPublishOutcome, PendingBlobLifetimeTransition, PendingBlobSource,
     PreparedBlobCustodySend, RecordSenderProjection, RecordTransferId, RejectedControl,
-    ReservedEventOnceCommit, RetainedBlobSource, RouteCacheOutcome, ScopeRekeyPublicationIntent,
-    StateSenderProjection, StateTransferId, Store, StoreBackingIdentity, StoreError,
-    StoreInspection, StoreLimits, StoreZeroizationState, StoredControl, StoredControlEffect,
-    StoredEvent, StoredEventTransfer, StoredRecord, StoredState, TransferLease,
-    ZeroizationArtifact, ZeroizationIntent, ZeroizationStore,
+    ReservedNumberedEventCommit, RetainedBlobSource, RouteCacheOutcome,
+    ScopeRekeyPublicationIntent, StateSenderProjection, StateTransferId, Store,
+    StoreBackingIdentity, StoreError, StoreInspection, StoreLimits, StoreZeroizationState,
+    StoredControl, StoredControlEffect, StoredEvent, StoredEventTransfer, StoredRecord,
+    StoredState, TransferLease, ZeroizationArtifact, ZeroizationIntent, ZeroizationStore,
 };
 use sha2::{Digest as _, Sha256};
 #[cfg(unix)]
@@ -119,7 +127,7 @@ use crate::{
     NodeIdentity,
     application::{
         AuthenticatedPeerStatus, ContactSyncStatus, EventOperationCapacity,
-        EventPublicationGroupDiagnostic, EventPublishOptions, EventPublishRequest, EventSyncStatus,
+        EventPublicationGroupDiagnostic, EventPublishOptions, EventSyncStatus,
         NumberedEventPublishRequest, PeerAuthorization, SelectedApplicationCommand,
         SelectedBlobCommand, SelectedBlobHandle, SelectedBlobNode, SelectedEventCommand,
         SelectedEventHandle, SelectedEventNode, SelectedEventStatus, SelectedRecordCommand,
@@ -479,8 +487,8 @@ const DEMO_EVENT_TOPIC: &str = "mesh.ping-pong";
 const DEMO_PING_PAYLOAD: &[u8] = b"ASTER_SAMPLE_PING_V1";
 const DEMO_PONG_PAYLOAD: &[u8] = b"ASTER_SAMPLE_PONG_V1";
 const DEMO_PING_LOGICAL_KEY: &[u8] = b"ping";
+#[cfg(test)]
 const DEMO_PING_OPERATION: &[u8] = b"aster.sample.ping-pong.v1/ping";
-const DEMO_PONG_OPERATION_PREFIX: &[u8] = b"aster.sample.ping-pong.v1/pong/";
 const DEMO_EVENT_SUBSCRIPTION_KEY: &[u8] = b"aster.sample.ping-pong.v1/receive";
 const MAX_EVENT_PUBLISH_RETRIES: usize = 4;
 const MAX_CUSTODY_MAINTENANCE_RETRIES: usize = 4;
@@ -4045,17 +4053,23 @@ impl SelectedEventStatusTracker {
     }
 
     fn observe_operation_commit<T>(&mut self, store: &Store, commit: impl FnOnce() -> T) -> T {
-        // Only the selected actor publishes local operations. Legacy retirement
-        // preserves its permanent count; numbered acknowledgement is not observed
-        // here and therefore cannot add a negative delta. Read failures or
-        // ambiguous deltas cannot alter the caller's result after a commit.
+        // Count first admissions even when the application applies and acknowledges
+        // the result in the same turn. Claims, retries and retirement add no work.
+        // Telemetry failures cannot alter the caller's publication result.
         let rows = || {
-            let legacy = store.event_operation_stats().ok()?;
-            let numbered = store.numbered_event_operation_stats().ok()?;
-            legacy
-                .records_total
-                .checked_add(numbered.clients)?
-                .checked_add(numbered.outstanding_results)
+            let numbered = store.committed_numbered_event_publication_count().ok()?;
+            #[cfg(test)]
+            {
+                store
+                    .event_operation_stats()
+                    .ok()?
+                    .records_total
+                    .checked_add(numbered)
+            }
+            #[cfg(not(test))]
+            {
+                Some(numbered)
+            }
         };
         let before = rows();
         let result = commit();
@@ -5309,17 +5323,12 @@ fn seed_demo_event_subscription(
     Ok(())
 }
 
+#[cfg(test)]
 fn ping_operation_key() -> Result<EventOperationKey, NodeError> {
     EventOperationKey::new(DEMO_PING_OPERATION.to_vec()).map_err(Into::into)
 }
 
-fn pong_operation_key(ping: EventSemanticId) -> Result<EventOperationKey, NodeError> {
-    let mut bytes = Vec::with_capacity(DEMO_PONG_OPERATION_PREFIX.len() + 32);
-    bytes.extend_from_slice(DEMO_PONG_OPERATION_PREFIX);
-    bytes.extend_from_slice(ping.as_bytes());
-    EventOperationKey::new(bytes).map_err(Into::into)
-}
-
+#[cfg(test)]
 pub(crate) struct SelectedEventPublish<'a> {
     pub operation: &'a EventOperationKey,
     pub predecessor: Option<EventSemanticId>,
@@ -5333,6 +5342,7 @@ pub(crate) struct SelectedEventPublish<'a> {
     pub tombstone: bool,
 }
 
+#[cfg(test)]
 fn verify_existing_event_publication(
     sealer: &mut ReferenceEnvelopeSealer,
     stored: &StoredEvent,
@@ -5374,6 +5384,7 @@ fn verify_existing_event_publication(
     Ok(event)
 }
 
+#[cfg(test)]
 pub(crate) fn publish_selected_event_once(
     store: &Store,
     policy: &ControlPolicySnapshot,
@@ -5383,11 +5394,13 @@ pub(crate) fn publish_selected_event_once(
     publish_selected_event_once_observed(store, policy, sealer, request).result
 }
 
+#[cfg(test)]
 pub(crate) struct SelectedEventPublishAttempt {
     pub(crate) result: Result<(StoredEvent, bool), NodeError>,
     pub(crate) writer_commits: u64,
 }
 
+#[cfg(test)]
 pub(crate) fn publish_selected_event_once_observed(
     store: &Store,
     policy: &ControlPolicySnapshot,
@@ -5403,6 +5416,7 @@ pub(crate) fn publish_selected_event_once_observed(
     }
 }
 
+#[cfg(test)]
 fn publish_selected_event_once_counted(
     store: &Store,
     policy: &ControlPolicySnapshot,
@@ -5628,9 +5642,12 @@ fn publish_selected_event_once_counted(
     )))
 }
 
+#[cfg(test)]
 pub(crate) type SelectedEventPublishOutcome = Result<(StoredEvent, bool), NodeError>;
+#[cfg(test)]
 pub(crate) type SelectedEventGroupResult = Result<Vec<SelectedEventPublishOutcome>, NodeError>;
 
+#[cfg(test)]
 pub(crate) struct SelectedEventGroupAttempt {
     /// An outer error precedes a shared commit and permits singleton fallback.
     /// Inner errors are committed per-input outcomes and must not be replayed.
@@ -5642,6 +5659,7 @@ pub(crate) struct SelectedEventGroupAttempt {
 ///
 /// The caller owns cohort partitioning and singleton fallback. This function
 /// never acknowledges an Event before the shared durable commit succeeds.
+#[cfg(test)]
 pub(crate) fn publish_selected_event_group_once(
     store: &Store,
     policy: &ControlPolicySnapshot,
@@ -5662,6 +5680,7 @@ pub(crate) fn publish_selected_event_group_once(
     }
 }
 
+#[cfg(test)]
 fn publish_selected_event_group_once_counted(
     store: &Store,
     policy: &ControlPolicySnapshot,
@@ -5930,6 +5949,196 @@ fn publish_selected_event_group_once_counted(
     )))
 }
 
+pub(crate) struct SelectedNumberedEventPublish<'a> {
+    pub client: &'a aster_redb_store::EventClientId,
+    pub session: aster_redb_store::EventPublicationSession,
+    pub sequence: aster_redb_store::EventOperationSequence,
+    pub predecessor: Option<EventSemanticId>,
+    pub topic: &'a Topic,
+    pub scope: &'a Scope,
+    pub priority: Priority,
+    pub ttl_ms: Option<u64>,
+    pub custody_sample: Option<CustodySample>,
+    pub logical_key: &'a [u8],
+    pub payload: &'a [u8],
+    pub tombstone: bool,
+}
+
+pub(crate) fn publish_selected_numbered_event_group(
+    store: &Store,
+    policy: &ControlPolicySnapshot,
+    sealer: &mut ReferenceEnvelopeSealer,
+    requests: &[SelectedNumberedEventPublish<'_>],
+    writer_commits: &mut u64,
+) -> Result<Vec<NumberedEventPublishOutcome>, NodeError> {
+    let first = requests
+        .first()
+        .ok_or_else(|| NodeError::Configuration("Event publication group is empty".into()))?;
+    if requests.iter().any(|request| {
+        request.topic != first.topic
+            || request.scope != first.scope
+            || request.custody_sample.is_some() != first.custody_sample.is_some()
+    }) {
+        return Err(NodeError::Configuration(
+            "Event publication group crosses a topic, scope, or custody boundary".into(),
+        ));
+    }
+    for request in requests {
+        if request.ttl_ms == Some(0) {
+            return Err(NodeError::Configuration(
+                "finite Event TTL must be greater than zero milliseconds".into(),
+            ));
+        }
+        if request.ttl_ms.is_some() && request.custody_sample.is_none() {
+            return Err(NodeError::Configuration(
+                "finite Event publication requires a continuous custody sample".into(),
+            ));
+        }
+        if request.tombstone && request.ttl_ms.is_some() {
+            return Err(NodeError::Configuration(
+                "Event tombstones are durable and cannot carry finite TTL".into(),
+            ));
+        }
+        if request.tombstone && !request.payload.is_empty() {
+            return Err(NodeError::Configuration(
+                "Event tombstones must carry an empty payload".into(),
+            ));
+        }
+    }
+
+    let intents = requests
+        .iter()
+        .map(|request| {
+            EventPublicationIntent::new(
+                EventPublicationSpec::new(
+                    sealer.identity(),
+                    request.topic.clone(),
+                    request.scope.clone(),
+                    request.priority,
+                    request.logical_key.to_vec(),
+                    request.tombstone,
+                    request.ttl_ms,
+                )?,
+                request.payload,
+            )
+        })
+        .collect::<Result<Vec<_>, StoreError>>()?;
+    let operation_requests = requests
+        .iter()
+        .zip(&intents)
+        .map(|(request, intent)| {
+            NumberedEventOperationRequest::new(
+                request.client,
+                request.session,
+                request.sequence,
+                request.predecessor,
+                intent,
+                request.payload,
+            )
+        })
+        .collect::<Result<Vec<_>, StoreError>>()?;
+    let key_epoch = store
+        .active_scope_epoch(first.scope)?
+        .map_or(1, |(epoch, _)| epoch);
+    let predecessors = requests
+        .iter()
+        .map(|request| request.predecessor)
+        .collect::<Vec<_>>();
+    for _ in 0..MAX_EVENT_PUBLISH_RETRIES {
+        let custody_revision = first
+            .custody_sample
+            .map(|_| store.custody_policy_revision())
+            .transpose()?;
+        let reservations = store.reserve_event_group_with_policy(
+            policy,
+            sealer.identity(),
+            first.topic,
+            first.scope,
+            &predecessors,
+        )?;
+        let mut sealed_events = Vec::with_capacity(requests.len());
+        let mut verified_events = Vec::with_capacity(requests.len());
+        for (request, reservation) in requests.iter().zip(&reservations) {
+            let header = reservation.header(
+                request.priority,
+                request.logical_key.to_vec(),
+                request.ttl_ms,
+                u64::try_from(request.payload.len()).map_err(|_| {
+                    NodeError::Protocol("Event payload length overflows u64".into())
+                })?,
+                request.tombstone,
+                key_epoch,
+            )?;
+            let sealed = sealer.seal_event(&header, request.payload)?;
+            let route_verified = sealer.verify_event(&sealed.bytes)?;
+            let verified = match sealer.verify_event_content(route_verified, &sealed.bytes)? {
+                EventContentVerification::ContentVerified { event, payload }
+                    if payload == request.payload =>
+                {
+                    event
+                }
+                EventContentVerification::ContentVerified { .. } => {
+                    return Err(NodeError::Protocol(
+                        "locally sealed Event reopened with different content".into(),
+                    ));
+                }
+                EventContentVerification::RouteOnly(_) => {
+                    return Err(NodeError::Protocol(
+                        "local Event publisher lacks content authorization".into(),
+                    ));
+                }
+            };
+            sealed_events.push(sealed);
+            verified_events.push(verified);
+        }
+        let commits = operation_requests
+            .iter()
+            .zip(&reservations)
+            .zip(&verified_events)
+            .zip(&sealed_events)
+            .map(|(((operation, reservation), verified), sealed)| {
+                ReservedNumberedEventCommit::new(operation, reservation, verified, &sealed.bytes)
+            })
+            .collect::<Vec<_>>();
+        let committed = match (first.custody_sample, custody_revision) {
+            (Some(sample), Some(revision)) => store
+                .commit_reserved_numbered_event_group_with_custody_policy(
+                    policy,
+                    LocalCustodyCheckpoint::new(revision, sample),
+                    &commits,
+                ),
+            (None, None) => {
+                store.commit_reserved_numbered_event_group_with_policy(policy, &commits)
+            }
+            _ => Err(StoreError::SemanticInvariant(
+                "custody sample and policy revision were not captured together",
+            )),
+        };
+        match committed {
+            Ok(group) => {
+                *writer_commits = writer_commits
+                    .checked_add(group.writer_commits())
+                    .ok_or_else(|| {
+                        NodeError::Protocol("Event writer commit count overflowed".into())
+                    })?;
+                return Ok(group.into_outcomes());
+            }
+            Err(StoreError::ReservationChanged) => continue,
+            Err(StoreError::Custody(CustodyStoreError::PolicyChanged)) => continue,
+            Err(StoreError::Custody(CustodyStoreError::AlreadyRetired)) => {
+                return Err(NodeError::Protocol(EVENT_OPERATION_RETIRED.into()));
+            }
+            Err(StoreError::EventOperationConflict | StoreError::OperationPredecessorMismatch) => {
+                return Err(NodeError::Protocol(EVENT_OPERATION_CONFLICT.into()));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(NodeError::Protocol(format!(
+        "Event publication reservation changed {MAX_EVENT_PUBLISH_RETRIES} times"
+    )))
+}
+
 pub(crate) fn publish_selected_numbered_event_once(
     store: &Store,
     policy: &ControlPolicySnapshot,
@@ -5937,6 +6146,47 @@ pub(crate) fn publish_selected_numbered_event_once(
     request: NumberedEventPublishRequest,
     options: EventPublishOptions,
     custody_sample: Option<CustodySample>,
+) -> Result<NumberedEventPublishOutcome, NodeError> {
+    publish_selected_numbered_event_once_observed(
+        store,
+        policy,
+        sealer,
+        request,
+        options,
+        custody_sample,
+    )
+    .0
+}
+
+pub(crate) fn publish_selected_numbered_event_once_observed(
+    store: &Store,
+    policy: &ControlPolicySnapshot,
+    sealer: &mut ReferenceEnvelopeSealer,
+    request: NumberedEventPublishRequest,
+    options: EventPublishOptions,
+    custody_sample: Option<CustodySample>,
+) -> (Result<NumberedEventPublishOutcome, NodeError>, u64) {
+    let mut writer_commits = 0;
+    let result = publish_selected_numbered_event_once_counted(
+        store,
+        policy,
+        sealer,
+        request,
+        options,
+        custody_sample,
+        &mut writer_commits,
+    );
+    (result, writer_commits)
+}
+
+pub(crate) fn publish_selected_numbered_event_once_counted(
+    store: &Store,
+    policy: &ControlPolicySnapshot,
+    sealer: &mut ReferenceEnvelopeSealer,
+    request: NumberedEventPublishRequest,
+    options: EventPublishOptions,
+    custody_sample: Option<CustodySample>,
+    writer_commits: &mut u64,
 ) -> Result<NumberedEventPublishOutcome, NodeError> {
     let NumberedEventPublishRequest {
         client_id,
@@ -6038,7 +6288,7 @@ pub(crate) fn publish_selected_numbered_event_once(
         };
         let committed = match (custody_sample, custody_revision) {
             (Some(sample), Some(revision)) => store
-                .commit_reserved_numbered_event_with_custody_policy(
+                .commit_reserved_numbered_event_with_custody_policy_observed(
                     policy,
                     LocalCustodyCheckpoint::new(revision, sample),
                     &operation_request,
@@ -6046,18 +6296,24 @@ pub(crate) fn publish_selected_numbered_event_once(
                     &verified,
                     &sealed.bytes,
                 ),
-            (None, None) => store.commit_reserved_numbered_event_with_policy(
+            (None, None) => store.commit_reserved_numbered_event_with_policy_observed(
                 policy,
                 &operation_request,
                 &reservation,
                 &verified,
                 &sealed.bytes,
             ),
-            _ => Err(StoreError::SemanticInvariant(
-                "custody sample and policy revision were not captured together",
-            )),
+            _ => {
+                return Err(StoreError::SemanticInvariant(
+                    "custody sample and policy revision were not captured together",
+                )
+                .into());
+            }
         };
-        match committed {
+        *writer_commits = writer_commits
+            .checked_add(committed.writer_commits)
+            .ok_or_else(|| NodeError::Protocol("Event writer commit count overflowed".into()))?;
+        match committed.result {
             Ok(outcome) => return Ok(outcome),
             Err(StoreError::ReservationChanged) => continue,
             Err(StoreError::Custody(CustodyStoreError::PolicyChanged)) => continue,
@@ -6069,6 +6325,7 @@ pub(crate) fn publish_selected_numbered_event_once(
     )))
 }
 
+#[cfg(test)]
 struct DemoEventPublish<'a> {
     operation: &'a EventOperationKey,
     predecessor: Option<EventSemanticId>,
@@ -6077,6 +6334,7 @@ struct DemoEventPublish<'a> {
     payload: &'a [u8],
 }
 
+#[cfg(test)]
 fn publish_event_once(
     store: &Store,
     policy: &ControlPolicySnapshot,
@@ -6117,123 +6375,222 @@ struct SampleApplicationContext<'a> {
     event_route_cache: &'a AuthenticatedEventRouteCache,
 }
 
+fn emit_native_application_receipt(
+    event: &StoredEvent,
+    inserted: bool,
+    predecessor: Option<EventSemanticId>,
+    store: &Store,
+) -> Result<(), NodeError> {
+    if let Some(ping) = predecessor {
+        let ping_publisher = store
+            .event_by_semantic_id(ping)?
+            .ok_or_else(|| NodeError::Protocol("native Pong predecessor unavailable".into()))?
+            .header
+            .stamp
+            .dot
+            .publisher;
+        node_stdout!(
+            "APPLICATION status={} kind=pong transfer_id={} semantic_id={} publisher={} correlation_semantic_id={} ping_publisher={} source_authenticated=true causal_observation=verified ttl=none",
+            if inserted { "emitted" } else { "existing" },
+            format_transfer_id(event.transfer_id),
+            format_semantic_id(event.semantic_id),
+            format_node_id(event.header.stamp.dot.publisher),
+            format_semantic_id(ping),
+            format_node_id(ping_publisher)
+        );
+    } else {
+        node_stdout!(
+            "APPLICATION status={} kind=ping transfer_id={} semantic_id={} publisher={} source_authenticated=true ttl=none",
+            if inserted { "emitted" } else { "existing" },
+            format_transfer_id(event.transfer_id),
+            format_semantic_id(event.semantic_id),
+            format_node_id(event.header.stamp.dot.publisher)
+        );
+    }
+    Ok(())
+}
+
+fn finish_native_publication(
+    context: &mut SampleApplicationContext<'_>,
+    journal: &mut crate::demo_publication::Journal,
+) -> Result<(), NodeError> {
+    let intent = journal
+        .pending()
+        .ok_or_else(|| NodeError::Protocol("native publication has no retained intent".into()))?
+        .clone();
+    let predecessor = intent.predecessor.map(EventSemanticId::new);
+    let outcome = publish_selected_numbered_event_once(
+        context.store,
+        context.policy,
+        context.sealer,
+        NumberedEventPublishRequest {
+            client_id: journal.client.clone(),
+            session: journal.session()?,
+            sequence: aster_redb_store::EventOperationSequence::new(intent.sequence)
+                .map_err(StoreError::from)?,
+            predecessor: intent
+                .predecessor
+                .map(crate::application::EventId::from_bytes),
+            topic: demo_event_topic()?,
+            scope: demo_scope()?,
+            priority: Priority::Immediate,
+            logical_key: intent.logical_key,
+            payload: intent.payload,
+            tombstone: false,
+        },
+        EventPublishOptions::durable(),
+        Some(context.custody_clock.sample()?),
+    )?;
+    let event = context
+        .store
+        .get_event(outcome.result.receipt.transfer_id)?
+        .ok_or_else(|| {
+            NodeError::Protocol(
+                "native committed Event content is retired before application".into(),
+            )
+        })?;
+    cache_accepted_stored_event(context.event_route_cache, context.sealer, &event)?;
+    journal.apply(context.store, *event.semantic_id.as_bytes())?;
+    emit_native_application_receipt(&event, outcome.inserted, predecessor, context.store)?;
+    Ok(())
+}
+
 fn drive_sample_application(
     role: NodeApplication,
-    context: SampleApplicationContext<'_>,
-    cursor: &mut u64,
+    mut context: SampleApplicationContext<'_>,
+    journal: &mut Option<crate::demo_publication::Journal>,
     initial_receipt_emitted: &mut bool,
     status: &mut SelectedEventStatusTracker,
 ) -> Result<(), NodeError> {
     if matches!(role, NodeApplication::Relay) {
         return Ok(());
     }
-    let SampleApplicationContext {
-        store,
-        policy,
-        sealer,
-        custody_clock,
-        event_route_cache,
-    } = context;
-    status.observe_operation_commit(store, || match role {
-        NodeApplication::Relay => Ok(()),
-        NodeApplication::PingEmitter | NodeApplication::EpochTwoPingEmitter => {
-            if matches!(role, NodeApplication::EpochTwoPingEmitter)
-                && store
-                    .active_scope_epoch(&demo_scope()?)?
-                    .is_none_or(|(epoch, _)| epoch < 2)
-            {
-                return Ok(());
-            }
-            if *initial_receipt_emitted {
-                return Ok(());
-            }
-            let (ping, inserted) = publish_event_once(
-                store,
-                policy,
-                sealer,
-                DemoEventPublish {
-                    operation: &ping_operation_key()?,
-                    predecessor: None,
-                    custody_sample: custody_clock.sample()?,
-                    logical_key: DEMO_PING_LOGICAL_KEY.to_vec(),
-                    payload: DEMO_PING_PAYLOAD,
-                },
-            )?;
-            cache_accepted_stored_event(event_route_cache, sealer, &ping)?;
-            node_stdout!(
-                "APPLICATION status={} kind=ping transfer_id={} semantic_id={} publisher={} source_authenticated=true ttl=none",
-                if inserted { "emitted" } else { "existing" },
-                format_transfer_id(ping.transfer_id),
-                format_semantic_id(ping.semantic_id),
-                format_node_id(ping.header.stamp.dot.publisher),
-            );
-            *initial_receipt_emitted = true;
-            Ok(())
+    status.observe_operation_commit(context.store, || {
+        if journal.is_none() {
+            let client = aster_redb_store::EventClientId::new(match role {
+                NodeApplication::PongResponder => b"aster.native.pong.v1".to_vec(),
+                _ => b"aster.native.ping.v1".to_vec(),
+            })
+            .map_err(StoreError::from)?;
+            *journal = Some(crate::demo_publication::Journal::open(
+                context.store,
+                client,
+            )?);
         }
-        NodeApplication::PongResponder => {
-            let page = store.events_after_with_policy(policy, *cursor, MAX_EVENT_PAGE)?;
-            for event in page {
-                *cursor = event.acceptance_marker;
-                let route_verified = sealer.verify_event(&event.sealed)?;
-                verify_stored_claim(
-                    &route_verified,
-                    event.transfer_id,
-                    event.semantic_id,
-                    &event.header,
-                )?;
-                if event_is_inactive(store, &route_verified)? {
-                    continue;
-                }
-                let payload = match sealer.verify_event_content(route_verified, &event.sealed)? {
-                    EventContentVerification::ContentVerified {
-                        event: content_verified,
-                        payload,
-                    } => {
-                        verify_content_stored_claim(&content_verified, &event)?;
-                        payload
-                    }
-                    EventContentVerification::RouteOnly(_) => {
-                        return Err(NodeError::Protocol(
-                            "semantic Event lost required content authorization on restart".into(),
-                        ));
-                    }
-                };
-                if event.header.topic.as_str() != DEMO_EVENT_TOPIC
-                    || event.header.scope.as_str() != DEMO_SCOPE
+        let journal = journal.as_mut().expect("initialized native journal");
+        if journal.pending().is_some() {
+            finish_native_publication(&mut context, journal)?;
+            *initial_receipt_emitted = true;
+        }
+        if !*initial_receipt_emitted && let Some(last) = journal.last_event() {
+            if let Some(event) = context
+                .store
+                .event_by_semantic_id(EventSemanticId::new(last))?
+            {
+                let predecessor = matches!(role, NodeApplication::PongResponder)
+                    .then(|| {
+                        event
+                            .header
+                            .logical_key
+                            .as_slice()
+                            .try_into()
+                            .map(EventSemanticId::new)
+                    })
+                    .transpose()
+                    .map_err(|_| {
+                        NodeError::Protocol("native Pong correlation is invalid".into())
+                    })?;
+                emit_native_application_receipt(&event, false, predecessor, context.store)?;
+            }
+            *initial_receipt_emitted = true;
+        }
+        match role {
+            NodeApplication::Relay => Ok(()),
+            NodeApplication::PingEmitter | NodeApplication::EpochTwoPingEmitter => {
+                if journal.ping_completed()
+                    || matches!(role, NodeApplication::EpochTwoPingEmitter)
+                        && context
+                            .store
+                            .active_scope_epoch(&demo_scope()?)?
+                            .is_none_or(|(epoch, _)| epoch < 2)
                 {
-                    continue;
+                    return Ok(());
                 }
-                if payload != DEMO_PING_PAYLOAD
-                    || event.header.logical_key != DEMO_PING_LOGICAL_KEY
-                    || event.header.tombstone
-                {
-                    continue;
-                }
-                let operation = pong_operation_key(event.semantic_id)?;
-                let (pong, inserted) = publish_event_once(
-                    store,
-                    policy,
-                    sealer,
-                    DemoEventPublish {
-                        operation: &operation,
-                        predecessor: Some(event.semantic_id),
-                        custody_sample: custody_clock.sample()?,
-                        logical_key: event.semantic_id.as_bytes().to_vec(),
-                        payload: DEMO_PONG_PAYLOAD,
+                journal.retain(
+                    context.store,
+                    crate::demo_publication::Intent {
+                        sequence: 0,
+                        input_marker: journal.cursor(),
+                        predecessor: None,
+                        logical_key: DEMO_PING_LOGICAL_KEY.to_vec(),
+                        payload: DEMO_PING_PAYLOAD.to_vec(),
+                        applied: false,
                     },
                 )?;
-                cache_accepted_stored_event(event_route_cache, sealer, &pong)?;
-                node_stdout!(
-                    "APPLICATION status={} kind=pong transfer_id={} semantic_id={} publisher={} correlation_semantic_id={} ping_publisher={} source_authenticated=true causal_observation=verified ttl=none",
-                    if inserted { "emitted" } else { "existing" },
-                    format_transfer_id(pong.transfer_id),
-                    format_semantic_id(pong.semantic_id),
-                    format_node_id(pong.header.stamp.dot.publisher),
-                    format_semantic_id(event.semantic_id),
-                    format_node_id(event.header.stamp.dot.publisher),
-                );
+                finish_native_publication(&mut context, journal)?;
+                *initial_receipt_emitted = true;
+                Ok(())
             }
-            Ok(())
+            NodeApplication::PongResponder => {
+                for event in context.store.events_after_with_policy(
+                    context.policy,
+                    journal.cursor(),
+                    MAX_EVENT_PAGE,
+                )? {
+                    let route_verified = context.sealer.verify_event(&event.sealed)?;
+                    verify_stored_claim(
+                        &route_verified,
+                        event.transfer_id,
+                        event.semantic_id,
+                        &event.header,
+                    )?;
+                    if event_is_inactive(context.store, &route_verified)? {
+                        journal.advance_cursor(context.store, event.acceptance_marker)?;
+                        continue;
+                    }
+                    let payload = match context
+                        .sealer
+                        .verify_event_content(route_verified, &event.sealed)?
+                    {
+                        EventContentVerification::ContentVerified {
+                            event: verified,
+                            payload,
+                        } => {
+                            verify_content_stored_claim(&verified, &event)?;
+                            payload
+                        }
+                        EventContentVerification::RouteOnly(_) => {
+                            return Err(NodeError::Protocol(
+                                "semantic Event lost required content authorization on restart"
+                                    .into(),
+                            ));
+                        }
+                    };
+                    if event.header.topic.as_str() != DEMO_EVENT_TOPIC
+                        || event.header.scope.as_str() != DEMO_SCOPE
+                        || payload != DEMO_PING_PAYLOAD
+                        || event.header.logical_key != DEMO_PING_LOGICAL_KEY
+                        || event.header.tombstone
+                    {
+                        journal.advance_cursor(context.store, event.acceptance_marker)?;
+                        continue;
+                    }
+                    journal.retain(
+                        context.store,
+                        crate::demo_publication::Intent {
+                            sequence: 0,
+                            input_marker: event.acceptance_marker,
+                            predecessor: Some(*event.semantic_id.as_bytes()),
+                            logical_key: event.semantic_id.as_bytes().to_vec(),
+                            payload: DEMO_PONG_PAYLOAD.to_vec(),
+                            applied: false,
+                        },
+                    )?;
+                    finish_native_publication(&mut context, journal)?;
+                    *initial_receipt_emitted = true;
+                }
+                Ok(())
+            }
         }
     })
 }
@@ -14478,6 +14835,7 @@ fn execute_selected_event_command(
 ) -> bool {
     let mut new_event_inserted = false;
     match command {
+        #[cfg(test)]
         SelectedEventCommand::Publish {
             request,
             options,
@@ -14767,7 +15125,20 @@ impl BlobRetirementWake {
         self.timer.is_some()
     }
 
-    async fn elapsed(&mut self) {
+    async fn elapsed(
+        &mut self,
+        #[cfg(all(test, unix))] control: Option<&BlobRetirementDeadlineTestControl>,
+    ) {
+        #[cfg(all(test, unix))]
+        if let Some(control) = control {
+            // A persistent watch value remains open across select cancellation.
+            // Only handling is gated: the real Tokio timer keeps running.
+            let mut allowed = control.handling_allowed.clone();
+            allowed
+                .wait_for(|allowed| *allowed)
+                .await
+                .expect("deadline handling gate remains live");
+        }
         self.timer
             .as_mut()
             .expect("guarded Blob retirement wake")
@@ -14928,6 +15299,7 @@ async fn run_selected_blob_worker(
     Ok(())
 }
 
+#[cfg(test)]
 struct PendingEventPublication {
     request: EventPublishRequest,
     options: EventPublishOptions,
@@ -14939,6 +15311,7 @@ struct PendingEventPublication {
 // Ownership must return the unmatched command intact so FIFO can retain it;
 // boxing would add an allocation to every non-publication actor command.
 #[allow(clippy::result_large_err)]
+#[cfg(test)]
 fn ordinary_event_publication(
     command: SelectedApplicationCommand,
 ) -> Result<PendingEventPublication, SelectedApplicationCommand> {
@@ -14977,7 +15350,187 @@ fn execute_selected_application_command_coalesced(
         Arc<std::sync::Barrier>,
     )>,
 ) -> (usize, bool) {
-    let first = match ordinary_event_publication(command) {
+    if matches!(&command, SelectedApplicationCommand::Event(SelectedEventCommand::PublishNumbered { request, .. }) if request.priority != Priority::Flash)
+    {
+        return execute_selected_numbered_command_coalesced(
+            events,
+            state,
+            records,
+            blobs,
+            store,
+            emission_policy,
+            status,
+            receipt,
+            command,
+            commands,
+            commands_open,
+            pending,
+            group_sequence,
+            max_group_size,
+            #[cfg(all(test, unix))]
+            execution_gate,
+        );
+    }
+    #[cfg(not(test))]
+    {
+        let inserted = execute_selected_application_command(
+            events,
+            state,
+            records,
+            blobs,
+            store,
+            emission_policy,
+            status,
+            receipt,
+            command,
+        );
+        (1, inserted)
+    }
+    #[cfg(test)]
+    {
+        let first = match ordinary_event_publication(command) {
+            Ok(first) => first,
+            Err(command) => {
+                let new_event_inserted = execute_selected_application_command(
+                    events,
+                    state,
+                    records,
+                    blobs,
+                    store,
+                    emission_policy,
+                    status,
+                    receipt,
+                    command,
+                );
+                return (1, new_event_inserted);
+            }
+        };
+        let mut group = vec![first];
+        while group.len() < max_group_size.max(1) {
+            match commands.try_recv() {
+                Ok(command) => match ordinary_event_publication(command) {
+                    Ok(publication) => group.push(publication),
+                    Err(command) => {
+                        *pending = Some(command);
+                        break;
+                    }
+                },
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    *commands_open = false;
+                    break;
+                }
+            }
+        }
+        #[cfg(all(test, unix))]
+        if let Some((reached, release)) = execution_gate.take() {
+            reached.wait();
+            release.wait();
+        }
+        let Some(sequence) = group_sequence.checked_add(1) else {
+            let processed = group.len();
+            for publication in group {
+                let _ = publication
+                    .response
+                    .send(Err(crate::application::actor_unavailable("publish")));
+            }
+            return (processed, false);
+        };
+        *group_sequence = sequence;
+        let publications = group
+            .iter()
+            .map(|publication| (publication.request.clone(), publication.options))
+            .collect::<Vec<_>>();
+        let result = if status.operation_audit.state == EventOperationAuditState::Failed {
+            let collected = u64::try_from(group.len()).unwrap_or(u64::MAX);
+            crate::application::EventPublicationGroupResult {
+                results: (0..group.len())
+                    .map(|_| Err(crate::application::actor_unavailable("publish")))
+                    .collect(),
+                diagnostic: EventPublicationGroupDiagnostic {
+                    collected,
+                    failures: collected,
+                    ..EventPublicationGroupDiagnostic::default()
+                },
+            }
+        } else {
+            status
+                .observe_operation_commit(store, || events.publish_group_with_options(publications))
+        };
+        let diagnostic = result.diagnostic;
+        for (publication, outcome) in group.into_iter().zip(result.results) {
+            let _ = publication.response.send(outcome);
+        }
+        bounded_node_diagnostic!(
+            "event_publication_group group_sequence={} collected={} cohorts={} custody_writer_commits={} event_writer_commits={} total_writer_commits={} accepted_new={} exact_retries={} failures={} max_cohort_size={} singleton_fallbacks={}",
+            sequence,
+            diagnostic.collected,
+            diagnostic.cohorts,
+            diagnostic.custody_writer_commits,
+            diagnostic.event_writer_commits,
+            diagnostic.total_writer_commits(),
+            diagnostic.accepted_new,
+            diagnostic.exact_retries,
+            diagnostic.failures,
+            diagnostic.max_cohort_size,
+            diagnostic.singleton_fallbacks,
+        );
+        (
+            usize::try_from(diagnostic.collected).unwrap_or(APPLICATION_COMMAND_BUDGET),
+            diagnostic.accepted_new > 0,
+        )
+    }
+}
+
+struct PendingNumberedEventPublication {
+    request: NumberedEventPublishRequest,
+    options: EventPublishOptions,
+    response:
+        oneshot::Sender<Result<NumberedEventPublishOutcome, crate::application::ApplicationError>>,
+}
+
+// Ownership must return the unmatched command intact so FIFO can retain it;
+// boxing would add an allocation to every non-publication actor command.
+#[allow(clippy::result_large_err)]
+fn ordinary_numbered_event_publication(
+    command: SelectedApplicationCommand,
+) -> Result<PendingNumberedEventPublication, SelectedApplicationCommand> {
+    match command {
+        SelectedApplicationCommand::Event(SelectedEventCommand::PublishNumbered {
+            request,
+            options,
+            response,
+        }) if request.priority != Priority::Flash => Ok(PendingNumberedEventPublication {
+            request,
+            options,
+            response,
+        }),
+        command => Err(command),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_selected_numbered_command_coalesced(
+    events: &mut SelectedEventNode,
+    state: &mut SelectedStateNode,
+    records: &mut SelectedRecordNode,
+    blobs: &BlobWorkerSender,
+    store: &Store,
+    emission_policy: &LiveEmissionPolicy,
+    status: &mut SelectedEventStatusTracker,
+    receipt: &NodeReceipt,
+    command: SelectedApplicationCommand,
+    commands: &mut mpsc::Receiver<SelectedApplicationCommand>,
+    commands_open: &mut bool,
+    pending: &mut Option<SelectedApplicationCommand>,
+    group_sequence: &mut u64,
+    max_group_size: usize,
+    #[cfg(all(test, unix))] execution_gate: &mut Option<(
+        Arc<std::sync::Barrier>,
+        Arc<std::sync::Barrier>,
+    )>,
+) -> (usize, bool) {
+    let first = match ordinary_numbered_event_publication(command) {
         Ok(first) => first,
         Err(command) => {
             let new_event_inserted = execute_selected_application_command(
@@ -14997,7 +15550,7 @@ fn execute_selected_application_command_coalesced(
     let mut group = vec![first];
     while group.len() < max_group_size.max(1) {
         match commands.try_recv() {
-            Ok(command) => match ordinary_event_publication(command) {
+            Ok(command) => match ordinary_numbered_event_publication(command) {
                 Ok(publication) => group.push(publication),
                 Err(command) => {
                     *pending = Some(command);
@@ -15032,7 +15585,7 @@ fn execute_selected_application_command_coalesced(
         .collect::<Vec<_>>();
     let result = if status.operation_audit.state == EventOperationAuditState::Failed {
         let collected = u64::try_from(group.len()).unwrap_or(u64::MAX);
-        crate::application::EventPublicationGroupResult {
+        crate::application::NumberedEventPublicationGroupResult {
             results: (0..group.len())
                 .map(|_| Err(crate::application::actor_unavailable("publish")))
                 .collect(),
@@ -15043,7 +15596,9 @@ fn execute_selected_application_command_coalesced(
             },
         }
     } else {
-        status.observe_operation_commit(store, || events.publish_group_with_options(publications))
+        status.observe_operation_commit(store, || {
+            events.publish_numbered_group_with_options(publications)
+        })
     };
     let diagnostic = result.diagnostic;
     for (publication, outcome) in group.into_iter().zip(result.results) {
@@ -15410,6 +15965,14 @@ struct BlobMaintenanceTestGate {
     worker_constructed: Arc<AtomicBool>,
     worker_reached: Option<mpsc::UnboundedSender<()>>,
     worker_release: Option<Arc<tokio::sync::Notify>>,
+    retirement_deadline: Option<BlobRetirementDeadlineTestControl>,
+}
+
+#[cfg(all(test, unix))]
+#[derive(Clone)]
+struct BlobRetirementDeadlineTestControl {
+    handling_allowed: tokio::sync::watch::Receiver<bool>,
+    hold_queued_application: bool,
 }
 
 #[cfg(all(test, unix))]
@@ -15422,6 +15985,10 @@ struct BlobMaintenanceTestBlockGate {
 #[cfg(all(test, unix))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BlobMaintenanceScheduleObservation {
+    DeadlineDeferred {
+        queued_application: bool,
+        blob_outstanding: usize,
+    },
     Deferred {
         queued_application: bool,
         blob_outstanding: usize,
@@ -15492,6 +16059,7 @@ impl BlobMaintenanceTestGate {
 
 #[cfg(all(test, unix))]
 struct RunNodeActorTestControl {
+    allow_legacy_publication_fixture: bool,
     event_operation_audit: Option<EventOperationAuditTestControl>,
     before_loop_ready: oneshot::Sender<()>,
     before_loop_release: oneshot::Receiver<()>,
@@ -15745,7 +16313,7 @@ struct PinnedStateRootTestHook {
 #[cfg(test)]
 static PINNED_STATE_ROOT_TEST_HOOK: StdMutex<Option<PinnedStateRootTestHook>> = StdMutex::new(None);
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn install_pinned_state_root_test_hook(
     configured: PathBuf,
     action: impl FnOnce(&Path) + Send + 'static,
@@ -16062,8 +16630,17 @@ async fn run_node_actor_inner(
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
+    #[cfg(all(test, unix))]
+    let legacy_fixture = test_control
+        .as_ref()
+        .is_some_and(|control| control.allow_legacy_publication_fixture);
+    #[cfg(not(all(test, unix)))]
+    let legacy_fixture = false;
+    if !legacy_fixture {
+        Store::require_numbered_publication_compatible(&store_path)?;
+    }
     let blob_lease_limits = node_blob_lease_limits()?;
-    let store = Arc::new(
+    let store = Arc::new(if legacy_fixture {
         Store::open_with_all_limits_and_blob_lease_limits_for_mission(
             &store_path,
             forwarding.store_limits(),
@@ -16072,8 +16649,18 @@ async fn run_node_actor_inner(
             BlobLifecycleLimits::default(),
             blob_lease_limits,
             mission_authority,
-        )?,
-    );
+        )?
+    } else {
+        Store::open_numbered_with_all_limits_and_blob_lease_limits_for_mission(
+            &store_path,
+            forwarding.store_limits(),
+            forwarding.blob_depot_limits(),
+            forwarding.operation_limits(),
+            BlobLifecycleLimits::default(),
+            blob_lease_limits,
+            mission_authority,
+        )?
+    });
     store.require_process_exclusive_lock()?;
     #[cfg(unix)]
     {
@@ -16321,6 +16908,21 @@ async fn run_node_actor_inner(
         .map_or(0, |routing| routing.window.as_secs());
     #[cfg(not(feature = "nearby-discovery"))]
     let nearby_window_seconds = 0;
+    // Install the standalone signal handler before advertising readiness. The
+    // ctrl_c future registers lazily on its first poll; waiting until the actor
+    // loop leaves a window in which SIGINT still terminates the process.
+    // Embedded agents own shutdown and must not register a competing consumer.
+    let interrupt = tokio::signal::ctrl_c();
+    tokio::pin!(interrupt);
+    let interrupt_seen = if handle_sigint {
+        std::future::poll_fn(|context| match interrupt.as_mut().poll(context) {
+            std::task::Poll::Pending => std::task::Poll::Ready(Ok(false)),
+            std::task::Poll::Ready(result) => std::task::Poll::Ready(result.map(|()| true)),
+        })
+        .await?
+    } else {
+        false
+    };
     let provisioning_origin = config.provisioning_origin().receipt_label();
     node_stdout!(
         "READY selected=true pid={} carrier_id={} mission_id={} mission_authority={} sockets={} state={} peers={} application={} carrier_route={} controlled_relay_url={} controlled_relay_trust={} controlled_relay_readiness={} public_relay_fallback=false hosted_discovery=false nearby_discovery={} nearby_window_seconds={} discovery_metadata={} discovery_authority={} discovery_candidate_limit={} nat_traversal=not-claimed path_observation=not-authorization mission_auth=hybrid-pq provisioning={} semantics=source-authenticated-event reconciliation_classes={} controls=source-authenticated-flash commit_before_activate=true content_admission=capability-gated event_bridge={}",
@@ -16544,19 +17146,31 @@ async fn run_node_actor_inner(
 
     let mut ticker = tokio::time::interval(config.sync_interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    #[cfg(all(test, unix))]
+    if blob_maintenance_gate
+        .as_ref()
+        .is_some_and(|gate| gate.retirement_deadline.is_some())
+    {
+        // Deadline tests isolate the real retirement wake from the interval's
+        // immediate startup tick. Its next tick remains a full interval away.
+        ticker.tick().await;
+    }
     let stop = async move {
+        if interrupt_seen {
+            return;
+        }
         match (stop_deadline, handle_sigint) {
             (Some(deadline), true) => {
                 tokio::select! {
                     _ = sleep(deadline.saturating_duration_since(Instant::now())) => {}
-                    _ = tokio::signal::ctrl_c() => {}
+                    _ = &mut interrupt => {}
                 }
             }
             (Some(deadline), false) => {
                 sleep(deadline.saturating_duration_since(Instant::now())).await;
             }
             (None, true) => {
-                let _ = tokio::signal::ctrl_c().await;
+                let _ = interrupt.await;
             }
             (None, false) => std::future::pending::<()>().await,
         }
@@ -16583,9 +17197,13 @@ async fn run_node_actor_inner(
     let mut blob_maintenance_priority_deferred = false;
     let mut blob_retirement_deadline_retry_pending = false;
     #[cfg(all(test, unix))]
-    let mut application_receive_held_for_maintenance_test = blob_maintenance_gate
-        .as_ref()
-        .is_some_and(BlobMaintenanceTestGate::observes_schedule);
+    let mut application_receive_held_for_maintenance_test =
+        blob_maintenance_gate.as_ref().is_some_and(|gate| {
+            gate.retirement_deadline.as_ref().map_or_else(
+                || gate.observes_schedule(),
+                |control| control.hold_queued_application,
+            )
+        });
     #[cfg(not(all(test, unix)))]
     let application_receive_held_for_maintenance_test = false;
     let mut event_contact_wake = EventContactWakeState::default();
@@ -16620,7 +17238,7 @@ async fn run_node_actor_inner(
     let mut automatic_candidates = BTreeSet::<EndpointId>::new();
     let mut automatic_events_open = automatic_nearby;
     let mut next_outbound_peer = 0usize;
-    let mut application_cursor = 0u64;
+    let mut application_journal = None;
     let mut initial_application_receipt_emitted = false;
     let mut fatal_error = None;
     let mut live_zeroization = None;
@@ -17065,7 +17683,10 @@ async fn run_node_actor_inner(
                     control_yield_required = true;
                 }
             }
-            _ = blob_retirement_wake.elapsed(),
+            _ = blob_retirement_wake.elapsed(
+                #[cfg(all(test, unix))]
+                blob_maintenance_gate.as_ref().and_then(|gate| gate.retirement_deadline.as_ref()),
+            ),
                 if blob_retirement_wake.is_armed() && !application_tick_pending => {
                 blob_retirement_wake.clear();
                 blob_retirement_deadline_retry_pending = true;
@@ -17150,7 +17771,7 @@ async fn run_node_actor_inner(
                             custody_clock: &custody_clock,
                             event_route_cache: &event_route_cache,
                         },
-                        &mut application_cursor,
+                        &mut application_journal,
                         &mut initial_application_receipt_emitted,
                         &mut selected_event_status,
                     )
@@ -17174,6 +17795,11 @@ async fn run_node_actor_inner(
                 if let Some(gate) = blob_maintenance_gate.as_ref() {
                     if start_blob_maintenance {
                         gate.observe_schedule(BlobMaintenanceScheduleObservation::Started);
+                    } else if blob_retirement_deadline_retry_pending {
+                        gate.observe_schedule(BlobMaintenanceScheduleObservation::DeadlineDeferred {
+                            queued_application,
+                            blob_outstanding,
+                        });
                     } else if application_receive_held_for_maintenance_test {
                         gate.observe_schedule(BlobMaintenanceScheduleObservation::Deferred {
                             queued_application,
@@ -29843,7 +30469,7 @@ pub fn run_demo_scenario(
     // Event representation that was already durable when its processes began.
     run_demo_phase(&topology, "ping-publish", &[0], &ping_applications)?;
     require_application_receipt(root, "ping-publish", 0, "emitted", "ping")?;
-    let ping = load_demo_operation(&states[0], &missions[0], &ping_operation_key()?)?
+    let ping = load_demo_operation(&states[0], &missions[0], None)?
         .ok_or_else(|| NodeError::Demo("origin process did not durably publish Ping".into()))?;
     verify_demo_event(&states[0], &missions[0], &ping, DEMO_PING_PAYLOAD)?;
     if ping.header.stamp.dot.publisher != missions[0].identity()
@@ -29897,7 +30523,7 @@ pub fn run_demo_scenario(
     let pong = load_demo_operation(
         &states[nodes - 1],
         &missions[nodes - 1],
-        &pong_operation_key(ping.semantic_id)?,
+        Some(ping.semantic_id),
     )?
     .ok_or_else(|| NodeError::Demo("destination process did not durably emit Pong".into()))?;
     verify_demo_event(
@@ -30110,7 +30736,7 @@ fn run_controlled_n4_demo(
         "emitted",
         "ping",
     )?;
-    let ping = load_demo_operation(&states[2], &missions[2], &ping_operation_key()?)?
+    let ping = load_demo_operation(&states[2], &missions[2], None)?
         .ok_or_else(|| NodeError::Demo("surviving member did not emit epoch-two Ping".into()))?;
     if ping.header.key_epoch != 2 || ping.header.stamp.dot.publisher != missions[2].identity() {
         return Err(NodeError::Demo(
@@ -30144,10 +30770,9 @@ fn run_controlled_n4_demo(
         &captured_applications,
         &denied_contact,
     )?;
-    let captured_ping = load_demo_operation(&states[3], &missions[3], &ping_operation_key()?)?
-        .ok_or_else(|| {
-            NodeError::Demo("captured node did not exercise stale local signing".into())
-        })?;
+    let captured_ping = load_demo_operation(&states[3], &missions[3], None)?.ok_or_else(|| {
+        NodeError::Demo("captured node did not exercise stale local signing".into())
+    })?;
     if captured_ping.header.key_epoch != 1
         || load_demo_semantic(&states[3], &missions[3], ping.semantic_id)?.is_some()
     {
@@ -30200,12 +30825,8 @@ fn run_controlled_n4_demo(
     pong_applications[2] = NodeApplication::EpochTwoPingEmitter;
     run_demo_phase(topology, "pong-publish", &[0], &pong_applications)?;
     require_application_receipt(root, "pong-publish", 0, "emitted", "pong")?;
-    let pong = load_demo_operation(
-        &states[0],
-        &missions[0],
-        &pong_operation_key(ping.semantic_id)?,
-    )?
-    .ok_or_else(|| NodeError::Demo("eligible epoch-two member did not emit Pong".into()))?;
+    let pong = load_demo_operation(&states[0], &missions[0], Some(ping.semantic_id))?
+        .ok_or_else(|| NodeError::Demo("eligible epoch-two member did not emit Pong".into()))?;
     verify_demo_event(&states[0], &missions[0], &pong, DEMO_PONG_PAYLOAD)?;
     if pong.header.key_epoch != 2
         || pong.header.stamp.dot.publisher != missions[0].identity()
@@ -30426,10 +31047,30 @@ fn open_demo_store(
 fn load_demo_operation(
     state: &Path,
     mission: &DemoMission,
-    operation: &EventOperationKey,
+    predecessor: Option<EventSemanticId>,
 ) -> Result<Option<StoredEvent>, NodeError> {
-    let (store, _) = open_demo_store(state, mission)?;
-    store.event_for_operation(operation).map_err(Into::into)
+    let (store, sealer) = open_demo_store(state, mission)?;
+    let key = predecessor.map_or_else(
+        || DEMO_PING_LOGICAL_KEY.to_vec(),
+        |ping| ping.as_bytes().to_vec(),
+    );
+    let mut cursor = 0;
+    loop {
+        let page = store.events_after(cursor, MAX_EVENT_PAGE)?;
+        if page.is_empty() {
+            return Ok(None);
+        }
+        for event in page {
+            cursor = event.acceptance_marker;
+            if event.header.stamp.dot.publisher == sealer.identity()
+                && event.header.topic.as_str() == DEMO_EVENT_TOPIC
+                && event.header.scope.as_str() == DEMO_SCOPE
+                && event.header.logical_key == key
+            {
+                return Ok(Some(event));
+            }
+        }
+    }
 }
 
 fn load_demo_semantic(
@@ -31159,6 +31800,7 @@ fn validate_port_block(base: u16, count: usize) -> Result<(), NodeError> {
 
 #[cfg(test)]
 mod tests {
+    mod native_publication_test;
     mod operation_rate_test;
     use std::sync::{Barrier, mpsc as std_mpsc};
 
@@ -31301,11 +31943,26 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn blob_retirement_deadline_wakes_before_sync_and_reschedules_after_reopen() {
-        // Break caught: periodic-only maintenance performs its immediate first
-        // turn, then leaves due retained evidence stranded until the much
-        // longer synchronization interval elapses.
-        let state = root("blob-retirement-deadline-wake");
+    async fn blob_retirement_deadline_defers_to_queued_request_and_resumes() {
+        assert_blob_retirement_deadline_priority(true).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blob_retirement_deadline_defers_to_worker_and_resumes() {
+        assert_blob_retirement_deadline_priority(false).await;
+    }
+
+    #[cfg(unix)]
+    async fn assert_blob_retirement_deadline_priority(queued_request: bool) {
+        // Break caught: cleanup must defer to this exact operational state,
+        // then resume from the real retirement deadline rather than leaving
+        // retained evidence until the much longer synchronization interval.
+        let state = root(if queued_request {
+            "blob-retirement-deadline-queued"
+        } else {
+            "blob-retirement-deadline-worker"
+        });
         fs::create_dir_all(&state).expect("retirement deadline state");
         let services = control_test_services([0xd8; 32]);
         let mut member = open_test_sealer(&services.member);
@@ -31410,12 +32067,6 @@ mod tests {
         let (application_sender, application_receiver) =
             mpsc::channel(APPLICATION_COMMAND_CAPACITY);
         let application_admission = Arc::new(AtomicBool::new(true));
-        let selected = SelectedBlobHandle::new(
-            application_sender,
-            application_admission.clone(),
-            services.member.identity(),
-            services.member.mission_authority_id(),
-        );
         let (_control_sender, control_receiver) = mpsc::channel(CONTROL_COMMAND_CAPACITY);
         let (shutdown_sender, shutdown_receiver) = mpsc::channel(1);
         let (ready_sender, ready_receiver) = oneshot::channel();
@@ -31427,6 +32078,7 @@ mod tests {
         let (schedule_sender, mut schedule_receiver) = mpsc::unbounded_channel();
         let (worker_reached_sender, mut worker_reached_receiver) = mpsc::unbounded_channel();
         let worker_release = Arc::new(tokio::sync::Notify::new());
+        let (deadline_release, deadline_allowed) = tokio::sync::watch::channel(false);
         let actor = tokio::spawn(run_node_actor_inner(
             NodeConfig {
                 state: state.clone(),
@@ -31449,6 +32101,7 @@ mod tests {
                 ready: ready_sender,
                 contact_activity: Arc::new(ContactActivityProbe::default()),
                 test_control: Some(RunNodeActorTestControl {
+                    allow_legacy_publication_fixture: false,
                     event_operation_audit: Some(EventOperationAuditTestControl {
                         page_size: 1_024,
                         on_progress: Box::new(|_| {}),
@@ -31476,6 +32129,10 @@ mod tests {
                         worker_constructed: Arc::new(AtomicBool::new(false)),
                         worker_reached: Some(worker_reached_sender),
                         worker_release: Some(worker_release.clone()),
+                        retirement_deadline: Some(BlobRetirementDeadlineTestControl {
+                            handling_allowed: deadline_allowed,
+                            hold_queued_application: queued_request,
+                        }),
                     }),
                     blob_final_read_gate: None,
                     event_group_execution_gate: None,
@@ -31496,51 +32153,76 @@ mod tests {
             ),
         }
         before_loop_reached.await.expect("deadline actor loop gate");
+        let (response, blob_operation) = oneshot::channel();
+        // Awaiting send is the enqueue handshake. The actor is still at its
+        // loop gate, so it cannot consume this request before send completes.
+        application_sender
+            .send(SelectedApplicationCommand::Blob(
+                SelectedBlobCommand::Subscribe {
+                    request: BlobSubscriptionRequest {
+                        operation_key: b"deadline-operational-priority".to_vec(),
+                        topic: services.topic.clone(),
+                        scope: services.scope.clone(),
+                        include_descendant_scopes: false,
+                    },
+                    response,
+                },
+            ))
+            .await
+            .unwrap_or_else(|_| panic!("enqueue deadline Blob request"));
         before_loop_release
             .send(())
             .expect("release deadline actor loop");
-
-        let operation_topic = services.topic.clone();
-        let operation_scope = services.scope.clone();
-        let mut blob_operation = tokio::spawn(async move {
-            selected
-                .subscribe(BlobSubscriptionRequest {
-                    operation_key: b"deadline-operational-priority".to_vec(),
-                    topic: operation_topic,
-                    scope: operation_scope,
-                    include_descendant_scopes: false,
-                })
+        if !queued_request {
+            timeout(Duration::from_secs(10), worker_reached_receiver.recv())
                 .await
-        });
-        timeout(Duration::from_secs(10), worker_reached_receiver.recv())
-            .await
-            .expect("deadline Blob worker permit deadline")
-            .expect("deadline Blob worker permit observation");
-        timeout(Duration::from_secs(2), async {
+                .expect("deadline Blob worker permit deadline")
+                .expect("deadline Blob worker permit observation");
+        }
+        // Queued case: receiving is held until the scheduling decision.
+        // Worker case: the worker has signaled that it holds its permit and
+        // remains blocked. Let the real deadline be handled in that state.
+        deadline_release
+            .send(true)
+            .expect("allow deadline handling");
+        let observation = timeout(Duration::from_secs(10), async {
             loop {
                 let observation = schedule_receiver
                     .recv()
                     .await
                     .expect("deadline maintenance schedule observation");
-                if matches!(
-                    observation,
-                    BlobMaintenanceScheduleObservation::Deferred {
-                        blob_outstanding: 1,
-                        ..
+                match observation {
+                    BlobMaintenanceScheduleObservation::Deferred { .. } => {}
+                    BlobMaintenanceScheduleObservation::DeadlineDeferred { .. } => {
+                        break observation;
                     }
-                ) {
-                    break;
+                    BlobMaintenanceScheduleObservation::Started => {
+                        panic!("cleanup started before the deadline deferral");
+                    }
                 }
             }
         })
         .await
-        .expect("deadline wake must defer to the queued Blob request");
+        .expect("real deadline must defer before the 60-second sync interval");
+        assert_eq!(
+            observation,
+            BlobMaintenanceScheduleObservation::DeadlineDeferred {
+                queued_application: queued_request,
+                blob_outstanding: usize::from(!queued_request),
+            }
+        );
         assert_eq!(starts.load(Ordering::Acquire), 0);
+        if queued_request {
+            timeout(Duration::from_secs(10), worker_reached_receiver.recv())
+                .await
+                .expect("deferred queued request dispatch deadline")
+                .expect("deferred queued request reaches worker");
+        }
         worker_release.notify_one();
-        timeout(Duration::from_secs(10), &mut blob_operation)
+        timeout(Duration::from_secs(10), blob_operation)
             .await
             .expect("deadline Blob operation response deadline")
-            .expect("deadline Blob operation task")
+            .expect("deadline Blob operation response channel")
             .expect("deadline Blob operation succeeds");
 
         timeout(Duration::from_secs(2), async {
@@ -31638,6 +32320,7 @@ mod tests {
             worker_constructed: worker_constructed.clone(),
             worker_reached: None,
             worker_release: None,
+            retirement_deadline: None,
         };
         let actor = tokio::spawn(run_node_actor_inner(
             NodeConfig {
@@ -31661,6 +32344,7 @@ mod tests {
                 ready: ready_sender,
                 contact_activity: Arc::new(ContactActivityProbe::default()),
                 test_control: Some(RunNodeActorTestControl {
+                    allow_legacy_publication_fixture: false,
                     event_operation_audit: None,
                     before_loop_ready,
                     before_loop_release: release_loop,
@@ -31753,6 +32437,7 @@ mod tests {
                 ready: ready_sender,
                 contact_activity: Arc::new(ContactActivityProbe::default()),
                 test_control: Some(RunNodeActorTestControl {
+                    allow_legacy_publication_fixture: false,
                     event_operation_audit: None,
                     before_loop_ready,
                     before_loop_release: release_loop,
@@ -31773,6 +32458,7 @@ mod tests {
                         worker_constructed: Arc::new(AtomicBool::new(false)),
                         worker_reached: Some(worker_reached_sender),
                         worker_release: Some(worker_release.clone()),
+                        retirement_deadline: None,
                     }),
                     blob_final_read_gate: None,
                     event_group_execution_gate: None,
@@ -35929,6 +36615,7 @@ mod tests {
                 ready: ready_sender,
                 contact_activity,
                 test_control: Some(RunNodeActorTestControl {
+                    allow_legacy_publication_fixture: false,
                     event_operation_audit: None,
                     before_loop_ready,
                     before_loop_release: release_loop,
@@ -36167,6 +36854,7 @@ mod tests {
                 ready: ready_sender,
                 contact_activity: Arc::new(ContactActivityProbe::default()),
                 test_control: Some(RunNodeActorTestControl {
+                    allow_legacy_publication_fixture: false,
                     event_operation_audit: None,
                     before_loop_ready,
                     before_loop_release: release_loop,
@@ -39143,6 +39831,7 @@ mod tests {
                 ready: ready_sender,
                 contact_activity: Arc::new(ContactActivityProbe::default()),
                 test_control: Some(RunNodeActorTestControl {
+                    allow_legacy_publication_fixture: false,
                     before_loop_ready: before_loop_ready_sender,
                     before_loop_release: before_loop_release_receiver,
                     zeroization_queued: zeroization_queued_sender,
@@ -39286,6 +39975,7 @@ mod tests {
                 ready: ready_sender,
                 contact_activity: Arc::new(ContactActivityProbe::default()),
                 test_control: Some(RunNodeActorTestControl {
+                    allow_legacy_publication_fixture: false,
                     before_loop_ready,
                     before_loop_release: release_loop,
                     zeroization_queued,
@@ -39811,6 +40501,7 @@ mod tests {
                 ready: ready_sender,
                 contact_activity: Arc::new(ContactActivityProbe::default()),
                 test_control: Some(RunNodeActorTestControl {
+                    allow_legacy_publication_fixture: false,
                     event_operation_audit: None,
                     before_loop_ready,
                     before_loop_release: release_loop,
@@ -39969,6 +40660,7 @@ mod tests {
                 ready: ready_sender,
                 contact_activity: Arc::new(ContactActivityProbe::default()),
                 test_control: Some(RunNodeActorTestControl {
+                    allow_legacy_publication_fixture: false,
                     event_operation_audit: None,
                     before_loop_ready,
                     before_loop_release: release_loop,
@@ -40128,6 +40820,7 @@ mod tests {
                 ready: ready_sender,
                 contact_activity: Arc::new(ContactActivityProbe::default()),
                 test_control: Some(RunNodeActorTestControl {
+                    allow_legacy_publication_fixture: false,
                     event_operation_audit: None,
                     before_loop_ready,
                     before_loop_release: release_loop,
@@ -41588,6 +42281,7 @@ mod tests {
                 ready,
                 contact_activity: Arc::new(ContactActivityProbe::default()),
                 test_control: Some(RunNodeActorTestControl {
+                    allow_legacy_publication_fixture: true,
                     before_loop_ready,
                     before_loop_release,
                     zeroization_queued,
@@ -43343,20 +44037,31 @@ mod tests {
         })
         .await
         .expect("start peerless A");
-        let published = peerless_a
-            .selected_events()
-            .publish(crate::application::EventPublishRequest {
-                operation_key: b"three-node-outbound-publication".to_vec(),
-                predecessor: None,
-                topic: topic.clone(),
-                scope: scope.clone(),
-                priority: Priority::Priority,
-                logical_key: b"three-node-outbound".to_vec(),
-                payload: b"outbound insertion must wake onward contact".to_vec(),
-                tombstone: false,
-            })
+        use crate::publication_journal::{Backend, Intent, Journal};
+        let path = a_state.join("source-publication.redb");
+        Journal::initialize(&path, b"three-node-source-fixture").unwrap();
+        let events = peerless_a.selected_events();
+        let mut journal = Journal::open(&path, b"three-node-source-fixture").unwrap();
+        let mut backend = Backend::Live(&events);
+        journal.recover(&mut backend).await.unwrap();
+        let published = journal
+            .publish_metadata(
+                &mut backend,
+                Intent {
+                    predecessor: None,
+                    topic: topic.as_str().to_owned(),
+                    scope: scope.as_str().to_owned(),
+                    priority: Priority::Priority as u8,
+                    logical_key: b"three-node-outbound".to_vec(),
+                    payload: b"outbound insertion must wake onward contact".to_vec(),
+                    tombstone: false,
+                    ttl_ms: None,
+                },
+            )
             .await
-            .expect("preseed peerless A Event");
+            .unwrap();
+        journal.acknowledge(&mut backend).await.unwrap();
+        drop(journal);
         assert!(published.inserted);
         peerless_a.shutdown().await.expect("shutdown peerless A");
 
@@ -45739,6 +46444,7 @@ mod tests {
                 ready: ready_sender,
                 contact_activity: Arc::new(ContactActivityProbe::default()),
                 test_control: Some(RunNodeActorTestControl {
+                    allow_legacy_publication_fixture: false,
                     before_loop_ready,
                     before_loop_release: release_received,
                     zeroization_queued,
