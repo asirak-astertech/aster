@@ -1191,6 +1191,52 @@ impl<'a> BlobDepot<'a> {
         result
     }
 
+    /// Mints physical completion for canonical content before its semantic
+    /// source envelope receives a final causal identity.
+    pub fn completed_prepared_blob(
+        &mut self,
+        manifest: &BlobManifest,
+        manifest_digest: [u8; 32],
+    ) -> Result<BlobDepotCompletion, StoreError> {
+        self.store.require_live()?;
+        let variant_id = blob_variant_id(
+            manifest.id(),
+            manifest.content_group(),
+            manifest.content_epoch(),
+        );
+        let read = self.store.database.begin_read()?;
+        super::deletion::require_variant_available_read(&read, variant_id)?;
+        let import = load_import_read(&read, variant_id)?
+            .ok_or_else(|| blob_error(BlobStoreError::CompletionMismatch))?;
+        let physical_lineage = import
+            .physical_lineage
+            .ok_or_else(|| blob_error(BlobStoreError::CompletionMismatch))?;
+        if !import.matches_manifest(manifest)
+            || import.blob_id != manifest.id()
+            || import.content_group != *manifest.content_group()
+            || import.epoch != manifest.content_epoch()
+            || import.finalized_manifest_digest != Some(manifest_digest)
+        {
+            return Err(blob_error(BlobStoreError::CompletionMismatch));
+        }
+        verify_import_files_read(&read, &self.root, &import)?;
+        let import_fingerprint = Sha256::digest(encode_import(&import)?).into();
+        Ok(BlobDepotCompletion {
+            authority: Arc::clone(&self.store.blob_completion_authority),
+            backing_identity: self.store.backing_identity,
+            variant_id,
+            blob_id: manifest.id(),
+            content_group: *manifest.content_group(),
+            epoch: manifest.content_epoch(),
+            physical_lineage,
+            manifest_digest,
+            total_len: manifest.total_len(),
+            chunk_size: manifest.chunk_size(),
+            chunk_count: manifest.chunk_count(),
+            import_fingerprint,
+        })
+    }
+
     /// Rechecks a previously minted exact completion against the current
     /// mission-bound depot, including every durable marker and chunk file.
     ///

@@ -46,6 +46,77 @@ impl BlobPublicationStreamId {
     }
 }
 
+/// Stable opaque application token for one publisher-qualified local Blob
+/// operation. The token is an index key only; it carries no semantic identity
+/// or publication authority.
+pub fn local_blob_publication_stream_id(
+    publisher: NodeId,
+    operation: &[u8],
+) -> BlobPublicationStreamId {
+    let mut digest = Sha256::new();
+    digest.update(b"aster/local-blob-stream/id/v2");
+    digest.update(publisher);
+    digest.update((operation.len() as u64).to_be_bytes());
+    digest.update(operation);
+    let mut output: [u8; 32] = digest.finalize().into();
+    if output == [0; 32] {
+        output[31] = 1;
+    }
+    BlobPublicationStreamId(output)
+}
+
+/// Nonsemantic identity and bounds for one node-protected provisional upload.
+///
+/// Unlike [`BlobStreamOpen`], this value carries no publisher counter, causal
+/// context, signed source metadata, or publication authority. It exists only
+/// to bind staged ciphertext to the immutable upload reservation that owns it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlobUploadDescriptor {
+    upload_id: BlobPublicationStreamId,
+    request_digest: [u8; 32],
+    total_len: u64,
+    content_epoch: u64,
+}
+
+impl BlobUploadDescriptor {
+    pub fn new(
+        upload_id: BlobPublicationStreamId,
+        request_digest: [u8; 32],
+        total_len: u64,
+        content_epoch: u64,
+    ) -> Result<Self, BlobError> {
+        if request_digest == [0; 32]
+            || total_len == 0
+            || total_len > MAX_BLOB_STREAM_BYTES
+            || content_epoch == 0
+        {
+            return Err(BlobError::InvalidManifest);
+        }
+        Ok(Self {
+            upload_id,
+            request_digest,
+            total_len,
+            content_epoch,
+        })
+    }
+
+    pub const fn upload_id(&self) -> BlobPublicationStreamId {
+        self.upload_id
+    }
+
+    pub const fn request_digest(&self) -> &[u8; 32] {
+        &self.request_digest
+    }
+
+    pub const fn total_len(&self) -> u64 {
+        self.total_len
+    }
+
+    pub const fn content_epoch(&self) -> u64 {
+        self.content_epoch
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BlobStreamOpen {
     stream_id: BlobPublicationStreamId,
@@ -903,6 +974,23 @@ impl BlobStreamSegmentSealer {
         ))
     }
 
+    pub(crate) fn from_upload_provider(
+        upload: &BlobUploadDescriptor,
+        content_grant_seed: [u8; 32],
+        _seal: crate::source_blob::BlobStreamProviderSeal,
+    ) -> Result<Self, BlobError> {
+        let mut seed = Zeroizing::new(content_grant_seed);
+        let (key, nonce) = derive_upload_key(&seed, upload)?;
+        seed.zeroize();
+        Ok(Self::new(
+            *upload.upload_id().as_bytes(),
+            *upload.request_digest(),
+            upload.content_epoch(),
+            key,
+            nonce,
+        ))
+    }
+
     pub fn seal(
         &self,
         partition: BlobStreamPlainPartition,
@@ -995,6 +1083,18 @@ impl BlobStreamSegmentOpener {
     ) -> Result<Self, BlobError> {
         Ok(Self(BlobStreamSegmentSealer::from_provider(
             open,
+            content_grant_seed,
+            seal,
+        )?))
+    }
+
+    pub(crate) fn from_upload_provider(
+        upload: &BlobUploadDescriptor,
+        content_grant_seed: [u8; 32],
+        seal: crate::source_blob::BlobStreamProviderSeal,
+    ) -> Result<Self, BlobError> {
+        Ok(Self(BlobStreamSegmentSealer::from_upload_provider(
+            upload,
             content_grant_seed,
             seal,
         )?))
@@ -1131,6 +1231,37 @@ fn derive_stream_key(
         .map_err(|_| BlobError::AuthenticationFailed)?;
     Ok((key, nonce))
 }
+
+fn derive_upload_key(
+    content_grant_seed: &[u8; 32],
+    upload: &BlobUploadDescriptor,
+) -> Result<([u8; 32], [u8; 12]), BlobError> {
+    let hkdf = Hkdf::<Sha256>::new(Some(b"ASTER/blob-upload/key/v1\0"), content_grant_seed);
+    let mut binding = Vec::with_capacity(72);
+    binding.extend_from_slice(upload.upload_id().as_bytes());
+    binding.extend_from_slice(upload.request_digest());
+    binding.extend_from_slice(&upload.content_epoch().to_be_bytes());
+    let mut key = [0; 32];
+    let mut key_info = Vec::with_capacity(96);
+    key_info.extend_from_slice(b"ASTER/blob-upload/aead-key/v1\0");
+    key_info.extend_from_slice(&binding);
+    hkdf.expand(&key_info, &mut key)
+        .map_err(|_| BlobError::AuthenticationFailed)?;
+    let mut nonce = [0; 12];
+    let mut nonce_info = Vec::with_capacity(96);
+    nonce_info.extend_from_slice(b"ASTER/blob-upload/base-nonce/v1\0");
+    nonce_info.extend_from_slice(&binding);
+    hkdf.expand(&nonce_info, &mut nonce)
+        .map_err(|_| BlobError::AuthenticationFailed)?;
+    Ok((key, nonce))
+}
+
+/// Upload-specific names keep provisional application code independent from
+/// the legacy semantic stream-open representation while retaining the shared
+/// bounded encrypted-segment codec.
+pub type BlobUploadSegmentSealer = BlobStreamSegmentSealer;
+pub type BlobUploadSegmentOpener = BlobStreamSegmentOpener;
+pub type BlobUploadPlainPartition = BlobStreamPlainPartition;
 
 fn segment_aad(
     stream_id: [u8; 32],

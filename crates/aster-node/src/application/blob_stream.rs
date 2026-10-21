@@ -7,11 +7,12 @@ use crate::stream_pipeline::{
 use aster_mesh::{
     BLOB_STREAM_SEGMENT_BYTES, BlobStreamFrontier, BlobStreamOpen, BlobStreamPlainPartition,
     BlobStreamSegmentLeaves, BlobStreamSegmentOpener, BlobStreamSegmentSealer, BlobStreamSubtree,
-    EncryptedBlobStreamSegment, VerifiedBlobStreamOpen,
+    BlobUploadDescriptor, BlobUploadPlainPartition, BlobUploadSegmentOpener,
+    BlobUploadSegmentSealer, EncryptedBlobStreamSegment,
 };
 use aster_redb_store::{
-    BlobStreamPublication, BlobStreamReservation, BlobStreamResume,
-    pack::{BlobPackError, BlobPackReader, BlobPackWriter},
+    BlobStreamPublication, BlobUploadCheckpoint, BlobUploadReservation,
+    pack::{BlobPackError, BlobPackIdentity, BlobPackReader, BlobPackWriter, PinnedBlobPackRoot},
 };
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -36,11 +37,9 @@ const BLOB_STREAM_MAP_QUEUE_ITEMS: usize = 4;
 type SealedBlobStreamPartition = (EncryptedBlobStreamSegment, BlobStreamSegmentLeaves);
 
 pub(super) struct LocalBlobPublishStream {
-    pub(super) open: VerifiedBlobStreamOpen,
-    pub(super) reservation: BlobStreamReservation,
-    pub(super) resume: BlobStreamResume,
+    pub(super) reservation: BlobUploadReservation,
+    pub(super) checkpoint: BlobUploadCheckpoint,
     pub(super) writer: BlobPackWriter,
-    pub(super) sealer: BlobStreamSegmentSealer,
     pub(super) request: BlobPublishRequest,
     pub(super) options: BlobPublishOptions,
     pub(super) total_len: u64,
@@ -51,7 +50,6 @@ pub(super) struct LocalBlobPublishStream {
     pub(super) next_map_index: u64,
     pub(super) next_sink_index: u64,
     pub(super) mapped_segments: u64,
-    pub(super) publisher_counter: u64,
     pub(super) checkpoint_segments: u64,
 }
 
@@ -61,15 +59,17 @@ impl LocalBlobPublishStream {
     }
 
     pub(super) fn map_checkpoint_due(&self) -> bool {
-        self.next_map_index
-            .saturating_sub(self.resume.next_segment_index())
-            >= self.checkpoint_segments
+        self.next_map_index.saturating_sub(
+            self.checkpoint
+                .durable_pack_checkpoint()
+                .map_or(0, |checkpoint| checkpoint.next_index()),
+        ) >= self.checkpoint_segments
     }
 
     pub(super) fn durable_checkpoint_due(&self) -> bool {
         self.writer
             .plaintext_offset()
-            .saturating_sub(self.resume.durable_plaintext_offset())
+            .saturating_sub(self.checkpoint.durable_plaintext_offset())
             >= self.checkpoint_segments * BLOB_STREAM_SEGMENT_BYTES as u64
     }
 
@@ -93,13 +93,13 @@ pub(super) fn take_zeroizing_bytes(mut bytes: Zeroizing<Vec<u8>>) -> Vec<u8> {
 }
 
 pub(super) fn blob_stream_map_pool(
-    open: &VerifiedBlobStreamOpen,
-    sealer: &BlobStreamSegmentSealer,
+    upload: BlobUploadDescriptor,
+    sealer: &BlobUploadSegmentSealer,
     total_len: u64,
 ) -> Result<FixedPartitionMapPool<SealedBlobStreamPartition>, ApplicationError> {
-    let stream_id = *open.open().stream_id().as_bytes();
-    let open_digest = open.open().digest();
-    let content_epoch = open.open().content_epoch();
+    let stream_id = *upload.upload_id().as_bytes();
+    let open_digest = *upload.request_digest();
+    let content_epoch = upload.content_epoch();
     let sealer = sealer.clone();
     FixedPartitionMapPool::new(
         BLOB_STREAM_MAP_WORKERS,
@@ -109,7 +109,7 @@ pub(super) fn blob_stream_map_pool(
             let offset = index.checked_mul(BLOB_STREAM_SEGMENT_BYTES as u64).ok_or(
                 PipelineError::MapFailed("blob stream offset overflow".into()),
             )?;
-            let partition = BlobStreamPlainPartition::new(
+            let partition = BlobUploadPlainPartition::new(
                 stream_id,
                 open_digest,
                 content_epoch,
@@ -125,6 +125,139 @@ pub(super) fn blob_stream_map_pool(
         },
     )
     .map_err(blob_stream_pipeline_error)
+}
+
+/// Seekable bounded plaintext view over the exact Store-projected upload pack.
+/// Backward seeks reopen the durable checkpoint; normal canonical encryption
+/// reads forward with at most one decrypted provisional segment resident.
+pub(super) struct UploadPackPlainReader {
+    root: PinnedBlobPackRoot,
+    identity: BlobPackIdentity,
+    checkpoint: aster_redb_store::pack::BlobPackCheckpoint,
+    pack: BlobPackReader,
+    opener: BlobUploadSegmentOpener,
+    plaintext: Zeroizing<Vec<u8>>,
+    plaintext_offset: usize,
+    segment_start: u64,
+    position: u64,
+    total_len: u64,
+}
+
+impl UploadPackPlainReader {
+    pub(super) fn open(
+        root: PinnedBlobPackRoot,
+        reservation: &BlobUploadReservation,
+        checkpoint: &BlobUploadCheckpoint,
+        opener: BlobUploadSegmentOpener,
+    ) -> Result<Self, ApplicationError> {
+        let identity = reservation.pack_identity();
+        let durable = checkpoint.durable_pack_checkpoint().ok_or_else(|| {
+            ApplicationError::new(ApplicationErrorKind::Integrity, "blob upload finalize")
+        })?;
+        let pack = BlobPackReader::open_projected_upload_pinned(&root, &identity, durable)
+            .map_err(|error| blob_pack_application_error("blob upload finalize", error))?;
+        Ok(Self {
+            root,
+            identity,
+            checkpoint: durable.clone(),
+            pack,
+            opener,
+            plaintext: Zeroizing::new(Vec::new()),
+            plaintext_offset: 0,
+            segment_start: 0,
+            position: 0,
+            total_len: identity.total_len(),
+        })
+    }
+
+    fn reopen(&mut self) -> std::io::Result<()> {
+        self.pack = BlobPackReader::open_projected_upload_pinned(
+            &self.root,
+            &self.identity,
+            &self.checkpoint,
+        )
+        .map_err(std::io::Error::other)?;
+        self.plaintext.clear();
+        self.plaintext_offset = 0;
+        self.segment_start = 0;
+        self.position = 0;
+        Ok(())
+    }
+
+    fn load_next_segment(&mut self) -> std::io::Result<bool> {
+        let Some(segment) = self.pack.next_segment().map_err(std::io::Error::other)? else {
+            return Ok(false);
+        };
+        let (plaintext, _) = self.opener.open(&segment).map_err(std::io::Error::other)?;
+        self.segment_start = self.position;
+        self.plaintext = plaintext;
+        self.plaintext_offset = 0;
+        Ok(true)
+    }
+}
+
+impl Read for UploadPackPlainReader {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        if output.is_empty() || self.position >= self.total_len {
+            return Ok(0);
+        }
+        if self.plaintext_offset >= self.plaintext.len() && !self.load_next_segment()? {
+            return Ok(0);
+        }
+        let available = &self.plaintext[self.plaintext_offset..];
+        let len = available.len().min(output.len());
+        output[..len].copy_from_slice(&available[..len]);
+        self.plaintext_offset += len;
+        self.position = self
+            .position
+            .checked_add(len as u64)
+            .ok_or_else(|| std::io::Error::other("upload position overflow"))?;
+        Ok(len)
+    }
+}
+
+impl std::io::Seek for UploadPackPlainReader {
+    fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+        let target = match position {
+            std::io::SeekFrom::Start(position) => Some(position),
+            std::io::SeekFrom::End(delta) => self.total_len.checked_add_signed(delta),
+            std::io::SeekFrom::Current(delta) => self.position.checked_add_signed(delta),
+        }
+        .filter(|target| *target <= self.total_len)
+        .ok_or_else(|| std::io::Error::other("upload seek is out of bounds"))?;
+        if target == self.position {
+            return Ok(target);
+        }
+        let segment_end = self
+            .segment_start
+            .checked_add(self.plaintext.len() as u64)
+            .ok_or_else(|| std::io::Error::other("upload segment bound overflow"))?;
+        if !self.plaintext.is_empty() && (self.segment_start..=segment_end).contains(&target) {
+            self.plaintext_offset =
+                usize::try_from(target - self.segment_start).map_err(std::io::Error::other)?;
+            self.position = target;
+            return Ok(target);
+        }
+        self.reopen()?;
+        while self.position < target {
+            if !self.load_next_segment()? {
+                return Err(std::io::Error::other("upload pack ended during seek"));
+            }
+            let segment_end = self
+                .segment_start
+                .checked_add(self.plaintext.len() as u64)
+                .ok_or_else(|| std::io::Error::other("upload segment bound overflow"))?;
+            if target <= segment_end {
+                self.plaintext_offset =
+                    usize::try_from(target - self.segment_start).map_err(std::io::Error::other)?;
+                self.position = target;
+                return Ok(target);
+            }
+            self.position = segment_end;
+            self.plaintext_offset = self.plaintext.len();
+        }
+        Ok(target)
+    }
 }
 
 pub(super) fn blob_stream_pipeline_error(_error: PipelineError) -> ApplicationError {

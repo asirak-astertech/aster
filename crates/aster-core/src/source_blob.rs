@@ -15,7 +15,8 @@ use crate::{
     },
     blob_stream::{
         BlobStreamFinalCommitment, BlobStreamOpen, BlobStreamSegmentOpener,
-        BlobStreamSegmentSealer, VerifiedBlobStreamFinalCommitment, VerifiedBlobStreamOpen,
+        BlobStreamSegmentSealer, BlobUploadDescriptor, BlobUploadSegmentOpener,
+        BlobUploadSegmentSealer, VerifiedBlobStreamFinalCommitment, VerifiedBlobStreamOpen,
     },
     crypto::ReferenceEnvelopeSealer,
     envelope::{EnvelopeError, EnvelopeHeader, EnvelopeSealer, SealRequest, SealedEnvelope},
@@ -525,6 +526,35 @@ impl std::fmt::Debug for BlobContentVerification {
 }
 
 impl ReferenceEnvelopeSealer {
+    /// Mints the node-protected provisional-upload codec for one immutable
+    /// reservation without creating signed source or causal authority.
+    pub fn blob_upload_segment_sealer(
+        &self,
+        scope: &Scope,
+        topic: &Topic,
+        upload: &BlobUploadDescriptor,
+    ) -> Result<BlobUploadSegmentSealer, EnvelopeError> {
+        let seed = self
+            .blob_stream_content_grant_seed(scope, topic, upload.content_epoch())
+            .ok_or_else(|| blob_stream_authentication_error(BlobError::AuthenticationFailed))?;
+        BlobStreamSegmentSealer::from_upload_provider(upload, seed, BlobStreamProviderSeal(()))
+            .map_err(blob_stream_authentication_error)
+    }
+
+    /// Opens only records bound to the exact provisional upload reservation.
+    pub fn blob_upload_segment_opener(
+        &self,
+        scope: &Scope,
+        topic: &Topic,
+        upload: &BlobUploadDescriptor,
+    ) -> Result<BlobUploadSegmentOpener, EnvelopeError> {
+        let seed = self
+            .blob_stream_content_grant_seed(scope, topic, upload.content_epoch())
+            .ok_or_else(|| blob_stream_authentication_error(BlobError::AuthenticationFailed))?;
+        BlobStreamSegmentOpener::from_upload_provider(upload, seed, BlobStreamProviderSeal(()))
+            .map_err(blob_stream_authentication_error)
+    }
+
     pub fn blob_stream_authorization_digest(
         &self,
         scope: &Scope,

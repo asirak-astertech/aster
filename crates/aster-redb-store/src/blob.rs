@@ -33,11 +33,12 @@ use std::fmt;
 
 use aster_mesh::{
     AuthenticatedBlobCustodySendContextV1, BlobCustodyClaimV1, BlobCustodyDirectionV1,
-    BlobCustodyError, BlobCustodyTransferId, BlobId, BlobRouteCommitment,
-    BlobStore as CoreBlobStore, ContentVerifiedBlobEnvelope, CurrentBlobLineage,
-    MAX_BLOB_CHUNK_SIZE, MAX_BLOB_CHUNKS, MAX_BLOB_MANIFEST_BYTES, MAX_BLOB_MEDIA_TYPE_BYTES,
-    MAX_BLOB_SCHEMA_ID_BYTES, SELECTED_BLOB_CHUNK_SIZE as CORE_SELECTED_BLOB_CHUNK_SIZE,
-    VerifiedBlobContentCompletion, VerifiedBlobCustodyClaimV1, VerifiedBlobTransferPlan,
+    BlobCustodyError, BlobCustodyTransferId, BlobId, BlobManifest, BlobPublicationStreamId,
+    BlobRouteCommitment, BlobStore as CoreBlobStore, ContentVerifiedBlobEnvelope,
+    CurrentBlobLineage, MAX_BLOB_CHUNK_SIZE, MAX_BLOB_CHUNKS, MAX_BLOB_MANIFEST_BYTES,
+    MAX_BLOB_MEDIA_TYPE_BYTES, MAX_BLOB_SCHEMA_ID_BYTES,
+    SELECTED_BLOB_CHUNK_SIZE as CORE_SELECTED_BLOB_CHUNK_SIZE, VerifiedBlobContentCompletion,
+    VerifiedBlobCustodyClaimV1, VerifiedBlobTransferPlan, local_blob_publication_stream_id,
 };
 use redb::{ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle};
 
@@ -2993,6 +2994,19 @@ impl Store {
         depot.completed_blob(blob, manifest_bytes)
     }
 
+    /// Proves finalized canonical content before the final semantic source is
+    /// built by the atomic local-publication transaction.
+    pub fn completed_prepared_local_blob(
+        &self,
+        manifest: &BlobManifest,
+        manifest_digest: [u8; 32],
+    ) -> Result<BlobDepotCompletion, StoreError> {
+        self.require_live()?;
+        self.require_bound_mission()?;
+        let mut depot = BlobDepot::open_network_mutation(self, false)?;
+        depot.completed_prepared_blob(manifest, manifest_digest)
+    }
+
     /// Opens only the exact finalized depot variant authorized by `completion`.
     ///
     /// Unlike [`Self::blob_depot`], this page-read path does not perform a
@@ -3474,6 +3488,83 @@ impl Store {
         }
         let request = BlobOperationRequest::new(&owner.operation, intent);
         self.blob_for_operation_with_policy(policy, &request)
+    }
+
+    /// Resolves the publisher-qualified result before the caller can know the
+    /// content-derived intent. The caller must compare every immutable request
+    /// field before returning the result.
+    pub fn blob_for_owner_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        owner: &BlobOperationOwner,
+    ) -> Result<Option<StoredBlob>, StoreError> {
+        self.require_live()?;
+        let authority = self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        require_control_policy_read(&read, authority, policy)?;
+        if control_principal_revoked_read(&read, owner.publisher)? {
+            return Err(blob_error(BlobStoreError::PublisherRevoked(
+                owner.publisher,
+            )));
+        }
+        let owner_key = blob_operation_owner_key(owner)?;
+        let encoded = read
+            .open_table(BLOB_OPERATIONS)?
+            .get(owner_key.as_slice())?
+            .map(|value| value.value().to_vec());
+        if let Some(encoded) = encoded.as_deref()
+            && lifecycle::operation_record_is_retired(encoded).map_err(blob_error)?
+        {
+            return Err(blob_error(BlobStoreError::ExpiredOrRetired));
+        }
+        let transfer = encoded
+            .as_deref()
+            .map(decode_blob_operation_record)
+            .transpose()?
+            .map(|record| record.transfer_id);
+        transfer
+            .map(|transfer| load_blob_from_read(&read, transfer))
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    /// Resolves the canonical publication associated with one stable local
+    /// application token without retaining a parallel publication ledger.
+    pub fn blob_for_local_publication_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        publication_id: BlobPublicationStreamId,
+    ) -> Result<Option<StoredBlob>, StoreError> {
+        self.require_live()?;
+        let authority = self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        require_control_policy_read(&read, authority, policy)?;
+        let mut matched = None;
+        for row in read.open_table(BLOB_OPERATIONS)?.iter()? {
+            let (key, value) = row?;
+            let owner = decode_blob_operation_owner_key(key.value())?;
+            if local_blob_publication_stream_id(owner.publisher, owner.operation.as_bytes())
+                != publication_id
+            {
+                continue;
+            }
+            if matched.is_some() {
+                return Err(blob_error(BlobStoreError::OperationConflict));
+            }
+            if control_principal_revoked_read(&read, owner.publisher)? {
+                return Err(blob_error(BlobStoreError::PublisherRevoked(
+                    owner.publisher,
+                )));
+            }
+            if lifecycle::operation_record_is_retired(value.value()).map_err(blob_error)? {
+                return Err(blob_error(BlobStoreError::ExpiredOrRetired));
+            }
+            matched = Some(decode_blob_operation_record(value.value())?.transfer_id);
+        }
+        matched
+            .map(|transfer| load_blob_from_read(&read, transfer))
+            .transpose()
+            .map(Option::flatten)
     }
 
     pub(crate) fn blob_operation_retry_with_policy(

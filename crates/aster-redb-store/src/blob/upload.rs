@@ -13,7 +13,9 @@ use crate::{
     control_principal_revoked_write, decode_scope_epoch_index, enforce_live_write,
     require_control_policy_write,
 };
-use aster_mesh::{BlobManifest, BlobMetadata, BlobPublicationStreamId, NodeId};
+use aster_mesh::{
+    BlobManifest, BlobMetadata, BlobPublicationStreamId, NodeId, local_blob_publication_stream_id,
+};
 use redb::{Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -840,6 +842,9 @@ impl Store {
             {
                 return Err(blob_error(BlobStoreError::OperationConflict));
             }
+            if existing.reservation.control_policy != *policy {
+                return Err(blob_error(BlobStoreError::ReservationChanged));
+            }
             return Ok((
                 reservation_for_store(self, &existing),
                 existing.projection()?,
@@ -933,6 +938,9 @@ impl Store {
         write.set_durability(Durability::Immediate)?;
         enforce_live_write(&write)?;
         synchronize_blob_policy_generation_write(&write)?;
+        if reservation.control_policy != *policy {
+            return Err(blob_error(BlobStoreError::ReservationChanged));
+        }
         require_upload_policy_write(
             &write,
             authority,
@@ -1004,6 +1012,36 @@ impl Store {
                 Ok((reservation_for_store(self, &upload), upload.projection()?))
             })
             .transpose()
+    }
+
+    /// Resolves one in-progress upload by its stable local application token.
+    /// The bounded upload table remains the sole durable provisional authority.
+    pub fn resume_blob_upload_by_publication_id(
+        &self,
+        publication_id: BlobPublicationStreamId,
+    ) -> Result<Option<(BlobUploadReservation, BlobUploadCheckpoint)>, StoreError> {
+        self.require_live()?;
+        self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        let mut matched = None;
+        for row in read.open_table(super::BLOB_UPLOADS)?.iter()? {
+            let (_, value) = row?;
+            let upload = DurableBlobUpload::decode(
+                Arc::clone(&self.blob_completion_authority),
+                value.value(),
+            )?;
+            let owner = &upload.reservation.request.owner;
+            if local_blob_publication_stream_id(owner.publisher, owner.operation.as_bytes())
+                != publication_id
+            {
+                continue;
+            }
+            if matched.is_some() {
+                return Err(schema_error());
+            }
+            matched = Some((reservation_for_store(self, &upload), upload.projection()?));
+        }
+        Ok(matched)
     }
 
     pub fn complete_blob_upload(
@@ -1527,6 +1565,77 @@ mod tests {
         .expect("reopen exact projected pack");
         assert_eq!(writer.next_index(), durable.next_index());
         assert_eq!(writer.plaintext_offset(), durable.plaintext_offset());
+    }
+
+    #[test]
+    fn upload_retry_and_checkpoint_reject_immutable_policy_mismatch() {
+        // Break caught: retry and checkpoint must not accept a live
+        // caller-supplied policy when the durable upload is bound to different
+        // immutable policy bytes.
+        let fixture = fixture("policy-mismatch", 0x30, BlobDepotLimits::DEFAULT);
+        let request = request(&fixture, b"policy-mismatch", 1_024);
+        let policy = fixture.store.control_policy_snapshot().expect("policy");
+        fixture
+            .store
+            .reserve_blob_upload_with_policy(&policy, &request)
+            .expect("reserve upload");
+
+        let owner_key = blob_operation_owner_key(&request.owner).expect("owner key");
+        let write = fixture
+            .store
+            .database
+            .begin_write()
+            .expect("policy mismatch write");
+        let encoded = write
+            .open_table(super::super::BLOB_UPLOADS)
+            .expect("uploads")
+            .get(owner_key.as_slice())
+            .expect("read upload")
+            .expect("upload exists")
+            .value()
+            .to_vec();
+        let mut upload = DurableBlobUpload::decode(
+            Arc::clone(&fixture.store.blob_completion_authority),
+            &encoded,
+        )
+        .expect("decode upload");
+        upload.reservation.control_policy = ControlPolicySnapshot {
+            authority: [0xee; 32],
+            head: None,
+        };
+        write
+            .open_table(super::super::BLOB_UPLOADS)
+            .expect("uploads")
+            .insert(
+                owner_key.as_slice(),
+                upload.encode().expect("encode upload").as_slice(),
+            )
+            .expect("replace upload");
+        write.commit().expect("commit mismatch");
+
+        let error = fixture
+            .store
+            .reserve_blob_upload_with_policy(&policy, &request)
+            .expect_err("retry must bind the immutable reservation policy");
+        assert!(matches!(
+            error,
+            StoreError::Blob(BlobStoreError::ReservationChanged)
+        ));
+
+        let (corrupted, checkpoint) = fixture
+            .store
+            .resume_blob_upload(&request.owner)
+            .expect("resume corrupted reservation")
+            .expect("corrupted reservation remains durable");
+        let durable = append_real_upload_pack(&fixture, &corrupted, &[0x42; 1_024]);
+        let error = fixture
+            .store
+            .checkpoint_blob_upload(&policy, &corrupted, checkpoint, durable)
+            .expect_err("checkpoint must bind the immutable reservation policy");
+        assert!(matches!(
+            error,
+            StoreError::Blob(BlobStoreError::ReservationChanged)
+        ));
     }
 
     #[test]
