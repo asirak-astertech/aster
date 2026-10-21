@@ -10,7 +10,9 @@ This evidence covers five measured parts of the unreleased semantic-v9/profile-5
 4. receiver-owned provisional lifecycle reservation, checkpoint projection, signed-finish verification, and atomic inventory promotion; and
 5. interrupted cross-process resume from store-authoritative byte progress.
 
-It does **not** qualify production deployment. Application RPC integration, CI/full-matrix evidence, and three-device fused-path fairness remain open.
+It does **not** qualify production deployment. Later sections retain the
+application RPC, CI, and three-device contention requalification that closed
+the original evidence gaps without changing an installed service.
 
 All device binaries were cross-built from signed local branch `perf/data-mesh-stream-pipeline`. The relevant signed commits are:
 
@@ -305,6 +307,85 @@ device's `/tmp` is a 463-MiB tmpfs. Directing the benchmark's temporary pack to
 completed. Production pack roots are explicit store-owned paths; this is a
 benchmark/device-configuration UX issue, not a protocol dependency.
 
+## Signed-head CM4 requalification
+
+Signed commit `7930633255bec209a71fca4750a87a3261c8f1e7` was rebuilt locally for
+ARM64 with the locked dependency graph after the fork's Actions endpoint
+reported that Actions were disabled. The build used
+`aarch64-linux-gnu-gcc`; no source or dependency substitution was made. The
+deployed test-only artifacts were:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `asterctl` | `1ebd46b129d4b8125bf5b42c26062f7720b9ad78893a5706872e13525c533abb` |
+| Acceptance fixture | `efcabe50b2d4f65f553255926fdaf0fab0161d4136e7794c8c02b18a983ae065` |
+| Pipeline benchmark | `887293b749b7db8f68e631528f3ab1a9d10891caa8b6bbf440c1a36902b2ebfb` |
+| Transport benchmark | `3765e9044c96fa7b25a8b45284049d03c9ebfac8081b4760e347b7853614162c` |
+
+The conservative two-worker local pipeline completed 1 GiB on every CM4 with
+identical root
+`81f4cbd7babf24a8fe0464ff13ee0d676e7703fb19721cc1db2a5af1a8b33eb0`:
+
+| Device | Publish | Read | Peak in-flight bytes |
+| --- | ---: | ---: | ---: |
+| `rpi4-1` | 13.253 MiB/s | 13.576 MiB/s | 2,097,412 |
+| `rpi4-2` | 13.256 MiB/s | 13.660 MiB/s | 2,097,412 |
+| `rpi4-3` | 13.331 MiB/s | 13.744 MiB/s | 2,097,412 |
+
+The direct WLAN completed-pack path from `rpi4-2` (`192.168.60.80`) to
+`rpi4-1` (`192.168.60.79`) produced:
+
+| Size | Aster send/receive | Checkpoints | Adjacent raw TCP | Ratio |
+| ---: | ---: | ---: | ---: | ---: |
+| 256 MiB | 7.971 / 7.972 MiB/s | 2 | 9.491 MiB/s | 84.0% |
+| 800 MiB | 8.194 / 8.194 MiB/s | 7 | 9.425 MiB/s | 86.9% |
+| 1 GiB | 8.213 / 8.213 MiB/s | 8 | 9.354 MiB/s | 87.8% |
+
+The exact 1-GiB network phase transferred 1,073,879,040 wire bytes in
+124.69 seconds. Both roles reported plaintext root
+`d9de26cb30ee248f1134710adb690d098eca0d29860722d9c31a9bae2852a857`,
+ciphertext root
+`0ad4175dea2dcc894c50be80c7572c5f4182ce7899f3bf272e5b8e719e9cd3d5`,
+`Direct`, and one receiver publication. Receiver occupancy peaked at four
+items, 4,194,840 bytes, and two reorder entries.
+
+An exact 1-GiB attempt was then terminated after the receiver had retained
+652 MiB of provisional state. Fresh processes reopened that authority and
+both accepted wire offset `671174400`; only the remaining 402,704,640 bytes
+(384 segments, three checkpoints) crossed the network. The resumed attempt
+ran at 7.809/7.811 MiB/s, reproduced both final roots, and exposed exactly one
+publication.
+
+Two simultaneous 256-MiB sources (`rpi4-2` and `rpi4-3`) then sent to separate
+listeners on `rpi4-1`. Both completed with identical roots and one publication
+each. Per-flow receive rates were 4.177 and 4.467 MiB/s, a 1.07 fairness ratio,
+while aggregate goodput was 8.644 MiB/s. Each receive pipeline remained bounded
+to three items and 3,146,130 bytes.
+
+Finally, the exact `asterctl` and acceptance-fixture artifacts exercised the
+public loopback API on every CM4: 64-MiB `blob-publish`, `blob-status --wait`,
+and `blob-read`. All three status calls reached
+`BLOB_PUBLICATION_PHASE_AVAILABLE`; publication and Blob identities matched,
+and every read reproduced SHA-256
+`281e519df3077b557c6b03f5da83c4e8d397219259615dd7c3308f89cae8f2a6`.
+
+| Device | Publish | Read |
+| --- | ---: | ---: |
+| `rpi4-1` | 10.891 MiB/s | 9.268 MiB/s |
+| `rpi4-2` | 11.718 MiB/s | 9.572 MiB/s |
+| `rpi4-3` | 11.742 MiB/s | 9.927 MiB/s |
+
+Large SSH output over the ZeroTier management path stalled again during CLI
+help inspection. Keeping the 1,752-byte help output on-device showed exit code
+zero, the same SHA-256 on all devices, and all three Blob commands. This is the
+previously recorded management-path MTU symptom, not an Aster CLI stall. Aster
+payload endpoints remained explicitly bound to WLAN throughout network tests.
+
+The upstream PR checks for this exact signed head completed successfully:
+lockfiles, clippy, both Rust test shards, Rust 1.91 MSRV, dependency policy,
+age interoperability, bounded fuzz smoke, macOS compatibility, quality, both
+path-lab jobs, and the required aggregate check.
+
 ## Qualification boundary
 
 This evidence establishes that:
@@ -316,6 +397,8 @@ This evidence establishes that:
 - the public application Blob stream publishes and reads an exact 1 GiB on all three CM4s above the retained raw WLAN rate with bounded memory; and
 - the previous 1.5 MiB/s serial processing path is no longer the limiting design.
 
-It does not yet qualify production deployment. Three-device fused-path fairness
-after the rpi4-3 connectivity issue is resolved and CI/full-matrix evidence
-remain open.
+It does not qualify production deployment: this branch is still a draft, the
+device configuration/network remediation is intentionally separate, and
+download resume remains follow-up work. The signed-head implementation itself
+now has current three-device local/API evidence, direct-WLAN 1-GiB and durable
+resume evidence, concurrent-source contention evidence, and green upstream CI.
