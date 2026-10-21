@@ -1,8 +1,9 @@
 //! Sequential encrypted stream pack with alternating durable checkpoints.
 
 use aster_mesh::{
-    BlobPublicationStreamId, BlobStreamCheckpoint, BlobStreamFrontier, BlobStreamOpen,
-    BlobStreamSegmentLeaves, BlobStreamSubtree, EncryptedBlobStreamSegment,
+    BLOB_STREAM_SEGMENT_BYTES, BLOB_STREAM_SEGMENT_ENCODED_OVERHEAD_BYTES, BlobPublicationStreamId,
+    BlobStreamCheckpoint, BlobStreamFrontier, BlobStreamOpen, BlobStreamSegmentLeaves,
+    BlobStreamSubtree, EncryptedBlobStreamSegment,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -24,6 +25,21 @@ const CHECKPOINT_ZERO: &str = "checkpoint.0";
 const CHECKPOINT_ONE: &str = "checkpoint.1";
 const PACK_HEADER_LEN: u64 = 8 + 2 + 32 + 32 + 8;
 const MAX_RECORD_BYTES: usize = 2 * 1024 * 1024;
+const PACK_FIXED_RESERVATION_BYTES: u64 = 64 * 1024;
+
+pub(crate) fn reserved_upload_pack_bytes(total_len: u64) -> Result<u64, StoreError> {
+    let segments = total_len
+        .checked_add(BLOB_STREAM_SEGMENT_BYTES as u64 - 1)
+        .ok_or(StoreError::PayloadByteAccountingOverflow)?
+        / BLOB_STREAM_SEGMENT_BYTES as u64;
+    let overhead = segments
+        .checked_mul(BLOB_STREAM_SEGMENT_ENCODED_OVERHEAD_BYTES as u64 + 4)
+        .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+    total_len
+        .checked_add(overhead)
+        .and_then(|value| value.checked_add(PACK_FIXED_RESERVATION_BYTES))
+        .ok_or(StoreError::PayloadByteAccountingOverflow)
+}
 
 #[derive(Debug)]
 pub enum BlobPackError {
@@ -70,11 +86,19 @@ impl PinnedBlobPackRoot {
         })
     }
 
-    fn stream(&self, open: &BlobStreamOpen, create: bool) -> Result<BlobPackRoot, BlobPackError> {
+    fn stream_id(
+        &self,
+        stream_id: BlobPublicationStreamId,
+        create: bool,
+    ) -> Result<BlobPackRoot, BlobPackError> {
         Ok(BlobPackRoot::Pinned(self.directory.open_child_directory(
-            &hex32(open.stream_id().as_bytes()),
+            &hex32(stream_id.as_bytes()),
             create,
         )?))
+    }
+
+    fn stream(&self, open: &BlobStreamOpen, create: bool) -> Result<BlobPackRoot, BlobPackError> {
+        self.stream_id(open.stream_id(), create)
     }
 }
 
@@ -138,6 +162,32 @@ impl BlobPackRoot {
     }
 }
 
+/// Non-semantic identity for one node-protected provisional Blob upload pack.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlobPackIdentity {
+    upload_id: BlobPublicationStreamId,
+    request_digest: [u8; 32],
+    total_len: u64,
+}
+
+impl BlobPackIdentity {
+    pub(crate) const fn new(
+        upload_id: BlobPublicationStreamId,
+        request_digest: [u8; 32],
+        total_len: u64,
+    ) -> Self {
+        Self {
+            upload_id,
+            request_digest,
+            total_len,
+        }
+    }
+
+    fn from_stream(open: &BlobStreamOpen) -> Self {
+        Self::new(open.stream_id(), open.digest(), open.total_len())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BlobPackCheckpoint {
     generation: u64,
@@ -174,7 +224,17 @@ impl BlobPackCheckpoint {
         &self.open_digest
     }
 
+    /// Exact immutable provisional-upload request digest.
+    pub const fn request_digest(&self) -> &[u8; 32] {
+        &self.open_digest
+    }
+
     pub const fn stream_id(&self) -> BlobPublicationStreamId {
+        self.stream_id
+    }
+
+    /// Opaque node-local provisional-upload identity.
+    pub const fn upload_id(&self) -> BlobPublicationStreamId {
         self.stream_id
     }
 
@@ -230,7 +290,6 @@ impl BlobPackCheckpoint {
         reader.finish()?;
         if generation == 0
             || open_digest == [0; 32]
-            || total_len == 0
             || plaintext_offset > total_len
             || pack_len < PACK_HEADER_LEN
             || frontier.next_index() != next_index
@@ -275,31 +334,45 @@ impl BlobPackWriter {
 
     pub fn create(root: &Path, open: &BlobStreamOpen) -> Result<Self, BlobPackError> {
         fs::create_dir_all(root)?;
-        Self::create_in(BlobPackRoot::Path(root.to_owned()), open)
+        Self::create_in(
+            BlobPackRoot::Path(root.to_owned()),
+            BlobPackIdentity::from_stream(open),
+        )
     }
 
     pub fn create_pinned(
         root: &PinnedBlobPackRoot,
         open: &BlobStreamOpen,
     ) -> Result<Self, BlobPackError> {
-        Self::create_in(root.stream(open, true)?, open)
+        Self::create_in(
+            root.stream(open, true)?,
+            BlobPackIdentity::from_stream(open),
+        )
     }
 
-    fn create_in(root: BlobPackRoot, open: &BlobStreamOpen) -> Result<Self, BlobPackError> {
+    /// Creates a node-protected pack for a provisional application upload.
+    pub fn create_upload_pinned(
+        root: &PinnedBlobPackRoot,
+        identity: &BlobPackIdentity,
+    ) -> Result<Self, BlobPackError> {
+        Self::create_in(root.stream_id(identity.upload_id, true)?, *identity)
+    }
+
+    fn create_in(root: BlobPackRoot, identity: BlobPackIdentity) -> Result<Self, BlobPackError> {
         let mut data = root.open_data(true)?;
-        let open_digest = open.digest();
+        let open_digest = identity.request_digest;
         data.write_all(PACK_MAGIC)?;
         data.write_all(&PACK_VERSION.to_be_bytes())?;
         data.write_all(&open_digest)?;
-        data.write_all(open.stream_id().as_bytes())?;
-        data.write_all(&open.total_len().to_be_bytes())?;
+        data.write_all(identity.upload_id.as_bytes())?;
+        data.write_all(&identity.total_len.to_be_bytes())?;
         data.sync_all()?;
         let mut writer = Self {
             root,
             data,
             open_digest,
-            stream_id: open.stream_id(),
-            total_len: open.total_len(),
+            stream_id: identity.upload_id,
+            total_len: identity.total_len,
             next_index: 0,
             plaintext_offset: 0,
             pack_len: PACK_HEADER_LEN,
@@ -311,21 +384,27 @@ impl BlobPackWriter {
     }
 
     pub fn resume(root: &Path, open: &BlobStreamOpen) -> Result<Self, BlobPackError> {
-        Self::resume_in(BlobPackRoot::Path(root.to_owned()), open)
+        Self::resume_in(
+            BlobPackRoot::Path(root.to_owned()),
+            BlobPackIdentity::from_stream(open),
+        )
     }
 
     pub fn resume_pinned(
         root: &PinnedBlobPackRoot,
         open: &BlobStreamOpen,
     ) -> Result<Self, BlobPackError> {
-        Self::resume_in(root.stream(open, false)?, open)
+        Self::resume_in(
+            root.stream(open, false)?,
+            BlobPackIdentity::from_stream(open),
+        )
     }
 
-    fn resume_in(root: BlobPackRoot, open: &BlobStreamOpen) -> Result<Self, BlobPackError> {
+    fn resume_in(root: BlobPackRoot, identity: BlobPackIdentity) -> Result<Self, BlobPackError> {
         let mut data = root.open_data(false)?;
-        validate_header(&mut data, open)?;
-        let checkpoint = recover_checkpoint(&root, open, data.metadata()?.len())?;
-        Self::restore(root, open, data, checkpoint)
+        validate_header(&mut data, identity)?;
+        let checkpoint = recover_checkpoint(&root, identity, data.metadata()?.len())?;
+        Self::restore(root, identity, data, checkpoint)
     }
 
     /// Opens the pack at the exact checkpoint already projected into the store.
@@ -345,7 +424,7 @@ impl BlobPackWriter {
     ) -> Result<Self, BlobPackError> {
         Self::open_projected_in(
             BlobPackRoot::Path(root.to_owned()),
-            open,
+            BlobPackIdentity::from_stream(open),
             generation,
             next_index,
             plaintext_offset,
@@ -366,7 +445,36 @@ impl BlobPackWriter {
         let root = root.stream(open, generation == 0)?;
         Self::open_projected_in(
             root,
-            open,
+            BlobPackIdentity::from_stream(open),
+            generation,
+            next_index,
+            plaintext_offset,
+            pack_len,
+            payload_len,
+        )
+    }
+
+    /// Reopens a provisional upload at exactly the checkpoint already
+    /// projected into redb, discarding any later unprojected pack tail.
+    pub fn open_projected_upload_pinned(
+        root: &PinnedBlobPackRoot,
+        identity: &BlobPackIdentity,
+        projected: Option<&BlobPackCheckpoint>,
+    ) -> Result<Self, BlobPackError> {
+        let root = root.stream_id(identity.upload_id, projected.is_none())?;
+        let (generation, next_index, plaintext_offset, pack_len, payload_len) =
+            projected.map_or((0, 0, 0, 0, 0), |checkpoint| {
+                (
+                    checkpoint.generation(),
+                    checkpoint.next_index(),
+                    checkpoint.plaintext_offset(),
+                    checkpoint.pack_len(),
+                    checkpoint.payload_len(),
+                )
+            });
+        Self::open_projected_in(
+            root,
+            *identity,
             generation,
             next_index,
             plaintext_offset,
@@ -377,7 +485,7 @@ impl BlobPackWriter {
 
     fn open_projected_in(
         root: BlobPackRoot,
-        open: &BlobStreamOpen,
+        identity: BlobPackIdentity,
         generation: u64,
         next_index: u64,
         plaintext_offset: u64,
@@ -392,13 +500,13 @@ impl BlobPackWriter {
                         "non-empty Blob projection has zero generation",
                     ));
                 }
-                return Self::create_in(root, open);
+                return Self::create_in(root, identity);
             }
             None => return Err(BlobPackError::Invalid("Blob pack data is unavailable")),
         };
-        validate_header(&mut data, open)?;
+        validate_header(&mut data, identity)?;
         let data_len = data.metadata()?.len();
-        let checkpoint = recover_checkpoints(&root, open, data_len)?
+        let checkpoint = recover_checkpoints(&root, identity, data_len)?
             .into_iter()
             .filter(|checkpoint| {
                 if generation == 0 {
@@ -417,12 +525,12 @@ impl BlobPackWriter {
             .ok_or(BlobPackError::Invalid(
                 "store-projected Blob pack checkpoint is unavailable",
             ))?;
-        Self::restore(root, open, data, checkpoint)
+        Self::restore(root, identity, data, checkpoint)
     }
 
     fn restore(
         root: BlobPackRoot,
-        open: &BlobStreamOpen,
+        identity: BlobPackIdentity,
         mut data: File,
         checkpoint: BlobPackCheckpoint,
     ) -> Result<Self, BlobPackError> {
@@ -432,9 +540,9 @@ impl BlobPackWriter {
         Ok(Self {
             root,
             data,
-            open_digest: open.digest(),
-            stream_id: open.stream_id(),
-            total_len: open.total_len(),
+            open_digest: identity.request_digest,
+            stream_id: identity.upload_id,
+            total_len: identity.total_len,
             next_index: checkpoint.next_index,
             plaintext_offset: checkpoint.plaintext_offset,
             pack_len: checkpoint.pack_len,
@@ -574,11 +682,12 @@ impl BlobPackReader {
     }
 
     fn open_in(root: BlobPackRoot, open: &BlobStreamOpen) -> Result<Self, BlobPackError> {
+        let identity = BlobPackIdentity::from_stream(open);
         let mut data = root
             .open_existing_data()?
             .ok_or(BlobPackError::Invalid("Blob pack data is unavailable"))?;
-        validate_header(&mut data, open)?;
-        let checkpoint = recover_checkpoint(&root, open, data.metadata()?.len())?;
+        validate_header(&mut data, identity)?;
+        let checkpoint = recover_checkpoint(&root, identity, data.metadata()?.len())?;
         data.seek(SeekFrom::Start(PACK_HEADER_LEN))?;
         Ok(Self {
             data,
@@ -675,15 +784,15 @@ impl BlobPackReader {
     }
 }
 
-fn validate_header(data: &mut File, open: &BlobStreamOpen) -> Result<(), BlobPackError> {
+fn validate_header(data: &mut File, identity: BlobPackIdentity) -> Result<(), BlobPackError> {
     data.seek(SeekFrom::Start(0))?;
     let mut header = [0; PACK_HEADER_LEN as usize];
     data.read_exact(&mut header)?;
     if &header[..8] != PACK_MAGIC
         || u16::from_be_bytes(header[8..10].try_into().expect("version")) != PACK_VERSION
-        || header[10..42] != open.digest()
-        || header[42..74] != *open.stream_id().as_bytes()
-        || u64::from_be_bytes(header[74..82].try_into().expect("length")) != open.total_len()
+        || header[10..42] != identity.request_digest
+        || header[42..74] != *identity.upload_id.as_bytes()
+        || u64::from_be_bytes(header[74..82].try_into().expect("length")) != identity.total_len
     {
         return Err(BlobPackError::Invalid("Blob pack header identity mismatch"));
     }
@@ -692,10 +801,10 @@ fn validate_header(data: &mut File, open: &BlobStreamOpen) -> Result<(), BlobPac
 
 fn recover_checkpoint(
     root: &BlobPackRoot,
-    open: &BlobStreamOpen,
+    identity: BlobPackIdentity,
     data_len: u64,
 ) -> Result<BlobPackCheckpoint, BlobPackError> {
-    recover_checkpoints(root, open, data_len)?
+    recover_checkpoints(root, identity, data_len)?
         .into_iter()
         .max_by_key(|checkpoint| checkpoint.generation)
         .ok_or(BlobPackError::Invalid("no valid Blob pack checkpoint"))
@@ -703,7 +812,7 @@ fn recover_checkpoint(
 
 fn recover_checkpoints(
     root: &BlobPackRoot,
-    open: &BlobStreamOpen,
+    identity: BlobPackIdentity,
     data_len: u64,
 ) -> Result<Vec<BlobPackCheckpoint>, BlobPackError> {
     let mut valid = Vec::new();
@@ -714,9 +823,9 @@ fn recover_checkpoints(
         let Ok(checkpoint) = BlobPackCheckpoint::decode(&bytes) else {
             continue;
         };
-        if checkpoint.open_digest == open.digest()
-            && checkpoint.stream_id == open.stream_id()
-            && checkpoint.total_len == open.total_len()
+        if checkpoint.open_digest == identity.request_digest
+            && checkpoint.stream_id == identity.upload_id
+            && checkpoint.total_len == identity.total_len
             && checkpoint.pack_len <= data_len
         {
             valid.push(checkpoint);

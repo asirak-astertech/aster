@@ -676,6 +676,7 @@ pub struct BlobDepot<'a> {
     root: OwnedDirectory,
     active: Option<ActiveImport>,
     read_authorized_variant: Option<BlobVariantId>,
+    upload_credit: Option<super::upload::BlobUploadCreditClaim>,
 }
 
 /// Capability-gated, mutation-incapable adapter for one finalized Blob variant.
@@ -949,6 +950,7 @@ impl<'a> BlobDepot<'a> {
             root,
             active: None,
             read_authorized_variant: None,
+            upload_credit: None,
         })
     }
 
@@ -999,7 +1001,18 @@ impl<'a> BlobDepot<'a> {
             root,
             active: None,
             read_authorized_variant: None,
+            upload_credit: None,
         })
+    }
+
+    pub(super) fn open_upload_mutation(
+        store: &'a Store,
+        reservation: &super::upload::BlobUploadReservation,
+    ) -> Result<Self, StoreError> {
+        let claim = super::upload::upload_credit_claim(store, reservation)?;
+        let mut depot = Self::open_network_mutation(store, true)?;
+        depot.upload_credit = Some(claim);
+        Ok(depot)
     }
 
     /// Opens an exact finalized variant for a capability-authorized read
@@ -1088,6 +1101,7 @@ impl<'a> BlobDepot<'a> {
             root,
             active: None,
             read_authorized_variant: Some(completion.variant_id),
+            upload_credit: None,
         };
         let import = depot.exact_completion_import(&read, completion)?;
         super::deletion::require_variant_available_read(&read, completion.variant_id)?;
@@ -1341,12 +1355,7 @@ impl<'a> BlobDepot<'a> {
             .map(|value| decode_chunk_state(value.value()))
             .transpose()?;
         let admission_usage = depot_admission_usage_write(&write)?;
-        if existing.is_none() && admission_usage.chunks >= self.store.blob_depot_limits.max_chunks {
-            return Err(blob_error(BlobStoreError::DepotChunkLimitExceeded {
-                current: admission_usage.chunks,
-                limit: self.store.blob_depot_limits.max_chunks,
-            }));
-        }
+        let incoming_chunk = u64::from(existing.is_none());
         let previous = existing.unwrap_or_default();
         let next = mutation(previous)?;
         let previous_reserved = previous
@@ -1355,6 +1364,42 @@ impl<'a> BlobDepot<'a> {
             .transpose()?
             .unwrap_or(0);
         let next_reserved = next.expected.map(chunk_file_len).transpose()?.unwrap_or(0);
+        let incoming_bytes = next_reserved
+            .checked_sub(previous_reserved)
+            .ok_or_else(|| {
+                blob_error(BlobStoreError::SchemaInvariant(
+                    "Blob depot mutation unexpectedly releases reserved bytes",
+                ))
+            })?;
+        let consumed = if let Some(claim) = self.upload_credit.as_ref() {
+            let consume = super::upload::BlobUploadCapacity {
+                bytes: incoming_bytes,
+                chunks: incoming_chunk,
+                variants: 0,
+            };
+            super::upload::bind_and_consume_upload_credit_write(
+                &write,
+                self.store,
+                claim,
+                active.variant_id,
+                None,
+                consume,
+            )?;
+            consume
+        } else {
+            super::upload::BlobUploadCapacity::default()
+        };
+        let updated_chunks = admission_usage
+            .chunks
+            .checked_sub(consumed.chunks)
+            .and_then(|value| value.checked_add(incoming_chunk))
+            .ok_or(StoreError::ItemCountAccountingOverflow)?;
+        if updated_chunks > self.store.blob_depot_limits.max_chunks {
+            return Err(blob_error(BlobStoreError::DepotChunkLimitExceeded {
+                current: admission_usage.chunks,
+                limit: self.store.blob_depot_limits.max_chunks,
+            }));
+        }
         if previous_reserved != next_reserved {
             let mut depot = write.open_table(BLOB_DEPOT_METADATA)?;
             let durable_reserved = depot
@@ -1378,8 +1423,8 @@ impl<'a> BlobDepot<'a> {
                 .ok_or(StoreError::PayloadByteAccountingOverflow)?;
             let updated_admission = admission_usage
                 .reserved_bytes
-                .checked_sub(previous_reserved)
-                .and_then(|value| value.checked_add(next_reserved))
+                .checked_sub(consumed.bytes)
+                .and_then(|value| value.checked_add(incoming_bytes))
                 .ok_or_else(|| {
                     blob_error(BlobStoreError::SchemaInvariant(
                         "Blob depot admission-byte counter cannot cover its active chunk",
@@ -1388,7 +1433,7 @@ impl<'a> BlobDepot<'a> {
             if updated_admission > self.store.blob_depot_limits.max_bytes {
                 return Err(blob_error(BlobStoreError::DepotByteLimitExceeded {
                     current: admission_usage.reserved_bytes,
-                    incoming: next_reserved.saturating_sub(previous_reserved),
+                    incoming: incoming_bytes,
                     limit: self.store.blob_depot_limits.max_bytes,
                 }));
             }
@@ -1457,6 +1502,16 @@ impl<'a> BlobDepot<'a> {
                 ));
             }
             Some(_) => {
+                if let Some(claim) = self.upload_credit.as_ref() {
+                    super::upload::bind_and_consume_upload_credit_write(
+                        &write,
+                        self.store,
+                        claim,
+                        incoming.variant_id,
+                        Some(manifest),
+                        super::upload::BlobUploadCapacity::default(),
+                    )?;
+                }
                 if let (Some(physical_lineage), Some(owner_binding)) =
                     (incoming.physical_lineage, owner_binding)
                 {
@@ -1469,10 +1524,33 @@ impl<'a> BlobDepot<'a> {
                 }
             }
             None => {
-                let current = depot_admission_usage_write(&write)?.variants;
-                if current >= self.store.blob_depot_limits.max_variants {
+                let usage = depot_admission_usage_write(&write)?;
+                let consumed = if let Some(claim) = self.upload_credit.as_ref() {
+                    let consume = super::upload::BlobUploadCapacity {
+                        bytes: 0,
+                        chunks: 0,
+                        variants: 1,
+                    };
+                    super::upload::bind_and_consume_upload_credit_write(
+                        &write,
+                        self.store,
+                        claim,
+                        incoming.variant_id,
+                        Some(manifest),
+                        consume,
+                    )?;
+                    consume
+                } else {
+                    super::upload::BlobUploadCapacity::default()
+                };
+                let updated = usage
+                    .variants
+                    .checked_sub(consumed.variants)
+                    .and_then(|value| value.checked_add(1))
+                    .ok_or(StoreError::ItemCountAccountingOverflow)?;
+                if updated > self.store.blob_depot_limits.max_variants {
                     return Err(blob_error(BlobStoreError::DepotVariantLimitExceeded {
-                        current,
+                        current: usage.variants,
                         limit: self.store.blob_depot_limits.max_variants,
                     }));
                 }
@@ -2278,6 +2356,50 @@ pub(super) struct DepotAdmissionUsage {
     pub(super) reserved_bytes: u64,
 }
 
+pub(super) fn blob_upload_capacity(
+    total_len: u64,
+) -> Result<super::upload::BlobUploadCapacity, StoreError> {
+    let chunks = if total_len == 0 {
+        0
+    } else {
+        total_len
+            .checked_add(u64::from(super::SELECTED_BLOB_CHUNK_SIZE) - 1)
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?
+            / u64::from(super::SELECTED_BLOB_CHUNK_SIZE)
+    };
+    if chunks > super::MAX_SELECTED_BLOB_CHUNKS {
+        return Err(blob_error(BlobStoreError::InvalidPublication(
+            "Blob upload exceeds the selected manifest chunk bound",
+        )));
+    }
+    let conversion_overhead = chunks
+        .checked_mul(
+            CHUNK_FILE_HEADER_BYTES
+                .checked_add(u64::from(BLOB_CHUNK_TAG_BYTES))
+                .ok_or(StoreError::PayloadByteAccountingOverflow)?,
+        )
+        .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+    let staging = super::pack::reserved_upload_pack_bytes(total_len)?;
+    Ok(super::upload::BlobUploadCapacity {
+        bytes: staging
+            .checked_add(conversion_overhead)
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?,
+        chunks,
+        variants: 1,
+    })
+}
+
+pub(super) fn blob_upload_staging_charge(total_len: u64) -> Result<u64, StoreError> {
+    super::pack::reserved_upload_pack_bytes(total_len)
+}
+
+pub(super) fn blob_upload_conversion_overhead(total_len: u64) -> Result<u64, StoreError> {
+    let total = blob_upload_capacity(total_len)?.bytes;
+    total
+        .checked_sub(blob_upload_staging_charge(total_len)?)
+        .ok_or(StoreError::PayloadByteAccountingOverflow)
+}
+
 /// Capacity admission retains every physical resource through resumable
 /// unlink and deletion-manifest finalization.
 pub(super) fn depot_admission_usage_write(
@@ -2303,12 +2425,18 @@ pub(super) fn depot_admission_usage_write(
                 "Blob deletion chunk-row counter is missing",
             ))
         })?;
+    let upload = super::upload::upload_capacity_usage_write(write)?;
     Ok(DepotAdmissionUsage {
-        variants: imports,
+        variants: imports
+            .checked_add(upload.variants)
+            .ok_or(StoreError::ItemCountAccountingOverflow)?,
         chunks: active_chunks
             .checked_add(deletion_chunks)
+            .and_then(|value| value.checked_add(upload.chunks))
             .ok_or(StoreError::ItemCountAccountingOverflow)?,
-        reserved_bytes,
+        reserved_bytes: reserved_bytes
+            .checked_add(upload.bytes)
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?,
     })
 }
 
@@ -2335,12 +2463,18 @@ pub(super) fn depot_admission_usage_read(
                 "Blob deletion chunk-row counter is missing",
             ))
         })?;
+    let upload = super::upload::upload_capacity_usage_read(read)?;
     Ok(DepotAdmissionUsage {
-        variants: imports,
+        variants: imports
+            .checked_add(upload.variants)
+            .ok_or(StoreError::ItemCountAccountingOverflow)?,
         chunks: active_chunks
             .checked_add(deletion_chunks)
+            .and_then(|value| value.checked_add(upload.chunks))
             .ok_or(StoreError::ItemCountAccountingOverflow)?,
-        reserved_bytes,
+        reserved_bytes: reserved_bytes
+            .checked_add(upload.bytes)
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?,
     })
 }
 

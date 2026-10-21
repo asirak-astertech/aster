@@ -1,0 +1,1476 @@
+//! Durable provisional application-Blob upload authority.
+
+use super::pack::{BlobPackCheckpoint, BlobPackIdentity};
+use super::{
+    BLOB_OPERATIONS, BLOB_PUBLICATIONS, BlobOperationOwner, BlobStoreError, BlobTransferId, Store,
+    blob_error, blob_operation_owner_key, decode_blob_metadata, decode_blob_operation_record,
+    synchronize_blob_policy_generation_write,
+};
+use crate::{
+    CONTROL_SCOPE_EPOCHS, ControlPolicySnapshot, Priority, Scope, StoreError, Topic,
+    control_principal_revoked_write, decode_scope_epoch_index, enforce_live_write,
+    require_control_policy_write,
+};
+use aster_mesh::{BlobManifest, BlobMetadata, BlobPublicationStreamId, NodeId};
+use redb::{Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata};
+use sha2::{Digest, Sha256};
+use std::sync::Arc;
+
+const UPLOAD_MAGIC: &[u8; 8] = b"ASTRUP01";
+const UPLOAD_VERSION: u8 = 1;
+const UPLOAD_ID_DOMAIN: &[u8] = b"aster/blob-upload-id/v1\0";
+const UPLOAD_REQUEST_DOMAIN: &[u8] = b"aster/blob-upload-request/v1\0";
+const MAX_UPLOADS: u64 = super::MAX_BLOB_OPERATIONS;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlobUploadRequest {
+    pub owner: BlobOperationOwner,
+    pub topic: Topic,
+    pub scope: Scope,
+    pub priority: Priority,
+    pub ttl_ms: Option<u64>,
+    pub media_type: Option<String>,
+    pub schema_id: Vec<u8>,
+    pub total_len: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct BlobUploadCapacity {
+    pub(super) bytes: u64,
+    pub(super) chunks: u64,
+    pub(super) variants: u64,
+}
+
+impl BlobUploadCapacity {
+    fn checked_add(self, other: Self) -> Result<Self, StoreError> {
+        Ok(Self {
+            bytes: self
+                .bytes
+                .checked_add(other.bytes)
+                .ok_or(StoreError::PayloadByteAccountingOverflow)?,
+            chunks: self
+                .chunks
+                .checked_add(other.chunks)
+                .ok_or(StoreError::ItemCountAccountingOverflow)?,
+            variants: self
+                .variants
+                .checked_add(other.variants)
+                .ok_or(StoreError::ItemCountAccountingOverflow)?,
+        })
+    }
+
+    fn checked_sub(self, other: Self) -> Result<Self, StoreError> {
+        Ok(Self {
+            bytes: self
+                .bytes
+                .checked_sub(other.bytes)
+                .ok_or_else(schema_error)?,
+            chunks: self
+                .chunks
+                .checked_sub(other.chunks)
+                .ok_or_else(schema_error)?,
+            variants: self
+                .variants
+                .checked_sub(other.variants)
+                .ok_or_else(schema_error)?,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct BlobUploadReservation {
+    request: BlobUploadRequest,
+    control_policy: ControlPolicySnapshot,
+    content_epoch: u64,
+    request_digest: [u8; 32],
+    upload_id: BlobPublicationStreamId,
+    staging_charge_bytes: u64,
+    conversion_overhead_bytes: u64,
+    total_capacity: BlobUploadCapacity,
+    authority: Arc<()>,
+}
+
+impl PartialEq for BlobUploadReservation {
+    fn eq(&self, other: &Self) -> bool {
+        self.request == other.request
+            && self.control_policy == other.control_policy
+            && self.content_epoch == other.content_epoch
+            && self.request_digest == other.request_digest
+            && self.upload_id == other.upload_id
+            && self.staging_charge_bytes == other.staging_charge_bytes
+            && self.conversion_overhead_bytes == other.conversion_overhead_bytes
+            && self.total_capacity == other.total_capacity
+    }
+}
+
+impl Eq for BlobUploadReservation {}
+
+impl BlobUploadReservation {
+    pub const fn request(&self) -> &BlobUploadRequest {
+        &self.request
+    }
+
+    pub const fn control_policy(&self) -> &ControlPolicySnapshot {
+        &self.control_policy
+    }
+
+    pub const fn content_epoch(&self) -> u64 {
+        self.content_epoch
+    }
+
+    pub const fn staging_charge_bytes(&self) -> u64 {
+        self.staging_charge_bytes
+    }
+
+    pub const fn conversion_overhead_bytes(&self) -> u64 {
+        self.conversion_overhead_bytes
+    }
+
+    pub const fn reserved_bytes(&self) -> u64 {
+        self.total_capacity.bytes
+    }
+
+    pub const fn reserved_chunks(&self) -> u64 {
+        self.total_capacity.chunks
+    }
+
+    pub const fn reserved_variants(&self) -> u64 {
+        self.total_capacity.variants
+    }
+
+    pub const fn pack_identity(&self) -> BlobPackIdentity {
+        BlobPackIdentity::new(self.upload_id, self.request_digest, self.request.total_len)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlobUploadCheckpoint {
+    durable: Option<BlobPackCheckpoint>,
+    consumed: BlobUploadCapacity,
+    remaining: BlobUploadCapacity,
+}
+
+impl BlobUploadCheckpoint {
+    /// Exact pack journal state projected durably into redb, if any.
+    pub const fn durable_pack_checkpoint(&self) -> Option<&BlobPackCheckpoint> {
+        self.durable.as_ref()
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.durable
+            .as_ref()
+            .map_or(0, BlobPackCheckpoint::generation)
+    }
+
+    pub fn durable_pack_len(&self) -> u64 {
+        self.durable
+            .as_ref()
+            .map_or(0, BlobPackCheckpoint::pack_len)
+    }
+
+    pub fn durable_plaintext_offset(&self) -> u64 {
+        self.durable
+            .as_ref()
+            .map_or(0, BlobPackCheckpoint::plaintext_offset)
+    }
+
+    pub const fn credit_consumed_bytes(&self) -> u64 {
+        self.consumed.bytes
+    }
+
+    pub const fn credit_consumed_chunks(&self) -> u64 {
+        self.consumed.chunks
+    }
+
+    pub const fn credit_consumed_variants(&self) -> u64 {
+        self.consumed.variants
+    }
+
+    pub const fn credit_remaining_bytes(&self) -> u64 {
+        self.remaining.bytes
+    }
+
+    pub const fn credit_remaining_chunks(&self) -> u64 {
+        self.remaining.chunks
+    }
+
+    pub const fn credit_remaining_variants(&self) -> u64 {
+        self.remaining.variants
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct BlobUploadCreditClaim {
+    owner_key: Vec<u8>,
+    request_digest: [u8; 32],
+}
+
+#[derive(Clone, Debug)]
+struct DurableBlobUpload {
+    reservation: BlobUploadReservation,
+    checkpoint: Option<BlobPackCheckpoint>,
+    consumed: BlobUploadCapacity,
+    bound_variant: Option<super::BlobVariantId>,
+}
+
+impl DurableBlobUpload {
+    fn remaining(&self) -> Result<BlobUploadCapacity, StoreError> {
+        self.reservation.total_capacity.checked_sub(self.consumed)
+    }
+
+    fn projection(&self) -> Result<BlobUploadCheckpoint, StoreError> {
+        Ok(BlobUploadCheckpoint {
+            durable: self.checkpoint.clone(),
+            consumed: self.consumed,
+            remaining: self.remaining()?,
+        })
+    }
+
+    fn encode(&self) -> Result<Vec<u8>, StoreError> {
+        let owner_key = blob_operation_owner_key(&self.reservation.request.owner)?;
+        let topic = self.reservation.request.topic.as_str().as_bytes();
+        let scope = self.reservation.request.scope.as_str().as_bytes();
+        let media = self
+            .reservation
+            .request
+            .media_type
+            .as_deref()
+            .map(str::as_bytes);
+        let checkpoint = self
+            .checkpoint
+            .as_ref()
+            .map(BlobPackCheckpoint::encode)
+            .unwrap_or_default();
+        let mut output = Vec::new();
+        output.extend_from_slice(UPLOAD_MAGIC);
+        output.push(UPLOAD_VERSION);
+        push_u16_bytes(&mut output, &owner_key)?;
+        output.extend_from_slice(&self.reservation.control_policy.authority());
+        match self.reservation.control_policy.head() {
+            None => output.push(0),
+            Some((revision, transfer)) => {
+                output.push(1);
+                output.extend_from_slice(&revision.to_be_bytes());
+                output.extend_from_slice(transfer.as_bytes());
+            }
+        }
+        output.extend_from_slice(&self.reservation.content_epoch.to_be_bytes());
+        output.push(self.reservation.request.priority as u8);
+        match self.reservation.request.ttl_ms {
+            None => output.push(0),
+            Some(ttl) => {
+                output.push(1);
+                output.extend_from_slice(&ttl.to_be_bytes());
+            }
+        }
+        push_u16_bytes(&mut output, topic)?;
+        push_u16_bytes(&mut output, scope)?;
+        match media {
+            None => output.extend_from_slice(&u16::MAX.to_be_bytes()),
+            Some(media) => push_u16_bytes(&mut output, media)?,
+        }
+        push_u16_bytes(&mut output, &self.reservation.request.schema_id)?;
+        output.extend_from_slice(&self.reservation.request.total_len.to_be_bytes());
+        output.extend_from_slice(&self.reservation.request_digest);
+        output.extend_from_slice(self.reservation.upload_id.as_bytes());
+        output.extend_from_slice(&self.reservation.staging_charge_bytes.to_be_bytes());
+        output.extend_from_slice(&self.reservation.conversion_overhead_bytes.to_be_bytes());
+        encode_capacity(&mut output, self.reservation.total_capacity);
+        encode_capacity(&mut output, self.consumed);
+        match self.bound_variant {
+            None => output.push(0),
+            Some(variant) => {
+                output.push(1);
+                output.extend_from_slice(variant.as_bytes());
+            }
+        }
+        let checkpoint_len = u32::try_from(checkpoint.len())
+            .map_err(|_| StoreError::PayloadByteAccountingOverflow)?;
+        output.extend_from_slice(&checkpoint_len.to_be_bytes());
+        output.extend_from_slice(&checkpoint);
+        Ok(output)
+    }
+
+    fn decode(authority_capability: Arc<()>, encoded: &[u8]) -> Result<Self, StoreError> {
+        let mut cursor = UploadCursor::new(encoded);
+        if cursor.take(8)? != UPLOAD_MAGIC || cursor.u8()? != UPLOAD_VERSION {
+            return Err(schema_error());
+        }
+        let owner_key = cursor.short()?.to_vec();
+        let owner = super::decode_blob_operation_owner_key(&owner_key)?;
+        let authority = cursor.array()?;
+        let head = match cursor.u8()? {
+            0 => None,
+            1 => Some((
+                cursor.u64()?,
+                crate::ControlTransferId::new(cursor.array()?),
+            )),
+            _ => return Err(schema_error()),
+        };
+        let control_policy = ControlPolicySnapshot { authority, head };
+        let content_epoch = cursor.u64()?;
+        let priority = Priority::from_wire(cursor.u8()?).ok_or_else(schema_error)?;
+        let ttl_ms = match cursor.u8()? {
+            0 => None,
+            1 => Some(cursor.u64()?),
+            _ => return Err(schema_error()),
+        };
+        let topic = Topic::new(std::str::from_utf8(cursor.short()?).map_err(|_| schema_error())?)
+            .map_err(|_| schema_error())?;
+        let scope = Scope::new(std::str::from_utf8(cursor.short()?).map_err(|_| schema_error())?)
+            .map_err(|_| schema_error())?;
+        let media_len = cursor.u16()?;
+        let media_type = if media_len == u16::MAX {
+            None
+        } else {
+            Some(
+                std::str::from_utf8(cursor.take(usize::from(media_len))?)
+                    .map_err(|_| schema_error())?
+                    .to_owned(),
+            )
+        };
+        let schema_id = cursor.short()?.to_vec();
+        let total_len = cursor.u64()?;
+        let request_digest = cursor.array()?;
+        let upload_id =
+            BlobPublicationStreamId::from_bytes(cursor.array()?).map_err(|_| schema_error())?;
+        let staging_charge_bytes = cursor.u64()?;
+        let conversion_overhead_bytes = cursor.u64()?;
+        let total_capacity = decode_capacity(&mut cursor)?;
+        let consumed = decode_capacity(&mut cursor)?;
+        let bound_variant = match cursor.u8()? {
+            0 => None,
+            1 => Some(super::BlobVariantId::from_bytes(cursor.array()?)),
+            _ => return Err(schema_error()),
+        };
+        let checkpoint_len = usize::try_from(cursor.u32()?).map_err(|_| schema_error())?;
+        let checkpoint = if checkpoint_len == 0 {
+            None
+        } else {
+            Some(
+                BlobPackCheckpoint::decode(cursor.take(checkpoint_len)?)
+                    .map_err(|_| schema_error())?,
+            )
+        };
+        cursor.finish()?;
+        let request = BlobUploadRequest {
+            owner,
+            topic,
+            scope,
+            priority,
+            ttl_ms,
+            media_type,
+            schema_id,
+            total_len,
+        };
+        validate_request(&request)?;
+        let expected_capacity = super::depot::blob_upload_capacity(total_len)?;
+        let expected_staging = super::depot::blob_upload_staging_charge(total_len)?;
+        let expected_conversion = super::depot::blob_upload_conversion_overhead(total_len)?;
+        if request_digest_for(&request)? != request_digest
+            || upload_id_for(&request.owner, request_digest)? != upload_id
+            || staging_charge_bytes != expected_staging
+            || conversion_overhead_bytes != expected_conversion
+            || total_capacity != expected_capacity
+            || consumed.checked_add(total_capacity.checked_sub(consumed)?)? != total_capacity
+            || checkpoint.as_ref().is_some_and(|checkpoint| {
+                checkpoint.upload_id() != upload_id
+                    || checkpoint.request_digest() != &request_digest
+                    || checkpoint.total_len() != total_len
+            })
+        {
+            return Err(schema_error());
+        }
+        Ok(Self {
+            reservation: BlobUploadReservation {
+                request,
+                control_policy,
+                content_epoch,
+                request_digest,
+                upload_id,
+                staging_charge_bytes,
+                conversion_overhead_bytes,
+                total_capacity,
+                authority: authority_capability,
+            },
+            checkpoint,
+            consumed,
+            bound_variant,
+        })
+    }
+}
+
+fn validate_request(request: &BlobUploadRequest) -> Result<(), StoreError> {
+    if request.total_len == 0 {
+        return Err(blob_error(BlobStoreError::InvalidPublication(
+            "Blob upload length must be positive",
+        )));
+    }
+    if request.ttl_ms == Some(0) {
+        return Err(blob_error(BlobStoreError::InvalidPublication(
+            "finite Blob TTL must be positive",
+        )));
+    }
+    BlobMetadata::new(request.media_type.clone(), request.schema_id.clone()).map_err(|_| {
+        blob_error(BlobStoreError::InvalidPublication(
+            "invalid Blob upload metadata",
+        ))
+    })?;
+    super::depot::blob_upload_capacity(request.total_len)?;
+    Ok(())
+}
+
+fn request_digest_for(request: &BlobUploadRequest) -> Result<[u8; 32], StoreError> {
+    let owner_key = blob_operation_owner_key(&request.owner)?;
+    let mut digest = Sha256::new();
+    digest.update(UPLOAD_REQUEST_DOMAIN);
+    digest.update((owner_key.len() as u64).to_be_bytes());
+    digest.update(&owner_key);
+    digest.update((request.topic.as_str().len() as u64).to_be_bytes());
+    digest.update(request.topic.as_str().as_bytes());
+    digest.update((request.scope.as_str().len() as u64).to_be_bytes());
+    digest.update(request.scope.as_str().as_bytes());
+    digest.update([request.priority as u8]);
+    match request.ttl_ms {
+        None => digest.update([0]),
+        Some(ttl) => {
+            digest.update([1]);
+            digest.update(ttl.to_be_bytes());
+        }
+    }
+    match request.media_type.as_deref() {
+        None => digest.update(u64::MAX.to_be_bytes()),
+        Some(media) => {
+            digest.update((media.len() as u64).to_be_bytes());
+            digest.update(media.as_bytes());
+        }
+    }
+    digest.update((request.schema_id.len() as u64).to_be_bytes());
+    digest.update(&request.schema_id);
+    digest.update(request.total_len.to_be_bytes());
+    Ok(digest.finalize().into())
+}
+
+fn upload_id_for(
+    owner: &BlobOperationOwner,
+    request_digest: [u8; 32],
+) -> Result<BlobPublicationStreamId, StoreError> {
+    let owner_key = blob_operation_owner_key(owner)?;
+    let mut digest = Sha256::new();
+    digest.update(UPLOAD_ID_DOMAIN);
+    digest.update((owner_key.len() as u64).to_be_bytes());
+    digest.update(owner_key);
+    digest.update(request_digest);
+    BlobPublicationStreamId::from_bytes(digest.finalize().into()).map_err(|_| schema_error())
+}
+
+fn current_scope_epoch_write(
+    write: &redb::WriteTransaction,
+    scope: &Scope,
+) -> Result<u64, StoreError> {
+    write
+        .open_table(CONTROL_SCOPE_EPOCHS)?
+        .get(scope.as_str())?
+        .map(|value| decode_scope_epoch_index(value.value()))
+        .transpose()
+        .map(|value| value.map_or(1, |(epoch, _)| epoch))
+}
+
+fn require_upload_policy_write(
+    write: &redb::WriteTransaction,
+    authority: NodeId,
+    policy: &ControlPolicySnapshot,
+    request: &BlobUploadRequest,
+    expected_epoch: Option<u64>,
+) -> Result<u64, StoreError> {
+    require_control_policy_write(write, authority, policy)?;
+    if request.owner.publisher == [0; 32] {
+        return Err(blob_error(BlobStoreError::InvalidPublication(
+            "Blob upload publisher is invalid",
+        )));
+    }
+    if control_principal_revoked_write(write, request.owner.publisher)? {
+        return Err(blob_error(BlobStoreError::PublisherRevoked(
+            request.owner.publisher,
+        )));
+    }
+    let epoch = current_scope_epoch_write(write, &request.scope)?;
+    if expected_epoch.is_some_and(|expected| expected != epoch) {
+        return Err(blob_error(BlobStoreError::KeyEpochStale {
+            current: epoch,
+            received: expected_epoch.expect("checked"),
+        }));
+    }
+    Ok(epoch)
+}
+
+fn reservation_for_store(store: &Store, upload: &DurableBlobUpload) -> BlobUploadReservation {
+    let mut reservation = upload.reservation.clone();
+    reservation.authority = Arc::clone(&store.blob_completion_authority);
+    reservation
+}
+
+fn validate_reservation_capability(
+    store: &Store,
+    reservation: &BlobUploadReservation,
+) -> Result<Vec<u8>, StoreError> {
+    if !Arc::ptr_eq(&reservation.authority, &store.blob_completion_authority) {
+        return Err(blob_error(BlobStoreError::ReservationChanged));
+    }
+    blob_operation_owner_key(&reservation.request.owner)
+}
+
+pub(super) fn upload_credit_claim(
+    store: &Store,
+    reservation: &BlobUploadReservation,
+) -> Result<BlobUploadCreditClaim, StoreError> {
+    Ok(BlobUploadCreditClaim {
+        owner_key: validate_reservation_capability(store, reservation)?,
+        request_digest: reservation.request_digest,
+    })
+}
+
+pub(super) fn upload_capacity_usage_write(
+    write: &redb::WriteTransaction,
+) -> Result<BlobUploadCapacity, StoreError> {
+    upload_capacity_usage_table(&write.open_table(super::BLOB_UPLOADS)?)
+}
+
+pub(super) fn upload_capacity_usage_read(
+    read: &redb::ReadTransaction,
+) -> Result<BlobUploadCapacity, StoreError> {
+    upload_capacity_usage_table(&read.open_table(super::BLOB_UPLOADS)?)
+}
+
+fn upload_capacity_usage_table(
+    uploads: &impl ReadableTable<&'static [u8], &'static [u8]>,
+) -> Result<BlobUploadCapacity, StoreError> {
+    let mut usage = BlobUploadCapacity::default();
+    for row in uploads.iter()? {
+        let (_, value) = row?;
+        usage = usage
+            .checked_add(DurableBlobUpload::decode(Arc::new(()), value.value())?.remaining()?)?;
+    }
+    Ok(usage)
+}
+
+pub(super) fn bind_and_consume_upload_credit_write(
+    write: &redb::WriteTransaction,
+    store: &Store,
+    claim: &BlobUploadCreditClaim,
+    variant: super::BlobVariantId,
+    manifest: Option<&BlobManifest>,
+    consume: BlobUploadCapacity,
+) -> Result<(), StoreError> {
+    let encoded = write
+        .open_table(super::BLOB_UPLOADS)?
+        .get(claim.owner_key.as_slice())?
+        .map(|value| value.value().to_vec())
+        .ok_or_else(|| blob_error(BlobStoreError::ReservationChanged))?;
+    let mut upload =
+        DurableBlobUpload::decode(Arc::clone(&store.blob_completion_authority), &encoded)?;
+    require_upload_policy_write(
+        write,
+        store.require_bound_mission()?,
+        &upload.reservation.control_policy,
+        &upload.reservation.request,
+        Some(upload.reservation.content_epoch),
+    )?;
+    if let Some(manifest) = manifest {
+        let expected_metadata = BlobMetadata::new(
+            upload.reservation.request.media_type.clone(),
+            upload.reservation.request.schema_id.clone(),
+        )
+        .map_err(|_| schema_error())?;
+        if manifest.total_len() != upload.reservation.request.total_len
+            || manifest.content_epoch() != upload.reservation.content_epoch
+            || manifest.metadata() != &expected_metadata
+        {
+            return Err(blob_error(BlobStoreError::ReservationChanged));
+        }
+    } else if upload.bound_variant.is_none() {
+        return Err(blob_error(BlobStoreError::ReservationChanged));
+    }
+    if upload.reservation.request_digest != claim.request_digest
+        || upload.bound_variant.is_some_and(|bound| bound != variant)
+        || upload.remaining()?.checked_sub(consume).is_err()
+    {
+        return Err(blob_error(BlobStoreError::ReservationChanged));
+    }
+    upload.bound_variant = Some(variant);
+    upload.consumed = upload.consumed.checked_add(consume)?;
+    write
+        .open_table(super::BLOB_UPLOADS)?
+        .insert(claim.owner_key.as_slice(), upload.encode()?.as_slice())?;
+    Ok(())
+}
+
+pub(super) fn audit_blob_uploads_write(write: &redb::WriteTransaction) -> Result<(), StoreError> {
+    let uploads = write.open_table(super::BLOB_UPLOADS)?;
+    if uploads.len()? > MAX_UPLOADS {
+        return Err(schema_error());
+    }
+    for row in uploads.iter()? {
+        let (key, value) = row?;
+        let upload = DurableBlobUpload::decode(Arc::new(()), value.value())?;
+        if key.value() != blob_operation_owner_key(&upload.reservation.request.owner)? {
+            return Err(schema_error());
+        }
+        if let Some(operation) = write.open_table(BLOB_OPERATIONS)?.get(key.value())? {
+            let operation = decode_blob_operation_record(operation.value())?;
+            let publication = write
+                .open_table(BLOB_PUBLICATIONS)?
+                .get(operation.transfer_id.as_bytes().as_slice())?
+                .map(|value| decode_blob_metadata(value.value()))
+                .transpose()?
+                .ok_or_else(schema_error)?;
+            if upload.bound_variant != Some(publication.variant_id) {
+                return Err(schema_error());
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn audit_blob_uploads_read(read: &redb::ReadTransaction) -> Result<(), StoreError> {
+    let uploads = read.open_table(super::BLOB_UPLOADS)?;
+    if uploads.len()? > MAX_UPLOADS {
+        return Err(schema_error());
+    }
+    for row in uploads.iter()? {
+        let (key, value) = row?;
+        let upload = DurableBlobUpload::decode(Arc::new(()), value.value())?;
+        if key.value() != blob_operation_owner_key(&upload.reservation.request.owner)? {
+            return Err(schema_error());
+        }
+        if let Some(operation) = read.open_table(BLOB_OPERATIONS)?.get(key.value())? {
+            let operation = decode_blob_operation_record(operation.value())?;
+            let publication = read
+                .open_table(BLOB_PUBLICATIONS)?
+                .get(operation.transfer_id.as_bytes().as_slice())?
+                .map(|value| decode_blob_metadata(value.value()))
+                .transpose()?
+                .ok_or_else(schema_error)?;
+            if upload.bound_variant != Some(publication.variant_id) {
+                return Err(schema_error());
+            }
+        }
+    }
+    Ok(())
+}
+
+impl Store {
+    pub fn reserve_blob_upload_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        request: &BlobUploadRequest,
+    ) -> Result<(BlobUploadReservation, BlobUploadCheckpoint), StoreError> {
+        self.require_live()?;
+        validate_request(request)?;
+        let authority = self.require_bound_mission()?;
+        if request.owner.publisher == [0; 32] {
+            return Err(blob_error(BlobStoreError::InvalidPublication(
+                "Blob upload publisher is invalid",
+            )));
+        }
+        let owner_key = blob_operation_owner_key(&request.owner)?;
+        let request_digest = request_digest_for(request)?;
+        let total_capacity = super::depot::blob_upload_capacity(request.total_len)?;
+        let staging_charge_bytes = super::depot::blob_upload_staging_charge(request.total_len)?;
+        let conversion_overhead_bytes =
+            super::depot::blob_upload_conversion_overhead(request.total_len)?;
+        let mut write = self.database.begin_write()?;
+        write.set_durability(Durability::Immediate)?;
+        enforce_live_write(&write)?;
+        synchronize_blob_policy_generation_write(&write)?;
+        let content_epoch = require_upload_policy_write(&write, authority, policy, request, None)?;
+        if let Some(encoded) = write
+            .open_table(super::BLOB_UPLOADS)?
+            .get(owner_key.as_slice())?
+            .map(|value| value.value().to_vec())
+        {
+            let existing =
+                DurableBlobUpload::decode(Arc::clone(&self.blob_completion_authority), &encoded)?;
+            if existing.reservation.request != *request
+                || existing.reservation.request_digest != request_digest
+            {
+                return Err(blob_error(BlobStoreError::OperationConflict));
+            }
+            return Ok((
+                reservation_for_store(self, &existing),
+                existing.projection()?,
+            ));
+        }
+        if write
+            .open_table(BLOB_OPERATIONS)?
+            .get(owner_key.as_slice())?
+            .is_some()
+        {
+            return Err(blob_error(BlobStoreError::OperationConflict));
+        }
+        let current = super::depot::depot_admission_usage_write(&write)?;
+        let rows = write.open_table(super::BLOB_UPLOADS)?.len()?;
+        if rows >= MAX_UPLOADS {
+            return Err(blob_error(BlobStoreError::DepotVariantLimitExceeded {
+                current: rows,
+                limit: MAX_UPLOADS,
+            }));
+        }
+        if current
+            .reserved_bytes
+            .checked_add(total_capacity.bytes)
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?
+            > self.blob_depot_limits.max_bytes()
+        {
+            return Err(blob_error(BlobStoreError::DepotByteLimitExceeded {
+                current: current.reserved_bytes,
+                incoming: total_capacity.bytes,
+                limit: self.blob_depot_limits.max_bytes(),
+            }));
+        }
+        if current
+            .chunks
+            .checked_add(total_capacity.chunks)
+            .ok_or(StoreError::ItemCountAccountingOverflow)?
+            > self.blob_depot_limits.max_chunks()
+        {
+            return Err(blob_error(BlobStoreError::DepotChunkLimitExceeded {
+                current: current.chunks,
+                limit: self.blob_depot_limits.max_chunks(),
+            }));
+        }
+        if current
+            .variants
+            .checked_add(total_capacity.variants)
+            .ok_or(StoreError::ItemCountAccountingOverflow)?
+            > self.blob_depot_limits.max_variants()
+        {
+            return Err(blob_error(BlobStoreError::DepotVariantLimitExceeded {
+                current: current.variants,
+                limit: self.blob_depot_limits.max_variants(),
+            }));
+        }
+        let upload_id = upload_id_for(&request.owner, request_digest)?;
+        let reservation = BlobUploadReservation {
+            request: request.clone(),
+            control_policy: *policy,
+            content_epoch,
+            request_digest,
+            upload_id,
+            staging_charge_bytes,
+            conversion_overhead_bytes,
+            total_capacity,
+            authority: Arc::clone(&self.blob_completion_authority),
+        };
+        let upload = DurableBlobUpload {
+            reservation: reservation.clone(),
+            checkpoint: None,
+            consumed: BlobUploadCapacity::default(),
+            bound_variant: None,
+        };
+        write
+            .open_table(super::BLOB_UPLOADS)?
+            .insert(owner_key.as_slice(), upload.encode()?.as_slice())?;
+        write.commit()?;
+        Ok((reservation, upload.projection()?))
+    }
+
+    pub fn checkpoint_blob_upload(
+        &self,
+        policy: &ControlPolicySnapshot,
+        reservation: &BlobUploadReservation,
+        expected: BlobUploadCheckpoint,
+        durable: BlobPackCheckpoint,
+    ) -> Result<BlobUploadCheckpoint, StoreError> {
+        self.require_live()?;
+        let authority = self.require_bound_mission()?;
+        let owner_key = validate_reservation_capability(self, reservation)?;
+        let mut write = self.database.begin_write()?;
+        write.set_durability(Durability::Immediate)?;
+        enforce_live_write(&write)?;
+        synchronize_blob_policy_generation_write(&write)?;
+        require_upload_policy_write(
+            &write,
+            authority,
+            policy,
+            &reservation.request,
+            Some(reservation.content_epoch),
+        )?;
+        let encoded = write
+            .open_table(super::BLOB_UPLOADS)?
+            .get(owner_key.as_slice())?
+            .map(|value| value.value().to_vec())
+            .ok_or_else(|| blob_error(BlobStoreError::ReservationChanged))?;
+        let mut upload =
+            DurableBlobUpload::decode(Arc::clone(&self.blob_completion_authority), &encoded)?;
+        if reservation_for_store(self, &upload) != *reservation
+            || upload.projection()? != expected
+            || durable.upload_id() != reservation.upload_id
+            || durable.request_digest() != &reservation.request_digest
+            || durable.total_len() != reservation.request.total_len
+        {
+            return Err(blob_error(BlobStoreError::ReservationChanged));
+        }
+        if let Some(current) = upload.checkpoint.as_ref() {
+            if current == &durable {
+                return upload.projection();
+            }
+            if durable.generation()
+                != current
+                    .generation()
+                    .checked_add(1)
+                    .ok_or_else(schema_error)?
+                || durable.next_index() < current.next_index()
+                || durable.plaintext_offset() < current.plaintext_offset()
+                || durable.pack_len() < current.pack_len()
+            {
+                return Err(blob_error(BlobStoreError::ReservationChanged));
+            }
+        }
+        upload.checkpoint = Some(durable);
+        let projection = upload.projection()?;
+        write
+            .open_table(super::BLOB_UPLOADS)?
+            .insert(owner_key.as_slice(), upload.encode()?.as_slice())?;
+        write.commit()?;
+        Ok(projection)
+    }
+
+    pub fn resume_blob_upload(
+        &self,
+        owner: &BlobOperationOwner,
+    ) -> Result<Option<(BlobUploadReservation, BlobUploadCheckpoint)>, StoreError> {
+        self.require_live()?;
+        self.require_bound_mission()?;
+        let owner_key = blob_operation_owner_key(owner)?;
+        let read = self.database.begin_read()?;
+        let encoded = read
+            .open_table(super::BLOB_UPLOADS)?
+            .get(owner_key.as_slice())?
+            .map(|value| value.value().to_vec());
+        encoded
+            .map(|encoded| {
+                let upload = DurableBlobUpload::decode(
+                    Arc::clone(&self.blob_completion_authority),
+                    &encoded,
+                )?;
+                Ok((reservation_for_store(self, &upload), upload.projection()?))
+            })
+            .transpose()
+    }
+
+    pub fn complete_blob_upload(
+        &self,
+        reservation: &BlobUploadReservation,
+        publication: BlobTransferId,
+    ) -> Result<(), StoreError> {
+        self.require_live()?;
+        let owner_key = validate_reservation_capability(self, reservation)?;
+        let mut write = self.database.begin_write()?;
+        write.set_durability(Durability::Immediate)?;
+        enforce_live_write(&write)?;
+        let encoded = write
+            .open_table(super::BLOB_UPLOADS)?
+            .get(owner_key.as_slice())?
+            .map(|value| value.value().to_vec());
+        let Some(encoded) = encoded else {
+            let operation = write
+                .open_table(BLOB_OPERATIONS)?
+                .get(owner_key.as_slice())?
+                .map(|value| decode_blob_operation_record(value.value()))
+                .transpose()?;
+            return if operation.is_some_and(|operation| operation.transfer_id == publication) {
+                Ok(())
+            } else {
+                Err(blob_error(BlobStoreError::ReservationChanged))
+            };
+        };
+        let upload =
+            DurableBlobUpload::decode(Arc::clone(&self.blob_completion_authority), &encoded)?;
+        if reservation_for_store(self, &upload) != *reservation {
+            return Err(blob_error(BlobStoreError::ReservationChanged));
+        }
+        let operation = write
+            .open_table(BLOB_OPERATIONS)?
+            .get(owner_key.as_slice())?
+            .map(|value| decode_blob_operation_record(value.value()))
+            .transpose()?
+            .ok_or_else(|| blob_error(BlobStoreError::CompletionMismatch))?;
+        let metadata = write
+            .open_table(BLOB_PUBLICATIONS)?
+            .get(publication.as_bytes().as_slice())?
+            .map(|value| decode_blob_metadata(value.value()))
+            .transpose()?
+            .ok_or_else(|| blob_error(BlobStoreError::CompletionMismatch))?;
+        if operation.transfer_id != publication
+            || metadata.header.stamp.dot.publisher != reservation.request.owner.publisher
+            || metadata.header.topic != reservation.request.topic
+            || metadata.header.scope != reservation.request.scope
+            || metadata.header.priority != reservation.request.priority
+            || metadata.header.ttl_ms != reservation.request.ttl_ms
+            || metadata.header.key_epoch != reservation.content_epoch
+            || upload.bound_variant != Some(metadata.variant_id)
+        {
+            return Err(blob_error(BlobStoreError::CompletionMismatch));
+        }
+        write
+            .open_table(super::BLOB_UPLOADS)?
+            .remove(owner_key.as_slice())?;
+        write.commit()?;
+        Ok(())
+    }
+
+    pub fn abort_blob_upload(
+        &self,
+        reservation: &BlobUploadReservation,
+    ) -> Result<bool, StoreError> {
+        self.require_live()?;
+        let owner_key = validate_reservation_capability(self, reservation)?;
+        let mut write = self.database.begin_write()?;
+        write.set_durability(Durability::Immediate)?;
+        enforce_live_write(&write)?;
+        let encoded = write
+            .open_table(super::BLOB_UPLOADS)?
+            .get(owner_key.as_slice())?
+            .map(|value| value.value().to_vec());
+        let Some(encoded) = encoded else {
+            return Ok(false);
+        };
+        let upload =
+            DurableBlobUpload::decode(Arc::clone(&self.blob_completion_authority), &encoded)?;
+        if reservation_for_store(self, &upload) != *reservation {
+            return Err(blob_error(BlobStoreError::ReservationChanged));
+        }
+        write
+            .open_table(super::BLOB_UPLOADS)?
+            .remove(owner_key.as_slice())?;
+        write.commit()?;
+        Ok(true)
+    }
+}
+
+fn encode_capacity(output: &mut Vec<u8>, capacity: BlobUploadCapacity) {
+    output.extend_from_slice(&capacity.bytes.to_be_bytes());
+    output.extend_from_slice(&capacity.chunks.to_be_bytes());
+    output.extend_from_slice(&capacity.variants.to_be_bytes());
+}
+
+fn decode_capacity(cursor: &mut UploadCursor<'_>) -> Result<BlobUploadCapacity, StoreError> {
+    Ok(BlobUploadCapacity {
+        bytes: cursor.u64()?,
+        chunks: cursor.u64()?,
+        variants: cursor.u64()?,
+    })
+}
+
+fn push_u16_bytes(output: &mut Vec<u8>, bytes: &[u8]) -> Result<(), StoreError> {
+    let len = u16::try_from(bytes.len()).map_err(|_| schema_error())?;
+    output.extend_from_slice(&len.to_be_bytes());
+    output.extend_from_slice(bytes);
+    Ok(())
+}
+
+struct UploadCursor<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> UploadCursor<'a> {
+    const fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn take(&mut self, len: usize) -> Result<&'a [u8], StoreError> {
+        let end = self.offset.checked_add(len).ok_or_else(schema_error)?;
+        let value = self.bytes.get(self.offset..end).ok_or_else(schema_error)?;
+        self.offset = end;
+        Ok(value)
+    }
+
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], StoreError> {
+        self.take(N)?.try_into().map_err(|_| schema_error())
+    }
+
+    fn u8(&mut self) -> Result<u8, StoreError> {
+        Ok(self.array::<1>()?[0])
+    }
+
+    fn u16(&mut self) -> Result<u16, StoreError> {
+        Ok(u16::from_be_bytes(self.array()?))
+    }
+
+    fn u32(&mut self) -> Result<u32, StoreError> {
+        Ok(u32::from_be_bytes(self.array()?))
+    }
+
+    fn u64(&mut self) -> Result<u64, StoreError> {
+        Ok(u64::from_be_bytes(self.array()?))
+    }
+
+    fn short(&mut self) -> Result<&'a [u8], StoreError> {
+        let len = usize::from(self.u16()?);
+        self.take(len)
+    }
+
+    fn finish(self) -> Result<(), StoreError> {
+        if self.offset == self.bytes.len() {
+            Ok(())
+        } else {
+            Err(schema_error())
+        }
+    }
+}
+
+fn schema_error() -> StoreError {
+    blob_error(BlobStoreError::SchemaInvariant(
+        "provisional Blob upload row is malformed",
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::blob::pack::{BlobPackWriter, PinnedBlobPackRoot};
+    use crate::{
+        BlobDepotLimits, BlobOperationKey, BlobOperationOwner, BlobOperationRequest,
+        BlobPublicationIntent, Store, StoreLimits,
+    };
+    use aster_mesh::{
+        BlobContentVerification, BlobMetadata, Priority, ProvisioningAccess,
+        ReferenceEnvelopeSealer, ReferenceProvisioner, Scope, Topic, prepare_blob,
+    };
+    use std::io::Cursor;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
+
+    struct TestRoot(PathBuf);
+
+    impl TestRoot {
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "aster-upload-{label}-{}-{}",
+                std::process::id(),
+                NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).expect("create upload test root");
+            Self(path)
+        }
+
+        fn database(&self) -> PathBuf {
+            self.0.join("state.redb")
+        }
+    }
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct Fixture {
+        root: TestRoot,
+        store: Store,
+        publisher: ReferenceEnvelopeSealer,
+        reader: ReferenceEnvelopeSealer,
+        topic: Topic,
+        scope: Scope,
+    }
+
+    fn fixture(label: &str, seed: u8, limits: BlobDepotLimits) -> Fixture {
+        let topic = Topic::new("upload-imagery").expect("topic");
+        let scope = Scope::new("mission/upload-imagery").expect("scope");
+        let access = ProvisioningAccess::member(scope.clone(), vec![1], vec![topic.clone()])
+            .expect("member access");
+        let mut provisioner = ReferenceProvisioner::from_seed([seed; 32]).expect("provisioner");
+        let publisher = provisioner
+            .issue_control_authority(1, std::slice::from_ref(&access))
+            .and_then(ReferenceEnvelopeSealer::open)
+            .expect("publisher");
+        let reader = provisioner
+            .issue_node(2, &[access])
+            .and_then(ReferenceEnvelopeSealer::open)
+            .expect("reader");
+        let root = TestRoot::new(label);
+        let store = Store::open_with_limits_and_blob_depot_limits_for_mission(
+            root.database(),
+            StoreLimits::default(),
+            limits,
+            publisher.mission_authority_id(),
+        )
+        .expect("store");
+        Fixture {
+            root,
+            store,
+            publisher,
+            reader,
+            topic,
+            scope,
+        }
+    }
+
+    fn request(fixture: &Fixture, operation: &[u8], total_len: u64) -> BlobUploadRequest {
+        BlobUploadRequest {
+            owner: BlobOperationOwner::new(
+                fixture.publisher.identity(),
+                BlobOperationKey::new(operation.to_vec()).expect("operation"),
+            ),
+            topic: fixture.topic.clone(),
+            scope: fixture.scope.clone(),
+            priority: Priority::Immediate,
+            ttl_ms: Some(90_000),
+            media_type: Some("image/tiff".into()),
+            schema_id: b"geo-v4".to_vec(),
+            total_len,
+        }
+    }
+
+    #[test]
+    fn upload_restart_restores_exact_request_and_checkpoint() {
+        // Break caught: reconstructing an upload from current policy loses its
+        // immutable request or advances beyond the store-projected journal.
+        let mut fixture = fixture("restart", 0x31, BlobDepotLimits::DEFAULT);
+        let request = request(&fixture, b"restart-owner", 4_096);
+        let policy = fixture.store.control_policy_snapshot().expect("policy");
+        let (reservation, initial) = fixture
+            .store
+            .reserve_blob_upload_with_policy(&policy, &request)
+            .expect("reserve upload");
+        assert_eq!(reservation.request(), &request);
+        assert_eq!(reservation.control_policy(), &policy);
+        assert_eq!(reservation.content_epoch(), 1);
+        assert!(reservation.staging_charge_bytes() > request.total_len);
+        assert!(reservation.conversion_overhead_bytes() > 0);
+        assert_eq!(
+            reservation.reserved_bytes(),
+            reservation
+                .staging_charge_bytes()
+                .checked_add(reservation.conversion_overhead_bytes())
+                .expect("bounded upload charge")
+        );
+        assert_eq!(initial.credit_consumed_bytes(), 0);
+        assert_eq!(
+            initial.credit_remaining_bytes(),
+            reservation.reserved_bytes()
+        );
+
+        let pack_root = PinnedBlobPackRoot::open(&fixture.store).expect("pack root");
+        let mut writer =
+            BlobPackWriter::create_upload_pinned(&pack_root, &reservation.pack_identity())
+                .expect("create upload pack");
+        let durable = writer.checkpoint().expect("durable pack checkpoint");
+
+        // The journal may lead redb, but restart must not invent that progress.
+        drop(writer);
+        let authority = fixture.publisher.mission_authority_id();
+        drop(fixture.store);
+        fixture.store = Store::open_for_mission(fixture.root.database(), authority)
+            .expect("reopen before projection");
+        let (restarted, checkpoint) = fixture
+            .store
+            .resume_blob_upload(&request.owner)
+            .expect("resume before projection")
+            .expect("upload remains");
+        assert_eq!(restarted.request(), &request);
+        assert_eq!(checkpoint, initial);
+
+        let projected = fixture
+            .store
+            .checkpoint_blob_upload(&policy, &restarted, checkpoint, durable.clone())
+            .expect("project durable checkpoint");
+        assert_eq!(projected.generation(), durable.generation());
+        assert_eq!(projected.durable_pack_len(), durable.pack_len());
+
+        drop(fixture.store);
+        fixture.store = Store::open_for_mission(fixture.root.database(), authority)
+            .expect("reopen projected upload");
+        let (restarted, exact) = fixture
+            .store
+            .resume_blob_upload(&request.owner)
+            .expect("resume projected")
+            .expect("upload remains projected");
+        assert_eq!(restarted.request(), &request);
+        assert_eq!(restarted.control_policy(), &policy);
+        assert_eq!(exact, projected);
+        let pack_root = PinnedBlobPackRoot::open(&fixture.store).expect("reopen pack root");
+        let writer = BlobPackWriter::open_projected_upload_pinned(
+            &pack_root,
+            &restarted.pack_identity(),
+            exact.durable_pack_checkpoint(),
+        )
+        .expect("reopen exact projected pack");
+        assert_eq!(writer.next_index(), durable.next_index());
+        assert_eq!(writer.plaintext_offset(), durable.plaintext_offset());
+    }
+
+    #[test]
+    fn upload_capacity_remains_charged_through_canonical_promotion() {
+        // One selected 1-KiB chunk occupies plaintext + the canonical 153-byte
+        // file header + 16-byte AEAD tag.
+        let plaintext = vec![0x71; 1_024];
+        let canonical_bytes = 1_024 + 153 + 16;
+        let exact_bytes = super::super::depot::blob_upload_capacity(plaintext.len() as u64)
+            .expect("upload capacity")
+            .bytes;
+        let mut fixture = fixture(
+            "promotion",
+            0x32,
+            BlobDepotLimits::new(exact_bytes, 1, 1).expect("exact limits"),
+        );
+        let mut request = request(&fixture, b"exact-limit", plaintext.len() as u64);
+        request.ttl_ms = None;
+        let policy = fixture.store.control_policy_snapshot().expect("policy");
+        let (reservation, _) = fixture
+            .store
+            .reserve_blob_upload_with_policy(&policy, &request)
+            .expect("reserve exact capacity");
+
+        let prepared = prepare_blob(
+            &mut Cursor::new(&plaintext),
+            crate::SELECTED_BLOB_CHUNK_SIZE,
+            BlobMetadata::new(request.media_type.clone(), request.schema_id.clone())
+                .expect("metadata"),
+        )
+        .expect("prepare upload");
+        let mut service = fixture
+            .publisher
+            .blob_service_with_store(
+                &fixture.scope,
+                &fixture.topic,
+                1,
+                fixture
+                    .store
+                    .blob_depot_for_upload(&reservation)
+                    .expect("upload-bound depot"),
+            )
+            .expect("upload service");
+        let manifest = service
+            .install_prepared(&prepared)
+            .expect("install prepared");
+        let progress = service
+            .encrypt_some(&mut Cursor::new(&plaintext), &manifest, u64::MAX)
+            .expect("encrypt exact upload");
+        assert!(progress.complete);
+        let finished = service.finish_manifest(&manifest).expect("finish manifest");
+        drop(service);
+
+        let (_, converted) = fixture
+            .store
+            .resume_blob_upload(&request.owner)
+            .expect("resume converted")
+            .expect("converted upload remains provisional");
+        assert_eq!(
+            converted.credit_remaining_bytes(),
+            exact_bytes - canonical_bytes
+        );
+        assert_eq!(converted.credit_remaining_chunks(), 0);
+        assert_eq!(converted.credit_remaining_variants(), 0);
+        assert_eq!(converted.credit_consumed_bytes(), canonical_bytes);
+
+        let intent = BlobPublicationIntent::new_with_ttl(
+            request.owner.publisher,
+            request.topic.clone(),
+            request.scope.clone(),
+            request.priority,
+            prepared.id(),
+            request.ttl_ms,
+        )
+        .expect("publication intent");
+        let operation = BlobOperationRequest::new(&request.owner.operation, &intent);
+        let publication_reservation = fixture
+            .store
+            .reserve_blob_with_policy(
+                &policy,
+                request.owner.publisher,
+                &request.topic,
+                &request.scope,
+            )
+            .expect("publication reservation");
+        assert_eq!(publication_reservation.counter(), 1);
+        let header = publication_reservation
+            .header(
+                request.priority,
+                finished.route_commitment(),
+                u64::try_from(finished.manifest_bytes().len()).expect("manifest length"),
+                reservation.content_epoch(),
+            )
+            .expect("publication header");
+        let sealed = fixture
+            .publisher
+            .seal_blob_manifest(&header, finished.manifest_bytes())
+            .expect("seal manifest")
+            .bytes;
+        let route = fixture.reader.verify_blob(&sealed).expect("verify route");
+        let (blob, manifest_bytes) = match fixture
+            .reader
+            .verify_blob_content(route, &sealed)
+            .expect("verify content")
+        {
+            BlobContentVerification::ContentVerified {
+                blob,
+                manifest_bytes,
+            } => (blob, manifest_bytes),
+            BlobContentVerification::RouteOnly(_) => panic!("member unexpectedly route-only"),
+        };
+        let completion = fixture
+            .store
+            .completed_local_blob(&blob, &manifest_bytes)
+            .expect("completed upload proof");
+        let outcome = fixture
+            .store
+            .commit_reserved_blob_once_with_policy(
+                &policy,
+                &operation,
+                &publication_reservation,
+                &blob,
+                &sealed,
+                &completion,
+            )
+            .expect("canonical promotion");
+        assert!(outcome.inserted());
+        fixture
+            .store
+            .complete_blob_upload(&reservation, outcome.blob().transfer_id)
+            .expect("complete upload authority");
+        assert!(
+            fixture
+                .store
+                .resume_blob_upload(&request.owner)
+                .expect("resume completed")
+                .is_none()
+        );
+
+        drop(fixture.store);
+        let reopened = Store::open_with_limits_and_blob_depot_limits_for_mission(
+            fixture.root.database(),
+            StoreLimits::default(),
+            BlobDepotLimits::new(exact_bytes, 1, 1).expect("reopen limits"),
+            fixture.publisher.mission_authority_id(),
+        )
+        .expect("reopen promoted upload");
+        assert_eq!(
+            reopened
+                .blob_stats()
+                .expect("promoted stats")
+                .reserved_file_bytes,
+            canonical_bytes
+        );
+    }
+
+    #[test]
+    fn upload_crash_boundaries_reopen_to_one_authority() {
+        // Break caught: capacity credit projected separately from canonical
+        // import/chunk rows can be lost, duplicated, or spent by another import.
+        let plaintext = vec![0x81; 1_024];
+        let exact_bytes = super::super::depot::blob_upload_capacity(plaintext.len() as u64)
+            .expect("upload capacity")
+            .bytes;
+        let mut fixture = fixture(
+            "crash-boundaries",
+            0x33,
+            BlobDepotLimits::new(exact_bytes, 1, 1).expect("exact limits"),
+        );
+        let request = request(&fixture, b"credit-owner", plaintext.len() as u64);
+        let policy = fixture.store.control_policy_snapshot().expect("policy");
+        let (reservation, initial) = fixture
+            .store
+            .reserve_blob_upload_with_policy(&policy, &request)
+            .expect("reserve credit");
+
+        let unrelated = prepare_blob(
+            &mut Cursor::new(vec![0x82; plaintext.len()]),
+            crate::SELECTED_BLOB_CHUNK_SIZE,
+            BlobMetadata::new(Some("image/tiff".into()), b"geo-v4".to_vec()).expect("metadata"),
+        )
+        .expect("prepare unrelated");
+        let mut unrelated_service = fixture
+            .publisher
+            .blob_service_with_store(
+                &fixture.scope,
+                &fixture.topic,
+                1,
+                fixture
+                    .store
+                    .blob_depot_for_local_publish()
+                    .expect("normal depot"),
+            )
+            .expect("unrelated service");
+        assert!(unrelated_service.install_prepared(&unrelated).is_err());
+        drop(unrelated_service);
+
+        let authority = fixture.publisher.mission_authority_id();
+        drop(fixture.store);
+        fixture.store = Store::open_with_limits_and_blob_depot_limits_for_mission(
+            fixture.root.database(),
+            StoreLimits::default(),
+            BlobDepotLimits::new(exact_bytes, 1, 1).expect("reopen limits"),
+            authority,
+        )
+        .expect("reopen reserved credit");
+        let (restarted, checkpoint) = fixture
+            .store
+            .resume_blob_upload(&request.owner)
+            .expect("resume credit")
+            .expect("credit survives");
+        assert_eq!(checkpoint, initial);
+        assert!(fixture.store.blob_depot_for_upload(&reservation).is_err());
+
+        let prepared = prepare_blob(
+            &mut Cursor::new(&plaintext),
+            crate::SELECTED_BLOB_CHUNK_SIZE,
+            BlobMetadata::new(request.media_type.clone(), request.schema_id.clone())
+                .expect("metadata"),
+        )
+        .expect("prepare matching");
+        let mut service = fixture
+            .publisher
+            .blob_service_with_store(
+                &fixture.scope,
+                &fixture.topic,
+                1,
+                fixture
+                    .store
+                    .blob_depot_for_upload(&restarted)
+                    .expect("matching credit"),
+            )
+            .expect("matching service");
+        let _manifest = service
+            .install_prepared(&prepared)
+            .expect("consume variant/chunk credit");
+        drop(service);
+
+        // Import and digest rows consume variant/chunk units atomically, while
+        // the byte credit remains until the expected canonical record exists.
+        drop(fixture.store);
+        fixture.store = Store::open_with_limits_and_blob_depot_limits_for_mission(
+            fixture.root.database(),
+            StoreLimits::default(),
+            BlobDepotLimits::new(exact_bytes, 1, 1).expect("second reopen limits"),
+            authority,
+        )
+        .expect("reopen partial conversion");
+        let (restarted, partial) = fixture
+            .store
+            .resume_blob_upload(&request.owner)
+            .expect("resume partial")
+            .expect("partial upload remains");
+        assert_eq!(partial.credit_consumed_variants(), 1);
+        assert_eq!(partial.credit_consumed_chunks(), 1);
+        assert_eq!(partial.credit_consumed_bytes(), 0);
+        assert_eq!(partial.credit_remaining_bytes(), exact_bytes);
+        assert!(
+            fixture
+                .store
+                .abort_blob_upload(&restarted)
+                .expect("abort partial")
+        );
+        assert!(
+            fixture
+                .store
+                .resume_blob_upload(&request.owner)
+                .expect("resume aborted")
+                .is_none()
+        );
+    }
+}

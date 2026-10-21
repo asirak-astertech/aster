@@ -18,6 +18,7 @@ pub mod pack;
 #[allow(dead_code)]
 pub(crate) mod pressure;
 pub mod stream;
+pub mod upload;
 
 pub use lifecycle::{
     BlobLifecycleLimits, BlobMaintenanceBudget, BlobMaintenanceCandidate, BlobMaintenanceClass,
@@ -48,6 +49,7 @@ pub use stream::{
     BlobStreamConflictEvidence, BlobStreamInspection, BlobStreamPromotion, BlobStreamPublication,
     BlobStreamReservation, BlobStreamReservationRequest, BlobStreamResume, BlobStreamSource,
 };
+pub use upload::{BlobUploadCheckpoint, BlobUploadRequest, BlobUploadReservation};
 
 pub(crate) const BLOB_PUBLICATIONS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.semantic-blob-publications.v1");
@@ -63,6 +65,8 @@ pub(crate) const BLOB_ACCEPTANCE_MARKERS: TableDefinition<&[u8], u64> =
     TableDefinition::new("aster.semantic-blob-markers.v1");
 pub(crate) const BLOB_OPERATIONS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.blob-operations.v1");
+pub(crate) const BLOB_UPLOADS: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("aster.blob-uploads.v1");
 pub(crate) const BLOB_IMPORTS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.blob-imports.v1");
 pub(crate) const BLOB_CHUNKS: TableDefinition<&[u8], &[u8]> =
@@ -2930,6 +2934,17 @@ impl Store {
         self.require_live()?;
         self.require_bound_mission()?;
         BlobDepot::open(self)
+    }
+
+    /// Acquires a mutation adapter whose canonical admissions may consume only
+    /// this Store's exact durable provisional-upload capacity reservation.
+    pub fn blob_depot_for_upload(
+        &self,
+        reservation: &BlobUploadReservation,
+    ) -> Result<BlobDepot<'_>, StoreError> {
+        self.require_live()?;
+        self.require_bound_mission()?;
+        BlobDepot::open_upload_mutation(self, reservation)
     }
 
     /// Acquires the owner-bound mutation adapter for one local Blob publish
@@ -15145,6 +15160,7 @@ pub(crate) fn blob_schema_present_write(
         .iter()
         .filter(|table| existing.contains(**table))
         .count();
+    let upload_present = existing.contains(BLOB_UPLOADS.name());
     let stream_legacy_predecessor = stream_present == 3
         && existing.contains(BLOB_STREAM_RESERVATIONS.name())
         && existing.contains(BLOB_STREAM_OPERATIONS.name())
@@ -15174,6 +15190,7 @@ pub(crate) fn blob_schema_present_write(
     if legacy_present == 0
         && network_present == 0
         && stream_present == 0
+        && !upload_present
         && global_present.iter().all(|present| !present)
     {
         lifecycle::require_blob_lifecycle_absent_write(write)?;
@@ -15195,6 +15212,9 @@ pub(crate) fn blob_schema_present_write(
     }
     if network_present == 0 {
         initialize_blob_network_schema(write)?;
+    }
+    if !upload_present {
+        let _ = write.open_table(BLOB_UPLOADS)?;
     }
     if stream_present == 0 {
         initialize_blob_stream_schema(write)?;
@@ -15487,6 +15507,7 @@ pub(crate) fn audit_blob_tables_write(
     if !blob_schema_present_write(write)? {
         initialize_blob_schema(write)?;
     }
+    upload::audit_blob_uploads_write(write)?;
     let publication_encoding = lifecycle::publication_encoding_migration_write(write)?;
     migrate_blob_operation_ownership_write(write, publication_encoding)?;
     let deletion_owner_binding = depot::depot_owner_binding_if_present_write(write)?;
@@ -16025,6 +16046,7 @@ pub(crate) fn inspect_blob_tables_read(
         .iter()
         .filter(|table| existing.contains(**table))
         .count();
+    let upload_present = existing.contains(BLOB_UPLOADS.name());
     let metadata = read.open_table(METADATA)?;
     let global = blob_global_metadata_fields();
     let global_present = global
@@ -16043,7 +16065,10 @@ pub(crate) fn inspect_blob_tables_read(
             )));
         }
     };
-    if legacy_present == 0 && network_present == 0 && global_present.iter().all(|present| !present)
+    if legacy_present == 0
+        && network_present == 0
+        && !upload_present
+        && global_present.iter().all(|present| !present)
     {
         lifecycle::require_blob_lifecycle_absent_read(read)?;
         deletion::require_blob_deletion_absent_read(read)?;
@@ -16058,6 +16083,9 @@ pub(crate) fn inspect_blob_tables_read(
         )));
     }
     drop(metadata);
+    if upload_present {
+        upload::audit_blob_uploads_read(read)?;
+    }
     let deletion_owner_binding = depot::depot_owner_binding_if_present_read(read)?;
     let deletion_audit = deletion::inspect_blob_deletion_read(read, deletion_owner_binding)?;
     let publication_encoding = lifecycle::publication_encoding_migration_read(read)?;
@@ -16689,6 +16717,7 @@ fn initialize_blob_schema(write: &redb::WriteTransaction) -> Result<(), StoreErr
     let _ = write.open_table(BLOB_CONTENT_INDEX)?;
     let _ = write.open_table(BLOB_ACCEPTANCE_MARKERS)?;
     let _ = write.open_table(BLOB_OPERATIONS)?;
+    let _ = write.open_table(BLOB_UPLOADS)?;
     let _ = write.open_table(BLOB_IMPORTS)?;
     let _ = write.open_table(BLOB_CHUNKS)?;
     {
@@ -16786,12 +16815,24 @@ fn stream_blob_table_names() -> [&'static str; 6] {
     ]
 }
 
-fn blob_table_names() -> [&'static str; 13] {
+fn blob_table_names() -> [&'static str; 14] {
     let legacy = legacy_blob_table_names();
     let network = network_blob_table_names();
     [
-        legacy[0], legacy[1], legacy[2], legacy[3], legacy[4], legacy[5], legacy[6], legacy[7],
-        legacy[8], network[0], network[1], network[2], network[3],
+        legacy[0],
+        legacy[1],
+        legacy[2],
+        legacy[3],
+        legacy[4],
+        legacy[5],
+        legacy[6],
+        legacy[7],
+        legacy[8],
+        network[0],
+        network[1],
+        network[2],
+        network[3],
+        BLOB_UPLOADS.name(),
     ]
 }
 
@@ -29421,6 +29462,7 @@ mod tests {
                 .delete_table(BLOB_ACCEPTANCE_MARKERS)
                 .expect("markers");
             write.delete_table(BLOB_OPERATIONS).expect("operations");
+            write.delete_table(BLOB_UPLOADS).expect("uploads");
             write.delete_table(BLOB_IMPORTS).expect("imports");
             write.delete_table(BLOB_CHUNKS).expect("chunks");
             write
