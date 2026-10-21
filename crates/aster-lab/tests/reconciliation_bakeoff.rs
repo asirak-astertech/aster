@@ -693,7 +693,7 @@ impl Algorithm {
     const fn label(self) -> &'static str {
         match self {
             Self::Aster => "aster_merkle",
-            Self::Negentropy => "negentropy_0_5_1",
+            Self::Negentropy => "negentropy_0_5_2",
         }
     }
 

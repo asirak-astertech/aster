@@ -14,6 +14,8 @@ server = ["connectrpc/server"]
 client = ["connectrpc/client"]
 systemd-provider = ["dep:aster-systemd-credentials"]
 acceptance-test-provider = []
+# Internal integration-test controls; absent from default/customer builds.
+sdk-test-support = []
 
 [[bin]]
 name = "aster-agent"
