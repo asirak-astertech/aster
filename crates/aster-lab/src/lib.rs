@@ -2563,15 +2563,35 @@ mod tests {
     }
 
     #[test]
+    fn blob_recovery_validation_retains_chunk_bounds_without_allocating_them() {
+        assert_eq!(MIN_BLOB_CHUNK_SIZE, 4 * 1_024);
+        assert_eq!(MAX_BLOB_CHUNK_SIZE, 64 * 1_024);
+        let mut scenario = BlobRecoveryScenario {
+            root: test_path("blob-validation-limits"),
+            seed: 83,
+            blob_bytes: 1,
+            chunk_bytes: MAX_BLOB_CHUNK_SIZE,
+            restart_after_delivered_frames: 1,
+            max_pumps_per_contact: 1,
+            fault: FaultProfile::default(),
+        };
+        assert!(validate_blob(&scenario).is_ok());
+        scenario.chunk_bytes = MIN_BLOB_CHUNK_SIZE - 1;
+        assert!(validate_blob(&scenario).is_err());
+        scenario.chunk_bytes = MAX_BLOB_CHUNK_SIZE + 1;
+        assert!(validate_blob(&scenario).is_err());
+    }
+
+    #[test]
     fn blob_recovery_reopens_and_switches_to_alternate_peer() {
         let _guard = SCENARIO_TEST_LOCK.lock().unwrap();
         let root = test_path("blob-recovery");
         let metrics = run_blob_recovery(&BlobRecoveryScenario {
             root: root.clone(),
             seed: 97,
-            blob_bytes: 96 * 1_024,
+            blob_bytes: 3 * u64::from(MIN_BLOB_CHUNK_SIZE),
             chunk_bytes: MIN_BLOB_CHUNK_SIZE,
-            restart_after_delivered_frames: 16,
+            restart_after_delivered_frames: 1,
             max_pumps_per_contact: 50_000,
             fault: FaultProfile {
                 bits_per_second: 64_000,
@@ -2585,12 +2605,18 @@ mod tests {
         assert_eq!(metrics.restarts, 1);
         assert!(metrics.partial_restart_observed);
         assert!(metrics.partial_durable_blob_bytes > 0);
+        assert!(
+            metrics.partial_durable_blob_bytes < metrics.blob_bytes,
+            "partial={} total={}",
+            metrics.partial_durable_blob_bytes,
+            metrics.blob_bytes
+        );
         assert_eq!(
             metrics.reopened_durable_blob_bytes,
             metrics.partial_durable_blob_bytes
         );
         assert!(metrics.durable_progress_preserved);
-        assert_eq!(metrics.blob_bytes, 96 * 1_024);
+        assert_eq!(metrics.blob_bytes, 3 * u64::from(MIN_BLOB_CHUNK_SIZE));
         fs::remove_dir_all(root).unwrap();
     }
 

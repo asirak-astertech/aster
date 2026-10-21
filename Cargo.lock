@@ -287,6 +287,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "libc",
+ "memchr",
  "redb",
  "rustix",
  "serde",
@@ -309,11 +310,13 @@ dependencies = [
 name = "aster-compose-credentials"
 version = "0.1.0-alpha.1"
 dependencies = [
+ "aho-corasick",
  "aster-agent",
  "aster-core",
  "connectrpc",
  "getrandom 0.4.3",
  "libc",
+ "memchr",
  "rustix",
  "serde",
  "serde_json",
@@ -430,6 +433,8 @@ dependencies = [
  "libc",
  "redb",
  "rustix",
+ "serde",
+ "serde_json",
  "sha2 0.11.1",
  "tokio",
  "zeroize",
@@ -476,6 +481,7 @@ dependencies = [
 name = "asterctl"
 version = "0.1.0-alpha.1"
 dependencies = [
+ "aster-agent",
  "buffa",
  "bytes",
  "connectrpc",

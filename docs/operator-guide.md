@@ -248,16 +248,25 @@ sudo -u aster /usr/bin/asterctl \
   --operation-key operator-chat-reader-001 chat.events
 ```
 
+Initialize the publication journal once on Node A, then keep it and the same
+client identity across invocations. Initialization refuses an existing file:
+
+```sh
+sudo install -d -o aster -g aster -m 0700 /var/lib/aster-operator
+sudo -u aster /usr/bin/asterctl publication-init \
+  --journal /var/lib/aster-operator/events.redb --client-id operator-events
+```
+
 Publish on Node A:
 
 ```sh
 sudo -u aster /usr/bin/asterctl \
   --token-file /etc/aster/agent-credentials/client-token \
   publish \
+  --journal /var/lib/aster-operator/events.redb --client-id operator-events \
   --topic chat.events \
   --scope mission/team/alpha \
   --priority routine \
-  --operation-key operator-check-001 \
   "Node A operator check"
 ```
 
@@ -278,8 +287,14 @@ For a 60-second Event, add:
 --ttl-ms 60000
 ```
 
-If publication times out, retry the identical request on the same node with
-the same operation key, payload, and options.
+The journal contains plaintext intents and retained results; protect it and do
+not delete or reinitialize it to retry. After an uncertain outcome, use
+`publication-recover` with the same `--journal` and `--client-id`, then
+`publication-retry --sequence N` for the original pending sequence. Running
+`publish` again creates a new intent. After saving a committed result in your
+application, use `publication-ack --sequence N` with the same journal, identity,
+and token options to reclaim capacity. See the
+[CLI publication guide](../crates/asterctl/README.md#publish).
 
 ### Step 8: test a Blob
 
@@ -502,15 +517,26 @@ The bundle must authorize `chat.events@mission/team/alpha` and
 `imagery.maps@mission/team/alpha`. A local publish/query needs no subscription;
 for a peer-transfer check, create the matching subscription on the receiving
 node before publication and allow authenticated contact after creation. Publish
-and query an Event:
+and query an Event. Initialize the journal once in the persistent transfer
+bind mount, then retain it for later invocations:
 
 ```sh
+docker compose -f "$ASTER_COMPOSE_FILE" run --rm asterctl publication-init \
+  --journal /transfer/operator-events.redb --client-id compose-operator-events
 docker compose -f "$ASTER_COMPOSE_FILE" run --rm asterctl --json publish \
   --topic chat.events --scope mission/team/alpha --priority routine \
-  --operation-key compose-event-001 "Compose operator check"
+  --journal /transfer/operator-events.redb --client-id compose-operator-events \
+  "Compose operator check"
 docker compose -f "$ASTER_COMPOSE_FILE" run --rm asterctl --json query \
   --topic chat.events --scope mission/team/alpha
 ```
+
+Keep the transfer directory and journal protected; the journal holds plaintext
+Event intents and must survive the disposable CLI container. For later checks,
+omit `publication-init`. Use the same journal and identity with
+`publication-recover`, `publication-retry --sequence N`, and, after saving the
+result, `publication-ack --sequence N`, as in Debian Step 7. Each journal retains
+at most eight unacknowledged entries.
 
 Stage a nonempty file, publish it, and record the returned Blob ID:
 
@@ -610,7 +636,8 @@ mesh override:
 docker compose -f "$ASTER_COMPOSE_FILE" -f "$ASTER_REMOTE_MESH_FILE" \
   run --rm asterctl --json publish \
   --topic chat.events --scope mission/team/alpha --priority routine \
-  --operation-key compose-peer-event-001 "Docker to device check"
+  --journal /transfer/operator-events.redb --client-id compose-operator-events \
+  "Docker to device check"
 docker compose -f "$ASTER_COMPOSE_FILE" -f "$ASTER_REMOTE_MESH_FILE" \
   run --rm asterctl --timeout 900 --json blob-publish \
   --file /transfer/map.bin --topic imagery.maps \

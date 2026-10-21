@@ -10,8 +10,8 @@ ignore = [
   # treating this exception as production admission.
   "RUSTSEC-2026-0173",
   # The same pilot's compile-time localization configuration parser is also
-  # unmaintained, with no reported vulnerability or patched release. ADR 0018
-  # records its exact checksum, graph boundary, upstream migration, and exit.
+  # unmaintained. The scope checker enforces its exact version, registry source,
+  # checksum, and reverse dependency graph; ADR 0018 records migration and exit.
   "RUSTSEC-2026-0374",
 ]
 
