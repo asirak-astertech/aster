@@ -951,12 +951,12 @@ class RepositoryPolicyTests(unittest.TestCase):
         )
         self.assertEqual(workflow.count(matrix), 1)
         self.assertEqual(workflow.count("runs-on: ${{ matrix.runner }}"), 1)
-        self.assertEqual(
-            workflow.count(
-                "docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069"
-            ),
-            1,
+        buildx_actions = tuple(
+            match
+            for match in MODULE.ACTION_USE_RE.finditer(workflow)
+            if match.group("repository") == "docker/setup-buildx-action"
         )
+        self.assertEqual(len(buildx_actions), 1)
         self.assertEqual(workflow.count("driver: docker-container"), 1)
         self.assertEqual(
             workflow.count(
@@ -1000,13 +1000,7 @@ class RepositoryPolicyTests(unittest.TestCase):
         for old, new in (
             ("retention-days: 14", "retention-days: 0"),
             ("timeout-minutes: 60", "timeout-minutes: 0"),
-            ("actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
-             "actions/checkout@main"),
             ("docker buildx build", "docker run --rm"),
-            (
-                "docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069",
-                "docker/setup-buildx-action@main",
-            ),
             ("driver: docker-container", "driver: docker"),
             (
                 "image=moby/buildkit:buildx-stable-1@sha256:"
@@ -1032,10 +1026,73 @@ class RepositoryPolicyTests(unittest.TestCase):
         ):
             with self.subTest(new=new):
                 mutation = workflow.replace(old, new, 1)
-                digest = hashlib.sha256(mutation.encode()).hexdigest()
+                normalized = MODULE.normalize_workflow_action_pins(mutation)
+                digest = hashlib.sha256(normalized.encode()).hexdigest()
                 with mock.patch.object(MODULE, "COMPOSE_BUILD_WORKFLOW_SHA256", digest):
                     with self.assertRaises(MODULE.ValidationError):
                         MODULE.validate_workflow_policy(mutation, ci)
+
+    def test_release_workflow_accepts_reviewed_action_pin_updates(self):
+        workflow = (REPOSITORY / ".github/workflows/build-compose-images.yml").read_text()
+        ci = (REPOSITORY / ".github/workflows/ci.yml").read_text()
+        matches = tuple(MODULE.ACTION_USE_RE.finditer(workflow))
+        self.assertEqual(
+            tuple(match.group("repository") for match in matches),
+            MODULE.APPROVED_WORKFLOW_ACTIONS,
+        )
+
+        updated_workflow = workflow
+        for index, match in enumerate(matches):
+            replacement = (
+                f'{match.group("prefix")}{match.group("repository")}@'
+                f'{chr(ord("a") + index) * 40}{match.group("comment_prefix")}'
+                f'v99.{index}.0{match.group("suffix")}'
+            )
+            with self.subTest(action=match.group("repository")):
+                mutation = workflow.replace(match.group(0), replacement, 1)
+                self.assertNotEqual(mutation, workflow)
+                MODULE.validate_workflow_policy(mutation, ci)
+            updated_workflow = updated_workflow.replace(match.group(0), replacement, 1)
+
+        self.assertNotEqual(updated_workflow, workflow)
+        MODULE.validate_workflow_policy(updated_workflow, ci)
+
+    def test_release_workflow_rejects_unapproved_or_unpinned_actions(self):
+        workflow = (REPOSITORY / ".github/workflows/build-compose-images.yml").read_text()
+        ci = (REPOSITORY / ".github/workflows/ci.yml").read_text()
+        checkout = next(
+            match
+            for match in MODULE.ACTION_USE_RE.finditer(workflow)
+            if match.group("repository") == "actions/checkout"
+        )
+        prefix = checkout.group("prefix")
+        version = checkout.group("version")
+        suffix = checkout.group("suffix")
+        checkout_line = checkout.group(0)
+        mutations = (
+            workflow.replace(checkout_line, f"{prefix}actions/checkout@main # {version}", 1),
+            workflow.replace(checkout_line, f"{prefix}actions/checkout@abc123 # {version}", 1),
+            workflow.replace(checkout_line, f"{prefix}actions/checkout@{'a' * 40}  # {version}", 1),
+            workflow.replace(checkout_line, f"{prefix}actions/checkout@{'a' * 40} #  {version}", 1),
+            workflow.replace(checkout_line, f"{prefix}actions/checkout@{'a' * 40} # {version} ", 1),
+            workflow.replace(
+                checkout_line,
+                f"{prefix}attacker/checkout@{'a' * 40} # {version}{suffix}",
+                1,
+            ),
+            workflow.replace(checkout_line, f"{prefix}actions/checkout@{'a' * 40}", 1),
+            workflow.replace(checkout_line, f"{prefix}actions/checkout@{'a' * 40} # latest", 1),
+            workflow.replace(f"      - name: Check out source\n{checkout_line}\n", "", 1),
+            workflow.replace(
+                f"{checkout_line}\n",
+                f"{checkout_line}\n{prefix}actions/cache@{'e' * 40} # v6.1.0\n",
+                1,
+            ),
+        )
+        for index, mutation in enumerate(mutations):
+            self.assertNotEqual(mutation, workflow)
+            with self.subTest(case=index), self.assertRaises(MODULE.ValidationError):
+                MODULE.validate_workflow_policy(mutation, ci)
 
     def test_release_workflow_rejects_structural_and_command_obfuscation(self):
         workflow = (REPOSITORY / ".github/workflows/build-compose-images.yml").read_text()
@@ -1061,7 +1118,8 @@ class RepositoryPolicyTests(unittest.TestCase):
         )
         for index, mutation in enumerate(mutations):
             with self.subTest(case=index):
-                digest = hashlib.sha256(mutation.encode()).hexdigest()
+                normalized = MODULE.normalize_workflow_action_pins(mutation)
+                digest = hashlib.sha256(normalized.encode()).hexdigest()
                 with mock.patch.object(MODULE, "COMPOSE_BUILD_WORKFLOW_SHA256", digest):
                     with self.assertRaises(MODULE.ValidationError):
                         MODULE.validate_workflow_policy(mutation, ci)
