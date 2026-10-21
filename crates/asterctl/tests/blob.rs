@@ -205,7 +205,7 @@ fn blob_read_rejects_an_existing_output_without_clobbering_it() {
 
 #[cfg(not(target_os = "linux"))]
 #[test]
-fn blob_read_rejects_unsupported_platforms_before_contact_or_output_creation() {
+fn platform_compat_blob_read_rejects_before_contact_or_output_creation() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let destination = TestPath::new("unsupported-read");

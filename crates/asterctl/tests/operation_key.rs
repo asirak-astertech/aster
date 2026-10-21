@@ -16,16 +16,21 @@ use proto::aster::application::v1alpha1 as api;
 const TOKEN: &str = "asterctl-test-token-00000000000000";
 
 fn command(kind: &str, port: u16, key: Option<&str>) -> Command {
+    command_with_timeout(kind, port, key, None)
+}
+
+fn command_with_timeout(
+    kind: &str,
+    port: u16,
+    key: Option<&str>,
+    timeout_seconds: Option<&str>,
+) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_asterctl"));
-    command.args([
-        "--token",
-        TOKEN,
-        "--port",
-        &port.to_string(),
-        "--json",
-        kind,
-        "--scope=x",
-    ]);
+    command.args(["--token", TOKEN, "--port", &port.to_string(), "--json"]);
+    if let Some(timeout_seconds) = timeout_seconds {
+        command.arg(format!("--timeout={timeout_seconds}"));
+    }
+    command.args([kind, "--scope=x"]);
     if let Some(key) = key {
         command.args(["--operation-key", key]);
     }
@@ -287,7 +292,12 @@ fn unusable_receipts_keep_the_key_and_report_unknown_outcomes() {
 fn timeouts_preserve_the_generated_key_without_retrying() {
     let cases: Vec<_> = ["subscribe"].into_iter().map(|kind| thread::spawn(move || {
         let listener = listener();
-        let mut cmd = command(kind, listener.local_addr().unwrap().port(), Some("auto"));
+        let mut cmd = command_with_timeout(
+            kind,
+            listener.local_addr().unwrap().port(),
+            Some("auto"),
+            Some("1"),
+        );
         let child = cmd.spawn().unwrap();
         let mut stream = accept(&listener);
         let key = key_from_request(kind, &request(&mut stream));

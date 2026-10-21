@@ -602,7 +602,7 @@ mod tests {
 
     #[cfg(not(target_os = "linux"))]
     #[test]
-    fn blob_read_fails_closed_on_unsupported_platforms() {
+    fn platform_compat_blob_read_fails_closed_on_unsupported_platforms() {
         let path = std::env::temp_dir().join("asterctl-blob-unsupported-platform");
         assert_eq!(
             OutputFile::create(path).err(),

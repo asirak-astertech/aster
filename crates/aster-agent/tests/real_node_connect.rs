@@ -1356,8 +1356,8 @@ async fn subscription_listing_survives_restart_with_binary_keys_and_distinct_sel
 }
 
 #[tokio::test]
-async fn optional_event_ttl_is_enforced_by_the_live_agent() {
-    const TEST_TTL_MS: u64 = 10_000;
+async fn platform_compat_optional_event_ttl_is_enforced_by_the_live_agent() {
+    const TEST_TTL_MS: u64 = 3_000;
 
     let state = TestState::new();
     let mission = UnprotectedReferenceMission::from_bytes(
