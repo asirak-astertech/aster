@@ -529,9 +529,32 @@ impl BlobStreamPlainPartition {
         total_len: u64,
         plaintext: Vec<u8>,
     ) -> Result<Self, BlobError> {
+        Self::new_with_segment_bytes(
+            stream_id,
+            open_digest,
+            content_epoch,
+            index,
+            offset,
+            total_len,
+            plaintext,
+            BLOB_STREAM_SEGMENT_BYTES,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_segment_bytes(
+        stream_id: [u8; 32],
+        open_digest: [u8; 32],
+        content_epoch: u64,
+        index: u64,
+        offset: u64,
+        total_len: u64,
+        plaintext: Vec<u8>,
+        segment_bytes: usize,
+    ) -> Result<Self, BlobError> {
         let len = plaintext.len();
         let expected_offset = index
-            .checked_mul(BLOB_STREAM_SEGMENT_BYTES as u64)
+            .checked_mul(segment_bytes as u64)
             .ok_or(BlobError::LengthOverflow)?;
         let end = offset
             .checked_add(len as u64)
@@ -539,12 +562,14 @@ impl BlobStreamPlainPartition {
         if stream_id == [0; 32]
             || open_digest == [0; 32]
             || content_epoch == 0
+            || segment_bytes == 0
+            || segment_bytes > BLOB_STREAM_SEGMENT_BYTES
             || total_len == 0
             || offset != expected_offset
             || len == 0
-            || len > BLOB_STREAM_SEGMENT_BYTES
+            || len > segment_bytes
             || end > total_len
-            || (end < total_len && len != BLOB_STREAM_SEGMENT_BYTES)
+            || (end < total_len && len != segment_bytes)
         {
             return Err(BlobError::InvalidManifest);
         }
@@ -557,6 +582,34 @@ impl BlobStreamPlainPartition {
             total_len,
             plaintext: Zeroizing::new(plaintext),
         })
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_segment_bytes_for_test(
+        stream_id: [u8; 32],
+        open_digest: [u8; 32],
+        content_epoch: u64,
+        index: u64,
+        offset: u64,
+        total_len: u64,
+        plaintext: Vec<u8>,
+        segment_bytes: usize,
+    ) -> Result<Self, BlobError> {
+        assert!(
+            segment_bytes > 0 && segment_bytes <= BLOB_STREAM_SEGMENT_BYTES,
+            "test segment bound must be within the production limit"
+        );
+        Self::new_with_segment_bytes(
+            stream_id,
+            open_digest,
+            content_epoch,
+            index,
+            offset,
+            total_len,
+            plaintext,
+            segment_bytes,
+        )
     }
 }
 
@@ -697,6 +750,16 @@ impl EncryptedBlobStreamSegment {
     fn decode_borrowed(
         encoded: &[u8],
     ) -> Result<(EncryptedBlobStreamSegmentHeader, &[u8]), BlobError> {
+        Self::decode_borrowed_with_segment_bytes(encoded, BLOB_STREAM_SEGMENT_BYTES)
+    }
+
+    fn decode_borrowed_with_segment_bytes(
+        encoded: &[u8],
+        segment_bytes: usize,
+    ) -> Result<(EncryptedBlobStreamSegmentHeader, &[u8]), BlobError> {
+        if segment_bytes == 0 || segment_bytes > BLOB_STREAM_SEGMENT_BYTES {
+            return Err(BlobError::InvalidManifest);
+        }
         let mut reader = StreamReader::new(encoded);
         if reader.take(8)? != BLOB_STREAM_SEGMENT_MAGIC
             || reader.u16()? != BLOB_STREAM_FORMAT_VERSION
@@ -719,14 +782,14 @@ impl EncryptedBlobStreamSegment {
             || content_epoch == 0
             || total_len == 0
             || plaintext_len == 0
-            || plaintext_len as usize > BLOB_STREAM_SEGMENT_BYTES
+            || plaintext_len as usize > segment_bytes
             || ciphertext_len != plaintext_len as usize + 16
             || offset
                 != index
-                    .checked_mul(BLOB_STREAM_SEGMENT_BYTES as u64)
+                    .checked_mul(segment_bytes as u64)
                     .ok_or(BlobError::LengthOverflow)?
             || end > total_len
-            || (end < total_len && plaintext_len as usize != BLOB_STREAM_SEGMENT_BYTES)
+            || (end < total_len && plaintext_len as usize != segment_bytes)
         {
             return Err(BlobError::InvalidManifest);
         }
@@ -957,6 +1020,28 @@ impl BlobStreamSegmentOpener {
         BlobError,
     > {
         let (header, ciphertext) = EncryptedBlobStreamSegment::decode_borrowed(encoded)?;
+        self.open_borrowed(header, ciphertext)
+    }
+
+    #[cfg(test)]
+    fn open_encoded_with_segment_bytes_for_test(
+        &self,
+        encoded: &[u8],
+        segment_bytes: usize,
+    ) -> Result<
+        (
+            EncryptedBlobStreamSegmentHeader,
+            Zeroizing<Vec<u8>>,
+            BlobStreamSegmentLeaves,
+        ),
+        BlobError,
+    > {
+        assert!(
+            segment_bytes > 0 && segment_bytes <= BLOB_STREAM_SEGMENT_BYTES,
+            "test segment bound must be within the production limit"
+        );
+        let (header, ciphertext) =
+            EncryptedBlobStreamSegment::decode_borrowed_with_segment_bytes(encoded, segment_bytes)?;
         self.open_borrowed(header, ciphertext)
     }
 
@@ -1584,22 +1669,39 @@ mod tests {
     use super::*;
     use crate::{BlobMetadata, Priority, Scope, Topic, VersionVector};
 
+    const TEST_SEGMENT_BYTES: usize = 32;
+
     fn identities() -> ([u8; 32], [u8; 32], [u8; 32], [u8; 12]) {
         ([0x11; 32], [0x22; 32], [0x33; 32], [0x44; 12])
     }
 
     fn partition(index: u64, byte: u8) -> BlobStreamPlainPartition {
         let (stream_id, open_digest, _, _) = identities();
-        BlobStreamPlainPartition::new(
+        BlobStreamPlainPartition::new_with_segment_bytes_for_test(
             stream_id,
             open_digest,
             7,
             index,
-            index * BLOB_STREAM_SEGMENT_BYTES as u64,
-            4 * BLOB_STREAM_SEGMENT_BYTES as u64,
-            vec![byte; BLOB_STREAM_SEGMENT_BYTES],
+            index * TEST_SEGMENT_BYTES as u64,
+            4 * TEST_SEGMENT_BYTES as u64,
+            vec![byte; TEST_SEGMENT_BYTES],
+            TEST_SEGMENT_BYTES,
         )
         .expect("valid partition")
+    }
+
+    fn single_partition(byte: u8) -> BlobStreamPlainPartition {
+        let (stream_id, open_digest, _, _) = identities();
+        BlobStreamPlainPartition::new(
+            stream_id,
+            open_digest,
+            7,
+            0,
+            0,
+            TEST_SEGMENT_BYTES as u64,
+            vec![byte; TEST_SEGMENT_BYTES],
+        )
+        .expect("valid final partition")
     }
 
     fn contexts() -> (BlobStreamSegmentSealer, BlobStreamSegmentOpener) {
@@ -1638,6 +1740,7 @@ mod tests {
 
     #[test]
     fn blob_stream_open_has_a_distinct_multi_gibibyte_protocol_bound() {
+        assert_eq!(BLOB_STREAM_SEGMENT_BYTES, 1024 * 1024);
         let metadata = BlobMetadata::new(None, Vec::new()).expect("metadata");
         assert!(open_with_len(metadata.clone(), 1024 * 1024 * 1024).is_ok());
         assert!(open_with_len(metadata.clone(), MAX_BLOB_STREAM_BYTES).is_ok());
@@ -1706,8 +1809,11 @@ mod tests {
         sealed.swap(0, 3);
         sealed.swap(1, 2);
         for (segment, expected_leaves) in sealed {
-            let (plaintext, leaves) = opener.open(&segment).expect("open shuffled segment");
-            assert_eq!(plaintext[0], segment.index() as u8 + 1);
+            let encoded = segment.encode();
+            let (header, plaintext, leaves) = opener
+                .open_encoded_with_segment_bytes_for_test(&encoded, TEST_SEGMENT_BYTES)
+                .expect("decode and open shuffled segment");
+            assert_eq!(plaintext[0], header.index as u8 + 1);
             assert_eq!(leaves, expected_leaves);
         }
     }
@@ -1734,7 +1840,7 @@ mod tests {
             .append(BlobStreamSubtree::combine(left, right).expect("root"))
             .expect("append");
         frontier
-            .finish(4 * BLOB_STREAM_SEGMENT_BYTES as u64)
+            .finish(4 * TEST_SEGMENT_BYTES as u64)
             .expect("finish")
     }
 
@@ -1747,7 +1853,7 @@ mod tests {
 
     #[test]
     fn plaintext_root_is_stable_across_distinct_publication_contexts() {
-        let plaintext = vec![0x5a; BLOB_STREAM_SEGMENT_BYTES];
+        let plaintext = vec![0x5a; 32];
         let make_partition = |stream_id, open_digest| {
             BlobStreamPlainPartition::new(
                 stream_id,
@@ -1755,7 +1861,7 @@ mod tests {
                 7,
                 0,
                 0,
-                BLOB_STREAM_SEGMENT_BYTES as u64,
+                plaintext.len() as u64,
                 plaintext.clone(),
             )
             .expect("partition")
@@ -1778,9 +1884,7 @@ mod tests {
             frontier
                 .append(BlobStreamSubtree::leaf(0, leaves))
                 .expect("append");
-            frontier
-                .finish(BLOB_STREAM_SEGMENT_BYTES as u64)
-                .expect("finish")
+            frontier.finish(plaintext.len() as u64).expect("finish")
         };
         let first_roots = finish(first);
         let second_roots = finish(second);
@@ -1814,7 +1918,7 @@ mod tests {
         }
         assert_eq!(
             restored
-                .finish(4 * BLOB_STREAM_SEGMENT_BYTES as u64)
+                .finish(4 * TEST_SEGMENT_BYTES as u64)
                 .expect("finish"),
             roots_for_order(&[0, 1, 2, 3])
         );
@@ -1856,7 +1960,7 @@ mod tests {
                 .expect("append");
         }
         let roots = frontier
-            .finish(3 * BLOB_STREAM_SEGMENT_BYTES as u64)
+            .finish(3 * TEST_SEGMENT_BYTES as u64)
             .expect("three-segment root");
         assert_ne!(roots.0, [0; 32]);
         assert_ne!(roots.1, [0; 32]);
@@ -1874,7 +1978,7 @@ mod tests {
     #[test]
     fn blob_stream_segment_round_trips_canonically() {
         let (sealer, opener) = contexts();
-        let (segment, expected_leaves) = sealer.seal(partition(0, 9)).expect("seal");
+        let (segment, expected_leaves) = sealer.seal(single_partition(9)).expect("seal");
         let encoded = segment.encode();
         let decoded = EncryptedBlobStreamSegment::decode(&encoded).expect("decode");
         assert_eq!(decoded, segment);

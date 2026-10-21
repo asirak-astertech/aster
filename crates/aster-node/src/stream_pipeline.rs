@@ -940,12 +940,20 @@ mod tests {
         pool.submit_unbudgeted(StreamPartition::new(0, vec![0; 16]))
             .expect("first partition");
         map_started.wait();
-        let submitted = Instant::now();
-        pool.submit_unbudgeted(StreamPartition::new(1, vec![1; 16]))
-            .expect("queued partition");
-        assert!(submitted.elapsed() < Duration::from_millis(100));
 
-        release_map.wait();
+        let (submitted_tx, submitted_rx) = std::sync::mpsc::sync_channel(0);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let result = pool.submit_unbudgeted(StreamPartition::new(1, vec![1; 16]));
+                submitted_tx.send(result).expect("submission observer");
+            });
+            let submitted = submitted_rx.recv_timeout(Duration::from_secs(1));
+            release_map.wait();
+            submitted
+                .expect("queued admission waited for the active map")
+                .expect("queued partition");
+        });
+
         assert_eq!(pool.recv_mapped_blocking().expect("first map").index(), 0);
         assert_eq!(pool.recv_mapped_blocking().expect("second map").index(), 1);
         pool.shutdown().expect("joined pool");

@@ -36,6 +36,30 @@ cargo test --offline --locked --release -p aster-node stream_codec_ceiling_proce
 cargo test --offline --locked --release -p aster-iroh concurrent_stream_ceiling_transfers_one_gib_with_reverse_checkpoints -- --ignored --nocapture
 ```
 
+The public application-RPC publish/read path has a separate ignored benchmark.
+It uses the real node, native bidirectional gRPC upload, durable publication,
+and authenticated streaming read; it is not part of default correctness CI.
+Run it serially with a release build and place temporary state on a filesystem
+large enough for the selected payload and durable overhead:
+
+```text
+df -B1 "${TMPDIR:-/tmp}"
+/usr/bin/time -v -o /var/tmp/aster-blob-application-rss.txt \
+  env ASTER_BLOB_BENCH_BYTES=1073741824 \
+  cargo test --offline --locked --release -p aster-agent --all-features \
+  --test real_node_connect real_node_blob_bidi_stream_benchmark \
+  -- --ignored --exact --nocapture --test-threads=1
+df -B1 "${TMPDIR:-/tmp}"
+```
+
+For 1 GiB, budget at least 2 GiB of free temporary storage, 2 GiB of available
+memory, two CPU cores, and 20 minutes as a conservative timeout. Retain the
+binary commit, payload bytes, publish/read elapsed time and MiB/s, checkpoint
+count, temporary-filesystem capacity before and after the run, and the GNU
+`time` peak-RSS report. This local loopback result
+is engineering evidence only; it does not replace same-path raw transport or
+CM4 end-to-end qualification.
+
 ## Selected-contact measurement fields
 
 Semantic-v9/profile-5 contacts emit bounded measurements in their `CONTACT`

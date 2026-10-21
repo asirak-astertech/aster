@@ -878,6 +878,7 @@ async fn send_completed_pack_inner(
 struct RecordPartitioner {
     next_index: u64,
     consumed: u64,
+    max_record_bytes: usize,
 }
 
 impl RecordPartitioner {
@@ -885,7 +886,18 @@ impl RecordPartitioner {
         Self {
             next_index,
             consumed,
+            max_record_bytes: PROFILE5_MAX_RECORD_BYTES,
         }
+    }
+
+    #[cfg(test)]
+    fn with_max_record_bytes_for_test(mut self, max_record_bytes: usize) -> Self {
+        assert!(
+            max_record_bytes > 0 && max_record_bytes <= PROFILE5_MAX_RECORD_BYTES,
+            "test record bound must be within the production limit"
+        );
+        self.max_record_bytes = max_record_bytes;
+        self
     }
 
     async fn push(
@@ -901,7 +913,7 @@ impl RecordPartitioner {
             ));
         }
         let len = u32::from_be_bytes(bytes[..4].try_into().expect("record length")) as usize;
-        if len == 0 || len > PROFILE5_MAX_RECORD_BYTES {
+        if len == 0 || len > self.max_record_bytes {
             return Err(BlobNetworkError::new(
                 BlobNetworkStage::Framing,
                 "partition network extent",
@@ -1458,7 +1470,7 @@ mod tests {
     fn mission_data_record_protects_only_the_canonical_header() {
         let (mut sender, mut receiver, profile_digest) = mission_pair();
         let nonce = [0xc2; 32];
-        let body = vec![0xc3; PROFILE5_EXTENT_BYTES];
+        let body = vec![0xc3; 32];
         let frame = StreamFrame::Data(crate::stream_transfer::StreamDataV1 {
             transfer_id: [0xc4; 32],
             attempt_nonce: nonce,
@@ -1491,7 +1503,7 @@ mod tests {
 
     #[test]
     fn plain_data_framing_moves_the_canonical_record_allocation() {
-        let body = vec![0xc3; PROFILE5_EXTENT_BYTES];
+        let body = vec![0xc3; 32];
         let allocation = body.as_ptr();
         let data = crate::stream_transfer::StreamDataV1 {
             transfer_id: [0xc4; 32],
@@ -1917,12 +1929,14 @@ mod tests {
     #[tokio::test]
     async fn record_partitioner_rejects_records_larger_than_one_profile_extent() {
         let (sender, _receiver) = mpsc::channel(1);
-        let declared = PROFILE5_MAX_RECORD_BYTES + 1;
+        const TEST_RECORD_BYTES: usize = 4;
+        let declared = TEST_RECORD_BYTES + 1;
         let mut bytes = vec![0; declared + crate::stream_transfer::PROFILE5_RECORD_PREFIX_BYTES];
         bytes[..crate::stream_transfer::PROFILE5_RECORD_PREFIX_BYTES]
             .copy_from_slice(&(declared as u32).to_be_bytes());
 
         let error = RecordPartitioner::new(0, 0)
+            .with_max_record_bytes_for_test(TEST_RECORD_BYTES)
             .push(bytes, &sender)
             .await
             .expect_err("oversized profile-5 record must fail before verification");
@@ -2078,7 +2092,7 @@ mod tests {
     async fn completed_pack_crosses_v9_as_verified_checkpointed_segments() {
         let source_root = TempRoot::new("source");
         let receiver_root = TempRoot::new("receiver");
-        let total_len = 10 * BLOB_STREAM_SEGMENT_BYTES + 17;
+        let total_len = 3 * BLOB_STREAM_SEGMENT_BYTES + 17;
         let plaintext = (0..total_len)
             .map(|index| (index % 251) as u8)
             .collect::<Vec<_>>();

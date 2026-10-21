@@ -80,6 +80,19 @@ impl BlobConnectService {
         &self,
         request: api::ReadBlobRequest,
     ) -> ServiceResult<ServiceStream<api::ReadBlobResponse>> {
+        self.read_with_page_bytes(request, BLOB_RPC_FRAME_BYTES)
+            .await
+    }
+
+    async fn read_with_page_bytes(
+        &self,
+        request: api::ReadBlobRequest,
+        page_bytes: usize,
+    ) -> ServiceResult<ServiceStream<api::ReadBlobResponse>> {
+        assert!(
+            page_bytes > 0 && page_bytes <= BLOB_RPC_FRAME_BYTES,
+            "Blob read page bound must be within the production limit"
+        );
         let operation = PublicOperation::ReadBlob;
         let (request, topic, scope) = parse_read_request(request)?;
         let state = ReadStreamState {
@@ -100,7 +113,7 @@ impl BlobConnectService {
                 .read_page(BlobReadPageRequest {
                     blob: state.request.clone(),
                     offset: state.offset,
-                    max_bytes: BLOB_RPC_FRAME_BYTES,
+                    max_bytes: page_bytes,
                 })
                 .await
                 .map_err(|error| connect_blob_application_error(error, operation))?;
@@ -117,7 +130,7 @@ impl BlobConnectService {
             let complete = page.complete;
             let page_len = u64::try_from(page.len()).map_err(|_| internal(operation))?;
             if page.offset.checked_add(page_len) != Some(next_offset)
-                || page.len() > BLOB_RPC_FRAME_BYTES
+                || page.len() > page_bytes
                 || complete != (next_offset == observed.total_len)
             {
                 return Err(internal(operation));
@@ -180,11 +193,22 @@ struct UploadGrammar {
     received: u64,
     frames: u64,
     maximum_frames: u64,
+    frame_bytes: usize,
 }
 
 impl UploadGrammar {
     fn start(first: api::PublishBlobRequest) -> Result<(ParsedPublish, Self), ConnectError> {
+        Self::start_with_frame_bytes(first, BLOB_RPC_FRAME_BYTES)
+    }
+
+    fn start_with_frame_bytes(
+        first: api::PublishBlobRequest,
+        frame_bytes: usize,
+    ) -> Result<(ParsedPublish, Self), ConnectError> {
         let operation = PublicOperation::PublishBlob;
+        if frame_bytes == 0 || frame_bytes > BLOB_RPC_FRAME_BYTES {
+            return Err(internal(operation));
+        }
         let api::publish_blob_request::Frame::Metadata(metadata) =
             first.frame.ok_or_else(|| malformed(operation))?
         else {
@@ -216,7 +240,7 @@ impl UploadGrammar {
                 BlobPublishOptions::finite_ttl_ms(ttl_ms).map_err(|_| malformed(operation))?
             }
         };
-        let maximum_frames = maximum_chunk_frames_for_len(metadata.total_len)?;
+        let maximum_frames = maximum_chunk_frames_for_len(metadata.total_len, frame_bytes)?;
         Ok((
             ParsedPublish {
                 request: NodeBlobPublishRequest {
@@ -234,19 +258,32 @@ impl UploadGrammar {
                 received: 0,
                 frames: 0,
                 maximum_frames,
+                frame_bytes,
             },
         ))
+    }
+
+    #[cfg(test)]
+    fn start_with_frame_bytes_for_test(
+        first: api::PublishBlobRequest,
+        frame_bytes: usize,
+    ) -> Result<(ParsedPublish, Self), ConnectError> {
+        assert!(
+            frame_bytes > 0 && frame_bytes <= BLOB_RPC_FRAME_BYTES,
+            "test frame bound must be within the production limit"
+        );
+        Self::start_with_frame_bytes(first, frame_bytes)
     }
 
     fn resume(mut self, durable_offset: u64) -> Result<Self, ConnectError> {
         if durable_offset > self.total_len
             || (durable_offset != self.total_len
-                && !durable_offset.is_multiple_of(BLOB_RPC_FRAME_BYTES as u64))
+                && !durable_offset.is_multiple_of(self.frame_bytes as u64))
         {
             return Err(internal(PublicOperation::PublishBlob));
         }
         self.received = durable_offset;
-        self.frames = chunk_frames_for_len(durable_offset)?;
+        self.frames = chunk_frames_for_len(durable_offset, self.frame_bytes)?;
         Ok(self)
     }
 
@@ -259,7 +296,7 @@ impl UploadGrammar {
         };
         if chunk.offset != self.received
             || chunk.bytes.is_empty()
-            || chunk.bytes.len() > BLOB_RPC_FRAME_BYTES
+            || chunk.bytes.len() > self.frame_bytes
         {
             return Err(malformed(operation));
         }
@@ -268,7 +305,7 @@ impl UploadGrammar {
             .total_len
             .checked_sub(self.received)
             .ok_or_else(|| malformed(operation))?;
-        let canonical_len = remaining.min(BLOB_RPC_FRAME_BYTES as u64);
+        let canonical_len = remaining.min(self.frame_bytes as u64);
         if chunk_len != canonical_len {
             return Err(malformed(operation));
         }
@@ -295,11 +332,11 @@ impl UploadGrammar {
     }
 }
 
-fn chunk_frames_for_len(len: u64) -> Result<u64, ConnectError> {
+fn chunk_frames_for_len(len: u64, frame_bytes: usize) -> Result<u64, ConnectError> {
     if len == 0 {
         return Ok(0);
     }
-    maximum_chunk_frames_for_len(len)
+    maximum_chunk_frames_for_len(len, frame_bytes)
 }
 
 struct PublishStreamState {
@@ -366,9 +403,12 @@ async fn next_publish_response(
     }
 }
 
-fn maximum_chunk_frames_for_len(total_len: u64) -> Result<u64, ConnectError> {
+fn maximum_chunk_frames_for_len(total_len: u64, frame_bytes: usize) -> Result<u64, ConnectError> {
     let operation = PublicOperation::PublishBlob;
-    let chunk_bytes = u64::try_from(BLOB_RPC_FRAME_BYTES).map_err(|_| internal(operation))?;
+    let chunk_bytes = u64::try_from(frame_bytes).map_err(|_| internal(operation))?;
+    if chunk_bytes == 0 {
+        return Err(internal(operation));
+    }
     total_len
         .checked_sub(1)
         .and_then(|value| value.checked_div(chunk_bytes))
@@ -652,7 +692,7 @@ mod tests {
     use aster_mesh::{ProvisioningAccess, ReferenceProvisioner};
     use aster_node::application::{
         BlobPublicationInspection, BlobPublicationPhase, BlobStreamPublicationId,
-        MAX_SELECTED_BLOB_PAGE_BYTES, MAX_SELECTED_BLOB_STREAM_BYTES,
+        MAX_SELECTED_BLOB_STREAM_BYTES,
     };
     #[cfg(target_os = "linux")]
     use aster_node::mission::UnprotectedReferenceMission;
@@ -846,7 +886,7 @@ mod tests {
     }
 
     #[test]
-    fn blob_upload_rejects_empty_oversized_and_length_mismatched_streams() {
+    fn blob_upload_rejects_empty_and_over_policy_declared_lengths_without_allocating_them() {
         assert_eq!(
             UploadGrammar::start(metadata_frame(0, None))
                 .unwrap_err()
@@ -859,29 +899,42 @@ mod tests {
                 .code,
             ErrorCode::ResourceExhausted
         );
+    }
 
+    #[test]
+    fn blob_upload_rejects_an_empty_chunk() {
         let (_, mut empty_chunk) = UploadGrammar::start(metadata_frame(1, None)).unwrap();
         assert_eq!(
             empty_chunk.accept(chunk(0, Vec::new())).unwrap_err().code,
             ErrorCode::InvalidArgument
         );
+    }
 
-        let (_, mut oversized_chunk) = UploadGrammar::start(metadata_frame(
-            (MAX_SELECTED_BLOB_PAGE_BYTES + 1) as u64,
-            None,
-        ))
+    #[test]
+    fn blob_upload_rejects_a_chunk_above_the_injected_frame_limit() {
+        const TEST_FRAME_BYTES: usize = 4;
+        let (_, mut oversized_chunk) = UploadGrammar::start_with_frame_bytes_for_test(
+            metadata_frame((TEST_FRAME_BYTES + 1) as u64, None),
+            TEST_FRAME_BYTES,
+        )
         .unwrap();
         assert_eq!(
             oversized_chunk
-                .accept(chunk(0, vec![0; MAX_SELECTED_BLOB_PAGE_BYTES + 1]))
+                .accept(chunk(0, vec![0; TEST_FRAME_BYTES + 1]))
                 .unwrap_err()
                 .code,
             ErrorCode::InvalidArgument
         );
+    }
 
+    #[test]
+    fn blob_upload_rejects_a_stream_shorter_than_declared() {
         let (_, short) = UploadGrammar::start(metadata_frame(2, None)).unwrap();
         assert_eq!(short.finish().unwrap_err().code, ErrorCode::InvalidArgument);
+    }
 
+    #[test]
+    fn blob_upload_rejects_a_chunk_longer_than_the_declared_stream() {
         let (_, mut long) = UploadGrammar::start(metadata_frame(1, None)).unwrap();
         assert_eq!(
             long.accept(chunk(0, vec![1, 2])).unwrap_err().code,
@@ -891,20 +944,33 @@ mod tests {
 
     #[test]
     fn blob_upload_resumes_only_from_canonical_durable_offsets() {
-        let total = BLOB_RPC_FRAME_BYTES as u64 * 2 + 1;
-        let (_, grammar) = UploadGrammar::start(metadata_frame(total, None)).unwrap();
-        let grammar = grammar.resume(BLOB_RPC_FRAME_BYTES as u64).unwrap();
-        assert_eq!(grammar.received, BLOB_RPC_FRAME_BYTES as u64);
+        const TEST_FRAME_BYTES: usize = 4;
+        let total = TEST_FRAME_BYTES as u64 * 2 + 1;
+        let (_, grammar) = UploadGrammar::start_with_frame_bytes_for_test(
+            metadata_frame(total, None),
+            TEST_FRAME_BYTES,
+        )
+        .unwrap();
+        let grammar = grammar.resume(TEST_FRAME_BYTES as u64).unwrap();
+        assert_eq!(grammar.received, TEST_FRAME_BYTES as u64);
         assert_eq!(grammar.frames, 1);
 
-        let (_, grammar) = UploadGrammar::start(metadata_frame(total, None)).unwrap();
+        let (_, grammar) = UploadGrammar::start_with_frame_bytes_for_test(
+            metadata_frame(total, None),
+            TEST_FRAME_BYTES,
+        )
+        .unwrap();
         assert_eq!(grammar.resume(1).unwrap_err().code, ErrorCode::DataLoss);
     }
 
     #[test]
     fn blob_upload_derives_frame_bound_from_declared_u64_length() {
-        let declared = MAX_SELECTED_BLOB_PAGE_BYTES as u64 * 1_025;
-        assert_eq!(maximum_chunk_frames_for_len(declared).unwrap(), 1_025);
+        const TEST_FRAME_BYTES: usize = 4;
+        let declared = TEST_FRAME_BYTES as u64 * 1_025;
+        assert_eq!(
+            maximum_chunk_frames_for_len(declared, TEST_FRAME_BYTES).unwrap(),
+            1_025
+        );
     }
 
     #[test]
@@ -956,7 +1022,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn lazy_read_reauthenticates_expiry_between_pages() {
-        let ttl = std::time::Duration::from_secs(5);
+        const TEST_PAGE_BYTES: usize = 4;
+        let ttl = std::time::Duration::from_secs(2);
         let fixture = StagingTestRoot::new();
         let state_root = fixture.0.join("state");
         fs::create_dir(&state_root).unwrap();
@@ -990,7 +1057,7 @@ mod tests {
         .unwrap();
         let blobs = node.selected_blobs();
         let source_path = fixture.0.join("source.bin");
-        fs::write(&source_path, vec![0x5c; MAX_SELECTED_BLOB_PAGE_BYTES + 1]).unwrap();
+        fs::write(&source_path, vec![0x5c; TEST_PAGE_BYTES + 1]).unwrap();
         let publication = blobs
             .publish_with_options(
                 NodeBlobPublishRequest {
@@ -1011,18 +1078,21 @@ mod tests {
             .unwrap();
         let service = BlobConnectService::new(blobs, &state_root).unwrap();
         let mut stream = service
-            .read(api::ReadBlobRequest {
-                id: publication.id.as_bytes().to_vec(),
-                topic: "imagery.maps".to_owned(),
-                scope: "mission/team/alpha".to_owned(),
-                ..Default::default()
-            })
+            .read_with_page_bytes(
+                api::ReadBlobRequest {
+                    id: publication.id.as_bytes().to_vec(),
+                    topic: "imagery.maps".to_owned(),
+                    scope: "mission/team/alpha".to_owned(),
+                    ..Default::default()
+                },
+                TEST_PAGE_BYTES,
+            )
             .await
             .unwrap()
             .body;
         let first = stream.next().await.unwrap().unwrap();
         assert_eq!(first.offset, 0);
-        assert_eq!(first.chunk.len(), MAX_SELECTED_BLOB_PAGE_BYTES);
+        assert_eq!(first.chunk.len(), TEST_PAGE_BYTES);
         assert!(!first.complete);
 
         tokio::time::sleep(ttl + std::time::Duration::from_millis(100)).await;

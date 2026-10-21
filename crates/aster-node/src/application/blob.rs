@@ -5263,12 +5263,12 @@ mod tests {
 
     #[test]
     fn stream_partition_moves_the_zeroizing_plaintext_allocation() {
-        let plaintext = Zeroizing::new(vec![0x5a; BLOB_STREAM_SEGMENT_BYTES]);
+        let plaintext = Zeroizing::new(vec![0x5a; 32]);
         let allocation = plaintext.as_ptr();
         let moved = take_zeroizing_bytes(plaintext);
 
         assert_eq!(moved.as_ptr(), allocation);
-        assert_eq!(moved.len(), BLOB_STREAM_SEGMENT_BYTES);
+        assert_eq!(moved.len(), 32);
     }
 
     fn content_delivery(item: &BlobDeliveryItem) -> &BlobDelivery {

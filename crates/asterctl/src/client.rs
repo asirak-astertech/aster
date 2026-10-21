@@ -559,6 +559,32 @@ pub async fn publish_blob_with_progress<P: ProgressSink>(
     timeout: Duration,
     progress: &RefCell<P>,
 ) -> Result<api::PublishBlobReceipt, BlobPublishFailure> {
+    publish_blob_with_progress_and_chunk_bytes(
+        address,
+        token,
+        metadata,
+        file,
+        timeout,
+        progress,
+        blob_publish::CHUNK_BYTES,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn publish_blob_with_progress_and_chunk_bytes<P: ProgressSink>(
+    address: SocketAddr,
+    token: &Token,
+    metadata: api::PublishBlobMetadata,
+    file: File,
+    timeout: Duration,
+    progress: &RefCell<P>,
+    chunk_bytes: usize,
+) -> Result<api::PublishBlobReceipt, BlobPublishFailure> {
+    assert!(
+        chunk_bytes > 0 && chunk_bytes <= blob_publish::CHUNK_BYTES,
+        "Blob publish chunk bound must be within the production limit"
+    );
     let progress_state = PublishProgress::new(0, metadata.total_len);
     let failure_state = progress_state.clone();
     let transfer = async {
@@ -591,12 +617,10 @@ pub async fn publish_blob_with_progress<P: ProgressSink>(
             ));
         };
         if accepted.accepted_offset != accepted.durable_offset
-            || accepted.canonical_frame_bytes != blob_publish::CHUNK_BYTES as u32
+            || accepted.canonical_frame_bytes != chunk_bytes as u32
             || accepted.durable_offset > total_len
             || (accepted.durable_offset != total_len
-                && !accepted
-                    .durable_offset
-                    .is_multiple_of(blob_publish::CHUNK_BYTES as u64))
+                && !accepted.durable_offset.is_multiple_of(chunk_bytes as u64))
         {
             return Err(MutationError::unknown(
                 "agent returned an invalid Blob resume offset",
@@ -612,7 +636,8 @@ pub async fn publish_blob_with_progress<P: ProgressSink>(
             .store(resume_offset, Ordering::Release);
         progress_state.report(progress, ProgressEvent::Initial)?;
         let (mut send, mut receive) = rpc.into_split();
-        let (mut frames, reader) = blob_publish::stream_file(file, total_len, resume_offset);
+        let (mut frames, reader) =
+            blob_publish::stream_file_with_chunk_bytes(file, total_len, resume_offset, chunk_bytes);
         let sender_progress = progress_state.clone();
         let sender = async move {
             while let Some(frame) = frames.next().await {
@@ -711,7 +736,7 @@ pub async fn publish_blob_with_progress<P: ProgressSink>(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub async fn read_blob(
     address: SocketAddr,
     token: &Token,
@@ -731,8 +756,34 @@ pub async fn read_blob_with_progress<P: ProgressSink>(
     timeout: Duration,
     progress: &mut P,
 ) -> Result<blob_read::Metadata, String> {
+    read_blob_with_progress_and_page_bytes(
+        address,
+        token,
+        request,
+        output_path,
+        timeout,
+        progress,
+        blob_read::RPC_PAGE_BYTES,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn read_blob_with_progress_and_page_bytes<P: ProgressSink>(
+    address: SocketAddr,
+    token: &Token,
+    request: api::ReadBlobRequest,
+    output_path: PathBuf,
+    timeout: Duration,
+    progress: &mut P,
+    page_bytes: usize,
+) -> Result<blob_read::Metadata, String> {
+    assert!(
+        page_bytes > 0 && page_bytes <= blob_read::RPC_PAGE_BYTES,
+        "Blob read page bound must be within the production limit"
+    );
     let mut output = blob_read::OutputFile::create(output_path).map_err(str::to_owned)?;
-    let mut validator = blob_read::Validator::new(request.clone());
+    let mut validator = blob_read::Validator::new(request.clone()).with_max_page_bytes(page_bytes);
     let mut written = 0_u64;
     let mut started = false;
     let transfer: Result<blob_read::Metadata, String> = async {
@@ -1005,7 +1056,12 @@ mod tests {
         }
     }
 
-    fn read_page(offset: u64, chunk: Vec<u8>, complete: bool) -> api::ReadBlobResponse {
+    fn read_page(
+        total_len: u64,
+        offset: u64,
+        chunk: Vec<u8>,
+        complete: bool,
+    ) -> api::ReadBlobResponse {
         api::ReadBlobResponse {
             id: vec![1; 32],
             publisher: vec![2; 32],
@@ -1014,7 +1070,7 @@ mod tests {
             scope: "mission/team/alpha".into(),
             priority: api::Priority::Immediate.into(),
             ttl_ms: Some(60_000),
-            total_len: (blob_publish::CHUNK_BYTES + 1) as u64,
+            total_len,
             media_type: Some("application/octet-stream".into()),
             schema_id: b"schema".to_vec(),
             acceptance_marker: 4,
@@ -1232,7 +1288,9 @@ mod tests {
 
     #[tokio::test]
     async fn blob_native_http2_fixture_covers_multi_page_publish_and_read_clients() {
-        let payload = vec![0x5a; blob_publish::CHUNK_BYTES + 1];
+        const TEST_FRAME_BYTES: usize = 4;
+        const TEST_TOTAL_BYTES: usize = TEST_FRAME_BYTES + 1;
+        let payload = vec![0x5a; TEST_TOTAL_BYTES];
         let metadata = publish_metadata(payload.len() as u64);
         let expected_receipt = receipt(&metadata);
         let observed = Arc::new(Mutex::new(Vec::new()));
@@ -1256,8 +1314,8 @@ mod tests {
                                                 frame: Some(
                                                     api::publish_blob_response::Frame::Accepted(
                                                         Box::new(api::PublishBlobAccepted {
-                                                            canonical_frame_bytes:
-                                                                blob_publish::CHUNK_BYTES as u32,
+                                                            canonical_frame_bytes: TEST_FRAME_BYTES
+                                                                as u32,
                                                             ..Default::default()
                                                         }),
                                                     ),
@@ -1303,9 +1361,15 @@ mod tests {
                 connectrpc::streaming_handler_fn(
                     |_ctx, _request: api::ReadBlobRequest| async move {
                         connectrpc::Response::stream_ok(connectrpc::stream_iter([
-                            Ok(read_page(0, vec![0x5a; blob_publish::CHUNK_BYTES], false)),
                             Ok(read_page(
-                                blob_publish::CHUNK_BYTES as u64,
+                                TEST_TOTAL_BYTES as u64,
+                                0,
+                                vec![0x5a; TEST_FRAME_BYTES],
+                                false,
+                            )),
+                            Ok(read_page(
+                                TEST_TOTAL_BYTES as u64,
+                                TEST_FRAME_BYTES as u64,
                                 vec![0x5a],
                                 true,
                             )),
@@ -1322,19 +1386,22 @@ mod tests {
         let _ = std::fs::remove_file(&source);
         std::fs::write(&source, &payload).unwrap();
 
-        let response = match publish_blob(
+        let progress = RefCell::new(NoProgress);
+        let response = match publish_blob_with_progress_and_chunk_bytes(
             fixture.address,
             &token(),
             metadata,
             File::open(&source).unwrap(),
             Duration::from_secs(2),
+            &progress,
+            TEST_FRAME_BYTES,
         )
         .await
         {
             Ok(response) => response,
-            Err(error) => panic!(
+            Err(failure) => panic!(
                 "{}",
-                error.describe(
+                failure.error.describe(
                     "PublishBlob",
                     &crate::operation_key::Selection::Explicit("native-http2-fixture".to_owned())
                         .resolve()
@@ -1353,12 +1420,12 @@ mod tests {
             assert!(matches!(
                 frames[1].frame.as_ref(),
                 Some(api::publish_blob_request::Frame::Data(chunk))
-                    if chunk.offset == 0 && chunk.bytes.len() == blob_publish::CHUNK_BYTES
+                    if chunk.offset == 0 && chunk.bytes.len() == TEST_FRAME_BYTES
             ));
             assert!(matches!(
                 frames[2].frame.as_ref(),
                 Some(api::publish_blob_request::Frame::Data(chunk))
-                    if chunk.offset == blob_publish::CHUNK_BYTES as u64 && chunk.bytes.len() == 1
+                    if chunk.offset == TEST_FRAME_BYTES as u64 && chunk.bytes.len() == 1
             ));
             assert!(matches!(
                 frames[3].frame,
@@ -1374,12 +1441,15 @@ mod tests {
                 scope: "mission/team/alpha".into(),
                 ..Default::default()
             };
-            let read = read_blob(
+            let mut progress = NoProgress;
+            let read = read_blob_with_progress_and_page_bytes(
                 fixture.address,
                 &token(),
                 request,
                 destination.clone(),
                 Duration::from_secs(2),
+                &mut progress,
+                TEST_FRAME_BYTES,
             )
             .await
             .unwrap();
@@ -1615,12 +1685,18 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn read_interruption_reports_discarded_bytes() {
+        const TEST_PAGE_BYTES: usize = 4;
         let router = connectrpc::Router::new().route_server_stream(
             SERVICE,
             "ReadBlob",
             connectrpc::streaming_handler_fn(|_ctx, _request: api::ReadBlobRequest| async move {
                 connectrpc::Response::stream_ok(connectrpc::stream_iter([
-                    Ok(read_page(0, vec![0x5a; blob_publish::CHUNK_BYTES], false)),
+                    Ok(read_page(
+                        (TEST_PAGE_BYTES + 1) as u64,
+                        0,
+                        vec![0x5a; TEST_PAGE_BYTES],
+                        false,
+                    )),
                     Err(connectrpc::ConnectError::unavailable(
                         "secret fixture detail",
                     )),
@@ -1636,12 +1712,15 @@ mod tests {
             scope: "mission/team/alpha".into(),
             ..Default::default()
         };
-        let error = read_blob(
+        let mut progress = NoProgress;
+        let error = read_blob_with_progress_and_page_bytes(
             fixture.address,
             &token(),
             request,
             destination.clone(),
             Duration::from_secs(2),
+            &mut progress,
+            TEST_PAGE_BYTES,
         )
         .await
         .unwrap_err();
@@ -1649,7 +1728,7 @@ mod tests {
         assert!(
             error.contains(&format!(
                 "discarded {} authenticated bytes",
-                blob_publish::CHUNK_BYTES
+                TEST_PAGE_BYTES
             )),
             "{error}"
         );
@@ -1668,6 +1747,7 @@ mod tests {
             "ReadBlob",
             connectrpc::streaming_handler_fn(|_ctx, _request: api::ReadBlobRequest| async move {
                 connectrpc::Response::stream_ok(connectrpc::stream_iter([Ok(read_page(
+                    b"authenticated".len() as u64 + 1,
                     0,
                     b"authenticated".to_vec(),
                     false,

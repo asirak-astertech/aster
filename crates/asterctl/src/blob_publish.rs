@@ -228,17 +228,23 @@ impl connectrpc::client::Stream for FrameStream {
     }
 }
 
-pub(crate) fn stream_file(
+pub(crate) fn stream_file_with_chunk_bytes(
     file: File,
     total_len: u64,
     start_offset: u64,
+    chunk_bytes: usize,
 ) -> (
     FrameStream,
     tokio::task::JoinHandle<Result<(), &'static str>>,
 ) {
+    assert!(
+        chunk_bytes > 0 && chunk_bytes <= CHUNK_BYTES,
+        "test chunk bound must be within the production limit"
+    );
     let (sender, receiver) = tokio::sync::mpsc::channel(2);
-    let reader =
-        tokio::task::spawn_blocking(move || produce_frames(file, total_len, start_offset, sender));
+    let reader = tokio::task::spawn_blocking(move || {
+        produce_frames(file, total_len, start_offset, chunk_bytes, sender)
+    });
     (FrameStream { receiver }, reader)
 }
 
@@ -246,6 +252,7 @@ fn produce_frames(
     mut file: File,
     total_len: u64,
     start_offset: u64,
+    chunk_bytes: usize,
     sender: tokio::sync::mpsc::Sender<api::PublishBlobRequest>,
 ) -> Result<(), &'static str> {
     if start_offset > total_len {
@@ -256,7 +263,7 @@ fn produce_frames(
     let mut offset = start_offset;
     let mut remaining = total_len - start_offset;
     while remaining > 0 {
-        let length = remaining.min(CHUNK_BYTES as u64) as usize;
+        let length = remaining.min(chunk_bytes as u64) as usize;
         let mut chunk = vec![0_u8; length];
         file.read_exact(&mut chunk)
             .map_err(|_| "cannot read source file while request may have been sent")?;
@@ -323,6 +330,8 @@ pub(crate) fn checkpoint_is_valid(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_CHUNK_BYTES: usize = 4;
 
     fn metadata(total_len: u64) -> api::PublishBlobMetadata {
         api::PublishBlobMetadata {
@@ -434,10 +443,12 @@ mod tests {
 
         let path =
             std::env::temp_dir().join(format!("asterctl-blob-frames-{}", std::process::id()));
-        let bytes = vec![0x5a; CHUNK_BYTES + 1];
+        assert_eq!(CHUNK_BYTES, 512 * 1024);
+        let bytes = vec![0x5a; TEST_CHUNK_BYTES + 1];
         fs::write(&path, &bytes).unwrap();
         let file = File::open(&path).unwrap();
-        let (mut frames, reader) = stream_file(file, bytes.len() as u64, 0);
+        let (mut frames, reader) =
+            stream_file_with_chunk_bytes(file, bytes.len() as u64, 0, TEST_CHUNK_BYTES);
         let mut observed = Vec::new();
         while let Some(frame) = poll_fn(|context| Pin::new(&mut frames).poll_next(context)).await {
             observed.push(frame);
@@ -456,7 +467,10 @@ mod tests {
                 }
             })
             .collect();
-        assert_eq!(chunks, [(0, CHUNK_BYTES), (CHUNK_BYTES as u64, 1)]);
+        assert_eq!(
+            chunks,
+            [(0, TEST_CHUNK_BYTES), (TEST_CHUNK_BYTES as u64, 1)]
+        );
     }
 
     #[tokio::test]
@@ -466,10 +480,15 @@ mod tests {
 
         let path =
             std::env::temp_dir().join(format!("asterctl-blob-resume-{}", std::process::id()));
-        let bytes = vec![0x5a; CHUNK_BYTES + 3];
+        let bytes = vec![0x5a; TEST_CHUNK_BYTES + 3];
         fs::write(&path, &bytes).unwrap();
         let file = File::open(&path).unwrap();
-        let (mut frames, reader) = stream_file(file, bytes.len() as u64, CHUNK_BYTES as u64);
+        let (mut frames, reader) = stream_file_with_chunk_bytes(
+            file,
+            bytes.len() as u64,
+            TEST_CHUNK_BYTES as u64,
+            TEST_CHUNK_BYTES,
+        );
         let frame = poll_fn(|context| Pin::new(&mut frames).poll_next(context))
             .await
             .unwrap();
@@ -478,7 +497,7 @@ mod tests {
         let api::publish_blob_request::Frame::Data(chunk) = frame.frame.unwrap() else {
             panic!("expected resumed chunk")
         };
-        assert_eq!(chunk.offset, CHUNK_BYTES as u64);
+        assert_eq!(chunk.offset, TEST_CHUNK_BYTES as u64);
         assert_eq!(chunk.bytes, vec![0x5a; 3]);
     }
 
@@ -496,7 +515,7 @@ mod tests {
         let original_len = file.metadata().unwrap().len();
         fs::write(&path, b"short").unwrap();
 
-        let (mut frames, reader) = stream_file(file, original_len, 0);
+        let (mut frames, reader) = stream_file_with_chunk_bytes(file, original_len, 0, CHUNK_BYTES);
         while poll_fn(|context| Pin::new(&mut frames).poll_next(context))
             .await
             .is_some()

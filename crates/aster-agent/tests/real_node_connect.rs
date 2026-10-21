@@ -5,13 +5,11 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::{
     fs,
     path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-    task::Poll,
-    time::{Duration, Instant},
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
 };
+#[cfg(target_os = "linux")]
+use std::{sync::Arc, task::Poll, time::Instant};
 
 use aster_agent::{
     BoundAgent, ClientToken,
@@ -20,6 +18,7 @@ use aster_agent::{
 };
 #[cfg(target_os = "linux")]
 use aster_mesh::{ProvisioningAccess, ReferenceProvisioner, Scope, Topic};
+#[cfg(target_os = "linux")]
 use aster_node::application::MAX_SELECTED_BLOB_STREAM_BYTES;
 use aster_node::mission::UnprotectedReferenceMission;
 use aster_node::{MutableSourceInterests, NodeApplication, NodeConfig, start_node};
@@ -184,7 +183,7 @@ fn real_node_blob_bidi_stream_benchmark() {
             .expect("bind benchmark agent");
         let address = agent.local_addr().expect("agent address");
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let server = tokio::spawn(
+        let mut server = tokio::spawn(
             agent
                 .serve_with_blobs(
                     node.selected_events(),
@@ -322,8 +321,27 @@ fn real_node_blob_bidi_stream_benchmark() {
         );
 
         shutdown_tx.send(true).expect("request benchmark shutdown");
-        server.await.expect("benchmark server task").expect("benchmark server");
-        node.shutdown().await.expect("benchmark node shutdown");
+        match tokio::time::timeout(Duration::from_secs(5), &mut server).await {
+            Ok(result) => result
+                .expect("benchmark server task")
+                .expect("benchmark server"),
+            Err(_) => {
+                server.abort();
+                let _ = server.await;
+                panic!("benchmark server shutdown timeout");
+            }
+        }
+        let mut node_shutdown = tokio::spawn(node.shutdown());
+        match tokio::time::timeout(Duration::from_secs(5), &mut node_shutdown).await {
+            Ok(result) => result
+                .expect("benchmark node shutdown task")
+                .expect("benchmark node shutdown"),
+            Err(_) => {
+                node_shutdown.abort();
+                let _ = node_shutdown.await;
+                panic!("benchmark node shutdown timeout");
+            }
+        }
     });
 }
 
@@ -554,7 +572,7 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
                     .expect("deadline client URI"),
             )
             .with_protocol(Protocol::Grpc)
-            .with_default_timeout(Duration::from_secs(1))
+            .with_default_timeout(Duration::from_millis(500))
             .with_default_header(
                 "authorization",
                 format!("Bearer {}", String::from_utf8_lossy(TEST_TOKEN)),
@@ -873,7 +891,7 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
                             media_type: Some("application/octet-stream".to_owned()),
                             schema_id: b"schema/blob-v1".to_vec(),
                             total_len: finite_payload.len() as u64,
-                            ttl_ms: Some(1_000),
+                            ttl_ms: Some(500),
                             ..Default::default()
                         },
                     ))),
@@ -892,8 +910,8 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
             ]
         )
         .expect("publish finite Blob");
-        assert_eq!(finite.ttl_ms, Some(1_000));
-        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        assert_eq!(finite.ttl_ms, Some(500));
+        tokio::time::sleep(Duration::from_millis(600)).await;
 
         let mut expired = client
             .read_blob(api::ReadBlobRequest {

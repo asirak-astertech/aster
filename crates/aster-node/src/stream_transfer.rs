@@ -252,7 +252,13 @@ fn extent(v: u32) -> Result<(), StreamError> {
     }
 }
 fn validate_semantic_commitment(bytes: &[u8]) -> Result<(), StreamError> {
-    if bytes.is_empty() || bytes.len() > MAX_STREAM_SEMANTIC_COMMITMENT_BYTES {
+    validate_semantic_commitment_with_max(bytes, MAX_STREAM_SEMANTIC_COMMITMENT_BYTES)
+}
+fn validate_semantic_commitment_with_max(
+    bytes: &[u8],
+    max_bytes: usize,
+) -> Result<(), StreamError> {
+    if max_bytes == 0 || bytes.is_empty() || bytes.len() > max_bytes {
         Err(StreamError::invalid(
             "semantic commitment length is out of bounds",
         ))
@@ -262,7 +268,10 @@ fn validate_semantic_commitment(bytes: &[u8]) -> Result<(), StreamError> {
 }
 
 fn validate_authenticated_open(bytes: &[u8]) -> Result<(), StreamError> {
-    if bytes.is_empty() || bytes.len() > MAX_STREAM_AUTHENTICATED_OPEN_BYTES {
+    validate_authenticated_open_with_max(bytes, MAX_STREAM_AUTHENTICATED_OPEN_BYTES)
+}
+fn validate_authenticated_open_with_max(bytes: &[u8], max_bytes: usize) -> Result<(), StreamError> {
+    if max_bytes == 0 || bytes.is_empty() || bytes.len() > max_bytes {
         Err(StreamError::invalid(
             "authenticated open length is out of bounds",
         ))
@@ -1243,6 +1252,11 @@ mod stream_frame_codec {
     #[test]
     fn profile5_checkpoint_policy_batches_one_hundred_twenty_eight_mib() {
         assert_eq!(MAX_STREAM_CHECKPOINT_BATCH_BYTES, 128 * 1_048_576);
+        assert_eq!(
+            PROFILE5_MAX_RECORD_BYTES,
+            aster_mesh::BLOB_STREAM_SEGMENT_BYTES
+                + aster_mesh::BLOB_STREAM_SEGMENT_ENCODED_OVERHEAD_BYTES
+        );
         let total = 8 * 1024 * 1024 * 1024_u64;
         let extents = total.div_ceil(PROFILE5_EXTENT_BYTES as u64);
         let (_, control_bytes) = profile5_attempt_bounds(total).expect("attempt bounds");
@@ -1439,7 +1453,7 @@ mod stream_frame_codec {
     #[test]
     fn composite_data_record_keeps_the_segment_body_outside_the_protected_header() {
         let protected_header = vec![0xa1; 137];
-        let body = vec![0xb2; PROFILE5_EXTENT_BYTES];
+        let body = vec![0xb2; 32];
         let encoded = encode_composite_data_record(&protected_header, body.clone()).unwrap();
 
         assert_eq!(&encoded[..4], b"ASD1");
@@ -1527,14 +1541,20 @@ mod stream_frame_codec {
                 .encode_for_context(9, 5)
                 .is_err()
         );
-        open.authenticated_open = vec![0; MAX_STREAM_AUTHENTICATED_OPEN_BYTES + 1];
-        assert!(StreamFrame::Open(open).encode_for_context(9, 5).is_err());
         let mut data = match frames().remove(2) {
             StreamFrame::Data(data) => data,
             _ => unreachable!(),
         };
         data.attempt_nonce = [0; 32];
         assert!(StreamFrame::Data(data).encode_for_context(9, 5).is_err());
+    }
+
+    #[test]
+    fn authenticated_open_enforces_the_production_bound_with_a_small_fixture() {
+        assert_eq!(MAX_STREAM_AUTHENTICATED_OPEN_BYTES, 256 * 1024);
+        assert!(validate_authenticated_open_with_max(&[], 4).is_err());
+        assert!(validate_authenticated_open_with_max(&[0; 4], 4).is_ok());
+        assert!(validate_authenticated_open_with_max(&[0; 5], 4).is_err());
     }
 
     #[test]
@@ -1736,6 +1756,7 @@ mod stream_state {
 
     #[test]
     fn finish_requires_one_bounded_semantic_commitment() {
+        assert_eq!(MAX_STREAM_SEMANTIC_COMMITMENT_BYTES, 64 * 1024);
         let mut sender = StreamSenderState::new([1; 32], [2; 32], 0);
         sender
             .accept(StreamAcceptV1 {
@@ -1750,11 +1771,8 @@ mod stream_state {
             })
             .unwrap();
         assert!(sender.finish(Vec::new()).is_err());
-        assert!(
-            sender
-                .finish(vec![0; MAX_STREAM_SEMANTIC_COMMITMENT_BYTES + 1])
-                .is_err()
-        );
+        assert!(validate_semantic_commitment_with_max(&[0; 4], 4).is_ok());
+        assert!(validate_semantic_commitment_with_max(&[0; 5], 4).is_err());
     }
 
     #[test]

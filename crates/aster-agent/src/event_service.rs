@@ -1398,9 +1398,7 @@ mod tests {
 
     #[cfg(all(feature = "client", feature = "server", not(target_os = "linux")))]
     #[tokio::test]
-    async fn combined_handler_keeps_event_status_and_rejects_blob_before_inbound_poll() {
-        use std::task::Poll;
-
+    async fn platform_compat_combined_handler_keeps_event_and_blob_paths_live() {
         use buffa::view::HasMessageView as _;
 
         let state = TestState::new();
@@ -1504,33 +1502,61 @@ mod tests {
         .expect("combined Event handler");
         assert!(event.body.inserted);
 
-        let polls = Arc::new(AtomicU64::new(0));
-        let observed = Arc::clone(&polls);
+        let payload = b"cross-platform Blob".to_vec();
+        let frames = [
+            api::PublishBlobRequest {
+                frame: Some(api::publish_blob_request::Frame::Metadata(Box::new(
+                    api::PublishBlobMetadata {
+                        operation_key: b"non-linux-handler-blob".to_vec(),
+                        topic: "chat.events".to_owned(),
+                        scope: "mission/team/alpha".to_owned(),
+                        priority: api::Priority::Routine.into(),
+                        total_len: payload.len() as u64,
+                        ..Default::default()
+                    },
+                ))),
+                ..Default::default()
+            },
+            api::PublishBlobRequest {
+                frame: Some(api::publish_blob_request::Frame::Data(Box::new(
+                    api::PublishBlobData {
+                        offset: 0,
+                        bytes: payload,
+                        ..Default::default()
+                    },
+                ))),
+                ..Default::default()
+            },
+            api::PublishBlobRequest {
+                frame: Some(api::publish_blob_request::Frame::Finish(Box::default())),
+                ..Default::default()
+            },
+        ];
         let inbound: connectrpc::InboundStream<api::PublishBlobRequest> =
-            Box::pin(futures::stream::poll_fn(move |_| {
-                observed.fetch_add(1, Ordering::Relaxed);
-                Poll::<
-                    Option<
-                        Result<connectrpc::StreamMessage<api::PublishBlobRequest>, ConnectError>,
-                    >,
-                >::Pending
-            }));
-        let error = api::AsterApplicationService::publish_blob(
+            Box::pin(futures::stream::iter(frames.into_iter().map(|frame| {
+                Ok(connectrpc::StreamMessage::from_message(&frame))
+            })));
+        let mut responses = api::AsterApplicationService::publish_blob(
             &service,
             RequestContext::default(),
             inbound,
         )
         .await
-        .expect_err("unsupported publish fails at the handler boundary");
-        assert_public_detail(
-            &error,
-            "aster.application.v1alpha1.PublicErrorDetail",
-            ErrorCode::Unimplemented,
-            api::PublicErrorReason::UnsupportedValue,
-            "publish_blob",
-            false,
-        );
-        assert_eq!(polls.load(Ordering::Relaxed), 0);
+        .expect("cross-platform Blob handler")
+        .body;
+        let complete = tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(response) = responses.next().await {
+                let response = response.expect("Blob response");
+                if let Some(api::publish_blob_response::Frame::Complete(complete)) = response.frame
+                {
+                    return *complete;
+                }
+            }
+            panic!("Blob response stream ended before completion");
+        })
+        .await
+        .expect("cross-platform Blob publication timeout");
+        assert_eq!(complete.total_len, b"cross-platform Blob".len() as u64);
 
         node.shutdown().await.expect("node shutdown");
     }
