@@ -18,10 +18,15 @@ produce a host-qualification receipt.
 
 Because the manual packaging workflow intentionally has one fixed shape and
 the repository does not pin a YAML or shell AST dependency for this check, the
-validator also binds its exact reviewed bytes to a checked SHA-256 constant.
-Any workflow edit therefore requires an intentional constant update plus
-renewed policy-test and reviewer scrutiny; semantic checks remain independent
-defense in depth.
+validator binds its reviewed bytes to a checked SHA-256 constant after narrowly
+normalizing the full commit SHA and adjacent version comment for each approved
+Action invocation. Action identities, order, inputs, commands, permissions,
+triggers, jobs, and all other workflow bytes remain hash-bound. Every Action
+must still use a full lowercase 40-character commit SHA, and maintainers must
+review upstream Action changes; a syntactically valid SHA is not proof of
+equivalent behavior. Any non-pin workflow edit requires an intentional constant
+update plus renewed policy-test and reviewer scrutiny; semantic checks remain
+independent defense in depth.
 
 This statement is intentionally scoped to the Compose-provider checks. Other
 repository jobs, including the existing path-lab jobs, use Docker for their own
