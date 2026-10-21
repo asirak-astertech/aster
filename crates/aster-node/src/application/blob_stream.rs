@@ -25,7 +25,10 @@ use std::{
 use tokio::sync::{mpsc, oneshot};
 use zeroize::Zeroizing;
 
-use super::blob::{BlobPublishOptions, BlobPublishRequest, BlobPublishResult, SelectedBlobCommand};
+use super::blob::{
+    BlobPublishFinalization, BlobPublishOptions, BlobPublishRequest, BlobPublishResult,
+    SelectedBlobCommand,
+};
 use super::{
     ApplicationError, ApplicationErrorKind, SelectedApplicationCommand, actor_unavailable,
 };
@@ -393,9 +396,20 @@ impl SelectedBlobPublishStream {
             ))
             .await
             .map_err(|_| actor_unavailable("blob stream finish"))?;
-        received
+        let finalization = received
             .await
-            .map_err(|_| actor_unavailable("blob stream finish"))?
+            .map_err(|_| actor_unavailable("blob stream finish"))??;
+        match finalization {
+            BlobPublishFinalization::Completed(result) => Ok(result),
+            BlobPublishFinalization::Pending(job) => tokio::task::spawn_blocking(move || job.run())
+                .await
+                .map_err(|_| {
+                    ApplicationError::new(
+                        ApplicationErrorKind::StateUnavailable,
+                        "blob stream finish",
+                    )
+                })?,
+        }
     }
 }
 

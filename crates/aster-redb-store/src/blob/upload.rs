@@ -1774,12 +1774,44 @@ mod tests {
             )
             .expect("canonical promotion");
         assert!(outcome.inserted());
+        let pack_root = PinnedBlobPackRoot::open(&fixture.store).expect("post-commit pack root");
+        super::super::pack::inject_test_fault(
+            &pack_root,
+            super::super::pack::BlobPackFaultPoint::CleanupDurable,
+        );
         fixture
             .store
             .complete_blob_upload(&reservation, outcome.blob().transfer_id)
-            .expect("complete upload authority");
+            .expect_err("inject crash after durable pack removal");
+        assert!(
+            fixture
+                .store
+                .resume_blob_upload(&request.owner)
+                .expect("resume cleanup gap")
+                .is_some(),
+            "redb authority remains charged across cleanup crash"
+        );
+        let transfer_id = outcome.blob().transfer_id;
+        let authority = fixture.publisher.mission_authority_id();
+        drop(fixture.store);
+        fixture.store = Store::open_with_limits_and_blob_depot_limits_for_mission(
+            fixture.root.database(),
+            StoreLimits::default(),
+            BlobDepotLimits::new(exact_bytes, 1, 1).expect("cleanup-gap reopen limits"),
+            authority,
+        )
+        .expect("reopen after pack-removal crash boundary");
+        let (restarted, _) = fixture
+            .store
+            .resume_blob_upload(&request.owner)
+            .expect("resume cleanup gap after reopen")
+            .expect("cleanup authority survives reopen");
+        fixture
+            .store
+            .complete_blob_upload(&restarted, transfer_id)
+            .expect("retry completed cleanup with missing pack");
         let pack_root = PinnedBlobPackRoot::open(&fixture.store).expect("post-complete pack root");
-        BlobPackWriter::create_upload_pinned(&pack_root, &reservation.pack_identity())
+        BlobPackWriter::create_upload_pinned(&pack_root, &restarted.pack_identity())
             .expect("completion removed exact pack");
         assert!(
             fixture

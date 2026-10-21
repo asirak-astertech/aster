@@ -68,8 +68,8 @@ use crate::{
         AuthenticatedEventRouteCache, NodeCustodyClock, STORE_FILE, StartupEventVerification,
         blob_capacity_gc_target, cache_authenticated_blob_route_claim, ensure_principal_active,
         ensure_state_accepts_normal_operation, equivalent_blob_capacity_error,
-        open_startup_event_verifier_and_cache, recover_local_blob_capacity_after_cleanup,
-        refresh_application_policy,
+        open_replayed_verifier, open_startup_event_verifier_and_cache,
+        recover_local_blob_capacity_after_cleanup, refresh_application_policy,
     },
     stream_pipeline::StreamPartition,
 };
@@ -1437,7 +1437,7 @@ pub(crate) enum SelectedBlobCommand {
     },
     FinishPublishStream {
         token: [u8; 32],
-        response: oneshot::Sender<Result<BlobPublishResult, ApplicationError>>,
+        response: oneshot::Sender<Result<BlobPublishFinalization, ApplicationError>>,
     },
     ReadPage {
         request: BlobReadPageRequest,
@@ -1668,6 +1668,230 @@ impl VerifiedBlobDeliveryMetadata {
     }
 }
 
+pub(crate) enum BlobPublishFinalization {
+    Completed(BlobPublishResult),
+    Pending(BlobFinalizeJob),
+}
+
+pub(crate) struct BlobFinalizeJob {
+    mission: UnprotectedReferenceMission,
+    store: Arc<Store>,
+    source_route_cache: Arc<AuthenticatedEventRouteCache>,
+    custody_clock: NodeCustodyClock,
+    reservation: BlobUploadReservation,
+    cleanup_upload: bool,
+    #[cfg(test)]
+    gate: Option<(
+        std::sync::mpsc::SyncSender<()>,
+        std::sync::mpsc::Receiver<()>,
+    )>,
+}
+
+impl BlobFinalizeJob {
+    pub(super) fn run(self) -> Result<BlobPublishResult, ApplicationError> {
+        #[cfg(test)]
+        if let Some((reached, release)) = &self.gate {
+            reached
+                .send(())
+                .map_err(|_| actor_unavailable("blob stream finish"))?;
+            release
+                .recv()
+                .map_err(|_| actor_unavailable("blob stream finish"))?;
+        }
+
+        // Replay current authority inside this owned job. This deliberately
+        // happens after handoff from the application actor, so preparation and
+        // canonical encryption cannot stall unrelated application commands.
+        let mut verifier = open_replayed_verifier(&self.store, &self.mission)
+            .map_err(|error| application_error("blob stream finish", error))?;
+        let mut verifier_head = self
+            .store
+            .control_head()
+            .map_err(|error| application_error("blob stream finish", error.into()))?;
+        let policy = match refresh_application_policy(
+            &self.store,
+            &self.mission,
+            &mut verifier,
+            &mut verifier_head,
+        ) {
+            Ok(Some(policy)) => policy,
+            Ok(None) => {
+                return Err(ApplicationError::new(
+                    ApplicationErrorKind::PolicyUnsettled,
+                    "blob stream finish",
+                ));
+            }
+            Err(error) => return Err(application_error("blob stream finish", error)),
+        };
+        let request = self.reservation.request().clone();
+        let (current, checkpoint) = self
+            .store
+            .reserve_blob_upload_with_policy(&policy, &request)
+            .map_err(|error| application_error("blob stream finish", error.into()))?;
+        if current != self.reservation || checkpoint.durable_plaintext_offset() != request.total_len
+        {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::Integrity,
+                "blob stream finish",
+            ));
+        }
+        let identity = current.pack_identity();
+        let upload = BlobUploadDescriptor::new(
+            identity.upload_id(),
+            *identity.request_digest(),
+            identity.total_len(),
+            current.content_epoch(),
+        )
+        .map_err(|error| blob_core_error("blob stream finish", error))?;
+        let opener = verifier
+            .blob_upload_segment_opener(&request.scope, &request.topic, &upload)
+            .map_err(|error| application_error("blob stream finish", error.into()))?;
+        let root = PinnedBlobPackRoot::open(&self.store)
+            .map_err(|error| application_error("blob stream finish", error.into()))?;
+        let metadata = CoreBlobMetadata::new(request.media_type.clone(), request.schema_id.clone())
+            .map_err(|error| blob_core_error("blob stream finish", error))?;
+        let mut preparation_source =
+            UploadPackPlainReader::open(root, &current, &checkpoint, opener.clone())?;
+        let prepared = prepare_blob(&mut preparation_source, SELECTED_BLOB_CHUNK_SIZE, metadata)
+            .map_err(blob_prepare_error)?;
+        if prepared.total_len() != request.total_len || prepared.chunk_count() == 0 {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::Integrity,
+                "blob stream finish",
+            ));
+        }
+        let root = PinnedBlobPackRoot::open(&self.store)
+            .map_err(|error| application_error("blob stream finish", error.into()))?;
+        let mut encryption_source =
+            UploadPackPlainReader::open(root, &current, &checkpoint, opener)?;
+        let mut service = verifier
+            .blob_service_with_store(
+                &request.scope,
+                &request.topic,
+                current.content_epoch(),
+                self.store
+                    .blob_depot_for_upload(&current)
+                    .map_err(|error| application_error("blob stream finish", error.into()))?,
+            )
+            .map_err(|error| application_error("blob stream finish", error.into()))?;
+        let manifest = service
+            .install_prepared(&prepared)
+            .map_err(|error| blob_core_error("blob stream finish", error))?;
+        let progress = service
+            .encrypt_some(&mut encryption_source, &manifest, prepared.chunk_count())
+            .map_err(|error| blob_core_error("blob stream finish", error))?;
+        if !progress.complete || progress.verified_chunks != prepared.chunk_count() {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::Integrity,
+                "blob stream finish",
+            ));
+        }
+        let finished = service
+            .finish_manifest(&manifest)
+            .map_err(|error| blob_core_error("blob stream finish", error))?;
+        drop(service);
+        let completion = self
+            .store
+            .completed_prepared_local_blob(&manifest, *finished.manifest_digest())
+            .map_err(|error| application_error("blob stream finish", error.into()))?;
+        let intent = BlobPublicationIntent::new_with_ttl(
+            request.owner.publisher,
+            request.topic.clone(),
+            request.scope.clone(),
+            request.priority,
+            prepared.id(),
+            request.ttl_ms,
+        )
+        .map_err(|error| application_error("blob stream finish", error.into()))?;
+        let operation = BlobOperationRequest::new(&request.owner.operation, &intent);
+        let sample = if request.ttl_ms.is_some() {
+            Some(
+                self.custody_clock
+                    .sample()
+                    .map_err(|error| application_error("blob stream finish", error))?,
+            )
+        } else {
+            None
+        };
+        let outcome = self
+            .store
+            .commit_prepared_local_blob_once_with_policy(
+                &policy,
+                &operation,
+                request.ttl_ms,
+                sample,
+                sample,
+                &completion,
+                |publication| {
+                    let manifest_len = u64::try_from(finished.manifest_bytes().len())
+                        .map_err(|_| StoreError::PayloadByteAccountingOverflow)?;
+                    let header = publication.header(
+                        request.priority,
+                        finished.route_commitment(),
+                        manifest_len,
+                        current.content_epoch(),
+                    )?;
+                    let sealed = verifier
+                        .seal_blob_manifest(&header, finished.manifest_bytes())
+                        .map_err(|error| {
+                            StoreError::Blob(BlobStoreError::Verification(error.to_string()))
+                        })?
+                        .bytes;
+                    let route = verifier.verify_blob(&sealed).map_err(|error| {
+                        StoreError::Blob(BlobStoreError::Verification(error.to_string()))
+                    })?;
+                    let blob =
+                        match verifier
+                            .verify_blob_content(route, &sealed)
+                            .map_err(|error| {
+                                StoreError::Blob(BlobStoreError::Verification(error.to_string()))
+                            })? {
+                            BlobContentVerification::ContentVerified {
+                                blob,
+                                manifest_bytes,
+                            } if manifest_bytes == finished.manifest_bytes() => blob,
+                            _ => return Err(StoreError::Blob(BlobStoreError::CompletionMismatch)),
+                        };
+                    Ok((blob, sealed))
+                },
+            )
+            .map_err(|error| application_error("blob stream finish", error.into()))?;
+        let stored = SelectedBlobNode::verify_stored_blob_with(
+            &self.store,
+            self.mission.mission_authority_id(),
+            &mut verifier,
+            outcome.blob(),
+            Some(&intent),
+            current.content_epoch(),
+            "blob stream finish",
+            false,
+        )?;
+        cache_authenticated_blob_route_claim(
+            &self.store,
+            &self.source_route_cache,
+            &verifier,
+            &stored.blob,
+            &stored.manifest_bytes,
+            &outcome.blob().sealed,
+            outcome.blob().acceptance_marker,
+        )
+        .map_err(|error| application_error("blob stream finish", error))?;
+        if self.cleanup_upload {
+            self.store
+                .complete_blob_upload(&current, outcome.blob().transfer_id)
+                .map_err(|error| application_error("blob stream finish", error.into()))?;
+        }
+        let token = *local_blob_publication_stream_id(
+            request.owner.publisher,
+            request.owner.operation.as_bytes(),
+        )
+        .as_bytes();
+        let mut result = blob_publish_result(&stored, outcome.inserted());
+        result.publication_id = Some(BlobStreamPublicationId::from_bytes(token)?);
+        Ok(result)
+    }
+}
+
 /// Exclusive stopped-state handle over selected immutable Blob content.
 ///
 /// This owns the same process-exclusive mission-bound redb writer as Event,
@@ -1687,6 +1911,11 @@ pub struct SelectedBlobNode {
     final_read_gate: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
     #[cfg(test)]
     live_publish_pass_two_gate: Option<LivePublishPassTwoTestGate>,
+    #[cfg(test)]
+    stream_finalize_gate: Option<(
+        std::sync::mpsc::SyncSender<()>,
+        std::sync::mpsc::Receiver<()>,
+    )>,
     #[cfg(test)]
     live_publish_retry_rewind_failure: bool,
     #[cfg(test)]
@@ -1781,6 +2010,8 @@ impl SelectedBlobNode {
             #[cfg(test)]
             live_publish_pass_two_gate: None,
             #[cfg(test)]
+            stream_finalize_gate: None,
+            #[cfg(test)]
             live_publish_retry_rewind_failure: false,
             #[cfg(test)]
             live_operation_preflight_coherence_fault: false,
@@ -1830,6 +2061,8 @@ impl SelectedBlobNode {
             #[cfg(test)]
             live_publish_pass_two_gate: None,
             #[cfg(test)]
+            stream_finalize_gate: None,
+            #[cfg(test)]
             live_publish_retry_rewind_failure: false,
             #[cfg(test)]
             live_operation_preflight_coherence_fault: false,
@@ -1870,6 +2103,15 @@ impl SelectedBlobNode {
         release: std::sync::mpsc::Receiver<()>,
     ) {
         self.live_publish_pass_two_gate = Some(LivePublishPassTwoTestGate { reached, release });
+    }
+
+    #[cfg(test)]
+    fn set_stream_finalize_gate_for_test(
+        &mut self,
+        reached: std::sync::mpsc::SyncSender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) {
+        self.stream_finalize_gate = Some((reached, release));
     }
 
     #[cfg(test)]
@@ -1951,7 +2193,7 @@ impl SelectedBlobNode {
                 )
             }
             SelectedBlobCommand::FinishPublishStream { token, response } => {
-                let result = self.finish_publish_stream_inner(token);
+                let result = self.prepare_publish_stream_finalization(token);
                 finish_live_blob_ledger_command(
                     result,
                     response,
@@ -2131,13 +2373,17 @@ impl SelectedBlobNode {
             .store
             .resume_blob_upload(&owner)
             .map_err(|error| application_error("blob stream open", error.into()))?;
-        if existing_upload.is_none()
-            && let Some(stored) = self
-                .store
-                .blob_for_owner_with_policy(&policy, &owner)
-                .map_err(|error| application_error("blob stream open", error.into()))?
+        if let Some(stored) = self
+            .store
+            .blob_for_owner_with_policy(&policy, &owner)
+            .map_err(|error| application_error("blob stream open", error.into()))?
         {
             let result = self.completed_blob_upload_result(&stored, &request, epoch, token)?;
+            if let Some((reservation, _)) = existing_upload {
+                self.store
+                    .complete_blob_upload(&reservation, stored.transfer_id)
+                    .map_err(|error| application_error("blob stream open", error.into()))?;
+            }
             self.completed_publish_streams
                 .insert(token, (request.clone(), result));
             return Ok(OpenedBlobPublishStream {
@@ -2281,12 +2527,23 @@ impl SelectedBlobNode {
         })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn finish_publish_stream_inner(
         &mut self,
         token: [u8; 32],
     ) -> Result<BlobPublishResult, ApplicationError> {
+        match self.prepare_publish_stream_finalization(token)? {
+            BlobPublishFinalization::Completed(result) => Ok(result),
+            BlobPublishFinalization::Pending(job) => job.run(),
+        }
+    }
+
+    fn prepare_publish_stream_finalization(
+        &mut self,
+        token: [u8; 32],
+    ) -> Result<BlobPublishFinalization, ApplicationError> {
         if let Some((_, result)) = self.completed_publish_streams.remove(&token) {
-            return Ok(result);
+            return Ok(BlobPublishFinalization::Completed(result));
         }
         let mut stream = self.publish_streams.remove(&token).ok_or_else(|| {
             ApplicationError::new(ApplicationErrorKind::NotFound, "blob stream finish")
@@ -2312,198 +2569,30 @@ impl SelectedBlobNode {
             .writer
             .finish()
             .map_err(|error| blob_pack_application_error("blob stream finish", error))?;
-        self.finalize_blob_upload(stream.reservation)
+        Ok(BlobPublishFinalization::Pending(BlobFinalizeJob {
+            mission: self.mission.clone(),
+            store: Arc::clone(&self.store),
+            source_route_cache: Arc::clone(&self.source_route_cache),
+            custody_clock: self.custody_clock.clone(),
+            reservation: stream.reservation,
+            cleanup_upload: true,
+            #[cfg(test)]
+            gate: self.stream_finalize_gate.take(),
+        }))
     }
 
-    fn finalize_blob_upload(
+    #[cfg(test)]
+    fn finish_publish_stream_without_cleanup_for_test(
         &mut self,
-        reservation: BlobUploadReservation,
+        token: [u8; 32],
     ) -> Result<BlobPublishResult, ApplicationError> {
-        let policy = self.current_policy("blob stream finish")?;
-        let request = reservation.request().clone();
-        let (current, checkpoint) = self
-            .store
-            .reserve_blob_upload_with_policy(&policy, &request)
-            .map_err(|error| application_error("blob stream finish", error.into()))?;
-        if current != reservation || checkpoint.durable_plaintext_offset() != request.total_len {
-            return Err(ApplicationError::new(
-                ApplicationErrorKind::Integrity,
-                "blob stream finish",
-            ));
+        match self.prepare_publish_stream_finalization(token)? {
+            BlobPublishFinalization::Completed(result) => Ok(result),
+            BlobPublishFinalization::Pending(mut job) => {
+                job.cleanup_upload = false;
+                job.run()
+            }
         }
-        let identity = current.pack_identity();
-        let upload = BlobUploadDescriptor::new(
-            identity.upload_id(),
-            *identity.request_digest(),
-            identity.total_len(),
-            current.content_epoch(),
-        )
-        .map_err(|error| blob_core_error("blob stream finish", error))?;
-        let opener = self
-            .verifier
-            .blob_upload_segment_opener(&request.scope, &request.topic, &upload)
-            .map_err(|error| application_error("blob stream finish", error.into()))?;
-        let root = PinnedBlobPackRoot::open(&self.store)
-            .map_err(|error| application_error("blob stream finish", error.into()))?;
-        let metadata = CoreBlobMetadata::new(request.media_type.clone(), request.schema_id.clone())
-            .map_err(|error| blob_core_error("blob stream finish", error))?;
-        let mut preparation_source =
-            UploadPackPlainReader::open(root, &current, &checkpoint, opener.clone())?;
-        let prepared = prepare_blob(&mut preparation_source, SELECTED_BLOB_CHUNK_SIZE, metadata)
-            .map_err(blob_prepare_error)?;
-        if prepared.total_len() != request.total_len || prepared.chunk_count() == 0 {
-            return Err(ApplicationError::new(
-                ApplicationErrorKind::Integrity,
-                "blob stream finish",
-            ));
-        }
-        let root = PinnedBlobPackRoot::open(&self.store)
-            .map_err(|error| application_error("blob stream finish", error.into()))?;
-        let mut encryption_source =
-            UploadPackPlainReader::open(root, &current, &checkpoint, opener)?;
-        let mut service = self
-            .verifier
-            .blob_service_with_store(
-                &request.scope,
-                &request.topic,
-                current.content_epoch(),
-                self.store
-                    .blob_depot_for_upload(&current)
-                    .map_err(|error| application_error("blob stream finish", error.into()))?,
-            )
-            .map_err(|error| application_error("blob stream finish", error.into()))?;
-        let manifest = service
-            .install_prepared(&prepared)
-            .map_err(|error| blob_core_error("blob stream finish", error))?;
-        let progress = service
-            .encrypt_some(&mut encryption_source, &manifest, prepared.chunk_count())
-            .map_err(|error| blob_core_error("blob stream finish", error))?;
-        if !progress.complete || progress.verified_chunks != prepared.chunk_count() {
-            return Err(ApplicationError::new(
-                ApplicationErrorKind::Integrity,
-                "blob stream finish",
-            ));
-        }
-        let finished = service
-            .finish_manifest(&manifest)
-            .map_err(|error| blob_core_error("blob stream finish", error))?;
-        drop(service);
-        let completion = self
-            .store
-            .completed_prepared_local_blob(&manifest, *finished.manifest_digest())
-            .map_err(|error| application_error("blob stream finish", error.into()))?;
-        let intent = BlobPublicationIntent::new_with_ttl(
-            request.owner.publisher,
-            request.topic.clone(),
-            request.scope.clone(),
-            request.priority,
-            prepared.id(),
-            request.ttl_ms,
-        )
-        .map_err(|error| application_error("blob stream finish", error.into()))?;
-        let operation = BlobOperationRequest::new(&request.owner.operation, &intent);
-        let sample = if request.ttl_ms.is_some() {
-            Some(
-                self.custody_clock
-                    .sample()
-                    .map_err(|error| application_error("blob stream finish", error))?,
-            )
-        } else {
-            None
-        };
-        let outcome = self
-            .store
-            .commit_prepared_local_blob_once_with_policy(
-                &policy,
-                &operation,
-                request.ttl_ms,
-                sample,
-                sample,
-                &completion,
-                |publication| {
-                    let manifest_len = u64::try_from(finished.manifest_bytes().len())
-                        .map_err(|_| StoreError::PayloadByteAccountingOverflow)?;
-                    let header = publication.header(
-                        request.priority,
-                        finished.route_commitment(),
-                        manifest_len,
-                        current.content_epoch(),
-                    )?;
-                    let sealed = self
-                        .verifier
-                        .seal_blob_manifest(&header, finished.manifest_bytes())
-                        .map_err(|error| {
-                            StoreError::Blob(BlobStoreError::Verification(error.to_string()))
-                        })?
-                        .bytes;
-                    let route = self.verifier.verify_blob(&sealed).map_err(|error| {
-                        StoreError::Blob(BlobStoreError::Verification(error.to_string()))
-                    })?;
-                    let blob = match self.verifier.verify_blob_content(route, &sealed).map_err(
-                        |error| StoreError::Blob(BlobStoreError::Verification(error.to_string())),
-                    )? {
-                        BlobContentVerification::ContentVerified {
-                            blob,
-                            manifest_bytes,
-                        } if manifest_bytes == finished.manifest_bytes() => blob,
-                        _ => {
-                            return Err(StoreError::Blob(BlobStoreError::CompletionMismatch));
-                        }
-                    };
-                    Ok((blob, sealed))
-                },
-            )
-            .map_err(|error| application_error("blob stream finish", error.into()))?;
-        let stored = self.verify_stored_blob(
-            outcome.blob(),
-            Some(&intent),
-            current.content_epoch(),
-            "blob stream finish",
-            false,
-        )?;
-        cache_authenticated_blob_route_claim(
-            &self.store,
-            &self.source_route_cache,
-            &self.verifier,
-            &stored.blob,
-            &stored.manifest_bytes,
-            &outcome.blob().sealed,
-            outcome.blob().acceptance_marker,
-        )
-        .map_err(|error| application_error("blob stream finish", error))?;
-        self.store
-            .complete_blob_upload(&current, outcome.blob().transfer_id)
-            .map_err(|error| application_error("blob stream finish", error.into()))?;
-        let token = *local_blob_publication_stream_id(
-            request.owner.publisher,
-            request.owner.operation.as_bytes(),
-        )
-        .as_bytes();
-        let mut result = blob_publish_result(&stored, outcome.inserted());
-        result.publication_id = Some(BlobStreamPublicationId::from_bytes(token)?);
-        let options = match request.ttl_ms {
-            None => BlobPublishOptions::durable(),
-            Some(ttl_ms) => BlobPublishOptions::finite_ttl_ms(ttl_ms)?,
-        };
-        self.completed_publish_streams.insert(
-            token,
-            (
-                BlobPublishStreamRequest {
-                    publication: BlobPublishRequest {
-                        operation_key: request.owner.operation.as_bytes().to_vec(),
-                        topic: request.topic,
-                        scope: request.scope,
-                        priority: request.priority,
-                        media_type: request.media_type,
-                        schema_id: request.schema_id,
-                    },
-                    options,
-                    total_len: request.total_len,
-                },
-                result.clone(),
-            ),
-        );
-        Ok(result)
     }
 
     fn completed_blob_upload_result(
@@ -3757,6 +3846,45 @@ impl SelectedBlobNode {
                 blob_id: Some(result.id),
             });
         }
+        // A canonical operation is authoritative even while cleanup authority
+        // for its provisional pack remains durably charged after a crash.
+        if let Some(stored) = self
+            .store
+            .blob_for_local_publication_with_policy(&policy, request.publication_id.into_core())
+            .map_err(|error| application_error("blob publication status", error.into()))?
+        {
+            if stored.header.topic != request.topic || stored.header.scope != request.scope {
+                return Err(ApplicationError::new(
+                    ApplicationErrorKind::NotFound,
+                    "blob publication status",
+                ));
+            }
+            let epoch = self.active_epoch(&request.scope, "blob publication status")?;
+            self.require_blob_grants(
+                &request.topic,
+                &request.scope,
+                epoch,
+                "blob publication status",
+            )?;
+            let verified =
+                self.verify_stored_blob(&stored, None, epoch, "blob publication status", false)?;
+            let result = blob_publish_result(&verified, false);
+            return Ok(BlobPublicationInspection {
+                publication_id: request.publication_id,
+                phase: BlobPublicationPhase::Available,
+                plaintext_total_bytes: result.total_len,
+                durable_plaintext_bytes: result.total_len,
+                transfer_total_bytes: 0,
+                durable_transfer_bytes: 0,
+                total_units: result
+                    .total_len
+                    .div_ceil(u64::from(SELECTED_BLOB_CHUNK_SIZE)),
+                durable_units: result
+                    .total_len
+                    .div_ceil(u64::from(SELECTED_BLOB_CHUNK_SIZE)),
+                blob_id: Some(result.id),
+            });
+        }
         if let Some(upload) = self.publish_streams.get(&token) {
             if upload.request.topic != request.topic || upload.request.scope != request.scope {
                 return Err(ApplicationError::new(
@@ -3842,43 +3970,6 @@ impl SelectedBlobNode {
                     .durable_pack_checkpoint()
                     .map_or(0, |checkpoint| checkpoint.next_index()),
                 blob_id: None,
-            });
-        }
-        if let Some(stored) = self
-            .store
-            .blob_for_local_publication_with_policy(&policy, request.publication_id.into_core())
-            .map_err(|error| application_error("blob publication status", error.into()))?
-        {
-            if stored.header.topic != request.topic || stored.header.scope != request.scope {
-                return Err(ApplicationError::new(
-                    ApplicationErrorKind::NotFound,
-                    "blob publication status",
-                ));
-            }
-            let epoch = self.active_epoch(&request.scope, "blob publication status")?;
-            self.require_blob_grants(
-                &request.topic,
-                &request.scope,
-                epoch,
-                "blob publication status",
-            )?;
-            let verified =
-                self.verify_stored_blob(&stored, None, epoch, "blob publication status", false)?;
-            let result = blob_publish_result(&verified, false);
-            return Ok(BlobPublicationInspection {
-                publication_id: request.publication_id,
-                phase: BlobPublicationPhase::Available,
-                plaintext_total_bytes: result.total_len,
-                durable_plaintext_bytes: result.total_len,
-                transfer_total_bytes: 0,
-                durable_transfer_bytes: 0,
-                total_units: result
-                    .total_len
-                    .div_ceil(u64::from(SELECTED_BLOB_CHUNK_SIZE)),
-                durable_units: result
-                    .total_len
-                    .div_ceil(u64::from(SELECTED_BLOB_CHUNK_SIZE)),
-                blob_id: Some(result.id),
             });
         }
         let inspection = self
@@ -6465,6 +6556,68 @@ mod tests {
     }
 
     #[test]
+    fn stream_upload_prefers_canonical_result_over_residual_cleanup_authority() {
+        // Break caught: a committed canonical operation must win over a
+        // residual provisional row left by a cleanup crash.
+        let root = TestRoot::new("stream-upload-cleanup-gap");
+        let bytes = payload(BLOB_STREAM_SEGMENT_BYTES + 13);
+        let stream_request = BlobPublishStreamRequest {
+            publication: request(b"blob/stream/cleanup-gap"),
+            options: BlobPublishOptions::durable(),
+            total_len: bytes.len() as u64,
+        };
+        let (publication_id, original) = {
+            let mut node = selected_node(&root);
+            let opened = node
+                .open_publish_stream_inner(stream_request.clone())
+                .expect("open cleanup-gap upload");
+            for (offset, chunk) in bytes.chunks(64 * 1024).enumerate() {
+                node.append_publish_stream_inner(
+                    opened.token,
+                    (offset * 64 * 1024) as u64,
+                    Zeroizing::new(chunk.to_vec()),
+                )
+                .expect("append cleanup-gap bytes");
+            }
+            let result = node
+                .finish_publish_stream_without_cleanup_for_test(opened.token)
+                .expect("commit before injected cleanup crash");
+            let owner = BlobOperationOwner::new(
+                node.identity(),
+                BlobOperationKey::new(stream_request.publication.operation_key.clone())
+                    .expect("cleanup-gap operation"),
+            );
+            assert!(
+                node.store
+                    .resume_blob_upload(&owner)
+                    .expect("inspect residual upload")
+                    .is_some()
+            );
+            (result.publication_id.expect("publication id"), result)
+        };
+
+        let mut reopened = selected_node(&root);
+        let inspection = reopened
+            .inspect_publication(BlobPublicationInspectionRequest {
+                publication_id,
+                topic: blob_topic(),
+                scope: blob_scope(),
+            })
+            .expect("inspect canonical result across cleanup gap");
+        assert_eq!(inspection.phase, BlobPublicationPhase::Available);
+        assert_eq!(inspection.blob_id, Some(original.id));
+        let opened = reopened
+            .open_publish_stream_inner(stream_request)
+            .expect("exact retry converges cleanup gap");
+        assert_eq!(opened.progress.durable_offset, bytes.len() as u64);
+        let replay = reopened
+            .finish_publish_stream_inner(opened.token)
+            .expect("return canonical result");
+        assert_eq!(replay.id, original.id);
+        assert!(!replay.inserted);
+    }
+
+    #[test]
     fn selected_blob_publish_stream_promotes_and_replays_exact_operation() {
         // Preserve the focused PR 95 contract gate while the canonical test
         // name records the repaired authority model.
@@ -6589,6 +6742,11 @@ mod tests {
         // uploads while an exact canonical 64-KiB payload finalizes normally.
         let root = TestRoot::new("stream-upload-boundaries");
         let mut node = selected_node(&root);
+        assert_eq!(
+            MAX_SELECTED_BLOB_STREAM_BYTES,
+            8 * 1024 * 1024 * 1024,
+            "public stream ceiling remains 8 GiB"
+        );
         for (operation, total_len) in [
             (b"blob/stream/empty".as_slice(), 0),
             (
@@ -6659,6 +6817,62 @@ mod tests {
                 durable_offset: 0
             }
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn stream_finalize_worker_does_not_block_unrelated_application_command() {
+        // Break caught: canonical preparation/encryption on the actor prevents
+        // unrelated application commands from being serviced.
+        let root = TestRoot::new("stream-finalize-worker");
+        let bytes = payload(SELECTED_BLOB_CHUNK_SIZE as usize + 19);
+        let mut node = selected_node(&root);
+        let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        node.set_stream_finalize_gate_for_test(reached_tx, release_rx);
+        let identity = node.identity();
+        let mission_authority = node.mission_authority();
+        let admission = Arc::new(AtomicBool::new(true));
+        let worker_admission = Arc::clone(&admission);
+        let (commands, mut received) = mpsc::channel(4);
+        let handle = SelectedBlobHandle::new(commands, admission, identity, mission_authority);
+        let worker = tokio::task::spawn_blocking(move || {
+            while let Some(command) = received.blocking_recv() {
+                let SelectedApplicationCommand::Blob(command) = command else {
+                    panic!("finalize responsiveness test received another application class");
+                };
+                node.execute_live(command, &worker_admission)
+                    .expect("execute finalize responsiveness command");
+            }
+        });
+        let mut stream = handle
+            .open_publish_stream(BlobPublishStreamRequest {
+                publication: request(b"blob/stream/finalize-worker"),
+                options: BlobPublishOptions::durable(),
+                total_len: bytes.len() as u64,
+            })
+            .await
+            .expect("open live upload");
+        for (offset, chunk) in bytes.chunks(64 * 1024).enumerate() {
+            stream
+                .write((offset * 64 * 1024) as u64, Zeroizing::new(chunk.to_vec()))
+                .await
+                .expect("write live upload");
+        }
+        let finishing = tokio::spawn(async move { stream.finish().await });
+        tokio::task::spawn_blocking(move || reached_rx.recv().expect("finalizer reached gate"))
+            .await
+            .expect("join gate observer");
+        tokio::time::timeout(std::time::Duration::from_secs(1), handle.capacity_status())
+            .await
+            .expect("actor services capacity command while finalizer is held")
+            .expect("capacity status");
+        release_tx.send(()).expect("release finalizer");
+        finishing
+            .await
+            .expect("join finish task")
+            .expect("finish live upload");
+        drop(handle);
+        worker.await.expect("join live application actor");
     }
 
     #[test]
