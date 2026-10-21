@@ -654,6 +654,10 @@ docker compose -f "$ASTER_COMPOSE_FILE" -f "$ASTER_REMOTE_MESH_FILE" \
   run --rm asterctl --json query \
   --topic chat.events --scope mission/team/alpha
 docker compose -f "$ASTER_COMPOSE_FILE" -f "$ASTER_REMOTE_MESH_FILE" \
+  run --rm asterctl --timeout 900 --json blob-status \
+  --publication-id '<DEVICE_PUBLICATION_ID>' --topic imagery.maps \
+  --scope mission/team/alpha --wait
+docker compose -f "$ASTER_COMPOSE_FILE" -f "$ASTER_REMOTE_MESH_FILE" \
   run --rm asterctl --timeout 900 --json blob-read \
   --id '<DEVICE_BLOB_ID>' --topic imagery.maps \
   --scope mission/team/alpha --output /transfer/device-map.bin

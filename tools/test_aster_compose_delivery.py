@@ -729,6 +729,19 @@ class ScopeReductionTests(DeliveryTestCase):
 
 
 class RepositoryPolicyTests(unittest.TestCase):
+    def test_asterctl_readme_lists_complete_blob_workflow_and_timeout_defaults(self):
+        readme = (REPOSITORY / "crates/asterctl/README.md").read_text()
+        command_inventory = readme.split("Currently it provides", 1)[1].split(
+            "See man page", 1
+        )[0]
+        for command in ("blob-publish", "blob-status", "blob-read"):
+            with self.subTest(command=command):
+                self.assertIn(command, command_inventory)
+        timeout_row = next(
+            line for line in readme.splitlines() if line.startswith("| `--timeout SECONDS`")
+        )
+        self.assertIn("Blob publish/read default `900`", timeout_row)
+
     def test_blob_read_operator_docs_describe_portable_named_staging(self):
         for path in (
             REPOSITORY / "crates/asterctl/asterctl-blob-read.1",
@@ -753,7 +766,13 @@ class RepositoryPolicyTests(unittest.TestCase):
             cross_device.count('-f "$ASTER_REMOTE_MESH_FILE"'),
             8,
         )
-        for command in (" publish ", " query ", "blob-publish", "blob-read"):
+        for command in (
+            " publish ",
+            " query ",
+            "blob-publish",
+            "blob-status",
+            "blob-read",
+        ):
             with self.subTest(command=command):
                 self.assertIn(command, cross_device)
 
@@ -786,6 +805,7 @@ class RepositoryPolicyTests(unittest.TestCase):
             " publish ",
             " query ",
             "blob-publish",
+            "blob-status",
             "blob-read",
             "--ttl-ms",
             "sha256sum",

@@ -10,7 +10,7 @@ agents require a local authenticated tunnel endpoint; `--host` cannot send
 bearer tokens or Event payloads directly over a remote plaintext connection.
 
 Currently it provides `status`, `publish`, `query`, `subscribe`,
-`subscriptions`, `unsubscribe`, `blob-publish`, and `blob-read`.
+`subscriptions`, `unsubscribe`, `blob-publish`, `blob-status`, and `blob-read`.
 
 See man page for usage details
 
@@ -52,7 +52,7 @@ asterctl --help
 | --- | --- |
 | `-h, --host IP` | Agent IPv4 or IPv6 address; default `127.0.0.1` |
 | `-p, --port PORT` | RPC port, 1–65535; default `8181` |
-| `--timeout SECONDS` | Client timeout for each RPC, 1–86400 whole seconds; default `10`; agent-side limits also apply |
+| `--timeout SECONDS` | Client timeout for each RPC, 1–86400 whole seconds; default `10`, Blob publish/read default `900`; agent-side limits also apply |
 | `-j, --json` | Pretty-printed JSON; RPC fields use ProtoJSON, with CLI operation metadata described below |
 | `-t, --token TOKEN` | Plain-text API token, without the `Bearer ` prefix |
 | `--token-file PATH` | Read that same token from a regular file |
