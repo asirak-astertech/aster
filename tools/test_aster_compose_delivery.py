@@ -792,6 +792,38 @@ class RepositoryPolicyTests(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertIn(command, remote_lifecycle)
 
+    def test_cross_device_runbook_activates_reviewed_config_before_transfer(self):
+        runbook = (REPOSITORY / "docs/operator-guide.md").read_text()
+        cross_device = runbook.split(
+            "### Step 7: connect this Docker node to a test device", 1
+        )[1].split("### Compose boundaries", 1)[0]
+
+        docker_edit = cross_device.index("Docker node's `agent.json`:")
+        device_edit = cross_device.index("On the packaged test device:")
+        digest_review = cross_device.index('sha256sum "$ASTER_AGENT_CONFIG_FILE"')
+        preflight = cross_device.index("run --rm preflight")
+        activation = cross_device.index("up -d --force-recreate aster-agent")
+        verification = cross_device.index("run --rm verify")
+        first_transfer = cross_device.index("run --rm asterctl --json publish")
+
+        self.assertLess(docker_edit, digest_review)
+        self.assertLess(device_edit, digest_review)
+        self.assertLess(digest_review, preflight)
+        self.assertLess(preflight, activation)
+        self.assertLess(activation, verification)
+        self.assertLess(verification, first_transfer)
+        activation_block = cross_device[
+            digest_review:cross_device.index("Proceed only after preflight")
+        ]
+        self.assertIn(
+            "export ASTER_AGENT_CONFIG_SHA256='<reviewed-64-lowercase-hex>'",
+            activation_block,
+        )
+        self.assertEqual(
+            activation_block.count('-f "$ASTER_REMOTE_MESH_FILE"'),
+            4,
+        )
+
     def test_operator_runbook_has_artifact_only_compose_cli_examples(self):
         runbook = (REPOSITORY / "docs/operator-guide.md").read_text()
         required = (

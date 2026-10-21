@@ -593,21 +593,7 @@ objects; they do not prove peer transfer.
 ### Step 7: connect this Docker node to a test device
 
 Keep the default deployment closed unless a remote peer is required. For a
-reviewed ZeroTier test, bind the mesh port only to this host's ZeroTier IPv4:
-
-```sh
-export ASTER_MESH_BIND_ADDRESS='<THIS_HOST_ZEROTIER_IPV4>'
-export ASTER_MESH_PUBLISHED_PORT=8183
-docker compose -f "$ASTER_COMPOSE_FILE" -f "$ASTER_REMOTE_MESH_FILE" \
-  config --format json > /tmp/aster-compose.remote.rendered.json
-docker compose -f "$ASTER_COMPOSE_FILE" -f "$ASTER_REMOTE_MESH_FILE" \
-  run --rm preflight
-docker compose -f "$ASTER_COMPOSE_FILE" -f "$ASTER_REMOTE_MESH_FILE" \
-  up -d --force-recreate aster-agent
-docker compose -f "$ASTER_COMPOSE_FILE" -f "$ASTER_REMOTE_MESH_FILE" \
-  run --rm verify
-```
-
+reviewed ZeroTier test, edit both nodes before activating either change.
 Configure reciprocal authenticated peers and the exact Blob interest. In the
 Docker node's `agent.json`:
 
@@ -628,7 +614,38 @@ On the packaged test device:
 ```
 
 Restart the packaged device after its configuration change and permit UDP 8183
-in applicable host policy. Create the matching receiver subscriptions before
+in applicable host policy.
+
+Review the final Docker configuration, then refresh its digest. Do not reuse
+the digest from Step 4 after editing `agent.json`:
+
+```sh
+jq . "$ASTER_AGENT_CONFIG_FILE"
+sha256sum "$ASTER_AGENT_CONFIG_FILE"
+export ASTER_AGENT_CONFIG_SHA256='<reviewed-64-lowercase-hex>'
+```
+
+Bind the mesh port only to this host's ZeroTier IPv4. Validate the packaged
+Compose file, render the remote-mesh composition, run its preflight, and
+force-recreate the Docker agent so the edited configuration is active. Keep
+the override on every lifecycle command:
+
+```sh
+export ASTER_MESH_BIND_ADDRESS='<THIS_HOST_ZEROTIER_IPV4>'
+export ASTER_MESH_PUBLISHED_PORT=8183
+python3 "$ASTER_VALIDATOR" "$ASTER_COMPOSE_FILE"
+docker compose -f "$ASTER_COMPOSE_FILE" -f "$ASTER_REMOTE_MESH_FILE" \
+  config --format json > /tmp/aster-compose.remote.rendered.json
+docker compose -f "$ASTER_COMPOSE_FILE" -f "$ASTER_REMOTE_MESH_FILE" \
+  run --rm preflight
+docker compose -f "$ASTER_COMPOSE_FILE" -f "$ASTER_REMOTE_MESH_FILE" \
+  up -d --force-recreate aster-agent
+docker compose -f "$ASTER_COMPOSE_FILE" -f "$ASTER_REMOTE_MESH_FILE" \
+  run --rm verify
+```
+
+Proceed only after preflight passes and verification prints
+`VERIFY status=pass`. Create the matching receiver subscriptions before
 publishing. For Docker-to-device checks, every Docker command keeps the remote
 mesh override:
 
