@@ -60184,9 +60184,21 @@ mod tests {
             assert_eq!(node.identity(), identities[index]);
             node
         };
+        let recover_client = |node: &mut crate::application::SelectedEventNode, index: usize| {
+            let path = states[index].join("rekey-consumer-journal.redb");
+            let id = b"test.rekey-consumer";
+            if !path.exists() {
+                crate::publication_journal::Journal::initialize(&path, id).unwrap();
+            }
+            let mut journal = crate::publication_journal::Journal::open(&path, id).unwrap();
+            journal.recover_stopped(node).unwrap();
+            journal.client_context().unwrap()
+        };
         let subscriptions = [1, 2].map(|index| {
             let mut node = open(index);
+            let client = recover_client(&mut node, index);
             node.subscribe(EventSubscriptionRequest {
+                client,
                 operation_key: b"rekey-persisted-consume".to_vec(),
                 topic: services.topic.clone(),
                 scope: services.scope.clone(),
@@ -60239,8 +60251,10 @@ mod tests {
         } // Every Store and contact endpoint is closed before fresh publication.
         let mut reopened = [open(0), open(1), open(2)];
         for index in [1, 2] {
+            let client = recover_client(&mut reopened[index], index);
             let page = reopened[index]
                 .poll(EventPollRequest {
+                    client,
                     subscription: subscriptions[index - 1],
                     delivery_limit: 8,
                     scan_limit: 8,
@@ -60318,8 +60332,10 @@ mod tests {
         }
         for index in [1, 2] {
             let mut node = open(index);
+            let client = recover_client(&mut node, index);
             let page = node
                 .poll(EventPollRequest {
+                    client,
                     subscription: subscriptions[index - 1],
                     delivery_limit: 8,
                     scan_limit: 8,
