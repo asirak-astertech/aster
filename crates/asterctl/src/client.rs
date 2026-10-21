@@ -370,31 +370,18 @@ pub async fn status(
     Ok(response.into_owned())
 }
 
-pub async fn publish(
+pub fn publication_sdk(
     address: SocketAddr,
     token: &Token,
-    request: api::PublishEventRequest,
     timeout: Duration,
-) -> Result<api::PublishEventResponse, MutationError> {
-    let ttl_ms = request.ttl_ms;
+    identity: &crate::journal::Identity,
+) -> Result<aster_agent::sdk::NumberedEventSdk<HttpClient>, String> {
     let client = api::AsterApplicationServiceClient::new(
         HttpClient::plaintext(),
         config(address, token, timeout),
     );
-    let response = tokio::time::timeout(timeout, client.publish_event(request))
-        .await
-        .map_err(|_| MutationError::rpc(connectrpc::ErrorCode::DeadlineExceeded))?
-        .map_err(|error| MutationError::rpc(error.code))?;
-    let response = response.into_owned();
-    if response.id.len() != 32 || response.publisher.len() != 32 {
-        return Err(MutationError::unknown("invalid publication receipt"));
-    }
-    if ttl_ms.is_some() && response.ttl_ms != ttl_ms {
-        return Err(MutationError::unknown(
-            "agent did not confirm the requested TTL",
-        ));
-    }
-    Ok(response)
+    aster_agent::sdk::NumberedEventSdk::open(client, &identity.path, &identity.client_id)
+        .map_err(crate::journal::describe_error)
 }
 
 pub async fn publish_blob(
@@ -643,6 +630,16 @@ mod tests {
         ))
     }
 
+    #[cfg(target_os = "linux")]
+    fn private_test_directory(suffix: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = test_path(suffix);
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        directory
+    }
+
     #[test]
     fn blob_unknown_outcome_prints_exact_operation_key_retry_guidance() {
         let key = crate::operation_key::Selection::Explicit("blob-key".into())
@@ -875,10 +872,10 @@ mod tests {
         let fixture = Fixture::start(router).await;
         let source = test_path("source");
         #[cfg(target_os = "linux")]
-        let destination = test_path("destination");
-        let _ = std::fs::remove_file(&source);
+        let destination_directory = private_test_directory("destination-directory");
         #[cfg(target_os = "linux")]
-        let _ = std::fs::remove_file(&destination);
+        let destination = destination_directory.join("destination");
+        let _ = std::fs::remove_file(&source);
         std::fs::write(&source, &payload).unwrap();
 
         let response = match publish_blob(
@@ -944,7 +941,7 @@ mod tests {
         fixture.stop().await;
         std::fs::remove_file(source).unwrap();
         #[cfg(target_os = "linux")]
-        std::fs::remove_file(destination).unwrap();
+        std::fs::remove_dir_all(destination_directory).unwrap();
     }
 
     async fn publish_error(error: connectrpc::ConnectError) -> MutationError {
@@ -1090,7 +1087,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn blob_native_http2_read_error_discards_anonymous_partial_output() {
+    async fn blob_native_http2_read_error_discards_staged_partial_output() {
         let router = connectrpc::Router::new().route_server_stream(
             SERVICE,
             "ReadBlob",
@@ -1104,8 +1101,8 @@ mod tests {
             }),
         );
         let fixture = Fixture::start(router).await;
-        let destination = test_path("partial-destination");
-        let _ = std::fs::remove_file(&destination);
+        let directory = private_test_directory("partial-directory");
+        let destination = directory.join("destination");
         let request = api::ReadBlobRequest {
             id: vec![1; 32],
             topic: "imagery.maps".into(),
@@ -1125,16 +1122,15 @@ mod tests {
         assert!(!error.contains("secret fixture detail"), "{error}");
         assert!(!destination.exists());
         fixture.stop().await;
+        std::fs::remove_dir(directory).unwrap();
     }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn blob_native_http2_read_failure_leaves_no_named_partial_or_unrelated_damage() {
-        let directory = test_path("cleanup-directory");
+    async fn blob_native_http2_read_failure_removes_staged_partial_without_unrelated_damage() {
+        let directory = private_test_directory("cleanup-directory");
         let destination = directory.join("destination");
         let unrelated = directory.join("unrelated");
-        let _ = std::fs::remove_dir_all(&directory);
-        std::fs::create_dir(&directory).unwrap();
         std::fs::write(&unrelated, b"unrelated contents").unwrap();
         let directory_by_handler = directory.clone();
         let router = connectrpc::Router::new().route_server_stream(
@@ -1143,7 +1139,7 @@ mod tests {
             connectrpc::streaming_handler_fn(move |_ctx, _request: api::ReadBlobRequest| {
                 let directory = directory_by_handler.clone();
                 async move {
-                    assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+                    assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 2);
                     connectrpc::Response::stream_ok(connectrpc::stream_iter([Err::<
                         api::ReadBlobResponse,
                         _,
