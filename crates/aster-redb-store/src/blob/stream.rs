@@ -205,6 +205,13 @@ impl Profile5ReceiptRecord {
     }
 }
 
+#[cfg(test)]
+pub(super) fn test_decode_profile5_receipt_progress(
+    encoded: &[u8],
+) -> Result<BlobStreamResume, StoreError> {
+    Profile5ReceiptRecord::decode(encoded).map(|record| record.progress)
+}
+
 fn profile5_receipt_binding_from_metadata(
     metadata: &super::BlobMetadata,
     total_len: u64,

@@ -20417,7 +20417,31 @@ mod tests {
                 let (key, value) = table.iter().unwrap().next().unwrap().unwrap();
                 (key.value().to_vec(), value.value().to_vec())
             };
-            encoded[offset + 7] ^= 1;
+            if offset == 169 {
+                // Keep the corrupt generation nonzero so the row decoder
+                // accepts it and the exact shared-shape audit must reject it.
+                encoded[offset..offset + 8].copy_from_slice(&2u64.to_be_bytes());
+                let decoded = super::stream::test_decode_profile5_receipt_progress(&encoded)
+                    .expect("nonzero wrong generation remains decoder-valid");
+                assert_eq!(decoded.generation(), 2);
+                assert_eq!(
+                    (
+                        decoded.next_segment_index(),
+                        decoded.durable_plaintext_offset(),
+                        decoded.durable_pack_len(),
+                        decoded.durable_wire_offset(),
+                    ),
+                    (
+                        terminal.next_chunk_index,
+                        terminal.plaintext_offset,
+                        terminal.carrier_offset,
+                        terminal.wire_offset,
+                    ),
+                    "generation corruption leaves all terminal offsets exact"
+                );
+            } else {
+                encoded[offset + 7] ^= 1;
+            }
             table.insert(key.as_slice(), encoded.as_slice()).unwrap();
             drop(table);
             write.commit().unwrap();

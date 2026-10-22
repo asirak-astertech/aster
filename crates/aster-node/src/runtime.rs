@@ -52416,7 +52416,7 @@ mod tests {
                     ),
                 ),
             );
-            let (sent, received) = if label == "nonempty" {
+            let (sent, received, capacity_chain) = if label == "nonempty" {
                 assert!(
                     first.is_err(),
                     "mid-DATA disconnect must interrupt transfer"
@@ -52488,6 +52488,16 @@ mod tests {
                 let promoted_stats = target_store
                     .blob_stats()
                     .expect("capacity after canonical promotion");
+                assert!(promoted_stats.committed_file_bytes > target_before.committed_file_bytes);
+                assert!(promoted_stats.reserved_file_bytes > target_before.reserved_file_bytes);
+                assert!(
+                    promoted_stats.committed_file_bytes >= partial_stats.committed_file_bytes,
+                    "promotion cannot lose committed bytes charged for the first durable extent"
+                );
+                assert!(
+                    promoted_stats.reserved_file_bytes >= partial_stats.reserved_file_bytes,
+                    "promotion cannot lose reserved bytes charged for the first durable extent"
+                );
                 assert!(
                     target_store
                         .resume_profile5_receipt(publication)
@@ -52537,7 +52547,11 @@ mod tests {
                     settled_stats.reserved_file_bytes,
                     promoted_stats.reserved_file_bytes
                 );
-                settled
+                (
+                    settled.0,
+                    settled.1,
+                    Some((partial_stats, promoted_stats, settled_stats)),
+                )
             } else if label == "empty" {
                 assert!(
                     first.is_err(),
@@ -52567,7 +52581,7 @@ mod tests {
                     );
                 let retry_adapter = blob_stream::tests::MemoryTransportAdapter::new();
                 let mut retry_verifier = open_test_sealer(&services.other);
-                tokio::try_join!(
+                let settled = tokio::try_join!(
                     blob_stream::send_canonical_blob_profile5(
                         &retry_adapter,
                         &source_store,
@@ -52590,9 +52604,11 @@ mod tests {
                         &offer,
                     ),
                 )
-                .expect("resume interrupted empty profile-5 transfer")
+                .expect("resume interrupted empty profile-5 transfer");
+                (settled.0, settled.1, None)
             } else {
-                first.expect("canonical v9 production crossing")
+                let settled = first.expect("canonical v9 production crossing");
+                (settled.0, settled.1, None)
             };
             assert_eq!(sent.roots, received.roots);
             if label == "nonempty" {
@@ -52666,8 +52682,26 @@ mod tests {
                 let charged = target_store
                     .blob_stats()
                     .expect("profile-5 charge before retirement");
-                assert!(charged.committed_file_bytes > target_before.committed_file_bytes);
-                assert!(charged.reserved_file_bytes > target_before.reserved_file_bytes);
+                let (partial, promoted, acknowledged) =
+                    capacity_chain.expect("nonempty capacity chain");
+                assert!(promoted.committed_file_bytes >= partial.committed_file_bytes);
+                assert!(promoted.reserved_file_bytes >= partial.reserved_file_bytes);
+                assert_eq!(
+                    acknowledged.committed_file_bytes,
+                    promoted.committed_file_bytes
+                );
+                assert_eq!(
+                    acknowledged.reserved_file_bytes,
+                    promoted.reserved_file_bytes
+                );
+                assert_eq!(
+                    charged.committed_file_bytes,
+                    acknowledged.committed_file_bytes
+                );
+                assert_eq!(
+                    charged.reserved_file_bytes,
+                    acknowledged.reserved_file_bytes
+                );
                 target_store
                     .test_revoke_blob_publisher_for_reclamation(services.member.identity())
                     .expect("revoke received profile-5 publisher");
