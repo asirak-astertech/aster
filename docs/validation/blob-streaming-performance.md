@@ -106,14 +106,28 @@ cargo test --release -p aster-node composite_profile5_records_process_256_mib_in
 
 ## Open qualification: extent batching policy
 
+<!-- ASTER-BLOB-CAPABILITY:BEGIN -->
+```json
+{
+  "schema": 1,
+  "surface": "performance",
+  "legacy_2026_10_20_format": "ASTRBS02_1MiB_semantic_segments",
+  "legacy_2026_10_20_supports_current_candidate": false,
+  "current_map_unit": "65536-byte canonical plaintext chunk",
+  "current_record": "ASTRBT01",
+  "current_extent": "ABX1, at most 1048576 bytes",
+  "current_cm4_qualification": "pending_task_13"
+}
+```
+<!-- ASTER-BLOB-CAPABILITY:END -->
+
 The remediated profile uses the existing 64-KiB canonical plaintext chunk and
 an encoded canonical chunk record of at most 66,215 bytes. `ABX1` batches whole
 records into an extent of at most 1 MiB. The extent target is transfer policy,
 not the canonical plaintext chunk size and not a second Blob identity format.
 
-Current qualification must measure 64-KiB canonical plaintext chunks carried
-as ASTRBT01 records in at-most-1-MiB ABX1 extents. Task 13 must establish the
-current candidate's end-to-end throughput and latency, CPU, peak RSS and
+Task 13 must establish the current candidate's end-to-end throughput and
+latency, CPU, peak RSS and
 in-flight bytes, checkpoint cost, retransmitted bytes, resume amplification,
 and behavior under loss and constrained MTU. No result below supports the
 current batching choice.
@@ -155,5 +169,4 @@ passed the 80% floor. Receiver occupancy remained bounded at four items and
 4,194,840 bytes.
 
 This legacy requalification supported only the measured ASTRBS02 completed-pack
-candidate. The current profile-5 canonical-authority pipeline has different
-64-KiB/ASTRBT01/ABX1 map and extent units and requires new CM4 evidence.
+candidate. It supplies no evidence for later candidates.

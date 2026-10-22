@@ -21,6 +21,22 @@ constrained, and disconnected operation.
 > and [requirements status](docs/validation/requirements-status.md) before
 > planning a deployment.
 
+The current public Blob capability boundary is machine checked:
+
+<!-- ASTER-BLOB-CAPABILITY:BEGIN -->
+```json
+{
+  "schema": 1,
+  "surface": "public_api",
+  "local_publish_waits_for_peer": false,
+  "rust_agent_asterctl_publish_read": "implemented",
+  "blob_status_scope": "receiver_local_durable_state",
+  "blob_status_reports_remote_delivery_peer_or_convergence": false,
+  "cli_download_resume": "post_merge"
+}
+```
+<!-- ASTER-BLOB-CAPABILITY:END -->
+
 ## See it work
 
 Start with **Aster Field Notes**. It opens with no processes running, asks you

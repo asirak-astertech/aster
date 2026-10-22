@@ -87,10 +87,22 @@ The broad bindings use `blob_writer`/`BlobWriter`-style streaming. The legacy
 selected Rust live-file facade publishes an owned regular file, reads
 authenticated pages of at most 64 KiB, and retains its 64-MiB ceiling. The
 Linux local agent and `asterctl` use resumable 512-KiB application frames over
-the same canonical authority and admit objects through 8 GiB. Semantic v9
-selects profile 5 BlobStreamV1; semantic v7/v8 retain compatibility profile 4
-BlobRangesStreamV1. Profile 5 batches canonical 64-KiB plaintext chunks as
-complete ASTRBT01 records in ABX1 extents of at most 1 MiB.
+the same canonical authority and admit objects through 8 GiB. The selected
+Blob profile and map-unit contract is machine checked:
+
+<!-- ASTER-BLOB-CAPABILITY:BEGIN -->
+```json
+{
+  "schema": 1,
+  "surface": "recipes",
+  "semantic_v7_v8_profile": "4:BlobRangesStreamV1",
+  "semantic_v9_profile": "5:BlobStreamV1",
+  "map_unit": "65536-byte canonical plaintext chunk",
+  "record": "ASTRBT01, at most 66215 bytes",
+  "extent": "ABX1, at most 1048576 bytes"
+}
+```
+<!-- ASTER-BLOB-CAPABILITY:END -->
 
 Each returned chunk or page is authenticated, but whole-content verification
 finishes only at end-of-file. Write to a temporary destination and rename it

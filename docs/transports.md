@@ -57,12 +57,26 @@ whole-key active-head queue. Neither application selector mutates its separately
 configured network receive interest. The runtime also
 exposes a cloneable live Blob handle: publish accepts an already-open regular
 file at cursor zero, bounded to 64 MiB and 1,024 canonical 64-KiB chunks, and a
-live read returns at most 64 KiB of plaintext per zeroize-on-drop page. Semantic
-v9 selects profile 5 BlobStreamV1; semantic v7/v8 retain compatibility profile
-4 BlobRangesStreamV1. Profile 5 batches canonical 64-KiB plaintext chunks as
-complete ASTRBT01 records in ABX1 extents of at most 1 MiB, with
-receiver-authoritative resume. Profile 4 remains the compatibility path for
-peer-neutral contiguous carrier ranges of at most 16 KiB; v7 is durable-only,
+live read returns at most 64 KiB of plaintext per zeroize-on-drop page. The
+selected Blob profile and map-unit contract is machine checked:
+
+<!-- ASTER-BLOB-CAPABILITY:BEGIN -->
+```json
+{
+  "schema": 1,
+  "surface": "transports",
+  "semantic_v7_v8_profile": "4:BlobRangesStreamV1",
+  "semantic_v9_profile": "5:BlobStreamV1",
+  "map_unit": "65536-byte canonical plaintext chunk",
+  "record": "ASTRBT01, at most 66215 bytes",
+  "extent": "ABX1, at most 1048576 bytes"
+}
+```
+<!-- ASTER-BLOB-CAPABILITY:END -->
+
+Profile 5 uses receiver-authoritative resume. Profile 4 remains the
+compatibility path for peer-neutral contiguous carrier ranges of at most 16 KiB;
+v7 is durable-only,
 while v8 also implements
 authenticated finite-TTL custody and bounded lower-priority pressure recovery
 internally. The broader

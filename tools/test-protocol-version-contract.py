@@ -28,6 +28,90 @@ ORACLE = importlib.util.module_from_spec(ORACLE_SPEC)
 ORACLE_SPEC.loader.exec_module(ORACLE)
 
 
+DOCUMENTATION_CAPABILITIES = {
+    "node_api": {
+        "schema": 1,
+        "surface": "node_api",
+        "semantic_v7_v8_profile": "4:BlobRangesStreamV1",
+        "semantic_v9_profile": "5:BlobStreamV1",
+        "map_unit": "65536-byte canonical plaintext chunk",
+        "record": "ASTRBT01, at most 66215 bytes",
+        "extent": "ABX1, at most 1048576 bytes",
+    },
+    "transports": {
+        "schema": 1,
+        "surface": "transports",
+        "semantic_v7_v8_profile": "4:BlobRangesStreamV1",
+        "semantic_v9_profile": "5:BlobStreamV1",
+        "map_unit": "65536-byte canonical plaintext chunk",
+        "record": "ASTRBT01, at most 66215 bytes",
+        "extent": "ABX1, at most 1048576 bytes",
+    },
+    "recipes": {
+        "schema": 1,
+        "surface": "recipes",
+        "semantic_v7_v8_profile": "4:BlobRangesStreamV1",
+        "semantic_v9_profile": "5:BlobStreamV1",
+        "map_unit": "65536-byte canonical plaintext chunk",
+        "record": "ASTRBT01, at most 66215 bytes",
+        "extent": "ABX1, at most 1048576 bytes",
+    },
+    "runbook": {
+        "schema": 1,
+        "surface": "runbook",
+        "settlement_order": [
+            "authenticated_finish_and_content_verification",
+            "canonical_apply_promotion",
+            "result",
+            "ack",
+            "receipt_cleanup",
+        ],
+        "available_before_settlement_cleanup": True,
+        "receipt_key": ["receiving_mission_authority", "canonical_source"],
+        "receipt_persists_attempt_nonce": False,
+        "sender_hard_deadline_basis": "exact_canonical_wire_length",
+        "receiver_initial_hard_deadline_basis": "profile_wire_ceiling_before_authenticated_open",
+        "authenticated_progress_timeout_seconds": 120,
+        "plaintext_chunk_bytes": 65_536,
+        "encoded_record_max_bytes": 66_215,
+        "extent_max_bytes": 1_048_576,
+        "checkpoint_batch_max_bytes": 134_217_728,
+        "pre_profile5_canonical_blob_profile5_eligible": True,
+        "capacity_authority": "configured_blob_depot_limits",
+    },
+    "public_api": {
+        "schema": 1,
+        "surface": "public_api",
+        "local_publish_waits_for_peer": False,
+        "rust_agent_asterctl_publish_read": "implemented",
+        "blob_status_scope": "receiver_local_durable_state",
+        "blob_status_reports_remote_delivery_peer_or_convergence": False,
+        "cli_download_resume": "post_merge",
+    },
+    "performance": {
+        "schema": 1,
+        "surface": "performance",
+        "legacy_2026_10_20_format": "ASTRBS02_1MiB_semantic_segments",
+        "legacy_2026_10_20_supports_current_candidate": False,
+        "current_map_unit": "65536-byte canonical plaintext chunk",
+        "current_record": "ASTRBT01",
+        "current_extent": "ABX1, at most 1048576 bytes",
+        "current_cm4_qualification": "pending_task_13",
+    },
+}
+
+
+def capability_block(surface: str, *, value=None) -> str:
+    payload = DOCUMENTATION_CAPABILITIES[surface] if value is None else value
+    return (
+        "<!-- ASTER-BLOB-CAPABILITY:BEGIN -->\n"
+        "```json\n"
+        f"{json.dumps(payload, indent=2)}\n"
+        "```\n"
+        "<!-- ASTER-BLOB-CAPABILITY:END -->\n"
+    )
+
+
 def core_contract() -> str:
     constants = "\n".join(
         f"pub(crate) const SEMANTIC_PROTOCOL_V{version}: u16 = {version};"
@@ -112,6 +196,121 @@ class ProtocolVersionContractTests(unittest.TestCase):
             cddl if cddl is not None else cddl_contract(),
         )
 
+    def test_blob_documentation_contract_is_structured_and_single_authority(self) -> None:
+        documents = {
+            surface: capability_block(surface) for surface in DOCUMENTATION_CAPABILITIES
+        }
+        CHECKER.validate_blob_documentation_contract(documents)
+
+        duplicate = dict(documents)
+        duplicate["node_api"] += capability_block("node_api")
+        with self.assertRaisesRegex(
+            CHECKER.ContractViolation, "node_api.*exactly one structured capability block"
+        ):
+            CHECKER.validate_blob_documentation_contract(duplicate)
+
+        competing = dict(documents)
+        competing["transports"] += capability_block("node_api")
+        with self.assertRaisesRegex(
+            CHECKER.ContractViolation,
+            "transports.*exactly one structured capability block",
+        ):
+            CHECKER.validate_blob_documentation_contract(competing)
+
+        malformed = dict(documents)
+        malformed["runbook"] = malformed["runbook"].replace(
+            '"authenticated_progress_timeout_seconds": 120',
+            '"authenticated_progress_timeout_seconds": "two minutes"',
+        )
+        with self.assertRaisesRegex(CHECKER.ContractViolation, "runbook.*fields"):
+            CHECKER.validate_blob_documentation_contract(malformed)
+
+        extra_field = dict(documents)
+        extra_payload = dict(DOCUMENTATION_CAPABILITIES["performance"])
+        extra_payload["current_throughput_mib_s"] = 99
+        extra_field["performance"] = capability_block(
+            "performance", value=extra_payload
+        )
+        with self.assertRaisesRegex(CHECKER.ContractViolation, "performance.*fields"):
+            CHECKER.validate_blob_documentation_contract(extra_field)
+
+        missing_field = dict(documents)
+        missing_payload = dict(DOCUMENTATION_CAPABILITIES["public_api"])
+        del missing_payload["cli_download_resume"]
+        missing_field["public_api"] = capability_block(
+            "public_api", value=missing_payload
+        )
+        with self.assertRaisesRegex(CHECKER.ContractViolation, "public_api.*fields"):
+            CHECKER.validate_blob_documentation_contract(missing_field)
+
+        malformed_json = dict(documents)
+        malformed_json["recipes"] = malformed_json["recipes"].replace(
+            '"schema": 1', '"schema":', 1
+        )
+        with self.assertRaisesRegex(CHECKER.ContractViolation, "recipes.*JSON"):
+            CHECKER.validate_blob_documentation_contract(malformed_json)
+
+        contradictions = (
+            (
+                "node_api",
+                "node_api contradiction",
+                "Each 1 MiB segment carries its own authentication tag.",
+            ),
+            (
+                "transports",
+                "transports contradiction",
+                "Each segment of 1 MiB is authenticated on its own.",
+            ),
+            (
+                "recipes",
+                "recipes contradiction",
+                "Profile 5 separately authenticates every 1 MiB segment.",
+            ),
+            (
+                "runbook",
+                "receiver settlement contradiction",
+                "RESULT and ACK complete prior to canonical promotion.",
+            ),
+            (
+                "runbook",
+                "receipt attempt contradiction",
+                "The durable receipt retains the fresh attempt nonce.",
+            ),
+            (
+                "runbook",
+                "receiver timeout contradiction",
+                "For incoming transfers, the exact content length determines the absolute deadline.",
+            ),
+            (
+                "performance",
+                "legacy performance contradiction",
+                "Legacy CM4 measurements confirm the current ABX1 batching policy.",
+            ),
+        )
+        for surface, label, contradiction in contradictions:
+            damaged = dict(documents)
+            damaged[surface] += contradiction
+            with self.subTest(contradiction=label), self.assertRaisesRegex(
+                CHECKER.ContractViolation, label
+            ):
+                CHECKER.validate_blob_documentation_contract(damaged)
+
+        valid_distinctions = dict(documents)
+        valid_distinctions["node_api"] += (
+            "A 1 MiB segment is independently encrypted, while every 64 KiB "
+            "chunk is authenticated."
+        )
+        valid_distinctions["runbook"] += (
+            "Canonical promotion happens before RESULT and ACK, rather than "
+            "after RESULT and ACK. The durable receipt stores plan data, not "
+            "the fresh attempt nonce."
+        )
+        valid_distinctions["performance"] += (
+            "Legacy CM4 results support the historical ASTRBS02 candidate, "
+            "not the current ABX1 candidate."
+        )
+        CHECKER.validate_blob_documentation_contract(valid_distinctions)
+
     def test_blob_documentation_contract_rejects_each_capability_drift(self) -> None:
         documents = {
             "runbook": """Blob profile negotiation: semantic v7/v8 select profile 4; semantic v9 selects profile 5.
@@ -119,10 +318,6 @@ Profile 5 size terms: 65,536-byte canonical plaintext chunk; 66,215-byte maximum
 Profile 5 checkpoint maximum: 134,217,728 bytes (128 MiB).
 Canonical legacy eligibility: every pre-profile-5 canonical Blob remains eligible for profile 5 after upgrade.
 Unified capacity: provisional uploads, pending network receipts, and completed canonical variants share the configured Blob depot limits.
-Receiver settlement order: authenticated FINISH and content verification -> canonical apply/promotion -> RESULT -> ACK -> receipt cleanup.
-Canonical status may report AVAILABLE while RESULT/ACK settlement or receipt cleanup is still pending.
-The durable receipt is keyed by receiving mission authority and canonical source and binds the verified plan, depot/store authority, and durable checkpoint; it does not persist the fresh attempt nonce.
-Timeout asymmetry: the sender derives its hard deadline from the exact canonical wire length; the receiver opens before authenticated OPEN using the full profile wire ceiling. The two-minute authenticated-progress timeout is the shorter stall bound.
 """,
             "public_api": """Current Blob API capability: the Rust API, native-gRPC agent, and asterctl support bounded local publication and authenticated reads.
 Status boundary: local publication success is a durable local commit; blob-status is receiver-local durable state, not remote delivery, peer status, or convergence status.
@@ -141,48 +336,11 @@ Profile 5 batches canonical 64-KiB plaintext chunks as complete ASTRBT01 records
 Current qualification must measure 64-KiB canonical plaintext chunks carried as ASTRBT01 records in at-most-1-MiB ABX1 extents.
 """,
         }
+        documents = {
+            surface: capability_block(surface) + text
+            for surface, text in documents.items()
+        }
         CHECKER.validate_blob_documentation_contract(documents)
-        mutations = (
-            ("profile 5 negotiation", "semantic v9 selects profile 5", "semantic v9 selects profile 4"),
-            ("separate size terms", "66,215-byte maximum encoded canonical chunk record", "65,536-byte maximum encoded canonical chunk record"),
-            ("128 MiB checkpoint", "134,217,728 bytes (128 MiB)", "67,108,864 bytes (64 MiB)"),
-            ("canonical legacy eligibility", "every pre-profile-5 canonical Blob remains eligible", "new Blobs remain eligible"),
-            ("unified capacity", "share the configured Blob depot limits", "use a separate stream pool"),
-            ("agent and CLI capability", "native-gRPC agent, and asterctl support", "native-gRPC agent may eventually support"),
-            ("local versus convergence status", "not remote delivery, peer status, or convergence status", "reports remote delivery and convergence status"),
-            ("download resume boundary", "post-merge work", "current capability"),
-            ("receiver settlement order", "canonical apply/promotion -> RESULT -> ACK -> receipt cleanup", "RESULT -> ACK -> canonical apply/promotion -> receipt cleanup"),
-            ("canonical-first status timing", "may report AVAILABLE while RESULT/ACK settlement", "reports AVAILABLE only after RESULT/ACK settlement"),
-            ("receipt has no attempt binding", "does not persist the fresh attempt nonce", "persists the fresh attempt nonce"),
-            ("timeout asymmetry", "receiver opens before authenticated OPEN using the full profile wire ceiling", "receiver uses the exact canonical wire length"),
-        )
-        for label, old, new in mutations:
-            damaged = dict(documents)
-            target = "runbook" if old in damaged["runbook"] else "public_api"
-            damaged[target] = damaged[target].replace(old, new, 1)
-            with self.subTest(label=label), self.assertRaisesRegex(
-                CHECKER.ContractViolation, label
-            ):
-                CHECKER.validate_blob_documentation_contract(damaged)
-
-        for surface in ("node_api", "transports", "recipes"):
-            damaged = dict(documents)
-            damaged[surface] = damaged[surface].replace(
-                "canonical 64-KiB plaintext chunks as complete ASTRBT01 records",
-                "independently authenticated 1-MiB segments",
-            )
-            with self.subTest(surface=surface), self.assertRaisesRegex(
-                CHECKER.ContractViolation, surface
-            ):
-                CHECKER.validate_blob_documentation_contract(damaged)
-
-        damaged = dict(documents)
-        damaged["performance"] = damaged["performance"].replace(
-            "Legacy 2026-10-20 ASTRBS02 completed-pack evidence used 1-MiB semantic segments",
-            "The current ABX1 profile used 64-KiB canonical chunks",
-        )
-        with self.assertRaisesRegex(CHECKER.ContractViolation, "legacy performance"):
-            CHECKER.validate_blob_documentation_contract(damaged)
 
         coexistence_mutations = (
             (

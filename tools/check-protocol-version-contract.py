@@ -146,224 +146,191 @@ def require_once(text: str, declaration: str, label: str) -> None:
         fail(f"{label} declaration must occur exactly once; found {count}")
 
 
+BLOB_DOCUMENTATION_CAPABILITIES = {
+    surface: {
+        "schema": 1,
+        "surface": surface,
+        "semantic_v7_v8_profile": "4:BlobRangesStreamV1",
+        "semantic_v9_profile": "5:BlobStreamV1",
+        "map_unit": "65536-byte canonical plaintext chunk",
+        "record": "ASTRBT01, at most 66215 bytes",
+        "extent": "ABX1, at most 1048576 bytes",
+    }
+    for surface in ("node_api", "transports", "recipes")
+}
+BLOB_DOCUMENTATION_CAPABILITIES.update(
+    {
+        "runbook": {
+            "schema": 1,
+            "surface": "runbook",
+            "settlement_order": [
+                "authenticated_finish_and_content_verification",
+                "canonical_apply_promotion",
+                "result",
+                "ack",
+                "receipt_cleanup",
+            ],
+            "available_before_settlement_cleanup": True,
+            "receipt_key": ["receiving_mission_authority", "canonical_source"],
+            "receipt_persists_attempt_nonce": False,
+            "sender_hard_deadline_basis": "exact_canonical_wire_length",
+            "receiver_initial_hard_deadline_basis": "profile_wire_ceiling_before_authenticated_open",
+            "authenticated_progress_timeout_seconds": 120,
+            "plaintext_chunk_bytes": 65_536,
+            "encoded_record_max_bytes": 66_215,
+            "extent_max_bytes": 1_048_576,
+            "checkpoint_batch_max_bytes": 134_217_728,
+            "pre_profile5_canonical_blob_profile5_eligible": True,
+            "capacity_authority": "configured_blob_depot_limits",
+        },
+        "public_api": {
+            "schema": 1,
+            "surface": "public_api",
+            "local_publish_waits_for_peer": False,
+            "rust_agent_asterctl_publish_read": "implemented",
+            "blob_status_scope": "receiver_local_durable_state",
+            "blob_status_reports_remote_delivery_peer_or_convergence": False,
+            "cli_download_resume": "post_merge",
+        },
+        "performance": {
+            "schema": 1,
+            "surface": "performance",
+            "legacy_2026_10_20_format": "ASTRBS02_1MiB_semantic_segments",
+            "legacy_2026_10_20_supports_current_candidate": False,
+            "current_map_unit": "65536-byte canonical plaintext chunk",
+            "current_record": "ASTRBT01",
+            "current_extent": "ABX1, at most 1048576 bytes",
+            "current_cm4_qualification": "pending_task_13",
+        },
+    }
+)
+
+_CAPABILITY_BLOCK = re.compile(
+    r"<!-- ASTER-BLOB-CAPABILITY:BEGIN -->\s*"
+    r"```json\s*(.*?)\s*```\s*"
+    r"<!-- ASTER-BLOB-CAPABILITY:END -->",
+    re.DOTALL,
+)
+
+
+def _documentation_clauses(text: str) -> list[str]:
+    """Split prose at semantic clause boundaries before evaluating anchors."""
+    return [
+        " ".join(clause.lower().replace("-", " ").split())
+        for clause in re.split(
+            r"(?<=[.!?])\s+|;\s*|,\s*(?=(?:while|whereas|rather than|but)\b)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if clause.strip()
+    ]
+
+
+def _is_explicitly_denied(clause: str, anchors: tuple[str, ...]) -> bool:
+    """Return true only when negation is attached to the governed object."""
+    words = re.findall(r"[a-z0-9]+", clause)
+    anchor_positions = [
+        index
+        for index, word in enumerate(words)
+        if any(word.startswith(anchor) for anchor in anchors)
+    ]
+    for index, word in enumerate(words):
+        if word not in {"not", "no", "never", "without"}:
+            continue
+        if index + 1 < len(words) and words[index + 1] == "only":
+            continue
+        if any(abs(index - anchor) <= 8 for anchor in anchor_positions):
+            return True
+    return False
+
+
+def _unstructured_capability_text(surface: str, text: str) -> str:
+    if surface == "node_api":
+        text = re.sub(r"(?m)^//! ?", "", text)
+    begins = text.count("<!-- ASTER-BLOB-CAPABILITY:BEGIN -->")
+    ends = text.count("<!-- ASTER-BLOB-CAPABILITY:END -->")
+    matches = list(_CAPABILITY_BLOCK.finditer(text))
+    if begins != 1 or ends != 1 or len(matches) != 1:
+        fail(
+            f"Blob documentation {surface} must contain exactly one structured capability block"
+        )
+    try:
+        actual = json.loads(matches[0].group(1))
+    except json.JSONDecodeError as error:
+        fail(f"Blob documentation {surface} capability JSON is malformed: {error.msg}")
+    expected = BLOB_DOCUMENTATION_CAPABILITIES[surface]
+    if actual != expected:
+        fail(f"Blob documentation {surface} capability fields differ from the contract")
+    return text[: matches[0].start()] + text[matches[0].end() :]
+
+
 def validate_blob_documentation_contract(documents: dict[str, str]) -> None:
-    """Bind operator-facing Blob claims to the implemented profile-5 boundary."""
-    combined = " ".join("\n".join(documents.values()).split())
-    requirements = (
-        (
-            "profile 5 negotiation",
-            "semantic v7/v8 select profile 4; semantic v9 selects profile 5",
-        ),
-        ("separate size terms", "65,536-byte canonical plaintext chunk"),
-        (
-            "separate size terms",
-            "66,215-byte maximum encoded canonical chunk record",
-        ),
-        (
-            "separate size terms",
-            "1,048,576-byte maximum ABX1 batched extent",
-        ),
-        ("128 MiB checkpoint", "134,217,728 bytes (128 MiB)"),
-        ("canonical legacy eligibility", "every pre-profile-5 canonical Blob remains eligible"),
-        ("unified capacity", "share the configured Blob depot limits"),
-        ("agent and CLI capability", "native-gRPC agent, and asterctl support"),
-        (
-            "local versus convergence status",
-            "not remote delivery, peer status, or convergence status",
-        ),
-        ("download resume boundary", "Download resume: post-merge work"),
-    )
-    for label, statement in requirements:
-        if " ".join(statement.split()) not in combined:
-            fail(f"Blob documentation {label} declaration is missing")
+    """Validate one typed authority per surface and reject competing prose claims."""
+    if set(documents) != set(BLOB_DOCUMENTATION_CAPABILITIES):
+        fail("Blob documentation surfaces differ from the structured contract")
+    prose = {
+        surface: _unstructured_capability_text(surface, documents[surface])
+        for surface in BLOB_DOCUMENTATION_CAPABILITIES
+    }
 
-    def require_document(key: str, label: str, statement: str) -> None:
-        normalized = " ".join(documents.get(key, "").replace("//!", "").split())
-        if " ".join(statement.split()) not in normalized:
-            fail(f"Blob documentation {label} declaration is missing from {key}")
-
-    for label, statement in (
-        (
-            "receiver settlement order",
-            "authenticated FINISH and content verification -> canonical apply/promotion -> RESULT -> ACK -> receipt cleanup",
-        ),
-        (
-            "canonical-first status timing",
-            "may report AVAILABLE while RESULT/ACK settlement or receipt cleanup is still pending",
-        ),
-        (
-            "receipt has no attempt binding",
-            "does not persist the fresh attempt nonce",
-        ),
-        (
-            "timeout asymmetry",
-            "the sender derives its hard deadline from the exact canonical wire length; the receiver opens before authenticated OPEN using the full profile wire ceiling",
-        ),
-        (
-            "timeout asymmetry",
-            "The two-minute authenticated-progress timeout is the shorter stall bound",
-        ),
-    ):
-        require_document("runbook", label, statement)
-
-    profile_statement = (
-        "Semantic v9 selects profile 5 BlobStreamV1; semantic v7/v8 retain "
-        "compatibility profile 4 BlobRangesStreamV1"
-    )
-    chunk_statement = (
-        "Profile 5 batches canonical 64-KiB plaintext chunks as complete "
-        "ASTRBT01 records in ABX1 extents of at most 1 MiB"
-    )
     for surface in ("node_api", "transports", "recipes"):
-        require_document(surface, surface, profile_statement)
-        require_document(surface, surface, chunk_statement)
-        surface_text = documents.get(surface, "").replace("//!", "")
-        for statement in re.split(r"(?<=[.!?])\s+|\n+", surface_text):
-            segment_claim = " ".join(statement.lower().replace("-", " ").split())
-            explicitly_denies_segment_claim = bool(
-                re.search(
-                    r"\b(?:does|do|is|are|can|must)\s+not\b[^.]*"
-                    r"(?:\bindependen\w*\b|\bauthenticat\w*\b)|"
-                    r"\bnever\b[^.]*\bauthenticat\w*\b",
-                    segment_claim,
-                )
+        for clause in _documentation_clauses(prose[surface]):
+            has_one_mib_segment = bool(
+                re.search(r"\b1\s*mib\b", clause)
+                and re.search(r"\bsegments?\b", clause)
             )
-            if not explicitly_denies_segment_claim and all(
-                re.search(term, segment_claim)
-                for term in (
-                    r"\b1\s*mib\b",
-                    r"\bsegments?\b",
-                    r"\bauthenticat\w*\b",
-                    r"\bindependen\w*\b",
+            has_authentication = bool(re.search(r"\bauthenticat\w*\b", clause))
+            if (
+                has_one_mib_segment
+                and has_authentication
+                and not _is_explicitly_denied(
+                    clause, ("segment", "authenticat")
                 )
             ):
                 fail(f"Blob documentation {surface} contradiction is present")
 
-    runbook = " ".join(documents.get("runbook", "").split())
-    for sentence in re.split(r"(?<=[.!?])\s+", runbook):
-        lowered = sentence.lower()
-        has_settlement_terms = all(
-            term in lowered for term in ("promotion", "result", "ack")
+    for clause in _documentation_clauses(prose["runbook"]):
+        words = re.findall(r"[a-z]+", clause)
+        word_set = set(words)
+        settlement_denied = _is_explicitly_denied(
+            clause, ("promotion", "result", "ack")
         )
-        result_and_ack_precede_promotion = re.search(
-            r"(?:result.*ack|ack.*result).*\bbefore\b.*promotion", lowered
-        )
-        promotion_follows_result_and_ack = re.search(
-            r"promotion.*\b(?:after|follows?|following)\b.*(?:result.*ack|ack.*result)",
-            lowered,
-        )
-        explicitly_denies_settlement_claim = bool(
-            re.search(
-                r"promotion.*\b(?:does|did|can|must)\s+not\s+"
-                r"(?:follow|occur|happen)",
-                lowered,
-            )
-        )
-        if not explicitly_denies_settlement_claim and has_settlement_terms and (
-            result_and_ack_precede_promotion or promotion_follows_result_and_ack
-        ):
-            fail("Blob documentation receiver settlement contradiction is present")
-
-        storage_verbs = {
-            "persist",
-            "persists",
-            "persisted",
-            "store",
-            "stores",
-            "stored",
-            "contain",
-            "contains",
-            "contained",
-            "bind",
-            "binds",
-            "bound",
-            "record",
-            "records",
-            "recorded",
-            "save",
-            "saves",
-            "saved",
-        }
-        for receipt_clause in re.split(r"[;]", lowered):
-            words = re.findall(r"[a-z]+", receipt_clause)
-            storage_pattern = (
-                r"(?:persist\w*|stor\w*|contain\w*|bind\w*|bound|record\w*|sav\w*)"
-            )
-            explicitly_denies_attempt_storage = bool(
-                re.search(
-                    rf"(?:does|do|did|can|must)\s+not\s+{storage_pattern}"
-                    rf"[^;]*attempt (?:nonce|binding)|"
-                    rf"attempt (?:nonce|binding)[^;]*\bnot\b[^;]*{storage_pattern}",
-                    receipt_clause,
+        if {"promotion", "result", "ack"} <= word_set and not settlement_denied:
+            try:
+                correct_before = (
+                    words.index("promotion")
+                    < words.index("before")
+                    < min(words.index("result"), words.index("ack"))
                 )
-            )
-            positive_storage_claim = any(
-                word in storage_verbs
-                and not any(
-                    negation in words[max(0, index - 3) : index]
-                    for negation in ("no", "not", "never", "without")
-                )
-                for index, word in enumerate(words)
-            )
-            if (
-                "receipt" in lowered
-                and (
-                    "attempt nonce" in receipt_clause
-                    or "attempt binding" in receipt_clause
-                )
-                and positive_storage_claim
-                and not explicitly_denies_attempt_storage
-            ):
-                fail("Blob documentation receipt attempt contradiction is present")
-    for clause in re.split(r"[.;]", runbook):
-        lowered = clause.lower()
-        explicitly_denies_receiver_deadline = bool(
-            re.search(
-                r"(?:does|do|did|can|must)\s+not\s+"
-                r"(?:calculat\w*|deriv\w*|bas\w*|use\w*)[^;]*hard deadline",
-                lowered,
-            )
+            except ValueError:
+                correct_before = False
+            if not correct_before:
+                fail("Blob documentation receiver settlement contradiction is present")
+        receipt_denied = _is_explicitly_denied(
+            clause, ("receipt", "attempt", "nonce")
         )
-        if (
-            not explicitly_denies_receiver_deadline
-            and any(
-                role in lowered for role in ("receiver", "receiving", "incoming")
-            )
-            and "hard deadline" in lowered
-            and "exact" in lowered
-            and any(unit in lowered for unit in ("content", "wire", "bytes"))
-        ):
+        if {"receipt", "attempt", "nonce"} <= word_set and not receipt_denied:
+            fail("Blob documentation receipt attempt contradiction is present")
+        incoming_role = bool(word_set & {"receiver", "receiving", "incoming"})
+        exact_size = "exact" in word_set and bool(
+            word_set & {"content", "wire", "bytes", "length"}
+        )
+        deadline = "deadline" in word_set
+        deadline_denied = _is_explicitly_denied(
+            clause, ("receiver", "receiving", "incoming", "deadline")
+        )
+        if incoming_role and exact_size and deadline and not deadline_denied:
             fail("Blob documentation receiver timeout contradiction is present")
 
-    require_document(
-        "performance",
-        "legacy performance",
-        "Legacy 2026-10-20 ASTRBS02 completed-pack evidence used 1-MiB semantic segments",
-    )
-    require_document(
-        "performance",
-        "current performance qualification",
-        "Current qualification must measure 64-KiB canonical plaintext chunks carried as ASTRBT01 records in at-most-1-MiB ABX1 extents",
-    )
-    performance = " ".join(documents.get("performance", "").split())
-    for sentence in re.split(r"(?<=[.!?])\s+", performance):
-        lowered = sentence.lower()
-        support_verbs = r"(?:validat\w*|support\w*|qualif\w*|prov(?:e|es|ed|ing)|demonstrat\w*|establish\w*)"
-        explicitly_denies_current_support = bool(
-            re.search(
-                rf"(?:does|do|did|can)\s+not\s+{support_verbs}[^.]*\bcurrent\b|"
-                rf"\bnot\s+{support_verbs}[^.]*\bcurrent\b|"
-                rf"\bno\s+{support_verbs}\w*[^.]*\bcurrent\b",
-                lowered,
-            )
+    for clause in _documentation_clauses(prose["performance"]):
+        words = set(re.findall(r"[a-z0-9]+", clause))
+        historical = bool(words & {"legacy", "cm4", "2026"})
+        current = "current" in words
+        profile = bool(words & {"abx1", "batching", "candidate"})
+        current_denied = _is_explicitly_denied(
+            clause, ("current", "abx1", "batching", "candidate")
         )
-        if (
-            ("legacy" in lowered or "2026-10-20" in lowered or "cm4" in lowered)
-            and re.search(support_verbs, lowered)
-            and "current" in lowered
-            and any(word in lowered for word in ("abx1", "batching", "candidate"))
-            and not explicitly_denies_current_support
-        ):
+        if historical and current and profile and not current_denied:
             fail("Blob documentation legacy performance contradiction is present")
 
 

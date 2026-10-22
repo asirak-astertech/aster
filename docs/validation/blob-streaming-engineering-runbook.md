@@ -5,6 +5,40 @@ application publish through selected-contact transfer and receiver-local read.
 It is engineering validation, not a production deployment or release
 qualification procedure.
 
+The current receiver settlement, receipt, and timeout contract is machine
+checked:
+
+<!-- ASTER-BLOB-CAPABILITY:BEGIN -->
+```json
+{
+  "schema": 1,
+  "surface": "runbook",
+  "settlement_order": [
+    "authenticated_finish_and_content_verification",
+    "canonical_apply_promotion",
+    "result",
+    "ack",
+    "receipt_cleanup"
+  ],
+  "available_before_settlement_cleanup": true,
+  "receipt_key": [
+    "receiving_mission_authority",
+    "canonical_source"
+  ],
+  "receipt_persists_attempt_nonce": false,
+  "sender_hard_deadline_basis": "exact_canonical_wire_length",
+  "receiver_initial_hard_deadline_basis": "profile_wire_ceiling_before_authenticated_open",
+  "authenticated_progress_timeout_seconds": 120,
+  "plaintext_chunk_bytes": 65536,
+  "encoded_record_max_bytes": 66215,
+  "extent_max_bytes": 1048576,
+  "checkpoint_batch_max_bytes": 134217728,
+  "pre_profile5_canonical_blob_profile5_eligible": true,
+  "capacity_authority": "configured_blob_depot_limits"
+}
+```
+<!-- ASTER-BLOB-CAPABILITY:END -->
+
 ## Understand the selected profile
 
 Profile 5 is the semantic-v9 selection. It is not a migration back to v8 and
@@ -52,18 +86,15 @@ content must never be converted into that EOF.
 
 Local publish succeeds after the local durable commit and does not wait for a
 peer. Synchronization starts when an eligible destination becomes available or
-requests the content. Receiver settlement order: authenticated FINISH and
-content verification -> canonical apply/promotion -> RESULT -> ACK -> receipt
-cleanup. Canonical status may report AVAILABLE while RESULT/ACK settlement or
-receipt cleanup is still pending.
+requests the content. During terminal settlement, canonical-first status can
+become available before the transport attempt has fully closed.
 
 Every attempt is gated independently by authenticated peer identity, current
 Blob interest, route authorization, content proof, and nonrevocation. Status is
 canonical-first: `blob-status` reports receiver-local durable publication
-state, not carrier connectivity or source-side intent. The durable receipt is
-keyed by receiving mission authority and canonical source and binds the
-verified plan, depot/store authority, and durable checkpoint; it does not
-persist the fresh attempt nonce. Its checkpoint includes generation, chunk
+state, not carrier connectivity or source-side intent. The durable receipt
+binds the verified plan, depot/store authority, and durable checkpoint. Its
+checkpoint includes generation, chunk
 index, plaintext offset, pack offset, and wire offset. A later selected adapter
 therefore resumes the same publication without translating durable state.
 
@@ -89,10 +120,8 @@ authority: only promotion of the canonical manifest plus ASTRBT01 carriers
 creates the Blob publication. Check both state and depot filesystems and leave
 operational reserve; an observed capacity snapshot is not a reservation.
 
-Profile-5 transfer has asymmetric hard-deadline inputs. Timeout asymmetry: the
-sender derives its hard deadline from the exact canonical wire length; the
-receiver opens before authenticated OPEN using the full profile wire ceiling.
-The two-minute authenticated-progress timeout is the shorter stall bound.
+Profile-5 transfer has asymmetric hard-deadline inputs. Authenticated progress
+provides the shorter stall bound.
 
 Specifically:
 

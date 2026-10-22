@@ -19,10 +19,23 @@
 //! zeroize-on-drop plaintext pages. The corresponding stopped facades retain
 //! exclusive maintenance/application access and streaming Blob I/O. State and
 //! Record additionally use class-specific, explicitly interested reconciliation
-//! lanes. Semantic v9 selects profile 5 BlobStreamV1; semantic v7/v8 retain
-//! compatibility profile 4 BlobRangesStreamV1. Profile 5 batches canonical
-//! 64-KiB plaintext chunks as complete ASTRBT01 records in ABX1 extents of at
-//! most 1 MiB, with receiver-authoritative checkpoints; profile 4 keeps its
+//! lanes. The selected Blob profile and map-unit contract is machine checked:
+//!
+//! <!-- ASTER-BLOB-CAPABILITY:BEGIN -->
+//! ```json
+//! {
+//!   "schema": 1,
+//!   "surface": "node_api",
+//!   "semantic_v7_v8_profile": "4:BlobRangesStreamV1",
+//!   "semantic_v9_profile": "5:BlobStreamV1",
+//!   "map_unit": "65536-byte canonical plaintext chunk",
+//!   "record": "ASTRBT01, at most 66215 bytes",
+//!   "extent": "ABX1, at most 1048576 bytes"
+//! }
+//! ```
+//! <!-- ASTER-BLOB-CAPABILITY:END -->
+//!
+//! Profile 5 uses receiver-authoritative checkpoints; profile 4 keeps its
 //! historical bounds, v7 is durable-only, and v8 adds authenticated finite
 //! custody. Semantic v5/v6 Blob intent fails instead of falling back to a
 //! historical carrier path.
