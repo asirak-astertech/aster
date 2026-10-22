@@ -6,15 +6,44 @@ use super::{BlobStoreError, BlobVariantId, StoreError, blob_error, blob_variant_
 use aster_mesh::{
     BlobPhysicalLineage, BlobStreamFinalCommitment, BlobStreamOpen, SourceRouteLineage,
 };
-use redb::{ReadableTable, TableDefinition};
+use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
+
+/// Lease-backed reader for one lifecycle-owned canonical Profile-5 pack.
+/// Dropping the session releases deletion exclusion.
+pub struct Profile5PackReadSession {
+    reader: super::pack::BlobPackReader,
+    open: BlobStreamOpen,
+    commitment: BlobStreamFinalCommitment,
+    _lease: Arc<super::lease::BlobLeaseHandle>,
+}
+
+impl Profile5PackReadSession {
+    pub const fn open(&self) -> &BlobStreamOpen {
+        &self.open
+    }
+
+    pub const fn commitment(&self) -> &BlobStreamFinalCommitment {
+        &self.commitment
+    }
+
+    pub fn next_segment(
+        &mut self,
+    ) -> Result<Option<aster_mesh::EncryptedBlobStreamSegment>, StoreError> {
+        self.reader.next_segment().map_err(pack_store_error)
+    }
+
+    pub fn next_record(&mut self) -> Result<Option<super::pack::BlobPackRecord>, StoreError> {
+        self.reader.next_record().map_err(pack_store_error)
+    }
+}
 
 pub(crate) const BLOB_PROFILE5_PACKS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.blob-profile5-packs.v1");
 
 const PACK_VARIANT_MAGIC: &[u8; 8] = b"ASTRPV01";
-const PACK_VARIANT_VERSION: u16 = 1;
+const PACK_VARIANT_VERSION: u16 = 2;
 const PACK_SOURCE_MAGIC: &[u8; 8] = b"ASTRPS01";
 const PACK_SOURCE_VERSION: u16 = 1;
 
@@ -33,8 +62,34 @@ pub struct BlobPackVariant {
     authenticated_commitment: Vec<u8>,
     completion: BlobPackCompletion,
     capacity: BlobUploadCapacity,
-    lifecycle_owned: bool,
+    state: PackLifecycleState,
     authority: Arc<()>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PackLifecycleState {
+    Provisional,
+    Active,
+    DeletionPending,
+}
+
+impl PackLifecycleState {
+    const fn encode(self) -> u8 {
+        match self {
+            Self::Provisional => 0,
+            Self::Active => 1,
+            Self::DeletionPending => 2,
+        }
+    }
+
+    fn decode(value: u8) -> Result<Self, StoreError> {
+        match value {
+            0 => Ok(Self::Provisional),
+            1 => Ok(Self::Active),
+            2 => Ok(Self::DeletionPending),
+            _ => Err(pack_schema_error()),
+        }
+    }
 }
 
 impl PartialEq for BlobPackVariant {
@@ -50,7 +105,7 @@ impl PartialEq for BlobPackVariant {
             && self.authenticated_commitment == other.authenticated_commitment
             && self.completion == other.completion
             && self.capacity == other.capacity
-            && self.lifecycle_owned == other.lifecycle_owned
+            && self.state == other.state
     }
 }
 
@@ -87,7 +142,7 @@ impl BlobPackVariant {
             authenticated_commitment,
             completion,
             capacity,
-            lifecycle_owned: false,
+            state: PackLifecycleState::Provisional,
             authority,
         };
         variant.validate()?;
@@ -131,7 +186,11 @@ impl BlobPackVariant {
     }
 
     pub(super) const fn lifecycle_owned(&self) -> bool {
-        self.lifecycle_owned
+        matches!(self.state, PackLifecycleState::Active)
+    }
+
+    pub(super) const fn deletion_pending(&self) -> bool {
+        matches!(self.state, PackLifecycleState::DeletionPending)
     }
 
     pub(super) const fn owner_binding(&self) -> &[u8; 32] {
@@ -224,7 +283,7 @@ impl BlobPackVariant {
         output.extend_from_slice(&self.capacity.bytes.to_be_bytes());
         output.extend_from_slice(&self.capacity.chunks.to_be_bytes());
         output.extend_from_slice(&self.capacity.variants.to_be_bytes());
-        output.push(u8::from(self.lifecycle_owned));
+        output.push(self.state.encode());
         for bytes in [
             open.as_slice(),
             self.authenticated_open.as_slice(),
@@ -255,11 +314,7 @@ impl BlobPackVariant {
             chunks: cursor.u64()?,
             variants: cursor.u64()?,
         };
-        let lifecycle_owned = match cursor.u8()? {
-            0 => false,
-            1 => true,
-            _ => return Err(pack_schema_error()),
-        };
+        let state = PackLifecycleState::decode(cursor.u8()?)?;
         let open = BlobStreamOpen::decode(cursor.long()?).map_err(|_| pack_schema_error())?;
         let authenticated_open = cursor.long()?.to_vec();
         let commitment =
@@ -280,7 +335,7 @@ impl BlobPackVariant {
             authenticated_commitment,
             completion,
             capacity,
-            lifecycle_owned,
+            state,
             authority,
         };
         variant.validate()?;
@@ -367,7 +422,7 @@ pub(super) fn remove_provisional_write(
     expected: &BlobPackCompletion,
 ) -> Result<(), StoreError> {
     let pack = load_write(write, variant, Arc::new(()))?.ok_or_else(pack_schema_error)?;
-    if pack.lifecycle_owned || pack.completion() != expected {
+    if pack.state != PackLifecycleState::Provisional || pack.completion() != expected {
         return Err(pack_schema_error());
     }
     write
@@ -386,12 +441,15 @@ pub(super) fn promote_write(
     if pack.completion() != expected {
         return Err(pack_schema_error());
     }
-    if !pack.lifecycle_owned {
-        pack.lifecycle_owned = true;
+    if pack.state == PackLifecycleState::Provisional {
+        pack.state = PackLifecycleState::Active;
         let encoded = pack.encode()?;
         write
             .open_table(BLOB_PROFILE5_PACKS)?
             .insert(variant.as_bytes().as_slice(), encoded.as_slice())?;
+    }
+    if pack.state != PackLifecycleState::Active {
+        return Err(pack_schema_error());
     }
     Ok(pack.capacity)
 }
@@ -415,7 +473,7 @@ fn capacity_usage(
     for row in packs.iter()? {
         let (_, value) = row?;
         let pack = BlobPackVariant::decode(value.value(), Arc::new(()))?;
-        if pack.lifecycle_owned {
+        if pack.state != PackLifecycleState::Provisional {
             usage = usage.checked_add(pack.capacity())?;
         }
     }
@@ -441,10 +499,11 @@ fn active_pack_expectations(
     for row in packs.iter()? {
         let (_, value) = row?;
         let pack = BlobPackVariant::decode(value.value(), Arc::new(()))?;
-        if pack.lifecycle_owned {
+        if pack.state != PackLifecycleState::Provisional {
             expected.push(super::pack::ExpectedBlobUploadPack {
                 identity: pack.completion.identity(),
                 checkpoint: Some(pack.completion.checkpoint().clone()),
+                may_be_absent: pack.deletion_pending(),
             });
         }
     }
@@ -512,7 +571,7 @@ pub(super) fn audit_publication_evidence(
     owner_binding: [u8; 32],
 ) -> Result<(), StoreError> {
     let pack = BlobPackVariant::decode(encoded, Arc::new(()))?;
-    if !pack.lifecycle_owned
+    if pack.state != PackLifecycleState::Active
         || pack.variant_id != variant
         || pack.commitment.blob_id() != blob_id
         || pack.open.content_epoch() != epoch
@@ -531,8 +590,146 @@ pub(super) fn pressure_projection(
 ) -> Result<Option<(BlobVariantId, u64)>, StoreError> {
     let pack = BlobPackVariant::decode(encoded, Arc::new(()))?;
     Ok(pack
-        .lifecycle_owned
+        .lifecycle_owned()
         .then_some((pack.variant_id, pack.open.total_len())))
+}
+
+pub(super) fn is_pack_evidence(encoded: &[u8]) -> bool {
+    encoded.starts_with(PACK_VARIANT_MAGIC)
+}
+
+pub(super) fn encoded_variant_id(encoded: &[u8]) -> Result<BlobVariantId, StoreError> {
+    Ok(BlobPackVariant::decode(encoded, Arc::new(()))?.variant_id)
+}
+
+pub(super) fn deletion_projection(
+    key: &[u8],
+    encoded: &[u8],
+) -> Result<super::depot::DeletionImportProjection, StoreError> {
+    let pack = BlobPackVariant::decode(encoded, Arc::new(()))?;
+    if key != pack.variant_id.as_bytes() || pack.state != PackLifecycleState::Active {
+        return Err(pack_schema_error());
+    }
+    Ok(super::depot::DeletionImportProjection {
+        variant_id: pack.variant_id,
+        blob_id: pack.commitment.blob_id(),
+        content_group: pack.open.content_group(),
+        epoch: pack.open.content_epoch(),
+        total_len: pack.open.total_len(),
+        chunk_count: 0,
+        physical_lineage: pack.physical_lineage,
+        finalized_root: Some(*pack.completion.commitment_digest()),
+    })
+}
+
+pub(super) fn encoded_active_write(
+    write: &redb::WriteTransaction,
+    variant: BlobVariantId,
+) -> Result<Option<Vec<u8>>, StoreError> {
+    write
+        .open_table(BLOB_PROFILE5_PACKS)?
+        .get(variant.as_bytes().as_slice())?
+        .map(|value| {
+            let encoded = value.value().to_vec();
+            let pack = BlobPackVariant::decode(&encoded, Arc::new(()))?;
+            if pack.variant_id != variant || pack.state != PackLifecycleState::Active {
+                return Err(pack_schema_error());
+            }
+            Ok(encoded)
+        })
+        .transpose()
+}
+
+pub(super) fn mark_deletion_pending_write(
+    write: &redb::WriteTransaction,
+    variant: BlobVariantId,
+    expected_active: &[u8],
+) -> Result<(), StoreError> {
+    let mut packs = write.open_table(BLOB_PROFILE5_PACKS)?;
+    let current = packs
+        .get(variant.as_bytes().as_slice())?
+        .map(|value| value.value().to_vec())
+        .ok_or_else(pack_schema_error)?;
+    if current != expected_active {
+        return Err(pack_schema_error());
+    }
+    let mut pack = BlobPackVariant::decode(&current, Arc::new(()))?;
+    if pack.state != PackLifecycleState::Active {
+        return Err(pack_schema_error());
+    }
+    pack.state = PackLifecycleState::DeletionPending;
+    let encoded = pack.encode()?;
+    packs.insert(variant.as_bytes().as_slice(), encoded.as_slice())?;
+    Ok(())
+}
+
+pub(super) fn finalize_deletion_write(
+    write: &redb::WriteTransaction,
+    variant: BlobVariantId,
+    expected_active: &[u8],
+) -> Result<(), StoreError> {
+    let mut packs = write.open_table(BLOB_PROFILE5_PACKS)?;
+    let current = packs
+        .get(variant.as_bytes().as_slice())?
+        .map(|value| value.value().to_vec())
+        .ok_or_else(pack_schema_error)?;
+    let current = BlobPackVariant::decode(&current, Arc::new(()))?;
+    let expected = BlobPackVariant::decode(expected_active, Arc::new(()))?;
+    if current.variant_id != variant
+        || current.state != PackLifecycleState::DeletionPending
+        || expected.state != PackLifecycleState::Active
+        || current.completion != expected.completion
+        || current.open != expected.open
+        || current.commitment != expected.commitment
+        || current.owner_binding != expected.owner_binding
+    {
+        return Err(pack_schema_error());
+    }
+    packs.remove(variant.as_bytes().as_slice())?;
+    Ok(())
+}
+
+pub(super) fn validate_deletion_pending(
+    current: &[u8],
+    expected_active: &[u8],
+) -> Result<(), StoreError> {
+    let current = BlobPackVariant::decode(current, Arc::new(()))?;
+    let expected = BlobPackVariant::decode(expected_active, Arc::new(()))?;
+    if current.state != PackLifecycleState::DeletionPending
+        || expected.state != PackLifecycleState::Active
+        || current.variant_id != expected.variant_id
+        || current.route_lineage != expected.route_lineage
+        || current.physical_lineage != expected.physical_lineage
+        || current.owner_binding != expected.owner_binding
+        || current.authenticated_open_digest != expected.authenticated_open_digest
+        || current.open != expected.open
+        || current.authenticated_open != expected.authenticated_open
+        || current.commitment != expected.commitment
+        || current.authenticated_commitment != expected.authenticated_commitment
+        || current.completion != expected.completion
+        || current.capacity != expected.capacity
+    {
+        return Err(pack_schema_error());
+    }
+    Ok(())
+}
+
+pub(super) fn deletion_pending_projection(
+    encoded: &[u8],
+) -> Result<Option<(BlobVariantId, usize)>, StoreError> {
+    let pack = BlobPackVariant::decode(encoded, Arc::new(()))?;
+    Ok((pack.state == PackLifecycleState::DeletionPending)
+        .then_some((pack.variant_id, encoded.len())))
+}
+
+pub(super) fn deletion_identity(
+    encoded: &[u8],
+) -> Result<super::pack::BlobPackIdentity, StoreError> {
+    let pack = BlobPackVariant::decode(encoded, Arc::new(()))?;
+    if pack.state != PackLifecycleState::Active {
+        return Err(pack_schema_error());
+    }
+    Ok(pack.completion.identity())
 }
 
 pub(super) fn audited_lifecycle_imports_write(
@@ -568,6 +765,68 @@ fn audited_lifecycle_imports(
             })
         })
         .collect()
+}
+
+impl super::Store {
+    /// Opens one application plaintext session over the canonical pack while
+    /// excluding lifecycle deletion for the complete session lifetime.
+    #[doc(hidden)]
+    pub fn open_profile5_pack_application_read(
+        &self,
+        variant: BlobVariantId,
+    ) -> Result<Profile5PackReadSession, StoreError> {
+        self.open_profile5_pack_read(variant, super::lease::BlobLeaseKind::ApplicationPageRead)
+    }
+
+    /// Opens one transport session over exact canonical pack records while
+    /// excluding lifecycle deletion for the complete session lifetime.
+    #[doc(hidden)]
+    pub fn open_profile5_pack_transfer_read(
+        &self,
+        variant: BlobVariantId,
+    ) -> Result<Profile5PackReadSession, StoreError> {
+        self.open_profile5_pack_read(variant, super::lease::BlobLeaseKind::CarrierRange)
+    }
+
+    fn open_profile5_pack_read(
+        &self,
+        variant: BlobVariantId,
+        kind: super::lease::BlobLeaseKind,
+    ) -> Result<Profile5PackReadSession, StoreError> {
+        let _depot = self
+            .blob_depot_lock
+            .read()
+            .map_err(|_| blob_error(BlobStoreError::DepotIntegrity("depot lock is poisoned")))?;
+        self.require_live()?;
+        let read = self.database.begin_read()?;
+        super::deletion::require_variant_available_read(&read, variant)?;
+        let pack = load_read(&read, variant, Arc::clone(&self.blob_completion_authority))?
+            .ok_or_else(|| blob_error(BlobStoreError::NotFound))?;
+        if !pack.lifecycle_owned() {
+            return Err(blob_error(BlobStoreError::VariantDeleting));
+        }
+        let lease = self
+            .blob_lease_registry
+            .acquire(
+                self.blob_depot_owner_binding,
+                super::lease::BlobLeaseTarget::Variant(variant),
+                kind,
+            )
+            .map(|guard| Arc::new(super::lease::BlobLeaseHandle::new(guard)))
+            .map_err(super::lease::store_error)?;
+        drop(read);
+        drop(_depot);
+        let root = super::pack::PinnedBlobPackRoot::open(self)?;
+        let reader =
+            super::pack::BlobPackReader::open_completed_upload_pinned(&root, pack.completion())
+                .map_err(pack_store_error)?;
+        Ok(Profile5PackReadSession {
+            reader,
+            open: pack.open.clone(),
+            commitment: pack.commitment.clone(),
+            _lease: lease,
+        })
+    }
 }
 
 fn require_owner_binding(durable: Option<[u8; 32]>, actual: [u8; 32]) -> Result<(), StoreError> {

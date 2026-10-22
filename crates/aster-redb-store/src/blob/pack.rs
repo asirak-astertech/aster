@@ -349,6 +349,31 @@ pub(super) fn remove_upload_pack(
     Ok(())
 }
 
+/// Idempotently removes a lifecycle-owned pack directory. The exact identity
+/// comes from authenticated deletion evidence; absence is valid after a crash
+/// between durable unlink and redb manifest finalization.
+pub(super) fn remove_lifecycle_pack(
+    store_path: &Path,
+    backing_identity: crate::StoreBackingIdentity,
+    owner_token: [u8; 32],
+    identity: &BlobPackIdentity,
+) -> Result<(), StoreError> {
+    let Some(depot_root) = OwnedDirectory::open_root_if_present(store_path)? else {
+        return Ok(());
+    };
+    depot_root.require_store_binding(store_path, backing_identity, owner_token)?;
+    let Some(pack_root) = depot_root.open_child_directory_if_present(PACK_DIRECTORY)? else {
+        depot_root.sync()?;
+        return Ok(());
+    };
+    remove_upload_pack_directory(&pack_root, identity)?;
+    pack_root.sync()?;
+    #[cfg(test)]
+    maybe_inject_fault(pack_root.path(), BlobPackFaultPoint::CleanupDurable)
+        .map_err(pack_marker_store_error)?;
+    Ok(())
+}
+
 fn remove_upload_pack_directory(
     parent: &OwnedDirectory,
     identity: &BlobPackIdentity,
@@ -378,6 +403,7 @@ fn remove_upload_pack_directory(
             && entry != UPLOAD_DIGEST_FILE
             && entry != CHECKPOINT_ZERO
             && entry != CHECKPOINT_ONE
+            && entry != COMPLETION_FILE
             && entry != UPLOAD_MARKER
             && !entry.starts_with(PACK_TEMP_PREFIX)
         {
@@ -414,6 +440,9 @@ fn pack_marker_store_error(error: BlobPackError) -> StoreError {
 pub(super) struct ExpectedBlobUploadPack {
     pub(super) identity: BlobPackIdentity,
     pub(super) checkpoint: Option<BlobPackCheckpoint>,
+    /// Deletion owns the durable identity while the physical directory may
+    /// already be absent after a crash between unlink and redb finalization.
+    pub(super) may_be_absent: bool,
 }
 
 fn audit_expected_upload_pack(
@@ -566,7 +595,7 @@ fn audit_upload_packs(
     recover: bool,
 ) -> Result<Vec<BlobPackIdentity>, StoreError> {
     let Some(pack_root) = depot_root.open_child_directory_if_present(PACK_DIRECTORY)? else {
-        return if expected.is_empty() {
+        return if expected.iter().all(|expected| expected.may_be_absent) {
             Ok(Vec::new())
         } else {
             Err(blob_error(BlobStoreError::DepotIntegrity(
@@ -690,6 +719,9 @@ fn audit_upload_packs(
         }
         if cleanup.get(expected.identity.upload_id.as_bytes()) == Some(&expected.identity) {
             completed.push(expected.identity);
+            continue;
+        }
+        if expected.may_be_absent {
             continue;
         }
         return Err(blob_error(BlobStoreError::DepotIntegrity(

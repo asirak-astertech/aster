@@ -16,6 +16,7 @@ pub(crate) mod lease;
 pub(crate) mod lifecycle;
 pub mod pack;
 pub(crate) mod pack_lifecycle;
+pub use pack_lifecycle::Profile5PackReadSession;
 #[allow(dead_code)]
 pub(crate) mod pressure;
 pub mod stream;
@@ -2995,7 +2996,31 @@ impl Store {
             .blob_lease_registry
             .try_mark_delete_pending(snapshot)
             .map_err(lease::store_error)?;
-        deletion::move_finalized_variant_to_manifest_for_test(&write, variant)?;
+        if let Some(pack) = pack_lifecycle::encoded_active_write(&write, variant)? {
+            let lineage = write
+                .open_table(lifecycle::BLOB_LINEAGE_FENCES)?
+                .get(variant.as_bytes().as_slice())?
+                .map(|value| value.value().to_vec())
+                .ok_or_else(|| {
+                    blob_error(BlobStoreError::SchemaInvariant(
+                        "Blob deletion test lineage is missing",
+                    ))
+                })?;
+            if !deletion::admit_variant_write(
+                &write,
+                variant,
+                &pack,
+                &lineage,
+                self.blob_depot_owner_binding,
+                None,
+            )? {
+                return Err(blob_error(BlobStoreError::SchemaInvariant(
+                    "Blob deletion test pack admission was not applied",
+                )));
+            }
+        } else {
+            deletion::move_finalized_variant_to_manifest_for_test(&write, variant)?;
+        }
         if TEST_BLOB_DELETE_ADMISSION_PRE_COMMIT_FAULT.get() {
             return Err(blob_error(BlobStoreError::SchemaInvariant(
                 "injected Blob delete admission pre-commit failure",
@@ -9156,21 +9181,32 @@ fn pressure_deletion_evidence_write(
     variant: BlobVariantId,
     charge: &mut MaintenanceCharge,
 ) -> Result<Option<PressureDeletionEvidence>, StoreError> {
-    let imports = write.open_table(BLOB_IMPORTS)?;
-    let import = imports.get(variant.as_bytes().as_slice())?.ok_or_else(|| {
-        blob_error(BlobStoreError::SchemaInvariant(
-            "final Blob pressure root lacks its depot import",
-        ))
-    })?;
-    if !charge.charge_row(
-        MaintenanceRowIdentity::new("aster.blob-imports.v1", variant.as_bytes()),
-        import.value().len(),
-    )? {
-        return Ok(None);
-    }
-    let import_bytes = import.value().to_vec();
-    drop(import);
-    drop(imports);
+    let import_bytes = if let Some(pack) = pack_lifecycle::encoded_active_write(write, variant)? {
+        if !charge.charge_row(
+            MaintenanceRowIdentity::new(
+                pack_lifecycle::BLOB_PROFILE5_PACKS.name(),
+                variant.as_bytes(),
+            ),
+            pack.len(),
+        )? {
+            return Ok(None);
+        }
+        pack
+    } else {
+        let imports = write.open_table(BLOB_IMPORTS)?;
+        let import = imports.get(variant.as_bytes().as_slice())?.ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "final Blob pressure root lacks physical variant authority",
+            ))
+        })?;
+        if !charge.charge_row(
+            MaintenanceRowIdentity::new("aster.blob-imports.v1", variant.as_bytes()),
+            import.value().len(),
+        )? {
+            return Ok(None);
+        }
+        import.value().to_vec()
+    };
 
     let lineages = write.open_table(lifecycle::BLOB_LINEAGE_FENCES)?;
     let lineage = lineages
@@ -11264,7 +11300,7 @@ impl Store {
                     &self.path,
                     self.backing_identity,
                     self.blob_depot_owner_token,
-                    work.manifest.variant_id,
+                    &work.manifest,
                 )
                 .map(|()| (1, 0))
             }
@@ -13212,7 +13248,7 @@ impl Store {
                     &self.path,
                     self.backing_identity,
                     self.blob_depot_owner_token,
-                    work.manifest.variant_id,
+                    &work.manifest,
                 )
                 .map(|()| (1, 0))
             }

@@ -2674,6 +2674,9 @@ pub(super) fn deletion_import_projection(
     key: &[u8],
     value: &[u8],
 ) -> Result<DeletionImportProjection, StoreError> {
+    if super::pack_lifecycle::is_pack_evidence(value) {
+        return super::pack_lifecycle::deletion_projection(key, value);
+    }
     let variant = parse_variant_id(key)?;
     let import = decode_import(value)?;
     let audited = lifecycle_import_from_record(variant, import.clone())?;
@@ -3004,6 +3007,20 @@ pub(super) fn validate_deletion_manifest_root(
     records: &[BlobChunkRecord],
     expected: Option<[u8; 32]>,
 ) -> Result<(), StoreError> {
+    if super::pack_lifecycle::is_pack_evidence(import_value) {
+        let projection = super::pack_lifecycle::deletion_projection(
+            // The exact key is already validated by deletion admission; the
+            // variant is encoded in the retained row and reconstructed here.
+            super::pack_lifecycle::encoded_variant_id(import_value)?.as_bytes(),
+            import_value,
+        )?;
+        if !records.is_empty() || projection.finalized_root != expected {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "Blob pack deletion commitment differs from retained evidence",
+            )));
+        }
+        return Ok(());
+    }
     let import = decode_import(import_value)?;
     if import.finalized_manifest_digest != expected {
         return Err(blob_error(BlobStoreError::SchemaInvariant(
@@ -4536,8 +4553,22 @@ pub(super) fn delete_manifest_variant_directory(
     store_path: &Path,
     backing_identity: StoreBackingIdentity,
     owner_token: [u8; 32],
-    variant: BlobVariantId,
+    manifest: &super::deletion::BlobDeletionManifestHeader,
 ) -> Result<(), ManifestDeletionError> {
+    if super::pack_lifecycle::is_pack_evidence(&manifest.original_import) {
+        let identity = super::pack_lifecycle::deletion_identity(&manifest.original_import)?;
+        deletion_stage(
+            super::pack::remove_lifecycle_pack(
+                store_path,
+                backing_identity,
+                owner_token,
+                &identity,
+            ),
+            super::deletion::BlobDeletionFailureCategory::VariantDirectoryRemove,
+        )?;
+        return Ok(());
+    }
+    let variant = manifest.variant_id;
     let root = deletion_stage(
         OwnedDirectory::open_root_if_present(store_path),
         super::deletion::BlobDeletionFailureCategory::VariantDirectoryAccess,
@@ -6398,7 +6429,7 @@ impl OwnedDirectory {
             .map_err(|error| error.error)
     }
 
-    fn open_root_if_present(store_path: &Path) -> Result<Option<Self>, StoreError> {
+    pub(super) fn open_root_if_present(store_path: &Path) -> Result<Option<Self>, StoreError> {
         Self::open_root_internal(store_path)
     }
 
@@ -6617,7 +6648,7 @@ impl OwnedDirectory {
         Ok(root)
     }
 
-    fn require_store_binding(
+    pub(super) fn require_store_binding(
         &self,
         store_path: &Path,
         backing_identity: StoreBackingIdentity,
@@ -8019,7 +8050,7 @@ impl OwnedDirectory {
         }
     }
 
-    fn sync(&self) -> Result<(), StoreError> {
+    pub(super) fn sync(&self) -> Result<(), StoreError> {
         #[cfg(unix)]
         self.file
             .sync_all()

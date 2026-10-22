@@ -882,6 +882,7 @@ fn upload_pack_expectations_table(
             Ok(super::pack::ExpectedBlobUploadPack {
                 identity: upload.reservation.pack_identity(),
                 checkpoint: upload.checkpoint,
+                may_be_absent: false,
             })
         })
         .collect()
@@ -2793,6 +2794,133 @@ mod tests {
                 .expect("lookup promoted operation")
                 .is_some()
         );
+        let application_read = reopened
+            .open_profile5_pack_application_read(expected_variant)
+            .expect("lease canonical pack for application read");
+        let transfer_read = reopened
+            .open_profile5_pack_transfer_read(expected_variant)
+            .expect("lease canonical pack for transfer");
+
+        let maintenance_budget =
+            super::super::lifecycle::BlobMaintenanceBudget::new(256, 8, 32 * 1024 * 1024)
+                .expect("maintenance budget");
+        let expired_sample = CustodySample {
+            clock_id: [0x31; 16],
+            tick_ms: 100_100,
+        };
+        let mut retired = false;
+        for turn in 0..64 {
+            reopened
+                .run_blob_maintenance_turn_with_sample(
+                    maintenance_budget,
+                    (turn == 0).then_some(expired_sample),
+                )
+                .expect("retire finite pack");
+            if matches!(
+                reopened.blob_for_owner_with_policy(
+                    &reopened.control_policy_snapshot().expect("lookup policy"),
+                    &request.owner,
+                ),
+                Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+            ) {
+                retired = true;
+                break;
+            }
+        }
+        assert!(retired, "finite Profile-5 publication must retire");
+        assert!(matches!(
+            reopened.test_admit_blob_deletion_manifest(expected_variant),
+            Err(StoreError::Blob(BlobStoreError::VariantDeleting))
+        ));
+        drop(application_read);
+        assert!(matches!(
+            reopened.test_admit_blob_deletion_manifest(expected_variant),
+            Err(StoreError::Blob(BlobStoreError::VariantDeleting))
+        ));
+        drop(transfer_read);
+        reopened
+            .test_admit_blob_deletion_manifest(expected_variant)
+            .expect("admit retired pack deletion");
+        let read = reopened.database.begin_read().expect("retired pack read");
+        let retiring = super::super::pack_lifecycle::load_read(
+            &read,
+            expected_variant,
+            Arc::clone(&reopened.blob_completion_authority),
+        )
+        .expect("load retiring pack")
+        .expect("deletion retains pack authority");
+        assert!(retiring.deletion_pending());
+        assert!(
+            read.open_table(super::super::deletion::BLOB_DELETION_MANIFESTS)
+                .expect("deletion manifests")
+                .get(expected_variant.as_bytes().as_slice())
+                .expect("read deletion manifest")
+                .is_some()
+        );
+        let charged_before_failure =
+            super::super::depot::depot_admission_usage_read(&read).expect("retiring pack quota");
+        drop(read);
+        let pack_root = PinnedBlobPackRoot::open(&reopened).expect("retiring pack root");
+        super::super::pack::inject_test_fault(
+            &pack_root,
+            super::super::pack::BlobPackFaultPoint::CleanupDurable,
+        );
+        drop(pack_root);
+        let one_file_budget =
+            super::super::lifecycle::BlobMaintenanceBudget::new(256, 1, 32 * 1024 * 1024)
+                .expect("one-file maintenance budget");
+        let failed = reopened
+            .run_blob_capacity_gc(one_file_budget, None)
+            .expect("record deletion failure");
+        assert_eq!(failed.manifests_finalized, 0);
+        let read = reopened
+            .database
+            .begin_read()
+            .expect("failed deletion read");
+        assert_eq!(
+            super::super::depot::depot_admission_usage_read(&read).expect("failed deletion quota"),
+            charged_before_failure,
+            "failed physical deletion must not release pack quota"
+        );
+        drop(read);
+        drop(reopened);
+        let reopened = Store::open_with_limits_and_blob_depot_limits_for_mission(
+            root.database(),
+            StoreLimits::default(),
+            BlobDepotLimits::DEFAULT,
+            publisher.mission_authority_id(),
+        )
+        .expect("reopen after physical-delete crash gap");
+        let read = reopened
+            .database
+            .begin_read()
+            .expect("restart deletion read");
+        assert_eq!(
+            super::super::depot::depot_admission_usage_read(&read).expect("restart deletion quota"),
+            charged_before_failure
+        );
+        drop(read);
+        for _ in 0..8 {
+            reopened
+                .run_blob_capacity_gc(maintenance_budget, None)
+                .expect("delete retired pack");
+            let read = reopened
+                .database
+                .begin_read()
+                .expect("deletion progress read");
+            let removed = super::super::pack_lifecycle::load_read(
+                &read,
+                expected_variant,
+                Arc::clone(&reopened.blob_completion_authority),
+            )
+            .expect("load deletion progress")
+            .is_none();
+            drop(read);
+            if removed {
+                return;
+            }
+        }
+        panic!("retired Profile-5 pack was not physically finalized");
     }
 
     #[test]
@@ -4094,6 +4222,7 @@ mod tests {
         let expected = [super::super::pack::ExpectedBlobUploadPack {
             identity: active.pack_identity(),
             checkpoint: None,
+            may_be_absent: false,
         }];
         let before_reclaim = upload_pack_tree_snapshot(&fixture.root);
         let reclaim_order = [
