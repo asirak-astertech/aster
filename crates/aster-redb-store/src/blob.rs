@@ -32,13 +32,14 @@ use std::error::Error;
 use std::fmt;
 
 use aster_mesh::{
-    AuthenticatedBlobCustodySendContextV1, BlobCustodyClaimV1, BlobCustodyDirectionV1,
-    BlobCustodyError, BlobCustodyTransferId, BlobId, BlobManifest, BlobPublicationStreamId,
-    BlobRouteCommitment, BlobStore as CoreBlobStore, ContentVerifiedBlobEnvelope,
-    CurrentBlobLineage, MAX_BLOB_CHUNK_SIZE, MAX_BLOB_CHUNKS, MAX_BLOB_MANIFEST_BYTES,
-    MAX_BLOB_MEDIA_TYPE_BYTES, MAX_BLOB_SCHEMA_ID_BYTES,
-    SELECTED_BLOB_CHUNK_SIZE as CORE_SELECTED_BLOB_CHUNK_SIZE, VerifiedBlobContentCompletion,
-    VerifiedBlobCustodyClaimV1, VerifiedBlobTransferPlan, local_blob_publication_stream_id,
+    AuthenticatedBlobCustodySendContextV1, AuthenticatedBlobCustodySendContextV2,
+    BlobCustodyClaimV1, BlobCustodyClaimV2, BlobCustodyDirectionV1, BlobCustodyError,
+    BlobCustodyTransferId, BlobId, BlobManifest, BlobPublicationStreamId, BlobRouteCommitment,
+    BlobStore as CoreBlobStore, ContentVerifiedBlobEnvelope, CurrentBlobLineage,
+    MAX_BLOB_CHUNK_SIZE, MAX_BLOB_CHUNKS, MAX_BLOB_MANIFEST_BYTES, MAX_BLOB_MEDIA_TYPE_BYTES,
+    MAX_BLOB_SCHEMA_ID_BYTES, SELECTED_BLOB_CHUNK_SIZE as CORE_SELECTED_BLOB_CHUNK_SIZE,
+    VerifiedBlobContentCompletion, VerifiedBlobCustodyClaimV1, VerifiedBlobCustodyClaimV2,
+    VerifiedBlobTransferPlan, local_blob_publication_stream_id,
 };
 use redb::{ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle};
 
@@ -47,8 +48,9 @@ use super::*;
 pub use depot::{AuthenticatedBlobReadDepot, BlobDepot, BlobDepotCompletion};
 pub use lease::{BlobLeaseLimitError, BlobLeaseLimits};
 pub use stream::{
-    BlobStreamConflictEvidence, BlobStreamInspection, BlobStreamPromotion, BlobStreamPublication,
-    BlobStreamReservation, BlobStreamReservationRequest, BlobStreamResume, BlobStreamSource,
+    BlobProfile5Receipt, BlobStreamConflictEvidence, BlobStreamInspection, BlobStreamPromotion,
+    BlobStreamPublication, BlobStreamReservation, BlobStreamReservationRequest, BlobStreamResume,
+    BlobStreamSource,
 };
 pub use upload::{BlobUploadCheckpoint, BlobUploadRequest, BlobUploadReservation};
 
@@ -88,6 +90,8 @@ pub(crate) const BLOB_NETWORK_METADATA: TableDefinition<&str, u64> =
 // both ordinary semantic quotas and the network byte/row staging partition.
 pub(crate) const BLOB_CARRIER_FETCH_CURSORS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.blob-carrier-fetch-cursors.v1");
+pub(crate) const BLOB_PROFILE5_RECEIPTS: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("aster.blob-profile5-receipts.v1");
 pub(crate) const BLOB_STREAM_RESERVATIONS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.blob-stream-reservations.v2");
 pub(crate) const BLOB_STREAM_OPERATIONS: TableDefinition<&[u8], &[u8]> =
@@ -170,10 +174,10 @@ pub const MAX_BLOB_DURABLE_OPERATION_BYTES: u64 = MAX_BLOB_OWNED_OPERATION_BYTES
     + MAX_BLOB_OPERATIONS * MAX_BLOB_OPERATION_RETIREMENT_GROWTH_BYTES;
 /// Maximum signed publications retained for one `(topic, scope, BlobId)` read plan.
 pub const MAX_BLOB_PUBLICATIONS_PER_CONTENT: usize = 1_024;
-/// Maximum selected network Blob plaintext bytes (64 MiB).
-pub const MAX_NETWORK_BLOB_BYTES: u64 = 64 * 1024 * 1024;
-/// Maximum exact source-sealed manifest envelope admitted for networking (1 MiB).
-pub const MAX_BLOB_NETWORK_SOURCE_BYTES: usize = 1024 * 1024;
+/// Maximum semantic-v9/profile-5 Blob plaintext bytes (8 GiB).
+pub const MAX_NETWORK_BLOB_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+/// Maximum exact source-sealed manifest envelope admitted for profile-5 networking (16 MiB).
+pub const MAX_BLOB_NETWORK_SOURCE_BYTES: usize = 16 * 1024 * 1024;
 /// Exact maximum row count for one atomic policy-invalidation retirement.
 ///
 /// This private runtime integration bound covers one 12-row publication
@@ -1713,6 +1717,17 @@ impl BlobContactEligibility {
                     ..
                 },
             ) => profile_id == aster_mesh::TransferProfileId::BlobRangesStreamV1 as u16,
+            (
+                Self::CustodyV1,
+                BlobLifetime::Finite {
+                    provenance:
+                        BlobFiniteProvenance::NetworkV1 {
+                            semantic_version: 9,
+                            profile_id: 5,
+                        },
+                    ..
+                },
+            ) => true,
             (Self::CustodyV1, BlobLifetime::Finite { .. }) => false,
         }
     }
@@ -1755,6 +1770,14 @@ pub struct VerifiedBlobCustodySend {
     retention: BlobSourceRetention,
 }
 
+/// One-use semantic-v9/profile-5 finite send authorization.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct VerifiedBlobCustodySendV2 {
+    authority: AuthenticatedBlobCustodySendContextV2,
+    inner: VerifiedBlobCustodySend,
+}
+
 #[derive(Debug, Eq, PartialEq)]
 struct BlobCustodySendContextFields {
     semantic_version: u16,
@@ -1773,6 +1796,19 @@ impl From<AuthenticatedBlobCustodySendContextV1> for BlobCustodySendContextField
             session_transcript: context.session_transcript(),
             exchange_id: context.exchange_id(),
             direction: context.direction(),
+            finalization_charge_ms: context.finalization_charge_ms(),
+        }
+    }
+}
+
+impl From<&AuthenticatedBlobCustodySendContextV2> for BlobCustodySendContextFields {
+    fn from(context: &AuthenticatedBlobCustodySendContextV2) -> Self {
+        Self {
+            semantic_version: context.context().semantic_version(),
+            profile_id: context.context().profile(),
+            session_transcript: context.session_transcript(),
+            exchange_id: context.exchange_id(),
+            direction: context.context().direction(),
             finalization_charge_ms: context.finalization_charge_ms(),
         }
     }
@@ -1847,6 +1883,57 @@ impl VerifiedBlobCustodySend {
     }
 }
 
+impl VerifiedBlobCustodySendV2 {
+    pub fn into_claim(
+        self,
+        source: &ContentVerifiedBlobEnvelope,
+        exact_source_bytes: &[u8],
+    ) -> Result<(BlobCustodyClaimV2, PreparedBlobCustodySend), BlobCustodyError> {
+        let VerifiedBlobCustodySendV2 { authority, inner } = self;
+        let VerifiedBlobCustodySend {
+            context,
+            source_transfer_id,
+            source_len,
+            publication_id,
+            blob_id,
+            priority,
+            ttl_ms,
+            prior_cumulative_age_ms,
+            sender_sample,
+            authenticated_age_ms,
+            projection,
+            retention,
+        } = inner;
+        let claim = BlobCustodyClaimV2::from_authenticated_source(
+            authority,
+            source_transfer_id,
+            source,
+            exact_source_bytes,
+            prior_cumulative_age_ms,
+            sender_sample,
+        )?;
+        if claim.source_len() != source_len
+            || claim.publication_id() != publication_id
+            || claim.blob_id() != blob_id
+            || claim.priority() != priority
+            || claim.ttl_ms() != ttl_ms
+            || claim.forwarding_age_ms() != authenticated_age_ms
+        {
+            return Err(BlobCustodyError::ContextMismatch);
+        }
+        Ok((
+            claim,
+            PreparedBlobCustodySend {
+                context,
+                checkpoint_sample: sender_sample,
+                authenticated_age_ms,
+                projection,
+                retention,
+            },
+        ))
+    }
+}
+
 impl VerifiedFiniteBlobAdmission {
     fn from_verified(
         verified: VerifiedBlobCustodyClaimV1,
@@ -1864,6 +1951,26 @@ impl VerifiedFiniteBlobAdmission {
             provenance: BlobFiniteProvenance::NetworkV1 {
                 semantic_version: 8,
                 profile_id: aster_mesh::TransferProfileId::BlobRangesStreamV1 as u16,
+            },
+        }
+    }
+
+    fn from_verified_v2(
+        verified: VerifiedBlobCustodyClaimV2,
+        receiver_sample: aster_mesh::CustodySample,
+    ) -> Self {
+        Self {
+            source_transfer_id: *verified.source_transfer_id().as_bytes(),
+            source_len: verified.source_len(),
+            publication_id: verified.publication_id(),
+            blob_id: verified.blob_id(),
+            priority: verified.priority(),
+            ttl_ms: verified.ttl_ms(),
+            forwarding_age_ms: verified.forwarding_age_ms(),
+            receiver_sample,
+            provenance: BlobFiniteProvenance::NetworkV1 {
+                semantic_version: 9,
+                profile_id: 5,
             },
         }
     }
@@ -4014,6 +4121,31 @@ impl Store {
         )
     }
 
+    /// Semantic-v9/profile-5 finite admission. The authenticated sender age is
+    /// imported into this receiver's local monotonic custody continuity; the
+    /// sender clock identity is never persisted as local time authority.
+    #[doc(hidden)]
+    pub fn stage_verified_finite_blob_source_v2_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        blob: &ContentVerifiedBlobEnvelope,
+        sealed: &[u8],
+        plan: &VerifiedBlobTransferPlan,
+        verified: VerifiedBlobCustodyClaimV2,
+        receiver_sample: aster_mesh::CustodySample,
+    ) -> Result<BlobSourceStageOutcome, StoreError> {
+        self.stage_verified_blob_source_with_lifetime(
+            policy,
+            blob,
+            sealed,
+            plan,
+            Some(VerifiedFiniteBlobAdmission::from_verified_v2(
+                verified,
+                receiver_sample,
+            )),
+        )
+    }
+
     /// Test-fixture-only finite staging seam.
     ///
     /// This cannot mint runtime/contact authority. It derives every immutable
@@ -4872,6 +5004,36 @@ impl Store {
         )
     }
 
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn authorize_finite_blob_send_v2_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        projection: &BlobSourceProjection,
+        retention: BlobSourceRetention,
+        blob: &ContentVerifiedBlobEnvelope,
+        sealed: &[u8],
+        context: AuthenticatedBlobCustodySendContextV2,
+        sender_sample: aster_mesh::CustodySample,
+    ) -> Result<Option<VerifiedBlobCustodySendV2>, StoreError> {
+        let fields = BlobCustodySendContextFields::from(&context);
+        self.authorize_finite_blob_send_fields(
+            policy,
+            projection,
+            retention,
+            blob,
+            sealed,
+            fields,
+            sender_sample,
+        )
+        .map(|authorized| {
+            authorized.map(|inner| VerifiedBlobCustodySendV2 {
+                authority: context,
+                inner,
+            })
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn authorize_finite_blob_send_fields(
         &self,
@@ -4885,8 +5047,9 @@ impl Store {
     ) -> Result<Option<VerifiedBlobCustodySend>, StoreError> {
         self.require_live()?;
         let authority = self.require_bound_mission()?;
-        if context.semantic_version != 8
-            || context.profile_id != aster_mesh::TransferProfileId::BlobRangesStreamV1 as u16
+        if !((context.semantic_version == 8
+            && context.profile_id == aster_mesh::TransferProfileId::BlobRangesStreamV1 as u16)
+            || (context.semantic_version == 9 && context.profile_id == 5))
             || context.finalization_charge_ms == 0
         {
             return Err(blob_error(BlobStoreError::PendingSourceConflict));
@@ -4973,6 +5136,10 @@ impl Store {
                 semantic_version: 8,
                 profile_id,
             } if profile_id == aster_mesh::TransferProfileId::BlobRangesStreamV1 as u16 => {}
+            BlobFiniteProvenance::NetworkV1 {
+                semantic_version: 9,
+                profile_id: 5,
+            } => {}
             BlobFiniteProvenance::NetworkV1 { .. } => {
                 return Err(blob_error(BlobStoreError::PendingSourceConflict));
             }
@@ -15287,7 +15454,7 @@ pub(crate) fn blob_schema_present_write(
         return Ok(false);
     }
     if legacy_present != legacy.len()
-        || !matches!(network_present, 0 | 4)
+        || !matches!(network_present, 0 | 4 | 5)
         || !(stream_present == 0
             || stream_present == stream_tables.len()
             || stream_legacy_predecessor
@@ -15301,6 +15468,8 @@ pub(crate) fn blob_schema_present_write(
     }
     if network_present == 0 {
         initialize_blob_network_schema(write)?;
+    } else if network_present == 4 && !existing.contains(BLOB_PROFILE5_RECEIPTS.name()) {
+        let _ = write.open_table(BLOB_PROFILE5_RECEIPTS)?;
     }
     if !upload_present {
         let _ = write.open_table(BLOB_UPLOADS)?;
@@ -16164,7 +16333,7 @@ pub(crate) fn inspect_blob_tables_read(
         return Ok(BlobAuditSnapshot::default());
     }
     if legacy_present != legacy.len()
-        || !matches!(network_present, 0 | 4)
+        || !matches!(network_present, 0 | 4 | 5)
         || global_present.iter().any(|present| !present)
     {
         return Err(blob_error(BlobStoreError::SchemaInvariant(
@@ -16858,6 +17027,7 @@ fn initialize_blob_network_schema(write: &redb::WriteTransaction) -> Result<(), 
     let _ = write.open_table(BLOB_PENDING_SOURCES)?;
     let _ = write.open_table(BLOB_CARRIER_PREFIXES)?;
     let _ = write.open_table(BLOB_CARRIER_FETCH_CURSORS)?;
+    let _ = write.open_table(BLOB_PROFILE5_RECEIPTS)?;
     let mut metadata = write.open_table(BLOB_NETWORK_METADATA)?;
     if metadata.get(BLOB_NETWORK_SCHEMA_VERSION_FIELD)?.is_none() {
         metadata.insert(
@@ -16884,12 +17054,13 @@ fn legacy_blob_table_names() -> [&'static str; 9] {
     ]
 }
 
-fn network_blob_table_names() -> [&'static str; 4] {
+fn network_blob_table_names() -> [&'static str; 5] {
     [
         BLOB_PENDING_SOURCES.name(),
         BLOB_CARRIER_PREFIXES.name(),
         BLOB_NETWORK_METADATA.name(),
         BLOB_CARRIER_FETCH_CURSORS.name(),
+        BLOB_PROFILE5_RECEIPTS.name(),
     ]
 }
 
@@ -16904,7 +17075,7 @@ fn stream_blob_table_names() -> [&'static str; 6] {
     ]
 }
 
-fn blob_table_names() -> [&'static str; 14] {
+fn blob_table_names() -> [&'static str; 15] {
     let legacy = legacy_blob_table_names();
     let network = network_blob_table_names();
     [
@@ -16921,6 +17092,7 @@ fn blob_table_names() -> [&'static str; 14] {
         network[1],
         network[2],
         network[3],
+        network[4],
         BLOB_UPLOADS.name(),
     ]
 }
@@ -19657,6 +19829,135 @@ mod tests {
             BlobContentVerification::RouteOnly(_) => panic!("member unexpectedly route-only"),
         };
         (blob, sealed)
+    }
+
+    #[test]
+    fn profile5_receipt_restart_is_monotone_and_store_bound() {
+        let root = BlobTestRoot::new("profile5-receipt-restart");
+        let foreign = BlobTestRoot::new("profile5-receipt-foreign");
+        let mut services = blob_services(0xd7);
+        let plaintext = vec![0x5a; 64 * 1024];
+        let prepared = prepared_blob(&plaintext);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("profile-5 receipt store");
+        let proof = prepare_blob_proof(&store, &mut services, &prepared, &plaintext, 1);
+        let plan = proof
+            .blob
+            .transfer_plan(&proof.manifest_bytes)
+            .expect("transfer plan");
+        store
+            .stage_verified_blob_source_with_policy(
+                &proof.policy,
+                &proof.blob,
+                &proof.sealed,
+                &plan,
+            )
+            .expect("stage profile-5 source");
+        let (receipt, initial) = store
+            .reserve_profile5_receipt(&proof.policy, &plan)
+            .expect("reserve profile-5 receipt");
+        let carrier = plan.carrier_id(0).expect("carrier id");
+        let wire = plan
+            .carrier_total_len(&carrier.wire_bytes())
+            .expect("carrier length")
+            + 20;
+        let durable = BlobStreamResume::profile5(1, 1, plaintext.len() as u64, wire - 20, wire);
+        assert_eq!(
+            store
+                .checkpoint_profile5_receipt(&receipt, initial, durable)
+                .expect("checkpoint profile-5 receipt"),
+            durable
+        );
+        assert!(
+            store
+                .checkpoint_profile5_receipt(&receipt, initial, durable)
+                .is_err()
+        );
+
+        let foreign_store = Store::open_for_mission(&foreign.database, services.authority)
+            .expect("foreign profile-5 store");
+        assert!(
+            foreign_store
+                .checkpoint_profile5_receipt(&receipt, durable, durable)
+                .is_err()
+        );
+        drop(foreign_store);
+        drop(proof);
+        drop(store);
+
+        let reopened = Store::open_for_mission(&root.database, services.authority)
+            .expect("reopen profile-5 receipt store");
+        assert_eq!(
+            reopened
+                .resume_profile5_receipt(receipt.source())
+                .expect("resume profile-5 receipt"),
+            Some((receipt, durable))
+        );
+    }
+
+    #[test]
+    fn profile5_already_present_receipt_is_terminal_and_retryable() {
+        let root = BlobTestRoot::new("profile5-already-present");
+        let mut services = blob_services(0xd8);
+        let plaintext = vec![0x6b; 64 * 1024];
+        let prepared = prepared_blob(&plaintext);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("profile-5 duplicate store");
+        let (stored, _, _) = publish_blob(
+            &store,
+            &mut services,
+            &prepared,
+            &plaintext,
+            1,
+            b"profile5-already-present-operation",
+        );
+        let route = services
+            .reader
+            .verify_blob(&stored.sealed)
+            .expect("verify retained source route");
+        let (blob, manifest_bytes) = match services
+            .reader
+            .verify_blob_content(route, &stored.sealed)
+            .expect("verify retained source content")
+        {
+            BlobContentVerification::ContentVerified {
+                blob,
+                manifest_bytes,
+            } => (blob, manifest_bytes),
+            BlobContentVerification::RouteOnly(_) => panic!("member unexpectedly route-only"),
+        };
+        let plan = blob
+            .transfer_plan(&manifest_bytes)
+            .expect("retained transfer plan");
+        let policy = store.control_policy_snapshot().expect("duplicate policy");
+
+        let (receipt, initial) = store
+            .reserve_profile5_receipt(&policy, &plan)
+            .expect("reserve duplicate receipt");
+        assert_eq!(initial, BlobStreamResume::default());
+        let carrier = plan.carrier_id(0).expect("duplicate carrier ID");
+        let carrier_len = plan
+            .carrier_total_len(&carrier.wire_bytes())
+            .expect("duplicate carrier length");
+        let terminal = BlobStreamResume::profile5(
+            1,
+            plan.manifest().chunk_count(),
+            plaintext.len() as u64,
+            carrier_len,
+            carrier_len + 20,
+        );
+        store
+            .checkpoint_profile5_receipt(&receipt, initial, terminal)
+            .expect("checkpoint terminal duplicate receipt");
+        assert_eq!(terminal.next_segment_index(), plan.manifest().chunk_count());
+        assert_eq!(terminal.durable_plaintext_offset(), plaintext.len() as u64);
+        assert_eq!(terminal.durable_wire_offset(), carrier_len + 20);
+        assert_eq!(
+            store
+                .reserve_profile5_receipt(&policy, &plan)
+                .expect("retry terminal duplicate receipt"),
+            (receipt, terminal)
+        );
     }
 
     #[test]

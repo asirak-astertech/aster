@@ -2725,7 +2725,9 @@ pub(crate) fn prepare_depot_owner_token_write(
         .iter()
         .filter(|table| existing.contains(**table))
         .count();
-    if legacy.iter().any(|table| !existing.contains(*table)) || !matches!(network_present, 0 | 4) {
+    if legacy.iter().any(|table| !existing.contains(*table))
+        || !matches!(network_present, 0 | 4 | 5)
+    {
         return Err(blob_error(BlobStoreError::SchemaInvariant(
             "mission-scoped Blob schema group is incomplete",
         )));

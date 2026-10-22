@@ -2,14 +2,15 @@
 
 use crate::{
     event_pages::TransferProfileId,
-    frame::EventDirection,
+    frame::{BlobStreamSourceOfferV1, EventDirection},
     mission::MissionSession,
     stream_pipeline::PipelineReport,
     stream_transfer::{
-        CanonicalBlobExtentV1, PROFILE5_CANONICAL_EXTENT_BYTES, PROFILE5_IDLE_TIMEOUT,
-        StreamAction, StreamClass, StreamDirection, StreamExtentAction, StreamFrame, StreamOpenV1,
-        StreamResultCode, StreamSenderState, encode_composite_data_prefix, profile5_attempt_bounds,
-        profile5_attempt_hard_timeout, split_composite_data_record,
+        CanonicalBlobExtentV1, MAX_STREAM_CHECKPOINT_BATCH_BYTES, PROFILE5_CANONICAL_EXTENT_BYTES,
+        PROFILE5_IDLE_TIMEOUT, StreamAction, StreamClass, StreamDirection, StreamExtentAction,
+        StreamFrame, StreamOpenV1, StreamReceiverState, StreamResultCode, StreamSenderState,
+        encode_composite_data_prefix, profile5_attempt_bounds, profile5_attempt_hard_timeout,
+        profile5_receive_limit, split_composite_data_record,
     },
     stream_transport::{
         AttemptOpenRequest, AuthenticatedPeerSupport, AuthenticatedSupportSource,
@@ -19,10 +20,14 @@ use crate::{
     },
 };
 use aster_iroh::Connection;
-use aster_mesh::VerifiedBlobTransferPlan;
+use aster_mesh::{
+    BlobContentVerification, BlobCustodyTransferId, ContentVerifiedBlobEnvelope,
+    ReferenceEnvelopeSealer, VerifiedBlobTransferPlan,
+};
 use aster_redb_store::{
-    BlobDepotCompletion, BlobSourceRetention, BlobTransferId, ControlPolicySnapshot, Store,
-    StoredBlob,
+    ApplyOutcome, BlobCarrierObjectId, BlobDepotCompletion, BlobSourceProjection,
+    BlobSourceRetention, BlobSourceStageOutcome, BlobStreamResume, BlobTransferId, BlobVariantId,
+    ControlPolicySnapshot, MAX_BLOB_NETWORK_RANGE_BYTES, Store, StoredBlob,
 };
 use sha2::{Digest, Sha256};
 use std::{future::Future, sync::Arc};
@@ -35,8 +40,8 @@ use crate::{
         run_ordered_channel_pipeline_from,
     },
     stream_transfer::{
-        MAX_STREAM_CHECKPOINT_BATCH_BYTES, PROFILE5_ATTEMPT_TIMEOUT, PROFILE5_EXTENT_BYTES,
-        PROFILE5_MAX_RECORD_BYTES, StreamReceiverState, blob_pack_wire_len, profile5_receive_limit,
+        PROFILE5_ATTEMPT_TIMEOUT, PROFILE5_EXTENT_BYTES, PROFILE5_MAX_RECORD_BYTES,
+        blob_pack_wire_len,
     },
 };
 #[cfg(test)]
@@ -46,8 +51,7 @@ use aster_mesh::{
 };
 #[cfg(test)]
 use aster_redb_store::{
-    BlobOperationKey, BlobStreamReservation, BlobStreamReservationRequest, BlobStreamResume,
-    BlobStreamSource,
+    BlobOperationKey, BlobStreamReservation, BlobStreamReservationRequest, BlobStreamSource,
     pack::{BlobPackCheckpoint, BlobPackReader, BlobPackWriter, PinnedBlobPackRoot},
 };
 #[cfg(test)]
@@ -63,6 +67,11 @@ pub(crate) struct CanonicalBlobSendSource {
     stored: StoredBlob,
     plan: VerifiedBlobTransferPlan,
     completion: BlobDepotCompletion,
+    finite: Option<(
+        ContentVerifiedBlobEnvelope,
+        BlobSourceProjection,
+        BlobSourceRetention,
+    )>,
 }
 
 impl CanonicalBlobSendSource {
@@ -94,7 +103,24 @@ impl CanonicalBlobSendSource {
             stored,
             plan,
             completion,
+            finite: None,
         })
+    }
+
+    pub(crate) fn new_with_lifetime(
+        stored: StoredBlob,
+        plan: VerifiedBlobTransferPlan,
+        completion: BlobDepotCompletion,
+        blob: ContentVerifiedBlobEnvelope,
+        projection: BlobSourceProjection,
+        retention: BlobSourceRetention,
+    ) -> Result<Self, BlobNetworkError> {
+        let finite = blob.ttl_ms().is_some();
+        let mut source = Self::new(stored, plan, completion)?;
+        if finite {
+            source.finite = Some((blob, projection, retention));
+        }
+        Ok(source)
     }
 
     pub(crate) const fn publication(&self) -> BlobTransferId {
@@ -115,6 +141,10 @@ impl CanonicalBlobSendSource {
 
     pub(crate) const fn key_epoch(&self) -> u64 {
         self.stored.header.key_epoch
+    }
+
+    pub(crate) const fn is_finite(&self) -> bool {
+        self.finite.is_some()
     }
 }
 
@@ -161,6 +191,24 @@ fn canonical_blob_wire_len(plan: &VerifiedBlobTransferPlan) -> Result<u64, BlobN
         total = total
             .checked_add(extent_len)
             .ok_or("canonical Blob wire length overflow")?;
+    }
+    Ok(total)
+}
+
+fn canonical_blob_carrier_len(plan: &VerifiedBlobTransferPlan) -> Result<u64, BlobNetworkError> {
+    let mut total = 0u64;
+    for index in 0..plan.manifest().chunk_count() {
+        let carrier = plan
+            .carrier_id(index)
+            .map_err(|error| verification_failure("derive canonical carrier ID", error))?;
+        total = total
+            .checked_add(
+                plan.carrier_total_len(&carrier.wire_bytes())
+                    .map_err(|error| {
+                        verification_failure("derive canonical carrier length", error)
+                    })?,
+            )
+            .ok_or("canonical carrier length overflow")?;
     }
     Ok(total)
 }
@@ -1074,6 +1122,63 @@ pub(crate) async fn send_canonical_blob_profile5(
 ) -> Result<BlobNetworkReport, BlobNetworkError> {
     require_canonical_send_source(store, policy, source)?;
     let wire_len = canonical_blob_wire_len(&source.plan)?;
+    let finite_custody = if let Some((blob, projection, retention)) = &source.finite {
+        let exact_len = u64::try_from(source.stored.sealed.len())
+            .map_err(|_| "finite canonical source length overflows")?;
+        let charge = super::custody_finalization_charge_ms(exact_len)
+            .map_err(|error| lifecycle_failure("bound profile-5 custody age", error))?;
+        let context = session
+            .mint_blob_custody_send_context_v2(direction, 1, attempt_nonce, charge)
+            .map_err(|error| authentication_failure("authorize profile-5 custody record", error))?;
+        let sample = super::contact_custody_sample()
+            .map_err(|error| lifecycle_failure("sample profile-5 custody clock", error))?
+            .ok_or_else(|| {
+                lifecycle_failure("sample profile-5 custody clock", "clock unavailable")
+            })?;
+        let authorization = store
+            .authorize_finite_blob_send_v2_with_policy(
+                policy,
+                projection,
+                *retention,
+                blob,
+                &source.stored.sealed,
+                context,
+                sample,
+            )
+            .map_err(|error| lifecycle_failure("authorize finite profile-5 source", error))?
+            .ok_or_else(|| {
+                lifecycle_failure("authorize finite profile-5 source", "source expired")
+            })?;
+        let (claim, prepared) = authorization
+            .into_claim(blob, &source.stored.sealed)
+            .map_err(|error| authentication_failure("construct profile-5 custody claim", error))?;
+        let custody_frame = session
+            .seal_blob_custody_frame_v2(profile_digest, direction, attempt_nonce, &claim)
+            .map_err(|error| authentication_failure("seal profile-5 custody claim", error))?;
+        let final_sample = super::contact_custody_sample()
+            .map_err(|error| lifecycle_failure("finalize profile-5 custody clock", error))?
+            .ok_or_else(|| {
+                lifecycle_failure("finalize profile-5 custody clock", "clock unavailable")
+            })?;
+        if !store
+            .finalize_finite_blob_send_with_policy(
+                policy,
+                prepared,
+                blob,
+                &source.stored.sealed,
+                final_sample,
+            )
+            .map_err(|error| lifecycle_failure("finalize finite profile-5 source", error))?
+        {
+            return Err(lifecycle_failure(
+                "finalize finite profile-5 source",
+                "custody authority changed before emission",
+            ));
+        }
+        Some((claim.digest(), custody_frame))
+    } else {
+        None
+    };
     let (max_data_bytes, max_control_bytes) =
         profile5_attempt_bounds(wire_len).map_err(|error| {
             BlobNetworkError::new(BlobNetworkStage::Framing, "bound canonical stream", error)
@@ -1103,7 +1208,7 @@ pub(crate) async fn send_canonical_blob_profile5(
         total_len: wire_len,
         attempt_nonce,
         checkpoint_generation: 0,
-        custody_digest: None,
+        custody_digest: finite_custody.as_ref().map(|(digest, _)| *digest),
         source_len: u32::try_from(source.stored.sealed.len()).map_err(|_| {
             BlobNetworkError::new(
                 BlobNetworkStage::Framing,
@@ -1119,6 +1224,13 @@ pub(crate) async fn send_canonical_blob_profile5(
         direction,
         attempt_nonce,
     };
+    if let Some((_, custody_frame)) = finite_custody {
+        await_authenticated_progress(
+            "send canonical custody authority",
+            attempt.send_data(&custody_frame),
+        )
+        .await?;
+    }
     await_authenticated_progress(
         "send canonical open",
         attempt.send_data(&codec.encode(StreamFrame::Open(transfer_open.clone()))?),
@@ -1263,6 +1375,449 @@ pub(crate) async fn send_canonical_blob_profile5(
         wire_bytes: wire_len,
         resumed_from: resume_offset,
         attempt_bytes: wire_len - resume_offset,
+        roots,
+        checkpoints,
+        pipeline: None,
+    })
+}
+
+/// Receives one canonical profile-5 publication and promotes it exclusively
+/// through the ordinary pending-source/depot/application authorities.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn receive_canonical_blob_profile5(
+    adapter: &dyn StreamTransportAdapter,
+    store: &Store,
+    policy: &ControlPolicySnapshot,
+    verifier: &mut ReferenceEnvelopeSealer,
+    mission: &mut MissionSession,
+    profile_digest: [u8; 32],
+    direction: EventDirection,
+    expected_nonce: [u8; 32],
+    offer: &BlobStreamSourceOfferV1,
+) -> Result<BlobNetworkReport, BlobNetworkError> {
+    // The PLAN intentionally discloses no content size. Bound the transport by
+    // the selected profile ceiling until authenticated OPEN supplies the exact
+    // attempt size.
+    let profile_ceiling = (8u64 * 1024 * 1024 * 1024)
+        .checked_add(512 * 1024 * 1024)
+        .ok_or("profile-5 ceiling overflow")?;
+    let (max_data_bytes, max_control_bytes) =
+        profile5_attempt_bounds(profile_ceiling).map_err(|error| {
+            BlobNetworkError::new(BlobNetworkStage::Framing, "bound receive attempt", error)
+        })?;
+    let attempt = await_authenticated_progress(
+        "accept canonical transport attempt",
+        adapter.accept_attempt(AttemptOpenRequest {
+            deadline: Instant::now() + profile5_attempt_hard_timeout(profile_ceiling),
+            max_data_bytes,
+            max_control_bytes,
+        }),
+    )
+    .await?;
+    let mut codec = MissionBlobRecordCodec {
+        mission,
+        profile_digest,
+        direction,
+        attempt_nonce: expected_nonce,
+    };
+    let opened_custody = if offer.finite {
+        let frame = await_authenticated_progress(
+            "receive canonical custody authority",
+            attempt.receive_data(),
+        )
+        .await?
+        .ok_or("data stream closed before canonical custody authority")?;
+        Some(
+            codec
+                .mission
+                .open_blob_custody_frame_v2(profile_digest, direction, expected_nonce, &frame)
+                .map_err(|error| {
+                    authentication_failure("open profile-5 custody authority", error)
+                })?,
+        )
+    } else {
+        None
+    };
+    let encoded_open =
+        await_authenticated_progress("receive canonical open", attempt.receive_data())
+            .await?
+            .ok_or("data stream closed before canonical open")?;
+    let StreamFrame::Open(open) = codec.decode(&encoded_open)? else {
+        return Err("first canonical data frame was not OPEN".into());
+    };
+    let expected_direction = match direction {
+        EventDirection::ToSessionInitiator => StreamDirection::ToSessionInitiator,
+        EventDirection::ToSessionResponder => StreamDirection::ToSessionResponder,
+    };
+    if open.class != StreamClass::Blob
+        || open.direction != expected_direction
+        || open.session_transcript != codec.mission.session_id()
+        || open.exchange_id != 1
+        || open.transfer_id != offer.transfer_id
+        || open.source_transfer_id != offer.transfer_id
+        || open.attempt_nonce != expected_nonce
+        || open.source_len != offer.source_len
+        || open.source_digest != offer.source_digest
+        || (open.custody_digest.is_some() != offer.finite)
+    {
+        return Err(authentication_failure(
+            "validate canonical OPEN",
+            "OPEN differs from acknowledged PLAN/session or durable-source contract",
+        ));
+    }
+
+    let sealed = receive_authenticated_source(attempt.as_ref(), &mut codec, &open).await?;
+    if u32::try_from(sealed.len()).ok() != Some(offer.source_len)
+        || <[u8; 32]>::from(Sha256::digest(&sealed)) != offer.source_digest
+        || BlobTransferId::new(Sha256::digest(&sealed).into())
+            != BlobTransferId::new(offer.transfer_id)
+    {
+        return Err(authentication_failure(
+            "bind canonical SOURCE",
+            "SOURCE differs from acknowledged PLAN identity",
+        ));
+    }
+    let route = verifier
+        .verify_blob(&sealed)
+        .map_err(|error| authentication_failure("authenticate canonical SOURCE", error))?;
+    let BlobContentVerification::ContentVerified {
+        blob,
+        manifest_bytes,
+    } = verifier
+        .verify_blob_content(route, &sealed)
+        .map_err(|error| authentication_failure("authenticate canonical manifest", error))?
+    else {
+        return Err(authentication_failure(
+            "authenticate canonical manifest",
+            "receiver lacks the exact current content grant",
+        ));
+    };
+    let plan = blob
+        .transfer_plan(&manifest_bytes)
+        .map_err(|error| verification_failure("derive canonical transfer plan", error))?;
+    let wire_len = canonical_blob_wire_len(&plan)?;
+    let variant = BlobVariantId::for_content(
+        blob.blob_id(),
+        plan.manifest().content_group(),
+        plan.manifest().content_epoch(),
+    );
+    if (blob.ttl_ms().is_some() != offer.finite)
+        || blob.topic() != &offer.topic
+        || blob.scope() != &offer.scope
+        || blob.key_epoch() != offer.key_epoch
+        || open.publication_id != blob.item_id()
+        || open.variant_id != *variant.as_bytes()
+        || open.total_len != wire_len
+        || open.total_len > profile_ceiling
+    {
+        return Err(authentication_failure(
+            "recheck canonical source metadata",
+            "authenticated source differs from PLAN/OPEN metadata",
+        ));
+    }
+    verifier
+        .verify_current_blob_lineage(&blob)
+        .map_err(|error| authentication_failure("recheck canonical lineage", error))?;
+
+    let stage_outcome = if let Some((claim, authority)) = opened_custody {
+        let verified = claim
+            .verify_authenticated_source(
+                authority,
+                1,
+                BlobCustodyTransferId::from_exact_hash(blob.envelope_id()),
+                &blob,
+                &sealed,
+                claim.prior_cumulative_age_ms(),
+            )
+            .map_err(|error| authentication_failure("verify profile-5 custody claim", error))?;
+        if open.custody_digest != Some(verified.digest()) {
+            return Err(authentication_failure(
+                "bind profile-5 custody claim",
+                "OPEN custody digest differs from authenticated claim",
+            ));
+        }
+        let receiver_sample = super::contact_custody_sample()
+            .map_err(|error| lifecycle_failure("sample receiver custody clock", error))?
+            .ok_or_else(|| {
+                lifecycle_failure("sample receiver custody clock", "clock unavailable")
+            })?;
+        store
+            .stage_verified_finite_blob_source_v2_with_policy(
+                policy,
+                &blob,
+                &sealed,
+                &plan,
+                verified,
+                receiver_sample,
+            )
+            .map_err(|error| lifecycle_failure("stage finite canonical pending source", error))?
+    } else {
+        store
+            .stage_verified_blob_source_with_policy(policy, &blob, &sealed, &plan)
+            .map_err(|error| lifecycle_failure("stage canonical pending source", error))?
+    };
+    let source = BlobTransferId::new(offer.transfer_id);
+    let already_promoted = stage_outcome == BlobSourceStageOutcome::Duplicate
+        && store
+            .get_blob(source)
+            .map_err(|error| lifecycle_failure("resolve canonical duplicate", error))?
+            .is_some();
+    let (receipt, mut progress) = store
+        .reserve_profile5_receipt(policy, &plan)
+        .map_err(|error| lifecycle_failure("reserve profile-5 receipt", error))?;
+    if already_promoted {
+        let carrier_len = canonical_blob_carrier_len(&plan)?;
+        if progress.next_segment_index() != plan.manifest().chunk_count()
+            || progress.durable_plaintext_offset() != plan.manifest().total_len()
+            || progress.durable_pack_len() != carrier_len
+            || progress.durable_wire_offset() != wire_len
+        {
+            let terminal = BlobStreamResume::profile5(
+                progress
+                    .generation()
+                    .checked_add(1)
+                    .ok_or("receipt generation overflow")?,
+                plan.manifest().chunk_count(),
+                plan.manifest().total_len(),
+                carrier_len,
+                wire_len,
+            );
+            progress = store
+                .checkpoint_profile5_receipt(&receipt, progress, terminal)
+                .map_err(|error| durability_failure("checkpoint canonical duplicate", error))?;
+        }
+    }
+    let mut state = StreamReceiverState::new(
+        &open,
+        progress.durable_wire_offset(),
+        progress.generation(),
+        profile5_receive_limit(
+            wire_len,
+            progress.durable_wire_offset(),
+            MAX_STREAM_CHECKPOINT_BATCH_BYTES,
+        ),
+        PROFILE5_CANONICAL_EXTENT_BYTES as u32,
+    )
+    .map_err(|error| failure("initialize canonical receiver", error))?;
+    let StreamAction::Send(accept) = state
+        .accept(MAX_STREAM_CHECKPOINT_BATCH_BYTES)
+        .map_err(|error| failure("accept canonical receiver", error))?
+    else {
+        return Err("canonical receiver did not produce ACCEPT".into());
+    };
+    await_authenticated_progress(
+        "send canonical ACCEPT",
+        attempt.send_control(&codec.encode(accept)?),
+    )
+    .await?;
+
+    let resumed_from = progress.durable_wire_offset();
+    let mut last_announced = resumed_from;
+    let mut checkpoints = 0u64;
+    while progress.durable_wire_offset() < wire_len {
+        let encoded =
+            await_authenticated_progress("receive canonical DATA", attempt.receive_data())
+                .await?
+                .ok_or("data stream closed before canonical completion")?;
+        let frame = codec.decode(&encoded)?;
+        let StreamFrame::Data(data) = frame else {
+            return Err("canonical content phase received a non-DATA frame".into());
+        };
+        let through = match state
+            .data(&data)
+            .map_err(|error| failure("advance canonical receiver", error))?
+        {
+            StreamAction::Persist { through } => through,
+            StreamAction::Retry(_) => continue,
+            _ => return Err("canonical receiver produced an invalid DATA action".into()),
+        };
+        let extent = CanonicalBlobExtentV1::decode(&data.bytes)
+            .map_err(|error| verification_failure("decode ABX1 extent", error))?;
+        if extent.first_chunk_index != progress.next_segment_index() {
+            return Err(verification_failure(
+                "order ABX1 extent",
+                "extent chunk index differs from durable receipt",
+            ));
+        }
+        let mut plaintext = progress.durable_plaintext_offset();
+        let mut carrier_bytes = progress.durable_pack_len();
+        let mut next_index = extent.first_chunk_index;
+        for carrier in extent.carriers {
+            let expected_id = plan
+                .carrier_id(next_index)
+                .map_err(|error| verification_failure("derive carrier identity", error))?;
+            let verified = plan
+                .verify_carrier(&expected_id.wire_bytes(), &carrier)
+                .map_err(|error| verification_failure("authenticate ASTRBT01 carrier", error))?;
+            if verified.index() != next_index {
+                return Err(verification_failure(
+                    "authenticate ASTRBT01 carrier",
+                    "carrier index differs from ABX1 order",
+                ));
+            }
+            let object = BlobCarrierObjectId::new(expected_id.wire_bytes())
+                .map_err(|error| verification_failure("type carrier identity", error))?;
+            let total = u64::try_from(carrier.len()).map_err(|_| "carrier length overflow")?;
+            let mut offset = 0u64;
+            for page in carrier.chunks(MAX_BLOB_NETWORK_RANGE_BYTES) {
+                store
+                    .append_blob_carrier_prefix_with_policy(
+                        policy, source, object, total, offset, page,
+                    )
+                    .map_err(|error| durability_failure("stage canonical carrier", error))?;
+                offset = offset
+                    .checked_add(page.len() as u64)
+                    .ok_or("carrier prefix offset overflow")?;
+            }
+            store
+                .commit_complete_blob_carrier_with_policy(policy, source, object, &plan)
+                .map_err(|error| durability_failure("commit canonical carrier", error))?;
+            plaintext = plaintext
+                .checked_add(u64::from(
+                    plan.chunk_records()[next_index as usize].plaintext_len(),
+                ))
+                .ok_or("canonical plaintext progress overflow")?;
+            carrier_bytes = carrier_bytes
+                .checked_add(total)
+                .ok_or("canonical carrier progress overflow")?;
+            next_index = next_index
+                .checked_add(1)
+                .ok_or("canonical chunk index overflow")?;
+        }
+        let durable = BlobStreamResume::profile5(
+            progress
+                .generation()
+                .checked_add(1)
+                .ok_or("receipt generation overflow")?,
+            next_index,
+            plaintext,
+            carrier_bytes,
+            through,
+        );
+        progress = store
+            .checkpoint_profile5_receipt(&receipt, progress, durable)
+            .map_err(|error| durability_failure("checkpoint profile-5 receipt", error))?;
+        if through == wire_len
+            || through.saturating_sub(last_announced)
+                >= u64::from(MAX_STREAM_CHECKPOINT_BATCH_BYTES)
+        {
+            let new_limit =
+                profile5_receive_limit(wire_len, through, MAX_STREAM_CHECKPOINT_BATCH_BYTES);
+            let StreamAction::Send(checkpoint) = state
+                .persisted(through, progress.generation(), new_limit)
+                .map_err(|error| failure("persist canonical checkpoint", error))?
+            else {
+                return Err("canonical receiver did not produce CHECKPOINT".into());
+            };
+            await_authenticated_progress(
+                "send canonical CHECKPOINT",
+                attempt.send_control(&codec.encode(checkpoint)?),
+            )
+            .await?;
+            last_announced = through;
+            checkpoints += 1;
+        }
+    }
+
+    let encoded_finish =
+        await_authenticated_progress("receive canonical FINISH", attempt.receive_data())
+            .await?
+            .ok_or("data stream closed before canonical FINISH")?;
+    let StreamFrame::Finish(finish) = codec.decode(&encoded_finish)? else {
+        return Err("canonical terminal data frame was not FINISH".into());
+    };
+    if finish.semantic_commitment.as_slice() != plan.manifest_digest() {
+        return Err(verification_failure(
+            "validate canonical FINISH",
+            "semantic commitment differs from authenticated manifest",
+        ));
+    }
+    let StreamAction::Promote = state
+        .finish(finish)
+        .map_err(|error| settlement_failure("finish canonical receiver", error))?
+    else {
+        return Err("canonical receiver did not request promotion".into());
+    };
+
+    let code = if already_promoted {
+        // Re-run the exact receipt gate after FINISH so policy/lifecycle changes
+        // cannot turn a terminal retry into an acknowledgement of stale state.
+        store
+            .reserve_profile5_receipt(policy, &plan)
+            .map_err(|error| lifecycle_failure("recheck promoted profile-5 receipt", error))?;
+        StreamResultCode::AlreadyPresent
+    } else {
+        let depot_completion = store
+            .completed_pending_blob_with_policy(policy, source, &blob, &manifest_bytes, &plan)
+            .map_err(|error| durability_failure("complete canonical depot", error))?;
+        let depot = store
+            .blob_depot_for_pending_completion_verification(source, &depot_completion)
+            .map_err(|error| durability_failure("open canonical verification depot", error))?;
+        let content_completion = {
+            let mut service = verifier
+                .blob_service_with_store(blob.scope(), blob.topic(), blob.key_epoch(), depot)
+                .map_err(|error| verification_failure("open canonical content verifier", error))?;
+            service
+                .verify_blob_content_completion(&blob, &manifest_bytes)
+                .map_err(|error| {
+                    verification_failure("verify canonical content completion", error)
+                })?
+        };
+        let lineage = verifier
+            .verify_current_blob_lineage(&blob)
+            .map_err(|error| {
+                authentication_failure("recheck canonical promotion lineage", error)
+            })?;
+        match store
+            .apply_verified_blob_with_policy(
+                policy,
+                &plan,
+                &lineage,
+                &depot_completion,
+                &content_completion,
+            )
+            .map_err(|error| lifecycle_failure("promote canonical Blob", error))?
+        {
+            ApplyOutcome::Inserted { .. } => StreamResultCode::Promoted,
+            ApplyOutcome::Duplicate { .. } => StreamResultCode::AlreadyPresent,
+        }
+    };
+    let roots = (*blob.blob_id().as_bytes(), *plan.manifest_digest());
+    let digest = canonical_result_digest(&open, roots);
+    let StreamAction::Send(result) = state
+        .promoted(code, digest)
+        .map_err(|error| settlement_failure("build canonical RESULT", error))?
+    else {
+        return Err("canonical receiver did not produce RESULT".into());
+    };
+    await_authenticated_progress(
+        "send canonical RESULT",
+        attempt.send_control(&codec.encode(result)?),
+    )
+    .await?;
+    let encoded_ack = await_authenticated_progress("receive canonical ACK", attempt.receive_data())
+        .await?
+        .ok_or("data stream closed before canonical ACK")?;
+    let StreamFrame::ResultAck(ack) = codec.decode(&encoded_ack)? else {
+        return Err("canonical settlement frame was not ACK".into());
+    };
+    if !matches!(
+        state
+            .result_ack(ack, code)
+            .map_err(|error| settlement_failure("settle canonical receiver", error))?,
+        StreamAction::Terminal(terminal) if terminal == code
+    ) {
+        return Err("canonical receiver settlement did not terminate".into());
+    }
+    store
+        .complete_profile5_receipt(&receipt)
+        .map_err(|error| durability_failure("retire profile-5 receipt", error))?;
+    await_authenticated_progress("finish canonical control stream", attempt.finish_control())
+        .await?;
+    Ok(BlobNetworkReport {
+        wire_bytes: wire_len,
+        resumed_from,
+        attempt_bytes: wire_len.saturating_sub(resumed_from),
         roots,
         checkpoints,
         pipeline: None,
@@ -2121,6 +2676,7 @@ mod tests {
                 key_epoch: 1,
                 source_len,
                 source_digest,
+                finite: false,
             }),
         }
         .encode_for_semantic_version(9)

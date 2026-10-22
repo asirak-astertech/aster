@@ -133,6 +133,7 @@ pub(crate) struct BlobStreamSourceOfferV1 {
     pub key_epoch: u64,
     pub source_len: u32,
     pub source_digest: [u8; 32],
+    pub finite: bool,
 }
 
 /// Receiver-relative result for one authenticated semantic-v3 Event offer.
@@ -2431,6 +2432,7 @@ fn encode_blob_stream_plan_offer(
             output.extend_from_slice(&source.key_epoch.to_be_bytes());
             output.extend_from_slice(&source.source_len.to_be_bytes());
             output.extend_from_slice(&source.source_digest);
+            output.push(u8::from(source.finite));
         }
         _ => {
             return Err(NodeError::Protocol(
@@ -2477,6 +2479,15 @@ fn decode_blob_stream_plan_offer(body: &[u8]) -> Result<DecodedBlobStreamPlanOff
             let source_digest = take_exact(&mut rest, 32, "Blob stream source digest")?
                 .try_into()
                 .map_err(|_| NodeError::Protocol("Blob stream source digest differs".into()))?;
+            let finite = match take_exact(&mut rest, 1, "Blob stream lifetime class")?[0] {
+                0 => false,
+                1 => true,
+                _ => {
+                    return Err(NodeError::Protocol(
+                        "Blob stream lifetime class is not canonical".into(),
+                    ));
+                }
+            };
             if nonce == [0; 32]
                 || key_epoch == 0
                 || source_len == 0
@@ -2499,6 +2510,7 @@ fn decode_blob_stream_plan_offer(body: &[u8]) -> Result<DecodedBlobStreamPlanOff
                     key_epoch,
                     source_len,
                     source_digest,
+                    finite,
                 }),
             ))
         }
@@ -5127,6 +5139,7 @@ mod tests {
                     )
                     .unwrap(),
                     source_digest: [0xa5; 32],
+                    finite: false,
                 }),
             },
             Frame::BlobStreamPlanAck {
@@ -5157,6 +5170,7 @@ mod tests {
                 key_epoch: 7,
                 source_len: 1,
                 source_digest: [3; 32],
+                finite: false,
             }),
         }
         .encode_for_semantic_version(9)

@@ -26951,10 +26951,7 @@ fn next_canonical_blob_publication(
         mutable_transfer_cursor_mode(direction),
     )?;
     let mut publications = Vec::new();
-    // A missing custody digest is truthful only for durable sources. Task 5
-    // enables finite profile-5 inventory after adding the v9 custody
-    // authorization/finalization path on both sides of the contact.
-    store.visit_durable_retained_blob_sources(Some(policy), |retained| {
+    store.visit_retained_blob_sources(Some(policy), |retained| {
         if matches!(retained.retention, BlobSourceRetention::Completed { .. })
             && blob_projection_fits_profile5_bound(&retained.source)
         {
@@ -27055,8 +27052,15 @@ fn next_canonical_blob_publication(
                 "profile-5 canonical source lacks its completed depot capability".into(),
             )
         })?;
-        let source = blob_stream::CanonicalBlobSendSource::new(stored, plan, completion)
-            .map_err(profile5_blob_network_error)?;
+        let source = blob_stream::CanonicalBlobSendSource::new_with_lifetime(
+            stored,
+            plan,
+            completion,
+            blob,
+            retained.source.clone(),
+            retained.retention,
+        )
+        .map_err(profile5_blob_network_error)?;
         return Ok(Some(SelectedCanonicalBlobPublication {
             expected_cursor: cursor,
             source,
@@ -27123,6 +27127,7 @@ async fn send_profile5_blob_direction(
             key_epoch: publication.key_epoch(),
             source_len: u32::try_from(publication.authenticated_open().len()).unwrap_or(u32::MAX),
             source_digest: Sha256::digest(publication.authenticated_open()).into(),
+            finite: publication.is_finite(),
         });
     let response = request_mission_frame(
         connection,
@@ -27208,9 +27213,9 @@ async fn receive_profile5_blob_direction(
     store: Arc<Store>,
     connection: &aster_iroh::Connection,
     mission: &mut MissionSession,
-    _profiles: &V7TransferProfiles,
+    profiles: &V7TransferProfiles,
     guard: &EventLaneGuard,
-    _verifier: Arc<ReferenceEnvelopeSealer>,
+    verifier: &mut ReferenceEnvelopeSealer,
     local_interest: &BlobInterest,
     direction: EventDirection,
     receipt: &mut PeerReceipt,
@@ -27266,12 +27271,49 @@ async fn receive_profile5_blob_direction(
             "Blob stream plan exchange did not complete".into(),
         ));
     }
-    let Some((_nonce, _source)) = accepted else {
+    let Some((nonce, source)) = accepted else {
         return Ok(());
     };
-    Err(NodeError::Protocol(
-        "canonical profile-5 receiver is introduced by Task 5".into(),
+    let selector = local_interest
+        .selector(&source.topic, &source.scope)
+        .filter(|selector| selector.epoch() == source.key_epoch)
+        .ok_or_else(|| NodeError::Protocol("accepted Blob offer lost local interest".into()))?;
+    let peer = mission.peer().mission_id();
+    if !verifier.peer_can_route(
+        peer,
+        mission.peer_route_grant_commitments(),
+        &source.scope,
+        source.key_epoch,
+    ) || !verifier.peer_can_open_blob_content(
+        peer,
+        mission.peer_route_grant_commitments(),
+        &source.scope,
+        &source.topic,
+        source.key_epoch,
+        selector.content_proof(),
+    ) {
+        return Err(NodeError::Protocol(
+            "authenticated peer lacks the offered Blob route/content grant".into(),
+        ));
+    }
+    guard.check(&store)?;
+    let transport = blob_stream::select_stream_transport(connection.clone())
+        .map_err(profile5_blob_network_error)?;
+    let report = Box::pin(blob_stream::receive_canonical_blob_profile5(
+        transport.as_ref(),
+        &store,
+        guard.policy(),
+        verifier,
+        mission,
+        profiles.digest,
+        direction,
+        nonce,
+        &source,
     ))
+    .await
+    .map_err(profile5_blob_network_error)?;
+    record_blob_stream_report(receipt, &report, BlobStreamReportDirection::Received)?;
+    guard.check(&store)
 }
 
 fn profile5_plan_matches_local_interest(
@@ -27328,7 +27370,7 @@ async fn sync_profile5_blob_lane_if_selected(
             mission,
             profiles,
             guard,
-            Arc::new(verifier),
+            &mut verifier,
             &local_interest,
             EventDirection::ToSessionInitiator,
             receipt,
@@ -27347,7 +27389,7 @@ async fn serve_profile5_blob_lane_if_selected(
     profiles: Option<&V7TransferProfiles>,
     mode: BlobTransferMode,
     guard: &EventLaneGuard,
-    verifier: ReferenceEnvelopeSealer,
+    mut verifier: ReferenceEnvelopeSealer,
     interests: &MutableSourceInterests,
     receive_enabled: bool,
     send_enabled: bool,
@@ -27361,7 +27403,6 @@ async fn serve_profile5_blob_lane_if_selected(
     })?;
     let local_interest = protected_blob_interest(&store, &verifier, interests, true)?;
     let peer_interest = serve_blob_interests(connection, mission, &local_interest, receipt).await?;
-    let verifier = Arc::new(verifier);
     if receive_enabled {
         receive_profile5_blob_direction(
             Arc::clone(&store),
@@ -27369,7 +27410,7 @@ async fn serve_profile5_blob_lane_if_selected(
             mission,
             profiles,
             guard,
-            Arc::clone(&verifier),
+            &mut verifier,
             &local_interest,
             EventDirection::ToSessionResponder,
             receipt,
@@ -27378,11 +27419,6 @@ async fn serve_profile5_blob_lane_if_selected(
         .map_err(|error| blob_stream_error("profile-5 responder receive phase", error))?;
     }
     if send_enabled {
-        let mut verifier = Arc::try_unwrap(verifier).map_err(|_| {
-            NodeError::Protocol(
-                "profile-5 receiver retained the verifier after its phase completed".into(),
-            )
-        })?;
         send_profile5_blob_direction(
             &store,
             connection,
@@ -51908,6 +51944,7 @@ mod tests {
             key_epoch: 7,
             source_len: 128,
             source_digest: [0x62; 32],
+            finite: false,
         };
 
         assert!(!profile5_plan_matches_local_interest(&interest, &outside));
@@ -52000,10 +52037,7 @@ mod tests {
     }
 
     #[test]
-    fn profile5_sender_withholds_finite_source_until_v9_custody_authority_exists() {
-        // Mutation caught: the all-visible canonical visitor would advertise a
-        // finite publication while StreamOpenV1 truthfully has no v9 custody
-        // digest yet. Task 5 adds that authority before enabling this case.
+    fn finite_profile5_source_is_inventory_eligible_with_v9_custody_authority() {
         let services = control_test_services([0xa7; 32]);
         let state = root("canonical-profile5-finite-inventory");
         fs::create_dir_all(&state).expect("finite canonical inventory state");
@@ -52053,7 +52087,8 @@ mod tests {
             EventDirection::ToSessionResponder,
         )
         .expect("finite profile-5 inventory");
-        assert!(selected.is_none());
+        let selected = selected.expect("finite source is profile-5 eligible");
+        assert!(selected.source.is_finite());
 
         drop(store);
         fs::remove_dir_all(state).expect("finite canonical inventory cleanup");
