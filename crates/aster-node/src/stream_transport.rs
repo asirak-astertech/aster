@@ -327,6 +327,14 @@ pub(crate) enum StreamTransportError {
     Bounds,
 }
 
+impl std::fmt::Display for StreamTransportError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl std::error::Error for StreamTransportError {}
+
 pub(crate) type AdapterFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, StreamTransportError>> + Send + 'a>>;
 

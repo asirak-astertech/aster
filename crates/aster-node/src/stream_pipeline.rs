@@ -137,6 +137,10 @@ struct PipelineTestProbeInner {
     peak_reorder_items: std::sync::atomic::AtomicUsize,
     current_reorder_items: std::sync::atomic::AtomicUsize,
     mapped_ciphertext_zeroizations: Arc<std::sync::atomic::AtomicUsize>,
+    sender_extent_body_zeroizations: Arc<std::sync::atomic::AtomicUsize>,
+    sender_prefix_header_zeroizations: Arc<std::sync::atomic::AtomicUsize>,
+    sender_live_bytes: Arc<std::sync::atomic::AtomicUsize>,
+    sender_peak_live_bytes: Arc<std::sync::atomic::AtomicUsize>,
     prepared_sender_carriers: std::sync::atomic::AtomicUsize,
     received_extents: std::sync::atomic::AtomicUsize,
     available_item_permits: std::sync::atomic::AtomicUsize,
@@ -149,6 +153,14 @@ struct PipelineTestProbeInner {
 #[cfg(test)]
 #[derive(Clone)]
 pub(crate) struct PipelineTestProbe(Arc<PipelineTestProbeInner>);
+
+#[cfg(test)]
+pub(crate) struct SenderOwnershipObservers {
+    pub(crate) extent_body_zeroizations: Arc<std::sync::atomic::AtomicUsize>,
+    pub(crate) prefix_header_zeroizations: Arc<std::sync::atomic::AtomicUsize>,
+    pub(crate) live_bytes: Arc<std::sync::atomic::AtomicUsize>,
+    pub(crate) peak_live_bytes: Arc<std::sync::atomic::AtomicUsize>,
+}
 
 #[cfg(test)]
 static PIPELINE_TEST_PROBES: std::sync::LazyLock<
@@ -183,6 +195,34 @@ impl PipelineTestProbe {
 
     pub(crate) fn mapped_ciphertext_zeroizations(&self) -> usize {
         self.0.mapped_ciphertext_zeroizations.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn sender_ownership_observers_for_job(
+        job: StreamJobId,
+    ) -> Option<SenderOwnershipObservers> {
+        Self::for_job(job).map(|probe| SenderOwnershipObservers {
+            extent_body_zeroizations: Arc::clone(&probe.0.sender_extent_body_zeroizations),
+            prefix_header_zeroizations: Arc::clone(&probe.0.sender_prefix_header_zeroizations),
+            live_bytes: Arc::clone(&probe.0.sender_live_bytes),
+            peak_live_bytes: Arc::clone(&probe.0.sender_peak_live_bytes),
+        })
+    }
+
+    pub(crate) fn sender_extent_body_zeroizations(&self) -> usize {
+        self.0
+            .sender_extent_body_zeroizations
+            .load(Ordering::SeqCst)
+    }
+    pub(crate) fn sender_prefix_header_zeroizations(&self) -> usize {
+        self.0
+            .sender_prefix_header_zeroizations
+            .load(Ordering::SeqCst)
+    }
+    pub(crate) fn sender_live_bytes(&self) -> usize {
+        self.0.sender_live_bytes.load(Ordering::SeqCst)
+    }
+    pub(crate) fn sender_peak_live_bytes(&self) -> usize {
+        self.0.sender_peak_live_bytes.load(Ordering::SeqCst)
     }
 
     pub(crate) fn observe_received_extent(job: StreamJobId) {
@@ -452,7 +492,9 @@ impl PipelineReport {
         peak_owned_bytes: usize,
         peak_encoding_bytes: usize,
     ) -> Self {
-        self.peak_owned_bytes = self.peak_owned_bytes.max(peak_owned_bytes);
+        // An adapter with explicit ownership accounting replaces the generic
+        // admission estimate with its observed allocation lifetime peak.
+        self.peak_owned_bytes = peak_owned_bytes;
         self.peak_encoding_bytes = peak_encoding_bytes;
         self
     }
@@ -500,7 +542,7 @@ impl Display for PipelineReport {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub enum PipelineError {
     InvalidLimits,
     EmptyPartition,
@@ -509,7 +551,7 @@ pub enum PipelineError {
     WorkerPanicked,
     MapFailed(String),
     SinkFailed(String),
-    BlobNetwork(Box<crate::runtime::blob_stream::BlobNetworkError>),
+    Adapter(Arc<dyn Error + Send + Sync>),
 }
 
 impl Display for PipelineError {
@@ -518,7 +560,14 @@ impl Display for PipelineError {
     }
 }
 
-impl Error for PipelineError {}
+impl Error for PipelineError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Adapter(source) => Some(source.as_ref()),
+            _ => None,
+        }
+    }
+}
 
 struct Pending<T> {
     mapped: MappedPartition<T>,
@@ -1444,6 +1493,24 @@ mod tests {
             atomic::{AtomicUsize, Ordering},
         },
     };
+
+    #[derive(Debug)]
+    struct TestAdapterError;
+
+    impl std::fmt::Display for TestAdapterError {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("test adapter failure")
+        }
+    }
+
+    impl std::error::Error for TestAdapterError {}
+
+    #[test]
+    fn pipeline_error_retains_adapter_neutral_typed_source() {
+        let error = PipelineError::Adapter(Arc::new(TestAdapterError));
+        let source = std::error::Error::source(&error).expect("adapter source");
+        assert!(source.downcast_ref::<TestAdapterError>().is_some());
+    }
 
     #[tokio::test]
     async fn pipeline_accepts_async_partitions_and_preserves_order() {

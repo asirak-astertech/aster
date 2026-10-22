@@ -52276,6 +52276,14 @@ mod tests {
     }
 
     #[derive(Debug)]
+    struct SenderOwnershipTestReceipt {
+        carrier_zeroizations: usize,
+        extent_body_zeroizations: usize,
+        prefix_header_zeroizations: usize,
+        actual_peak_live_bytes: usize,
+    }
+
+    #[derive(Debug)]
     struct Profile5ReceiverMeasurementReceipt {
         payload_bytes: u64,
         wall_time_ns: u64,
@@ -52284,6 +52292,10 @@ mod tests {
         pipeline: crate::stream_pipeline::PipelineReport,
         sender_pipeline: crate::stream_pipeline::PipelineReport,
         sender_store_reads: u64,
+        sender_carrier_zeroizations: u64,
+        sender_extent_body_zeroizations: u64,
+        sender_prefix_header_zeroizations: u64,
+        sender_actual_peak_live_bytes: u64,
         store: aster_redb_store::Profile5BatchTestCounts,
     }
 
@@ -52294,6 +52306,7 @@ mod tests {
             pipeline: crate::stream_pipeline::PipelineReport,
             sender_pipeline: crate::stream_pipeline::PipelineReport,
             sender_store_reads: u64,
+            sender_ownership: SenderOwnershipTestReceipt,
             store: aster_redb_store::Profile5BatchTestCounts,
         ) -> Self {
             let payload_bytes = u64::try_from(payload_bytes).expect("profile-5 fixture size");
@@ -52307,6 +52320,11 @@ mod tests {
                 pipeline,
                 sender_pipeline,
                 sender_store_reads,
+                sender_carrier_zeroizations: sender_ownership.carrier_zeroizations as u64,
+                sender_extent_body_zeroizations: sender_ownership.extent_body_zeroizations as u64,
+                sender_prefix_header_zeroizations: sender_ownership.prefix_header_zeroizations
+                    as u64,
+                sender_actual_peak_live_bytes: sender_ownership.actual_peak_live_bytes as u64,
                 store,
             }
         }
@@ -52385,6 +52403,9 @@ mod tests {
                     "\"payload_bytes\":{},\"wall_time_ns\":{},",
                     "\"bytes_per_second\":{:.3},\"mib_per_second\":{:.3},",
                     "\"store\":{{\"carrier_reads\":{}}},",
+                    "\"ownership\":{{\"carrier_zeroizations\":{},",
+                    "\"extent_body_zeroizations\":{},\"prefix_header_zeroizations\":{},",
+                    "\"actual_peak_live_bytes\":{},\"live_bytes_after_join\":0}},",
                     "\"pipeline\":{{\"accepted_items\":{},\"completed_items\":{},",
                     "\"workers\":{},\"peak_in_flight_items\":{},",
                     "\"peak_in_flight_bytes\":{},\"peak_owned_bytes\":{},",
@@ -52396,6 +52417,10 @@ mod tests {
                 self.bytes_per_second,
                 self.mib_per_second,
                 self.sender_store_reads,
+                self.sender_carrier_zeroizations,
+                self.sender_extent_body_zeroizations,
+                self.sender_prefix_header_zeroizations,
+                self.sender_actual_peak_live_bytes,
                 self.sender_pipeline.accepted_items(),
                 self.sender_pipeline.completed_items(),
                 self.sender_pipeline.worker_count(),
@@ -52804,6 +52829,8 @@ mod tests {
                     "injected sender failure must fail the attempt"
                 );
                 let stage = first.as_ref().expect_err("sender failure").stage();
+                let source = std::error::Error::source(first.as_ref().expect_err("sender failure"))
+                    .expect("sender failure retains its concrete source");
                 assert_eq!(
                     stage,
                     match label {
@@ -52814,6 +52841,29 @@ mod tests {
                         _ => unreachable!(),
                     }
                 );
+                match label {
+                    "sender-map-failure" => assert!(
+                        source
+                            .downcast_ref::<aster_redb_store::StoreError>()
+                            .is_some()
+                    ),
+                    "sender-extent-failure" => assert!(
+                        source
+                            .downcast_ref::<blob_stream::InjectedExtentEncodeError>()
+                            .is_some()
+                    ),
+                    "sender-auth-failure" => assert!(
+                        source
+                            .downcast_ref::<blob_stream::InjectedDataAuthenticationError>()
+                            .is_some()
+                    ),
+                    "sender-transport-failure" => assert!(
+                        source
+                            .downcast_ref::<crate::stream_transport::StreamTransportError>()
+                            .is_some()
+                    ),
+                    _ => unreachable!(),
+                }
                 assert!(
                     target_store
                         .get_blob(publication)
@@ -52834,6 +52884,17 @@ mod tests {
                     sender_pipeline_probe.available_byte_permits(),
                     4 * aster_mesh::PROFILE5_CANONICAL_EXTENT_BYTES as usize
                 );
+                assert_eq!(sender_pipeline_probe.sender_live_bytes(), 0);
+                assert!(
+                    sender_pipeline_probe.sender_peak_live_bytes()
+                        <= blob_stream::PROFILE5_SENDER_OWNED_BYTES
+                );
+                if label != "sender-map-failure" {
+                    assert!(sender_pipeline_probe.sender_extent_body_zeroizations() > 0);
+                }
+                if matches!(label, "sender-auth-failure" | "sender-transport-failure") {
+                    assert!(sender_pipeline_probe.sender_prefix_header_zeroizations() > 0);
+                }
                 drop((source_store, target_store));
                 fs::remove_dir_all(source_state).expect("sender-failure source cleanup");
                 fs::remove_dir_all(target_state).expect("sender-failure target cleanup");
@@ -53188,6 +53249,14 @@ mod tests {
                     sender_pipeline.peak_owned_bytes() >= sender_pipeline.peak_encoding_bytes(),
                     "the total ownership peak must include encoded DATA held through transport"
                 );
+                assert_eq!(sender_pipeline_probe.sender_live_bytes(), 0);
+                assert_eq!(
+                    sender_pipeline_probe.sender_peak_live_bytes(),
+                    sender_pipeline.peak_owned_bytes(),
+                    "reported ownership peak must equal the actual-live-byte observer"
+                );
+                assert!(sender_pipeline_probe.sender_extent_body_zeroizations() > 0);
+                assert!(sender_pipeline_probe.sender_prefix_header_zeroizations() > 0);
                 assert!(sender_pipeline_probe.peak_active_workers() > 1);
                 assert!(sender_pipeline_probe.cleanup_observed());
                 assert!(sender_pipeline_probe.cancellation_signalled());
@@ -53255,6 +53324,15 @@ mod tests {
                     source_store
                         .profile5_batch_test_counts()
                         .sender_carrier_reads,
+                    SenderOwnershipTestReceipt {
+                        carrier_zeroizations: sender_pipeline_probe
+                            .mapped_ciphertext_zeroizations(),
+                        extent_body_zeroizations: sender_pipeline_probe
+                            .sender_extent_body_zeroizations(),
+                        prefix_header_zeroizations: sender_pipeline_probe
+                            .sender_prefix_header_zeroizations(),
+                        actual_peak_live_bytes: sender_pipeline_probe.sender_peak_live_bytes(),
+                    },
                     batch_counts,
                 ));
                 assert_eq!(batch_counts.installed_carriers, canonical_chunk_count);
@@ -53597,6 +53675,31 @@ mod tests {
             .expect("profile-5 sender measurement receipt is valid JSON");
         assert_eq!(sender["schema"], "aster.profile5-sender-measurement.v1");
         assert_eq!(sender["payload_bytes"], 4 * 1024 * 1024 + 1);
+        assert!(
+            sender["ownership"]["carrier_zeroizations"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert!(
+            sender["ownership"]["extent_body_zeroizations"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert!(
+            sender["ownership"]["prefix_header_zeroizations"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert_eq!(sender["ownership"]["live_bytes_after_join"], 0);
+        assert!(
+            sender["ownership"]["actual_peak_live_bytes"]
+                .as_u64()
+                .unwrap()
+                <= blob_stream::PROFILE5_SENDER_OWNED_BYTES as u64
+        );
         assert_eq!(
             sender["store"]["carrier_reads"], sender["pipeline"]["completed_items"],
             "sender Store work remains exactly linear in canonical carriers"

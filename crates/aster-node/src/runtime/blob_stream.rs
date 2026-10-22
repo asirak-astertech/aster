@@ -176,15 +176,54 @@ struct ZeroizingCanonicalCarrier {
     zeroize_observer: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
-#[derive(Default)]
 struct SenderByteOwnership {
     current: std::sync::atomic::AtomicUsize,
     peak: std::sync::atomic::AtomicUsize,
     encoding_current: std::sync::atomic::AtomicUsize,
     encoding_peak: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    live_observer: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    #[cfg(test)]
+    peak_observer: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    #[cfg(test)]
+    extent_body_zeroize_observer: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    #[cfg(test)]
+    prefix_header_zeroize_observer: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 impl SenderByteOwnership {
+    fn new(sender_job: StreamJobId) -> Self {
+        #[cfg(not(test))]
+        let _ = sender_job;
+        #[cfg(test)]
+        let observers =
+            crate::stream_pipeline::PipelineTestProbe::sender_ownership_observers_for_job(
+                sender_job,
+            );
+        Self {
+            current: std::sync::atomic::AtomicUsize::new(0),
+            peak: std::sync::atomic::AtomicUsize::new(0),
+            encoding_current: std::sync::atomic::AtomicUsize::new(0),
+            encoding_peak: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            live_observer: observers
+                .as_ref()
+                .map(|observers| Arc::clone(&observers.live_bytes)),
+            #[cfg(test)]
+            peak_observer: observers
+                .as_ref()
+                .map(|observers| Arc::clone(&observers.peak_live_bytes)),
+            #[cfg(test)]
+            extent_body_zeroize_observer: observers
+                .as_ref()
+                .map(|observers| Arc::clone(&observers.extent_body_zeroizations)),
+            #[cfg(test)]
+            prefix_header_zeroize_observer: observers
+                .as_ref()
+                .map(|observers| Arc::clone(&observers.prefix_header_zeroizations)),
+        }
+    }
+
     fn charge(self: &Arc<Self>, bytes: usize) -> SenderByteCharge {
         let current = self
             .current
@@ -192,6 +231,13 @@ impl SenderByteOwnership {
             + bytes;
         self.peak
             .fetch_max(current, std::sync::atomic::Ordering::SeqCst);
+        #[cfg(test)]
+        if let Some(live) = &self.live_observer {
+            let observed = live.fetch_add(bytes, std::sync::atomic::Ordering::SeqCst) + bytes;
+            if let Some(peak) = &self.peak_observer {
+                peak.fetch_max(observed, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
         SenderByteCharge {
             ownership: Arc::clone(self),
             bytes,
@@ -220,11 +266,103 @@ impl SenderByteOwnership {
     }
 }
 
+#[derive(Clone, Copy)]
+enum SenderBufferClass {
+    ExtentBody,
+    PrefixHeader,
+}
+
+struct ZeroizingSenderBuffer {
+    bytes: Vec<u8>,
+    _charge: SenderByteCharge,
+    #[cfg(test)]
+    zeroize_observer: Option<Arc<std::sync::atomic::AtomicUsize>>,
+}
+
+impl ZeroizingSenderBuffer {
+    fn new(bytes: Vec<u8>, ownership: &Arc<SenderByteOwnership>, class: SenderBufferClass) -> Self {
+        #[cfg(test)]
+        let zeroize_observer = match class {
+            SenderBufferClass::ExtentBody => ownership.extent_body_zeroize_observer.clone(),
+            SenderBufferClass::PrefixHeader => ownership.prefix_header_zeroize_observer.clone(),
+        };
+        #[cfg(not(test))]
+        let _ = class;
+        Self {
+            _charge: ownership.charge_encoding(bytes.len()),
+            bytes,
+            #[cfg(test)]
+            zeroize_observer,
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    fn take(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.bytes)
+    }
+}
+
+impl Drop for ZeroizingSenderBuffer {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        let had_bytes = !self.bytes.is_empty();
+        self.bytes.zeroize();
+        #[cfg(test)]
+        if had_bytes && let Some(observer) = self.zeroize_observer.take() {
+            observer.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+async fn send_owned_data_parts(
+    attempt: &dyn StreamAttempt,
+    prefix: ZeroizingSenderBuffer,
+    body: ZeroizingSenderBuffer,
+    inject_transport_failure: bool,
+) -> Result<(), crate::stream_transport::StreamTransportError> {
+    #[cfg(test)]
+    if inject_transport_failure {
+        return Err(crate::stream_transport::StreamTransportError::Closed);
+    }
+    #[cfg(not(test))]
+    let _ = inject_transport_failure;
+    attempt
+        .send_data_parts(prefix.as_slice(), body.as_slice())
+        .await
+}
+
 struct SenderByteCharge {
     ownership: Arc<SenderByteOwnership>,
     bytes: usize,
     encoding: bool,
 }
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct InjectedExtentEncodeError;
+#[cfg(test)]
+impl std::fmt::Display for InjectedExtentEncodeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("injected extent encoding failure")
+    }
+}
+#[cfg(test)]
+impl std::error::Error for InjectedExtentEncodeError {}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct InjectedDataAuthenticationError;
+#[cfg(test)]
+impl std::fmt::Display for InjectedDataAuthenticationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("injected DATA authentication failure")
+    }
+}
+#[cfg(test)]
+impl std::error::Error for InjectedDataAuthenticationError {}
 
 impl Drop for SenderByteCharge {
     fn drop(&mut self) {
@@ -235,6 +373,10 @@ impl Drop for SenderByteCharge {
             self.ownership
                 .encoding_current
                 .fetch_sub(self.bytes, std::sync::atomic::Ordering::SeqCst);
+        }
+        #[cfg(test)]
+        if let Some(live) = &self.ownership.live_observer {
+            live.fetch_sub(self.bytes, std::sync::atomic::Ordering::SeqCst);
         }
     }
 }
@@ -248,14 +390,6 @@ impl Drop for ZeroizingCanonicalCarrier {
         if had_ciphertext && let Some(observer) = self.zeroize_observer.take() {
             observer.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
-    }
-}
-
-struct ZeroizingCanonicalExtent(Vec<u8>);
-
-impl Drop for ZeroizingCanonicalExtent {
-    fn drop(&mut self) {
-        self.0.zeroize();
     }
 }
 
@@ -288,17 +422,8 @@ impl CanonicalSenderPipelineSink<'_> {
             .first_chunk_index
             .take()
             .ok_or_else(|| failure("send canonical extent", "missing canonical extent start"))
-            .map_err(|error| PipelineError::BlobNetwork(Box::new(error)))?;
+            .map_err(pipeline_adapter)?;
         let carriers = std::mem::take(&mut self.carriers);
-        #[cfg(test)]
-        if crate::stream_pipeline::PipelineTestProbe::sender_sink_failure_for_job(self.job_id) == 1
-        {
-            return Err(PipelineError::BlobNetwork(Box::new(BlobNetworkError::new(
-                BlobNetworkStage::Framing,
-                "encode canonical extent",
-                "injected extent encoding failure",
-            ))));
-        }
         let encoded = CanonicalBlobExtentV1::encode_carriers(
             first_chunk_index,
             carriers
@@ -306,48 +431,57 @@ impl CanonicalSenderPipelineSink<'_> {
                 .map(|carrier| carrier.value().bytes.as_slice()),
         )
         .map_err(|error| {
-            PipelineError::BlobNetwork(Box::new(BlobNetworkError::new(
+            pipeline_adapter(BlobNetworkError::with_source(
                 BlobNetworkStage::Framing,
                 "encode canonical extent",
                 error,
-            )))
+            ))
         })?;
-        let encoded_charge = self.ownership.charge_encoding(encoded.len());
-        let mut encoded = ZeroizingCanonicalExtent(encoded);
-        let mut pending = Some(std::mem::take(&mut encoded.0));
+        let mut encoded =
+            ZeroizingSenderBuffer::new(encoded, &self.ownership, SenderBufferClass::ExtentBody);
+        #[cfg(test)]
+        if crate::stream_pipeline::PipelineTestProbe::sender_sink_failure_for_job(self.job_id) == 1
+        {
+            return Err(pipeline_adapter(BlobNetworkError::with_source(
+                BlobNetworkStage::Framing,
+                "encode canonical extent",
+                InjectedExtentEncodeError,
+            )));
+        }
+        let mut pending = Some(encoded.take());
         while let Some(extent) = pending.take() {
-            match self.state.send_extent(extent).map_err(|error| {
-                PipelineError::BlobNetwork(Box::new(failure("advance canonical sender", error)))
-            })? {
+            match self
+                .state
+                .send_extent(extent)
+                .map_err(|error| pipeline_adapter(failure("advance canonical sender", error)))?
+            {
                 StreamExtentAction::Send(data) => {
+                    let (header, body) = data.into_header_and_body().map_err(|error| {
+                        pipeline_adapter(BlobNetworkError::with_source(
+                            BlobNetworkStage::Framing,
+                            "split data frame",
+                            error,
+                        ))
+                    })?;
+                    encoded.bytes = body;
                     #[cfg(test)]
-                    if crate::stream_pipeline::PipelineTestProbe::sender_sink_failure_for_job(
-                        self.job_id,
-                    ) == 2
-                    {
-                        let mut bytes = data.bytes;
-                        bytes.zeroize();
-                        return Err(PipelineError::BlobNetwork(Box::new(
-                            authentication_failure(
-                                "seal data-header mission record",
-                                "injected DATA authentication failure",
-                            ),
-                        )));
-                    }
-                    let (mut prefix, mut body) = self
+                    let inject_auth =
+                        crate::stream_pipeline::PipelineTestProbe::sender_sink_failure_for_job(
+                            self.job_id,
+                        ) == 2;
+                    #[cfg(not(test))]
+                    let inject_auth = false;
+                    let prefix = self
                         .codec
-                        .encode_data_parts(data)
-                        .map_err(|error| PipelineError::BlobNetwork(Box::new(error)))?;
-                    if prefix.len() > 4096 {
-                        prefix.zeroize();
-                        body.zeroize();
-                        return Err(PipelineError::BlobNetwork(Box::new(BlobNetworkError::new(
+                        .encode_charged_data_prefix(header, &self.ownership, inject_auth)
+                        .map_err(pipeline_adapter)?;
+                    if prefix.as_slice().len() > 4096 {
+                        return Err(pipeline_adapter(BlobNetworkError::new(
                             BlobNetworkStage::Framing,
                             "bound canonical DATA prefix",
                             "authenticated prefix exceeds sender encoding budget",
-                        ))));
+                        )));
                     }
-                    let prefix_charge = self.ownership.charge_encoding(prefix.len());
                     #[cfg(test)]
                     if let Some((entered, release)) =
                         crate::stream_pipeline::PipelineTestProbe::sender_send_gate_for_job(
@@ -361,68 +495,66 @@ impl CanonicalSenderPipelineSink<'_> {
                             .map_err(|_| PipelineError::WorkerPanicked)?
                             .forget();
                     }
-                    let send = await_authenticated_progress("send canonical data", async {
-                        #[cfg(test)]
-                        if crate::stream_pipeline::PipelineTestProbe::sender_sink_failure_for_job(
+                    #[cfg(test)]
+                    let inject_transport_failure =
+                        crate::stream_pipeline::PipelineTestProbe::sender_sink_failure_for_job(
                             self.job_id,
-                        ) == 3
-                        {
-                            return Err(crate::stream_transport::StreamTransportError::Closed);
-                        }
-                        self.attempt.send_data_parts(&prefix, &body).await
-                    })
+                        ) == 3;
+                    #[cfg(not(test))]
+                    let inject_transport_failure = false;
+                    let send = await_authenticated_progress(
+                        "send canonical data",
+                        send_owned_data_parts(
+                            self.attempt,
+                            prefix,
+                            encoded,
+                            inject_transport_failure,
+                        ),
+                    )
                     .await;
-                    prefix.zeroize();
-                    body.zeroize();
-                    drop(prefix_charge);
-                    send.map_err(|error| PipelineError::BlobNetwork(Box::new(error)))?;
+                    drop(carriers);
+                    return send.map_err(pipeline_adapter);
                 }
                 StreamExtentAction::Retry {
                     reason: crate::stream_transfer::StreamRetry::CreditBlocked,
                     bytes,
                 } => {
+                    encoded.bytes = bytes;
                     let checkpoint = await_authenticated_progress(
                         "receive canonical checkpoint",
                         self.attempt.receive_control(),
                     )
                     .await
-                    .map_err(|error| PipelineError::BlobNetwork(Box::new(error)))?
+                    .map_err(pipeline_adapter)?
                     .ok_or_else(|| {
-                        PipelineError::BlobNetwork(Box::new(transport_failure(
+                        pipeline_adapter(transport_failure(
                             "receive canonical checkpoint",
                             "control stream closed",
-                        )))
+                        ))
                     })?;
-                    let StreamFrame::Checkpoint(checkpoint) = self
-                        .codec
-                        .decode(&checkpoint)
-                        .map_err(|error| PipelineError::BlobNetwork(Box::new(error)))?
+                    let StreamFrame::Checkpoint(checkpoint) =
+                        self.codec.decode(&checkpoint).map_err(pipeline_adapter)?
                     else {
-                        return Err(PipelineError::BlobNetwork(Box::new(failure(
+                        return Err(pipeline_adapter(failure(
                             "receive canonical checkpoint",
                             "credit wait received a non-checkpoint frame",
-                        ))));
+                        )));
                     };
                     self.state.checkpoint(checkpoint).map_err(|error| {
-                        PipelineError::BlobNetwork(Box::new(failure(
-                            "advance canonical checkpoint",
-                            error,
-                        )))
+                        pipeline_adapter(failure("advance canonical checkpoint", error))
                     })?;
                     self.checkpoints += 1;
-                    pending = Some(bytes);
+                    pending = Some(encoded.take());
                 }
                 StreamExtentAction::Retry { .. } => {
-                    return Err(PipelineError::BlobNetwork(Box::new(failure(
+                    return Err(pipeline_adapter(failure(
                         "advance canonical sender",
                         "invalid extent retry",
-                    ))));
+                    )));
                 }
             }
         }
-        drop(carriers);
-        drop(encoded_charge);
-        Ok(())
+        unreachable!("sender extent must finish with a DATA send")
     }
 }
 
@@ -467,11 +599,12 @@ pub enum BlobNetworkStage {
     Settlement,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct BlobNetworkError {
     stage: BlobNetworkStage,
     context: String,
     detail: String,
+    source: Option<Arc<dyn std::error::Error + Send + Sync>>,
 }
 
 impl BlobNetworkError {
@@ -484,6 +617,20 @@ impl BlobNetworkError {
             stage,
             context: context.into(),
             detail: detail.to_string(),
+            source: None,
+        }
+    }
+
+    fn with_source(
+        stage: BlobNetworkStage,
+        context: impl Into<String>,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            stage,
+            context: context.into(),
+            detail: source.to_string(),
+            source: Some(Arc::new(source)),
         }
     }
 
@@ -532,7 +679,21 @@ impl std::fmt::Display for BlobNetworkError {
     }
 }
 
-impl std::error::Error for BlobNetworkError {}
+impl PartialEq for BlobNetworkError {
+    fn eq(&self, other: &Self) -> bool {
+        self.stage == other.stage && self.context == other.context && self.detail == other.detail
+    }
+}
+
+impl Eq for BlobNetworkError {}
+
+impl std::error::Error for BlobNetworkError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_deref()
+            .map(|source| source as &(dyn std::error::Error + 'static))
+    }
+}
 
 async fn await_authenticated_progress<T>(
     context: &'static str,
@@ -541,7 +702,7 @@ async fn await_authenticated_progress<T>(
     tokio::time::timeout(PROFILE5_IDLE_TIMEOUT, future)
         .await
         .map_err(|_| transport_failure(context, "authenticated progress idle timeout"))?
-        .map_err(|error| transport_failure(context, format!("{error:?}")))
+        .map_err(|error| BlobNetworkError::with_source(BlobNetworkStage::Transport, context, error))
 }
 
 #[allow(dead_code)] // Task 5 consumes the complete receiver-facing report.
@@ -561,9 +722,16 @@ fn failure(context: impl Into<String>, error: impl std::fmt::Display) -> BlobNet
 
 fn sender_pipeline_failure(error: PipelineError) -> BlobNetworkError {
     match error {
-        PipelineError::BlobNetwork(error) => *error,
+        PipelineError::Adapter(error) => error
+            .downcast_ref::<BlobNetworkError>()
+            .cloned()
+            .unwrap_or_else(|| failure("run canonical sender pipeline", error)),
         error => failure("run canonical sender pipeline", error),
     }
+}
+
+fn pipeline_adapter(error: BlobNetworkError) -> PipelineError {
+    PipelineError::Adapter(Arc::new(error))
 }
 
 fn authentication_failure(
@@ -718,6 +886,70 @@ fn stream_frame_name(frame: &StreamFrame) -> &'static str {
         StreamFrame::Finish(_) => "finish",
         StreamFrame::Result(_) => "result",
         StreamFrame::ResultAck(_) => "result acknowledgement",
+    }
+}
+
+impl MissionBlobRecordCodec<'_> {
+    fn encode_charged_data_prefix(
+        &mut self,
+        header: crate::stream_transfer::StreamDataHeaderV1,
+        ownership: &Arc<SenderByteOwnership>,
+        inject_auth_failure: bool,
+    ) -> Result<ZeroizingSenderBuffer, BlobNetworkError> {
+        let encoded_header = header
+            .encode_for_context(9, TransferProfileId::BlobStreamV1 as u16)
+            .map_err(|error| {
+                BlobNetworkError::with_source(
+                    BlobNetworkStage::Framing,
+                    "encode data header",
+                    error,
+                )
+            })?;
+        let encoded_header =
+            ZeroizingSenderBuffer::new(encoded_header, ownership, SenderBufferClass::PrefixHeader);
+        #[cfg(test)]
+        if inject_auth_failure {
+            return Err(BlobNetworkError::with_source(
+                BlobNetworkStage::Authentication,
+                "seal data-header mission record",
+                InjectedDataAuthenticationError,
+            ));
+        }
+        #[cfg(not(test))]
+        let _ = inject_auth_failure;
+        let protected_header = self
+            .mission
+            .seal_v9_blob_data_header(
+                self.profile_digest,
+                self.direction,
+                self.attempt_nonce,
+                encoded_header.as_slice(),
+            )
+            .map_err(|error| {
+                BlobNetworkError::with_source(
+                    BlobNetworkStage::Authentication,
+                    "seal data-header mission record",
+                    error,
+                )
+            })?;
+        let protected_header = ZeroizingSenderBuffer::new(
+            protected_header,
+            ownership,
+            SenderBufferClass::PrefixHeader,
+        );
+        let prefix =
+            encode_composite_data_prefix(protected_header.as_slice()).map_err(|error| {
+                BlobNetworkError::with_source(
+                    BlobNetworkStage::Framing,
+                    "encode composite data prefix",
+                    error,
+                )
+            })?;
+        Ok(ZeroizingSenderBuffer::new(
+            prefix,
+            ownership,
+            SenderBufferClass::PrefixHeader,
+        ))
     }
 }
 
@@ -1427,27 +1659,22 @@ pub(crate) async fn send_canonical_blob_profile5(
     let producer = tokio::spawn(async move {
         for index in initial_chunk_index..producer_plan.manifest().chunk_count() {
             let carrier_id = producer_plan.carrier_id(index).map_err(|error| {
-                PipelineError::BlobNetwork(Box::new(verification_failure(
+                pipeline_adapter(verification_failure(
                     "resolve canonical sender carrier",
                     error,
-                )))
+                ))
             })?;
             let carrier_len = usize::try_from(
                 producer_plan
                     .carrier_total_len(&carrier_id.wire_bytes())
                     .map_err(|error| {
-                        PipelineError::BlobNetwork(Box::new(verification_failure(
+                        pipeline_adapter(verification_failure(
                             "bound canonical sender carrier",
                             error,
-                        )))
+                        ))
                     })?,
             )
-            .map_err(|error| {
-                PipelineError::BlobNetwork(Box::new(failure(
-                    "bound canonical sender carrier",
-                    error,
-                )))
-            })?;
+            .map_err(|error| pipeline_adapter(failure("bound canonical sender carrier", error)))?;
             partition_tx
                 .send(Ok(StreamPartition::new_accounted(
                     index,
@@ -1461,7 +1688,7 @@ pub(crate) async fn send_canonical_blob_profile5(
     });
     let map_store = Arc::clone(&store);
     let map_plan = Arc::clone(&source.plan);
-    let sender_ownership = Arc::new(SenderByteOwnership::default());
+    let sender_ownership = Arc::new(SenderByteOwnership::new(sender_job));
     let map_ownership = Arc::clone(&sender_ownership);
     let map_session = Arc::new(
         store
@@ -1493,10 +1720,11 @@ pub(crate) async fn send_canonical_blob_profile5(
             let carrier = map_store
                 .read_profile5_sender_carrier(&map_session, &map_plan, index)
                 .map_err(|error| {
-                    PipelineError::BlobNetwork(Box::new(verification_failure(
+                    pipeline_adapter(BlobNetworkError::with_source(
+                        BlobNetworkStage::Verification,
                         "read canonical sender carrier",
                         error,
-                    )))
+                    ))
                 })?;
             #[cfg(test)]
             crate::stream_pipeline::PipelineTestProbe::observe_prepared_sender_carrier(sender_job);
@@ -2898,6 +3126,89 @@ pub(crate) mod tests {
     };
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+    struct PendingSendAttempt {
+        entered: Arc<tokio::sync::Semaphore>,
+    }
+
+    impl StreamAttempt for PendingSendAttempt {
+        fn send_data<'a>(&'a self, _frame: &'a [u8]) -> AdapterFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn send_data_parts<'a>(
+            &'a self,
+            _prefix: &'a [u8],
+            _body: &'a [u8],
+        ) -> AdapterFuture<'a, ()> {
+            self.entered.add_permits(1);
+            Box::pin(std::future::pending())
+        }
+
+        fn receive_control(&self) -> AdapterFuture<'_, Option<Vec<u8>>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn finish_data(&self) -> AdapterFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_blocked_sender_send_zeroizes_every_owned_class_and_reclaims_bytes() {
+        let job = StreamJobId::from_bytes([0x91; 16]);
+        let probe = crate::stream_pipeline::PipelineTestProbe::install(job);
+        let ownership = Arc::new(SenderByteOwnership::new(job));
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let attempt = Arc::new(PendingSendAttempt {
+            entered: Arc::clone(&entered),
+        });
+        let carrier_observer =
+            crate::stream_pipeline::PipelineTestProbe::mapped_ciphertext_observer_for_job(job);
+        let task = tokio::spawn({
+            let ownership = Arc::clone(&ownership);
+            async move {
+                let _carrier = ZeroizingCanonicalCarrier {
+                    bytes: vec![0x11; 128],
+                    _charge: ownership.charge(128),
+                    zeroize_observer: carrier_observer,
+                };
+                let body = ZeroizingSenderBuffer::new(
+                    vec![0x22; 256],
+                    &ownership,
+                    SenderBufferClass::ExtentBody,
+                );
+                let prefix = ZeroizingSenderBuffer::new(
+                    vec![0x33; 64],
+                    &ownership,
+                    SenderBufferClass::PrefixHeader,
+                );
+                send_owned_data_parts(attempt.as_ref(), prefix, body, false).await
+            }
+        });
+        entered
+            .acquire()
+            .await
+            .expect("blocked transport entered")
+            .forget();
+        task.abort();
+        assert!(task.await.expect_err("send task cancelled").is_cancelled());
+        assert_eq!(probe.mapped_ciphertext_zeroizations(), 1);
+        assert_eq!(probe.sender_extent_body_zeroizations(), 1);
+        assert_eq!(probe.sender_prefix_header_zeroizations(), 1);
+        assert_eq!(probe.sender_live_bytes(), 0);
+        assert_eq!(probe.sender_peak_live_bytes(), 128 + 256 + 64);
+        assert_eq!(
+            ownership.current.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            ownership
+                .encoding_current
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
 
     #[test]
     fn canonical_carrier_extent_batches_whole_encrypted_records() {
