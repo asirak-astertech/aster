@@ -286,17 +286,27 @@ fn profile5_progress_matches_shape(
         .is_some_and(|index| progress.generation == index as u64)
 }
 
+pub(super) struct Profile5ReceiptAuditContext {
+    pub(super) mission_authority: Option<NodeId>,
+    pub(super) owner_binding: Option<[u8; 32]>,
+    pub(super) pending_encoding: super::PendingBlobEncodingGeneration,
+    pub(super) publication_encoding: super::lifecycle::PublicationEncodingGeneration,
+}
+
 pub(super) fn audit_profile5_receipts(
     receipts: &impl ReadableTable<&'static [u8], &'static [u8]>,
     pending: &impl ReadableTable<&'static [u8], &'static [u8]>,
     publications: &impl ReadableTable<&'static [u8], &'static [u8]>,
     imports: &impl ReadableTable<&'static [u8], &'static [u8]>,
     chunks: &impl ReadableTable<&'static [u8], &'static [u8]>,
-    mission_authority: Option<NodeId>,
-    owner_binding: Option<[u8; 32]>,
-    pending_encoding: super::PendingBlobEncodingGeneration,
-    publication_encoding: super::lifecycle::PublicationEncodingGeneration,
+    context: Profile5ReceiptAuditContext,
 ) -> Result<(), StoreError> {
+    let Profile5ReceiptAuditContext {
+        mission_authority,
+        owner_binding,
+        pending_encoding,
+        publication_encoding,
+    } = context;
     let rows = receipts.len()?;
     let bytes = rows
         .checked_mul(PROFILE5_RECEIPT_KEY_BYTES + PROFILE5_RECEIPT_VALUE_BYTES)

@@ -84,10 +84,8 @@ impl StreamPartition {
         let had_plaintext = !self.bytes.is_empty();
         self.bytes.zeroize();
         #[cfg(test)]
-        if had_plaintext {
-            if let Some(observer) = self.zeroize_observer.take() {
-                observer.fetch_add(1, Ordering::SeqCst);
-            }
+        if had_plaintext && let Some(observer) = self.zeroize_observer.take() {
+            observer.fetch_add(1, Ordering::SeqCst);
         }
     }
 }
@@ -1089,17 +1087,25 @@ where
     let test_probe = PipelineTestProbe::for_job(job_id);
     #[cfg(not(test))]
     let test_probe = None;
+    #[cfg(test)]
+    let map_probe = test_probe.clone();
+    #[cfg(not(test))]
+    let map_probe = test_probe;
     let mut map_pool = FixedPartitionMapPool::new_with_probe(
         limits.workers,
         limits.max_in_flight_items,
         map,
-        test_probe.clone(),
+        map_probe,
     )?;
     #[cfg(test)]
     map_pool.observe_budgets_for_test(Arc::clone(&item_budget), Arc::clone(&byte_budget));
 
     let outcome = async {
-        let mut reorder = ReorderBuffer::new(test_probe.clone());
+        #[cfg(test)]
+        let reorder_probe = test_probe.clone();
+        #[cfg(not(test))]
+        let reorder_probe = test_probe;
+        let mut reorder = ReorderBuffer::new(reorder_probe);
         let mut stages = [StageObservation::default(); PIPELINE_STAGE_COUNT];
         let mut accepted_items = 0_u64;
         let mut completed_items = 0_u64;

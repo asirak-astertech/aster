@@ -1335,6 +1335,8 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    type UploadPackTreeSnapshot = Option<Vec<(String, Option<Vec<u8>>)>>;
+
     static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
 
     struct UploadPackPlainReader {
@@ -1574,7 +1576,7 @@ mod tests {
         Some(rows)
     }
 
-    fn upload_pack_root_snapshot(root: &TestRoot) -> Option<Vec<(String, Option<Vec<u8>>)>> {
+    fn upload_pack_root_snapshot(root: &TestRoot) -> UploadPackTreeSnapshot {
         let path = root.0.join("blob-depot-v1").join("stream-packs-v2");
         if !path.exists() {
             return None;
@@ -1599,7 +1601,7 @@ mod tests {
         Some(rows)
     }
 
-    fn upload_pack_tree_snapshot(root: &TestRoot) -> Option<Vec<(String, Option<Vec<u8>>)>> {
+    fn upload_pack_tree_snapshot(root: &TestRoot) -> UploadPackTreeSnapshot {
         fn visit(base: &Path, directory: &Path, rows: &mut Vec<(String, Option<Vec<u8>>)>) {
             for entry in fs::read_dir(directory).expect("read upload pack tree") {
                 let entry = entry.expect("upload pack tree entry");
@@ -1634,7 +1636,7 @@ mod tests {
         Some(rows)
     }
 
-    fn cleanup_marker_count(snapshot: &Option<Vec<(String, Option<Vec<u8>>)>>) -> usize {
+    fn cleanup_marker_count(snapshot: &UploadPackTreeSnapshot) -> usize {
         snapshot.as_ref().map_or(0, |rows| {
             rows.iter()
                 .filter(|(name, _)| name.starts_with(".aster-upload-cleanup-"))
@@ -1712,7 +1714,7 @@ mod tests {
                     pack.sync_all().expect("sync replacement");
                 }
                 "checkpoint-mismatch" => {
-                    let projected = if durable.generation() % 2 == 0 {
+                    let projected = if durable.generation().is_multiple_of(2) {
                         "checkpoint.0"
                     } else {
                         "checkpoint.1"

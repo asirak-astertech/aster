@@ -1827,8 +1827,10 @@ mod stream_frame_codec {
         // Mutations caught: splitting a canonical carrier at an extent edge or
         // accepting a noncanonical/trailing extent encoding.
         assert_eq!(PROFILE5_CANONICAL_PLAINTEXT_CHUNK_BYTES, 64 * 1024);
-        assert!(PROFILE5_CANONICAL_CARRIER_RECORD_BYTES > 64 * 1024);
-        assert!(PROFILE5_CANONICAL_EXTENT_BYTES > PROFILE5_CANONICAL_CARRIER_RECORD_BYTES);
+        const {
+            assert!(PROFILE5_CANONICAL_CARRIER_RECORD_BYTES > 64 * 1024);
+            assert!(PROFILE5_CANONICAL_EXTENT_BYTES > PROFILE5_CANONICAL_CARRIER_RECORD_BYTES);
+        }
 
         let extent = CanonicalBlobExtentV1 {
             first_chunk_index: 17,

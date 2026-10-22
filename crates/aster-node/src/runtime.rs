@@ -687,8 +687,10 @@ fn mutable_classes_for_semantic(semantic_version: u16) -> &'static [MutableClass
     }
 }
 
+const ACTIVE_RECONCILIATION_CLASSES: &str =
+    "event,state,record,blob-v9-profile5-v7-v8-profile4-compat";
 const READY_RECONCILIATION_CLASSES: &str =
-    "event,state,record,blob-v7-v8-profile4,event-bridge-v6-opt-in";
+    "event,state,record,blob-v9-profile5-v7-v8-profile4-compat,event-bridge-v6-opt-in";
 
 const fn contact_reconciliation_classes(semantic_version: u16) -> &'static str {
     if semantic_version >= SEMANTIC_PROTOCOL_V7 {
@@ -1079,10 +1081,12 @@ impl MutableSourceInterests {
 
     /// Adds the explicit Blob source/content selector set.
     ///
-    /// Selected carrier transfer uses semantic-v7/v8 profile 4: v7 is
-    /// durable-only and v8 additionally admits authenticated finite custody.
-    /// Keeping this additive preserves the semantic-v4 constructor contract;
-    /// callers which do not opt in disclose and receive no Blob identifiers.
+    /// Selected carrier transfer uses semantic-v9 profile 5 with bounded,
+    /// receiver-checkpointed canonical streaming. Contacts negotiated at
+    /// semantic v7/v8 retain profile 4 compatibility: v7 is durable-only and
+    /// v8 additionally admits authenticated finite custody. Keeping this
+    /// additive preserves the semantic-v4 constructor contract; callers which
+    /// do not opt in disclose and receive no Blob identifiers.
     pub fn with_blob(mut self, blob: Vec<SourceInterestSelector>) -> Self {
         self.blob = blob;
         self
@@ -18960,7 +18964,7 @@ async fn run_node_actor_inner(
         "contacts_observed"
     };
     node_stdout!(
-        "STOP lifecycle=complete sync_status={} carrier_id={} mission_id={} contacts={} contact_errors={} direct_contacts={} relay_contacts={} unknown_path_contacts={} carrier_path_transitions={} carrier_path_transition_saturations={} path_observation=not-authorization opaque_items={} opaque_acceptance_markers={} events={} event_acceptance_markers={} route_cached_events={} controls={} applied_controls={} pending_controls={} control_highwater={} blobs={} blob_acceptance_markers={} blob_last_acceptance_marker={} blob_sealed_bytes={} blob_operations={} blob_operation_bytes={} blob_variants={} blob_finalized_variants={} blob_committed_chunks={} blob_committed_file_bytes={} blob_reserved_file_bytes={} pending_blobs={} blob_carrier_prefixes={} blob_carrier_fetch_cursors={} blob_network_staging_bytes={} blob_ranges_fetched={} blob_bytes_fetched={} blob_remaining={} blob_deferred={} mission_auth=hybrid-pq provisioning={} semantics=source-authenticated-event reconciliation_classes=event,state,record,blob-v7-v8-profile4 controls_semantics=source-authenticated-flash",
+        "STOP lifecycle=complete sync_status={} carrier_id={} mission_id={} contacts={} contact_errors={} direct_contacts={} relay_contacts={} unknown_path_contacts={} carrier_path_transitions={} carrier_path_transition_saturations={} path_observation=not-authorization opaque_items={} opaque_acceptance_markers={} events={} event_acceptance_markers={} route_cached_events={} controls={} applied_controls={} pending_controls={} control_highwater={} blobs={} blob_acceptance_markers={} blob_last_acceptance_marker={} blob_sealed_bytes={} blob_operations={} blob_operation_bytes={} blob_variants={} blob_finalized_variants={} blob_committed_chunks={} blob_committed_file_bytes={} blob_reserved_file_bytes={} pending_blobs={} blob_carrier_prefixes={} blob_carrier_fetch_cursors={} blob_network_staging_bytes={} blob_ranges_fetched={} blob_bytes_fetched={} blob_remaining={} blob_deferred={} mission_auth=hybrid-pq provisioning={} semantics=source-authenticated-event reconciliation_classes={} controls_semantics=source-authenticated-flash",
         sync_status,
         local_id,
         format_node_id(config.mission.identity()),
@@ -19000,6 +19004,7 @@ async fn run_node_actor_inner(
         receipt.blob_remaining,
         receipt.blob_deferred,
         provisioning_origin,
+        ACTIVE_RECONCILIATION_CLASSES,
     );
     Ok(receipt)
 }
@@ -27091,17 +27096,29 @@ fn settle_blob_stream_cursor(
     }
 }
 
-async fn send_profile5_blob_direction(
-    store: &Store,
-    connection: &aster_iroh::Connection,
-    mission: &mut MissionSession,
-    profiles: &V7TransferProfiles,
-    guard: &EventLaneGuard,
-    verifier: &mut ReferenceEnvelopeSealer,
-    peer_interest: &BlobInterest,
+struct Profile5BlobSendDirection<'a> {
+    store: &'a Store,
+    connection: &'a aster_iroh::Connection,
+    profiles: &'a V7TransferProfiles,
+    guard: &'a EventLaneGuard,
+    peer_interest: &'a BlobInterest,
     direction: EventDirection,
+}
+
+async fn send_profile5_blob_direction(
+    context: Profile5BlobSendDirection<'_>,
+    mission: &mut MissionSession,
+    verifier: &mut ReferenceEnvelopeSealer,
     receipt: &mut PeerReceipt,
 ) -> Result<(), NodeError> {
+    let Profile5BlobSendDirection {
+        store,
+        connection,
+        profiles,
+        guard,
+        peer_interest,
+        direction,
+    } = context;
     guard.check(store)?;
     let peer = mission.peer().mission_id();
     let selected = next_canonical_blob_publication(
@@ -27351,14 +27368,16 @@ async fn sync_profile5_blob_lane_if_selected(
         sync_blob_interests(connection, mission, &local_interest, true, receipt).await?;
     if send_enabled {
         send_profile5_blob_direction(
-            store,
-            connection,
+            Profile5BlobSendDirection {
+                store,
+                connection,
+                profiles,
+                guard,
+                peer_interest: &peer_interest,
+                direction: EventDirection::ToSessionResponder,
+            },
             mission,
-            profiles,
-            guard,
             &mut verifier,
-            &peer_interest,
-            EventDirection::ToSessionResponder,
             receipt,
         )
         .await?;
@@ -27420,14 +27439,16 @@ async fn serve_profile5_blob_lane_if_selected(
     }
     if send_enabled {
         send_profile5_blob_direction(
-            &store,
-            connection,
+            Profile5BlobSendDirection {
+                store: &store,
+                connection,
+                profiles,
+                guard,
+                peer_interest: &peer_interest,
+                direction: EventDirection::ToSessionInitiator,
+            },
             mission,
-            profiles,
-            guard,
             &mut verifier,
-            &peer_interest,
-            EventDirection::ToSessionInitiator,
             receipt,
         )
         .await
@@ -33569,6 +33590,60 @@ mod tests {
         fs::remove_dir_all(state).expect("cleanup customer-safe state");
     }
 
+    #[tokio::test]
+    async fn selected_node_ready_and_stop_report_current_blob_profiles() {
+        // Break caught: operator lifecycle diagnostics describing Blob as only
+        // the v7/v8 profile-4 path after semantic-v9/profile-5 became current.
+        let state = root("current-blob-profile-lifecycle-diagnostics");
+        fs::create_dir_all(&state).expect("state root");
+        #[cfg(unix)]
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700))
+            .expect("owner-only state root");
+        let (output, captured) = captured_node_output(NodeOperatorOutputPolicy::Legacy);
+        let running = start_node_with_forwarding_output(
+            NodeConfig {
+                state: state.clone(),
+                bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+                mission: test_mission(),
+                peers: Vec::new(),
+                mutable_interests: MutableSourceInterests::default(),
+                sync_interval: Duration::from_secs(60),
+                run_for: None,
+                application: NodeApplication::Relay,
+            },
+            SelectedForwardingConfig::default(),
+            output,
+        )
+        .await
+        .expect("start selected node");
+        running.shutdown().await.expect("stop selected node");
+
+        let records = captured.records();
+        let ready = records
+            .iter()
+            .find_map(|(stream, record)| {
+                (*stream == NodeOutputStream::Stdout && record.starts_with("READY selected=true"))
+                    .then_some(record)
+            })
+            .expect("READY lifecycle diagnostic");
+        let stop = records
+            .iter()
+            .find_map(|(stream, record)| {
+                (*stream == NodeOutputStream::Stdout
+                    && record.starts_with("STOP lifecycle=complete"))
+                .then_some(record)
+            })
+            .expect("STOP lifecycle diagnostic");
+        let current =
+            "reconciliation_classes=event,state,record,blob-v9-profile5-v7-v8-profile4-compat";
+        assert!(ready.contains(current), "stale READY diagnostic: {ready}");
+        assert!(stop.contains(current), "stale STOP diagnostic: {stop}");
+        assert!(!ready.contains("blob-v7-v8-profile4"));
+        assert!(!stop.contains("blob-v7-v8-profile4"));
+
+        fs::remove_dir_all(state).expect("cleanup selected node state");
+    }
+
     #[test]
     fn contact_election_prefers_lower_identity_then_bounds_higher_fallback() {
         let first = expected_peer(901, 29_901).carrier.id;
@@ -34177,7 +34252,7 @@ mod tests {
         assert_eq!(mutable_classes_for_semantic(7), &MUTABLE_V5_CLASSES);
         assert_eq!(
             READY_RECONCILIATION_CLASSES,
-            "event,state,record,blob-v7-v8-profile4,event-bridge-v6-opt-in"
+            "event,state,record,blob-v9-profile5-v7-v8-profile4-compat,event-bridge-v6-opt-in"
         );
         assert_eq!(contact_reconciliation_classes(1), "event,state,record");
         assert_eq!(contact_reconciliation_classes(4), "event,state,record");

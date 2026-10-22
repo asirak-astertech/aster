@@ -1597,7 +1597,7 @@ pub(crate) enum BlobPublishFinalization {
 
 enum PreparedBlobPublishFinalization {
     Completed(BlobPublishResult),
-    Pending(BlobFinalizeJob),
+    Pending(Box<BlobFinalizeJob>),
 }
 
 struct BlobFinalizeJob {
@@ -2654,7 +2654,7 @@ impl SelectedBlobNode {
             }
             PreparedBlobPublishFinalization::Pending(job) => self
                 .finalize_pool
-                .try_submit(job)
+                .try_submit(*job)
                 .map(BlobPublishFinalization::Scheduled),
         }
     }
@@ -2706,16 +2706,18 @@ impl SelectedBlobNode {
             .writer
             .finish()
             .map_err(|error| blob_pack_application_error("blob stream finish", error))?;
-        Ok(PreparedBlobPublishFinalization::Pending(BlobFinalizeJob {
-            mission: self.mission.clone(),
-            store: Arc::clone(&self.store),
-            source_route_cache: Arc::clone(&self.source_route_cache),
-            custody_clock: self.custody_clock.clone(),
-            reservation: stream.reservation,
-            cleanup_upload: true,
-            #[cfg(test)]
-            gate: self.stream_finalize_gate.clone(),
-        }))
+        Ok(PreparedBlobPublishFinalization::Pending(Box::new(
+            BlobFinalizeJob {
+                mission: self.mission.clone(),
+                store: Arc::clone(&self.store),
+                source_route_cache: Arc::clone(&self.source_route_cache),
+                custody_clock: self.custody_clock.clone(),
+                reservation: stream.reservation,
+                cleanup_upload: true,
+                #[cfg(test)]
+                gate: self.stream_finalize_gate.clone(),
+            },
+        )))
     }
 
     #[cfg(test)]
@@ -2727,7 +2729,7 @@ impl SelectedBlobNode {
             PreparedBlobPublishFinalization::Completed(result) => Ok(result),
             PreparedBlobPublishFinalization::Pending(mut job) => {
                 job.cleanup_upload = false;
-                job.run()
+                (*job).run()
             }
         }
     }

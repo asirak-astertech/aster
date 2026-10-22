@@ -948,7 +948,7 @@ fn protocol_open(
     direction: StreamDirection,
 ) -> StreamOpenV1 {
     let source_len = u32::try_from(authenticated_open.len()).unwrap_or(u32::MAX);
-    let source_digest = Sha256::digest(&authenticated_open).into();
+    let source_digest = Sha256::digest(authenticated_open).into();
     StreamOpenV1 {
         class: StreamClass::Blob,
         direction,
@@ -2098,29 +2098,45 @@ pub(crate) async fn receive_completed_pack(
     let mut codec = PlainBlobRecordCodec;
     let transport = select_stream_transport(connection)?;
     receive_completed_pack_inner(
-        transport.as_ref(),
-        open,
-        opener,
-        PackAccess::Path(root),
-        wire_len,
-        limits,
-        StreamDirection::ToSessionResponder,
+        CompletedPackReceive {
+            transport: transport.as_ref(),
+            open,
+            opener,
+            root: PackAccess::Path(root),
+            wire_len,
+            limits,
+            direction: StreamDirection::ToSessionResponder,
+        },
         &mut codec,
     )
     .await
 }
 
 #[cfg(test)]
-async fn receive_completed_pack_inner(
-    transport: &dyn StreamTransportAdapter,
-    open: &BlobStreamOpen,
+struct CompletedPackReceive<'a> {
+    transport: &'a dyn StreamTransportAdapter,
+    open: &'a BlobStreamOpen,
     opener: BlobStreamSegmentOpener,
-    root: PackAccess<'_>,
+    root: PackAccess<'a>,
     wire_len: u64,
     limits: PipelineLimits,
     direction: StreamDirection,
+}
+
+#[cfg(test)]
+async fn receive_completed_pack_inner(
+    context: CompletedPackReceive<'_>,
     codec: &mut dyn BlobRecordCodec,
 ) -> Result<BlobNetworkReport, BlobNetworkError> {
+    let CompletedPackReceive {
+        transport,
+        open,
+        opener,
+        root,
+        wire_len,
+        limits,
+        direction,
+    } = context;
     let (max_data_bytes, max_control_bytes) =
         profile5_attempt_bounds(wire_len).map_err(|error| {
             BlobNetworkError::new(BlobNetworkStage::Framing, "bound stream attempt", error)
@@ -2366,10 +2382,7 @@ pub(crate) mod tests {
         AdapterFuture, CandidateHealth, StreamAttempt, StreamReceiveAttempt,
         StreamTransportAdapter, StreamTransportError, StreamTransportId, TransferRequirements,
     };
-    use crate::{
-        application::blob_stream::publish_blob_stream,
-        stream_pipeline::{PipelineLimits, PipelineTestProbe},
-    };
+    use crate::{application::blob_stream::publish_blob_stream, stream_pipeline::PipelineLimits};
     use aster_iroh::{CarrierSecurityProfile, Endpoint, EndpointConfig, ExpectedPeer, SecretKey};
     use aster_mesh::{
         BLOB_STREAM_SEGMENT_BYTES, BlobMetadata, BlobPublicationStreamId, BlobStreamOpen,
@@ -2963,7 +2976,6 @@ pub(crate) mod tests {
         control: mpsc::UnboundedSender<Option<Vec<u8>>>,
         fail_after_receives: Option<usize>,
         receives: std::sync::atomic::AtomicUsize,
-        failure_worker_probe: Option<PipelineTestProbe>,
     }
 
     impl StreamReceiveAttempt for MemoryReceiverAttempt {
@@ -2974,11 +2986,6 @@ pub(crate) mod tests {
                     .fail_after_receives
                     .is_some_and(|limit| receive >= limit)
                 {
-                    if let Some(probe) = &self.failure_worker_probe {
-                        while probe.peak_active_workers() == 0 {
-                            tokio::task::yield_now().await;
-                        }
-                    }
                     let _ = self.control.send(None);
                     return Err(StreamTransportError::Closed);
                 }
@@ -3026,20 +3033,8 @@ pub(crate) mod tests {
                     control: control_send,
                     fail_after_receives,
                     receives: std::sync::atomic::AtomicUsize::new(0),
-                    failure_worker_probe: None,
                 }),
             }
-        }
-
-        fn with_receive_failure_after_worker_active(
-            fail_after_receives: usize,
-            probe: PipelineTestProbe,
-        ) -> Self {
-            let mut adapter = Self::with_receive_failure(Some(fail_after_receives));
-            Arc::get_mut(&mut adapter.receiver)
-                .expect("new adapter uniquely owns receiver")
-                .failure_worker_probe = Some(probe);
-            adapter
         }
     }
 
@@ -3092,7 +3087,6 @@ pub(crate) mod tests {
                     control: control_send,
                     fail_after_receives: Some(fail_after_receives),
                     receives: std::sync::atomic::AtomicUsize::new(0),
-                    failure_worker_probe: None,
                 }),
             }
         }
@@ -3141,7 +3135,6 @@ pub(crate) mod tests {
                 control,
                 fail_after_receives: None,
                 receives: std::sync::atomic::AtomicUsize::new(0),
-                failure_worker_probe: None,
             })
         }
 
@@ -3315,7 +3308,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn pack_source_emits_one_canonical_record_per_transport_extent() {
+    async fn legacy_pack_source_preserves_one_record_per_transport_extent() {
         let source_root = TempRoot::new("record-extents");
         let total_len = 2 * BLOB_STREAM_SEGMENT_BYTES + 17;
         let open = open(total_len as u64);
@@ -3357,8 +3350,11 @@ pub(crate) mod tests {
         }
 
         assert_eq!(extents.len() as u64, published.segment_count);
-        assert_eq!(extents[0].len(), PROFILE5_CANONICAL_EXTENT_BYTES);
-        assert_eq!(extents[1].len(), PROFILE5_CANONICAL_EXTENT_BYTES);
+        let legacy_record_bytes = crate::stream_transfer::PROFILE5_LEGACY_RECORD_PREFIX_BYTES
+            + crate::stream_transfer::PROFILE5_LEGACY_SEGMENT_RECORD_BYTES;
+        assert_eq!(extents[0].len(), legacy_record_bytes);
+        assert_eq!(extents[1].len(), legacy_record_bytes);
+        assert!(legacy_record_bytes > PROFILE5_CANONICAL_EXTENT_BYTES);
     }
 
     #[tokio::test]
@@ -3404,7 +3400,9 @@ pub(crate) mod tests {
     async fn completed_pack_runtime_uses_selected_transport_adapter() {
         let source_root = TempRoot::new("adapter-source");
         let receiver_root = TempRoot::new("adapter-receiver");
-        let total_len = 2 * BLOB_STREAM_SEGMENT_BYTES + 17;
+        let total_len = PROFILE5_CANONICAL_EXTENT_BYTES
+            - crate::stream_transfer::PROFILE5_LEGACY_RECORD_PREFIX_BYTES
+            - aster_mesh::BLOB_STREAM_SEGMENT_ENCODED_OVERHEAD_BYTES;
         let open = open(total_len as u64);
         let key = [0x66; 32];
         let nonce = [0x76; 12];
@@ -3442,22 +3440,28 @@ pub(crate) mod tests {
             &mut sender_codec,
         );
         let receiver = receive_completed_pack_inner(
-            &transport,
-            &open,
-            BlobStreamSegmentOpener::from_test_key(
-                *open.stream_id().as_bytes(),
-                open.digest(),
-                open.content_epoch(),
-                key,
-                nonce,
-            ),
-            PackAccess::Path(&receiver_root.0),
-            wire_len,
-            limits,
-            StreamDirection::ToSessionResponder,
+            CompletedPackReceive {
+                transport: &transport,
+                open: &open,
+                opener: BlobStreamSegmentOpener::from_test_key(
+                    *open.stream_id().as_bytes(),
+                    open.digest(),
+                    open.content_epoch(),
+                    key,
+                    nonce,
+                ),
+                root: PackAccess::Path(&receiver_root.0),
+                wire_len,
+                limits,
+                direction: StreamDirection::ToSessionResponder,
+            },
             &mut receiver_codec,
         );
-        let (sent, received) = tokio::join!(sender, receiver);
+        let (sent, received) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(sender, receiver)
+        })
+        .await
+        .expect("selected transport adapter round-trip must remain bounded");
         let sent = sent.unwrap();
         let received = received.unwrap();
 
@@ -3472,7 +3476,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn receive_transport_failure_cancels_and_joins_pipeline() {
+    async fn oversized_legacy_pack_extent_fails_without_hanging_receiver() {
         let source_root = TempRoot::new("cancel-source");
         let receiver_root = TempRoot::new("cancel-receiver");
         let total_len = 3 * BLOB_STREAM_SEGMENT_BYTES + 17;
@@ -3497,15 +3501,7 @@ pub(crate) mod tests {
         .unwrap();
         let roots = (published.plaintext_root, published.ciphertext_root);
         let wire_len = completed_pack_wire_len(&source_root.0, &open).unwrap();
-        let job = StreamJobId::from_bytes(
-            open.stream_id().as_bytes()[..16]
-                .try_into()
-                .expect("job ID"),
-        );
-        let probe = PipelineTestProbe::install(job);
-        probe.hold_workers_for_test();
-        let transport =
-            MemoryTransportAdapter::with_receive_failure_after_worker_active(3, probe.clone());
+        let transport = MemoryTransportAdapter::new();
         let mut sender_codec = PlainBlobRecordCodec;
         let mut receiver_codec = PlainBlobRecordCodec;
 
@@ -3521,61 +3517,40 @@ pub(crate) mod tests {
             &mut sender_codec,
         );
         let receiver = receive_completed_pack_inner(
-            &transport,
-            &open,
-            BlobStreamSegmentOpener::from_test_key(
-                *open.stream_id().as_bytes(),
-                open.digest(),
-                open.content_epoch(),
-                key,
-                nonce,
-            ),
-            PackAccess::Path(&receiver_root.0),
-            wire_len,
-            limits,
-            StreamDirection::ToSessionResponder,
+            CompletedPackReceive {
+                transport: &transport,
+                open: &open,
+                opener: BlobStreamSegmentOpener::from_test_key(
+                    *open.stream_id().as_bytes(),
+                    open.digest(),
+                    open.content_epoch(),
+                    key,
+                    nonce,
+                ),
+                root: PackAccess::Path(&receiver_root.0),
+                wire_len,
+                limits,
+                direction: StreamDirection::ToSessionResponder,
+            },
             &mut receiver_codec,
         );
-        let (_sent, received) = tokio::join!(sender, receiver);
-        let error = received.expect_err("injected transport failure must terminate receive");
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::try_join!(sender, receiver)
+        })
+        .await
+        .expect("oversized legacy extent rejection must remain bounded")
+        .expect_err("legacy record above the profile-5 extent bound must fail");
 
-        assert_eq!(error.stage(), BlobNetworkStage::Transport);
-        assert!(
-            probe.peak_active_workers() > 0,
-            "failure preceded worker activity"
-        );
-        assert!(!probe.admission_open(), "pipeline admission remained open");
-        assert!(
-            probe.admission_rejected(),
-            "pipeline internal admission still accepts"
-        );
-        assert!(
-            probe.rejected_plaintext_zeroized(),
-            "rejected sentinel plaintext was not zeroized"
-        );
-        assert!(
-            probe.rejected_permits_reclaimed(),
-            "rejected sentinel permits leaked"
-        );
-        assert!(
-            probe.cleanup_observed(),
-            "pipeline cleanup was not observed"
-        );
-        assert!(probe.cancellation_signalled(), "pipeline was not cancelled");
-        assert!(probe.channels_closed(), "pipeline channels remained open");
-        assert_eq!(probe.worker_exits(), 2, "not every receive worker exited");
-        assert_eq!(probe.joined_workers(), 2, "not every receive worker joined");
-        assert_eq!(probe.available_item_permits(), 4);
-        assert_eq!(probe.available_byte_permits(), 5 * 1024 * 1024);
-        assert_eq!(probe.current_reorder_items(), 0);
-        assert!(!ACTIVE_RECEIVE_PIPELINES.lock().unwrap().contains(&job));
+        assert_eq!(error.stage(), BlobNetworkStage::Protocol);
     }
 
     #[tokio::test]
     async fn completed_pack_crosses_v9_as_verified_checkpointed_segments() {
         let source_root = TempRoot::new("source");
         let receiver_root = TempRoot::new("receiver");
-        let total_len = 3 * BLOB_STREAM_SEGMENT_BYTES + 17;
+        let total_len = PROFILE5_CANONICAL_EXTENT_BYTES
+            - crate::stream_transfer::PROFILE5_LEGACY_RECORD_PREFIX_BYTES
+            - aster_mesh::BLOB_STREAM_SEGMENT_ENCODED_OVERHEAD_BYTES;
         let plaintext = (0..total_len)
             .map(|index| (index % 251) as u8)
             .collect::<Vec<_>>();

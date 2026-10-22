@@ -26,6 +26,10 @@ pub const PROFILE5_MAX_CARRIERS_PER_EXTENT: u64 = (PROFILE5_CANONICAL_EXTENT_BYT
     - PROFILE5_CANONICAL_EXTENT_HEADER_BYTES)
     / (PROFILE5_CANONICAL_CARRIER_PREFIX_BYTES + MAX_BLOB_TRANSFER_OBJECT_BYTES as u64);
 /// Maximum ABX1 wire length for the maximum 8-GiB/131,072-chunk manifest.
+#[allow(
+    clippy::manual_div_ceil,
+    reason = "the protocol contract checker requires a portable arithmetic constant expression"
+)]
 pub const PROFILE5_MAX_CANONICAL_WIRE_BYTES: u64 = MAX_BLOB_CHUNKS
     * (PROFILE5_CANONICAL_CARRIER_PREFIX_BYTES + MAX_BLOB_TRANSFER_OBJECT_BYTES as u64)
     + ((MAX_BLOB_CHUNKS + PROFILE5_MAX_CARRIERS_PER_EXTENT - 1) / PROFILE5_MAX_CARRIERS_PER_EXTENT)

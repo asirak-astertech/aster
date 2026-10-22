@@ -1326,6 +1326,14 @@ pub struct BlobReservation {
     context: VersionVector,
 }
 
+struct BlobReservationInputs<'a> {
+    publisher: NodeId,
+    topic: &'a Topic,
+    scope: &'a Scope,
+    ttl_ms: Option<u64>,
+    local_initial_sample: Option<aster_mesh::CustodySample>,
+}
+
 impl BlobReservation {
     pub const fn control_policy(&self) -> &ControlPolicySnapshot {
         &self.control_policy
@@ -1757,6 +1765,28 @@ struct VerifiedFiniteBlobAdmission {
     receiver_sample: aster_mesh::CustodySample,
     provenance: BlobFiniteProvenance,
 }
+
+#[derive(Clone, Copy)]
+struct BlobNetworkSourceLimits {
+    total_len: u64,
+    source_len: usize,
+    chunks: u64,
+}
+
+const LEGACY_BLOB_NETWORK_SOURCE_LIMITS: BlobNetworkSourceLimits = BlobNetworkSourceLimits {
+    total_len: MAX_NETWORK_BLOB_BYTES,
+    source_len: MAX_BLOB_NETWORK_SOURCE_BYTES,
+    chunks: MAX_NETWORK_BLOB_CHUNKS,
+};
+const PROFILE5_BLOB_NETWORK_SOURCE_LIMITS: BlobNetworkSourceLimits = BlobNetworkSourceLimits {
+    total_len: MAX_PROFILE5_NETWORK_BLOB_BYTES,
+    source_len: MAX_PROFILE5_BLOB_NETWORK_SOURCE_BYTES,
+    chunks: MAX_PROFILE5_NETWORK_BLOB_CHUNKS,
+};
+
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub type BlobFiniteLifetimeEvidence = (u64, u64, Option<aster_mesh::CustodySample>, u64, bool);
 
 /// Opaque one-use authorization to construct one finite Blob custody claim.
 ///
@@ -3036,7 +3066,7 @@ impl Store {
     pub fn test_blob_finite_lifetime_evidence(
         &self,
         transfer: BlobTransferId,
-    ) -> Result<Option<(u64, u64, Option<aster_mesh::CustodySample>, u64, bool)>, StoreError> {
+    ) -> Result<Option<BlobFiniteLifetimeEvidence>, StoreError> {
         let read = self.database.begin_read()?;
         let metadata = read
             .open_table(BLOB_PUBLICATIONS)?
@@ -3520,12 +3550,15 @@ impl Store {
         &self,
         write: &redb::WriteTransaction,
         policy: &ControlPolicySnapshot,
-        publisher: NodeId,
-        topic: &Topic,
-        scope: &Scope,
-        ttl_ms: Option<u64>,
-        local_initial_sample: Option<aster_mesh::CustodySample>,
+        inputs: BlobReservationInputs<'_>,
     ) -> Result<BlobReservation, StoreError> {
+        let BlobReservationInputs {
+            publisher,
+            topic,
+            scope,
+            ttl_ms,
+            local_initial_sample,
+        } = inputs;
         if ttl_ms == Some(0) {
             return Err(blob_error(BlobStoreError::InvalidPublication(
                 "finite Blob TTL must be positive",
@@ -4133,9 +4166,7 @@ impl Store {
             sealed,
             plan,
             None,
-            MAX_NETWORK_BLOB_BYTES,
-            MAX_BLOB_NETWORK_SOURCE_BYTES,
-            MAX_NETWORK_BLOB_CHUNKS,
+            LEGACY_BLOB_NETWORK_SOURCE_LIMITS,
         )
     }
 
@@ -4153,9 +4184,7 @@ impl Store {
             sealed,
             plan,
             None,
-            MAX_PROFILE5_NETWORK_BLOB_BYTES,
-            MAX_PROFILE5_BLOB_NETWORK_SOURCE_BYTES,
-            MAX_PROFILE5_NETWORK_BLOB_CHUNKS,
+            PROFILE5_BLOB_NETWORK_SOURCE_LIMITS,
         )
     }
 
@@ -4201,9 +4230,7 @@ impl Store {
                 verified,
                 receiver_sample,
             )),
-            MAX_NETWORK_BLOB_BYTES,
-            MAX_BLOB_NETWORK_SOURCE_BYTES,
-            MAX_NETWORK_BLOB_CHUNKS,
+            LEGACY_BLOB_NETWORK_SOURCE_LIMITS,
         )
     }
 
@@ -4229,9 +4256,7 @@ impl Store {
                 verified,
                 receiver_sample,
             )),
-            MAX_PROFILE5_NETWORK_BLOB_BYTES,
-            MAX_PROFILE5_BLOB_NETWORK_SOURCE_BYTES,
-            MAX_PROFILE5_NETWORK_BLOB_CHUNKS,
+            PROFILE5_BLOB_NETWORK_SOURCE_LIMITS,
         )
     }
 
@@ -4273,9 +4298,7 @@ impl Store {
             sealed,
             plan,
             Some(admission),
-            MAX_NETWORK_BLOB_BYTES,
-            MAX_BLOB_NETWORK_SOURCE_BYTES,
-            MAX_NETWORK_BLOB_CHUNKS,
+            LEGACY_BLOB_NETWORK_SOURCE_LIMITS,
         )
     }
 
@@ -4323,19 +4346,9 @@ impl Store {
             plan,
             Some(admission),
             if semantic_version == 9 && profile_id == 5 {
-                MAX_PROFILE5_NETWORK_BLOB_BYTES
+                PROFILE5_BLOB_NETWORK_SOURCE_LIMITS
             } else {
-                MAX_NETWORK_BLOB_BYTES
-            },
-            if semantic_version == 9 && profile_id == 5 {
-                MAX_PROFILE5_BLOB_NETWORK_SOURCE_BYTES
-            } else {
-                MAX_BLOB_NETWORK_SOURCE_BYTES
-            },
-            if semantic_version == 9 && profile_id == 5 {
-                MAX_PROFILE5_NETWORK_BLOB_CHUNKS
-            } else {
-                MAX_NETWORK_BLOB_CHUNKS
+                LEGACY_BLOB_NETWORK_SOURCE_LIMITS
             },
         )
     }
@@ -4359,9 +4372,7 @@ impl Store {
             sealed,
             plan,
             finite,
-            MAX_NETWORK_BLOB_BYTES,
-            MAX_BLOB_NETWORK_SOURCE_BYTES,
-            MAX_NETWORK_BLOB_CHUNKS,
+            LEGACY_BLOB_NETWORK_SOURCE_LIMITS,
         )
     }
 
@@ -4372,16 +4383,14 @@ impl Store {
         sealed: &[u8],
         plan: &VerifiedBlobTransferPlan,
         finite: Option<VerifiedFiniteBlobAdmission>,
-        max_total_len: u64,
-        max_source_len: usize,
-        max_chunks: u64,
+        limits: BlobNetworkSourceLimits,
     ) -> Result<BlobSourceStageOutcome, StoreError> {
         self.require_live()?;
         let authority = self.require_bound_mission()?;
-        if sealed.len() > max_source_len {
+        if sealed.len() > limits.source_len {
             return Err(blob_error(BlobStoreError::NetworkSourceTooLarge {
                 sealed_len: sealed.len(),
-                limit: max_source_len,
+                limit: limits.source_len,
             }));
         }
         blob.verify_exact_sealed(sealed)
@@ -4397,12 +4406,12 @@ impl Store {
             return Err(blob_error(BlobStoreError::PendingSourceConflict));
         }
         let manifest = plan.manifest();
-        if manifest.total_len() > max_total_len || manifest.chunk_count() > max_chunks {
+        if manifest.total_len() > limits.total_len || manifest.chunk_count() > limits.chunks {
             return Err(blob_error(BlobStoreError::NetworkBlobTooLarge {
                 total_len: manifest.total_len(),
                 chunk_count: manifest.chunk_count(),
-                max_total_len,
-                max_chunks,
+                max_total_len: limits.total_len,
+                max_chunks: limits.chunks,
             }));
         }
 
@@ -4764,8 +4773,8 @@ impl Store {
             &write,
             self.blob_depot_limits,
             plan,
-            max_total_len,
-            max_chunks,
+            limits.total_len,
+            limits.chunks,
         )?;
         if existing.is_none() {
             let pending_acceptance_order =
@@ -7727,11 +7736,13 @@ impl Store {
         let reservation = self.reserve_blob_with_lifetime_and_sample_write(
             &write,
             policy,
-            request.intent.publisher,
-            &request.intent.topic,
-            &request.intent.scope,
-            ttl_ms,
-            initial_sample,
+            BlobReservationInputs {
+                publisher: request.intent.publisher,
+                topic: &request.intent.topic,
+                scope: &request.intent.scope,
+                ttl_ms,
+                local_initial_sample: initial_sample,
+            },
         )?;
         let (blob, sealed) = build(&reservation)?;
         let lifetime = match ttl_ms {
@@ -15729,18 +15740,20 @@ fn audit_or_initialize_blob_marker_high_water(
     }
 }
 
+type BlobOperationRetirement = (
+    lifecycle::RetirementReason,
+    u64,
+    [u8; 32],
+    [u8; 32],
+    lifecycle::RetirementAge,
+);
+
 struct BlobOperationOwnershipMigration {
     old_key: Vec<u8>,
     new_key: Vec<u8>,
     value: Vec<u8>,
     active_transfer: Option<BlobTransferId>,
-    retired: Option<(
-        lifecycle::RetirementReason,
-        u64,
-        [u8; 32],
-        [u8; 32],
-        lifecycle::RetirementAge,
-    )>,
+    retired: Option<BlobOperationRetirement>,
 }
 
 fn blob_intent_digest_for_metadata(metadata: &BlobMetadata) -> Result<[u8; 32], StoreError> {
@@ -15879,11 +15892,7 @@ fn migrate_blob_operation_ownership_write(
                 "Blob operation ownership migration is ambiguous",
             )));
         }
-        let retired = lifecycle::operation_retirement(value.value())
-            .map_err(blob_error)?
-            .map(|(reason, generation, old_digest, intent_digest, age)| {
-                (reason, generation, old_digest, intent_digest, age)
-            });
+        let retired = lifecycle::operation_retirement(value.value()).map_err(blob_error)?;
         let predecessor_digest: [u8; 32] = Sha256::digest(key.value()).into();
         if let Some((_, _, old_digest, _, _)) = retired
             && old_digest != predecessor_digest
@@ -17547,10 +17556,12 @@ fn audit_blob_network_tables_write_with_publications(
         publications,
         &imports,
         &chunks,
-        mission_authority,
-        owner_binding,
-        pending_encoding,
-        publication_encoding,
+        stream::Profile5ReceiptAuditContext {
+            mission_authority,
+            owner_binding,
+            pending_encoding,
+            publication_encoding,
+        },
     )?;
     Ok(audit)
 }
@@ -17590,10 +17601,12 @@ fn inspect_blob_network_tables_read_with_publications(
             publications,
             &imports,
             &chunks,
-            read_mission_binding_read(read)?,
-            owner_binding,
-            pending_encoding,
-            publication_encoding,
+            stream::Profile5ReceiptAuditContext {
+                mission_authority: read_mission_binding_read(read)?,
+                owner_binding,
+                pending_encoding,
+                publication_encoding,
+            },
         )?;
     }
     Ok(audit)
@@ -19827,6 +19840,9 @@ mod tests {
     };
 
     use super::*;
+
+    type StreamTableRows = Vec<(Vec<u8>, Vec<u8>)>;
+    type StreamOnlySnapshot = (BTreeSet<String>, Vec<StreamTableRows>);
 
     static NEXT_BLOB_ROOT: AtomicU64 = AtomicU64::new(1);
 
@@ -31059,7 +31075,7 @@ mod tests {
         write.commit().expect("commit stream-only schema");
     }
 
-    fn stream_only_snapshot(path: &Path) -> (BTreeSet<String>, Vec<Vec<(Vec<u8>, Vec<u8>)>>) {
+    fn stream_only_snapshot(path: &Path) -> StreamOnlySnapshot {
         let database = redb::Builder::new()
             .open_read_only(path)
             .expect("open stream-only snapshot");
