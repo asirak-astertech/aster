@@ -27097,7 +27097,7 @@ fn settle_blob_stream_cursor(
 }
 
 struct Profile5BlobSendDirection<'a> {
-    store: &'a Store,
+    store: Arc<Store>,
     connection: &'a aster_iroh::Connection,
     profiles: &'a V7TransferProfiles,
     guard: &'a EventLaneGuard,
@@ -27119,10 +27119,10 @@ async fn send_profile5_blob_direction(
         peer_interest,
         direction,
     } = context;
-    guard.check(store)?;
+    guard.check(&store)?;
     let peer = mission.peer().mission_id();
     let selected = next_canonical_blob_publication(
-        store,
+        &store,
         guard.policy(),
         verifier,
         peer,
@@ -27196,7 +27196,7 @@ async fn send_profile5_blob_direction(
             "Blob stream plan acknowledgement changed the attempt nonce".into(),
         ));
     }
-    guard.check(store)?;
+    guard.check(&store)?;
     // Keep the profile-5 state machine off the contact worker's stack. Debug
     // builds on smaller-stack targets still retain scoped cancellation inside
     // the boxed operation.
@@ -27204,7 +27204,7 @@ async fn send_profile5_blob_direction(
         .map_err(profile5_blob_network_error)?;
     let report = Box::pin(blob_stream::send_canonical_blob_profile5(
         transport.as_ref(),
-        store,
+        Arc::clone(&store),
         guard.policy(),
         &source,
         mission,
@@ -27216,13 +27216,13 @@ async fn send_profile5_blob_direction(
     .map_err(profile5_blob_network_error)?;
     record_blob_stream_report(receipt, &report, BlobStreamReportDirection::Sent)?;
     settle_blob_stream_cursor(
-        store,
+        &store,
         peer,
         direction,
         expected_cursor,
         source.publication(),
     )?;
-    guard.check(store)
+    guard.check(&store)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -27369,7 +27369,7 @@ async fn sync_profile5_blob_lane_if_selected(
     if send_enabled {
         send_profile5_blob_direction(
             Profile5BlobSendDirection {
-                store,
+                store: Arc::clone(&lease_store),
                 connection,
                 profiles,
                 guard,
@@ -27440,7 +27440,7 @@ async fn serve_profile5_blob_lane_if_selected(
     if send_enabled {
         send_profile5_blob_direction(
             Profile5BlobSendDirection {
-                store: &store,
+                store: Arc::clone(&store),
                 connection,
                 profiles,
                 guard,
@@ -52282,6 +52282,8 @@ mod tests {
         bytes_per_second: f64,
         mib_per_second: f64,
         pipeline: crate::stream_pipeline::PipelineReport,
+        sender_pipeline: crate::stream_pipeline::PipelineReport,
+        sender_store_reads: u64,
         store: aster_redb_store::Profile5BatchTestCounts,
     }
 
@@ -52290,6 +52292,8 @@ mod tests {
             payload_bytes: usize,
             wall_time: std::time::Duration,
             pipeline: crate::stream_pipeline::PipelineReport,
+            sender_pipeline: crate::stream_pipeline::PipelineReport,
+            sender_store_reads: u64,
             store: aster_redb_store::Profile5BatchTestCounts,
         ) -> Self {
             let payload_bytes = u64::try_from(payload_bytes).expect("profile-5 fixture size");
@@ -52301,6 +52305,8 @@ mod tests {
                 bytes_per_second,
                 mib_per_second: bytes_per_second / (1024.0 * 1024.0),
                 pipeline,
+                sender_pipeline,
+                sender_store_reads,
                 store,
             }
         }
@@ -52371,6 +52377,63 @@ mod tests {
                 self.store.parent_directory_syncs,
             )
         }
+
+        fn sender_structured_line(&self) -> String {
+            format!(
+                concat!(
+                    "{{\"schema\":\"aster.profile5-sender-measurement.v1\",",
+                    "\"payload_bytes\":{},\"wall_time_ns\":{},",
+                    "\"bytes_per_second\":{:.3},\"mib_per_second\":{:.3},",
+                    "\"store\":{{\"carrier_reads\":{}}},",
+                    "\"pipeline\":{{\"accepted_items\":{},\"completed_items\":{},",
+                    "\"workers\":{},\"peak_in_flight_items\":{},",
+                    "\"peak_in_flight_bytes\":{},\"peak_reorder_items\":{},",
+                    "\"stages\":{{\"admission\":{},\"map\":{},\"reorder\":{},\"sink\":{}}}}}}}"
+                ),
+                self.payload_bytes,
+                self.wall_time_ns,
+                self.bytes_per_second,
+                self.mib_per_second,
+                self.sender_store_reads,
+                self.sender_pipeline.accepted_items(),
+                self.sender_pipeline.completed_items(),
+                self.sender_pipeline.worker_count(),
+                self.sender_pipeline.peak_in_flight_items(),
+                self.sender_pipeline.peak_in_flight_bytes(),
+                self.sender_pipeline.peak_reorder_items(),
+                Self::stage_line_for(
+                    &self.sender_pipeline,
+                    crate::stream_pipeline::PipelineStage::Admission,
+                ),
+                Self::stage_line_for(
+                    &self.sender_pipeline,
+                    crate::stream_pipeline::PipelineStage::Map,
+                ),
+                Self::stage_line_for(
+                    &self.sender_pipeline,
+                    crate::stream_pipeline::PipelineStage::Reorder,
+                ),
+                Self::stage_line_for(
+                    &self.sender_pipeline,
+                    crate::stream_pipeline::PipelineStage::Sink,
+                ),
+            )
+        }
+
+        fn stage_line_for(
+            pipeline: &crate::stream_pipeline::PipelineReport,
+            stage: crate::stream_pipeline::PipelineStage,
+        ) -> String {
+            let observation = pipeline.stage(stage);
+            format!(
+                "{{\"items\":{},\"bytes\":{},\"queue_wait_ns\":{},\"service_ns\":{},\"output_blocked_ns\":{}}}",
+                observation.items,
+                observation.bytes,
+                observation.queue_wait_ns,
+                observation.service_ns,
+                observation.output_blocked_ns,
+            )
+        }
     }
 
     async fn assert_completed_canonical_blob_crossing(
@@ -52383,6 +52446,7 @@ mod tests {
             ("nonempty", multi_extent.as_slice(), false),
             ("pipeline", sustained_pipeline.as_slice(), false),
             ("sink-failure", multi_extent.as_slice(), false),
+            ("sender-map-failure", multi_extent.as_slice(), false),
             ("empty", b"".as_slice(), false),
             (
                 "finite",
@@ -52396,8 +52460,10 @@ mod tests {
             fs::create_dir_all(&source_state).expect("canonical v9 source state");
             fs::create_dir_all(&target_state).expect("canonical v9 target state");
             let authority = services.member.mission_authority_id();
-            let source_store = Store::open_for_mission(source_state.join(STORE_FILE), authority)
-                .expect("canonical v9 source store");
+            let source_store = Arc::new(
+                Store::open_for_mission(source_state.join(STORE_FILE), authority)
+                    .expect("canonical v9 source store"),
+            );
             let mut target_store = Arc::new(
                 Store::open_for_mission(target_state.join(STORE_FILE), authority)
                     .expect("canonical v9 target store"),
@@ -52536,6 +52602,9 @@ mod tests {
             let source_policy = source_store
                 .control_policy_snapshot()
                 .expect("canonical v9 source policy");
+            if label == "sender-map-failure" {
+                source_store.fail_profile5_sender_carrier_read_at_for_test(2);
+            }
             let target_policy = target_store
                 .control_policy_snapshot()
                 .expect("canonical v9 target policy");
@@ -52573,9 +52642,16 @@ mod tests {
             let pipeline_probe = crate::stream_pipeline::PipelineTestProbe::install(
                 crate::stream_pipeline::StreamJobId::from_bytes(pipeline_job),
             );
+            let mut sender_pipeline_job = pipeline_job;
+            sender_pipeline_job[0] ^= 0x80;
+            let sender_pipeline_probe = crate::stream_pipeline::PipelineTestProbe::install(
+                crate::stream_pipeline::StreamJobId::from_bytes(sender_pipeline_job),
+            );
             let precommit_barrier = if matches!(label, "pipeline" | "sink-failure") {
                 let (entered, release) = target_store.install_profile5_batch_precommit_gate();
                 let probe = pipeline_probe.clone();
+                let sender_probe = sender_pipeline_probe.clone();
+                let first_extent_end = wire_shape.checkpoints()[1].next_chunk_index as usize;
                 Some(std::thread::spawn(move || {
                     entered
                         .recv_timeout(std::time::Duration::from_secs(10))
@@ -52586,6 +52662,17 @@ mod tests {
                         && std::time::Instant::now() < deadline
                     {
                         std::thread::yield_now();
+                    }
+                    if label == "pipeline" {
+                        while sender_probe.prepared_sender_carriers() <= first_extent_end
+                            && std::time::Instant::now() < deadline
+                        {
+                            std::thread::yield_now();
+                        }
+                        assert!(
+                            sender_probe.prepared_sender_carriers() > first_extent_end,
+                            "carrier N+1 must be prepared while extent N durability is blocked"
+                        );
                     }
                     let received = probe.received_extents();
                     release
@@ -52603,7 +52690,7 @@ mod tests {
                     source_guard,
                     blob_stream::send_canonical_blob_profile5(
                         adapter.as_ref(),
-                        &source_store,
+                        Arc::clone(&source_store),
                         &source_policy,
                         &source,
                         &mut sender_session,
@@ -52688,10 +52775,45 @@ mod tests {
                 fs::remove_dir_all(target_state).expect("sink-failure target cleanup");
                 continue;
             }
+            if label == "sender-map-failure" {
+                assert!(
+                    first.is_err(),
+                    "injected sender map failure must fail the attempt"
+                );
+                assert!(
+                    target_store
+                        .get_blob(publication)
+                        .expect("sender-map-failure target lookup")
+                        .is_none()
+                );
+                assert!(sender_pipeline_probe.mapped_ciphertext_zeroizations() > 0);
+                assert!(sender_pipeline_probe.cleanup_observed());
+                assert!(sender_pipeline_probe.cancellation_signalled());
+                assert!(sender_pipeline_probe.channels_closed());
+                assert_eq!(sender_pipeline_probe.active_workers(), 0);
+                assert_eq!(
+                    sender_pipeline_probe.worker_exits(),
+                    sender_pipeline_probe.joined_workers()
+                );
+                drop((source_store, target_store));
+                fs::remove_dir_all(source_state).expect("sender-map-failure source cleanup");
+                fs::remove_dir_all(target_state).expect("sender-map-failure target cleanup");
+                continue;
+            }
             let (sent, received, capacity_chain) = if label == "nonempty" {
                 assert!(
                     first.is_err(),
                     "mid-DATA disconnect must interrupt transfer"
+                );
+                assert!(sender_pipeline_probe.mapped_ciphertext_zeroizations() > 0);
+                assert!(sender_pipeline_probe.cleanup_observed());
+                assert!(sender_pipeline_probe.cancellation_signalled());
+                assert!(sender_pipeline_probe.channels_closed());
+                assert_eq!(sender_pipeline_probe.active_workers(), 0);
+                assert_eq!(
+                    sender_pipeline_probe.worker_exits(),
+                    sender_pipeline_probe.joined_workers(),
+                    "a transport failure must join every sender map worker before returning"
                 );
                 assert!(
                     target_store
@@ -52703,7 +52825,13 @@ mod tests {
                     .resume_profile5_receipt(publication)
                     .expect("partial receipt lookup")
                     .expect("partial receipt exists");
-                assert!(partial.durable_wire_offset() > 0);
+                assert!(
+                    partial.durable_wire_offset() > 0,
+                    "received_extents={} receiver_ops={:?} sender_prepared={}",
+                    pipeline_probe.received_extents(),
+                    target_store.profile5_batch_test_counts(),
+                    sender_pipeline_probe.prepared_sender_carriers(),
+                );
                 assert!(partial.durable_wire_offset() < wire_shape.terminal().wire_offset);
                 let partial_stats = target_store
                     .blob_stats()
@@ -52767,7 +52895,7 @@ mod tests {
                 let dropped_ack = tokio::try_join!(
                     blob_stream::send_canonical_blob_profile5(
                         &ack_adapter,
-                        &source_store,
+                        Arc::clone(&source_store),
                         &source_policy,
                         &source,
                         &mut ack_sender,
@@ -52902,7 +53030,7 @@ mod tests {
                 let settled = tokio::try_join!(
                     blob_stream::send_canonical_blob_profile5(
                         &retry_adapter,
-                        &source_store,
+                        Arc::clone(&source_store),
                         &source_policy,
                         &source,
                         &mut retry_sender,
@@ -52973,7 +53101,7 @@ mod tests {
                 let settled = tokio::try_join!(
                     blob_stream::send_canonical_blob_profile5(
                         &retry_adapter,
-                        &source_store,
+                        Arc::clone(&source_store),
                         &source_policy,
                         &source,
                         &mut retry_sender,
@@ -53001,6 +53129,44 @@ mod tests {
             };
             assert_eq!(sent.roots, received.roots);
             if label == "pipeline" {
+                let sender_pipeline = sent
+                    .pipeline
+                    .as_ref()
+                    .expect("canonical production send must report its bounded pipeline");
+                assert_eq!(sender_pipeline.completed_items(), canonical_chunk_count);
+                assert!(sender_pipeline.worker_count() > 1);
+                assert!(sender_pipeline.peak_in_flight_items() <= 8);
+                assert!(sender_pipeline.peak_in_flight_bytes() <= 1024 * 1024);
+                assert!(sender_pipeline.peak_reorder_items() <= 8);
+                assert!(sender_pipeline_probe.peak_active_workers() > 1);
+                assert!(sender_pipeline_probe.cleanup_observed());
+                assert!(sender_pipeline_probe.cancellation_signalled());
+                assert!(sender_pipeline_probe.channels_closed());
+                assert_eq!(sender_pipeline_probe.active_workers(), 0);
+                assert_eq!(
+                    sender_pipeline_probe.worker_exits(),
+                    sender_pipeline_probe.joined_workers()
+                );
+                assert_eq!(
+                    sender_pipeline_probe.mapped_ciphertext_zeroizations(),
+                    canonical_chunk_count as usize,
+                    "every prepared sender carrier is zeroized after ordered emission"
+                );
+                assert_eq!(
+                    source_store
+                        .profile5_batch_test_counts()
+                        .sender_carrier_reads,
+                    canonical_chunk_count,
+                    "the production sender performs exactly one Store carrier read per resumed map partition"
+                );
+                for stage in [
+                    crate::stream_pipeline::PipelineStage::Admission,
+                    crate::stream_pipeline::PipelineStage::Map,
+                    crate::stream_pipeline::PipelineStage::Reorder,
+                    crate::stream_pipeline::PipelineStage::Sink,
+                ] {
+                    assert_eq!(sender_pipeline.stage(stage).items, canonical_chunk_count);
+                }
                 let pipeline = received
                     .pipeline
                     .as_ref()
@@ -53035,6 +53201,10 @@ mod tests {
                     plaintext.len(),
                     transfer_wall_time,
                     pipeline.clone(),
+                    sender_pipeline.clone(),
+                    source_store
+                        .profile5_batch_test_counts()
+                        .sender_carrier_reads,
                     batch_counts,
                 ));
                 assert_eq!(batch_counts.installed_carriers, canonical_chunk_count);
@@ -53373,6 +53543,14 @@ mod tests {
             "aster.profile5-receiver-measurement.v1"
         );
         assert_eq!(structured["payload_bytes"], 4 * 1024 * 1024 + 1);
+        let sender: serde_json::Value = serde_json::from_str(&receipt.sender_structured_line())
+            .expect("profile-5 sender measurement receipt is valid JSON");
+        assert_eq!(sender["schema"], "aster.profile5-sender-measurement.v1");
+        assert_eq!(sender["payload_bytes"], 4 * 1024 * 1024 + 1);
+        assert_eq!(
+            sender["store"]["carrier_reads"], sender["pipeline"]["completed_items"],
+            "sender Store work remains exactly linear in canonical carriers"
+        );
     }
 
     #[tokio::test]
@@ -53390,6 +53568,24 @@ mod tests {
                 receipt.store.installed_carriers
             );
             println!("{}", receipt.structured_line());
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "release-only exact sender production path; requires multi-GiB RAM/disk and is not a default local gate"]
+    async fn release_profile5_sender_real_path_covers_exact_800_mib_and_1_gib() {
+        for bytes in [800 * 1024 * 1024, 1024 * 1024 * 1024] {
+            let receipt = assert_completed_canonical_blob_crossing(bytes).await;
+            assert_eq!(receipt.payload_bytes, bytes as u64);
+            assert!(receipt.wall_time_ns > 0);
+            assert!(receipt.bytes_per_second > 0.0);
+            assert!(receipt.mib_per_second > 0.0);
+            assert!(receipt.sender_pipeline.worker_count() > 1);
+            assert_eq!(
+                receipt.sender_store_reads,
+                receipt.sender_pipeline.completed_items(),
+            );
+            println!("{}", receipt.sender_structured_line());
         }
     }
 

@@ -5279,6 +5279,8 @@ struct BlobDepotTestCounters {
 #[cfg(any(test, feature = "test-utils"))]
 #[derive(Default)]
 struct Profile5BatchTestCounters {
+    sender_carrier_reads: std::sync::atomic::AtomicU64,
+    sender_carrier_read_fail_at: std::sync::atomic::AtomicU64,
     durable_batches: std::sync::atomic::AtomicU64,
     installed_carriers: std::sync::atomic::AtomicU64,
     source_stage_write_begins: std::sync::atomic::AtomicU64,
@@ -5345,7 +5347,7 @@ pub struct Store {
     blob_lifecycle_limits: BlobLifecycleLimits,
     mission_authority: Option<NodeId>,
     live: AtomicBool,
-    blob_depot_lock: std::sync::Mutex<()>,
+    blob_depot_lock: std::sync::RwLock<()>,
     blob_completion_authority: std::sync::Arc<()>,
     blob_depot_owner_token: [u8; 32],
     blob_depot_owner_binding: [u8; 32],
@@ -6436,7 +6438,7 @@ impl Store {
             blob_lifecycle_limits,
             mission_authority,
             live: AtomicBool::new(true),
-            blob_depot_lock: std::sync::Mutex::new(()),
+            blob_depot_lock: std::sync::RwLock::new(()),
             blob_completion_authority: std::sync::Arc::new(()),
             blob_depot_owner_token,
             blob_depot_owner_binding,
@@ -7879,7 +7881,7 @@ impl Store {
         // Drain the one borrowed physical-depot adapter after closing its live
         // gate. The terminal transaction cannot commit while ciphertext I/O is
         // in flight, and every adapter method also observes the closed gate.
-        let _depot_guard = self.blob_depot_lock.lock().map_err(|_| {
+        let _depot_guard = self.blob_depot_lock.write().map_err(|_| {
             StoreError::Blob(BlobStoreError::DepotIntegrity("depot lock is poisoned"))
         })?;
         let mut write = self.database.begin_write()?;

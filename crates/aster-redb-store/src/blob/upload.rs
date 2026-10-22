@@ -871,7 +871,7 @@ impl Store {
         let pack_root = PinnedBlobPackRoot::open(self)?;
         let _depot_guard = self
             .blob_depot_lock
-            .lock()
+            .write()
             .map_err(|_| blob_error(BlobStoreError::DepotIntegrity("depot lock is poisoned")))?;
         self.require_live()?;
         let mut write = self.database.begin_write()?;
@@ -1124,7 +1124,7 @@ impl Store {
         let pack_root = PinnedBlobPackRoot::open(self)?;
         let _depot_guard = self
             .blob_depot_lock
-            .lock()
+            .write()
             .map_err(|_| blob_error(BlobStoreError::DepotIntegrity("depot lock is poisoned")))?;
         self.require_live()?;
         let mut write = self.database.begin_write()?;
@@ -1196,7 +1196,7 @@ impl Store {
         let pack_root = PinnedBlobPackRoot::open(self)?;
         let _depot_guard = self
             .blob_depot_lock
-            .lock()
+            .write()
             .map_err(|_| blob_error(BlobStoreError::DepotIntegrity("depot lock is poisoned")))?;
         self.require_live()?;
         let mut write = self.database.begin_write()?;

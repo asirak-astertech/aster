@@ -36,6 +36,7 @@ use sha2::{Digest, Sha256};
 use std::{collections::VecDeque, future::Future, sync::Arc};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
+use zeroize::Zeroize;
 
 #[cfg(test)]
 use crate::stream_transfer::{
@@ -56,7 +57,7 @@ use std::path::Path;
 /// insufficient.
 pub(crate) struct CanonicalBlobSendSource {
     stored: StoredBlob,
-    plan: VerifiedBlobTransferPlan,
+    plan: Arc<VerifiedBlobTransferPlan>,
     completion: BlobDepotCompletion,
     finite: Option<(
         ContentVerifiedBlobEnvelope,
@@ -92,7 +93,7 @@ impl CanonicalBlobSendSource {
         }
         Ok(Self {
             stored,
-            plan,
+            plan: Arc::new(plan),
             completion,
             finite: None,
         })
@@ -163,93 +164,153 @@ fn canonical_sender_requires_final_checkpoint(
     }
 }
 
-struct CanonicalCarrierExtentSource<'a> {
-    store: &'a Store,
-    source: &'a CanonicalBlobSendSource,
-    plan: &'a VerifiedBlobTransferPlan,
-    shape: aster_mesh::Profile5CanonicalWireShape,
-    next_chunk_index: u64,
-    wire_offset: u64,
+struct ZeroizingCanonicalCarrier {
+    bytes: Vec<u8>,
+    #[cfg(test)]
+    zeroize_observer: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
-impl<'a> CanonicalCarrierExtentSource<'a> {
-    fn new_at(
-        store: &'a Store,
-        source: &'a CanonicalBlobSendSource,
-        wire_offset: u64,
-    ) -> Result<Self, BlobNetworkError> {
-        let shape = aster_mesh::profile5_canonical_wire_shape(&source.plan)
-            .map_err(|error| verification_failure("derive canonical ABX1 shape", error))?;
-        let next_chunk_index = shape
-            .checkpoint_for_wire_offset(wire_offset)
-            .ok_or("profile-5 resume offset is not a canonical extent boundary")?
-            .next_chunk_index;
-        Ok(Self {
-            store,
-            source,
-            plan: &source.plan,
-            shape,
-            next_chunk_index,
-            wire_offset,
-        })
+impl ZeroizingCanonicalCarrier {
+    fn take(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.bytes)
     }
 
-    fn next_extent(&mut self) -> Result<Option<Vec<u8>>, BlobNetworkError> {
-        if self.next_chunk_index == self.plan.manifest().chunk_count() {
-            return Ok(None);
+    #[cfg(test)]
+    fn take_zeroize_observer(&mut self) -> Option<Arc<std::sync::atomic::AtomicUsize>> {
+        self.zeroize_observer.take()
+    }
+}
+
+impl Drop for ZeroizingCanonicalCarrier {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        let had_ciphertext = !self.bytes.is_empty();
+        self.bytes.zeroize();
+        #[cfg(test)]
+        if had_ciphertext && let Some(observer) = self.zeroize_observer.take() {
+            observer.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
-        let first_chunk_index = self.next_chunk_index;
-        let position = self
-            .shape
-            .checkpoints()
-            .iter()
-            .position(|checkpoint| checkpoint.next_chunk_index == first_chunk_index)
-            .ok_or("canonical extent starts outside the canonical partition")?;
-        let before = self.shape.checkpoints()[position];
-        let after = *self
-            .shape
-            .checkpoints()
-            .get(position + 1)
-            .ok_or("canonical extent has no successor")?;
-        let count = after.next_chunk_index - before.next_chunk_index;
-        let expected_len = after.wire_offset - before.wire_offset;
-        let mut carriers = Vec::with_capacity(
-            usize::try_from(count).map_err(|_| "canonical carrier count overflows")?,
-        );
-        {
-            // The depot lock never crosses a transport await. Each extent is
-            // built and rechecked synchronously, then the capability-gated
-            // read adapter is dropped before backpressure can suspend us.
-            let mut depot = self
-                .store
-                .blob_depot_for_authenticated_read(&self.source.completion)
-                .map_err(|error| durability_failure("open canonical Blob depot", error))?;
-            for index in first_chunk_index..first_chunk_index + count {
-                carriers.push(
-                    self.plan
-                        .build_carrier(&mut depot, index)
-                        .map_err(|error| verification_failure("build canonical carrier", error))?
-                        .into_bytes(),
-                );
+    }
+}
+
+struct ZeroizingCanonicalExtent(Vec<u8>);
+
+impl Drop for ZeroizingCanonicalExtent {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+struct CanonicalSenderPipelineSink<'a> {
+    attempt: &'a dyn StreamAttempt,
+    codec: MissionBlobRecordCodec<'a>,
+    state: StreamSenderState,
+    extent_ends: VecDeque<u64>,
+    first_chunk_index: Option<u64>,
+    carriers: Vec<ZeroizingCanonicalCarrier>,
+    checkpoints: u64,
+}
+
+impl CanonicalSenderPipelineSink<'_> {
+    async fn accept(
+        &mut self,
+        mapped: MappedPartition<ZeroizingCanonicalCarrier>,
+    ) -> Result<(), PipelineError> {
+        let index = mapped.index();
+        self.first_chunk_index.get_or_insert(index);
+        self.carriers.push(mapped.into_value());
+        if self.extent_ends.front().copied() != Some(index + 1) {
+            return Ok(());
+        }
+        self.extent_ends.pop_front();
+        let first_chunk_index = self
+            .first_chunk_index
+            .take()
+            .ok_or_else(|| PipelineError::SinkFailed("missing canonical extent start".into()))?;
+        let mut carriers = std::mem::take(&mut self.carriers);
+        #[cfg(test)]
+        let observers = carriers
+            .iter_mut()
+            .map(ZeroizingCanonicalCarrier::take_zeroize_observer)
+            .collect::<Vec<_>>();
+        let mut extent = CanonicalBlobExtentV1 {
+            first_chunk_index,
+            carriers: carriers
+                .iter_mut()
+                .map(ZeroizingCanonicalCarrier::take)
+                .collect(),
+        };
+        let encoded = extent
+            .encode()
+            .map_err(|error| PipelineError::SinkFailed(error.to_string()))?;
+        for carrier in &mut extent.carriers {
+            carrier.zeroize();
+        }
+        #[cfg(test)]
+        for observer in observers.into_iter().flatten() {
+            observer.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        let mut encoded = ZeroizingCanonicalExtent(encoded);
+        let mut pending = Some(std::mem::take(&mut encoded.0));
+        while let Some(extent) = pending.take() {
+            match self
+                .state
+                .send_extent(extent)
+                .map_err(|error| PipelineError::SinkFailed(error.to_string()))?
+            {
+                StreamExtentAction::Send(data) => {
+                    let (mut prefix, mut body) = self
+                        .codec
+                        .encode_data_parts(data)
+                        .map_err(|error| PipelineError::SinkFailed(error.to_string()))?;
+                    let send = await_authenticated_progress(
+                        "send canonical data",
+                        self.attempt.send_data_parts(&prefix, &body),
+                    )
+                    .await;
+                    prefix.zeroize();
+                    body.zeroize();
+                    send.map_err(|error| PipelineError::SinkFailed(error.to_string()))?;
+                }
+                StreamExtentAction::Retry {
+                    reason: crate::stream_transfer::StreamRetry::CreditBlocked,
+                    bytes,
+                } => {
+                    let checkpoint = await_authenticated_progress(
+                        "receive canonical checkpoint",
+                        self.attempt.receive_control(),
+                    )
+                    .await
+                    .map_err(|error| PipelineError::SinkFailed(error.to_string()))?
+                    .ok_or_else(|| {
+                        PipelineError::SinkFailed(
+                            "control stream closed before canonical checkpoint".into(),
+                        )
+                    })?;
+                    let StreamFrame::Checkpoint(checkpoint) = self
+                        .codec
+                        .decode(&checkpoint)
+                        .map_err(|error| PipelineError::SinkFailed(error.to_string()))?
+                    else {
+                        return Err(PipelineError::SinkFailed(
+                            "canonical credit wait received a non-checkpoint frame".into(),
+                        ));
+                    };
+                    self.state
+                        .checkpoint(checkpoint)
+                        .map_err(|error| PipelineError::SinkFailed(error.to_string()))?;
+                    self.checkpoints += 1;
+                    pending = Some(bytes);
+                }
+                StreamExtentAction::Retry { .. } => {
+                    return Err(PipelineError::SinkFailed(
+                        "canonical sender produced an invalid extent retry".into(),
+                    ));
+                }
             }
         }
-        let encoded = CanonicalBlobExtentV1 {
-            first_chunk_index,
-            carriers,
-        }
-        .encode()
-        .map_err(|error| {
-            BlobNetworkError::new(BlobNetworkStage::Framing, "encode canonical extent", error)
-        })?;
-        if encoded.len() as u64 != expected_len {
-            return Err("canonical extent differs from its preflight length".into());
-        }
-        self.next_chunk_index += count;
-        self.wire_offset = self
-            .wire_offset
-            .checked_add(expected_len)
-            .ok_or("canonical wire offset overflow")?;
-        Ok(Some(encoded))
+        drop(carriers);
+        Ok(())
     }
 }
 
@@ -1052,7 +1113,7 @@ fn require_canonical_send_source(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn send_canonical_blob_profile5(
     adapter: &dyn StreamTransportAdapter,
-    store: &Store,
+    store: Arc<Store>,
     policy: &ControlPolicySnapshot,
     source: &CanonicalBlobSendSource,
     session: &mut MissionSession,
@@ -1060,7 +1121,7 @@ pub(crate) async fn send_canonical_blob_profile5(
     direction: EventDirection,
     attempt_nonce: [u8; 32],
 ) -> Result<BlobNetworkReport, BlobNetworkError> {
-    require_canonical_send_source(store, policy, source)?;
+    require_canonical_send_source(&store, policy, source)?;
     let wire_len = canonical_blob_wire_len(&source.plan)?;
     let finite_custody = if let Some((blob, projection, retention)) = &source.finite {
         let exact_len = u64::try_from(source.stored.sealed.len())
@@ -1119,11 +1180,9 @@ pub(crate) async fn send_canonical_blob_profile5(
     } else {
         None
     };
-    let extent_count = profile5_canonical_wire_shape(&source.plan)
-        .map_err(|error| authentication_failure("derive canonical wire shape", error))?
-        .checkpoints()
-        .len()
-        .saturating_sub(1);
+    let wire_shape = profile5_canonical_wire_shape(&source.plan)
+        .map_err(|error| authentication_failure("derive canonical wire shape", error))?;
+    let extent_count = wire_shape.checkpoints().len().saturating_sub(1);
     let (max_data_bytes, max_control_bytes) =
         profile5_attempt_bounds_for_extents(wire_len, extent_count).map_err(|error| {
             BlobNetworkError::new(BlobNetworkStage::Framing, "bound canonical stream", error)
@@ -1200,52 +1259,124 @@ pub(crate) async fn send_canonical_blob_profile5(
     let accepted = state
         .accept(accept)
         .map_err(|error| failure("accept canonical stream", error))?;
-    let mut extent_source = CanonicalCarrierExtentSource::new_at(store, source, resume_offset)?;
     let requires_final_checkpoint = canonical_sender_requires_final_checkpoint(accepted)?;
-    let mut pending = if requires_final_checkpoint {
-        extent_source.next_extent()?
-    } else {
-        None
-    };
-    let mut checkpoints = 0_u64;
-    while let Some(extent) = pending.take() {
-        match state
-            .send_extent(extent)
-            .map_err(|error| failure("advance canonical sender extent", error))?
-        {
-            StreamExtentAction::Send(data) => {
-                let (prefix, body) = codec.encode_data_parts(data)?;
-                await_authenticated_progress(
-                    "send canonical data",
-                    attempt.send_data_parts(&prefix, &body),
-                )
-                .await?;
-                pending = extent_source.next_extent()?;
-            }
-            StreamExtentAction::Retry {
-                reason: crate::stream_transfer::StreamRetry::CreditBlocked,
-                bytes,
-            } => {
-                let checkpoint = await_authenticated_progress(
-                    "receive canonical checkpoint",
-                    attempt.receive_control(),
-                )
-                .await?
-                .ok_or("control stream closed before canonical checkpoint")?;
-                let StreamFrame::Checkpoint(checkpoint) = codec.decode(&checkpoint)? else {
-                    return Err("canonical credit wait received a non-checkpoint frame".into());
-                };
-                state
-                    .checkpoint(checkpoint)
-                    .map_err(|error| failure("advance canonical checkpoint", error))?;
-                checkpoints += 1;
-                pending = Some(bytes);
-            }
-            StreamExtentAction::Retry { .. } => {
-                return Err("canonical sender produced an invalid extent retry".into());
-            }
+    let resume_checkpoint = wire_shape
+        .checkpoint_for_wire_offset(resume_offset)
+        .ok_or("profile-5 resume offset is not a canonical extent boundary")?;
+    let initial_chunk_index = resume_checkpoint.next_chunk_index;
+    let extent_ends = wire_shape
+        .checkpoints()
+        .iter()
+        .copied()
+        .filter(|checkpoint| checkpoint.next_chunk_index > initial_chunk_index)
+        .map(|checkpoint| checkpoint.next_chunk_index)
+        .collect::<VecDeque<_>>();
+    let mut sender_job = [0u8; 16];
+    sender_job.copy_from_slice(&transfer_open.transfer_id[..16]);
+    sender_job[0] ^= 0x80;
+    let sender_job = StreamJobId::from_bytes(sender_job);
+    #[cfg(test)]
+    let sender_zeroize_observer =
+        crate::stream_pipeline::PipelineTestProbe::mapped_ciphertext_observer_for_job(sender_job);
+    let (partition_tx, partition_rx) = mpsc::channel(8);
+    let producer_plan = Arc::clone(&source.plan);
+    let producer = tokio::spawn(async move {
+        for index in initial_chunk_index..producer_plan.manifest().chunk_count() {
+            let carrier_id = producer_plan
+                .carrier_id(index)
+                .map_err(|error| PipelineError::MapFailed(error.to_string()))?;
+            let carrier_len = usize::try_from(
+                producer_plan
+                    .carrier_total_len(&carrier_id.wire_bytes())
+                    .map_err(|error| PipelineError::MapFailed(error.to_string()))?,
+            )
+            .map_err(|error| PipelineError::MapFailed(error.to_string()))?;
+            partition_tx
+                .send(Ok(StreamPartition::new_accounted(
+                    index,
+                    index.to_be_bytes().to_vec(),
+                    carrier_len,
+                )))
+                .await
+                .map_err(|_| PipelineError::WorkerPanicked)?;
         }
+        Ok::<(), PipelineError>(())
+    });
+    let map_store = Arc::clone(&store);
+    let map_plan = Arc::clone(&source.plan);
+    let map_session = Arc::new(
+        store
+            .begin_profile5_sender_read(&source.completion)
+            .map_err(|error| durability_failure("open canonical sender read session", error))?,
+    );
+    let sink = Arc::new(tokio::sync::Mutex::new(CanonicalSenderPipelineSink {
+        attempt: attempt.as_ref(),
+        codec,
+        state,
+        extent_ends,
+        first_chunk_index: None,
+        carriers: Vec::new(),
+        checkpoints: 0,
+    }));
+    let sink_for_pipeline = Arc::clone(&sink);
+    let pipeline_result = run_ordered_channel_pipeline_from(
+        sender_job,
+        partition_rx,
+        initial_chunk_index,
+        PipelineLimits::new(4, 8, 1024 * 1024, 8)
+            .map_err(|error| failure("configure canonical sender pipeline", error))?,
+        move |partition| {
+            let index = partition.index();
+            drop(partition.into_bytes());
+            let carrier = map_store
+                .read_profile5_sender_carrier(&map_session, &map_plan, index)
+                .map_err(|error| PipelineError::MapFailed(error.to_string()))?;
+            #[cfg(test)]
+            crate::stream_pipeline::PipelineTestProbe::observe_prepared_sender_carrier(sender_job);
+            Ok(ZeroizingCanonicalCarrier {
+                bytes: carrier,
+                #[cfg(test)]
+                zeroize_observer: sender_zeroize_observer.clone(),
+            })
+        },
+        move |mapped| {
+            let sink = Arc::clone(&sink_for_pipeline);
+            async move { sink.lock().await.accept(mapped).await }
+        },
+    )
+    .await;
+    let producer_result = producer
+        .await
+        .map_err(|error| failure("join canonical sender admission", error))?;
+    let pipeline = match pipeline_result {
+        Ok(report) => report,
+        Err(error) => {
+            // A local read/map/framing failure must close the sender half so
+            // the receiver observes EOF instead of waiting for DATA forever.
+            _ = await_authenticated_progress(
+                "close canonical data stream after sender pipeline failure",
+                attempt.finish_data(),
+            )
+            .await;
+            return Err(failure("run canonical sender pipeline", error));
+        }
+    };
+    producer_result.map_err(|error| failure("admit canonical sender partitions", error))?;
+    let sink = Arc::try_unwrap(sink)
+        .map_err(|_| failure("join canonical sender pipeline", "sink remains shared"))?
+        .into_inner();
+    if !sink.carriers.is_empty() || !sink.extent_ends.is_empty() {
+        return Err(failure(
+            "complete canonical sender pipeline",
+            "canonical extent batch remained incomplete",
+        ));
     }
+    let CanonicalSenderPipelineSink {
+        mut codec,
+        mut state,
+        mut checkpoints,
+        ..
+    } = sink;
     if requires_final_checkpoint {
         let checkpoint = await_authenticated_progress(
             "receive final canonical checkpoint",
@@ -1327,7 +1458,7 @@ pub(crate) async fn send_canonical_blob_profile5(
         attempt_bytes: wire_len - resume_offset,
         roots,
         checkpoints,
-        pipeline: None,
+        pipeline: Some(pipeline),
     })
 }
 

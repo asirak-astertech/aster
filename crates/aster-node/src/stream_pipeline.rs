@@ -27,6 +27,7 @@ impl StreamJobId {
 pub struct StreamPartition {
     index: u64,
     source_end: u64,
+    accounted_bytes: usize,
     bytes: Vec<u8>,
     #[cfg(test)]
     zeroize_observer: Option<Arc<std::sync::atomic::AtomicUsize>>,
@@ -37,6 +38,7 @@ impl StreamPartition {
         Self {
             index,
             source_end: 0,
+            accounted_bytes: bytes.len(),
             bytes,
             #[cfg(test)]
             zeroize_observer: None,
@@ -47,6 +49,7 @@ impl StreamPartition {
         Self {
             index,
             source_end,
+            accounted_bytes: bytes.len(),
             bytes,
             #[cfg(test)]
             zeroize_observer: None,
@@ -62,11 +65,24 @@ impl StreamPartition {
     }
 
     pub fn len(&self) -> usize {
-        self.bytes.len()
+        self.accounted_bytes
     }
 
     pub fn is_empty(&self) -> bool {
-        self.bytes.is_empty()
+        self.accounted_bytes == 0
+    }
+
+    /// Constructs a small control partition whose pipeline occupancy is
+    /// charged to the bytes the map stage will materialize.
+    pub(crate) fn new_accounted(index: u64, bytes: Vec<u8>, accounted_bytes: usize) -> Self {
+        Self {
+            index,
+            source_end: 0,
+            accounted_bytes,
+            bytes,
+            #[cfg(test)]
+            zeroize_observer: None,
+        }
     }
 
     pub fn into_bytes(mut self) -> Vec<u8> {
@@ -114,6 +130,7 @@ struct PipelineTestProbeInner {
     peak_reorder_items: std::sync::atomic::AtomicUsize,
     current_reorder_items: std::sync::atomic::AtomicUsize,
     mapped_ciphertext_zeroizations: Arc<std::sync::atomic::AtomicUsize>,
+    prepared_sender_carriers: std::sync::atomic::AtomicUsize,
     received_extents: std::sync::atomic::AtomicUsize,
     available_item_permits: std::sync::atomic::AtomicUsize,
     available_byte_permits: std::sync::atomic::AtomicUsize,
@@ -163,6 +180,19 @@ impl PipelineTestProbe {
         if let Some(probe) = Self::for_job(job) {
             probe.0.received_extents.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    pub(crate) fn observe_prepared_sender_carrier(job: StreamJobId) {
+        if let Some(probe) = Self::for_job(job) {
+            probe
+                .0
+                .prepared_sender_carriers
+                .fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    pub(crate) fn prepared_sender_carriers(&self) -> usize {
+        self.0.prepared_sender_carriers.load(Ordering::SeqCst)
     }
 
     pub(crate) fn received_extents(&self) -> usize {

@@ -45,7 +45,9 @@ use redb::{ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle};
 
 use super::*;
 
-pub use depot::{AuthenticatedBlobReadDepot, BlobDepot, BlobDepotCompletion};
+pub use depot::{
+    AuthenticatedBlobReadDepot, BlobDepot, BlobDepotCompletion, Profile5SenderReadSession,
+};
 pub use lease::{BlobLeaseLimitError, BlobLeaseLimits};
 pub use stream::{BlobProfile5Receipt, BlobStreamResume};
 pub use upload::{BlobUploadCheckpoint, BlobUploadRequest, BlobUploadReservation};
@@ -53,6 +55,7 @@ pub use upload::{BlobUploadCheckpoint, BlobUploadRequest, BlobUploadReservation}
 #[cfg(any(test, feature = "test-utils"))]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Profile5BatchTestCounts {
+    pub sender_carrier_reads: u64,
     pub durable_batches: u64,
     pub installed_carriers: u64,
     pub total_write_begins: u64,
@@ -2781,7 +2784,7 @@ impl Store {
         };
         let candidate_index = candidate_index.expect("candidate records its page index");
 
-        let _depot_guard = match self.blob_depot_lock.try_lock() {
+        let _depot_guard = match self.blob_depot_lock.try_write() {
             Ok(guard) => guard,
             Err(std::sync::TryLockError::WouldBlock) => {
                 return Ok(manifest_admission_progress(
@@ -2956,7 +2959,7 @@ impl Store {
     fn test_admit_blob_deletion_manifest(&self, variant: BlobVariantId) -> Result<(), StoreError> {
         let _depot_guard = self
             .blob_depot_lock
-            .lock()
+            .write()
             .map_err(|_| blob_error(BlobStoreError::DepotIntegrity("depot lock is poisoned")))?;
         self.require_live()?;
         let target = lease::BlobLeaseTarget::Variant(variant);
@@ -3165,7 +3168,7 @@ impl Store {
     /// Acquires the owner-bound mutation adapter for one local Blob publish
     /// without a global depot audit.
     ///
-    /// Existing roots are opened under the common depot mutex with exact
+    /// Existing roots are opened under the common exclusive depot guard with exact
     /// Store/backing/owner binding. A missing root is created only for a
     /// canonically empty durable Blob namespace.
     pub fn blob_depot_for_local_publish(&self) -> Result<BlobDepot<'_>, StoreError> {
@@ -3225,9 +3228,10 @@ impl Store {
     ///
     /// Unlike [`Self::blob_depot`], this page-read path does not perform a
     /// global Blob schema audit, create the depot root, or enter a write
-    /// transaction. It still acquires the common depot mutex, rechecks live
-    /// state and the exact Store/backing/owner binding, and rejects a stale or
-    /// foreign nonconstructible completion capability.
+    /// transaction. It acquires a shared depot guard plus an exact variant
+    /// lease, rechecks live state and Store/backing/owner binding, and rejects
+    /// a stale or foreign nonconstructible completion capability. Finalized
+    /// readers may therefore run concurrently while mutation stays exclusive.
     pub fn blob_depot_for_authenticated_read(
         &self,
         completion: &BlobDepotCompletion,
@@ -3235,6 +3239,60 @@ impl Store {
         self.require_live()?;
         self.require_bound_mission()?;
         BlobDepot::open_authenticated_read(self, completion)
+    }
+
+    /// Loads and verifies one complete canonical carrier for the profile-5
+    /// sender. Keeping this as a Store seam makes each map operation explicit
+    /// and measurable while retaining the nonconstructible completion gate.
+    #[doc(hidden)]
+    pub fn begin_profile5_sender_read(
+        &self,
+        completion: &BlobDepotCompletion,
+    ) -> Result<Profile5SenderReadSession, StoreError> {
+        self.require_live()?;
+        self.require_bound_mission()?;
+        BlobDepot::open_profile5_sender_session(self, completion)
+    }
+
+    /// Loads one carrier under an already-authorized attempt session.
+    #[doc(hidden)]
+    pub fn read_profile5_sender_carrier(
+        &self,
+        session: &Profile5SenderReadSession,
+        plan: &VerifiedBlobTransferPlan,
+        index: u64,
+    ) -> Result<Vec<u8>, StoreError> {
+        #[cfg(any(test, feature = "test-utils"))]
+        if self
+            .profile5_batch_test_counters
+            .sender_carrier_read_fail_at
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == index.saturating_add(1)
+        {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "injected profile-5 sender carrier read failure",
+            )));
+        }
+        let mut depot = BlobDepot::open_profile5_sender_read(self, session)?;
+        let carrier = plan
+            .build_carrier(&mut depot, index)
+            .map_err(|error| blob_error(BlobStoreError::Verification(error.to_string())))?;
+        #[cfg(any(test, feature = "test-utils"))]
+        self.profile5_batch_test_counters
+            .sender_carrier_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(carrier.into_bytes())
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn fail_profile5_sender_carrier_read_at_for_test(&self, index: u64) {
+        self.profile5_batch_test_counters
+            .sender_carrier_read_fail_at
+            .store(
+                index.saturating_add(1),
+                std::sync::atomic::Ordering::Relaxed,
+            );
     }
 
     /// Node-internal full-content verification seam for a still-pending source.
@@ -3256,7 +3314,7 @@ impl Store {
     /// Mints one exact completion capability for an authenticated pending
     /// network source without opening the unrestricted globally audited depot.
     ///
-    /// The common depot mutex is acquired before the pending snapshot. Current
+    /// The common exclusive depot guard is acquired before the pending snapshot. Current
     /// policy, source identity, sealed envelope, transfer plan, owner/backing
     /// binding, import, every committed chunk, and every physical file are
     /// rechecked while the lock remains held. The fixed root must already
@@ -3348,7 +3406,7 @@ impl Store {
     /// the caller supplies a source/content-verified envelope, while the Store
     /// rechecks the exact completed projection, acceptance marker, sealed row,
     /// owner/backing binding, finalized import, chunk markers, and files under
-    /// the common depot mutex.
+    /// the common exclusive depot guard.
     pub fn completed_retained_blob(
         &self,
         projection: &BlobSourceProjection,
@@ -6665,7 +6723,7 @@ impl Store {
         let authority = self.require_bound_mission()?;
         let _depot_guard = self
             .blob_depot_lock
-            .lock()
+            .write()
             .map_err(|_| blob_error(BlobStoreError::DepotIntegrity("depot lock is poisoned")))?;
         self.require_live()?;
         let write = self.database.begin_write()?;
@@ -6820,6 +6878,10 @@ impl Store {
     #[doc(hidden)]
     pub fn profile5_batch_test_counts(&self) -> Profile5BatchTestCounts {
         let mut counts = Profile5BatchTestCounts {
+            sender_carrier_reads: self
+                .profile5_batch_test_counters
+                .sender_carrier_reads
+                .load(std::sync::atomic::Ordering::Relaxed),
             durable_batches: self
                 .profile5_batch_test_counters
                 .durable_batches
@@ -7581,7 +7643,7 @@ impl Store {
 
         let _depot_guard = self
             .blob_depot_lock
-            .lock()
+            .write()
             .map_err(|_| blob_error(BlobStoreError::DepotIntegrity("depot lock is poisoned")))?;
         self.require_live()?;
         depot::verify_completion(self, depot_completion)?;
@@ -7994,7 +8056,7 @@ impl Store {
         self.require_live()?;
         let _depot_guard = self
             .blob_depot_lock
-            .lock()
+            .write()
             .map_err(|_| blob_error(BlobStoreError::DepotIntegrity("depot lock is poisoned")))?;
         self.require_live()?;
         depot::verify_completion(self, completion)?;
@@ -8195,7 +8257,7 @@ impl Store {
 
         let _depot_guard = self
             .blob_depot_lock
-            .lock()
+            .write()
             .map_err(|_| blob_error(BlobStoreError::DepotIntegrity("depot lock is poisoned")))?;
         self.require_live()?;
         let read = self.database.begin_read()?;
@@ -10842,7 +10904,7 @@ impl Store {
         drop(read);
 
         for (candidate_position, variant, expected_import, expected_lineage) in candidates {
-            let _depot_guard = match self.blob_depot_lock.try_lock() {
+            let _depot_guard = match self.blob_depot_lock.try_write() {
                 Ok(guard) => guard,
                 Err(std::sync::TryLockError::WouldBlock) => {
                     return Ok(BlobCapacityAdmissionStep::Blocked {
@@ -10974,7 +11036,7 @@ impl Store {
                 });
             }
         };
-        let _depot_guard = match self.blob_depot_lock.try_lock() {
+        let _depot_guard = match self.blob_depot_lock.try_write() {
             Ok(guard) => guard,
             Err(std::sync::TryLockError::WouldBlock) => {
                 return Ok(BlobCapacityPhysicalStep::Blocked {
@@ -11122,7 +11184,7 @@ impl Store {
         };
         let _depot_guard = self
             .blob_depot_lock
-            .lock()
+            .write()
             .map_err(|_| blob_error(BlobStoreError::DepotIntegrity("depot lock is poisoned")))?;
         self.require_live()?;
 
@@ -12907,7 +12969,7 @@ impl Store {
             }
         };
 
-        let _depot_guard = match self.blob_depot_lock.try_lock() {
+        let _depot_guard = match self.blob_depot_lock.try_write() {
             Ok(guard) => guard,
             Err(std::sync::TryLockError::WouldBlock) => {
                 return Ok(BlobMaintenanceProgress {
@@ -41399,7 +41461,7 @@ mod tests {
             let typed_failure = {
                 let _guard = store
                     .blob_depot_lock
-                    .lock()
+                    .write()
                     .expect("hostile direct deletion depot lock");
                 depot::delete_manifest_chunk(
                     &store.path,
@@ -46285,7 +46347,7 @@ mod tests {
             true,
         );
         let locked_before = blob_maintenance_cursor_rows(&locked);
-        let depot_guard = locked.blob_depot_lock.lock().expect("depot guard");
+        let depot_guard = locked.blob_depot_lock.write().expect("depot guard");
         let blocked = locked
             .run_blob_capacity_gc(maintenance_budget(8), None)
             .expect("lock contention is bounded no-progress");

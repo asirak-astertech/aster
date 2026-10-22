@@ -14,7 +14,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, MutexGuard};
+use std::sync::{Arc, RwLockReadGuard, RwLockWriteGuard};
 
 use aster_mesh::{
     BlobChunkRecord, BlobManifest, BlobMetadata as CoreBlobMetadata, BlobPhysicalLineage,
@@ -664,9 +664,15 @@ impl BlobDepotCompletion {
 }
 
 /// Borrowed, single-owner adapter from the generic core Blob engine to this Store.
+#[allow(dead_code)] // Variant payloads are held solely for their RAII lock lifetime.
+enum BlobDepotGuard<'a> {
+    Read(RwLockReadGuard<'a, ()>),
+    Write(RwLockWriteGuard<'a, ()>),
+}
+
 pub struct BlobDepot<'a> {
     store: &'a Store,
-    _guard: MutexGuard<'a, ()>,
+    _guard: BlobDepotGuard<'a>,
     _lease: Option<Arc<super::lease::BlobLeaseHandle>>,
     root: OwnedDirectory,
     active: Option<ActiveImport>,
@@ -681,6 +687,13 @@ pub struct BlobDepot<'a> {
 /// fails closed before entering redb or touching the depot filesystem.
 pub struct AuthenticatedBlobReadDepot<'a> {
     depot: BlobDepot<'a>,
+}
+
+/// Nonconstructible attempt-scoped deletion exclusion for concurrent
+/// profile-5 sender carrier readers.
+pub struct Profile5SenderReadSession {
+    completion: BlobDepotCompletion,
+    lease: Arc<super::lease::BlobLeaseHandle>,
 }
 
 impl AuthenticatedBlobReadDepot<'_> {
@@ -1173,7 +1186,7 @@ impl<'a> BlobDepot<'a> {
     pub(super) fn open(store: &'a Store) -> Result<Self, StoreError> {
         let guard = store
             .blob_depot_lock
-            .lock()
+            .write()
             .map_err(|_| blob_error(BlobStoreError::DepotIntegrity("depot lock is poisoned")))?;
         // Close the precheck/lock race with terminal entry, which flips the
         // live gate before waiting for this same adapter lock.
@@ -1213,7 +1226,7 @@ impl<'a> BlobDepot<'a> {
         };
         Ok(Self {
             store,
-            _guard: guard,
+            _guard: BlobDepotGuard::Write(guard),
             _lease: None,
             root,
             active: None,
@@ -1233,7 +1246,7 @@ impl<'a> BlobDepot<'a> {
     ) -> Result<Self, StoreError> {
         let guard = store
             .blob_depot_lock
-            .lock()
+            .write()
             .map_err(|_| blob_error(BlobStoreError::DepotIntegrity("depot lock is poisoned")))?;
         store.require_live()?;
         let read = store.database.begin_read()?;
@@ -1264,7 +1277,7 @@ impl<'a> BlobDepot<'a> {
         };
         Ok(Self {
             store,
-            _guard: guard,
+            _guard: BlobDepotGuard::Write(guard),
             _lease: None,
             root,
             active: None,
@@ -1301,7 +1314,7 @@ impl<'a> BlobDepot<'a> {
         completion: &BlobDepotCompletion,
         lease_kind: super::lease::BlobLeaseKind,
     ) -> Result<AuthenticatedBlobReadDepot<'a>, StoreError> {
-        Self::open_authenticated_read_internal(store, completion, Some(lease_kind), None)
+        Self::open_authenticated_read_internal(store, completion, Some(lease_kind), None, None)
     }
 
     /// Opens the same mutation-denying authenticated adapter without consuming
@@ -1313,7 +1326,35 @@ impl<'a> BlobDepot<'a> {
         source: BlobTransferId,
         completion: &BlobDepotCompletion,
     ) -> Result<AuthenticatedBlobReadDepot<'a>, StoreError> {
-        Self::open_authenticated_read_internal(store, completion, None, Some(source))
+        Self::open_authenticated_read_internal(store, completion, None, Some(source), None)
+    }
+
+    pub(super) fn open_profile5_sender_session(
+        store: &'a Store,
+        completion: &BlobDepotCompletion,
+    ) -> Result<Profile5SenderReadSession, StoreError> {
+        let depot = Self::open_authenticated_read_with_kind(
+            store,
+            completion,
+            super::lease::BlobLeaseKind::CarrierRange,
+        )?;
+        Ok(Profile5SenderReadSession {
+            completion: completion.clone(),
+            lease: depot.owned_lease_guard()?,
+        })
+    }
+
+    pub(super) fn open_profile5_sender_read(
+        store: &'a Store,
+        session: &Profile5SenderReadSession,
+    ) -> Result<AuthenticatedBlobReadDepot<'a>, StoreError> {
+        Self::open_authenticated_read_internal(
+            store,
+            &session.completion,
+            None,
+            None,
+            Some(Arc::clone(&session.lease)),
+        )
     }
 
     fn open_authenticated_read_internal(
@@ -1321,11 +1362,17 @@ impl<'a> BlobDepot<'a> {
         completion: &BlobDepotCompletion,
         lease_kind: Option<super::lease::BlobLeaseKind>,
         required_pending: Option<BlobTransferId>,
+        existing_lease: Option<Arc<super::lease::BlobLeaseHandle>>,
     ) -> Result<AuthenticatedBlobReadDepot<'a>, StoreError> {
-        let guard = store
-            .blob_depot_lock
-            .lock()
-            .map_err(|_| blob_error(BlobStoreError::DepotIntegrity("depot lock is poisoned")))?;
+        let guard = if lease_kind.is_some() || existing_lease.is_some() {
+            BlobDepotGuard::Read(store.blob_depot_lock.read().map_err(|_| {
+                blob_error(BlobStoreError::DepotIntegrity("depot lock is poisoned"))
+            })?)
+        } else {
+            BlobDepotGuard::Write(store.blob_depot_lock.write().map_err(|_| {
+                blob_error(BlobStoreError::DepotIntegrity("depot lock is poisoned"))
+            })?)
+        };
         store.require_live()?;
         if !Arc::ptr_eq(&completion.authority, &store.blob_completion_authority)
             || completion.backing_identity != store.backing_identity
@@ -1374,19 +1421,23 @@ impl<'a> BlobDepot<'a> {
         let import = depot.exact_completion_import(&read, completion)?;
         super::deletion::require_variant_available_read(&read, completion.variant_id)?;
         drop(read);
-        depot._lease = lease_kind
-            .map(|kind| {
-                store
-                    .blob_lease_registry
-                    .acquire(
-                        store.blob_depot_owner_binding,
-                        super::lease::BlobLeaseTarget::Variant(completion.variant_id),
-                        kind,
-                    )
-                    .map(|guard| Arc::new(super::lease::BlobLeaseHandle::new(guard)))
-                    .map_err(super::lease::store_error)
-            })
-            .transpose()?;
+        depot._lease = if let Some(existing) = existing_lease {
+            Some(existing)
+        } else {
+            lease_kind
+                .map(|kind| {
+                    store
+                        .blob_lease_registry
+                        .acquire(
+                            store.blob_depot_owner_binding,
+                            super::lease::BlobLeaseTarget::Variant(completion.variant_id),
+                            kind,
+                        )
+                        .map(|guard| Arc::new(super::lease::BlobLeaseHandle::new(guard)))
+                        .map_err(super::lease::store_error)
+                })
+                .transpose()?
+        };
         depot.active = Some(active_from_import(&import));
         #[cfg(test)]
         store
