@@ -678,27 +678,34 @@ priority order:
    and checker-bound; the receipt does not prove indefinite tombstone
    retention, garbage collection, delete-wins behavior, longer partitions,
    relays, physical or mixed implementations, scale, or release.
-   Historical stopped `SelectedBlobNode` remains available. Current
-   `RunningNode::selected_blobs()` returns a cloneable actor-owned handle that
-   admits a nonempty regular file under the selected 64-MiB/1,024-chunk bound,
-   publishes through a capacity-one joined worker, and returns freshly
-   authenticated zeroize-on-drop plaintext pages of at most 64 KiB. Exact
-   retry, cancellation/admission boundaries, policy/rekey races, shutdown and
+   Historical stopped `SelectedBlobNode` remains available.
+
+   <!-- ASTER-BLOB-CURRENT:running-node-selected-blobs:BEGIN -->
+   Current Blob transfer uses semantic v9 profile 5 with receiver-authoritative checkpoints and ABX1 canonical extents, bounded at 8 GiB and 131,072 chunks; semantic v7/v8 profile 4 remains compatibility-only at 64 MiB and 1,024 chunks.
+   <!-- ASTER-BLOB-CURRENT:running-node-selected-blobs:END -->
+
+   Current `RunningNode::selected_blobs()` returns a cloneable actor-owned
+   handle that admits a nonempty regular file under the 8-GiB/131,072-chunk
+   application bound, schedules canonical finalization through the joined
+   two-worker/two-queue pipeline, and returns freshly authenticated
+   zeroize-on-drop plaintext pages of at most 64 KiB. Exact retry,
+   cancellation/admission boundaries, policy/rekey races, shutdown and
    zeroization closure, direct-Iroh later synchronization, receiver read, and
-   peerless restart read have focused automation. Separately, the
+   peerless restart read have focused automation. Semantic v9 network sync
+   sends complete ASTRBT01 records in bounded ABX1 extents and resumes from
+   receiver-authoritative durable checkpoints. Semantic v7/v8 profile 4 is
+   retained only for wire compatibility. Separately, the
    runtime reconciles durable State/Record objects in semantic v4/v5 through
    protected class/direction exact-ID lanes under explicit interests. Exact
    result acknowledgement, exact Finish remainder, typed capacity deferral,
    per-object/per-class limits, and fair durable cursor rotation bound each
-   contact. Semantic v5 additionally stages each exact Blob source before its
-   carriers, persists peer-neutral 16-KiB prefixes, resumes the exact complement
-   from another eligible content peer after receiver reopen, and withholds the
-   publication until depot, full-content, and current-lineage proofs agree.
-   The retained three-participant Blob receipt exercises the live boundary,
-   direct seeding, a one-contact 16-KiB partial retained across graceful reopen,
-   one-contact 16-KiB continuation from a different eligible peer without
-   source refetch, the 65,870-byte finish, exact 98,638-carrier-byte
-   reconstruction, and a final peerless reopen. A separate retained State
+   contact. The retained three-participant Blob receipt is historical
+   semantic-v5/profile-4 evidence: it exercises direct seeding, a one-contact
+   16-KiB partial retained across graceful reopen, one-contact 16-KiB
+   continuation from a different eligible peer without source refetch, the
+   65,870-byte finish, exact 98,638-carrier-byte reconstruction, and a final
+   peerless reopen. It does not validate the current semantic-v9/profile-5
+   ABX1 pipeline. A separate retained State
    subscription receipt now observes durable positive-current-version delivery,
    forced receiver-process termination and attempt-two redelivery, explicit
    current tombstone delivery, acknowledgement/reacknowledgement, and separation

@@ -405,6 +405,33 @@ class ProtocolVersionContractTests(unittest.TestCase):
         with self.assertRaisesRegex(CHECKER.ContractViolation, "current section set"):
             CHECKER.validate_blob_documentation_contract(damaged)
 
+        malformed_markers = (
+            "<!-- ASTER-BLOB-CURRENT:rogue_name:BEGIN -->\nextra\n"
+            "<!-- ASTER-BLOB-CURRENT:rogue_name:END -->\n",
+            "<!-- aster-blob-current:rogue:BEGIN -->\nextra\n"
+            "<!-- aster-blob-current:rogue:END -->\n",
+            "<!-- ASTER_BLOB_CURRENT:rogue:BEGIN -->\nextra\n"
+            "<!-- ASTER_BLOB_CURRENT:rogue:END -->\n",
+            "<!-- ASTER BLOB CURRENT : rogue : BEGIN -->\nextra\n"
+            "<!-- ASTER BLOB CURRENT : rogue : END -->\n",
+        )
+        for marker in malformed_markers:
+            damaged = dict(documents)
+            damaged["requirements_status"] += marker
+            with self.subTest(marker=marker.splitlines()[0]), self.assertRaisesRegex(
+                CHECKER.ContractViolation, "current section marker"
+            ):
+                CHECKER.validate_blob_documentation_contract(damaged)
+
+        unrelated_markers = dict(documents)
+        unrelated_markers["requirements_status"] += (
+            "<!-- ASTER-BLOB-HISTORICAL:rogue_name:BEGIN -->\nextra\n"
+            "<!-- ASTER-BLOB-HISTORICAL:rogue_name:END -->\n"
+            "<!-- ASTER-RECORD-CURRENT:rogue:BEGIN -->\nextra\n"
+            "<!-- ASTER-RECORD-CURRENT:rogue:END -->\n"
+        )
+        CHECKER.validate_blob_documentation_contract(unrelated_markers)
+
         damaged = dict(documents)
         expected = CHECKER.render_requirements_current_section(first)
         damaged["requirements_status"] = damaged["requirements_status"].replace(
@@ -412,6 +439,17 @@ class ProtocolVersionContractTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(CHECKER.ContractViolation, first):
             CHECKER.validate_blob_documentation_contract(damaged)
+
+        stale_running_node = dict(documents)
+        stale_running_node["requirements_status"] += (
+            "Current RunningNode::selected_blobs() admits files under the selected "
+            "64-MiB/1,024-chunk bound, publishes through a capacity-one worker, and "
+            "uses semantic v5 peer-neutral 16-KiB prefixes."
+        )
+        with self.assertRaisesRegex(
+            CHECKER.ContractViolation, "requirements_status.*selected Blob mechanism"
+        ):
+            CHECKER.validate_blob_documentation_contract(stale_running_node)
 
     def test_documentation_surface_set_is_exact(self) -> None:
         documents = {
@@ -441,6 +479,40 @@ class ProtocolVersionContractTests(unittest.TestCase):
                 CHECKER.ContractViolation, f"{surface}.*exactly one"
             ):
                 CHECKER.validate_blob_documentation_contract(duplicate)
+
+        man_contradictions = (
+            (
+                "blob_publish_man",
+                "Local publication waits for a peer before it commits.",
+            ),
+            (
+                "blob_read_man",
+                "CLI download resume is implemented and continues from the previous byte.",
+            ),
+            (
+                "blob_status_man",
+                "blob-status reports remote delivery, peer status, and convergence.",
+            ),
+        )
+        for surface, claim in man_contradictions:
+            damaged = dict(documents)
+            damaged[surface] += claim
+            with self.subTest(surface=surface), self.assertRaisesRegex(
+                CHECKER.ContractViolation, f"{surface}.*governed claim"
+            ):
+                CHECKER.validate_blob_documentation_contract(damaged)
+
+        accurate_man_prose = dict(documents)
+        accurate_man_prose["blob_publish_man"] += (
+            "Local publication does not wait for a peer before it commits."
+        )
+        accurate_man_prose["blob_read_man"] += (
+            "CLI download resume is not supported; interrupted downloads restart at byte zero."
+        )
+        accurate_man_prose["blob_status_man"] += (
+            "blob-status does not report remote delivery, peer status, or convergence."
+        )
+        CHECKER.validate_blob_documentation_contract(accurate_man_prose)
 
         public_claims = (
             "Local publication waits for a peer before it commits.",

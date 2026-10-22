@@ -249,6 +249,7 @@ BLOB_DOCUMENTATION_CAPABILITIES.update(
 
 REQUIREMENTS_CURRENT_SECTION_NAMES = (
     "selected-lane-summary",
+    "running-node-selected-blobs",
     "live-selected-blob",
     "current-automation",
     "selected-blob-network",
@@ -282,6 +283,14 @@ _REQUIREMENTS_CURRENT_BLOCK = re.compile(
     r"<!-- ASTER-BLOB-CURRENT:([a-z0-9-]+):BEGIN -->\s*(.*?)\s*"
     r"<!-- ASTER-BLOB-CURRENT:\1:END -->",
     re.DOTALL,
+)
+_REQUIREMENTS_CURRENT_MARKER = re.compile(
+    r"<!--\s*ASTER(?:[-_\s]+)BLOB(?:[-_\s]+)CURRENT\s*:\s*[^:>]+?\s*:\s*"
+    r"(?:BEGIN|END)\s*-->",
+    re.IGNORECASE,
+)
+_REQUIREMENTS_CANONICAL_CURRENT_MARKER = re.compile(
+    r"<!-- ASTER-BLOB-CURRENT:[a-z0-9-]+:(?:BEGIN|END) -->"
 )
 
 
@@ -386,6 +395,19 @@ def _documentation_sentences(text: str) -> list[set[str]]:
     ]
 
 
+def _documentation_sentence_text(text: str) -> list[tuple[str, set[str]]]:
+    """Return normalized sentence text and tokens for relation-aware checks."""
+    text = _CODE_FENCE.sub("", text)
+    sentences = []
+    for sentence in re.split(r"(?<=[.!?])\s+|\n{2,}|\n(?=\|)", text):
+        normalized = " ".join(sentence.lower().replace("-", " ").split())
+        if not normalized:
+            continue
+        normalized = re.sub(r"\bblob\s+status\b", "blobstatus", normalized)
+        sentences.append((normalized, set(re.findall(r"[a-z0-9]+", normalized))))
+    return sentences
+
+
 def _contains_any(words: set[str], prefixes: tuple[str, ...]) -> bool:
     return any(any(word.startswith(prefix) for prefix in prefixes) for word in words)
 
@@ -425,6 +447,18 @@ def _reject_capability_shaped_json(surface: str, text: str) -> None:
 
 
 def _validate_requirements_current_sections(text: str) -> str:
+    candidate_markers = _REQUIREMENTS_CURRENT_MARKER.findall(text)
+    canonical_markers = _REQUIREMENTS_CANONICAL_CURRENT_MARKER.findall(text)
+    expected_marker_count = 2 * len(REQUIREMENTS_CURRENT_SECTION_NAMES)
+    if (
+        len(candidate_markers) != expected_marker_count
+        or len(canonical_markers) != expected_marker_count
+        or candidate_markers != canonical_markers
+    ):
+        fail(
+            "Blob documentation requirements_status current section set differs: "
+            "current section marker set differs"
+        )
     matches = list(_REQUIREMENTS_CURRENT_BLOCK.finditer(text))
     names = [match.group(1) for match in matches]
     if sorted(names) != sorted(REQUIREMENTS_CURRENT_SECTION_NAMES):
@@ -530,6 +564,55 @@ def validate_blob_documentation_contract(documents: dict[str, str]) -> None:
             if governed:
                 fail(f"Blob documentation {surface} governed claim is outside its capability block")
 
+    for sentence, words in _documentation_sentence_text(prose["blob_publish_man"]):
+        waits_for_peer = (
+            {"local", "peer"} <= words
+            and _contains_any(words, ("publish", "publicat"))
+            and _contains_any(words, ("wait",))
+        )
+        denied = bool(
+            re.search(r"\b(?:do|does|did|will|must|need) not wait\b", sentence)
+            or re.search(r"\bwithout waiting\b", sentence)
+        )
+        if waits_for_peer and not denied:
+            fail(
+                "Blob documentation blob_publish_man governed claim is outside "
+                "its capability block"
+            )
+
+    for sentence, words in _documentation_sentence_text(prose["blob_read_man"]):
+        positive_resume = (
+            {"cli", "download", "resume"} <= words
+            and bool(words & {"implemented", "continues", "continue", "supported"})
+        )
+        denied = bool(
+            re.search(r"\b(?:is|are) not (?:yet )?(?:implemented|supported)\b", sentence)
+            or "post merge" in sentence
+            or "restart at byte zero" in sentence
+            or "restarts at byte zero" in sentence
+        )
+        if positive_resume and not denied:
+            fail(
+                "Blob documentation blob_read_man governed claim is outside "
+                "its capability block"
+            )
+
+    for sentence, words in _documentation_sentence_text(prose["blob_status_man"]):
+        remote_status = (
+            "blobstatus" in words
+            and _contains_any(words, ("report",))
+            and bool(words & {"remote", "peer", "convergence"})
+        )
+        denied = bool(
+            re.search(r"\b(?:do|does|will) not report\b", sentence)
+            or re.search(r"\breports? no\b", sentence)
+        )
+        if remote_status and not denied:
+            fail(
+                "Blob documentation blob_status_man governed claim is outside "
+                "its capability block"
+            )
+
     stale_current_requirements = (
         "current selected offer is `[8, 7, 6, 5, 4, 3, 2, 1]`",
         "selected handshake default/highest semantic version is 8",
@@ -541,6 +624,24 @@ def validate_blob_documentation_contract(documents: dict[str, str]) -> None:
     for stale in stale_current_requirements:
         if stale.lower() in requirements.lower():
             fail("Blob documentation requirements_status retains stale current-v8 wording")
+    for _, words in _documentation_sentence_text(requirements):
+        stale_running_node = (
+            {"runningnode", "selected", "blobs"} <= words
+            and (
+                (
+                    {"64", "mib", "1024"} <= words
+                    and bool(words & {"chunk", "chunks"})
+                )
+                or ({"capacity", "one", "worker"} <= words)
+            )
+        )
+        stale_profile5_mechanism = (
+            {"semantic", "v5"} <= words
+            and bool(words & {"stages", "persists", "resumes", "withholds"})
+            and ({"16", "kib"} <= words or "prefixes" in words)
+        )
+        if stale_running_node or stale_profile5_mechanism:
+            fail("Blob documentation requirements_status retains stale selected Blob mechanism")
 
 
 def parse_numeric_declaration(text: str, label: str) -> tuple[int, ...]:
