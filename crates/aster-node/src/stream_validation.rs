@@ -1,15 +1,17 @@
 //! Instrumented end-to-end driver for the semantic-v9 stream protocol.
 //!
-//! This is intentionally not an application API. It exercises the same framing,
-//! state machines, credit, settlement, and selected transport used by the runtime
-//! while the Blob lifecycle adapter is composed around them.
+//! This is intentionally not an application API. It exercises the same ABX1
+//! DATA grammar, state machines, credit, settlement, size-derived hard bound,
+//! and selected transport used by the runtime. The retired PR95 ASTRBS02 pack
+//! path is test-only and cannot be emitted through this production module.
 
 use crate::{
     stream_transfer::{
-        MAX_STREAM_CHECKPOINT_BATCH_BYTES, PROFILE5_ATTEMPT_TIMEOUT, PROFILE5_EXTENT_BYTES,
-        StreamAction, StreamClass, StreamDirection, StreamExtentAction, StreamFrame, StreamOpenV1,
-        StreamReceiverState, StreamResultCode, StreamSenderState, profile5_attempt_bounds,
-        profile5_receive_limit,
+        CanonicalBlobExtentV1, MAX_STREAM_CHECKPOINT_BATCH_BYTES,
+        PROFILE5_CANONICAL_CARRIER_RECORD_BYTES, PROFILE5_EXTENT_BYTES, StreamAction, StreamClass,
+        StreamDirection, StreamExtentAction, StreamFrame, StreamOpenV1, StreamReceiverState,
+        StreamResultCode, StreamSenderState, profile5_attempt_bounds,
+        profile5_attempt_hard_timeout, profile5_receive_limit,
     },
     stream_transport::{AttemptOpenRequest, IrohQuicV1Adapter, StreamTransportAdapter},
 };
@@ -17,72 +19,6 @@ use aster_iroh::Connection;
 use sha2::{Digest, Sha256};
 use std::time::Instant as StdInstant;
 use tokio::time::Instant;
-
-pub use crate::runtime::blob_stream::{
-    BlobCommitmentVerifier, BlobNetworkReport, BlobReceiveStoreSession,
-};
-use aster_mesh::{BlobStreamOpen, BlobStreamSegmentOpener};
-use std::path::Path;
-
-pub fn completed_pack_wire_len(root: &Path, open: &BlobStreamOpen) -> Result<u64, String> {
-    crate::runtime::blob_stream::completed_pack_wire_len(root, open)
-        .map_err(|error| error.to_string())
-}
-
-pub fn expected_pack_wire_len(plaintext_len: u64) -> Result<u64, String> {
-    crate::runtime::blob_stream::expected_pack_wire_len(plaintext_len)
-        .map_err(|error| error.to_string())
-}
-
-pub async fn send_completed_pack(
-    connection: Connection,
-    open: &BlobStreamOpen,
-    authenticated_open: Vec<u8>,
-    root: &Path,
-    roots: ([u8; 32], [u8; 32]),
-    semantic_commitment: Vec<u8>,
-) -> Result<BlobNetworkReport, String> {
-    crate::runtime::blob_stream::send_completed_pack(
-        connection,
-        open,
-        authenticated_open,
-        root,
-        roots,
-        semantic_commitment,
-    )
-    .await
-    .map_err(|error| error.to_string())
-}
-
-pub async fn receive_completed_pack(
-    connection: Connection,
-    open: &BlobStreamOpen,
-    opener: BlobStreamSegmentOpener,
-    root: &Path,
-    wire_len: u64,
-    limits: crate::stream_pipeline::PipelineLimits,
-) -> Result<BlobNetworkReport, String> {
-    crate::runtime::blob_stream::receive_completed_pack(
-        connection, open, opener, root, wire_len, limits,
-    )
-    .await
-    .map_err(|error| error.to_string())
-}
-
-pub async fn receive_completed_pack_with_store(
-    connection: Connection,
-    session: BlobReceiveStoreSession,
-    opener: BlobStreamSegmentOpener,
-    root: &Path,
-    wire_len: u64,
-    limits: crate::stream_pipeline::PipelineLimits,
-) -> Result<BlobNetworkReport, String> {
-    crate::runtime::blob_stream::receive_completed_pack_with_store(
-        connection, session, opener, root, wire_len, limits,
-    )
-    .await
-    .map_err(|error| error.to_string())
-}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct StreamValidationReport {
@@ -94,8 +30,19 @@ pub struct StreamValidationReport {
 }
 
 fn payload(offset: u64, len: usize) -> Vec<u8> {
-    let extent = offset / PROFILE5_EXTENT_BYTES as u64;
+    let extent = offset / PROFILE5_CANONICAL_CARRIER_RECORD_BYTES as u64;
     vec![(extent as u8).wrapping_mul(31).wrapping_add(0x5a); len]
+}
+
+fn validation_wire_len(payload_len: u64) -> Result<u64, String> {
+    let carriers = payload_len.div_ceil(PROFILE5_CANONICAL_CARRIER_RECORD_BYTES as u64);
+    payload_len
+        .checked_add(
+            carriers
+                .checked_mul(20)
+                .ok_or("validation wire length overflow")?,
+        )
+        .ok_or_else(|| "validation wire length overflow".into())
 }
 
 fn rate(bytes: u64, elapsed_ns: u128) -> f64 {
@@ -112,16 +59,21 @@ fn decoded(bytes: &[u8]) -> Result<StreamFrame, String> {
     StreamFrame::decode_for_context(9, 5, bytes).map_err(|error| error.to_string())
 }
 
+pub(crate) fn decode_validation_extent(bytes: &[u8]) -> Result<CanonicalBlobExtentV1, String> {
+    CanonicalBlobExtentV1::decode(bytes).map_err(|error| error.to_string())
+}
+
 pub async fn send(connection: Connection, bytes: u64) -> Result<StreamValidationReport, String> {
     if bytes == 0 {
         return Err("validation payload must be nonempty".into());
     }
+    let wire_len = validation_wire_len(bytes)?;
     let (max_data_bytes, max_control_bytes) =
-        profile5_attempt_bounds(bytes).map_err(|error| error.to_string())?;
+        profile5_attempt_bounds(wire_len).map_err(|error| error.to_string())?;
     let adapter = IrohQuicV1Adapter::new(connection);
     let attempt = adapter
         .open_attempt(AttemptOpenRequest {
-            deadline: Instant::now() + PROFILE5_ATTEMPT_TIMEOUT,
+            deadline: Instant::now() + profile5_attempt_hard_timeout(wire_len),
             max_data_bytes,
             max_control_bytes,
         })
@@ -138,7 +90,7 @@ pub async fn send(connection: Connection, bytes: u64) -> Result<StreamValidation
         source_transfer_id: [0x32; 32],
         publication_id: [0x33; 32],
         variant_id: [0x34; 32],
-        total_len: bytes,
+        total_len: wire_len,
         attempt_nonce,
         checkpoint_generation: 0,
         custody_digest: None,
@@ -157,33 +109,48 @@ pub async fn send(connection: Connection, bytes: u64) -> Result<StreamValidation
     let StreamFrame::Accept(accept) = decoded(&accept)? else {
         return Err("first control frame was not accept".into());
     };
-    let mut state = StreamSenderState::new(transfer_id, attempt_nonce, bytes);
+    let mut state = StreamSenderState::new(transfer_id, attempt_nonce, wire_len);
     state.accept(accept).map_err(|error| error.to_string())?;
     let started = StdInstant::now();
-    let mut offset = 0_u64;
+    let mut payload_offset = 0_u64;
     let mut checkpoints = 0_u64;
     let mut hasher = Sha256::new();
-    let mut pending = None;
-    while offset < bytes {
-        let len = (bytes - offset).min(PROFILE5_EXTENT_BYTES as u64) as usize;
-        let extent = pending.take().unwrap_or_else(|| payload(offset, len));
+    let mut pending: Option<(Vec<u8>, usize)> = None;
+    let mut carrier_index = 0_u64;
+    while payload_offset < bytes {
+        let len =
+            (bytes - payload_offset).min(PROFILE5_CANONICAL_CARRIER_RECORD_BYTES as u64) as usize;
+        let (extent, payload_len) = match pending.take() {
+            Some(pending) => pending,
+            None => {
+                let carrier = payload(payload_offset, len);
+                hasher.update(&carrier);
+                let encoded = CanonicalBlobExtentV1 {
+                    first_chunk_index: carrier_index,
+                    carriers: vec![carrier],
+                }
+                .encode()
+                .map_err(|error| error.to_string())?;
+                (encoded, len)
+            }
+        };
         match state
             .send_extent(extent)
             .map_err(|error| error.to_string())?
         {
             StreamExtentAction::Send(data) => {
-                hasher.update(&data.bytes);
                 attempt
                     .send_data(&encoded(StreamFrame::Data(data))?)
                     .await
                     .map_err(|error| format!("send data: {error:?}"))?;
-                offset += len as u64;
+                payload_offset += payload_len as u64;
+                carrier_index += 1;
             }
             StreamExtentAction::Retry {
                 reason: crate::stream_transfer::StreamRetry::CreditBlocked,
                 bytes,
             } => {
-                pending = Some(bytes);
+                pending = Some((bytes, payload_len));
                 let checkpoint = attempt
                     .receive_control()
                     .await
@@ -288,11 +255,13 @@ async fn receive_with_batch(
     checkpoint_batch: u32,
 ) -> Result<StreamValidationReport, String> {
     let (max_data_bytes, max_control_bytes) =
-        profile5_attempt_bounds(expected_bytes).map_err(|error| error.to_string())?;
+        profile5_attempt_bounds(validation_wire_len(expected_bytes)?)
+            .map_err(|error| error.to_string())?;
+    let expected_wire = validation_wire_len(expected_bytes)?;
     let adapter = IrohQuicV1Adapter::new(connection);
     let attempt = adapter
         .accept_attempt(AttemptOpenRequest {
-            deadline: Instant::now() + PROFILE5_ATTEMPT_TIMEOUT,
+            deadline: Instant::now() + profile5_attempt_hard_timeout(expected_wire),
             max_data_bytes,
             max_control_bytes,
         })
@@ -306,7 +275,7 @@ async fn receive_with_batch(
     let StreamFrame::Open(open) = decoded(&open)? else {
         return Err("first data frame was not open".into());
     };
-    if open.class != StreamClass::Blob || open.total_len != expected_bytes {
+    if open.class != StreamClass::Blob || open.total_len != expected_wire {
         return Err("stream open differs from expected Blob transfer".into());
     }
     let batch = u64::from(checkpoint_batch);
@@ -314,7 +283,7 @@ async fn receive_with_batch(
         &open,
         0,
         0,
-        profile5_receive_limit(expected_bytes, 0, checkpoint_batch),
+        profile5_receive_limit(expected_wire, 0, checkpoint_batch),
         PROFILE5_EXTENT_BYTES as u32,
     )
     .map_err(|error| error.to_string())?;
@@ -333,6 +302,8 @@ async fn receive_with_batch(
     let mut durable = 0_u64;
     let mut generation = 0_u64;
     let mut checkpoints = 0_u64;
+    let mut payload_bytes = 0_u64;
+    let mut carrier_index = 0_u64;
     loop {
         let bytes = attempt
             .receive_data()
@@ -350,10 +321,22 @@ async fn receive_with_batch(
                 if through != accepted {
                     return Err("receiver persistence offset differed".into());
                 }
-                hasher.update(&data.bytes);
-                if through == expected_bytes || through - durable >= batch {
+                let extent = decode_validation_extent(&data.bytes)?;
+                if extent.first_chunk_index != carrier_index || extent.carriers.len() != 1 {
+                    return Err("validation DATA is not one ordered canonical carrier".into());
+                }
+                let carrier = &extent.carriers[0];
+                payload_bytes = payload_bytes
+                    .checked_add(carrier.len() as u64)
+                    .ok_or("validation payload length overflow")?;
+                if payload_bytes > expected_bytes {
+                    return Err("validation payload exceeds expected length".into());
+                }
+                carrier_index += 1;
+                hasher.update(carrier);
+                if through == expected_wire || through - durable >= batch {
                     generation += 1;
-                    let limit = profile5_receive_limit(expected_bytes, through, checkpoint_batch);
+                    let limit = profile5_receive_limit(expected_wire, through, checkpoint_batch);
                     let StreamAction::Send(checkpoint) = state
                         .persisted(through, generation, limit)
                         .map_err(|error| error.to_string())?
@@ -369,6 +352,9 @@ async fn receive_with_batch(
                 }
             }
             StreamFrame::Finish(finish) => {
+                if payload_bytes != expected_bytes {
+                    return Err("validation payload ended before expected length".into());
+                }
                 let StreamAction::Promote =
                     state.finish(finish).map_err(|error| error.to_string())?
                 else {
@@ -430,6 +416,26 @@ mod tests {
     use super::*;
     use aster_iroh::{CarrierSecurityProfile, Endpoint, EndpointConfig, ExpectedPeer, SecretKey};
     use std::collections::BTreeSet;
+
+    #[test]
+    fn semantic_v9_validation_rejects_raw_pack_data() {
+        // Mutation caught: accepting the retired ASTRBS02 body would restore a
+        // second semantic-v9 DATA grammar alongside production ABX1.
+        let mut raw = Vec::from(8_u32.to_be_bytes());
+        raw.extend_from_slice(b"ASTRBS02");
+        assert!(decode_validation_extent(&raw).is_err());
+
+        let encoded = CanonicalBlobExtentV1 {
+            first_chunk_index: 0,
+            carriers: vec![vec![0x5a; 32]],
+        }
+        .encode()
+        .unwrap();
+        assert_eq!(
+            decode_validation_extent(&encoded).unwrap().carriers[0],
+            vec![0x5a; 32]
+        );
+    }
 
     #[tokio::test]
     async fn semantic_v9_driver_transfers_and_settles_over_selected_transport() {

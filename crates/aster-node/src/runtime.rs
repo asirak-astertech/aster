@@ -26941,6 +26941,8 @@ fn next_canonical_blob_publication(
     policy: &ControlPolicySnapshot,
     verifier: &mut ReferenceEnvelopeSealer,
     peer: NodeId,
+    peer_route_commitments: &[[u8; 32]],
+    peer_interest: &BlobInterest,
     direction: EventDirection,
 ) -> Result<Option<SelectedCanonicalBlobPublication>, NodeError> {
     let cursor = store.mutable_transfer_cursor(
@@ -26969,6 +26971,27 @@ fn next_canonical_blob_publication(
         .unwrap_or(0);
     publications.rotate_left(start);
     for retained in publications {
+        let Some(selector) = peer_interest
+            .selector(&retained.source.topic, &retained.source.scope)
+            .filter(|selector| selector.epoch() == retained.source.epoch)
+        else {
+            continue;
+        };
+        if !verifier.peer_can_route(
+            peer,
+            peer_route_commitments,
+            &retained.source.scope,
+            retained.source.epoch,
+        ) || !verifier.peer_can_open_blob_content(
+            peer,
+            peer_route_commitments,
+            &retained.source.scope,
+            &retained.source.topic,
+            retained.source.epoch,
+            selector.content_proof(),
+        ) {
+            continue;
+        }
         let stored = store
             .get_blob(retained.source.transfer_id)?
             .ok_or_else(|| {
@@ -27009,6 +27032,24 @@ fn next_canonical_blob_publication(
         let plan = blob.transfer_plan(&manifest_bytes).map_err(|error| {
             NodeError::Protocol(format!("profile-5 canonical manifest plan failed: {error}"))
         })?;
+        let Some(final_selector) = peer_interest
+            .selector(blob.topic(), blob.scope())
+            .filter(|selector| selector.epoch() == blob.key_epoch())
+        else {
+            continue;
+        };
+        if !verifier.peer_can_route(peer, peer_route_commitments, blob.scope(), blob.key_epoch())
+            || !verifier.peer_can_open_blob_content(
+                peer,
+                peer_route_commitments,
+                blob.scope(),
+                blob.topic(),
+                blob.key_epoch(),
+                final_selector.content_proof(),
+            )
+        {
+            continue;
+        }
         let completion = claim.depot_completion.ok_or_else(|| {
             NodeError::FatalBlobCoherence(
                 "profile-5 canonical source lacks its completed depot capability".into(),
@@ -27053,13 +27094,21 @@ async fn send_profile5_blob_direction(
     profiles: &V7TransferProfiles,
     guard: &EventLaneGuard,
     verifier: &mut ReferenceEnvelopeSealer,
+    peer_interest: &BlobInterest,
     direction: EventDirection,
     receipt: &mut PeerReceipt,
 ) -> Result<(), NodeError> {
     guard.check(store)?;
     let peer = mission.peer().mission_id();
-    let selected =
-        next_canonical_blob_publication(store, guard.policy(), verifier, peer, direction)?;
+    let selected = next_canonical_blob_publication(
+        store,
+        guard.policy(),
+        verifier,
+        peer,
+        mission.peer_route_grant_commitments(),
+        peer_interest,
+        direction,
+    )?;
     let publication = selected.as_ref().map(|selected| &selected.source);
     let mut attempt_nonce = publication.as_ref().map(|_| [0; 32]);
     if let Some(nonce) = attempt_nonce.as_mut() {
@@ -27069,6 +27118,9 @@ async fn send_profile5_blob_direction(
         .as_ref()
         .map(|publication| BlobStreamSourceOfferV1 {
             transfer_id: *publication.publication().as_bytes(),
+            topic: publication.topic().clone(),
+            scope: publication.scope().clone(),
+            key_epoch: publication.key_epoch(),
             source_len: u32::try_from(publication.authenticated_open().len()).unwrap_or(u32::MAX),
             source_digest: Sha256::digest(publication.authenticated_open()).into(),
         });
@@ -27112,13 +27164,9 @@ async fn send_profile5_blob_direction(
     };
     let nonce = attempt_nonce.expect("publication has attempt nonce");
     if acknowledged_nonce.is_none() {
-        settle_blob_stream_cursor(
-            store,
-            peer,
-            direction,
-            expected_cursor,
-            source.publication(),
-        )?;
+        // A bounded decline discloses no SOURCE bytes and is not settlement.
+        // Retain the cursor so a later contact with matching authenticated
+        // interest can schedule the publication.
         return Ok(());
     }
     if acknowledged_nonce != Some(nonce) {
@@ -27163,7 +27211,7 @@ async fn receive_profile5_blob_direction(
     _profiles: &V7TransferProfiles,
     guard: &EventLaneGuard,
     _verifier: Arc<ReferenceEnvelopeSealer>,
-    _local_interest: &BlobInterest,
+    local_interest: &BlobInterest,
     direction: EventDirection,
     receipt: &mut PeerReceipt,
 ) -> Result<(), NodeError> {
@@ -27190,8 +27238,12 @@ async fn receive_profile5_blob_direction(
             let acknowledged_nonce = match (attempt_nonce, source) {
                 (None, None) => None,
                 (Some(nonce), Some(source)) => {
-                    accepted = Some((nonce, source));
-                    Some(nonce)
+                    if profile5_plan_matches_local_interest(local_interest, &source) {
+                        accepted = Some((nonce, source));
+                        Some(nonce)
+                    } else {
+                        None
+                    }
                 }
                 _ => {
                     return Err(NodeError::Protocol(
@@ -27222,6 +27274,15 @@ async fn receive_profile5_blob_direction(
     ))
 }
 
+fn profile5_plan_matches_local_interest(
+    local_interest: &BlobInterest,
+    source: &BlobStreamSourceOfferV1,
+) -> bool {
+    local_interest
+        .selector(&source.topic, &source.scope)
+        .is_some_and(|selector| selector.epoch() == source.key_epoch)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn sync_profile5_blob_lane_if_selected(
     store: &Store,
@@ -27244,6 +27305,8 @@ async fn sync_profile5_blob_lane_if_selected(
         NodeError::Protocol("profile-5 Blob lane has no authenticated profiles".into())
     })?;
     let local_interest = protected_blob_interest(store, &verifier, interests, true)?;
+    let peer_interest =
+        sync_blob_interests(connection, mission, &local_interest, true, receipt).await?;
     if send_enabled {
         send_profile5_blob_direction(
             store,
@@ -27252,6 +27315,7 @@ async fn sync_profile5_blob_lane_if_selected(
             profiles,
             guard,
             &mut verifier,
+            &peer_interest,
             EventDirection::ToSessionResponder,
             receipt,
         )
@@ -27296,6 +27360,7 @@ async fn serve_profile5_blob_lane_if_selected(
         NodeError::Protocol("profile-5 Blob lane has no authenticated profiles".into())
     })?;
     let local_interest = protected_blob_interest(&store, &verifier, interests, true)?;
+    let peer_interest = serve_blob_interests(connection, mission, &local_interest, receipt).await?;
     let verifier = Arc::new(verifier);
     if receive_enabled {
         receive_profile5_blob_direction(
@@ -27325,6 +27390,7 @@ async fn serve_profile5_blob_lane_if_selected(
             profiles,
             guard,
             &mut verifier,
+            &peer_interest,
             EventDirection::ToSessionInitiator,
             receipt,
         )
@@ -39829,6 +39895,17 @@ mod tests {
                 request_mission_frame(
                     connection,
                     mission,
+                    Frame::BlobInterest(BlobInterest::empty()),
+                    receipt,
+                )
+                .await
+                .expect("profile-5 Blob interest exchange"),
+                Frame::BlobInterestReply(BlobInterest::empty()),
+            );
+            assert_eq!(
+                request_mission_frame(
+                    connection,
+                    mission,
                     Frame::BlobStreamPlan {
                         direction: EventDirection::ToSessionResponder,
                         attempt_nonce: None,
@@ -46536,6 +46613,33 @@ mod tests {
             .expect("open test sealer")
     }
 
+    fn authenticated_peer_route_commitments(
+        source: &UnprotectedReferenceMission,
+        peer: &UnprotectedReferenceMission,
+    ) -> Vec<[u8; 32]> {
+        let (initiator, client_hello) = ReferenceSessionInitiator::start(
+            peer.fresh_bundle().expect("peer test session bundle"),
+        )
+        .expect("start peer test session");
+        let responder = ReferenceSessionResponder::open(
+            source.fresh_bundle().expect("source test session bundle"),
+        )
+        .expect("open source test session");
+        let (responder, server_hello) = responder
+            .receive_client(&client_hello)
+            .expect("source authenticates peer hello");
+        let (initiator, client_auth) = initiator
+            .receive_server(&server_hello)
+            .expect("peer authenticates source hello");
+        let (source_session, server_finished) = responder
+            .receive_client_auth(&client_auth)
+            .expect("source authenticates peer session");
+        let _peer_session = initiator
+            .receive_finished(&server_finished)
+            .expect("peer authenticates source session");
+        source_session.peer_route_grant_commitments().to_vec()
+    }
+
     struct RuntimeTestUnprotector {
         calls: usize,
         plaintext: Option<Vec<u8>>,
@@ -51753,12 +51857,27 @@ mod tests {
             b"ordinary canonical Blob predating profile 5",
         );
         let policy = store.control_policy_snapshot().expect("canonical policy");
+        let peer_verifier = open_test_sealer(&services.other);
+        let peer_interest = protected_blob_interest(
+            &store,
+            &peer_verifier,
+            &MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
+                services.topic.clone(),
+                services.scope.clone(),
+                false,
+            )]),
+            true,
+        )
+        .expect("canonical peer interest");
+        let commitments = authenticated_peer_route_commitments(&services.member, &services.other);
 
         let selected = next_canonical_blob_publication(
             &store,
             &policy,
             &mut verifier,
             services.other.identity(),
+            &commitments,
+            &peer_interest,
             EventDirection::ToSessionResponder,
         )
         .expect("canonical profile-5 inventory")
@@ -51767,6 +51886,117 @@ mod tests {
 
         drop(store);
         fs::remove_dir_all(state).expect("canonical inventory cleanup");
+    }
+
+    #[test]
+    fn profile5_plan_local_interest_mismatch_declines_before_source() {
+        // Mutation caught: acknowledging every structurally valid offer would
+        // let an uninterested peer solicit the complete sealed SOURCE.
+        let topic = Topic::new("imagery").unwrap();
+        let scope = Scope::new("mission/interested").unwrap();
+        let interest = BlobInterest::new(vec![BlobInterestSelector::new(
+            topic.clone(),
+            scope.clone(),
+            7,
+            [0x44; crate::frame::BLOB_CONTENT_PROOF_BYTES],
+        )])
+        .unwrap();
+        let outside = BlobStreamSourceOfferV1 {
+            transfer_id: [0x61; 32],
+            topic,
+            scope: Scope::new("mission/outside").unwrap(),
+            key_epoch: 7,
+            source_len: 128,
+            source_digest: [0x62; 32],
+        };
+
+        assert!(!profile5_plan_matches_local_interest(&interest, &outside));
+    }
+
+    #[test]
+    fn profile5_sender_interest_and_route_denial_preserve_cursor() {
+        // Mutation caught: selecting from durable inventory without the peer's
+        // exact protected interest or route/content commitment discloses SOURCE
+        // and can settle past work that peer never requested.
+        let services = control_test_services([0xb8; 32]);
+        let state = root("profile5-peer-denial");
+        fs::create_dir_all(&state).expect("peer denial state");
+        let store = Store::open_for_mission(
+            state.join(STORE_FILE),
+            services.member.mission_authority_id(),
+        )
+        .expect("peer denial store");
+        let mut verifier = open_test_sealer(&services.member);
+        let publication = publish_test_blob(
+            &store,
+            &mut verifier,
+            &services.topic,
+            &services.scope,
+            1,
+            b"withhold from uninterested or unauthorized peer",
+        );
+        let policy = store.control_policy_snapshot().unwrap();
+        let mode = mutable_transfer_cursor_mode(EventDirection::ToSessionResponder);
+        assert_eq!(
+            store
+                .mutable_transfer_cursor(
+                    services.other.identity(),
+                    MutableTransferCursorClass::BlobStream,
+                    mode,
+                )
+                .unwrap(),
+            None
+        );
+
+        let uninterested = next_canonical_blob_publication(
+            &store,
+            &policy,
+            &mut verifier,
+            services.other.identity(),
+            &[],
+            &BlobInterest::empty(),
+            EventDirection::ToSessionResponder,
+        )
+        .unwrap();
+        assert!(uninterested.is_none());
+
+        let peer_verifier = open_test_sealer(&services.other);
+        let interested = protected_blob_interest(
+            &store,
+            &peer_verifier,
+            &MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
+                services.topic.clone(),
+                services.scope.clone(),
+                false,
+            )]),
+            true,
+        )
+        .unwrap();
+        let unauthorized = next_canonical_blob_publication(
+            &store,
+            &policy,
+            &mut verifier,
+            services.other.identity(),
+            &[],
+            &interested,
+            EventDirection::ToSessionResponder,
+        )
+        .unwrap();
+        assert!(unauthorized.is_none());
+        assert!(store.get_blob(publication).unwrap().is_some());
+        assert_eq!(
+            store
+                .mutable_transfer_cursor(
+                    services.other.identity(),
+                    MutableTransferCursorClass::BlobStream,
+                    mode,
+                )
+                .unwrap(),
+            None
+        );
+
+        drop(store);
+        fs::remove_dir_all(state).unwrap();
     }
 
     #[test]
@@ -51799,12 +52029,27 @@ mod tests {
         );
         assert!(store.get_blob(publication).unwrap().is_some());
         let policy = store.control_policy_snapshot().expect("finite policy");
+        let peer_verifier = open_test_sealer(&services.other);
+        let peer_interest = protected_blob_interest(
+            &store,
+            &peer_verifier,
+            &MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
+                services.topic.clone(),
+                services.scope.clone(),
+                false,
+            )]),
+            true,
+        )
+        .expect("finite peer interest");
+        let commitments = authenticated_peer_route_commitments(&services.member, &services.other);
 
         let selected = next_canonical_blob_publication(
             &store,
             &policy,
             &mut verifier,
             services.other.identity(),
+            &commitments,
+            &peer_interest,
             EventDirection::ToSessionResponder,
         )
         .expect("finite profile-5 inventory");
@@ -56583,7 +56828,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn semantic_v9_profile_five_contact_transfers_completed_blob_stream() {
+    async fn semantic_v9_profile_five_contact_quarantines_legacy_pack_publications() {
         let services = control_test_services([0x96; 32]);
         let states = [root("v9-stream-source"), root("v9-stream-receiver")];
         for state in &states {
@@ -56602,22 +56847,13 @@ mod tests {
             .map(|index| (index % 251) as u8)
             .collect::<Vec<_>>();
         let mut publisher = open_test_sealer(&services.member);
-        let stream_id = publish_test_blob_stream(
+        let _stream_id = publish_test_blob_stream(
             &source_store,
             &mut publisher,
             &services.topic,
             &services.scope,
             &plaintext,
             0x94,
-        );
-        let second_plaintext = vec![0xa7; aster_mesh::BLOB_STREAM_SEGMENT_BYTES + 29];
-        let second_stream_id = publish_test_blob_stream(
-            &source_store,
-            &mut publisher,
-            &services.topic,
-            &services.scope,
-            &second_plaintext,
-            0x99,
         );
         let node = |store: Arc<Store>, mission: UnprotectedReferenceMission, clock: u8| {
             TestForwardingNode {
@@ -56649,16 +56885,11 @@ mod tests {
         );
         let client = client.expect("v9 stream sender contact");
         let server = server.expect("v9 stream receiver contact");
-        assert!(client.receipt.blob_stream.sent_bytes > plaintext.len() as u64);
+        assert_eq!(client.receipt.blob_stream.sent_bytes, 0);
         assert_eq!(client.receipt.blob_stream.received_bytes, 0);
         assert_eq!(server.receipt.blob_stream.sent_bytes, 0);
-        assert_eq!(
-            server.receipt.blob_stream.received_bytes,
-            client.receipt.blob_stream.sent_bytes
-        );
-        assert_eq!(server.receipt.blob_stream.completed_partitions, 3);
-        assert_eq!(server.receipt.blob_stream.map.items, 3);
-        assert_eq!(server.receipt.blob_stream.sink.items, 3);
+        assert_eq!(server.receipt.blob_stream.received_bytes, 0);
+        assert_eq!(server.receipt.blob_stream.completed_partitions, 0);
 
         let policy = receiver_store
             .control_policy_snapshot()
@@ -56666,61 +56897,7 @@ mod tests {
         let publications = receiver_store
             .blob_stream_publications_with_policy(&policy)
             .expect("receiver stream publications");
-        let publication = publications
-            .iter()
-            .find(|publication| publication.stream_id() == stream_id)
-            .expect("transferred stream publication");
-        let receiver = open_test_sealer(&services.other);
-        let verified_open = receiver
-            .verify_blob_stream_open(publication.authenticated_open())
-            .expect("verify received stream open");
-        let opener = receiver
-            .blob_stream_segment_opener(&verified_open)
-            .expect("open received stream content");
-        let pack_root = aster_redb_store::pack::PinnedBlobPackRoot::open(&receiver_store)
-            .expect("pin received stream pack root");
-        let mut reader =
-            aster_redb_store::pack::BlobPackReader::open_pinned(&pack_root, publication.open())
-                .expect("open received stream pack");
-        let mut received = Vec::with_capacity(plaintext.len());
-        while let Some(segment) = reader.next_segment().expect("read received segment") {
-            let (bytes, _) = opener
-                .open(&segment)
-                .expect("authenticate received segment");
-            received.extend_from_slice(&bytes);
-        }
-        assert_eq!(received, plaintext);
-
-        drop(source_store);
-        let source_store = Arc::new(
-            Store::open_for_mission(states[0].join(STORE_FILE), authority)
-                .expect("reopen v9 stream source store"),
-        );
-        let (second_client, second_server, _, _) =
-            contact_test_pair_with_forwarding_results_tracked_and_interests(
-                node(receiver_store.clone(), services.other.clone(), 0x9a),
-                node(source_store.clone(), services.member.clone(), 0x9b),
-                MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
-                    services.topic.clone(),
-                    services.scope.clone(),
-                    false,
-                )]),
-                MutableSourceInterests::default(),
-            )
-            .await;
-        assert!(
-            second_client.is_ok() && second_server.is_ok(),
-            "second v9 stream contact failed: client={second_client:?} server={second_server:?}"
-        );
-        let publications = receiver_store
-            .blob_stream_publications_with_policy(&policy)
-            .expect("receiver publications after second contact");
-        assert!(
-            publications
-                .iter()
-                .any(|publication| publication.stream_id() == second_stream_id),
-            "a second contact must progress past the first settled publication"
-        );
+        assert!(publications.is_empty());
         assert_eq!(
             source_store
                 .mutable_transfer_cursor(
@@ -56729,31 +56906,8 @@ mod tests {
                     MutableTransferCursorMode::OfferToPeer,
                 )
                 .expect("profile-5 scheduling cursor"),
-            Some(*second_stream_id.as_bytes())
-        );
-
-        let (converged_client, converged_server, _, _) =
-            contact_test_pair_with_forwarding_results_tracked_and_interests(
-                node(receiver_store.clone(), services.other.clone(), 0x9c),
-                node(source_store.clone(), services.member.clone(), 0x9d),
-                MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
-                    services.topic.clone(),
-                    services.scope.clone(),
-                    false,
-                )]),
-                MutableSourceInterests::default(),
-            )
-            .await;
-        let converged_client = converged_client.expect("converged v9 stream sender contact");
-        let converged_server = converged_server.expect("converged v9 stream receiver contact");
-        assert_eq!(converged_client.receipt.blob_stream.sent_bytes, 0);
-        assert_eq!(converged_server.receipt.blob_stream.received_bytes, 0);
-        assert_eq!(
-            receiver_store
-                .blob_stream_publications_with_policy(&policy)
-                .expect("converged receiver publications")
-                .len(),
-            2
+            None,
+            "a quarantined legacy pack cannot advance the profile-5 cursor",
         );
 
         drop((publications, source_store, receiver_store));

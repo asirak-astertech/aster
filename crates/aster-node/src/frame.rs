@@ -125,9 +125,12 @@ pub(crate) enum FrameEmissionPolicy {
     ReceiveOnly,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct BlobStreamSourceOfferV1 {
     pub transfer_id: [u8; 32],
+    pub topic: Topic,
+    pub scope: Scope,
+    pub key_epoch: u64,
     pub source_len: u32,
     pub source_digest: [u8; 32],
 }
@@ -1543,7 +1546,12 @@ impl Frame {
                 direction,
                 attempt_nonce,
                 source,
-            } => encode_blob_stream_plan_offer(&mut output, *direction, *attempt_nonce, *source)?,
+            } => encode_blob_stream_plan_offer(
+                &mut output,
+                *direction,
+                *attempt_nonce,
+                source.clone(),
+            )?,
             Self::BlobStreamPlanAck {
                 direction,
                 attempt_nonce,
@@ -2418,6 +2426,9 @@ fn encode_blob_stream_plan_offer(
             output.push(1);
             output.extend_from_slice(&nonce);
             output.extend_from_slice(&source.transfer_id);
+            encode_event_name(output, source.topic.as_str(), "Blob stream topic")?;
+            encode_event_name(output, source.scope.as_str(), "Blob stream scope")?;
+            output.extend_from_slice(&source.key_epoch.to_be_bytes());
             output.extend_from_slice(&source.source_len.to_be_bytes());
             output.extend_from_slice(&source.source_digest);
         }
@@ -2443,22 +2454,33 @@ fn decode_blob_stream_plan_offer(body: &[u8]) -> Result<DecodedBlobStreamPlanOff
     let direction = EventDirection::decode(direction)?;
     match body {
         [0] => Ok((direction, None, None)),
-        [1, rest @ ..] if rest.len() == 100 => {
-            let nonce: [u8; 32] = rest[..32]
+        [1, rest @ ..] => {
+            let mut rest = rest;
+            let nonce: [u8; 32] = take_exact(&mut rest, 32, "Blob stream plan nonce")?
                 .try_into()
                 .map_err(|_| NodeError::Protocol("Blob stream plan nonce length differs".into()))?;
-            let transfer_id = rest[32..64]
+            let transfer_id = take_exact(&mut rest, 32, "Blob stream source id")?
                 .try_into()
                 .map_err(|_| NodeError::Protocol("Blob stream source id differs".into()))?;
-            let source_len =
-                u32::from_be_bytes(rest[64..68].try_into().map_err(|_| {
-                    NodeError::Protocol("Blob stream source length differs".into())
-                })?);
-            let source_digest = rest[68..100]
+            let topic = decode_event_topic(&mut rest)?;
+            let scope = decode_event_scope(&mut rest)?;
+            let key_epoch = u64::from_be_bytes(
+                take_exact(&mut rest, 8, "Blob stream key epoch")?
+                    .try_into()
+                    .map_err(|_| NodeError::Protocol("Blob stream key epoch differs".into()))?,
+            );
+            let source_len = u32::from_be_bytes(
+                take_exact(&mut rest, 4, "Blob stream source length")?
+                    .try_into()
+                    .map_err(|_| NodeError::Protocol("Blob stream source length differs".into()))?,
+            );
+            let source_digest = take_exact(&mut rest, 32, "Blob stream source digest")?
                 .try_into()
                 .map_err(|_| NodeError::Protocol("Blob stream source digest differs".into()))?;
             if nonce == [0; 32]
+                || key_epoch == 0
                 || source_len == 0
+                || !rest.is_empty()
                 || usize::try_from(source_len).ok().is_none_or(|length| {
                     length > crate::stream_transfer::MAX_STREAM_AUTHENTICATED_OPEN_BYTES
                 })
@@ -2472,6 +2494,9 @@ fn decode_blob_stream_plan_offer(body: &[u8]) -> Result<DecodedBlobStreamPlanOff
                 Some(nonce),
                 Some(BlobStreamSourceOfferV1 {
                     transfer_id,
+                    topic,
+                    scope,
+                    key_epoch,
                     source_len,
                     source_digest,
                 }),
@@ -5094,6 +5119,9 @@ mod tests {
                 attempt_nonce: Some([0x71; 32]),
                 source: Some(BlobStreamSourceOfferV1 {
                     transfer_id: [0xa4; 32],
+                    topic: Topic::new("imagery").unwrap(),
+                    scope: Scope::new("mission/alpha").unwrap(),
+                    key_epoch: 7,
                     source_len: u32::try_from(
                         crate::stream_transfer::MAX_STREAM_AUTHENTICATED_OPEN_BYTES,
                     )
@@ -5124,6 +5152,9 @@ mod tests {
             attempt_nonce: Some([1; 32]),
             source: Some(BlobStreamSourceOfferV1 {
                 transfer_id: [2; 32],
+                topic: Topic::new("imagery").unwrap(),
+                scope: Scope::new("mission/alpha").unwrap(),
+                key_epoch: 7,
                 source_len: 1,
                 source_digest: [3; 32],
             }),

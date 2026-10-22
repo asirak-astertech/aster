@@ -4,17 +4,12 @@ use crate::{
     event_pages::TransferProfileId,
     frame::EventDirection,
     mission::MissionSession,
-    stream_pipeline::{
-        MappedPartition, PipelineError, PipelineLimits, PipelineReport, StreamJobId,
-        StreamPartition, run_ordered_channel_pipeline_from,
-    },
+    stream_pipeline::PipelineReport,
     stream_transfer::{
-        CanonicalBlobExtentV1, MAX_STREAM_CHECKPOINT_BATCH_BYTES, PROFILE5_ATTEMPT_TIMEOUT,
-        PROFILE5_CANONICAL_EXTENT_BYTES, PROFILE5_EXTENT_BYTES, PROFILE5_IDLE_TIMEOUT,
-        PROFILE5_MAX_RECORD_BYTES, StreamAction, StreamClass, StreamDirection, StreamExtentAction,
-        StreamFrame, StreamOpenV1, StreamReceiverState, StreamResultCode, StreamSenderState,
-        blob_pack_wire_len, encode_composite_data_prefix, profile5_attempt_bounds,
-        profile5_attempt_hard_timeout, profile5_receive_limit, split_composite_data_record,
+        CanonicalBlobExtentV1, PROFILE5_CANONICAL_EXTENT_BYTES, PROFILE5_IDLE_TIMEOUT,
+        StreamAction, StreamClass, StreamDirection, StreamExtentAction, StreamFrame, StreamOpenV1,
+        StreamResultCode, StreamSenderState, encode_composite_data_prefix, profile5_attempt_bounds,
+        profile5_attempt_hard_timeout, split_composite_data_record,
     },
     stream_transport::{
         AttemptOpenRequest, AuthenticatedPeerSupport, AuthenticatedSupportSource,
@@ -24,19 +19,41 @@ use crate::{
     },
 };
 use aster_iroh::Connection;
-use aster_mesh::{
-    BlobStreamOpen, BlobStreamSegmentOpener, NodeId, VerifiedBlobStreamFinalCommitment,
-    VerifiedBlobStreamOpen, VerifiedBlobTransferPlan,
-};
+use aster_mesh::VerifiedBlobTransferPlan;
 use aster_redb_store::{
-    BlobDepotCompletion, BlobOperationKey, BlobSourceRetention, BlobStreamReservation,
-    BlobStreamReservationRequest, BlobStreamResume, BlobStreamSource, BlobTransferId,
-    ControlPolicySnapshot, Store, StoredBlob,
-    pack::{BlobPackCheckpoint, BlobPackReader, BlobPackWriter, PinnedBlobPackRoot},
+    BlobDepotCompletion, BlobSourceRetention, BlobTransferId, ControlPolicySnapshot, Store,
+    StoredBlob,
 };
 use sha2::{Digest, Sha256};
-use std::{future::Future, path::Path, sync::Arc};
-use tokio::{sync::mpsc, time::Instant};
+use std::{future::Future, sync::Arc};
+use tokio::time::Instant;
+
+#[cfg(test)]
+use crate::{
+    stream_pipeline::{
+        MappedPartition, PipelineError, PipelineLimits, StreamJobId, StreamPartition,
+        run_ordered_channel_pipeline_from,
+    },
+    stream_transfer::{
+        MAX_STREAM_CHECKPOINT_BATCH_BYTES, PROFILE5_ATTEMPT_TIMEOUT, PROFILE5_EXTENT_BYTES,
+        PROFILE5_MAX_RECORD_BYTES, StreamReceiverState, blob_pack_wire_len, profile5_receive_limit,
+    },
+};
+#[cfg(test)]
+use aster_mesh::{
+    BlobStreamOpen, BlobStreamSegmentOpener, NodeId, VerifiedBlobStreamFinalCommitment,
+    VerifiedBlobStreamOpen,
+};
+#[cfg(test)]
+use aster_redb_store::{
+    BlobOperationKey, BlobStreamReservation, BlobStreamReservationRequest, BlobStreamResume,
+    BlobStreamSource,
+    pack::{BlobPackCheckpoint, BlobPackReader, BlobPackWriter, PinnedBlobPackRoot},
+};
+#[cfg(test)]
+use std::path::Path;
+#[cfg(test)]
+use tokio::sync::mpsc;
 
 /// Capability-bearing canonical send input. Construction requires the
 /// source/content-verified transfer plan and the Store's nonconstructible
@@ -86,6 +103,18 @@ impl CanonicalBlobSendSource {
 
     pub(crate) fn authenticated_open(&self) -> &[u8] {
         &self.stored.sealed
+    }
+
+    pub(crate) const fn topic(&self) -> &aster_mesh::Topic {
+        &self.stored.header.topic
+    }
+
+    pub(crate) const fn scope(&self) -> &aster_mesh::Scope {
+        &self.stored.header.scope
+    }
+
+    pub(crate) const fn key_epoch(&self) -> u64 {
+        self.stored.header.key_epoch
     }
 }
 
@@ -280,6 +309,7 @@ impl BlobNetworkError {
         }
     }
 
+    #[cfg(test)]
     pub const fn stage(&self) -> BlobNetworkStage {
         self.stage
     }
@@ -336,6 +366,7 @@ async fn await_authenticated_progress<T>(
         .map_err(|error| transport_failure(context, format!("{error:?}")))
 }
 
+#[allow(dead_code)] // Task 5 consumes the complete receiver-facing report.
 #[derive(Debug)]
 pub struct BlobNetworkReport {
     pub wire_bytes: u64,
@@ -346,12 +377,14 @@ pub struct BlobNetworkReport {
     pub pipeline: Option<PipelineReport>,
 }
 
+#[cfg(test)]
 pub type BlobCommitmentVerifier = Arc<
     dyn Fn(&VerifiedBlobStreamOpen, &[u8]) -> Result<VerifiedBlobStreamFinalCommitment, String>
         + Send
         + Sync,
 >;
 
+#[cfg(test)]
 pub struct BlobReceiveStoreSession {
     store: Arc<Store>,
     policy: ControlPolicySnapshot,
@@ -362,6 +395,7 @@ pub struct BlobReceiveStoreSession {
     verify_commitment: BlobCommitmentVerifier,
 }
 
+#[cfg(test)]
 impl BlobReceiveStoreSession {
     pub fn new(
         store: Arc<Store>,
@@ -474,12 +508,14 @@ pub(crate) fn select_stream_transport(
     )
 }
 
+#[cfg(test)]
 fn encoded(frame: StreamFrame) -> Result<Vec<u8>, BlobNetworkError> {
     frame.encode_for_context(9, 5).map_err(|error| {
         BlobNetworkError::new(BlobNetworkStage::Framing, "encode stream frame", error)
     })
 }
 
+#[cfg(test)]
 fn decoded(bytes: &[u8]) -> Result<StreamFrame, BlobNetworkError> {
     StreamFrame::decode_for_context(9, 5, bytes).map_err(|error| {
         BlobNetworkError::new(BlobNetworkStage::Framing, "decode stream frame", error)
@@ -495,8 +531,10 @@ trait BlobRecordCodec: Send {
     fn decode(&mut self, bytes: &[u8]) -> Result<StreamFrame, BlobNetworkError>;
 }
 
+#[cfg(test)]
 struct PlainBlobRecordCodec;
 
+#[cfg(test)]
 impl BlobRecordCodec for PlainBlobRecordCodec {
     fn encode(&mut self, frame: StreamFrame) -> Result<Vec<u8>, BlobNetworkError> {
         if let StreamFrame::Data(data) = frame {
@@ -693,6 +731,7 @@ async fn send_authenticated_source(
     Ok(())
 }
 
+#[allow(dead_code)] // Task 5 receiver admission consumes this staged helper.
 async fn receive_authenticated_source(
     attempt: &dyn StreamReceiveAttempt,
     codec: &mut dyn BlobRecordCodec,
@@ -740,6 +779,7 @@ async fn receive_authenticated_source(
     Ok(source)
 }
 
+#[cfg(test)]
 fn result_digest(open: &BlobStreamOpen, roots: ([u8; 32], [u8; 32])) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(b"aster/blob-network-result/v1");
@@ -749,6 +789,7 @@ fn result_digest(open: &BlobStreamOpen, roots: ([u8; 32], [u8; 32])) -> [u8; 32]
     hasher.finalize().into()
 }
 
+#[cfg(test)]
 async fn finish_receiver_attempt(
     attempt: Arc<dyn crate::stream_transport::StreamReceiveAttempt>,
 ) -> Result<(), BlobNetworkError> {
@@ -766,6 +807,7 @@ async fn finish_receiver_attempt(
         .map_err(|error| transport_failure("finish control stream", format!("{error:?}")))
 }
 
+#[cfg(test)]
 pub(crate) fn completed_pack_wire_len(
     root: &Path,
     open: &BlobStreamOpen,
@@ -776,11 +818,13 @@ pub(crate) fn completed_pack_wire_len(
 }
 
 #[allow(dead_code)] // The pinned receiver arm is reconnected by Task 5.
+#[cfg(test)]
 enum PackAccess<'a> {
     Path(&'a Path),
     Pinned(&'a PinnedBlobPackRoot),
 }
 
+#[cfg(test)]
 impl PackAccess<'_> {
     fn reader(&self, open: &BlobStreamOpen) -> Result<BlobPackReader, BlobNetworkError> {
         match self {
@@ -836,6 +880,7 @@ impl PackAccess<'_> {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn expected_pack_wire_len(plaintext_len: u64) -> Result<u64, BlobNetworkError> {
     blob_pack_wire_len(plaintext_len).map_err(|error| {
         BlobNetworkError::new(
@@ -846,10 +891,12 @@ pub(crate) fn expected_pack_wire_len(plaintext_len: u64) -> Result<u64, BlobNetw
     })
 }
 
+#[cfg(test)]
 struct PackExtentSource {
     reader: BlobPackReader,
 }
 
+#[cfg(test)]
 impl PackExtentSource {
     fn new(root: &PackAccess<'_>, open: &BlobStreamOpen) -> Result<Self, BlobNetworkError> {
         Ok(Self {
@@ -900,6 +947,7 @@ impl PackExtentSource {
     }
 }
 
+#[cfg(test)]
 fn protocol_open(
     open: &BlobStreamOpen,
     authenticated_open: &[u8],
@@ -927,7 +975,8 @@ fn protocol_open(
     }
 }
 
-pub async fn send_completed_pack(
+#[cfg(test)]
+pub(crate) async fn send_completed_pack(
     connection: Connection,
     open: &BlobStreamOpen,
     authenticated_open: Vec<u8>,
@@ -1221,6 +1270,7 @@ pub(crate) async fn send_canonical_blob_profile5(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn send_completed_pack_inner(
     transport: &dyn StreamTransportAdapter,
     open: &BlobStreamOpen,
@@ -1400,12 +1450,14 @@ async fn send_completed_pack_inner(
     })
 }
 
+#[cfg(test)]
 struct RecordPartitioner {
     next_index: u64,
     consumed: u64,
     max_record_bytes: usize,
 }
 
+#[cfg(test)]
 impl RecordPartitioner {
     fn new(next_index: u64, consumed: u64) -> Self {
         Self {
@@ -1482,11 +1534,13 @@ impl RecordPartitioner {
 }
 
 #[derive(Clone)]
+#[cfg(test)]
 struct DurableProgress {
     wire_offset: u64,
     checkpoint: BlobPackCheckpoint,
 }
 
+#[cfg(test)]
 async fn send_durable_checkpoint(
     attempt: &std::sync::Arc<dyn crate::stream_transport::StreamReceiveAttempt>,
     state: &mut StreamReceiverState,
@@ -1518,7 +1572,8 @@ async fn send_durable_checkpoint(
     Ok(())
 }
 
-pub async fn receive_completed_pack(
+#[cfg(test)]
+pub(crate) async fn receive_completed_pack(
     connection: Connection,
     open: &BlobStreamOpen,
     opener: BlobStreamSegmentOpener,
@@ -1543,7 +1598,8 @@ pub async fn receive_completed_pack(
     .await
 }
 
-pub async fn receive_completed_pack_with_store(
+#[cfg(test)]
+pub(crate) async fn receive_completed_pack_with_store(
     connection: Connection,
     session: BlobReceiveStoreSession,
     opener: BlobStreamSegmentOpener,
@@ -1571,6 +1627,7 @@ pub async fn receive_completed_pack_with_store(
 
 #[allow(clippy::too_many_arguments)]
 #[allow(dead_code)] // Task 5 supplies profile-5 source acceptance before this receiver.
+#[cfg(test)]
 pub(crate) async fn receive_completed_pack_with_store_protected(
     connection: Connection,
     mission: &mut MissionSession,
@@ -1610,6 +1667,7 @@ pub(crate) async fn receive_completed_pack_with_store_protected(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn receive_completed_pack_inner(
     transport: &dyn StreamTransportAdapter,
     open: &BlobStreamOpen,
@@ -2058,6 +2116,9 @@ mod tests {
             attempt_nonce: Some(attempt_nonce),
             source: Some(crate::frame::BlobStreamSourceOfferV1 {
                 transfer_id: [0x62; 32],
+                topic: Topic::new("imagery").unwrap(),
+                scope: Scope::new("mission/alpha").unwrap(),
+                key_epoch: 1,
                 source_len,
                 source_digest,
             }),
@@ -2166,6 +2227,11 @@ mod tests {
         assert_eq!(
             CanonicalBlobExtentV1::decode(&decoded.bytes).unwrap(),
             extent
+        );
+        assert_eq!(
+            crate::stream_validation::decode_validation_extent(&decoded.bytes).unwrap(),
+            extent,
+            "production DATA must decode through the public validation path",
         );
     }
 
