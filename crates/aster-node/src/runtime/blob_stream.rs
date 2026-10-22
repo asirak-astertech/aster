@@ -50,6 +50,19 @@ const PROFILE5_SENDER_ENCODING_WINDOW_BYTES: usize = PROFILE5_CANONICAL_EXTENT_B
 pub(crate) const PROFILE5_SENDER_OWNED_BYTES: usize =
     PROFILE5_SENDER_CARRIER_WINDOW_BYTES + PROFILE5_SENDER_ENCODING_WINDOW_BYTES;
 
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_NATIVE_PROFILE5_CHECKPOINT_BATCH_BYTES: u32;
+}
+
+fn native_profile5_checkpoint_batch_bytes() -> u32 {
+    #[cfg(test)]
+    if let Ok(bytes) = TEST_NATIVE_PROFILE5_CHECKPOINT_BATCH_BYTES.try_with(|bytes| *bytes) {
+        return bytes;
+    }
+    MAX_STREAM_CHECKPOINT_BATCH_BYTES
+}
+
 /// Drop-safe owner for the peer-visible DATA half of a transport attempt.
 /// Normal completion disarms it only after `finish_data` succeeds; every
 /// error or cancellation path synchronously signals adapter cancellation.
@@ -2486,8 +2499,8 @@ async fn receive_native_profile5_pack(
     let opener = verifier
         .blob_stream_segment_opener(&verified_open)
         .map_err(|error| authentication_failure("open native Profile-5 segments", error))?;
-    let mut current_limit =
-        profile5_receive_limit(wire_len, resumed_from, MAX_STREAM_CHECKPOINT_BATCH_BYTES);
+    let checkpoint_batch_bytes = native_profile5_checkpoint_batch_bytes();
+    let mut current_limit = profile5_receive_limit(wire_len, resumed_from, checkpoint_batch_bytes);
     let mut state = StreamReceiverState::new(
         &transfer_open,
         resumed_from,
@@ -2497,7 +2510,7 @@ async fn receive_native_profile5_pack(
     )
     .map_err(|error| failure("initialize native Profile-5 receiver", error))?;
     let StreamAction::Send(accept) = state
-        .accept(MAX_STREAM_CHECKPOINT_BATCH_BYTES)
+        .accept(checkpoint_batch_bytes)
         .map_err(|error| failure("accept native Profile-5 receiver", error))?
     else {
         return Err("native Profile-5 receiver did not produce ACCEPT".into());
@@ -2566,7 +2579,7 @@ async fn receive_native_profile5_pack(
                                 )
                             })?;
                         if wire_end.saturating_sub(*last_checkpoint_wire)
-                            >= u64::from(MAX_STREAM_CHECKPOINT_BATCH_BYTES)
+                            >= u64::from(checkpoint_batch_bytes)
                             || plaintext_end == total_plaintext
                         {
                             Some((
@@ -2651,8 +2664,7 @@ async fn receive_native_profile5_pack(
             };
             parser.push(&data.bytes, &partition_tx).await?;
             received = through;
-            if parser.consumed.saturating_sub(durable_wire)
-                >= u64::from(MAX_STREAM_CHECKPOINT_BATCH_BYTES)
+            if parser.consumed.saturating_sub(durable_wire) >= u64::from(checkpoint_batch_bytes)
                 || parser.consumed == wire_len
             {
                 let progress = durable_rx.recv().await.ok_or_else(|| {
@@ -2671,11 +2683,8 @@ async fn receive_native_profile5_pack(
                         )
                     })?
                     .generation();
-                current_limit = profile5_receive_limit(
-                    wire_len,
-                    progress.wire_offset,
-                    MAX_STREAM_CHECKPOINT_BATCH_BYTES,
-                );
+                current_limit =
+                    profile5_receive_limit(wire_len, progress.wire_offset, checkpoint_batch_bytes);
                 let StreamAction::Send(checkpoint) = state
                     .persisted(progress.wire_offset, generation, current_limit)
                     .map_err(|error| failure("persist native Profile-5 checkpoint", error))?
@@ -4658,6 +4667,16 @@ pub(crate) mod tests {
     };
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+    pub(crate) async fn with_native_profile5_checkpoint_batch<F: Future>(
+        bytes: u32,
+        future: F,
+    ) -> F::Output {
+        assert!(bytes > 0);
+        TEST_NATIVE_PROFILE5_CHECKPOINT_BATCH_BYTES
+            .scope(bytes, future)
+            .await
+    }
 
     struct PendingSendAttempt {
         entered: Arc<tokio::sync::Semaphore>,

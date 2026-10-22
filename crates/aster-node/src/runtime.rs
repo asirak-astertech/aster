@@ -52900,22 +52900,36 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn lifecycle_native_profile5_pack_crosses_without_legacy_repack() {
-        assert_lifecycle_native_profile5_pack_crosses_without_legacy_repack(None).await;
+        assert_lifecycle_native_profile5_pack_crosses_without_legacy_repack(None, None).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn finite_lifecycle_native_profile5_pack_crosses_with_custody() {
-        assert_lifecycle_native_profile5_pack_crosses_without_legacy_repack(Some(600_000)).await;
+        assert_lifecycle_native_profile5_pack_crosses_without_legacy_repack(Some(600_000), None)
+            .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn interrupted_native_profile5_pack_resumes_on_fresh_adapter() {
+        assert_lifecycle_native_profile5_pack_crosses_without_legacy_repack(None, Some(3)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fully_checkpointed_native_profile5_pack_reconnect_sends_finish() {
+        assert_lifecycle_native_profile5_pack_crosses_without_legacy_repack(None, Some(5)).await;
     }
 
     async fn assert_lifecycle_native_profile5_pack_crosses_without_legacy_repack(
         ttl_ms: Option<u64>,
+        fail_after_receives: Option<usize>,
     ) {
         let services = control_test_services([0xe1; 32]);
-        let suffix = if ttl_ms.is_some() {
-            "finite"
-        } else {
-            "durable"
+        let suffix = match (ttl_ms.is_some(), fail_after_receives) {
+            (true, _) => "finite",
+            (false, Some(3)) => "resume",
+            (false, Some(5)) => "fully-checkpointed",
+            (false, Some(_)) => "interrupted",
+            (false, None) => "durable",
         };
         let source_state = root(&format!("native-profile5-pack-source-{suffix}"));
         let target_state = root(&format!("native-profile5-pack-target-{suffix}"));
@@ -52963,6 +52977,7 @@ mod tests {
                 source_session.authenticated_commitment(),
             )
             .expect("verify native source commitment");
+        let publication_stream_id = verified_open.open().stream_id();
         let source = blob_stream::CanonicalBlobSendSource::new_native(
             stored,
             retained.source.clone(),
@@ -52998,9 +53013,6 @@ mod tests {
             .expect("native responder bundle")
             .to_bytes()
             .expect("encode native responder bundle");
-        let (mut sender_session, mut receiver_session, profile_digest) =
-            blob_stream::tests::mission_pair_from_bundles(&initiator_bytes, &responder_bytes);
-        let adapter = blob_stream::tests::MemoryTransportAdapter::new();
         let source_policy = source_store
             .control_policy_snapshot()
             .expect("native source policy");
@@ -53022,6 +53034,102 @@ mod tests {
         let mut target_verifier = open_test_sealer(&services.other);
         let target_cache = AuthenticatedEventRouteCache::empty(&target_verifier);
         let direction = EventDirection::ToSessionResponder;
+        let resumed_after_interruption = if let Some(fail_after_receives) = fail_after_receives {
+            assert!(
+                ttl_ms.is_none(),
+                "resume fixture currently uses durable custody"
+            );
+            let (mut failed_sender, mut failed_receiver, failed_profile_digest) =
+                blob_stream::tests::mission_pair_from_bundles(&initiator_bytes, &responder_bytes);
+            let failed_adapter = blob_stream::tests::MemoryTransportAdapter::with_receive_failure(
+                Some(fail_after_receives),
+            );
+            let failed_source_live = Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal));
+            let failed_source_guard = ContactEmissionGuard {
+                captured: failed_source_live
+                    .snapshot()
+                    .expect("failed source emission snapshot"),
+                live: failed_source_live,
+                custody_clock: NodeCustodyClock::injected([0xd1; 16], 75, 0),
+            };
+            let failed_target_live = Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal));
+            let failed_target_guard = ContactEmissionGuard {
+                captured: failed_target_live
+                    .snapshot()
+                    .expect("failed target emission snapshot"),
+                live: failed_target_live,
+                custody_clock: NodeCustodyClock::injected([0xe5; 16], 7_500, 0),
+            };
+            let failed_transfer = Box::pin(async {
+                let failed_send = Box::pin(CONTACT_EMISSION_GUARD.scope(
+                    failed_source_guard,
+                    blob_stream::send_canonical_blob_profile5(
+                        &failed_adapter,
+                        Arc::clone(&source_store),
+                        &source_policy,
+                        &source,
+                        &mut failed_sender,
+                        failed_profile_digest,
+                        direction,
+                        [0xe6; 32],
+                    ),
+                ));
+                let failed_receive = Box::pin(CONTACT_EMISSION_GUARD.scope(
+                    failed_target_guard,
+                    blob_stream::receive_canonical_blob_profile5(
+                        &failed_adapter,
+                        Arc::clone(&target_store),
+                        &target_cache,
+                        &target_policy,
+                        &mut target_verifier,
+                        &mut failed_receiver,
+                        failed_profile_digest,
+                        direction,
+                        [0xe6; 32],
+                        &offer,
+                    ),
+                ));
+                tokio::join!(failed_send, failed_receive)
+            });
+            let failed = blob_stream::tests::with_native_profile5_checkpoint_batch(
+                BLOB_STREAM_SEGMENT_BYTES as u32,
+                tokio::time::timeout(std::time::Duration::from_secs(15), failed_transfer),
+            )
+            .await
+            .expect("interrupted native attempt terminates");
+            assert!(
+                failed.0.is_err() && failed.1.is_err(),
+                "both peers must observe the interrupted adapter: {failed:?}"
+            );
+            assert!(
+                target_store
+                    .get_blob(publication)
+                    .expect("interrupted target lookup")
+                    .is_none(),
+                "interrupted native pack must remain invisible"
+            );
+            let (_, checkpoint) = target_store
+                .resume_blob_upload_by_publication_id(publication_stream_id)
+                .expect("load interrupted native upload")
+                .expect("interrupted native upload remains resumable");
+            let resumed = checkpoint
+                .durable_pack_checkpoint()
+                .expect("interrupted native pack has durable progress")
+                .payload_len();
+            let wire_len = crate::stream_transfer::blob_pack_wire_len(plaintext.len() as u64)
+                .expect("native pack wire length");
+            if fail_after_receives == 5 {
+                assert_eq!(resumed, wire_len);
+            } else {
+                assert!(resumed > 0 && resumed < wire_len);
+            }
+            resumed
+        } else {
+            0
+        };
+        let (mut sender_session, mut receiver_session, profile_digest) =
+            blob_stream::tests::mission_pair_from_bundles(&initiator_bytes, &responder_bytes);
+        let adapter = blob_stream::tests::MemoryTransportAdapter::new();
         let nonce = [0xe2; 32];
         let source_live = Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal));
         let source_guard = ContactEmissionGuard {
@@ -53083,8 +53191,8 @@ mod tests {
         let received = received.expect("native Profile-5 receiver");
         assert_eq!(sent.roots, received.roots);
         assert_eq!(sent.wire_bytes, received.wire_bytes);
-        assert_eq!(sent.resumed_from, 0);
-        assert_eq!(received.resumed_from, 0);
+        assert_eq!(sent.resumed_from, resumed_after_interruption);
+        assert_eq!(received.resumed_from, resumed_after_interruption);
 
         let retry_adapter = blob_stream::tests::MemoryTransportAdapter::new();
         let (mut retry_sender_session, mut retry_receiver_session, retry_profile_digest) =
@@ -53181,7 +53289,17 @@ mod tests {
                 _ => panic!("native source and target packs contain different record counts"),
             }
         }
-        assert_eq!(adapter.data_part_body_lengths(), record_lengths);
+        let mut wire_offset = 0_u64;
+        let transmitted_record_lengths = record_lengths
+            .iter()
+            .copied()
+            .filter(|record_len| {
+                let transmit = wire_offset >= resumed_after_interruption;
+                wire_offset = wire_offset.saturating_add(*record_len as u64);
+                transmit
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(adapter.data_part_body_lengths(), transmitted_record_lengths);
         assert!(retry_adapter.data_part_body_lengths().is_empty());
         let mut target_pack = target_store
             .open_profile5_pack_application_read(target_blob.variant_id)
