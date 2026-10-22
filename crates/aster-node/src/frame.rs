@@ -131,6 +131,7 @@ pub(crate) struct BlobStreamSourceOfferV1 {
     pub topic: Topic,
     pub scope: Scope,
     pub key_epoch: u64,
+    pub content_proof: [u8; BLOB_CONTENT_PROOF_BYTES],
     pub source_len: u32,
     pub source_digest: [u8; 32],
     pub finite: bool,
@@ -2430,6 +2431,7 @@ fn encode_blob_stream_plan_offer(
             encode_event_name(output, source.topic.as_str(), "Blob stream topic")?;
             encode_event_name(output, source.scope.as_str(), "Blob stream scope")?;
             output.extend_from_slice(&source.key_epoch.to_be_bytes());
+            output.extend_from_slice(&source.content_proof);
             output.extend_from_slice(&source.source_len.to_be_bytes());
             output.extend_from_slice(&source.source_digest);
             output.push(u8::from(source.finite));
@@ -2471,6 +2473,13 @@ fn decode_blob_stream_plan_offer(body: &[u8]) -> Result<DecodedBlobStreamPlanOff
                     .try_into()
                     .map_err(|_| NodeError::Protocol("Blob stream key epoch differs".into()))?,
             );
+            let content_proof = take_exact(
+                &mut rest,
+                BLOB_CONTENT_PROOF_BYTES,
+                "Blob stream source content proof",
+            )?
+            .try_into()
+            .map_err(|_| NodeError::Protocol("Blob stream source proof differs".into()))?;
             let source_len = u32::from_be_bytes(
                 take_exact(&mut rest, 4, "Blob stream source length")?
                     .try_into()
@@ -2508,6 +2517,7 @@ fn decode_blob_stream_plan_offer(body: &[u8]) -> Result<DecodedBlobStreamPlanOff
                     topic,
                     scope,
                     key_epoch,
+                    content_proof,
                     source_len,
                     source_digest,
                     finite,
@@ -5134,6 +5144,7 @@ mod tests {
                     topic: Topic::new("imagery").unwrap(),
                     scope: Scope::new("mission/alpha").unwrap(),
                     key_epoch: 7,
+                    content_proof: [0xa6; BLOB_CONTENT_PROOF_BYTES],
                     source_len: u32::try_from(
                         crate::stream_transfer::MAX_STREAM_AUTHENTICATED_OPEN_BYTES,
                     )
@@ -5168,6 +5179,7 @@ mod tests {
                 topic: Topic::new("imagery").unwrap(),
                 scope: Scope::new("mission/alpha").unwrap(),
                 key_epoch: 7,
+                content_proof: [4; BLOB_CONTENT_PROOF_BYTES],
                 source_len: 1,
                 source_digest: [3; 32],
                 finite: false,

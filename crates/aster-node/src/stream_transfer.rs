@@ -18,12 +18,14 @@ pub(crate) const PROFILE5_CANONICAL_EXTENT_BYTES: usize =
     aster_mesh::PROFILE5_CANONICAL_EXTENT_BYTES as usize;
 pub(crate) const CANONICAL_BLOB_EXTENT_HEADER_BYTES: usize =
     aster_mesh::PROFILE5_CANONICAL_EXTENT_HEADER_BYTES as usize;
-#[cfg(test)]
-pub(crate) const PROFILE5_LEGACY_RECORD_PREFIX_BYTES: usize = 4;
-/// Retired ASTRBS02 local-pack fixture size. It is not a semantic-v9 extent.
-#[cfg(test)]
-pub(crate) const PROFILE5_LEGACY_SEGMENT_RECORD_BYTES: usize =
+pub(crate) const PROFILE5_PACK_RECORD_PREFIX_BYTES: usize = 4;
+/// Maximum exact length-prefixed ASTRBS02 record size.
+pub(crate) const PROFILE5_PACK_SEGMENT_RECORD_BYTES: usize =
     aster_mesh::BLOB_STREAM_SEGMENT_BYTES + aster_mesh::BLOB_STREAM_SEGMENT_ENCODED_OVERHEAD_BYTES;
+/// One length-prefixed authenticated ASTRBS02 record. Native Profile-5 pack
+/// transfer keeps the record intact instead of emitting a tiny tail frame.
+pub(crate) const PROFILE5_PACK_TRANSPORT_FRAME_BYTES: usize =
+    PROFILE5_PACK_RECORD_PREFIX_BYTES + PROFILE5_PACK_SEGMENT_RECORD_BYTES;
 /// No authenticated protocol progress for this long is a retryable stall.
 pub(crate) const PROFILE5_IDLE_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 /// Legacy pack paths retain their bounded attempt while profile-5 canonical
@@ -31,7 +33,7 @@ pub(crate) const PROFILE5_IDLE_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 pub(crate) const PROFILE5_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const PROFILE5_MIN_USEFUL_BYTES_PER_SECOND: u64 = 128 * 1024;
 const PROFILE5_SETTLEMENT_HEADROOM: Duration = Duration::from_secs(20 * 60);
-pub(crate) const MAX_STREAM_EXTENT_BYTES: usize = PROFILE5_CANONICAL_EXTENT_BYTES;
+pub(crate) const MAX_STREAM_EXTENT_BYTES: usize = PROFILE5_PACK_TRANSPORT_FRAME_BYTES;
 pub(crate) const MAX_STREAM_CHECKPOINT_BATCH_BYTES: u32 = 128 * 1_048_576;
 pub(crate) const STREAM_DATA_FIXED_BYTES: usize = 89;
 pub(crate) const MAX_PROTECTED_STREAM_DATA_HEADER_BYTES: usize = 2 * 1024;
@@ -106,14 +108,13 @@ pub(crate) fn profile5_attempt_hard_timeout(bytes: u64) -> Duration {
         .saturating_add(PROFILE5_SETTLEMENT_HEADROOM)
 }
 
-#[cfg(test)]
 pub(crate) fn blob_pack_wire_len(plaintext_len: u64) -> Result<u64, StreamError> {
     let segments = plaintext_len.div_ceil(aster_mesh::BLOB_STREAM_SEGMENT_BYTES as u64);
     plaintext_len
         .checked_add(
             segments
                 .checked_mul(
-                    PROFILE5_LEGACY_RECORD_PREFIX_BYTES as u64
+                    PROFILE5_PACK_RECORD_PREFIX_BYTES as u64
                         + aster_mesh::BLOB_STREAM_SEGMENT_ENCODED_OVERHEAD_BYTES as u64,
                 )
                 .ok_or_else(|| StreamError::invalid("wire length overflow"))?,
@@ -1885,13 +1886,16 @@ mod stream_frame_codec {
     use sha2::{Digest, Sha256};
 
     #[test]
-    fn profile5_checkpoint_policy_batches_one_hundred_twenty_eight_mib() {
-        assert_eq!(MAX_STREAM_EXTENT_BYTES, 1_048_576);
-        assert!(extent(1_048_576).is_ok());
-        assert!(extent(1_048_577).is_err());
+    fn profile5_checkpoint_policy_and_native_record_bounds_are_independent() {
+        assert_eq!(PROFILE5_CANONICAL_EXTENT_BYTES, 1_048_576);
+        assert_eq!(PROFILE5_PACK_SEGMENT_RECORD_BYTES, 1_048_706);
+        assert_eq!(PROFILE5_PACK_TRANSPORT_FRAME_BYTES, 1_048_710);
+        assert_eq!(MAX_STREAM_EXTENT_BYTES, PROFILE5_PACK_TRANSPORT_FRAME_BYTES);
+        assert!(extent(PROFILE5_PACK_TRANSPORT_FRAME_BYTES as u32).is_ok());
+        assert!(extent((PROFILE5_PACK_TRANSPORT_FRAME_BYTES + 1) as u32).is_err());
         assert_eq!(MAX_STREAM_CHECKPOINT_BATCH_BYTES, 128 * 1_048_576);
         assert_eq!(
-            PROFILE5_LEGACY_SEGMENT_RECORD_BYTES,
+            PROFILE5_PACK_SEGMENT_RECORD_BYTES,
             aster_mesh::BLOB_STREAM_SEGMENT_BYTES
                 + aster_mesh::BLOB_STREAM_SEGMENT_ENCODED_OVERHEAD_BYTES
         );

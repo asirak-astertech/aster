@@ -47,11 +47,11 @@ use aster_iroh::{
     PreparedNearbyDiscoveryBrowser,
 };
 use aster_mesh::{
-    AuthenticatedBlobCustodyContactV1, BlobContentVerification, BlobCustodyClaimV1,
-    BlobCustodyDirectionV1, BlobCustodyTransferId, BlobError, BlobId, BlobPhysicalLineage,
-    ContentVerifiedBlobEnvelope, ContentVerifiedEventEnvelope, CustodyClaims, CustodyError,
-    CustodyExpectation, CustodyHop, CustodySample, CustodyTransferClaims, CustodyTransferId,
-    EventContentVerification, EventRouteLineage, MAX_CUSTODY_WRAPPER_BYTES,
+    AuthenticatedBlobCustodyContactV1, BLOB_STREAM_SEGMENT_BYTES, BlobContentVerification,
+    BlobCustodyClaimV1, BlobCustodyDirectionV1, BlobCustodyTransferId, BlobError, BlobId,
+    BlobPhysicalLineage, ContentVerifiedBlobEnvelope, ContentVerifiedEventEnvelope, CustodyClaims,
+    CustodyError, CustodyExpectation, CustodyHop, CustodySample, CustodyTransferClaims,
+    CustodyTransferId, EventContentVerification, EventRouteLineage, MAX_CUSTODY_WRAPPER_BYTES,
     MIN_CUSTODY_SEMANTIC_VERSION, NodeId, Priority, ProvisioningAccess, ProvisioningLoadId,
     ProvisioningProtectionError, ProvisioningSecretLoader, ProvisioningSecretRef,
     ProvisioningUnprotector, REFERENCE_SESSION_FRAME_OVERHEAD_BYTES, RecordContentVerification,
@@ -10384,6 +10384,99 @@ fn authenticate_blob_source(
     )
 }
 
+/// Authenticates a lifecycle-owned Profile-5 source directly from its signed
+/// stream open and final commitment. `None` means the retained source uses the
+/// legacy envelope/depot representation; `Some(false)` means this verifier
+/// generation cannot yet authenticate the Profile-5 authority during control
+/// replay.
+fn try_authenticate_profile5_blob_source(
+    store: &Store,
+    verifier: &ReferenceEnvelopeSealer,
+    projection: &BlobSourceProjection,
+    retention: BlobSourceRetention,
+) -> Result<Option<bool>, NodeError> {
+    if !matches!(retention, BlobSourceRetention::Completed { .. }) {
+        return Ok(None);
+    }
+    let stored = store.get_blob(projection.transfer_id)?.ok_or_else(|| {
+        NodeError::Protocol("completed Blob projection lost its source row".into())
+    })?;
+    let session = match store.open_profile5_pack_application_read(stored.variant_id) {
+        Ok(session) => session,
+        Err(StoreError::Blob(BlobStoreError::NotFound)) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let verified_open = match verifier.verify_blob_stream_open(session.authenticated_open()) {
+        Ok(open) => open,
+        Err(_) => return Ok(Some(false)),
+    };
+    if verifier
+        .verify_blob_stream_commitment(&verified_open, session.authenticated_commitment())
+        .is_err()
+    {
+        return Ok(Some(false));
+    }
+    let open = verified_open.open();
+    let commitment = session.commitment();
+    let sealed_len = u64::try_from(stored.sealed.len())
+        .map_err(|_| NodeError::Protocol("Profile-5 source length overflow".into()))?;
+    let mut semantic = Sha256::new();
+    semantic.update(b"aster/blob-profile5-semantic/v1\0");
+    semantic.update(open.publisher());
+    semantic.update(open.publisher_counter().to_be_bytes());
+    semantic.update(open.digest());
+    semantic.update(commitment.encode());
+    let semantic_id = BlobSemanticId::new(semantic.finalize().into());
+    let manifest_digest: [u8; 32] = Sha256::digest(commitment.encode()).into();
+    let source_transfer = BlobTransferId::new(Sha256::digest(&stored.sealed).into());
+    if stored.transfer_id != projection.transfer_id
+        || source_transfer != projection.transfer_id
+        || stored.semantic_id != projection.semantic_id
+        || semantic_id != projection.semantic_id
+        || stored.blob_id != projection.blob_id
+        || commitment.blob_id() != projection.blob_id
+        || stored.manifest_digest != projection.manifest_digest
+        || manifest_digest != projection.manifest_digest
+        || stored.route_lineage != Some(projection.route_lineage)
+        || stored.physical_lineage != Some(projection.physical_lineage)
+        || session.route_lineage() != &projection.route_lineage
+        || session.physical_lineage() != &projection.physical_lineage
+        || open.publisher() != projection.publisher
+        || open.topic() != &projection.topic
+        || open.scope() != &projection.scope
+        || open.content_epoch() != projection.epoch
+        || open.total_len() != projection.total_len
+        || commitment.total_len() != projection.total_len
+        || commitment.segment_count() != projection.chunk_count
+        || projection.chunk_size != BLOB_STREAM_SEGMENT_BYTES as u32
+        || projection.sealed_len != sealed_len
+        || stored.header.stamp.dot.publisher != open.publisher()
+        || stored.header.stamp.dot.counter != open.publisher_counter()
+        || stored.header.topic != *open.topic()
+        || stored.header.scope != *open.scope()
+        || stored.header.priority != open.priority()
+        || stored.header.ttl_ms != open.ttl_ms()
+        || stored.header.key_epoch != open.content_epoch()
+        || stored.header.logical_key.as_slice() != commitment.blob_id().as_bytes()
+    {
+        return Err(NodeError::Protocol(
+            "retained Profile-5 Blob proof differs from its exact transfer".into(),
+        ));
+    }
+    if verifier.blob_stream_authorization_digest(open.scope(), open.content_epoch())
+        != Some(projection.route_lineage)
+        || !verifier.is_current_blob_physical_lineage_binding(
+            open.scope(),
+            open.topic(),
+            open.content_epoch(),
+            &projection.physical_lineage,
+        )
+    {
+        return Ok(Some(false));
+    }
+    Ok(Some(true))
+}
+
 fn authenticate_blob_source_for_contact(
     store: &Store,
     verifier: &mut ReferenceEnvelopeSealer,
@@ -10703,6 +10796,8 @@ pub(crate) fn open_startup_event_verifier_and_cache(
     let mut mutable_claims = BTreeMap::new();
     let mut retained_blobs = BTreeMap::new();
     let mut blob_claims = BTreeMap::new();
+    let mut profile5_blobs = BTreeSet::new();
+    let mut verified_profile5_blobs = BTreeSet::new();
     // Several authenticated publications may share one immutable physical
     // variant. Startup audits every exact variant once, then reuses only the
     // nonconstructible depot capability; each source claim still cross-binds
@@ -10821,19 +10916,30 @@ pub(crate) fn open_startup_event_verifier_and_cache(
                 "pre-control retained Blob snapshot contains a duplicate exact transfer".into(),
             ));
         }
-        let sealed = retained_blob_sealed(store, &item.source, item.retention)?;
-        if let Some(claim) = try_authenticate_blob_source(
-            store,
-            &mut verifier,
-            &sealed,
-            &item.source,
-            item.retention,
-            Some(&mut startup_blob_completions),
-        )? && (claim.transfer_id != id || blob_claims.insert(id, claim).is_some())
+        match try_authenticate_profile5_blob_source(store, &verifier, &item.source, item.retention)?
         {
-            return Err(NodeError::Protocol(
-                "pre-control retained Blob proof differs from its exact transfer".into(),
-            ));
+            Some(authenticated) => {
+                profile5_blobs.insert(id);
+                if authenticated {
+                    verified_profile5_blobs.insert(id);
+                }
+            }
+            None => {
+                let sealed = retained_blob_sealed(store, &item.source, item.retention)?;
+                if let Some(claim) = try_authenticate_blob_source(
+                    store,
+                    &mut verifier,
+                    &sealed,
+                    &item.source,
+                    item.retention,
+                    Some(&mut startup_blob_completions),
+                )? && (claim.transfer_id != id || blob_claims.insert(id, claim).is_some())
+                {
+                    return Err(NodeError::Protocol(
+                        "pre-control retained Blob proof differs from its exact transfer".into(),
+                    ));
+                }
+            }
         }
     }
     if retained_blobs.len() > cache.blob_capacity {
@@ -10843,7 +10949,7 @@ pub(crate) fn open_startup_event_verifier_and_cache(
     }
     let mut unclaimed_blobs_by_scope_epoch = BTreeMap::new();
     for (id, (projection, _)) in &retained_blobs {
-        if !blob_claims.contains_key(id) {
+        if !blob_claims.contains_key(id) && !verified_profile5_blobs.contains(id) {
             unclaimed_blobs_by_scope_epoch
                 .entry((projection.scope.clone(), projection.epoch))
                 .or_insert_with(Vec::new)
@@ -10879,22 +10985,35 @@ pub(crate) fn open_startup_event_verifier_and_cache(
                     "incremental retained Blob index lost its exact projection".into(),
                 )
             })?;
-            let sealed = retained_blob_sealed(store, projection, *retention)?;
-            let Some(claim) = try_authenticate_blob_source(
-                store,
-                &mut verifier,
-                &sealed,
-                projection,
-                *retention,
-                Some(&mut startup_blob_completions),
-            )?
-            else {
-                continue;
-            };
-            if claim.transfer_id != id || blob_claims.insert(id, claim).is_some() {
-                return Err(NodeError::Protocol(
-                    "incremental retained Blob proof differs from its exact transfer".into(),
-                ));
+            if profile5_blobs.contains(&id) {
+                if try_authenticate_profile5_blob_source(store, &verifier, projection, *retention)?
+                    != Some(true)
+                {
+                    continue;
+                }
+                if !verified_profile5_blobs.insert(id) {
+                    return Err(NodeError::Protocol(
+                        "incremental retained Profile-5 Blob proof is duplicated".into(),
+                    ));
+                }
+            } else {
+                let sealed = retained_blob_sealed(store, projection, *retention)?;
+                let Some(claim) = try_authenticate_blob_source(
+                    store,
+                    &mut verifier,
+                    &sealed,
+                    projection,
+                    *retention,
+                    Some(&mut startup_blob_completions),
+                )?
+                else {
+                    continue;
+                };
+                if claim.transfer_id != id || blob_claims.insert(id, claim).is_some() {
+                    return Err(NodeError::Protocol(
+                        "incremental retained Blob proof differs from its exact transfer".into(),
+                    ));
+                }
             }
         }
     }
@@ -11006,7 +11125,23 @@ pub(crate) fn open_startup_event_verifier_and_cache(
                 "final retained Blob snapshot differs from the pre-control snapshot".into(),
             ));
         }
-        if let Entry::Vacant(entry) = blob_claims.entry(id) {
+        if profile5_blobs.contains(&id) {
+            if !verified_profile5_blobs.contains(&id) {
+                if try_authenticate_profile5_blob_source(
+                    store,
+                    &verifier,
+                    &item.source,
+                    item.retention,
+                )? != Some(true)
+                {
+                    return Err(NodeError::Protocol(
+                        "retained Profile-5 Blob source cannot be opened by its current provider"
+                            .into(),
+                    ));
+                }
+                verified_profile5_blobs.insert(id);
+            }
+        } else if let Entry::Vacant(entry) = blob_claims.entry(id) {
             let sealed = retained_blob_sealed(store, &item.source, item.retention)?;
             let claim = authenticate_blob_source(
                 store,
@@ -11024,7 +11159,11 @@ pub(crate) fn open_startup_event_verifier_and_cache(
             entry.insert(claim);
         }
     }
-    if final_blob_ids.len() != retained_blobs.len() || blob_claims.len() != retained_blobs.len() {
+    if final_blob_ids.len() != retained_blobs.len()
+        || blob_claims.len().checked_add(verified_profile5_blobs.len())
+            != Some(retained_blobs.len())
+        || profile5_blobs != verified_profile5_blobs
+    {
         return Err(NodeError::Protocol(
             "retained Blob source proof is incomplete across control replay".into(),
         ));
@@ -27026,6 +27165,40 @@ fn next_canonical_blob_publication(
                     "profile-5 inventory lost its exact canonical source row".into(),
                 )
             })?;
+        match store.open_profile5_pack_transfer_read(stored.variant_id) {
+            Ok(session) => {
+                let open = verifier.verify_blob_stream_open(session.authenticated_open())?;
+                verifier
+                    .verify_blob_stream_commitment(&open, session.authenticated_commitment())?;
+                if verifier.blob_stream_authorization_digest(
+                    open.open().scope(),
+                    open.open().content_epoch(),
+                ) != Some(retained.source.route_lineage)
+                    || !verifier.is_current_blob_physical_lineage_binding(
+                        open.open().scope(),
+                        open.open().topic(),
+                        open.open().content_epoch(),
+                        &retained.source.physical_lineage,
+                    )
+                {
+                    continue;
+                }
+                let source = blob_stream::CanonicalBlobSendSource::new_native(
+                    stored,
+                    retained.source.clone(),
+                    retained.retention,
+                    open,
+                    &session,
+                )
+                .map_err(profile5_blob_network_error)?;
+                return Ok(Some(SelectedCanonicalBlobPublication {
+                    expected_cursor: cursor,
+                    source,
+                }));
+            }
+            Err(StoreError::Blob(BlobStoreError::NotFound)) => {}
+            Err(error) => return Err(error.into()),
+        }
         let claim = authenticate_blob_source(
             store,
             verifier,
@@ -27160,17 +27333,25 @@ async fn send_profile5_blob_direction(
     if let Some(nonce) = attempt_nonce.as_mut() {
         getrandom::fill(nonce).map_err(|error| blob_stream_error("Blob stream nonce", error))?;
     }
-    let source = publication
-        .as_ref()
-        .map(|publication| BlobStreamSourceOfferV1 {
+    let source = match publication.as_ref() {
+        Some(publication) => Some(BlobStreamSourceOfferV1 {
             transfer_id: *publication.publication().as_bytes(),
             topic: publication.topic().clone(),
             scope: publication.scope().clone(),
             key_epoch: publication.key_epoch(),
+            content_proof: verifier
+                .mint_blob_peer_content_proof(
+                    publication.scope(),
+                    publication.topic(),
+                    publication.key_epoch(),
+                )?
+                .wire_bytes(),
             source_len: u32::try_from(publication.authenticated_open().len()).unwrap_or(u32::MAX),
             source_digest: Sha256::digest(publication.authenticated_open()).into(),
             finite: publication.is_finite(),
-        });
+        }),
+        None => None,
+    };
     let response = request_mission_frame(
         connection,
         mission,
@@ -27316,7 +27497,7 @@ async fn receive_profile5_blob_direction(
     let Some((nonce, source)) = accepted else {
         return Ok(());
     };
-    let selector = local_interest
+    local_interest
         .selector(&source.topic, &source.scope)
         .filter(|selector| selector.epoch() == source.key_epoch)
         .ok_or_else(|| NodeError::Protocol("accepted Blob offer lost local interest".into()))?;
@@ -27332,18 +27513,20 @@ async fn receive_profile5_blob_direction(
         &source.scope,
         &source.topic,
         source.key_epoch,
-        selector.content_proof(),
+        &source.content_proof,
     ) {
         return Err(NodeError::Protocol(
             "authenticated peer lacks the offered Blob route/content grant".into(),
         ));
     }
     guard.check(&store)?;
+    let route_cache = contact_mutable_route_cache(verifier)?;
     let transport = blob_stream::select_production_stream_transport(connection.clone())
         .map_err(profile5_blob_network_error)?;
     let report = Box::pin(blob_stream::receive_canonical_blob_profile5(
         transport.as_ref(),
         Arc::clone(&store),
+        route_cache.as_ref(),
         guard.policy(),
         verifier,
         mission,
@@ -45369,7 +45552,9 @@ mod tests {
                 .create(state)
                 .expect("owner-only direct-Iroh Blob state");
         }
-        let bytes = (0..(aster_mesh::SELECTED_BLOB_CHUNK_SIZE as usize + 211))
+        // Exercise multiple profile-5 extents so QUIC settlement cannot race
+        // with a buffered single-extent transfer.
+        let bytes = (0usize..(1024 * 1024 + 211))
             .map(|index| (index.wrapping_mul(13) % 251) as u8)
             .collect::<Vec<_>>();
         fs::write(&source_path, &bytes).expect("direct-Iroh Blob source");
@@ -45394,7 +45579,7 @@ mod tests {
         let scope = Scope::new("test/runtime-contact").expect("direct-Iroh Blob scope");
         let request = live_blob_request(b"direct-iroh-blob", &topic, &scope);
         let offline = with_test_semantic_version(
-            SEMANTIC_PROTOCOL_V8,
+            SEMANTIC_PROTOCOL_V9,
             Box::pin(start_node(NodeConfig {
                 state: source_state.clone(),
                 bind: SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -45469,7 +45654,7 @@ mod tests {
             *published.id.as_bytes(),
         );
         let (source_running, receiver_running) = with_test_semantic_version(
-            SEMANTIC_PROTOCOL_V8,
+            SEMANTIC_PROTOCOL_V9,
             Box::pin(start_test_pair(
                 source_config,
                 receiver_config,
@@ -45524,7 +45709,6 @@ mod tests {
             })
             .await
             .unwrap_or_else(|error| panic!("direct-Iroh Blob convergence: {error}"));
-        progress.assert_carriers_complete();
         assert_eq!(
             read_live_blob_pages(&receiver_blobs, read.clone()).await,
             bytes
@@ -45560,13 +45744,13 @@ mod tests {
             assert_eq!(receipt.relay_contacts, 0);
             assert_eq!(receipt.unknown_path_contacts, 0);
         }
-        assert!(receiver_receipt.blob_ranges_fetched > 0);
-        assert!(receiver_receipt.blob_bytes_fetched > 0);
+        assert_eq!(receiver_receipt.blob_ranges_fetched, 0);
+        assert_eq!(receiver_receipt.blob_bytes_fetched, 0);
         assert_eq!(receiver_receipt.blobs, 1);
         assert_eq!(receiver_receipt.blob_finalized_variants, 1);
 
         let reopened = with_test_semantic_version(
-            SEMANTIC_PROTOCOL_V8,
+            SEMANTIC_PROTOCOL_V9,
             Box::pin(start_node(NodeConfig {
                 state: receiver_state,
                 bind: SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -48536,6 +48720,157 @@ mod tests {
             Priority::Routine,
             plaintext,
         )
+    }
+
+    fn publish_test_profile5_pack(
+        store: &Store,
+        sealer: &mut ReferenceEnvelopeSealer,
+        topic: &Topic,
+        scope: &Scope,
+        epoch: u64,
+        plaintext: &[u8],
+    ) -> BlobTransferId {
+        let policy = store
+            .control_policy_snapshot()
+            .expect("native Profile-5 source policy");
+        let operation =
+            aster_redb_store::BlobOperationKey::new(b"runtime/native-profile5-crossing".to_vec())
+                .expect("native Profile-5 operation key");
+        let owner = aster_redb_store::BlobOperationOwner::new(sealer.identity(), operation);
+        let request = aster_redb_store::BlobUploadRequest {
+            owner,
+            topic: topic.clone(),
+            scope: scope.clone(),
+            priority: Priority::Routine,
+            ttl_ms: None,
+            media_type: Some("application/octet-stream".into()),
+            schema_id: Vec::new(),
+            total_len: plaintext.len() as u64,
+        };
+        let policy_revision = policy.head().map_or(1, |(revision, _)| revision);
+        let authorization_digest = sealer
+            .blob_stream_authorization_digest(scope, epoch)
+            .expect("native Profile-5 source authorization");
+        let mission = sealer.mission_authority_id();
+        let (reservation, checkpoint, open) = store
+            .reserve_profile5_upload_with_policy(&policy, &request, None, |semantic, existing| {
+                assert!(existing.is_none(), "native test publication is new");
+                let open = aster_mesh::BlobStreamOpen::new(
+                    aster_mesh::local_blob_publication_stream_id(
+                        request.owner.publisher,
+                        request.owner.operation.as_bytes(),
+                    ),
+                    request.owner.publisher,
+                    request.owner.operation.as_bytes().to_vec(),
+                    mission,
+                    semantic.counter(),
+                    semantic.context().clone(),
+                    request.topic.clone(),
+                    request.scope.clone(),
+                    aster_mesh::BlobMetadata::new(request.media_type.clone(), Vec::new())
+                        .expect("native Profile-5 metadata"),
+                    request.priority,
+                    None,
+                    None,
+                    request.total_len,
+                    epoch,
+                    policy_revision,
+                    authorization_digest,
+                    [0x4d; 32],
+                )
+                .expect("native Profile-5 open");
+                let authenticated = sealer.seal_blob_stream_open(&open).map_err(|error| {
+                    StoreError::Blob(BlobStoreError::Verification(error.to_string()))
+                })?;
+                let verified = sealer
+                    .verify_blob_stream_open(&authenticated)
+                    .map_err(|error| {
+                        StoreError::Blob(BlobStoreError::Verification(error.to_string()))
+                    })?;
+                Ok((verified, authenticated))
+            })
+            .expect("reserve native Profile-5 upload");
+        let root = aster_redb_store::pack::PinnedBlobPackRoot::open(store)
+            .expect("native Profile-5 pack root");
+        let mut writer = aster_redb_store::pack::BlobPackWriter::open_projected_upload_pinned(
+            &root,
+            &reservation.pack_identity(),
+            checkpoint.durable_pack_checkpoint(),
+        )
+        .expect("native Profile-5 writer");
+        let segment_sealer = sealer
+            .blob_stream_segment_sealer(&open)
+            .expect("native Profile-5 segment sealer");
+        for (index, bytes) in plaintext.chunks(BLOB_STREAM_SEGMENT_BYTES).enumerate() {
+            let offset = (index * BLOB_STREAM_SEGMENT_BYTES) as u64;
+            let partition = aster_mesh::BlobStreamPlainPartition::new(
+                *open.open().stream_id().as_bytes(),
+                open.open().digest(),
+                open.open().content_epoch(),
+                index as u64,
+                offset,
+                plaintext.len() as u64,
+                bytes.to_vec(),
+            )
+            .expect("native Profile-5 partition");
+            let (segment, leaves) = segment_sealer
+                .seal(partition)
+                .expect("seal native Profile-5 segment");
+            writer
+                .append(&segment, leaves)
+                .expect("append native Profile-5 segment");
+        }
+        let durable = writer
+            .checkpoint()
+            .expect("checkpoint native Profile-5 pack");
+        let checkpoint = store
+            .checkpoint_blob_upload(&policy, &reservation, checkpoint, durable)
+            .expect("project native Profile-5 checkpoint");
+        let (plaintext_root, ciphertext_root) =
+            writer.final_roots().expect("native Profile-5 final roots");
+        let commitment = aster_mesh::BlobStreamFinalCommitment::new(
+            &open,
+            plaintext_root,
+            ciphertext_root,
+            writer.next_index(),
+            None,
+        )
+        .expect("native Profile-5 commitment");
+        let authenticated_commitment = sealer
+            .seal_blob_stream_commitment(&commitment)
+            .expect("seal native Profile-5 commitment");
+        let verified_commitment = sealer
+            .verify_blob_stream_commitment(&open, &authenticated_commitment)
+            .expect("verify native Profile-5 commitment");
+        let lineage = sealer
+            .blob_stream_lineage(&open)
+            .expect("native Profile-5 lineage");
+        let completion = writer
+            .finish_profile5(&verified_commitment)
+            .expect("finish native Profile-5 pack");
+        let checkpoint = store
+            .checkpoint_blob_upload(
+                &policy,
+                &reservation,
+                checkpoint,
+                completion.checkpoint().clone(),
+            )
+            .expect("project completed native Profile-5 checkpoint");
+        let checkpoint = store
+            .complete_profile5_upload_pack(
+                &policy,
+                &reservation,
+                checkpoint,
+                completion,
+                &verified_commitment,
+                lineage,
+            )
+            .expect("install native Profile-5 completion");
+        store
+            .commit_profile5_upload_once_with_policy(&policy, &reservation, &checkpoint, None)
+            .expect("promote native Profile-5 publication")
+            .blob()
+            .transfer_id
     }
 
     #[expect(
@@ -52155,6 +52490,7 @@ mod tests {
             topic,
             scope: Scope::new("mission/outside").unwrap(),
             key_epoch: 7,
+            content_proof: [0x63; crate::frame::BLOB_CONTENT_PROOF_BYTES],
             source_len: 128,
             source_digest: [0x62; 32],
             finite: false,
@@ -52605,6 +52941,202 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn lifecycle_native_profile5_pack_crosses_without_legacy_repack() {
+        let services = control_test_services([0xe1; 32]);
+        let source_state = root("native-profile5-pack-source");
+        let target_state = root("native-profile5-pack-target");
+        fs::create_dir_all(&source_state).expect("native source state");
+        fs::create_dir_all(&target_state).expect("native target state");
+        let authority = services.member.mission_authority_id();
+        let source_store = Arc::new(
+            Store::open_for_mission(source_state.join(STORE_FILE), authority)
+                .expect("native source store"),
+        );
+        let target_store = Arc::new(
+            Store::open_for_mission(target_state.join(STORE_FILE), authority)
+                .expect("native target store"),
+        );
+        let plaintext = (0..(2 * BLOB_STREAM_SEGMENT_BYTES + 17))
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let mut source_verifier = open_test_sealer(&services.member);
+        let publication = publish_test_profile5_pack(
+            &source_store,
+            &mut source_verifier,
+            &services.topic,
+            &services.scope,
+            1,
+            &plaintext,
+        );
+        let retained = source_store
+            .blob_source_projection(publication)
+            .expect("native source projection")
+            .expect("native source remains retained");
+        let stored = source_store
+            .get_blob(publication)
+            .expect("native source lookup")
+            .expect("native source exists");
+        let source_session = source_store
+            .open_profile5_pack_transfer_read(stored.variant_id)
+            .expect("native source transfer lease");
+        let verified_open = source_verifier
+            .verify_blob_stream_open(source_session.authenticated_open())
+            .expect("verify native source open");
+        source_verifier
+            .verify_blob_stream_commitment(
+                &verified_open,
+                source_session.authenticated_commitment(),
+            )
+            .expect("verify native source commitment");
+        let source = blob_stream::CanonicalBlobSendSource::new_native(
+            stored,
+            retained.source,
+            retained.retention,
+            verified_open,
+            &source_session,
+        )
+        .expect("bind native source");
+        drop(source_session);
+        let offer = BlobStreamSourceOfferV1 {
+            transfer_id: *source.publication().as_bytes(),
+            topic: source.topic().clone(),
+            scope: source.scope().clone(),
+            key_epoch: source.key_epoch(),
+            content_proof: source_verifier
+                .mint_blob_peer_content_proof(source.scope(), source.topic(), source.key_epoch())
+                .expect("native source peer proof")
+                .wire_bytes(),
+            source_len: u32::try_from(source.authenticated_open().len())
+                .expect("native source length"),
+            source_digest: Sha256::digest(source.authenticated_open()).into(),
+            finite: false,
+        };
+        let initiator_bytes = services
+            .member
+            .fresh_bundle()
+            .expect("native initiator bundle")
+            .to_bytes()
+            .expect("encode native initiator bundle");
+        let responder_bytes = services
+            .other
+            .fresh_bundle()
+            .expect("native responder bundle")
+            .to_bytes()
+            .expect("encode native responder bundle");
+        let (mut sender_session, mut receiver_session, profile_digest) =
+            blob_stream::tests::mission_pair_from_bundles(&initiator_bytes, &responder_bytes);
+        let adapter = blob_stream::tests::MemoryTransportAdapter::new();
+        let source_policy = source_store
+            .control_policy_snapshot()
+            .expect("native source policy");
+        let target_policy = target_store
+            .control_policy_snapshot()
+            .expect("native target policy");
+        let mut target_verifier = open_test_sealer(&services.other);
+        let target_cache = AuthenticatedEventRouteCache::empty(&target_verifier);
+        let direction = EventDirection::ToSessionResponder;
+        let nonce = [0xe2; 32];
+        let sender_future = blob_stream::send_canonical_blob_profile5(
+            &adapter,
+            Arc::clone(&source_store),
+            &source_policy,
+            &source,
+            &mut sender_session,
+            profile_digest,
+            direction,
+            nonce,
+        );
+        let receiver_future = blob_stream::receive_canonical_blob_profile5(
+            &adapter,
+            Arc::clone(&target_store),
+            &target_cache,
+            &target_policy,
+            &mut target_verifier,
+            &mut receiver_session,
+            profile_digest,
+            direction,
+            nonce,
+            &offer,
+        );
+        let (sent, received) = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            tokio::join!(Box::pin(sender_future), Box::pin(receiver_future))
+        })
+        .await
+        .expect("native Profile-5 crossing remains bounded");
+        let sent = sent.expect("native Profile-5 sender");
+        let received = received.expect("native Profile-5 receiver");
+        assert_eq!(sent.roots, received.roots);
+        assert_eq!(sent.wire_bytes, received.wire_bytes);
+        assert_eq!(sent.resumed_from, 0);
+        assert_eq!(received.resumed_from, 0);
+
+        let retry_adapter = blob_stream::tests::MemoryTransportAdapter::new();
+        let (mut retry_sender_session, mut retry_receiver_session, retry_profile_digest) =
+            blob_stream::tests::mission_pair_from_bundles(&initiator_bytes, &responder_bytes);
+        let retry_nonce = [0xe3; 32];
+        let (retry_sent, retry_received) =
+            tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                tokio::join!(
+                    Box::pin(blob_stream::send_canonical_blob_profile5(
+                        &retry_adapter,
+                        Arc::clone(&source_store),
+                        &source_policy,
+                        &source,
+                        &mut retry_sender_session,
+                        retry_profile_digest,
+                        direction,
+                        retry_nonce,
+                    )),
+                    Box::pin(blob_stream::receive_canonical_blob_profile5(
+                        &retry_adapter,
+                        Arc::clone(&target_store),
+                        &target_cache,
+                        &target_policy,
+                        &mut target_verifier,
+                        &mut retry_receiver_session,
+                        retry_profile_digest,
+                        direction,
+                        retry_nonce,
+                        &offer,
+                    ))
+                )
+            })
+            .await
+            .expect("promoted native Profile-5 retry remains bounded");
+        let retry_sent = retry_sent.expect("promoted native Profile-5 retry sender");
+        let retry_received = retry_received.expect("promoted native Profile-5 retry receiver");
+        assert_eq!(retry_sent.roots, retry_received.roots);
+        assert_eq!(retry_sent.resumed_from, retry_sent.wire_bytes);
+        assert_eq!(retry_sent.attempt_bytes, 0);
+        assert_eq!(retry_received.resumed_from, retry_received.wire_bytes);
+        assert_eq!(retry_received.attempt_bytes, 0);
+        assert!(retry_received.pipeline.is_none());
+
+        let target_blob = target_store
+            .get_blob(publication)
+            .expect("native target lookup")
+            .expect("native target publication promoted");
+        let mut target_pack = target_store
+            .open_profile5_pack_application_read(target_blob.variant_id)
+            .expect("native target application lease");
+        let target_open = target_verifier
+            .verify_blob_stream_open(target_pack.authenticated_open())
+            .expect("verify target native open");
+        let opener = target_verifier
+            .blob_stream_segment_opener(&target_open)
+            .expect("target native opener");
+        let mut restored = Vec::with_capacity(plaintext.len());
+        while let Some(segment) = target_pack
+            .next_segment()
+            .expect("read native target segment")
+        {
+            let (bytes, _) = opener.open(&segment).expect("open native target segment");
+            restored.extend_from_slice(&bytes);
+        }
+        assert_eq!(restored, plaintext);
+    }
+
     async fn assert_completed_canonical_blob_crossing(
         sustained_pipeline_bytes: usize,
     ) -> Profile5ReceiverMeasurementReceipt {
@@ -52744,6 +53276,14 @@ mod tests {
                 topic: source.topic().clone(),
                 scope: source.scope().clone(),
                 key_epoch: source.key_epoch(),
+                content_proof: source_verifier
+                    .mint_blob_peer_content_proof(
+                        source.scope(),
+                        source.topic(),
+                        source.key_epoch(),
+                    )
+                    .expect("canonical v9 source proof")
+                    .wire_bytes(),
                 source_len: u32::try_from(source.authenticated_open().len())
                     .expect("canonical v9 source length"),
                 source_digest: Sha256::digest(source.authenticated_open()).into(),
@@ -52816,6 +53356,7 @@ mod tests {
                 )
                 .expect("canonical v9 subscription");
             let mut target_verifier = open_test_sealer(&services.other);
+            let target_cache = AuthenticatedEventRouteCache::empty(&target_verifier);
             let attempt_nonce = [0xa9; 32];
             let direction = EventDirection::ToSessionResponder;
             let source_live = Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal));
@@ -52913,6 +53454,7 @@ mod tests {
                 blob_stream::receive_canonical_blob_profile5(
                     adapter.as_ref(),
                     Arc::clone(&target_store),
+                    &target_cache,
                     &target_policy,
                     &mut target_verifier,
                     &mut receiver_session,
@@ -53251,6 +53793,7 @@ mod tests {
                     blob_stream::receive_canonical_blob_profile5(
                         &ack_adapter,
                         Arc::clone(&target_store),
+                        &target_cache,
                         &target_policy,
                         &mut ack_verifier,
                         &mut ack_receiver,
@@ -53386,6 +53929,7 @@ mod tests {
                     blob_stream::receive_canonical_blob_profile5(
                         &retry_adapter,
                         Arc::clone(&target_store),
+                        &target_cache,
                         &target_policy,
                         &mut retry_verifier,
                         &mut retry_receiver,
@@ -53457,6 +54001,7 @@ mod tests {
                     blob_stream::receive_canonical_blob_profile5(
                         &retry_adapter,
                         Arc::clone(&target_store),
+                        &target_cache,
                         &target_policy,
                         &mut retry_verifier,
                         &mut retry_receiver,

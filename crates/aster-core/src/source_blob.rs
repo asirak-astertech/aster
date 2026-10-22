@@ -757,6 +757,19 @@ impl ReferenceEnvelopeSealer {
         self.current_blob_physical_lineage(scope, topic, epoch) == Some(lineage)
     }
 
+    /// Tests a persisted one-way physical-lineage binding without exposing a
+    /// provider-minted capability or any content-key material.
+    pub fn is_current_blob_physical_lineage_binding(
+        &self,
+        scope: &Scope,
+        topic: &Topic,
+        epoch: u64,
+        binding: &[u8; 32],
+    ) -> bool {
+        self.current_blob_physical_lineage(scope, topic, epoch)
+            .is_some_and(|lineage| lineage.binding() == binding)
+    }
+
     /// Mints the semantic-v5 request proof for this node's exact current Blob
     /// content grant. Content-only nodes can mint a proof, but a serving peer's
     /// verification also requires exact route authorization.

@@ -1366,6 +1366,53 @@ impl Store {
         ))
     }
 
+    /// Reserves a receiver-side pack for an already authenticated remote
+    /// Profile-5 open. The exact publisher dot/open bytes become durable and
+    /// retryable before DATA admission; no local identity is minted.
+    pub fn reserve_received_profile5_upload_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        verified: &VerifiedBlobStreamOpen,
+        authenticated: &[u8],
+    ) -> Result<
+        (
+            BlobUploadReservation,
+            BlobUploadCheckpoint,
+            VerifiedBlobStreamOpen,
+        ),
+        StoreError,
+    > {
+        let open = verified.open();
+        let request = BlobUploadRequest {
+            owner: super::BlobOperationOwner::new(
+                open.publisher(),
+                super::BlobOperationKey::new(open.operation_key().to_vec())?,
+            ),
+            topic: open.topic().clone(),
+            scope: open.scope().clone(),
+            priority: open.priority(),
+            ttl_ms: open.ttl_ms(),
+            media_type: open.metadata().media_type().map(str::to_owned),
+            schema_id: open.metadata().schema_id().to_vec(),
+            total_len: open.total_len(),
+        };
+        self.reserve_profile5_upload_with_policy(
+            policy,
+            &request,
+            open.initial_custody(),
+            |reservation, existing| {
+                if reservation.counter() != open.publisher_counter()
+                    || reservation.context() != open.causal_context()
+                    || reservation.initial_custody() != open.initial_custody()
+                    || existing.is_some_and(|bytes| bytes != authenticated)
+                {
+                    return Err(blob_error(BlobStoreError::OperationConflict));
+                }
+                Ok((verified.clone(), authenticated.to_vec()))
+            },
+        )
+    }
+
     fn reserve_blob_upload_with_policy_impl(
         &self,
         policy: &ControlPolicySnapshot,

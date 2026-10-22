@@ -262,6 +262,37 @@ pub(super) fn blob_source_shape_read(
     route_chunk_count: u64,
     completed: bool,
 ) -> Result<BlobSourceShape, StoreError> {
+    if let Some(encoded) = read
+        .open_table(super::pack_lifecycle::BLOB_PROFILE5_PACKS)?
+        .get(variant_id.as_bytes().as_slice())?
+        .map(|value| value.value().to_vec())
+    {
+        if !completed {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "provisional retained source cannot reference an active Profile-5 pack",
+            )));
+        }
+        let owner_binding = depot_owner_binding_if_present_read(read)?.ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "Profile-5 pack exists without depot owner binding",
+            ))
+        })?;
+        let (total_len, segment_count) = super::pack_lifecycle::source_shape_evidence(
+            &encoded,
+            variant_id,
+            blob_id,
+            epoch,
+            manifest_digest,
+            route_chunk_count,
+            physical_lineage,
+            owner_binding,
+        )?;
+        return Ok(BlobSourceShape {
+            total_len,
+            chunk_size: aster_mesh::BLOB_STREAM_SEGMENT_BYTES as u32,
+            chunk_count: segment_count,
+        });
+    }
     let import = load_import_read(read, variant_id)?.ok_or_else(|| {
         blob_error(BlobStoreError::SchemaInvariant(
             "retained Blob source is missing its exact depot import",
@@ -311,6 +342,37 @@ pub(super) fn blob_source_shape_write(
     route_chunk_count: u64,
     completed: bool,
 ) -> Result<BlobSourceShape, StoreError> {
+    if let Some(encoded) = write
+        .open_table(super::pack_lifecycle::BLOB_PROFILE5_PACKS)?
+        .get(variant_id.as_bytes().as_slice())?
+        .map(|value| value.value().to_vec())
+    {
+        if !completed {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "provisional retained source cannot reference an active Profile-5 pack",
+            )));
+        }
+        let owner_binding = depot_owner_binding_if_present_write(write)?.ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "Profile-5 pack exists without depot owner binding",
+            ))
+        })?;
+        let (total_len, segment_count) = super::pack_lifecycle::source_shape_evidence(
+            &encoded,
+            variant_id,
+            blob_id,
+            epoch,
+            manifest_digest,
+            route_chunk_count,
+            physical_lineage,
+            owner_binding,
+        )?;
+        return Ok(BlobSourceShape {
+            total_len,
+            chunk_size: aster_mesh::BLOB_STREAM_SEGMENT_BYTES as u32,
+            chunk_count: segment_count,
+        });
+    }
     let import = load_import_write(write, variant_id)?.ok_or_else(|| {
         blob_error(BlobStoreError::SchemaInvariant(
             "retained Blob source is missing its exact depot import",

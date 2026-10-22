@@ -3,36 +3,52 @@
 use aster_iroh::{EndpointId, ExpectedPeer};
 use aster_mesh::{ProvisioningAccess, ReferenceProvisioner};
 use aster_node::{
-    MissionExpectedPeer, MutableSourceInterests, NodeConfig, NodeIdentity, SourceInterestSelector,
+    BlobDepotLimits, MissionExpectedPeer, MutableSourceInterests, NodeConfig, NodeIdentity,
+    SelectedForwardingConfig, SourceInterestSelector,
     application::{
-        ApplicationErrorKind, BlobPublishRequest, BlobReadPageRequest, BlobReadRequest,
-        MAX_SELECTED_BLOB_PAGE_BYTES, MAX_SELECTED_LIVE_BLOB_BYTES, Priority, Scope, Topic,
+        ApplicationErrorKind, BlobPublishOptions, BlobPublishRequest, BlobPublishStreamRequest,
+        BlobReadPageRequest, BlobReadRequest, MAX_SELECTED_BLOB_PAGE_BYTES,
+        MAX_SELECTED_BLOB_STREAM_BYTES, Priority, Scope, Topic,
     },
     mission::UnprotectedReferenceMission,
-    start_node,
+    start_node_with_forwarding,
 };
 use aster_redb_store::Store;
 use sha2::{Digest, Sha256};
 use std::{
     error::Error,
     fs::{self, File},
-    io::Write,
+    io::{Read, Seek, SeekFrom, Write},
     net::{SocketAddr, UdpSocket},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 use tokio::time::{sleep, timeout};
+use zeroize::Zeroizing;
 type E = Box<dyn Error + Send + Sync>;
 struct Participant {
     state: PathBuf,
     mission: UnprotectedReferenceMission,
     carrier: EndpointId,
 }
+
+#[cfg(unix)]
+fn create_owner_only_directory(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    fs::DirBuilder::new().mode(0o700).create(path)
+}
+
+#[cfg(not(unix))]
+fn create_owner_only_directory(path: &Path) -> std::io::Result<()> {
+    fs::create_dir(path)
+}
+
 fn participant(root: &Path, name: &str, bytes: Vec<u8>) -> Result<Participant, E> {
     let dir = root.join(name);
-    fs::create_dir(&dir)?;
+    create_owner_only_directory(&dir)?;
     let state = dir.join("state");
-    fs::create_dir(&state)?;
+    create_owner_only_directory(&state)?;
     let mission = UnprotectedReferenceMission::persist(dir.join("mission.bundle"), bytes)?;
     let carrier = NodeIdentity::load_or_create(&state)?.id();
     Ok(Participant {
@@ -67,6 +83,25 @@ fn config(
     assert_eq!(c.sync_interval, Duration::from_millis(500));
     c
 }
+
+fn forwarding(total_len: u64) -> Result<SelectedForwardingConfig, E> {
+    let max_bytes = total_len
+        .checked_mul(3)
+        .and_then(|bytes| bytes.checked_add(256 * 1024 * 1024))
+        .ok_or("benchmark Blob depot byte limit overflow")?;
+    let max_chunks = total_len
+        .div_ceil(64 * 1024)
+        .checked_mul(2)
+        .and_then(|chunks| chunks.checked_add(1024))
+        .ok_or("benchmark Blob depot chunk limit overflow")?;
+    Ok(
+        SelectedForwardingConfig::default().with_blob_depot_limits(BlobDepotLimits::new(
+            max_bytes.max(1),
+            max_chunks.max(1),
+            4,
+        )?),
+    )
+}
 fn receipt(name: &str, r: &aster_node::NodeReceipt) {
     println!(
         "BENCH_RECEIPT {{\"node\":\"{name}\",\"contacts\":{},\"direct_contacts\":{},\"relay_contacts\":{},\"unknown_path_contacts\":{},\"contact_errors\":{},\"blobs\":{},\"pending_blobs\":{},\"blob_ranges_fetched\":{},\"blob_bytes_fetched\":{},\"committed_chunks\":{},\"network_staging_bytes\":{}}}",
@@ -83,6 +118,17 @@ fn receipt(name: &str, r: &aster_node::NodeReceipt) {
         r.blob_network_staging_bytes
     );
 }
+
+fn transfer_is_pending(kind: ApplicationErrorKind) -> bool {
+    matches!(
+        kind,
+        ApplicationErrorKind::NotFound
+            | ApplicationErrorKind::RequestRejected
+            | ApplicationErrorKind::UnauthorizedOrRevoked
+            | ApplicationErrorKind::PolicyUnsettled
+    )
+}
+
 fn fixture_bytes(offset: u64, len: usize) -> Vec<u8> {
     // SplitMix64's bijective output permutation over a counter, not randomness
     // for credentials. Distinct aligned words/chunks avoid a repetitive Blob
@@ -101,6 +147,30 @@ fn fixture_bytes(offset: u64, len: usize) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn benchmark_directories_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let path = std::env::temp_dir().join(format!(
+            "aster-blob-benchmark-directory-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir(&path);
+
+        create_owner_only_directory(&path).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        fs::remove_dir(&path).unwrap();
+
+        assert_eq!(mode, 0o700);
+    }
+
+    #[test]
+    fn receiver_absence_is_pending_until_reconciliation_completes() {
+        assert!(transfer_is_pending(ApplicationErrorKind::NotFound));
+        assert!(!transfer_is_pending(ApplicationErrorKind::Integrity));
+    }
 
     #[test]
     fn all_live_size_chunks_are_distinct_and_generation_is_seek_independent() {
@@ -126,7 +196,7 @@ async fn main() -> Result<(), E> {
     let root = PathBuf::from(&args[1]);
     let len: u64 = args[2].parse()?;
     let deadline: u64 = args[3].parse()?;
-    fs::create_dir(&root)?;
+    create_owner_only_directory(&root)?;
     let topic = Topic::new("benchmark.blob")?;
     let scope = Scope::new("test/blob-benchmark")?;
     let access = ProvisioningAccess::member(scope.clone(), vec![1], vec![topic.clone()])?;
@@ -161,17 +231,24 @@ async fn main() -> Result<(), E> {
     drop(file);
     let expected: String = hash.finalize().iter().map(|b| format!("{b:02x}")).collect();
     println!(
-        "BENCH_SOURCE {{\"bytes\":{len},\"sha256\":\"{expected}\",\"generation_ns\":{},\"max_live_blob_bytes\":{MAX_SELECTED_LIVE_BLOB_BYTES},\"sync_interval_ms\":500,\"tokio_workers\":2}}",
+        "BENCH_SOURCE {{\"bytes\":{len},\"sha256\":\"{expected}\",\"generation_ns\":{},\"max_stream_blob_bytes\":{MAX_SELECTED_BLOB_STREAM_BYTES},\"sync_interval_ms\":500,\"tokio_workers\":2}}",
         generation.elapsed().as_nanos()
     );
+    if len > MAX_SELECTED_BLOB_STREAM_BYTES {
+        return Err("benchmark source exceeds the selected streaming protocol limit".into());
+    }
     let local = SocketAddr::from(([127, 0, 0, 1], 0));
-    let peerless = start_node(config(&publisher, local, None, &topic, &scope)).await?;
+    let peerless = start_node_with_forwarding(
+        config(&publisher, local, None, &topic, &scope),
+        forwarding(len)?,
+    )
+    .await?;
     let total = Instant::now();
     let publication_start = Instant::now();
-    let result = peerless
+    let mut upload = peerless
         .selected_blobs()
-        .publish(
-            BlobPublishRequest {
+        .open_publish_stream(BlobPublishStreamRequest {
+            publication: BlobPublishRequest {
                 operation_key: b"benchmark-once".to_vec(),
                 topic: topic.clone(),
                 scope: scope.clone(),
@@ -179,23 +256,22 @@ async fn main() -> Result<(), E> {
                 media_type: Some("application/octet-stream".into()),
                 schema_id: b"benchmark-v1".to_vec(),
             },
-            File::open(&source)?,
-        )
-        .await;
-    let publication_ns = publication_start.elapsed().as_nanos();
-    if len > MAX_SELECTED_LIVE_BLOB_BYTES {
-        let error = result.expect_err("oversized publication must reject");
-        assert_eq!(error.kind(), ApplicationErrorKind::ResourceLimit);
-        let r = peerless.shutdown().await?;
-        assert_eq!(r.blobs, 0);
-        receipt("publisher_rejected", &r);
-        println!(
-            "BENCH_RESULT {{\"status\":\"rejected_resource_limit\",\"bytes\":{len},\"source_sha256\":\"{expected}\",\"publication_attempt_ns\":{publication_ns},\"publication_ns\":null,\"transfer_ns\":null,\"verification_ns\":null,\"total_ns\":{},\"max_live_blob_bytes\":{MAX_SELECTED_LIVE_BLOB_BYTES}}}",
-            total.elapsed().as_nanos()
-        );
-        return Ok(());
+            options: BlobPublishOptions::durable(),
+            total_len: len,
+        })
+        .await?;
+    let mut source_file = File::open(&source)?;
+    let mut offset = upload.durable_offset();
+    source_file.seek(SeekFrom::Start(offset))?;
+    while offset < len {
+        let chunk_len = usize::try_from((len - offset).min(1024 * 1024))?;
+        let mut bytes = Zeroizing::new(vec![0_u8; chunk_len]);
+        source_file.read_exact(&mut bytes)?;
+        let progress = upload.write(offset, bytes).await?;
+        offset = progress.accepted_offset;
     }
-    let published = result?;
+    let published = upload.finish().await?;
+    let publication_ns = publication_start.elapsed().as_nanos();
     assert_eq!(published.total_len, len);
     assert!(published.inserted);
     println!(
@@ -217,12 +293,12 @@ async fn main() -> Result<(), E> {
     let pc = config(&publisher, pa, Some((&receiver, ra)), &topic, &scope);
     let rc = config(&receiver, ra, Some((&publisher, pa)), &topic, &scope);
     let (p, r) = if publisher.carrier > receiver.carrier {
-        let p = start_node(pc).await?;
-        let r = start_node(rc).await?;
+        let p = start_node_with_forwarding(pc, forwarding(len)?).await?;
+        let r = start_node_with_forwarding(rc, forwarding(len)?).await?;
         (p, r)
     } else {
-        let r = start_node(rc).await?;
-        let p = start_node(pc).await?;
+        let r = start_node_with_forwarding(rc, forwarding(len)?).await?;
+        let p = start_node_with_forwarding(pc, forwarding(len)?).await?;
         (p, r)
     };
     let request = BlobReadRequest {
@@ -231,14 +307,25 @@ async fn main() -> Result<(), E> {
         scope: scope.clone(),
     };
     let h = r.selected_blobs();
+    let publisher_events = p.selected_events();
+    let receiver_events = r.selected_events();
     let mut last = Instant::now();
+    let mut content_visible = false;
     let completed=timeout(Duration::from_secs(deadline),async {
-  loop {match h.read_page(BlobReadPageRequest{blob:request.clone(),offset:0,max_bytes:1}).await {
-   Ok(page)=>{assert_eq!(page.total_len,len);assert_eq!(page.id,published.id);break Ok::<(),E>(());},
-   Err(e) if matches!(e.kind(),ApplicationErrorKind::RequestRejected|ApplicationErrorKind::UnauthorizedOrRevoked|ApplicationErrorKind::PolicyUnsettled)=>{},
-   Err(e)=>break Err(Box::new(e) as E),
-  }
-  if last.elapsed()>=Duration::from_secs(10){let s=r.selected_events().status().await?;println!("BENCH_PROGRESS {{\"elapsed_ns\":{},\"authenticated_contacts\":{},\"failed_contacts\":{}}}",transfer.elapsed().as_nanos(),s.authenticated_contacts,s.failed_contact_attempts);last=Instant::now();}
+  loop {
+   if !content_visible { match h.read_page(BlobReadPageRequest{blob:request.clone(),offset:0,max_bytes:1}).await {
+    Ok(page)=>{assert_eq!(page.total_len,len);assert_eq!(page.id,published.id);content_visible=true;},
+    Err(e) if transfer_is_pending(e.kind())=>{},
+    Err(e)=>break Err(Box::new(e) as E),
+   }}
+   let (publisher_status, receiver_status) = tokio::join!(publisher_events.status(), receiver_events.status());
+   let publisher_status = publisher_status?;
+   let receiver_status = receiver_status?;
+   if publisher_status.failed_contact_attempts > 0 || receiver_status.failed_contact_attempts > 0 {
+    break Err(format!("contact failed before settlement: publisher={} receiver={}", publisher_status.failed_contact_attempts, receiver_status.failed_contact_attempts).into());
+   }
+   if content_visible && publisher_status.authenticated_contacts > 0 && receiver_status.authenticated_contacts > 0 { break Ok::<(),E>(()); }
+  if last.elapsed()>=Duration::from_secs(10){println!("BENCH_PROGRESS {{\"elapsed_ns\":{},\"content_visible\":{},\"publisher_authenticated_contacts\":{},\"receiver_authenticated_contacts\":{},\"publisher_failed_contacts\":{},\"receiver_failed_contacts\":{}}}",transfer.elapsed().as_nanos(),content_visible,publisher_status.authenticated_contacts,receiver_status.authenticated_contacts,publisher_status.failed_contact_attempts,receiver_status.failed_contact_attempts);last=Instant::now();}
   sleep(Duration::from_millis(20)).await;
  }
  }).await;
@@ -246,8 +333,8 @@ async fn main() -> Result<(), E> {
     if let Ok(outcome) = &completed {
         assert!(outcome.is_ok(), "transfer failed: {outcome:?}");
     }
-    // Finish and fold the last contact into receipts before opening stores.
-    sleep(Duration::from_millis(600)).await;
+    // The readiness loop includes terminal contact accounting, so shutdown
+    // cannot truncate profile-5 settlement after content becomes visible.
     let (pr, rr) = tokio::join!(p.shutdown(), r.shutdown());
     let pr = pr?;
     let rr = rr?;
@@ -291,7 +378,11 @@ async fn main() -> Result<(), E> {
     drop(store);
     let transfer_ns = transfer.elapsed().as_nanos();
     let verification = Instant::now();
-    let reopened = start_node(config(&receiver, local, None, &topic, &scope)).await?;
+    let reopened = start_node_with_forwarding(
+        config(&receiver, local, None, &topic, &scope),
+        forwarding(len)?,
+    )
+    .await?;
     let handle = reopened.selected_blobs();
     let mut offset = 0;
     let mut digest = Sha256::new();

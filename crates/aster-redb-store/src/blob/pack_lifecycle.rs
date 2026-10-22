@@ -15,7 +15,11 @@ use std::sync::Arc;
 pub struct Profile5PackReadSession {
     reader: super::pack::BlobPackReader,
     open: BlobStreamOpen,
+    authenticated_open: Vec<u8>,
     commitment: BlobStreamFinalCommitment,
+    authenticated_commitment: Vec<u8>,
+    route_lineage: [u8; 32],
+    physical_lineage: [u8; 32],
     _lease: Arc<super::lease::BlobLeaseHandle>,
 }
 
@@ -24,8 +28,28 @@ impl Profile5PackReadSession {
         &self.open
     }
 
+    pub fn authenticated_open(&self) -> &[u8] {
+        &self.authenticated_open
+    }
+
     pub const fn commitment(&self) -> &BlobStreamFinalCommitment {
         &self.commitment
+    }
+
+    pub fn authenticated_commitment(&self) -> &[u8] {
+        &self.authenticated_commitment
+    }
+
+    pub const fn route_lineage(&self) -> &[u8; 32] {
+        &self.route_lineage
+    }
+
+    pub const fn physical_lineage(&self) -> &[u8; 32] {
+        &self.physical_lineage
+    }
+
+    pub const fn wire_len(&self) -> u64 {
+        self.reader.checkpoint().payload_len()
     }
 
     pub fn next_segment(
@@ -46,6 +70,39 @@ const PACK_VARIANT_MAGIC: &[u8; 8] = b"ASTRPV01";
 const PACK_VARIANT_VERSION: u16 = 2;
 const PACK_SOURCE_MAGIC: &[u8; 8] = b"ASTRPS01";
 const PACK_SOURCE_VERSION: u16 = 1;
+
+pub(super) fn profile5_source_record(
+    authenticated_open: &[u8],
+    authenticated_commitment: &[u8],
+) -> Result<Vec<u8>, StoreError> {
+    let open_len = u32::try_from(authenticated_open.len())
+        .map_err(|_| StoreError::PayloadByteAccountingOverflow)?;
+    let finish_len = u32::try_from(authenticated_commitment.len())
+        .map_err(|_| StoreError::PayloadByteAccountingOverflow)?;
+    let mut source = Vec::with_capacity(
+        8 + 2 + 4 + authenticated_open.len() + 4 + authenticated_commitment.len(),
+    );
+    source.extend_from_slice(PACK_SOURCE_MAGIC);
+    source.extend_from_slice(&PACK_SOURCE_VERSION.to_be_bytes());
+    source.extend_from_slice(&open_len.to_be_bytes());
+    source.extend_from_slice(authenticated_open);
+    source.extend_from_slice(&finish_len.to_be_bytes());
+    source.extend_from_slice(authenticated_commitment);
+    Ok(source)
+}
+
+pub(super) fn profile5_semantic_digest(
+    open: &BlobStreamOpen,
+    commitment: &BlobStreamFinalCommitment,
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"aster/blob-profile5-semantic/v1\0");
+    digest.update(open.publisher());
+    digest.update(open.publisher_counter().to_be_bytes());
+    digest.update(open.digest());
+    digest.update(commitment.encode());
+    digest.finalize().into()
+}
 
 /// Nonconstructible Store-bound projection of one lifecycle-owned Profile-5
 /// physical variant.
@@ -198,30 +255,11 @@ impl BlobPackVariant {
     }
 
     pub(super) fn source_record(&self) -> Result<Vec<u8>, StoreError> {
-        let open_len = u32::try_from(self.authenticated_open.len())
-            .map_err(|_| StoreError::PayloadByteAccountingOverflow)?;
-        let finish_len = u32::try_from(self.authenticated_commitment.len())
-            .map_err(|_| StoreError::PayloadByteAccountingOverflow)?;
-        let mut source = Vec::with_capacity(
-            8 + 2 + 4 + self.authenticated_open.len() + 4 + self.authenticated_commitment.len(),
-        );
-        source.extend_from_slice(PACK_SOURCE_MAGIC);
-        source.extend_from_slice(&PACK_SOURCE_VERSION.to_be_bytes());
-        source.extend_from_slice(&open_len.to_be_bytes());
-        source.extend_from_slice(&self.authenticated_open);
-        source.extend_from_slice(&finish_len.to_be_bytes());
-        source.extend_from_slice(&self.authenticated_commitment);
-        Ok(source)
+        profile5_source_record(&self.authenticated_open, &self.authenticated_commitment)
     }
 
     pub(super) fn semantic_digest(&self) -> [u8; 32] {
-        let mut digest = Sha256::new();
-        digest.update(b"aster/blob-profile5-semantic/v1\0");
-        digest.update(self.open.publisher());
-        digest.update(self.open.publisher_counter().to_be_bytes());
-        digest.update(self.open.digest());
-        digest.update(self.commitment.encode());
-        digest.finalize().into()
+        profile5_semantic_digest(&self.open, &self.commitment)
     }
 
     pub(super) fn is_bound_to(&self, authority: &Arc<()>) -> bool {
@@ -466,6 +504,18 @@ pub(super) fn active_capacity_usage_read(
     capacity_usage(&read.open_table(BLOB_PROFILE5_PACKS)?)
 }
 
+pub(super) fn active_committed_file_bytes_write(
+    write: &redb::WriteTransaction,
+) -> Result<u64, StoreError> {
+    committed_file_bytes(&write.open_table(BLOB_PROFILE5_PACKS)?)
+}
+
+pub(super) fn active_committed_file_bytes_read(
+    read: &redb::ReadTransaction,
+) -> Result<u64, StoreError> {
+    committed_file_bytes(&read.open_table(BLOB_PROFILE5_PACKS)?)
+}
+
 fn capacity_usage(
     packs: &impl ReadableTable<&'static [u8], &'static [u8]>,
 ) -> Result<BlobUploadCapacity, StoreError> {
@@ -478,6 +528,22 @@ fn capacity_usage(
         }
     }
     Ok(usage)
+}
+
+fn committed_file_bytes(
+    packs: &impl ReadableTable<&'static [u8], &'static [u8]>,
+) -> Result<u64, StoreError> {
+    let mut bytes = 0_u64;
+    for row in packs.iter()? {
+        let (_, value) = row?;
+        let pack = BlobPackVariant::decode(value.value(), Arc::new(()))?;
+        if pack.state != PackLifecycleState::Provisional {
+            bytes = bytes
+                .checked_add(pack.completion().pack_len())
+                .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+        }
+    }
+    Ok(bytes)
 }
 
 pub(super) fn active_pack_expectations_write(
@@ -583,6 +649,31 @@ pub(super) fn audit_publication_evidence(
         return Err(pack_schema_error());
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn source_shape_evidence(
+    encoded: &[u8],
+    variant: BlobVariantId,
+    blob_id: aster_mesh::BlobId,
+    epoch: u64,
+    manifest_digest: [u8; 32],
+    segment_count: u64,
+    physical_lineage: [u8; 32],
+    owner_binding: [u8; 32],
+) -> Result<(u64, u64), StoreError> {
+    audit_publication_evidence(
+        encoded,
+        variant,
+        blob_id,
+        epoch,
+        manifest_digest,
+        segment_count,
+        Some(physical_lineage),
+        owner_binding,
+    )?;
+    let pack = BlobPackVariant::decode(encoded, Arc::new(()))?;
+    Ok((pack.open.total_len(), pack.commitment.segment_count()))
 }
 
 pub(super) fn pressure_projection(
@@ -775,7 +866,21 @@ impl super::Store {
         &self,
         variant: BlobVariantId,
     ) -> Result<Profile5PackReadSession, StoreError> {
-        self.open_profile5_pack_read(variant, super::lease::BlobLeaseKind::ApplicationPageRead)
+        self.open_profile5_pack_read(variant, super::lease::BlobLeaseKind::ApplicationPageRead, 0)
+    }
+
+    /// Opens an application reader at the fixed boundary for `segment`.
+    #[doc(hidden)]
+    pub fn open_profile5_pack_application_read_at_segment(
+        &self,
+        variant: BlobVariantId,
+        segment: u64,
+    ) -> Result<Profile5PackReadSession, StoreError> {
+        self.open_profile5_pack_read(
+            variant,
+            super::lease::BlobLeaseKind::ApplicationPageRead,
+            segment,
+        )
     }
 
     /// Opens one transport session over exact canonical pack records while
@@ -785,13 +890,24 @@ impl super::Store {
         &self,
         variant: BlobVariantId,
     ) -> Result<Profile5PackReadSession, StoreError> {
-        self.open_profile5_pack_read(variant, super::lease::BlobLeaseKind::CarrierRange)
+        self.open_profile5_pack_read(variant, super::lease::BlobLeaseKind::CarrierRange, 0)
+    }
+
+    /// Opens a transfer reader at one canonical segment boundary.
+    #[doc(hidden)]
+    pub fn open_profile5_pack_transfer_read_at_segment(
+        &self,
+        variant: BlobVariantId,
+        segment: u64,
+    ) -> Result<Profile5PackReadSession, StoreError> {
+        self.open_profile5_pack_read(variant, super::lease::BlobLeaseKind::CarrierRange, segment)
     }
 
     fn open_profile5_pack_read(
         &self,
         variant: BlobVariantId,
         kind: super::lease::BlobLeaseKind,
+        first_segment: u64,
     ) -> Result<Profile5PackReadSession, StoreError> {
         let _depot = self
             .blob_depot_lock
@@ -817,13 +933,20 @@ impl super::Store {
         drop(read);
         drop(_depot);
         let root = super::pack::PinnedBlobPackRoot::open(self)?;
-        let reader =
-            super::pack::BlobPackReader::open_completed_upload_pinned(&root, pack.completion())
-                .map_err(pack_store_error)?;
+        let reader = super::pack::BlobPackReader::open_completed_upload_pinned_at_segment(
+            &root,
+            pack.completion(),
+            first_segment,
+        )
+        .map_err(pack_store_error)?;
         Ok(Profile5PackReadSession {
             reader,
             open: pack.open.clone(),
+            authenticated_open: pack.authenticated_open.clone(),
             commitment: pack.commitment.clone(),
+            authenticated_commitment: pack.authenticated_commitment.clone(),
+            route_lineage: pack.route_lineage,
+            physical_lineage: pack.physical_lineage,
             _lease: lease,
         })
     }

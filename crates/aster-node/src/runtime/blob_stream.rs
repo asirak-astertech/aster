@@ -10,9 +10,11 @@ use crate::{
     },
     stream_transfer::{
         CanonicalBlobExtentV1, MAX_STREAM_CHECKPOINT_BATCH_BYTES, PROFILE5_CANONICAL_EXTENT_BYTES,
-        PROFILE5_IDLE_TIMEOUT, StreamAction, StreamClass, StreamDirection, StreamExtentAction,
-        StreamFrame, StreamOpenV1, StreamReceiverState, StreamResultCode, StreamSenderState,
-        encode_composite_data_prefix, profile5_attempt_bounds, profile5_attempt_bounds_for_extents,
+        PROFILE5_IDLE_TIMEOUT, PROFILE5_PACK_SEGMENT_RECORD_BYTES,
+        PROFILE5_PACK_TRANSPORT_FRAME_BYTES, StreamAction, StreamClass, StreamDirection,
+        StreamExtentAction, StreamFrame, StreamOpenV1, StreamReceiverState, StreamResultCode,
+        StreamSenderState, blob_pack_wire_len, encode_composite_data_prefix,
+        profile5_attempt_bounds, profile5_attempt_bounds_for_extents,
         profile5_attempt_hard_timeout, profile5_receive_limit, split_composite_data_record,
     },
     stream_transport::{
@@ -23,19 +25,24 @@ use crate::{
 };
 use aster_iroh::Connection;
 use aster_mesh::{
-    BlobContentVerification, BlobCustodyTransferId, ContentVerifiedBlobEnvelope,
-    ReferenceEnvelopeSealer, VerifiedBlobTransferPlan, profile5_canonical_wire_shape,
+    BlobContentVerification, BlobCustodyTransferId, BlobStreamFinalCommitment, BlobStreamOpen,
+    ContentVerifiedBlobEnvelope, ReferenceEnvelopeSealer, VerifiedBlobStreamOpen,
+    VerifiedBlobTransferPlan, profile5_canonical_wire_shape,
 };
+use aster_redb_store::pack::{BlobPackWriter, PinnedBlobPackRoot};
 use aster_redb_store::{
-    ApplyOutcome, BlobDepotCompletion, BlobSourceProjection, BlobSourceRetention,
-    BlobSourceStageOutcome, BlobStreamResume, BlobTransferId, BlobVariantId, ControlPolicySnapshot,
-    Store, StoredBlob,
+    ApplyOutcome, BlobDepotCompletion, BlobOperationKey, BlobOperationOwner, BlobSourceProjection,
+    BlobSourceRetention, BlobSourceStageOutcome, BlobStreamResume, BlobTransferId,
+    BlobUploadCheckpoint, BlobUploadReservation, BlobVariantId, ControlPolicySnapshot, Store,
+    StoredBlob, profile5_pack_identities,
 };
 use sha2::{Digest, Sha256};
 use std::{collections::VecDeque, future::Future, sync::Arc};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use zeroize::Zeroize;
+
+use super::{AuthenticatedEventRouteCache, cache_authenticated_blob_route_claim};
 
 const PROFILE5_SENDER_CARRIER_WINDOW_BYTES: usize = 4 * PROFILE5_CANONICAL_EXTENT_BYTES;
 const PROFILE5_SENDER_ENCODING_WINDOW_BYTES: usize = PROFILE5_CANONICAL_EXTENT_BYTES + 4096;
@@ -118,15 +125,10 @@ impl Drop for SenderAdmissionLifecycle {
 }
 
 #[cfg(test)]
-use crate::stream_transfer::{
-    PROFILE5_ATTEMPT_TIMEOUT, PROFILE5_LEGACY_SEGMENT_RECORD_BYTES, blob_pack_wire_len,
-};
+use crate::stream_transfer::PROFILE5_ATTEMPT_TIMEOUT;
 #[cfg(test)]
-use aster_mesh::{BlobStreamOpen, BlobStreamSegmentOpener};
-#[cfg(test)]
-use aster_redb_store::pack::{
-    BlobPackCheckpoint, BlobPackReader, BlobPackWriter, PinnedBlobPackRoot,
-};
+use aster_mesh::BlobStreamSegmentOpener;
+use aster_redb_store::pack::{BlobPackCheckpoint, BlobPackReader};
 #[cfg(test)]
 use std::path::Path;
 
@@ -134,7 +136,7 @@ use std::path::Path;
 /// source/content-verified transfer plan and the Store's nonconstructible
 /// completion proof; a raw `Store + BlobTransferId` is intentionally
 /// insufficient.
-pub(crate) struct CanonicalBlobSendSource {
+struct LegacyCanonicalBlobSendSource {
     stored: StoredBlob,
     plan: Arc<VerifiedBlobTransferPlan>,
     completion: BlobDepotCompletion,
@@ -143,6 +145,21 @@ pub(crate) struct CanonicalBlobSendSource {
         BlobSourceProjection,
         BlobSourceRetention,
     )>,
+}
+
+struct NativeCanonicalBlobSendSource {
+    stored: StoredBlob,
+    projection: BlobSourceProjection,
+    retention: BlobSourceRetention,
+    open: VerifiedBlobStreamOpen,
+    commitment: BlobStreamFinalCommitment,
+    authenticated_commitment: Vec<u8>,
+    wire_len: u64,
+}
+
+pub(crate) enum CanonicalBlobSendSource {
+    Legacy(LegacyCanonicalBlobSendSource),
+    Native(NativeCanonicalBlobSendSource),
 }
 
 impl CanonicalBlobSendSource {
@@ -170,12 +187,12 @@ impl CanonicalBlobSendSource {
                 "verified source, manifest, and depot completion differ",
             ));
         }
-        Ok(Self {
+        Ok(Self::Legacy(LegacyCanonicalBlobSendSource {
             stored,
             plan: Arc::new(plan),
             completion,
             finite: None,
-        })
+        }))
     }
 
     pub(crate) fn new_with_lifetime(
@@ -189,33 +206,102 @@ impl CanonicalBlobSendSource {
         let finite = blob.ttl_ms().is_some();
         let mut source = Self::new(stored, plan, completion)?;
         if finite {
+            let Self::Legacy(source) = &mut source else {
+                unreachable!("legacy constructor returned native source")
+            };
             source.finite = Some((blob, projection, retention));
         }
         Ok(source)
     }
 
+    pub(crate) fn new_native(
+        stored: StoredBlob,
+        projection: BlobSourceProjection,
+        retention: BlobSourceRetention,
+        open: VerifiedBlobStreamOpen,
+        session: &aster_redb_store::Profile5PackReadSession,
+    ) -> Result<Self, BlobNetworkError> {
+        let value = open.open();
+        let commitment = session.commitment();
+        if stored.transfer_id != projection.transfer_id
+            || stored.semantic_id != projection.semantic_id
+            || stored.blob_id != projection.blob_id
+            || stored.variant_id
+                != BlobVariantId::for_content(
+                    commitment.blob_id(),
+                    &value.content_group(),
+                    value.content_epoch(),
+                )
+            || value.publisher() != projection.publisher
+            || value.topic() != &projection.topic
+            || value.scope() != &projection.scope
+            || value.content_epoch() != projection.epoch
+            || value.total_len() != projection.total_len
+            || commitment.blob_id() != projection.blob_id
+            || commitment.segment_count() != projection.chunk_count
+            || session.route_lineage() != &projection.route_lineage
+            || session.physical_lineage() != &projection.physical_lineage
+            || session.authenticated_open() != open.authenticated_bytes()
+        {
+            return Err(authentication_failure(
+                "bind native Profile-5 send source",
+                "authenticated open, commitment, and lifecycle projection differ",
+            ));
+        }
+        Ok(Self::Native(NativeCanonicalBlobSendSource {
+            stored,
+            projection,
+            retention,
+            open,
+            commitment: commitment.clone(),
+            authenticated_commitment: session.authenticated_commitment().to_vec(),
+            wire_len: session.wire_len(),
+        }))
+    }
+
     pub(crate) const fn publication(&self) -> BlobTransferId {
-        self.stored.transfer_id
+        match self {
+            Self::Legacy(source) => source.stored.transfer_id,
+            Self::Native(source) => source.stored.transfer_id,
+        }
     }
 
     pub(crate) fn authenticated_open(&self) -> &[u8] {
-        &self.stored.sealed
+        match self {
+            Self::Legacy(source) => &source.stored.sealed,
+            Self::Native(source) => source.open.authenticated_bytes(),
+        }
     }
 
     pub(crate) const fn topic(&self) -> &aster_mesh::Topic {
-        &self.stored.header.topic
+        match self {
+            Self::Legacy(source) => &source.stored.header.topic,
+            Self::Native(source) => &source.stored.header.topic,
+        }
     }
 
     pub(crate) const fn scope(&self) -> &aster_mesh::Scope {
-        &self.stored.header.scope
+        match self {
+            Self::Legacy(source) => &source.stored.header.scope,
+            Self::Native(source) => &source.stored.header.scope,
+        }
     }
 
     pub(crate) const fn key_epoch(&self) -> u64 {
-        self.stored.header.key_epoch
+        match self {
+            Self::Legacy(source) => source.stored.header.key_epoch,
+            Self::Native(source) => source.stored.header.key_epoch,
+        }
     }
 
     pub(crate) const fn is_finite(&self) -> bool {
-        self.finite.is_some()
+        match self {
+            Self::Legacy(source) => source.finite.is_some(),
+            Self::Native(source) => {
+                matches!(source.retention, BlobSourceRetention::Completed { .. })
+                    && source.open.open().ttl_ms().is_some()
+            }
+        }
     }
 }
 
@@ -1545,8 +1631,15 @@ fn require_canonical_send_source(
     policy: &ControlPolicySnapshot,
     source: &CanonicalBlobSendSource,
 ) -> Result<(), BlobNetworkError> {
+    let source = match source {
+        CanonicalBlobSendSource::Legacy(source) => source,
+        CanonicalBlobSendSource::Native(source) => {
+            require_native_profile5_send_source(store, policy, source)?;
+            return Ok(());
+        }
+    };
     let exact = store
-        .get_blob(source.publication())
+        .get_blob(source.stored.transfer_id)
         .map_err(|error| lifecycle_failure("load canonical Blob source", error))?
         .ok_or_else(|| lifecycle_failure("load canonical Blob source", "publication is absent"))?;
     if exact != source.stored {
@@ -1558,7 +1651,7 @@ fn require_canonical_send_source(
     let mut authorized = false;
     store
         .visit_retained_blob_sources(Some(policy), |retained| {
-            if retained.source.transfer_id == source.publication()
+            if retained.source.transfer_id == source.stored.transfer_id
                 && matches!(
                     retained.retention,
                     BlobSourceRetention::Completed {
@@ -1584,6 +1677,1043 @@ fn require_canonical_send_source(
     Ok(())
 }
 
+fn require_native_profile5_send_source(
+    store: &Store,
+    policy: &ControlPolicySnapshot,
+    source: &NativeCanonicalBlobSendSource,
+) -> Result<(), BlobNetworkError> {
+    let exact = store
+        .get_blob(source.stored.transfer_id)
+        .map_err(|error| lifecycle_failure("load native Profile-5 source", error))?
+        .ok_or_else(|| {
+            lifecycle_failure("load native Profile-5 source", "publication is absent")
+        })?;
+    if exact != source.stored {
+        return Err(authentication_failure(
+            "recheck native Profile-5 source",
+            "source bytes or metadata changed",
+        ));
+    }
+    let mut authorized = false;
+    store
+        .visit_retained_blob_sources(Some(policy), |retained| {
+            if retained.source == source.projection
+                && retained.retention == source.retention
+                && retained.source.transfer_id == source.stored.transfer_id
+                && matches!(
+                    retained.retention,
+                    BlobSourceRetention::Completed { acceptance_marker }
+                        if acceptance_marker == source.stored.acceptance_marker
+                )
+            {
+                authorized = true;
+            }
+        })
+        .map_err(|error| lifecycle_failure("authorize native Profile-5 source", error))?;
+    if !authorized {
+        return Err(lifecycle_failure(
+            "authorize native Profile-5 source",
+            "publication is not current and lifecycle-visible",
+        ));
+    }
+    Ok(())
+}
+
+fn profile5_segment_for_wire_offset(
+    total_len: u64,
+    wire_len: u64,
+    wire_offset: u64,
+) -> Result<u64, BlobNetworkError> {
+    let record_bytes = PROFILE5_PACK_SEGMENT_RECORD_BYTES as u64 + 4;
+    let full_segments = total_len / aster_mesh::BLOB_STREAM_SEGMENT_BYTES as u64;
+    let full_prefix = full_segments
+        .checked_mul(record_bytes)
+        .ok_or("Profile-5 wire prefix overflow")?;
+    if wire_offset == wire_len {
+        return Ok(total_len.div_ceil(aster_mesh::BLOB_STREAM_SEGMENT_BYTES as u64));
+    }
+    if wire_offset <= full_prefix && wire_offset.is_multiple_of(record_bytes) {
+        return Ok(wire_offset / record_bytes);
+    }
+    Err(BlobNetworkError::new(
+        BlobNetworkStage::Framing,
+        "resume native Profile-5 pack",
+        "durable offset is not a canonical segment boundary",
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_native_profile5_pack(
+    adapter: &dyn StreamTransportAdapter,
+    store: Arc<Store>,
+    policy: &ControlPolicySnapshot,
+    source: &NativeCanonicalBlobSendSource,
+    session: &mut MissionSession,
+    profile_digest: [u8; 32],
+    direction: EventDirection,
+    attempt_nonce: [u8; 32],
+) -> Result<BlobNetworkReport, BlobNetworkError> {
+    if source.open.open().ttl_ms().is_some() {
+        return Err(lifecycle_failure(
+            "send native Profile-5 pack",
+            "finite-lifetime native pack transfer requires imported custody authority",
+        ));
+    }
+    let open_value = source.open.open();
+    let expected_wire = blob_pack_wire_len(open_value.total_len())
+        .map_err(|error| failure("calculate native Profile-5 wire length", error))?;
+    if source.wire_len != expected_wire {
+        return Err(durability_failure(
+            "open native Profile-5 pack",
+            "durable pack length differs from its segment contract",
+        ));
+    }
+    let frame_count = usize::try_from(
+        open_value
+            .total_len()
+            .div_ceil(aster_mesh::BLOB_STREAM_SEGMENT_BYTES as u64),
+    )
+    .map_err(|_| {
+        BlobNetworkError::new(
+            BlobNetworkStage::Framing,
+            "bound native Profile-5 stream",
+            "segment count overflows platform limits",
+        )
+    })?;
+    let (max_data_bytes, max_control_bytes) =
+        profile5_attempt_bounds_for_extents(source.wire_len, frame_count).map_err(|error| {
+            BlobNetworkError::new(
+                BlobNetworkStage::Framing,
+                "bound native Profile-5 stream",
+                error,
+            )
+        })?;
+    let attempt = await_authenticated_progress(
+        "open native Profile-5 transport attempt",
+        adapter.open_attempt(AttemptOpenRequest {
+            deadline: Instant::now() + profile5_attempt_hard_timeout(source.wire_len),
+            max_data_bytes,
+            max_control_bytes,
+        }),
+    )
+    .await?;
+    let mut cancellation = SenderDataCancellation::new(Arc::clone(&attempt));
+    let stream_direction = match direction {
+        EventDirection::ToSessionInitiator => StreamDirection::ToSessionInitiator,
+        EventDirection::ToSessionResponder => StreamDirection::ToSessionResponder,
+    };
+    let transfer_open = StreamOpenV1 {
+        class: StreamClass::Blob,
+        direction: stream_direction,
+        session_transcript: session.session_id(),
+        exchange_id: 1,
+        transfer_id: *source.stored.transfer_id.as_bytes(),
+        source_transfer_id: *source.stored.transfer_id.as_bytes(),
+        publication_id: *source.stored.semantic_id.as_bytes(),
+        variant_id: *source.stored.variant_id.as_bytes(),
+        total_len: source.wire_len,
+        attempt_nonce,
+        checkpoint_generation: 0,
+        custody_digest: None,
+        source_len: u32::try_from(source.open.authenticated_bytes().len()).map_err(|_| {
+            BlobNetworkError::new(
+                BlobNetworkStage::Framing,
+                "bind native Profile-5 source",
+                "authenticated open length overflows",
+            )
+        })?,
+        source_digest: Sha256::digest(source.open.authenticated_bytes()).into(),
+    };
+    let mut codec = MissionBlobRecordCodec {
+        mission: session,
+        profile_digest,
+        direction,
+        attempt_nonce,
+    };
+    await_authenticated_progress(
+        "send native Profile-5 open",
+        attempt.send_data(&codec.encode(StreamFrame::Open(transfer_open.clone()))?),
+    )
+    .await?;
+    send_authenticated_source(
+        attempt.as_ref(),
+        &mut codec,
+        &transfer_open,
+        source.open.authenticated_bytes(),
+    )
+    .await?;
+    let accept =
+        await_authenticated_progress("receive native Profile-5 accept", attempt.receive_control())
+            .await?
+            .ok_or("control stream closed before native Profile-5 accept")?;
+    let StreamFrame::Accept(accept) = codec.decode(&accept)? else {
+        return Err("first native Profile-5 control frame was not ACCEPT".into());
+    };
+    let resumed_from = accept.durable_offset;
+    let first_segment =
+        profile5_segment_for_wire_offset(open_value.total_len(), source.wire_len, resumed_from)?;
+    let mut state =
+        StreamSenderState::new(transfer_open.transfer_id, attempt_nonce, source.wire_len);
+    let accepted = state
+        .accept(accept)
+        .map_err(|error| failure("accept native Profile-5 stream", error))?;
+    let requires_final_checkpoint = canonical_sender_requires_final_checkpoint(accepted)?;
+    let mut checkpoints = 0_u64;
+    if requires_final_checkpoint {
+        let mut reader = store
+            .open_profile5_pack_transfer_read_at_segment(source.stored.variant_id, first_segment)
+            .map_err(|error| durability_failure("open native Profile-5 transfer lease", error))?;
+        if reader.authenticated_open() != source.open.authenticated_bytes()
+            || reader.authenticated_commitment() != source.authenticated_commitment
+            || reader.commitment() != &source.commitment
+        {
+            return Err(authentication_failure(
+                "recheck native Profile-5 transfer source",
+                "leased pack metadata changed",
+            ));
+        }
+        while let Some(record) = reader
+            .next_record()
+            .map_err(|error| durability_failure("read native Profile-5 record", error))?
+        {
+            let mut pending = record.into_bytes();
+            loop {
+                match state
+                    .send_extent(pending)
+                    .map_err(|error| failure("advance native Profile-5 sender", error))?
+                {
+                    StreamExtentAction::Send(data) => {
+                        let (prefix, body) = codec.encode_data_parts(data)?;
+                        await_authenticated_progress(
+                            "send native Profile-5 data",
+                            attempt.send_data_parts(&prefix, &body),
+                        )
+                        .await?;
+                        break;
+                    }
+                    StreamExtentAction::Retry {
+                        reason: crate::stream_transfer::StreamRetry::CreditBlocked,
+                        bytes,
+                    } => {
+                        let checkpoint = await_authenticated_progress(
+                            "receive native Profile-5 checkpoint",
+                            attempt.receive_control(),
+                        )
+                        .await?
+                        .ok_or("control stream closed before native Profile-5 checkpoint")?;
+                        let StreamFrame::Checkpoint(checkpoint) = codec.decode(&checkpoint)? else {
+                            return Err(
+                                "native Profile-5 credit wait received another frame".into()
+                            );
+                        };
+                        state.checkpoint(checkpoint).map_err(|error| {
+                            failure("advance native Profile-5 checkpoint", error)
+                        })?;
+                        require_native_profile5_send_source(&store, policy, source)?;
+                        checkpoints = checkpoints.saturating_add(1);
+                        pending = bytes;
+                    }
+                    StreamExtentAction::Retry { .. } => {
+                        return Err("native Profile-5 sender produced an invalid retry".into());
+                    }
+                }
+            }
+        }
+        let checkpoint = await_authenticated_progress(
+            "receive final native Profile-5 checkpoint",
+            attempt.receive_control(),
+        )
+        .await?
+        .ok_or("control stream closed before final native Profile-5 checkpoint")?;
+        let StreamFrame::Checkpoint(checkpoint) = codec.decode(&checkpoint)? else {
+            return Err("final native Profile-5 control frame was not CHECKPOINT".into());
+        };
+        state
+            .checkpoint(checkpoint)
+            .map_err(|error| failure("advance final native Profile-5 checkpoint", error))?;
+        require_native_profile5_send_source(&store, policy, source)?;
+        checkpoints = checkpoints.saturating_add(1);
+    }
+    require_native_profile5_send_source(&store, policy, source)?;
+    let StreamAction::Send(finish) = state
+        .finish(source.authenticated_commitment.clone())
+        .map_err(|error| failure("finish native Profile-5 sender", error))?
+    else {
+        return Err("native Profile-5 sender did not produce FINISH".into());
+    };
+    await_authenticated_progress(
+        "send native Profile-5 finish",
+        attempt.send_data(&codec.encode(finish)?),
+    )
+    .await?;
+    let result =
+        await_authenticated_progress("receive native Profile-5 result", attempt.receive_control())
+            .await?
+            .ok_or("control stream closed before native Profile-5 result")?;
+    let StreamFrame::Result(result) = codec.decode(&result)? else {
+        return Err("native Profile-5 terminal control frame was not RESULT".into());
+    };
+    let roots = (
+        *source.commitment.blob_id().as_bytes(),
+        Sha256::digest(source.commitment.encode()).into(),
+    );
+    if !matches!(
+        result.code,
+        StreamResultCode::Promoted | StreamResultCode::AlreadyPresent
+    ) || result.result_digest != canonical_result_digest(&transfer_open, roots)
+    {
+        return Err(settlement_failure(
+            "validate native Profile-5 result",
+            "result did not bind the exact pack commitment",
+        ));
+    }
+    let expected = result.code;
+    let (StreamAction::Send(ack), StreamAction::Terminal(settled)) = state
+        .result(result)
+        .map_err(|error| settlement_failure("settle native Profile-5 sender", error))?
+    else {
+        return Err(settlement_failure(
+            "settle native Profile-5 sender",
+            "settlement action differed",
+        ));
+    };
+    if settled != expected {
+        return Err(settlement_failure(
+            "settle native Profile-5 sender",
+            "result code differed",
+        ));
+    }
+    await_authenticated_progress(
+        "send native Profile-5 result acknowledgement",
+        attempt.send_data(&codec.encode(ack)?),
+    )
+    .await?;
+    await_authenticated_progress("finish native Profile-5 data stream", attempt.finish_data())
+        .await?;
+    cancellation.disarm();
+    if await_authenticated_progress(
+        "receive native Profile-5 control EOF",
+        attempt.receive_control(),
+    )
+    .await?
+    .is_some()
+    {
+        return Err("native Profile-5 control stream contained trailing data".into());
+    }
+    Ok(BlobNetworkReport {
+        wire_bytes: source.wire_len,
+        resumed_from,
+        attempt_bytes: source.wire_len.saturating_sub(resumed_from),
+        roots,
+        checkpoints,
+        pipeline: None,
+    })
+}
+
+struct NativeProfile5RecordParser {
+    buffer: Vec<u8>,
+    next_index: u64,
+    consumed: u64,
+}
+
+impl NativeProfile5RecordParser {
+    fn new(next_index: u64, consumed: u64) -> Self {
+        Self {
+            buffer: Vec::with_capacity(PROFILE5_PACK_SEGMENT_RECORD_BYTES + 4),
+            next_index,
+            consumed,
+        }
+    }
+
+    async fn push(
+        &mut self,
+        bytes: &[u8],
+        sender: &mpsc::Sender<Result<StreamPartition, PipelineError>>,
+    ) -> Result<(), BlobNetworkError> {
+        self.buffer.extend_from_slice(bytes);
+        loop {
+            if self.buffer.len() < 4 {
+                return Ok(());
+            }
+            let encoded_len =
+                u32::from_be_bytes(self.buffer[..4].try_into().expect("record length")) as usize;
+            if encoded_len == 0
+                || encoded_len
+                    > aster_mesh::BLOB_STREAM_SEGMENT_BYTES
+                        + aster_mesh::BLOB_STREAM_SEGMENT_ENCODED_OVERHEAD_BYTES
+            {
+                return Err(verification_failure(
+                    "partition native Profile-5 record",
+                    "record length is out of bounds",
+                ));
+            }
+            let record_len = encoded_len
+                .checked_add(4)
+                .ok_or("native Profile-5 record length overflow")?;
+            if self.buffer.len() < record_len {
+                return Ok(());
+            }
+            let wire_end = self
+                .consumed
+                .checked_add(record_len as u64)
+                .ok_or("native Profile-5 wire offset overflow")?;
+            let record = self.buffer.drain(..record_len).collect::<Vec<_>>();
+            sender
+                .send(Ok(StreamPartition::new_at(
+                    self.next_index,
+                    wire_end,
+                    record,
+                )))
+                .await
+                .map_err(|_| {
+                    verification_failure(
+                        "submit native Profile-5 record",
+                        "verification pipeline closed",
+                    )
+                })?;
+            self.next_index = self
+                .next_index
+                .checked_add(1)
+                .ok_or("native Profile-5 segment index overflow")?;
+            self.consumed = wire_end;
+        }
+    }
+
+    fn finish(&self, wire_len: u64) -> Result<(), BlobNetworkError> {
+        if self.buffer.is_empty() && self.consumed == wire_len {
+            Ok(())
+        } else {
+            Err(verification_failure(
+                "finish native Profile-5 records",
+                "stream ended with a partial record",
+            ))
+        }
+    }
+}
+
+#[derive(Clone)]
+struct NativeProfile5DurableProgress {
+    wire_offset: u64,
+    checkpoint: BlobUploadCheckpoint,
+}
+
+fn existing_native_profile5_pack(
+    store: &Store,
+    policy: &ControlPolicySnapshot,
+    verified_open: &VerifiedBlobStreamOpen,
+    transfer_open: &StreamOpenV1,
+) -> Result<Option<(StoredBlob, aster_redb_store::Profile5PackReadSession)>, BlobNetworkError> {
+    let open = verified_open.open();
+    let operation = BlobOperationKey::new(open.operation_key().to_vec())
+        .map_err(|error| authentication_failure("bind native Profile-5 operation", error))?;
+    let owner = BlobOperationOwner::new(open.publisher(), operation);
+    let Some(blob) = store
+        .blob_for_owner_with_policy(policy, &owner)
+        .map_err(|error| lifecycle_failure("resolve native Profile-5 retry", error))?
+    else {
+        return Ok(None);
+    };
+    let pack = store
+        .open_profile5_pack_transfer_read(blob.variant_id)
+        .map_err(|error| durability_failure("open promoted native Profile-5 retry", error))?;
+    let (transfer_id, semantic_id, variant_id) = profile5_pack_identities(
+        pack.open(),
+        pack.authenticated_open(),
+        pack.commitment(),
+        pack.authenticated_commitment(),
+    )
+    .map_err(|error| authentication_failure("derive promoted Profile-5 identities", error))?;
+    if pack.open() != open
+        || pack.authenticated_open() != verified_open.authenticated_bytes()
+        || blob.transfer_id != transfer_id
+        || blob.semantic_id != semantic_id
+        || blob.variant_id != variant_id
+        || transfer_open.transfer_id != *transfer_id.as_bytes()
+        || transfer_open.source_transfer_id != *transfer_id.as_bytes()
+        || transfer_open.publication_id != *semantic_id.as_bytes()
+        || transfer_open.variant_id != *variant_id.as_bytes()
+    {
+        return Err(authentication_failure(
+            "bind promoted native Profile-5 retry",
+            "existing publication differs from authenticated transport source",
+        ));
+    }
+    Ok(Some((blob, pack)))
+}
+
+async fn settle_existing_native_profile5_pack(
+    attempt: Arc<dyn StreamReceiveAttempt>,
+    mut codec: MissionBlobRecordCodec<'_>,
+    verifier: &mut ReferenceEnvelopeSealer,
+    transfer_open: StreamOpenV1,
+    verified_open: &VerifiedBlobStreamOpen,
+    blob: StoredBlob,
+    pack: aster_redb_store::Profile5PackReadSession,
+    wire_len: u64,
+) -> Result<BlobNetworkReport, BlobNetworkError> {
+    let mut state = StreamReceiverState::new(
+        &transfer_open,
+        wire_len,
+        0,
+        wire_len,
+        PROFILE5_PACK_TRANSPORT_FRAME_BYTES as u32,
+    )
+    .map_err(|error| failure("resume promoted native Profile-5 receiver", error))?;
+    let StreamAction::Send(accept) = state
+        .accept(MAX_STREAM_CHECKPOINT_BATCH_BYTES)
+        .map_err(|error| failure("accept promoted native Profile-5 retry", error))?
+    else {
+        return Err("promoted native Profile-5 retry did not produce ACCEPT".into());
+    };
+    await_authenticated_progress(
+        "send promoted native Profile-5 accept",
+        attempt.send_control(&codec.encode(accept)?),
+    )
+    .await?;
+    let encoded_finish = await_authenticated_progress(
+        "receive promoted native Profile-5 finish",
+        attempt.receive_data(),
+    )
+    .await?
+    .ok_or("data stream closed before promoted native Profile-5 finish")?;
+    let StreamFrame::Finish(finish) = codec.decode(&encoded_finish)? else {
+        return Err("promoted native Profile-5 retry did not receive FINISH".into());
+    };
+    if finish.semantic_commitment != pack.authenticated_commitment() {
+        return Err(authentication_failure(
+            "bind promoted native Profile-5 finish",
+            "authenticated commitment differs from retained pack",
+        ));
+    }
+    verifier
+        .verify_blob_stream_commitment(verified_open, &finish.semantic_commitment)
+        .map_err(|error| {
+            authentication_failure("authenticate promoted native Profile-5 commitment", error)
+        })?;
+    let StreamAction::Promote = state
+        .finish(finish)
+        .map_err(|error| settlement_failure("finish promoted native Profile-5 retry", error))?
+    else {
+        return Err("promoted native Profile-5 retry did not request settlement".into());
+    };
+    let roots = (
+        *pack.commitment().blob_id().as_bytes(),
+        Sha256::digest(pack.commitment().encode()).into(),
+    );
+    if blob.blob_id != pack.commitment().blob_id() {
+        return Err(authentication_failure(
+            "bind promoted native Profile-5 roots",
+            "retained publication differs from retained pack commitment",
+        ));
+    }
+    let digest = canonical_result_digest(&transfer_open, roots);
+    let StreamAction::Send(result) = state
+        .promoted(StreamResultCode::AlreadyPresent, digest)
+        .map_err(|error| settlement_failure("settle promoted native Profile-5 retry", error))?
+    else {
+        return Err("promoted native Profile-5 retry did not produce RESULT".into());
+    };
+    await_authenticated_progress(
+        "send promoted native Profile-5 result",
+        attempt.send_control(&codec.encode(result)?),
+    )
+    .await?;
+    let encoded_ack = await_authenticated_progress(
+        "receive promoted native Profile-5 result acknowledgement",
+        attempt.receive_data(),
+    )
+    .await?
+    .ok_or("data stream closed before promoted native Profile-5 acknowledgement")?;
+    let StreamFrame::ResultAck(ack) = codec.decode(&encoded_ack)? else {
+        return Err("promoted native Profile-5 retry did not receive RESULT_ACK".into());
+    };
+    if !matches!(
+        state
+            .result_ack(ack, StreamResultCode::AlreadyPresent)
+            .map_err(|error| settlement_failure("acknowledge promoted Profile-5 retry", error))?,
+        StreamAction::Terminal(StreamResultCode::AlreadyPresent)
+    ) {
+        return Err("promoted native Profile-5 retry did not terminate".into());
+    }
+    if await_authenticated_progress(
+        "receive promoted native Profile-5 data EOF",
+        attempt.receive_data(),
+    )
+    .await?
+    .is_some()
+    {
+        return Err("promoted native Profile-5 retry contained trailing data".into());
+    }
+    await_authenticated_progress(
+        "finish promoted native Profile-5 control stream",
+        attempt.finish_control(),
+    )
+    .await?;
+    Ok(BlobNetworkReport {
+        wire_bytes: wire_len,
+        resumed_from: wire_len,
+        attempt_bytes: 0,
+        roots,
+        checkpoints: 0,
+        pipeline: None,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn receive_native_profile5_pack(
+    attempt: Arc<dyn StreamReceiveAttempt>,
+    mut codec: MissionBlobRecordCodec<'_>,
+    store: Arc<Store>,
+    policy: &ControlPolicySnapshot,
+    verifier: &mut ReferenceEnvelopeSealer,
+    transfer_open: StreamOpenV1,
+    verified_open: VerifiedBlobStreamOpen,
+    offer: &BlobStreamSourceOfferV1,
+) -> Result<BlobNetworkReport, BlobNetworkError> {
+    let open = verified_open.open();
+    let wire_len = blob_pack_wire_len(open.total_len())
+        .map_err(|error| failure("calculate received Profile-5 pack length", error))?;
+    if offer.finite
+        || open.ttl_ms().is_some()
+        || open.publisher() == [0; 32]
+        || open.topic() != &offer.topic
+        || open.scope() != &offer.scope
+        || open.content_epoch() != offer.key_epoch
+        || transfer_open.total_len != wire_len
+        || transfer_open.source_len != offer.source_len
+        || transfer_open.source_digest != offer.source_digest
+    {
+        return Err(authentication_failure(
+            "validate native Profile-5 source",
+            "authenticated open differs from PLAN/OPEN metadata",
+        ));
+    }
+    if let Some((blob, pack)) =
+        existing_native_profile5_pack(&store, policy, &verified_open, &transfer_open)?
+    {
+        return settle_existing_native_profile5_pack(
+            attempt,
+            codec,
+            verifier,
+            transfer_open,
+            &verified_open,
+            blob,
+            pack,
+            wire_len,
+        )
+        .await;
+    }
+    let (reservation, initial_checkpoint, restored_open) = store
+        .reserve_received_profile5_upload_with_policy(
+            policy,
+            &verified_open,
+            verified_open.authenticated_bytes(),
+        )
+        .map_err(|error| lifecycle_failure("reserve native Profile-5 receiver pack", error))?;
+    if restored_open != verified_open {
+        return Err(authentication_failure(
+            "restore native Profile-5 receiver open",
+            "durable authenticated open changed",
+        ));
+    }
+    let durable_pack = initial_checkpoint.durable_pack_checkpoint();
+    let resumed_from = durable_pack.map_or(0, |checkpoint| checkpoint.payload_len());
+    let root = PinnedBlobPackRoot::open(&store)
+        .map_err(|error| durability_failure("open native Profile-5 pack root", error))?;
+    let writer = BlobPackWriter::open_projected_upload_pinned(
+        &root,
+        &reservation.pack_identity(),
+        durable_pack,
+    )
+    .map_err(|error| durability_failure("restore native Profile-5 pack writer", error))?;
+    let opener = verifier
+        .blob_stream_segment_opener(&verified_open)
+        .map_err(|error| authentication_failure("open native Profile-5 segments", error))?;
+    let mut current_limit =
+        profile5_receive_limit(wire_len, resumed_from, MAX_STREAM_CHECKPOINT_BATCH_BYTES);
+    let mut state = StreamReceiverState::new(
+        &transfer_open,
+        resumed_from,
+        durable_pack.map_or(0, BlobPackCheckpoint::generation),
+        current_limit,
+        PROFILE5_PACK_TRANSPORT_FRAME_BYTES as u32,
+    )
+    .map_err(|error| failure("initialize native Profile-5 receiver", error))?;
+    let StreamAction::Send(accept) = state
+        .accept(MAX_STREAM_CHECKPOINT_BATCH_BYTES)
+        .map_err(|error| failure("accept native Profile-5 receiver", error))?
+    else {
+        return Err("native Profile-5 receiver did not produce ACCEPT".into());
+    };
+    await_authenticated_progress(
+        "send native Profile-5 accept",
+        attempt.send_control(&codec.encode(accept)?),
+    )
+    .await?;
+
+    let next_index = durable_pack.map_or(0, BlobPackCheckpoint::next_index);
+    let (partition_tx, partition_rx) = mpsc::channel(8);
+    let (durable_tx, mut durable_rx) = mpsc::unbounded_channel();
+    let sink_store = Arc::clone(&store);
+    let sink_policy = *policy;
+    let sink_reservation = reservation.clone();
+    let sink_initial = initial_checkpoint.clone();
+    let total_plaintext = open.total_len();
+    let mut job = [0_u8; 16];
+    job.copy_from_slice(&transfer_open.transfer_id[..16]);
+    let pipeline_job = StreamJobId::from_bytes(job);
+    let mut pipeline_task = tokio::spawn(async move {
+        let sink = Arc::new(std::sync::Mutex::new((writer, sink_initial, resumed_from)));
+        let sink_for_pipeline = Arc::clone(&sink);
+        let report = run_ordered_channel_pipeline_from(
+            pipeline_job,
+            partition_rx,
+            next_index,
+            PipelineLimits::new(4, 8, 16 * 1024 * 1024, 8)
+                .map_err(|_| PipelineError::InvalidLimits)?,
+            move |partition| {
+                let index = partition.index();
+                let wire_end = partition.source_end();
+                let record = partition.into_bytes();
+                let (header, _plaintext, leaves) = opener
+                    .open_encoded(&record[4..])
+                    .map_err(|error| PipelineError::MapFailed(error.to_string()))?;
+                if header.index() != index {
+                    return Err(PipelineError::MapFailed(
+                        "native Profile-5 segment index differs".into(),
+                    ));
+                }
+                Ok((record, header, leaves, wire_end))
+            },
+            move |mapped: MappedPartition<_>| {
+                let (record, header, leaves, wire_end) = mapped.into_value();
+                let sink = Arc::clone(&sink_for_pipeline);
+                let store = Arc::clone(&sink_store);
+                let reservation = sink_reservation.clone();
+                let durable_tx = durable_tx.clone();
+                Box::pin(async move {
+                    let checkpoint = {
+                        let mut state = sink
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let (writer, projected, last_checkpoint_wire) = &mut *state;
+                        writer
+                            .append_record(&record[4..], leaves)
+                            .map_err(|error| PipelineError::SinkFailed(error.to_string()))?;
+                        let plaintext_end = header
+                            .offset()
+                            .checked_add(u64::from(header.plaintext_len()))
+                            .ok_or_else(|| {
+                                PipelineError::SinkFailed(
+                                    "native Profile-5 plaintext progress overflow".into(),
+                                )
+                            })?;
+                        if wire_end.saturating_sub(*last_checkpoint_wire)
+                            >= u64::from(MAX_STREAM_CHECKPOINT_BATCH_BYTES)
+                            || plaintext_end == total_plaintext
+                        {
+                            Some((
+                                projected.clone(),
+                                writer.checkpoint().map_err(|error| {
+                                    PipelineError::SinkFailed(error.to_string())
+                                })?,
+                            ))
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some((expected, durable)) = checkpoint {
+                        let expected_for_commit = expected.clone();
+                        let projected = tokio::task::spawn_blocking(move || {
+                            store.checkpoint_blob_upload(
+                                &sink_policy,
+                                &reservation,
+                                expected_for_commit,
+                                durable,
+                            )
+                        })
+                        .await
+                        .map_err(|error| PipelineError::SinkFailed(error.to_string()))?
+                        .map_err(|error| PipelineError::SinkFailed(error.to_string()))?;
+                        let mut state = sink
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let (_, current, last_checkpoint_wire) = &mut *state;
+                        if *current != expected {
+                            return Err(PipelineError::SinkFailed(
+                                "native Profile-5 checkpoint authority changed".into(),
+                            ));
+                        }
+                        *current = projected.clone();
+                        *last_checkpoint_wire = wire_end;
+                        durable_tx
+                            .send(NativeProfile5DurableProgress {
+                                wire_offset: wire_end,
+                                checkpoint: projected,
+                            })
+                            .map_err(|_| {
+                                PipelineError::SinkFailed(
+                                    "native Profile-5 checkpoint receiver closed".into(),
+                                )
+                            })?;
+                    }
+                    Ok(())
+                })
+            },
+        )
+        .await?;
+        let (writer, projected, _) = Arc::try_unwrap(sink)
+            .map_err(|_| PipelineError::WorkerPanicked)?
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok::<_, PipelineError>((report, writer, projected))
+    });
+
+    let mut parser = NativeProfile5RecordParser::new(next_index, resumed_from);
+    let mut received = resumed_from;
+    let mut durable_wire = resumed_from;
+    let mut checkpoints = 0_u64;
+    let mut receive = Box::pin(async {
+        while received < wire_len {
+            let encoded = await_authenticated_progress(
+                "receive native Profile-5 data",
+                attempt.receive_data(),
+            )
+            .await?
+            .ok_or("data stream closed before native Profile-5 completion")?;
+            let StreamFrame::Data(data) = codec.decode(&encoded)? else {
+                return Err("native Profile-5 content phase received another frame".into());
+            };
+            let through = match state
+                .data(&data)
+                .map_err(|error| failure("advance native Profile-5 receiver", error))?
+            {
+                StreamAction::Persist { through } => through,
+                StreamAction::Retry(_) => continue,
+                _ => return Err("native Profile-5 receiver produced an invalid DATA action".into()),
+            };
+            parser.push(&data.bytes, &partition_tx).await?;
+            received = through;
+            if parser.consumed.saturating_sub(durable_wire)
+                >= u64::from(MAX_STREAM_CHECKPOINT_BATCH_BYTES)
+                || parser.consumed == wire_len
+            {
+                let progress = durable_rx.recv().await.ok_or_else(|| {
+                    durability_failure(
+                        "checkpoint native Profile-5 pipeline",
+                        "durable progress channel closed",
+                    )
+                })?;
+                let generation = progress
+                    .checkpoint
+                    .durable_pack_checkpoint()
+                    .ok_or_else(|| {
+                        durability_failure(
+                            "checkpoint native Profile-5 pipeline",
+                            "durable pack checkpoint is absent",
+                        )
+                    })?
+                    .generation();
+                current_limit = profile5_receive_limit(
+                    wire_len,
+                    progress.wire_offset,
+                    MAX_STREAM_CHECKPOINT_BATCH_BYTES,
+                );
+                let StreamAction::Send(checkpoint) = state
+                    .persisted(progress.wire_offset, generation, current_limit)
+                    .map_err(|error| failure("persist native Profile-5 checkpoint", error))?
+                else {
+                    return Err("native Profile-5 receiver did not produce CHECKPOINT".into());
+                };
+                await_authenticated_progress(
+                    "send native Profile-5 checkpoint",
+                    attempt.send_control(&codec.encode(checkpoint)?),
+                )
+                .await?;
+                durable_wire = progress.wire_offset;
+                checkpoints = checkpoints.saturating_add(1);
+            }
+        }
+        parser.finish(wire_len)?;
+        drop(partition_tx);
+        Ok::<_, BlobNetworkError>((codec, state, checkpoints))
+    });
+    let map_pipeline_error = |error| match error {
+        PipelineError::MapFailed(_) => {
+            verification_failure("authenticate native ASTRBS02 segment", error)
+        }
+        PipelineError::SinkFailed(_) => durability_failure("commit native Profile-5 pack", error),
+        _ => failure("run native Profile-5 receive pipeline", error),
+    };
+    let (receive_result, pipeline_result) = tokio::select! {
+        received = &mut receive => {
+            match received {
+                Ok(received) => {
+                    let pipeline = pipeline_task
+                        .await
+                        .map_err(|error| failure("join native Profile-5 receive pipeline", error))?
+                        .map_err(map_pipeline_error)?;
+                    (received, pipeline)
+                }
+                Err(error) => {
+                    pipeline_task.abort();
+                    let _ = pipeline_task.await;
+                    return Err(error);
+                }
+            }
+        }
+        joined = &mut pipeline_task => {
+            let pipeline = joined
+                .map_err(|error| failure("join native Profile-5 receive pipeline", error))?
+                .map_err(map_pipeline_error)?;
+            let received = receive.await?;
+            (received, pipeline)
+        }
+    };
+    let (mut codec, mut state, checkpoints) = receive_result;
+    let (pipeline, writer, projected) = pipeline_result;
+    let encoded_finish =
+        await_authenticated_progress("receive native Profile-5 finish", attempt.receive_data())
+            .await?
+            .ok_or("data stream closed before native Profile-5 finish")?;
+    let StreamFrame::Finish(finish) = codec.decode(&encoded_finish)? else {
+        return Err("native Profile-5 terminal data frame was not FINISH".into());
+    };
+    let verified_commitment = verifier
+        .verify_blob_stream_commitment(&verified_open, &finish.semantic_commitment)
+        .map_err(|error| {
+            authentication_failure("authenticate native Profile-5 commitment", error)
+        })?;
+    let commitment = verified_commitment.commitment();
+    let (expected_transfer, expected_semantic, variant) = profile5_pack_identities(
+        open,
+        verified_open.authenticated_bytes(),
+        commitment,
+        &finish.semantic_commitment,
+    )
+    .map_err(|error| authentication_failure("derive native Profile-5 identities", error))?;
+    if transfer_open.transfer_id != *expected_transfer.as_bytes()
+        || transfer_open.source_transfer_id != *expected_transfer.as_bytes()
+        || transfer_open.publication_id != *expected_semantic.as_bytes()
+        || transfer_open.variant_id != *variant.as_bytes()
+    {
+        return Err(authentication_failure(
+            "bind native Profile-5 identities",
+            "transport OPEN differs from signed Profile-5 source",
+        ));
+    }
+    let StreamAction::Promote = state
+        .finish(finish)
+        .map_err(|error| settlement_failure("finish native Profile-5 receiver", error))?
+    else {
+        return Err("native Profile-5 receiver did not request promotion".into());
+    };
+    let lineage = verifier
+        .blob_stream_lineage(&verified_open)
+        .map_err(|error| authentication_failure("derive native Profile-5 lineage", error))?;
+    let roots = (
+        *commitment.blob_id().as_bytes(),
+        Sha256::digest(commitment.encode()).into(),
+    );
+    let finish_store = Arc::clone(&store);
+    let finish_policy = *policy;
+    let finish_reservation = reservation.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        let completion = writer
+            .finish_profile5(&verified_commitment)
+            .map_err(|error| {
+                aster_redb_store::StoreError::Blob(aster_redb_store::BlobStoreError::Verification(
+                    error.to_string(),
+                ))
+            })?;
+        let projected = finish_store.checkpoint_blob_upload(
+            &finish_policy,
+            &finish_reservation,
+            projected,
+            completion.checkpoint().clone(),
+        )?;
+        let projected = finish_store.complete_profile5_upload_pack(
+            &finish_policy,
+            &finish_reservation,
+            projected,
+            completion,
+            &verified_commitment,
+            lineage,
+        )?;
+        finish_store.commit_profile5_upload_once_with_policy(
+            &finish_policy,
+            &finish_reservation,
+            &projected,
+            None,
+        )
+    })
+    .await
+    .map_err(|error| failure("join native Profile-5 promotion", error))?
+    .map_err(|error| lifecycle_failure("promote native Profile-5 pack", error))?;
+    if *outcome.blob().transfer_id.as_bytes() != transfer_open.transfer_id
+        || *outcome.blob().semantic_id.as_bytes() != transfer_open.publication_id
+        || outcome.blob().variant_id != variant
+    {
+        return Err(authentication_failure(
+            "bind promoted native Profile-5 source",
+            "promoted publication identities differ from transport OPEN",
+        ));
+    }
+    let code = if outcome.inserted() {
+        StreamResultCode::Promoted
+    } else {
+        StreamResultCode::AlreadyPresent
+    };
+    let digest = canonical_result_digest(&transfer_open, roots);
+    let StreamAction::Send(result) = state
+        .promoted(code, digest)
+        .map_err(|error| settlement_failure("build native Profile-5 result", error))?
+    else {
+        return Err("native Profile-5 receiver did not produce RESULT".into());
+    };
+    await_authenticated_progress(
+        "send native Profile-5 result",
+        attempt.send_control(&codec.encode(result)?),
+    )
+    .await?;
+    let encoded_ack = await_authenticated_progress(
+        "receive native Profile-5 result acknowledgement",
+        attempt.receive_data(),
+    )
+    .await?
+    .ok_or("data stream closed before native Profile-5 result acknowledgement")?;
+    let StreamFrame::ResultAck(ack) = codec.decode(&encoded_ack)? else {
+        return Err("native Profile-5 settlement frame was not RESULT_ACK".into());
+    };
+    if !matches!(
+        state
+            .result_ack(ack, code)
+            .map_err(|error| settlement_failure("settle native Profile-5 receiver", error))?,
+        StreamAction::Terminal(settled) if settled == code
+    ) {
+        return Err("native Profile-5 receiver settlement did not terminate".into());
+    }
+    if await_authenticated_progress("receive native Profile-5 data EOF", attempt.receive_data())
+        .await?
+        .is_some()
+    {
+        return Err("native Profile-5 data stream contained trailing bytes".into());
+    }
+    await_authenticated_progress(
+        "finish native Profile-5 control stream",
+        attempt.finish_control(),
+    )
+    .await?;
+    Ok(BlobNetworkReport {
+        wire_bytes: wire_len,
+        resumed_from,
+        attempt_bytes: wire_len.saturating_sub(resumed_from),
+        roots,
+        checkpoints,
+        pipeline: Some(pipeline),
+    })
+}
+
 /// Sends one already source/content-authenticated canonical publication.
 ///
 /// The capability-bearing `source` is deliberately required in addition to
@@ -1601,6 +2731,22 @@ pub(crate) async fn send_canonical_blob_profile5(
     attempt_nonce: [u8; 32],
 ) -> Result<BlobNetworkReport, BlobNetworkError> {
     require_canonical_send_source(&store, policy, source)?;
+    if let CanonicalBlobSendSource::Native(source) = source {
+        return Box::pin(send_native_profile5_pack(
+            adapter,
+            store,
+            policy,
+            source,
+            session,
+            profile_digest,
+            direction,
+            attempt_nonce,
+        ))
+        .await;
+    }
+    let CanonicalBlobSendSource::Legacy(source) = source else {
+        unreachable!("native source returned before legacy sender")
+    };
     let wire_len = canonical_blob_wire_len(&source.plan)?;
     let finite_custody = if let Some((blob, projection, retention)) = &source.finite {
         let exact_len = u64::try_from(source.stored.sealed.len())
@@ -1685,8 +2831,8 @@ pub(crate) async fn send_canonical_blob_profile5(
         direction: stream_direction,
         session_transcript: session.session_id(),
         exchange_id: 1,
-        transfer_id: *source.publication().as_bytes(),
-        source_transfer_id: *source.publication().as_bytes(),
+        transfer_id: *source.stored.transfer_id.as_bytes(),
+        source_transfer_id: *source.stored.transfer_id.as_bytes(),
         publication_id: *source.stored.semantic_id.as_bytes(),
         variant_id: *source.stored.variant_id.as_bytes(),
         total_len: wire_len,
@@ -1997,6 +3143,7 @@ pub(crate) async fn send_canonical_blob_profile5(
 pub(crate) async fn receive_canonical_blob_profile5(
     adapter: &dyn StreamTransportAdapter,
     store: Arc<Store>,
+    route_cache: &AuthenticatedEventRouteCache,
     policy: &ControlPolicySnapshot,
     verifier: &mut ReferenceEnvelopeSealer,
     mission: &mut MissionSession,
@@ -2075,6 +3222,19 @@ pub(crate) async fn receive_canonical_blob_profile5(
     }
 
     let sealed = receive_authenticated_source(attempt.as_ref(), &mut codec, &open).await?;
+    if let Ok(native_open) = verifier.verify_blob_stream_open(&sealed) {
+        return Box::pin(receive_native_profile5_pack(
+            attempt,
+            codec,
+            store,
+            policy,
+            verifier,
+            open,
+            native_open,
+            offer,
+        ))
+        .await;
+    }
     if u32::try_from(sealed.len()).ok() != Some(offer.source_len)
         || <[u8; 32]>::from(Sha256::digest(&sealed)) != offer.source_digest
         || BlobTransferId::new(Sha256::digest(&sealed).into())
@@ -2526,11 +3686,36 @@ pub(crate) async fn receive_canonical_blob_profile5(
     };
 
     let code = if already_promoted {
+        let _lifecycle = route_cache
+            .lock_blob_lifecycle()
+            .map_err(|error| lifecycle_failure("lock promoted profile-5 cache", error))?;
         // Re-run the exact receipt gate after FINISH so policy/lifecycle changes
         // cannot turn a terminal retry into an acknowledgement of stale state.
         store
             .reserve_profile5_receipt(policy, &plan)
             .map_err(|error| lifecycle_failure("recheck promoted profile-5 receipt", error))?;
+        let retained = store
+            .blob_source_projection(source)
+            .map_err(|error| durability_failure("load promoted profile-5 source", error))?
+            .ok_or_else(|| {
+                durability_failure("load promoted profile-5 source", "source is absent")
+            })?;
+        let BlobSourceRetention::Completed { acceptance_marker } = retained.retention else {
+            return Err(durability_failure(
+                "load promoted profile-5 source",
+                "source is not completed",
+            ));
+        };
+        cache_authenticated_blob_route_claim(
+            &store,
+            route_cache,
+            verifier,
+            &blob,
+            &manifest_bytes,
+            &sealed,
+            acceptance_marker,
+        )
+        .map_err(|error| durability_failure("cache promoted profile-5 source", error))?;
         StreamResultCode::AlreadyPresent
     } else {
         let depot_completion = store
@@ -2554,7 +3739,10 @@ pub(crate) async fn receive_canonical_blob_profile5(
             .map_err(|error| {
                 authentication_failure("recheck canonical promotion lineage", error)
             })?;
-        match store
+        let _lifecycle = route_cache
+            .lock_blob_lifecycle()
+            .map_err(|error| lifecycle_failure("lock profile-5 promotion cache", error))?;
+        let outcome = store
             .apply_verified_profile5_blob_with_policy(
                 policy,
                 &plan,
@@ -2562,8 +3750,18 @@ pub(crate) async fn receive_canonical_blob_profile5(
                 &depot_completion,
                 &content_completion,
             )
-            .map_err(|error| lifecycle_failure("promote canonical Blob", error))?
-        {
+            .map_err(|error| lifecycle_failure("promote canonical Blob", error))?;
+        cache_authenticated_blob_route_claim(
+            &store,
+            route_cache,
+            verifier,
+            &blob,
+            &manifest_bytes,
+            &sealed,
+            outcome.acceptance_marker(),
+        )
+        .map_err(|error| durability_failure("cache canonical Blob promotion", error))?;
+        match outcome {
             ApplyOutcome::Inserted { .. } => StreamResultCode::Promoted,
             ApplyOutcome::Duplicate { .. } => StreamResultCode::AlreadyPresent,
         }
@@ -2598,6 +3796,12 @@ pub(crate) async fn receive_canonical_blob_profile5(
     store
         .complete_profile5_receipt(&receipt)
         .map_err(|error| durability_failure("retire profile-5 receipt", error))?;
+    if await_authenticated_progress("receive canonical data EOF", attempt.receive_data())
+        .await?
+        .is_some()
+    {
+        return Err("canonical data stream contained a frame after result acknowledgement".into());
+    }
     await_authenticated_progress("finish canonical control stream", attempt.finish_control())
         .await?;
     Ok(BlobNetworkReport {
@@ -2811,14 +4015,14 @@ impl RecordPartitioner {
         Self {
             next_index,
             consumed,
-            max_record_bytes: PROFILE5_LEGACY_SEGMENT_RECORD_BYTES,
+            max_record_bytes: PROFILE5_PACK_SEGMENT_RECORD_BYTES,
         }
     }
 
     #[cfg(test)]
     fn with_max_record_bytes_for_test(mut self, max_record_bytes: usize) -> Self {
         assert!(
-            max_record_bytes > 0 && max_record_bytes <= PROFILE5_LEGACY_SEGMENT_RECORD_BYTES,
+            max_record_bytes > 0 && max_record_bytes <= PROFILE5_PACK_SEGMENT_RECORD_BYTES,
             "test record bound must be within the production limit"
         );
         self.max_record_bytes = max_record_bytes;
@@ -3484,6 +4688,7 @@ pub(crate) mod tests {
                 topic: Topic::new("imagery").unwrap(),
                 scope: Scope::new("mission/alpha").unwrap(),
                 key_epoch: 1,
+                content_proof: [0x65; crate::frame::BLOB_CONTENT_PROOF_BYTES],
                 source_len,
                 source_digest,
                 finite: false,
@@ -4329,8 +5534,8 @@ pub(crate) mod tests {
         }
 
         assert_eq!(extents.len() as u64, published.segment_count);
-        let legacy_record_bytes = crate::stream_transfer::PROFILE5_LEGACY_RECORD_PREFIX_BYTES
-            + crate::stream_transfer::PROFILE5_LEGACY_SEGMENT_RECORD_BYTES;
+        let legacy_record_bytes = crate::stream_transfer::PROFILE5_PACK_RECORD_PREFIX_BYTES
+            + crate::stream_transfer::PROFILE5_PACK_SEGMENT_RECORD_BYTES;
         assert_eq!(extents[0].len(), legacy_record_bytes);
         assert_eq!(extents[1].len(), legacy_record_bytes);
         assert!(legacy_record_bytes > PROFILE5_CANONICAL_EXTENT_BYTES);
@@ -4362,8 +5567,8 @@ pub(crate) mod tests {
         const TEST_RECORD_BYTES: usize = 4;
         let declared = TEST_RECORD_BYTES + 1;
         let mut bytes =
-            vec![0; declared + crate::stream_transfer::PROFILE5_LEGACY_RECORD_PREFIX_BYTES];
-        bytes[..crate::stream_transfer::PROFILE5_LEGACY_RECORD_PREFIX_BYTES]
+            vec![0; declared + crate::stream_transfer::PROFILE5_PACK_RECORD_PREFIX_BYTES];
+        bytes[..crate::stream_transfer::PROFILE5_PACK_RECORD_PREFIX_BYTES]
             .copy_from_slice(&(declared as u32).to_be_bytes());
 
         let error = RecordPartitioner::new(0, 0)
@@ -4380,7 +5585,7 @@ pub(crate) mod tests {
         let source_root = TempRoot::new("adapter-source");
         let receiver_root = TempRoot::new("adapter-receiver");
         let total_len = PROFILE5_CANONICAL_EXTENT_BYTES
-            - crate::stream_transfer::PROFILE5_LEGACY_RECORD_PREFIX_BYTES
+            - crate::stream_transfer::PROFILE5_PACK_RECORD_PREFIX_BYTES
             - aster_mesh::BLOB_STREAM_SEGMENT_ENCODED_OVERHEAD_BYTES;
         let open = open(total_len as u64);
         let key = [0x66; 32];
@@ -4528,7 +5733,7 @@ pub(crate) mod tests {
         let source_root = TempRoot::new("source");
         let receiver_root = TempRoot::new("receiver");
         let total_len = PROFILE5_CANONICAL_EXTENT_BYTES
-            - crate::stream_transfer::PROFILE5_LEGACY_RECORD_PREFIX_BYTES
+            - crate::stream_transfer::PROFILE5_PACK_RECORD_PREFIX_BYTES
             - aster_mesh::BLOB_STREAM_SEGMENT_ENCODED_OVERHEAD_BYTES;
         let plaintext = (0..total_len)
             .map(|index| (index % 251) as u8)

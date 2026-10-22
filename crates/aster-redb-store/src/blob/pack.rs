@@ -2233,6 +2233,25 @@ impl BlobPackReader {
         Self::open_completed_in(root.upload(&completion.identity, false)?, completion)
     }
 
+    /// Opens a completed canonical pack at one independently readable fixed
+    /// segment boundary. All records preceding the final segment have the
+    /// protocol-fixed encoded size, so this remains O(1) in the Blob offset.
+    pub fn open_completed_upload_pinned_at_segment(
+        root: &PinnedBlobPackRoot,
+        completion: &BlobPackCompletion,
+        index: u64,
+    ) -> Result<Self, BlobPackError> {
+        let reader = Self::open_completed_upload_pinned(root, completion)?;
+        let record_bytes = 4_u64
+            .checked_add(BLOB_STREAM_SEGMENT_BYTES as u64)
+            .and_then(|bytes| bytes.checked_add(BLOB_STREAM_SEGMENT_ENCODED_OVERHEAD_BYTES as u64))
+            .ok_or(BlobPackError::Invalid("Blob pack record offset overflow"))?;
+        let payload_offset = index
+            .checked_mul(record_bytes)
+            .ok_or(BlobPackError::Invalid("Blob pack record offset overflow"))?;
+        Self::open_at_payload_offset_in(reader, index, payload_offset)
+    }
+
     /// Path-backed completion reader used by pack-level validation and tools.
     pub fn open_completed(
         root: &Path,

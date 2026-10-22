@@ -1113,6 +1113,36 @@ impl BlobVariantId {
     }
 }
 
+/// Derives the publication identities bound by an authenticated native
+/// Profile-5 open and final commitment. Receivers use this before promotion so
+/// transport OPEN identity mismatches cannot mutate durable state.
+pub fn profile5_pack_identities(
+    open: &aster_mesh::BlobStreamOpen,
+    authenticated_open: &[u8],
+    commitment: &aster_mesh::BlobStreamFinalCommitment,
+    authenticated_commitment: &[u8],
+) -> Result<(BlobTransferId, BlobSemanticId, BlobVariantId), StoreError> {
+    if commitment.open_digest() != &open.digest()
+        || commitment.stream_id() != open.stream_id()
+        || commitment.total_len() != open.total_len()
+        || commitment.content_epoch() != open.content_epoch()
+        || commitment.ttl_ms() != open.ttl_ms()
+    {
+        return Err(blob_error(BlobStoreError::CompletionMismatch));
+    }
+    let source =
+        pack_lifecycle::profile5_source_record(authenticated_open, authenticated_commitment)?;
+    Ok((
+        BlobTransferId::new(Sha256::digest(source).into()),
+        BlobSemanticId::new(pack_lifecycle::profile5_semantic_digest(open, commitment)),
+        BlobVariantId::for_content(
+            commitment.blob_id(),
+            &open.content_group(),
+            open.content_epoch(),
+        ),
+    ))
+}
+
 pub(crate) fn blob_variant_id(
     blob_id: BlobId,
     content_group: &[u8; 32],
@@ -8836,8 +8866,12 @@ impl PreparedBlobPublication {
         let open = pack.open();
         let commitment = pack.commitment();
         let sealed = pack.source_record()?;
-        let transfer_id = BlobTransferId::new(Sha256::digest(&sealed).into());
-        let semantic_id = BlobSemanticId::new(pack.semantic_digest());
+        let (transfer_id, semantic_id, variant_id) = profile5_pack_identities(
+            open,
+            pack.authenticated_open(),
+            commitment,
+            pack.authenticated_commitment(),
+        )?;
         let blob_id = commitment.blob_id();
         let route = BlobRouteCommitment::from_parts(
             blob_id,
@@ -8873,7 +8907,6 @@ impl PreparedBlobPublication {
         let manifest_digest = *pack.completion().commitment_digest();
         let route_lineage = *pack.route_lineage();
         let physical_lineage = *pack.physical_lineage();
-        let variant_id = pack.variant_id();
         let mission_authority = *open.mission_id();
         let encoded_metadata = encode_blob_metadata(BlobMetadata {
             transfer_id,
@@ -14985,7 +15018,8 @@ fn blob_source_projection(
         .checked_add(u64::from(shape.chunk_size).saturating_sub(1))
         .filter(|_| shape.chunk_size != 0)
         .map(|bytes| bytes / u64::from(shape.chunk_size));
-    if shape.chunk_size != SELECTED_BLOB_CHUNK_SIZE
+    if (shape.chunk_size != SELECTED_BLOB_CHUNK_SIZE
+        && shape.chunk_size != aster_mesh::BLOB_STREAM_SEGMENT_BYTES as u32)
         || shape.chunk_count != route.chunk_count()
         || expected_chunks != Some(shape.chunk_count)
     {
@@ -17141,11 +17175,27 @@ pub(crate) fn audit_blob_tables_write(
         )));
     }
     let depot_stats = depot::audit_depot_metadata_write(write, &deletion_audit)?;
-    stats.variants = depot_stats.variants;
-    stats.finalized_variants = depot_stats.finalized_variants;
-    stats.committed_chunks = depot_stats.committed_chunks;
-    stats.committed_file_bytes = depot_stats.committed_file_bytes;
-    stats.reserved_file_bytes = depot_stats.reserved_file_bytes;
+    let pack_capacity = pack_lifecycle::active_capacity_usage_write(write)?;
+    stats.variants = depot_stats
+        .variants
+        .checked_add(pack_capacity.variants)
+        .ok_or(StoreError::ItemCountAccountingOverflow)?;
+    stats.finalized_variants = depot_stats
+        .finalized_variants
+        .checked_add(pack_capacity.variants)
+        .ok_or(StoreError::ItemCountAccountingOverflow)?;
+    stats.committed_chunks = depot_stats
+        .committed_chunks
+        .checked_add(pack_capacity.chunks)
+        .ok_or(StoreError::ItemCountAccountingOverflow)?;
+    stats.committed_file_bytes = depot_stats
+        .committed_file_bytes
+        .checked_add(pack_lifecycle::active_committed_file_bytes_write(write)?)
+        .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+    stats.reserved_file_bytes = depot_stats
+        .reserved_file_bytes
+        .checked_add(pack_capacity.bytes)
+        .ok_or(StoreError::PayloadByteAccountingOverflow)?;
     let network = audit_blob_network_tables_write_with_publications(
         write,
         read_mission_binding(write)?,
@@ -17557,11 +17607,27 @@ pub(crate) fn inspect_blob_tables_read(
         )));
     }
     let depot_stats = depot::inspect_depot_metadata_read(read, &deletion_audit)?;
-    stats.variants = depot_stats.variants;
-    stats.finalized_variants = depot_stats.finalized_variants;
-    stats.committed_chunks = depot_stats.committed_chunks;
-    stats.committed_file_bytes = depot_stats.committed_file_bytes;
-    stats.reserved_file_bytes = depot_stats.reserved_file_bytes;
+    let pack_capacity = pack_lifecycle::active_capacity_usage_read(read)?;
+    stats.variants = depot_stats
+        .variants
+        .checked_add(pack_capacity.variants)
+        .ok_or(StoreError::ItemCountAccountingOverflow)?;
+    stats.finalized_variants = depot_stats
+        .finalized_variants
+        .checked_add(pack_capacity.variants)
+        .ok_or(StoreError::ItemCountAccountingOverflow)?;
+    stats.committed_chunks = depot_stats
+        .committed_chunks
+        .checked_add(pack_capacity.chunks)
+        .ok_or(StoreError::ItemCountAccountingOverflow)?;
+    stats.committed_file_bytes = depot_stats
+        .committed_file_bytes
+        .checked_add(pack_lifecycle::active_committed_file_bytes_read(read)?)
+        .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+    stats.reserved_file_bytes = depot_stats
+        .reserved_file_bytes
+        .checked_add(pack_capacity.bytes)
+        .ok_or(StoreError::PayloadByteAccountingOverflow)?;
     if network_predecessor || network_current {
         let network = inspect_blob_network_tables_read_with_publications(
             read,
