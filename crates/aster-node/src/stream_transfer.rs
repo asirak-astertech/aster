@@ -942,6 +942,8 @@ pub(crate) enum StreamRetry {
 // results, and boxing every data/control frame would add a hot-path allocation.
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum StreamAction {
+    SendData,
+    SendFinish,
     Send(StreamFrame),
     Persist { through: u64 },
     Promote,
@@ -988,7 +990,7 @@ impl StreamSenderState {
     pub(crate) const fn transport_lost(&self) -> StreamAction {
         StreamAction::Retry(StreamRetry::TransportLost)
     }
-    pub(crate) fn accept(&mut self, x: StreamAcceptV1) -> Result<(), StreamError> {
+    pub(crate) fn accept(&mut self, x: StreamAcceptV1) -> Result<StreamAction, StreamError> {
         self.identity(&x.transfer_id, &x.attempt_nonce)?;
         if x.sequence != 0
             || x.durable_offset > x.absolute_receive_limit
@@ -1005,7 +1007,11 @@ impl StreamSenderState {
         self.max_extent = x.max_extent_bytes;
         self.generation = x.checkpoint_generation;
         self.control_sequence = 1;
-        Ok(())
+        Ok(if self.durable == self.total {
+            StreamAction::SendFinish
+        } else {
+            StreamAction::SendData
+        })
     }
     pub(crate) fn send_extent(
         &mut self,
@@ -1549,18 +1555,21 @@ mod stream_frame_codec {
         let transfer_id = [0x81; 32];
         let attempt_nonce = [0x82; 32];
         let mut sender = StreamSenderState::new(transfer_id, attempt_nonce, 0);
-        sender
-            .accept(StreamAcceptV1 {
-                transfer_id,
-                attempt_nonce,
-                sequence: 0,
-                durable_offset: 0,
-                checkpoint_generation: 0,
-                absolute_receive_limit: 0,
-                max_extent_bytes: PROFILE5_CANONICAL_EXTENT_BYTES as u32,
-                checkpoint_batch_bytes: MAX_STREAM_CHECKPOINT_BATCH_BYTES,
-            })
-            .expect("accept empty stream");
+        assert_eq!(
+            sender
+                .accept(StreamAcceptV1 {
+                    transfer_id,
+                    attempt_nonce,
+                    sequence: 0,
+                    durable_offset: 0,
+                    checkpoint_generation: 0,
+                    absolute_receive_limit: 0,
+                    max_extent_bytes: PROFILE5_CANONICAL_EXTENT_BYTES as u32,
+                    checkpoint_batch_bytes: MAX_STREAM_CHECKPOINT_BATCH_BYTES,
+                })
+                .expect("accept empty stream"),
+            StreamAction::SendFinish
+        );
         let StreamAction::Send(StreamFrame::Finish(finish)) =
             sender.finish(vec![0x83; 32]).expect("finish empty stream")
         else {
@@ -1666,11 +1675,11 @@ mod stream_frame_codec {
         let vectors = [
             (
                 0xd6,
-                521,
+                296,
                 [
-                    0x69, 0x7b, 0x46, 0x39, 0x9b, 0x15, 0x20, 0xcb, 0x83, 0x7f, 0x9f, 0x7f, 0x66,
-                    0x27, 0xb9, 0xe1, 0xd4, 0x9a, 0x84, 0xca, 0xaa, 0x8f, 0xd4, 0x18, 0x3a, 0xbc,
-                    0x58, 0x2c, 0xd2, 0xdd, 0x5c, 0xe9,
+                    0x65, 0x2e, 0xed, 0x21, 0x1e, 0xc7, 0x0b, 0x78, 0x24, 0xcf, 0x42, 0xfa, 0xd3,
+                    0xda, 0x6c, 0x95, 0xea, 0x8c, 0x48, 0xdc, 0xd5, 0x9d, 0xaf, 0xdd, 0x3a, 0xc4,
+                    0x75, 0x2a, 0x48, 0xe2, 0x08, 0x86,
                 ],
             ),
             (
@@ -1855,7 +1864,7 @@ mod stream_frame_codec {
             );
         }
         let mut open = frames()[0].encode_for_context(9, 5).unwrap();
-        let custody_presence = open.len() - 37;
+        let custody_presence = open.len() - (1 + 32 + 4 + 32);
         open[custody_presence] = 2;
         assert!(StreamFrame::decode_for_context(9, 5, &open).is_err());
         let mut open = match frames().remove(0) {
@@ -1953,18 +1962,21 @@ mod stream_state {
     #[test]
     fn sender_pipelines_against_absolute_credit_and_accepts_cumulative_checkpoint() {
         let mut sender = StreamSenderState::new([1; 32], [2; 32], 64);
-        sender
-            .accept(StreamAcceptV1 {
-                transfer_id: [1; 32],
-                attempt_nonce: [2; 32],
-                sequence: 0,
-                durable_offset: 0,
-                checkpoint_generation: 1,
-                absolute_receive_limit: 32,
-                max_extent_bytes: 16,
-                checkpoint_batch_bytes: 32,
-            })
-            .unwrap();
+        assert_eq!(
+            sender
+                .accept(StreamAcceptV1 {
+                    transfer_id: [1; 32],
+                    attempt_nonce: [2; 32],
+                    sequence: 0,
+                    durable_offset: 0,
+                    checkpoint_generation: 1,
+                    absolute_receive_limit: 32,
+                    max_extent_bytes: 16,
+                    checkpoint_batch_bytes: 32,
+                })
+                .unwrap(),
+            StreamAction::SendData
+        );
         assert!(matches!(
             sender.send_extent(vec![3; 16]).unwrap(),
             StreamExtentAction::Send(_)
@@ -2005,6 +2017,87 @@ mod stream_state {
             sender.send_extent(vec![5; 16]).unwrap(),
             StreamExtentAction::Send(_)
         ));
+    }
+
+    #[test]
+    fn fully_checkpointed_retry_sends_finish_without_waiting_for_data() {
+        let transfer_id = [0x41; 32];
+        let attempt_nonce = [0x42; 32];
+        let total = 64;
+        let mut sender = StreamSenderState::new(transfer_id, attempt_nonce, total);
+
+        assert_eq!(
+            sender.accept(StreamAcceptV1 {
+                transfer_id,
+                attempt_nonce,
+                sequence: 0,
+                durable_offset: total,
+                checkpoint_generation: 7,
+                absolute_receive_limit: total,
+                max_extent_bytes: 16,
+                checkpoint_batch_bytes: 32,
+            }),
+            Ok(StreamAction::SendFinish)
+        );
+
+        let StreamAction::Send(StreamFrame::Finish(finish)) =
+            sender.finish(vec![0x43; 32]).expect("terminal FINISH")
+        else {
+            panic!("fully checkpointed sender did not emit FINISH");
+        };
+        assert_eq!(finish.transfer_id, transfer_id);
+        assert_eq!(finish.attempt_nonce, attempt_nonce);
+        assert_eq!(finish.sequence, 0);
+        assert_eq!(finish.final_offset, total);
+
+        let mut open = open(total, attempt_nonce);
+        open.transfer_id = transfer_id;
+        let mut receiver =
+            StreamReceiverState::new(&open, total, 7, total, 16).expect("terminal receiver");
+        assert!(matches!(
+            receiver.accept(32).expect("terminal ACCEPT"),
+            StreamAction::Send(StreamFrame::Accept(_))
+        ));
+        assert_eq!(
+            receiver.finish(finish).expect("validate terminal FINISH"),
+            StreamAction::Promote
+        );
+        let result = receiver
+            .promoted(StreamResultCode::AlreadyPresent, [0x44; 32])
+            .expect("terminal RESULT");
+        assert_eq!(
+            receiver
+                .promoted(StreamResultCode::AlreadyPresent, [0x44; 32])
+                .expect("idempotent terminal RESULT"),
+            result
+        );
+        let StreamAction::Send(StreamFrame::Result(result)) = result else {
+            panic!("receiver did not emit RESULT");
+        };
+        let first = sender.result(result.clone()).expect("settle sender");
+        assert_eq!(
+            sender.result(result).expect("idempotent sender settlement"),
+            first
+        );
+        let (StreamAction::Send(StreamFrame::ResultAck(ack)), terminal) = first else {
+            panic!("sender did not emit RESULT ACK and terminal action");
+        };
+        assert_eq!(
+            terminal,
+            StreamAction::Terminal(StreamResultCode::AlreadyPresent)
+        );
+        assert_eq!(
+            receiver
+                .result_ack(ack.clone(), StreamResultCode::AlreadyPresent)
+                .expect("terminal ACK"),
+            StreamAction::Terminal(StreamResultCode::AlreadyPresent)
+        );
+        assert_eq!(
+            receiver
+                .result_ack(ack, StreamResultCode::AlreadyPresent)
+                .expect("idempotent terminal ACK"),
+            StreamAction::Terminal(StreamResultCode::AlreadyPresent)
+        );
     }
 
     #[test]

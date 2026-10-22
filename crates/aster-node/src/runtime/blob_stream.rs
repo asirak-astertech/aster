@@ -162,8 +162,14 @@ fn canonical_blob_carrier_len(plan: &VerifiedBlobTransferPlan) -> Result<u64, Bl
         .carrier_offset)
 }
 
-const fn canonical_sender_requires_final_checkpoint(total: u64, durable: u64) -> bool {
-    total != 0 && durable < total
+fn canonical_sender_requires_final_checkpoint(
+    accepted: StreamAction,
+) -> Result<bool, BlobNetworkError> {
+    match accepted {
+        StreamAction::SendData => Ok(true),
+        StreamAction::SendFinish => Ok(false),
+        _ => Err("stream acceptance produced an invalid sender action".into()),
+    }
 }
 
 struct CanonicalCarrierExtentSource<'a> {
@@ -1212,11 +1218,16 @@ pub(crate) async fn send_canonical_blob_profile5(
     };
     let resume_offset = accept.durable_offset;
     let mut state = StreamSenderState::new(transfer_open.transfer_id, attempt_nonce, wire_len);
-    state
+    let accepted = state
         .accept(accept)
         .map_err(|error| failure("accept canonical stream", error))?;
     let mut extent_source = CanonicalCarrierExtentSource::new_at(store, source, resume_offset)?;
-    let mut pending = extent_source.next_extent()?;
+    let requires_final_checkpoint = canonical_sender_requires_final_checkpoint(accepted)?;
+    let mut pending = if requires_final_checkpoint {
+        extent_source.next_extent()?
+    } else {
+        None
+    };
     let mut checkpoints = 0_u64;
     while let Some(extent) = pending.take() {
         match state
@@ -1256,7 +1267,7 @@ pub(crate) async fn send_canonical_blob_profile5(
             }
         }
     }
-    if canonical_sender_requires_final_checkpoint(wire_len, resume_offset) {
+    if requires_final_checkpoint {
         let checkpoint = await_authenticated_progress(
             "receive final canonical checkpoint",
             attempt.receive_control(),
@@ -1844,11 +1855,16 @@ async fn send_completed_pack_inner(
     };
     let resume_offset = accept.durable_offset;
     let mut state = StreamSenderState::new(transfer_open.transfer_id, attempt_nonce, wire_len);
-    state
+    let accepted = state
         .accept(accept)
         .map_err(|error| failure("accept stream", error))?;
     let mut source = PackExtentSource::new_at(&root, open, resume_offset)?;
-    let mut pending = source.next_extent()?;
+    let requires_final_checkpoint = canonical_sender_requires_final_checkpoint(accepted)?;
+    let mut pending = if requires_final_checkpoint {
+        source.next_extent()?
+    } else {
+        None
+    };
     let mut checkpoints = 0;
     while let Some(extent) = pending.take() {
         match state
@@ -1886,18 +1902,20 @@ async fn send_completed_pack_inner(
             }
         }
     }
-    let checkpoint = attempt
-        .receive_control()
-        .await
-        .map_err(|error| transport_failure("receive final checkpoint", format!("{error:?}")))?
-        .ok_or("control stream closed before final checkpoint")?;
-    let StreamFrame::Checkpoint(checkpoint) = codec.decode(&checkpoint)? else {
-        return Err("final control frame was not checkpoint".into());
-    };
-    state
-        .checkpoint(checkpoint)
-        .map_err(|error| failure("advance final sender checkpoint", error))?;
-    checkpoints += 1;
+    if requires_final_checkpoint {
+        let checkpoint = attempt
+            .receive_control()
+            .await
+            .map_err(|error| transport_failure("receive final checkpoint", format!("{error:?}")))?
+            .ok_or("control stream closed before final checkpoint")?;
+        let StreamFrame::Checkpoint(checkpoint) = codec.decode(&checkpoint)? else {
+            return Err("final control frame was not checkpoint".into());
+        };
+        state
+            .checkpoint(checkpoint)
+            .map_err(|error| failure("advance final sender checkpoint", error))?;
+        checkpoints += 1;
+    }
     let StreamAction::Send(finish) = state
         .finish(semantic_commitment)
         .map_err(|error| failure("finish sender state", error))?
@@ -2625,10 +2643,27 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn fully_checkpointed_accept_advances_to_finish_without_final_checkpoint_wait() {
-        assert!(!canonical_sender_requires_final_checkpoint(1024, 1024));
-        assert!(canonical_sender_requires_final_checkpoint(1024, 512));
-        assert!(!canonical_sender_requires_final_checkpoint(0, 0));
+    fn fully_checkpointed_runtime_retry_settles_exactly_once() {
+        let transfer_id = [0x51; 32];
+        let attempt_nonce = [0x52; 32];
+        let total = 1024;
+        let mut sender = StreamSenderState::new(transfer_id, attempt_nonce, total);
+
+        let action = sender
+            .accept(crate::stream_transfer::StreamAcceptV1 {
+                transfer_id,
+                attempt_nonce,
+                sequence: 0,
+                durable_offset: total,
+                checkpoint_generation: 9,
+                absolute_receive_limit: total,
+                max_extent_bytes: PROFILE5_CANONICAL_EXTENT_BYTES as u32,
+                checkpoint_batch_bytes: MAX_STREAM_CHECKPOINT_BATCH_BYTES,
+            })
+            .expect("fully checkpointed ACCEPT");
+
+        assert_eq!(action, StreamAction::SendFinish);
+        assert!(!canonical_sender_requires_final_checkpoint(action).unwrap());
     }
 
     #[test]
