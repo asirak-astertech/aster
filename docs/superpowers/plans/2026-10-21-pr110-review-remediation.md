@@ -14,7 +14,10 @@
 
 - Preserve semantic-v7/v8 profile-4 wire behavior byte-for-byte.
 - Semantic v9 uses profile 5 and fails closed on unknown critical records or extents.
-- Keep agent, Rust application, and `asterctl` Blob request/output contracts introduced by PR 95.
+- Replace the unreleased PR 95 `PublishBlob` wire exchange with the current
+  bidirectional `v1alpha1` stream; require generated-client regeneration and do
+  not retain an additive legacy upload method when no production deployment
+  depends on it. Keep Blob semantic identity and operation-key recovery intact.
 - Keep local publication peer-independent; only network synchronization waits for a destination.
 - Bound memory independently of Blob size and keep one checkpoint batch at or below 128 MiB.
 - Distinguish canonical plaintext chunk, encoded chunk-record, and batched extent limits; derive encoded limits from the codec.
@@ -495,7 +498,9 @@
 
 - [ ] **Step 4: Request whole-branch code review and fix every actionable result test-first**
 
-  Review against the remediation spec, the 17-row traceability table, and PR 95 API compatibility. Repeat focused checks for every change.
+  Review against the remediation spec, the 17-row traceability table, and the
+  documented unreleased PR 95 `PublishBlob` compatibility break. Repeat
+  focused checks for every change.
 
 - [ ] **Step 5: Commit any gate-only corrections**
 

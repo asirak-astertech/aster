@@ -320,9 +320,9 @@
 - Consumes: Tasks 1-4's stable publication identity, inspection states, capacity output, progress modes, and recovery wording.
 - Produces: a fake-adapter portability test, current operator examples, and the focused pre-CI readiness evidence.
 
-- [x] **Step 1: Add the failing cross-transport resume test**
+- [x] **Step 1: Add the failing transport-neutral reopen test**
 
-  Add `publication_status_survives_small_mtu_interrupt_and_different_adapter_resume`. The first fake adapter fragments at a small MTU and stops after at least one durable checkpoint; the second adapter resumes from the exact receiver-authoritative offset. Assert unchanged publication ID, monotonic common durable counters, final Blob ID/hash equality, and no IP/Iroh type in the status interface.
+  Add `publication_status_survives_small_mtu_interrupt_and_different_adapter_resume`. The fake seam exercises a small-MTU interrupted attempt and a fresh adapter instance resuming from the exact receiver-authoritative offset. Its evidence is transport-neutral reopen of the same single contact-agreed adapter contract, not production cross-transport selection or failover. Assert unchanged publication ID, monotonic common durable counters, final Blob ID/hash equality, and no IP/Iroh type in the status interface.
 
 - [x] **Step 2: Run the fake-adapter test and confirm it fails**
 

@@ -237,11 +237,22 @@ makes a profile-5-arrived publication visible to existing matching Blob
 subscriptions. Poll, attempt rotation, acknowledgement, retirement delivery,
 and delivery status use the existing exact-publication ledger unchanged.
 
-The agent and `asterctl` APIs introduced by PR 95 keep their request and output
-contracts. Streaming remains an implementation of bounded application I/O, not
-a second semantic API. Publication status is projected from the provisional
-upload, canonical pending-source, canonical publication, and retained
-retirement authorities by exact publication identity.
+The PR 95 `PublishBlob` RPC is intentionally replaced in the still-unreleased
+`v1alpha1` application schema. Its client-streaming request and unary receipt
+become a bidirectional stream with metadata, accepted offset, offset-bearing
+data, durable checkpoints, finish, and complete receipt messages. There are no
+production deployments, so there is no deployed-client compatibility promise
+for the PR 95 shape. Clients must regenerate from the repository schema and
+adopt the new exchange before connecting to this server.
+
+The old method is not retained under an additive legacy name: doing so would
+freeze two public upload grammars and two recovery contracts without a deployed
+consumer, while the selected surface requires the server-authoritative durable
+offset and checkpoint responses. This is an application-wire break only; Blob
+identity, canonical storage, operation-key idempotency, and mesh profile-4/5
+compatibility remain as specified. Publication status is projected from the
+provisional upload, canonical pending-source, canonical publication, and
+retained retirement authorities by exact publication identity.
 
 ### 10. Transport abstraction and cancellation
 
@@ -269,6 +280,13 @@ publications fails closed with a specific unsupported-development-schema error;
 it is never silently discarded or guessed into canonical authority. Test and
 development users must export through the reviewed API before changing builds
 or reset that unqualified state.
+
+The application client migration is a coordinated alpha cutover, not a stored
+content migration: stop old PR 95 clients, upgrade the agent, regenerate client
+code from `proto/aster/application/v1alpha1/aster.proto`, implement the current
+bidirectional `PublishBlob` exchange, and retry uncertain operations with their
+original operation keys and identical intent. An old generated client must not
+be pointed at the new method and is not promised a compatibility response.
 
 Read-only inspection never mutates or partially migrates a schema. Migration is
 atomic and idempotent, and audit rejects partial authority, orphan checkpoints,

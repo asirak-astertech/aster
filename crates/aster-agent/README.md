@@ -105,6 +105,13 @@ two commands. The plaintext listener remains loopback-only, and every command
 requires exactly one bearer-token source. Prefer a protected token file rather
 than a literal token in shell history:
 
+`PublishBlob` streams directly into the running node's durable upload
+authority on platforms supported by the selected node and store. The agent
+does not create a separate whole-upload plaintext staging file and therefore
+has no Linux-only upload-staging gate. This differs from `asterctl blob-read`,
+whose safe destination-file publication still requires Linux and a qualifying
+filesystem.
+
 The machine-checked capability block above is authoritative for publication,
 status, and download behavior. Node-to-node profile-5 receipt resume remains a
 separate protocol mechanism.
@@ -184,16 +191,20 @@ existing or concurrently created path, and synchronizes the directory. Failure
 cleanup is best-effort; filesystem errors or an abrupt process or host failure
 can leave the hidden owner-only file for operator cleanup. A post-publication
 directory-sync error says the output exists and must be verified before retrying.
-Unsupported platforms or filesystems fail closed. The caller's publish source
-and completed read output remain caller-owned files outside node zeroization
-custody; zeroizing the node does not erase either file. The agent's upload
-staging is separate, private, unlinked before payload acceptance, and currently
-Linux-only. On Linux the configured state root (including an accepted symlink)
-is resolved once and the node start is verified against that exact device/inode
-before Blob staging uses the pinned descriptor; later path replacement cannot
-redirect either side. On other supported Unix platforms the existing Event and
-status service still starts, while Blob publish fails with a fixed unsupported
-response before consuming stream bytes.
+Unsupported output platforms or filesystems fail closed. The caller's publish
+source and completed read output remain caller-owned files outside node
+zeroization custody; zeroizing the node does not erase either file. Upload
+bytes pass through bounded agent frames into node-owned durable
+packs/checkpoints rather than an agent-owned plaintext file.
+
+The current `PublishBlob` method intentionally replaces the unreleased PR 95
+`v1alpha1` client-streaming/unary exchange with a bidirectional stream. There
+are no production deployments, so there is no deployed-client compatibility
+promise. Regenerate clients
+from the repository schema, implement accepted-offset/checkpoint responses, and
+preserve the original operation key and exact intent for recovery. An additive
+legacy method is not retained because it would freeze a second mutation and
+recovery grammar without a deployed consumer.
 
 This agent surface also exposes capacity observation. Blob subscription, poll,
 acknowledgement, network-wide visibility, and Blob FFI lifetime fields remain

@@ -97,8 +97,10 @@ canonical-first: `blob-status` reports receiver-local durable publication
 state, not carrier connectivity or source-side intent. The durable receipt
 binds the verified plan, depot/store authority, and durable checkpoint. Its
 checkpoint includes generation, chunk
-index, plaintext offset, pack offset, and wire offset. A later selected adapter
-therefore resumes the same publication without translating durable state.
+index, plaintext offset, pack offset, and wire offset. A fresh instance or
+reopen of the same single contact-agreed adapter therefore resumes the same
+publication without translating durable state. Cross-transport selection and
+failover are not implemented.
 
 The current adapter is Iroh QUIC. The adapter interface is carrier-independent
 and retains the bindings needed by a reliable ordered full-duplex non-IP
@@ -111,6 +113,22 @@ local publication success is a durable local commit; blob-status is
 receiver-local durable state, not remote delivery, peer status, or convergence
 status. Download resume: post-merge work; interrupted asterctl downloads
 currently restart at byte zero.
+
+### Migrate the unreleased application client
+
+PR 110 intentionally replaces the PR 95 `v1alpha1` `PublishBlob`
+client-streaming request/unary receipt with the current bidirectional stream.
+PR 95 was not deployed to production, so its generated client has no
+compatibility promise. Do not retain or operate an additive legacy upload
+method: two public mutation grammars would create competing recovery contracts
+without a deployed consumer.
+
+For this alpha cutover, stop old clients, upgrade the agent, regenerate client
+bindings from `proto/aster/application/v1alpha1/aster.proto`, and implement the
+`metadata -> accepted -> data(offset) -> checkpoint -> finish -> complete`
+exchange. Preserve operation keys and exact intent so an uncertain publication
+can converge through the node's durable upload authority. No Blob content or
+database migration is required by this application-wire change.
 
 ## Capacity and timeout bounds
 
@@ -195,8 +213,9 @@ sha256sum "$OUTPUT"
 
 An interrupted CLI download removes its staged bytes and currently restarts at
 zero. That is independent of node-to-node receipt resume, which continues from
-the receiver's authenticated durable checkpoint even when adapter selection
-changes. If the 15-minute read RPC cap is reached, confirm `blob-status` still
+the receiver's authenticated durable checkpoint after a fresh instance or
+reopen of the same single contact-agreed adapter. If the 15-minute read RPC cap
+is reached, confirm `blob-status` still
 reports `AVAILABLE`, remove any owner-only abandoned staging file after
 inspection, and retry the read; the CLI download itself does not resume.
 

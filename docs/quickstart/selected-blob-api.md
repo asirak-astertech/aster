@@ -135,11 +135,14 @@ file provider.
 
 ## Use the local agent and `asterctl`
 
-On Linux, the local `aster-agent` exposes native gRPC `PublishBlob` and
-`ReadBlob` streams backed by the same running node authority. Its plaintext
-listener is loopback-only. On non-Linux hosts, `ReadBlob` remains available to
-a capable native-gRPC client, while secure agent upload staging and
-`asterctl blob-read` finalization are unsupported. Supply exactly one
+The local `aster-agent` exposes native gRPC `PublishBlob` and `ReadBlob`
+streams backed by the same running node authority on platforms supported by
+the selected node and store. `PublishBlob` writes directly into node-owned
+durable upload staging; the agent creates no separate plaintext upload file and
+has no Linux-only staging gate. Its plaintext listener is loopback-only.
+`asterctl blob-read` output finalization remains separately limited to Linux
+and qualifying filesystems, while a capable native-gRPC client may consume
+`ReadBlob` without that CLI filesystem boundary. Supply exactly one
 bearer-token source to `asterctl`; a protected token file avoids placing the
 token in the command line:
 
@@ -207,8 +210,10 @@ canonical wire bytes. The receiver opens before authenticated OPEN, while PLAN
 still hides content size, and initially derives its hard deadline from the full
 profile wire ceiling. The legacy ten-minute bound is not a normal-success
 timeout. CLI and agent RPC deadlines are separate local application bounds. A
-timed-out local upload is retried with the same operation key; peer transfer resumes from the
-receiver's last durable checkpoint, including after an adapter change.
+timed-out local upload is retried with the same operation key; peer transfer
+resumes from the receiver's last durable checkpoint after a fresh instance or
+reopen of the same single contact-agreed adapter. Cross-transport selection and
+failover are not implemented.
 Publish/read progress is written only to stderr. `--progress auto` displays it
 on a terminal, `always` emits newline records, and `never` disables it. A
 download interruption discards its staged output and restarts from byte zero;
@@ -228,12 +233,20 @@ be verified before retrying. Unsupported platforms and filesystems fail closed.
 
 The caller's source file and completed output file remain outside node
 zeroization custody. Node zeroization does not erase them, and callers must
-apply their own retention and sanitization policy. The agent separately stages
-an upload in one private allocated file under its pinned state root, unlinks it
-before accepting payload bytes, and currently requires Linux for that custody
-boundary. Keep the publish source contents and length unchanged until command
-exit; detectable size changes have an unknown publication outcome, while
-same-length in-place mutation is outside the command contract.
+apply their own retention and sanitization policy. Upload bytes pass through
+bounded agent frames into the node's durable upload pack and checkpoints; the
+agent does not allocate or unlink a separate whole-upload plaintext staging
+file. Keep the publish source contents and length unchanged until command exit;
+detectable size changes have an unknown publication outcome, while same-length
+in-place mutation is outside the command contract.
+
+This branch intentionally replaces the unreleased PR 95 `v1alpha1`
+`PublishBlob` client-streaming/unary contract with the current bidirectional
+exchange. Regenerate clients from the repository schema and implement accepted
+offset, offset-bearing data, checkpoint, finish, and complete handling. There
+is no deployed-client compatibility promise and no additive legacy upload
+method; preserve the original operation key and exact intent when recovering an
+uncertain publication.
 
 The agent also provides capacity observation. Blob subscription, poll,
 acknowledgement, network-wide visibility, and FFI lifetime controls remain

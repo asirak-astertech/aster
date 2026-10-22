@@ -180,10 +180,14 @@ to determine ordinary lifecycle state.
 ## Protocol and compatibility
 
 `InspectBlobPublication`, `BlobCapacityStatus`, and the publication-ID field in
-`PublishBlobReceipt` are additive fields and methods in the existing alpha
-application protocol. Existing `GetStatus`, `PublishBlob`, and `ReadBlob` field
-meanings are unchanged. Generated Rust and Go artifacts and descriptor fixtures
-are regenerated in the same change.
+`PublishBlobReceipt` are additive fields and methods in the alpha application
+protocol. The subsequently selected PR 110 implementation intentionally
+replaces the unreleased PR 95 `PublishBlob` client-streaming/unary exchange with
+the current bidirectional `v1alpha1` stream. No production deployment depends
+on the older generated method; clients must regenerate and migrate, and an
+additive legacy upload method is not retained. `GetStatus` and `ReadBlob`
+retain their field meanings. Generated Rust and Go artifacts and descriptor
+fixtures are regenerated in the same change.
 
 Semantic-v9/profile-5 mesh framing does not change. Semantic-v7/v8 profile 4 is
 unchanged. This increment adds no peer acknowledgement, coordination message,
@@ -196,8 +200,10 @@ continuous connection, ordered carrier packet delivery, or a minimum attempt
 duration. A later BTLE adapter may fragment and reorder its own carrier units,
 but it must present the existing ordered Aster stream-attempt producer/consumer
 contract and resume from the same receiver-authoritative absolute checkpoint.
-Changing transport between attempts must not change the Blob identity, lifecycle
-state meanings, CLI output schema, or safe-retry procedure.
+Reopening a fresh instance of the same single contact-agreed adapter must not
+change the Blob identity, lifecycle state meanings, CLI output schema, or
+safe-retry procedure. Cross-transport selection and failover remain outside
+this increment.
 
 ## Security and privacy
 
@@ -240,9 +246,9 @@ Focused automated evidence must cover:
 - read interruption cleanup diagnostics;
 - Blob capacity output and exhausted-limit flags;
 - unchanged profile-4 vectors and profile-5 transfer behavior; and
-- a transport-neutral fake-adapter test using a small MTU, interrupted attempts,
-  and a different adapter on resume, proving that status observes only common
-  durable checkpoints and contains no IP/Iroh fields; and
+- a transport-neutral fake-adapter test using a small MTU and a fresh instance
+  of the same contact-agreed adapter after interruption, proving that status
+  observes only common durable checkpoints and contains no IP/Iroh fields; and
 - updated CLI help, man pages, operator guide, and engineering runbook examples.
 
 The composite CM4 validation must retain timestamps and terminal outputs for
