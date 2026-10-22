@@ -2177,7 +2177,7 @@ impl VerifiedFiniteBlobAdmission {
         let forwarding_age_ms = verified
             .forwarding_age_ms()
             .checked_add(elapsed_ms)
-            .ok_or_else(|| blob_error(BlobStoreError::PendingSourceConflict))?;
+            .ok_or_else(|| blob_error(BlobStoreError::ExpiredOrRetired))?;
         Ok(Self {
             source_transfer_id: *verified.source_transfer_id().as_bytes(),
             source_len: verified.source_len(),
@@ -2192,6 +2192,20 @@ impl VerifiedFiniteBlobAdmission {
                 profile_id: 5,
             },
         })
+    }
+
+    fn forwarding_age_at(
+        &self,
+        normalized_sample: aster_mesh::CustodySample,
+    ) -> Result<u64, StoreError> {
+        if normalized_sample.clock_id != self.receiver_sample.clock_id
+            || normalized_sample.tick_ms < self.receiver_sample.tick_ms
+        {
+            return Err(blob_error(BlobStoreError::PendingSourceConflict));
+        }
+        self.forwarding_age_ms
+            .checked_add(normalized_sample.tick_ms - self.receiver_sample.tick_ms)
+            .ok_or_else(|| blob_error(BlobStoreError::ExpiredOrRetired))
     }
 
     #[cfg(any(test, feature = "test-utils"))]
@@ -5585,9 +5599,11 @@ impl Store {
             || admission.blob_id != pack.commitment().blob_id()
             || admission.priority != open.open().priority()
             || open.open().ttl_ms() != Some(admission.ttl_ms)
-            || admission.forwarding_age_ms >= admission.ttl_ms
         {
             return Err(blob_error(BlobStoreError::PendingSourceConflict));
+        }
+        if admission.forwarding_age_ms >= admission.ttl_ms {
+            return Err(blob_error(BlobStoreError::ExpiredOrRetired));
         }
 
         let write = self.database.begin_write()?;
@@ -5595,6 +5611,10 @@ impl Store {
         require_control_policy_write(&write, authority, policy)?;
         synchronize_blob_policy_generation_write(&write)?;
         let continuity = custody::observe_continuity_write(&write, admission.receiver_sample)?;
+        let forwarding_age_ms = admission.forwarding_age_at(continuity.sample())?;
+        if forwarding_age_ms >= admission.ttl_ms {
+            return Err(blob_error(BlobStoreError::ExpiredOrRetired));
+        }
         let encoded = write
             .open_table(BLOB_PUBLICATIONS)?
             .get(transfer_id.as_bytes().as_slice())?
@@ -5619,7 +5639,7 @@ impl Store {
         let incoming = BlobLifetime::Finite {
             ttl_ms: admission.ttl_ms,
             age: custody::LowerBoundAgeCheckpoint {
-                cumulative_age_ms: admission.forwarding_age_ms,
+                cumulative_age_ms: forwarding_age_ms,
                 checkpoint: Some(continuity.sample()),
                 continuity_generation: continuity.generation(),
                 continuity_lost: false,
@@ -5635,7 +5655,7 @@ impl Store {
                     generation: continuity.generation(),
                     sample: continuity.sample(),
                 }),
-                Some(admission.receiver_sample),
+                Some(continuity.sample()),
             )?,
         )?;
         require_blob_lifetime_visible_write(&write, merged)?;
@@ -22926,6 +22946,34 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn finite_admission_age_overflow_is_terminal() {
+        // Mutation caught: treating authenticated age overflow as a retryable
+        // conflict strands an already completed provisional Profile-5 pack.
+        let receiver_sample = CustodySample {
+            clock_id: [0x45; 16],
+            tick_ms: 10,
+        };
+        let admission = VerifiedFiniteBlobAdmission::for_test(
+            [0x46; 32],
+            1,
+            [0x47; 32],
+            BlobId::from_bytes([0x48; 32]),
+            Priority::Immediate,
+            u64::MAX,
+            u64::MAX - 1,
+            receiver_sample,
+        );
+
+        assert!(matches!(
+            admission.forwarding_age_at(CustodySample {
+                clock_id: receiver_sample.clock_id,
+                tick_ms: receiver_sample.tick_ms + 2,
+            }),
+            Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+        ));
     }
 
     #[test]

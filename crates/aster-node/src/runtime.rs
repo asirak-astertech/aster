@@ -52898,89 +52898,145 @@ mod tests {
         }
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn lifecycle_native_profile5_pack_crosses_without_legacy_repack() {
-        Box::pin(
-            assert_lifecycle_native_profile5_pack_crosses_without_legacy_repack(
-                None, None, false, false,
-            ),
-        )
-        .await;
+    fn run_native_profile5_test(future: Pin<Box<dyn Future<Output = ()> + Send>>) {
+        let joined = thread::Builder::new()
+            .name("native-profile5-test".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build native Profile-5 test runtime")
+                    .block_on(future);
+            })
+            .expect("spawn native Profile-5 test thread")
+            .join();
+        if let Err(panic) = joined {
+            std::panic::resume_unwind(panic);
+        }
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn finite_lifecycle_native_profile5_pack_crosses_with_custody() {
-        Box::pin(
+    #[test]
+    fn lifecycle_native_profile5_pack_crosses_without_legacy_repack() {
+        run_native_profile5_test(Box::pin(
+            assert_lifecycle_native_profile5_pack_crosses_without_legacy_repack(
+                None, None, false, false, None, 100, None,
+            ),
+        ));
+    }
+
+    #[test]
+    fn finite_lifecycle_native_profile5_pack_crosses_with_custody() {
+        run_native_profile5_test(Box::pin(
             assert_lifecycle_native_profile5_pack_crosses_without_legacy_repack(
                 Some(600_000),
                 None,
                 false,
                 false,
+                None,
+                100,
+                None,
             ),
-        )
-        .await;
+        ));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn interrupted_native_profile5_pack_resumes_on_fresh_adapter() {
-        Box::pin(
+    #[test]
+    fn interrupted_native_profile5_pack_resumes_on_fresh_adapter() {
+        run_native_profile5_test(Box::pin(
             assert_lifecycle_native_profile5_pack_crosses_without_legacy_repack(
                 None,
                 Some(3),
                 false,
                 false,
+                None,
+                100,
+                None,
             ),
-        )
-        .await;
+        ));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn fully_checkpointed_native_profile5_pack_reconnect_sends_finish() {
-        Box::pin(
+    #[test]
+    fn fully_checkpointed_native_profile5_pack_reconnect_sends_finish() {
+        run_native_profile5_test(Box::pin(
             assert_lifecycle_native_profile5_pack_crosses_without_legacy_repack(
                 None,
                 Some(5),
                 false,
                 false,
+                None,
+                100,
+                None,
             ),
-        )
-        .await;
+        ));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn interrupted_finite_native_profile5_pack_resumes_after_store_restart() {
-        Box::pin(
+    #[test]
+    fn interrupted_finite_native_profile5_pack_resumes_after_store_restart() {
+        run_native_profile5_test(Box::pin(
             assert_lifecycle_native_profile5_pack_crosses_without_legacy_repack(
                 Some(600_000),
                 Some(4),
                 false,
                 false,
+                None,
+                100,
+                None,
             ),
-        )
-        .await;
+        ));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn finite_native_profile5_pack_expiring_during_transfer_stays_invisible() {
-        Box::pin(
+    #[test]
+    fn finite_native_profile5_pack_expiring_during_transfer_stays_invisible() {
+        run_native_profile5_test(Box::pin(
             assert_lifecycle_native_profile5_pack_crosses_without_legacy_repack(
-                Some(100),
+                Some(1_000),
                 None,
                 true,
                 false,
+                None,
+                100,
+                None,
             ),
-        )
-        .await;
+        ));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn revoked_native_profile5_pack_during_transfer_stays_invisible() {
-        Box::pin(
+    #[test]
+    fn revoked_native_profile5_pack_during_transfer_stays_invisible() {
+        run_native_profile5_test(Box::pin(
             assert_lifecycle_native_profile5_pack_crosses_without_legacy_repack(
-                None, None, false, true,
+                None, None, false, true, None, 100, None,
             ),
-        )
-        .await;
+        ));
+    }
+
+    #[test]
+    fn native_profile5_sender_finalization_overrun_emits_nothing_and_retries() {
+        run_native_profile5_test(Box::pin(
+            assert_lifecycle_native_profile5_pack_crosses_without_legacy_repack(
+                Some(600_000),
+                None,
+                false,
+                false,
+                Some(MAX_CUSTODY_FINALIZATION_CHARGE_MS + 1),
+                100,
+                Some(("sender-finalization-overrun", 0xe9)),
+            ),
+        ));
+    }
+
+    #[test]
+    fn native_profile5_sender_finalization_expiry_emits_nothing() {
+        run_native_profile5_test(Box::pin(
+            assert_lifecycle_native_profile5_pack_crosses_without_legacy_repack(
+                Some(80),
+                None,
+                false,
+                false,
+                Some(60),
+                30,
+                Some(("sender-finalization-expiry", 0xeb)),
+            ),
+        ));
     }
 
     async fn assert_lifecycle_native_profile5_pack_crosses_without_legacy_repack(
@@ -52988,23 +53044,28 @@ mod tests {
         fail_after_receives: Option<usize>,
         expire_before_promotion: bool,
         revoke_before_promotion: bool,
+        sender_finalization_delay_ms: Option<u64>,
+        source_clock_tick_ms: u64,
+        fixture_override: Option<(&'static str, u8)>,
     ) {
-        let services = control_test_services([0xe1; 32]);
-        let suffix = match (
-            ttl_ms.is_some(),
-            fail_after_receives,
-            expire_before_promotion,
-            revoke_before_promotion,
-        ) {
-            (_, _, _, true) => "revoked",
-            (true, _, true, _) => "finite-expired",
-            (true, Some(_), false, _) => "finite-resume",
-            (true, _, false, _) => "finite",
-            (false, Some(3), _, _) => "resume",
-            (false, Some(5), _, _) => "fully-checkpointed",
-            (false, Some(_), _, _) => "interrupted",
-            (false, None, _, _) => "durable",
-        };
+        let (suffix, services_seed) = fixture_override.unwrap_or_else(|| {
+            match (
+                ttl_ms.is_some(),
+                fail_after_receives,
+                expire_before_promotion,
+                revoke_before_promotion,
+            ) {
+                (_, _, _, true) => ("revoked", 0xe7),
+                (true, _, true, _) => ("finite-expired", 0xe6),
+                (true, Some(_), false, _) => ("finite-resume", 0xe5),
+                (true, _, false, _) => ("finite", 0xe2),
+                (false, Some(3), _, _) => ("resume", 0xe3),
+                (false, Some(5), _, _) => ("fully-checkpointed", 0xe4),
+                (false, Some(_), _, _) => ("interrupted", 0xe8),
+                (false, None, _, _) => ("durable", 0xe1),
+            }
+        });
+        let services = control_test_services([services_seed; 32]);
         let source_state = root(&format!("native-profile5-pack-source-{suffix}"));
         let target_state = root(&format!("native-profile5-pack-target-{suffix}"));
         fs::create_dir_all(&source_state).expect("native source state");
@@ -53018,6 +53079,9 @@ mod tests {
             Store::open_for_mission(target_state.join(STORE_FILE), authority)
                 .expect("native target store"),
         );
+        let target_stats_before = target_store
+            .blob_stats()
+            .expect("native target baseline Blob stats");
         let plaintext = (0..(2 * BLOB_STREAM_SEGMENT_BYTES + 17))
             .map(|index| (index % 251) as u8)
             .collect::<Vec<_>>();
@@ -53079,11 +53143,13 @@ mod tests {
         });
         let mut receiver_job = [0_u8; 16];
         receiver_job.copy_from_slice(&offer.transfer_id[..16]);
-        let pipeline_probe = (expire_before_promotion || revoke_before_promotion).then(|| {
-            crate::stream_pipeline::PipelineTestProbe::install(
-                crate::stream_pipeline::StreamJobId::from_bytes(receiver_job),
-            )
-        });
+        let pipeline_probe =
+            (expire_before_promotion || revoke_before_promotion || fail_after_receives.is_some())
+                .then(|| {
+                    crate::stream_pipeline::PipelineTestProbe::install(
+                        crate::stream_pipeline::StreamJobId::from_bytes(receiver_job),
+                    )
+                });
         let initiator_bytes = services
             .member
             .fresh_bundle()
@@ -53180,6 +53246,23 @@ mod tests {
                 failed.0.is_err() && failed.1.is_err(),
                 "both peers must observe the interrupted adapter: {failed:?}"
             );
+            let interrupted_probe = pipeline_probe
+                .as_ref()
+                .expect("interrupted native receiver pipeline probe");
+            assert!(
+                interrupted_probe.peak_active_workers() > 0,
+                "interrupted native transfer must exercise map workers"
+            );
+            assert_eq!(
+                interrupted_probe.active_workers(),
+                0,
+                "interrupted native transfer must leave no map worker alive"
+            );
+            assert_eq!(
+                interrupted_probe.joined_workers(),
+                interrupted_probe.worker_exits(),
+                "interrupted native transfer must join every worker that exits"
+            );
             assert!(
                 target_store
                     .get_blob(publication)
@@ -53234,7 +53317,7 @@ mod tests {
         let source_guard = ContactEmissionGuard {
             captured: source_live.snapshot().expect("source emission snapshot"),
             live: source_live,
-            custody_clock: NodeCustodyClock::injected([0xd1; 16], 100, 0),
+            custody_clock: NodeCustodyClock::injected([0xd1; 16], source_clock_tick_ms, 0),
         };
         let target_live = Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal));
         let target_clock = NodeCustodyClock::injected([0xe5; 16], 10_000, 0);
@@ -53243,17 +53326,59 @@ mod tests {
             live: target_live,
             custody_clock: target_clock.clone(),
         };
+        let promotion_hook_ran = Arc::new(AtomicBool::new(false));
         let promotion_hook: Option<Arc<dyn Fn() + Send + Sync>> = if expire_before_promotion {
             let expiry_clock = target_clock.clone();
+            let hook_ran = Arc::clone(&promotion_hook_ran);
+            let hook_store = Arc::clone(&target_store);
+            let expected_wire_len =
+                crate::stream_transfer::blob_pack_wire_len(plaintext.len() as u64)
+                    .expect("expiring native pack wire length");
             Some(Arc::new(move || {
+                hook_ran.store(true, Ordering::SeqCst);
+                let (_, checkpoint) = hook_store
+                    .resume_blob_upload_by_publication_id(publication_stream_id)
+                    .expect("load expiring native upload before promotion")
+                    .expect("expiring native upload remains provisional before promotion");
+                assert_eq!(
+                    checkpoint
+                        .durable_pack_checkpoint()
+                        .expect("expiring native upload has durable pack progress")
+                        .payload_len(),
+                    expected_wire_len,
+                    "expiry injection must run only after the complete pack is durable"
+                );
+                hook_store
+                    .test_observe_blob_custody_sample(CustodySample {
+                        clock_id: [0xe5; 16],
+                        tick_ms: 11_000,
+                    })
+                    .expect("advance native receiver continuity during promotion race");
                 expiry_clock
-                    .set_injected_tick(10_100)
-                    .expect("advance native receiver beyond TTL");
+                    .set_injected_tick(10_400)
+                    .expect("advance native receiver within direct receipt TTL");
             }))
         } else if revoke_before_promotion {
             let revoke_store = Arc::clone(&target_store);
             let publisher = services.member.identity();
+            let hook_ran = Arc::clone(&promotion_hook_ran);
+            let expected_wire_len =
+                crate::stream_transfer::blob_pack_wire_len(plaintext.len() as u64)
+                    .expect("revoked native pack wire length");
             Some(Arc::new(move || {
+                hook_ran.store(true, Ordering::SeqCst);
+                let (_, checkpoint) = revoke_store
+                    .resume_blob_upload_by_publication_id(publication_stream_id)
+                    .expect("load revoked native upload before promotion")
+                    .expect("revoked native upload remains provisional before promotion");
+                assert_eq!(
+                    checkpoint
+                        .durable_pack_checkpoint()
+                        .expect("revoked native upload has durable pack progress")
+                        .payload_len(),
+                    expected_wire_len,
+                    "revocation injection must run only after the complete pack is durable"
+                );
                 revoke_store
                     .test_revoke_blob_publisher_for_reclamation(publisher)
                     .expect("revoke native publisher before promotion");
@@ -53265,7 +53390,7 @@ mod tests {
         let sender_adapter = Arc::clone(&adapter);
         let sender_store = Arc::clone(&source_store);
         let sender_source = Arc::clone(&source);
-        let sender_handle = tokio::spawn(CONTACT_EMISSION_GUARD.scope(source_guard, async move {
+        let sender_inner = CONTACT_EMISSION_GUARD.scope(source_guard, async move {
             blob_stream::send_canonical_blob_profile5(
                 sender_adapter.as_ref(),
                 sender_store,
@@ -53277,7 +53402,15 @@ mod tests {
                 nonce,
             )
             .await
-        }));
+        });
+        let sender_handle = if let Some(delay_ms) = sender_finalization_delay_ms {
+            tokio::spawn(
+                TEST_BLOB_FINALIZATION_DELAY_MS
+                    .scope(std::cell::Cell::new(Some(delay_ms)), sender_inner),
+            )
+        } else {
+            tokio::spawn(sender_inner)
+        };
         let receiver_adapter = Arc::clone(&adapter);
         let receiver_store = Arc::clone(&target_store);
         let receiver_cache = Arc::clone(&target_cache);
@@ -53307,6 +53440,157 @@ mod tests {
             tokio::spawn(receiver_inner)
         };
 
+        if sender_finalization_delay_ms.is_some() {
+            let (sent, received) =
+                tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                    tokio::join!(sender_handle, receiver_handle)
+                })
+                .await
+                .expect("rejected native sender finalization remains bounded");
+            let sent = sent.expect("join rejected native Profile-5 sender");
+            let (received, returned_target_verifier) =
+                received.expect("join rejected native Profile-5 receiver");
+            target_verifier = returned_target_verifier;
+            assert!(sent.is_err(), "sender must reject stale finite custody");
+            assert!(
+                received.is_err(),
+                "receiver must observe the pre-emission sender rejection"
+            );
+            assert_eq!(
+                adapter.data_frames_sent(),
+                0,
+                "sender finalization rejection must precede custody, OPEN, DATA, and FINISH emission"
+            );
+            assert!(
+                adapter.data_part_body_lengths().is_empty(),
+                "sender finalization rejection must precede native pack DATA emission"
+            );
+            assert!(
+                target_store
+                    .resume_blob_upload_by_publication_id(publication_stream_id)
+                    .expect("lookup rejected sender-finalization upload")
+                    .is_none(),
+                "pre-emission rejection must not reserve target upload state"
+            );
+            assert!(
+                target_store
+                    .get_blob(publication)
+                    .expect("sender-finalization target lookup")
+                    .is_none(),
+                "pre-emission rejection must not publish at the target"
+            );
+            assert_eq!(
+                target_store
+                    .blob_stats()
+                    .expect("target stats after sender-finalization rejection"),
+                target_stats_before,
+                "pre-emission rejection must not consume target Blob capacity"
+            );
+            let source_after_rejection = source_store.get_blob(publication);
+            if sender_finalization_delay_ms
+                .is_some_and(|delay| delay > MAX_CUSTODY_FINALIZATION_CHARGE_MS)
+            {
+                assert!(
+                    source_after_rejection
+                        .expect("source lookup after finalization charge overrun")
+                        .is_some(),
+                    "charge overrun must leave the source available for a fresh attempt"
+                );
+                let retry_adapter = blob_stream::tests::MemoryTransportAdapter::new();
+                let (mut retry_sender_session, mut retry_receiver_session, retry_profile_digest) =
+                    blob_stream::tests::mission_pair_from_bundles(
+                        &initiator_bytes,
+                        &responder_bytes,
+                    );
+                let retry_source_live =
+                    Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal));
+                let retry_source_tick = source_clock_tick_ms
+                    .checked_add(sender_finalization_delay_ms.expect("finalization delay"))
+                    .and_then(|tick| tick.checked_add(1))
+                    .expect("fresh retry source clock remains bounded");
+                let retry_source_guard = ContactEmissionGuard {
+                    captured: retry_source_live
+                        .snapshot()
+                        .expect("fresh retry source emission snapshot"),
+                    live: retry_source_live,
+                    custody_clock: NodeCustodyClock::injected([0xd1; 16], retry_source_tick, 0),
+                };
+                let retry_target_live =
+                    Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal));
+                let retry_target_guard = ContactEmissionGuard {
+                    captured: retry_target_live
+                        .snapshot()
+                        .expect("fresh retry target emission snapshot"),
+                    live: retry_target_live,
+                    custody_clock: NodeCustodyClock::injected([0xe5; 16], 20_000, 0),
+                };
+                let retry_nonce = [0xec; 32];
+                let (retry_sent, retry_received) =
+                    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                        tokio::join!(
+                            Box::pin(CONTACT_EMISSION_GUARD.scope(
+                                retry_source_guard,
+                                blob_stream::send_canonical_blob_profile5(
+                                    &retry_adapter,
+                                    Arc::clone(&source_store),
+                                    &source_policy,
+                                    &source,
+                                    &mut retry_sender_session,
+                                    retry_profile_digest,
+                                    direction,
+                                    retry_nonce,
+                                ),
+                            )),
+                            Box::pin(CONTACT_EMISSION_GUARD.scope(
+                                retry_target_guard,
+                                blob_stream::receive_canonical_blob_profile5(
+                                    &retry_adapter,
+                                    Arc::clone(&target_store),
+                                    &target_cache,
+                                    &target_policy,
+                                    &mut target_verifier,
+                                    &mut retry_receiver_session,
+                                    retry_profile_digest,
+                                    direction,
+                                    retry_nonce,
+                                    &offer,
+                                ),
+                            ))
+                        )
+                    })
+                    .await
+                    .expect("fresh native custody retry remains bounded");
+                let retry_sent = retry_sent.expect("fresh native custody retry sender");
+                let retry_received = retry_received.expect("fresh native custody retry receiver");
+                assert_eq!(retry_sent.roots, retry_received.roots);
+                assert!(
+                    retry_adapter.data_frames_sent() > 0
+                        && !retry_adapter.data_part_body_lengths().is_empty(),
+                    "fresh custody authorization must emit and promote the retained source"
+                );
+                assert!(
+                    target_store
+                        .get_blob(publication)
+                        .expect("fresh custody retry target lookup")
+                        .is_some(),
+                    "fresh custody authorization must publish the same source at the target"
+                );
+            } else {
+                assert!(
+                    matches!(
+                        source_after_rejection,
+                        Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+                    ),
+                    "elapsed finite source must retire before emission: {source_after_rejection:?}"
+                );
+            }
+            drop(target_store);
+            drop(source_store);
+            fs::remove_dir_all(source_state).expect("sender-finalization source cleanup");
+            fs::remove_dir_all(target_state).expect("sender-finalization target cleanup");
+            return;
+        }
+
         if expire_before_promotion || revoke_before_promotion {
             let (received, _) =
                 tokio::time::timeout(std::time::Duration::from_secs(15), receiver_handle)
@@ -53318,6 +53602,28 @@ mod tests {
             assert!(
                 received.is_err(),
                 "receiver must reject stale promotion authority"
+            );
+            assert!(
+                promotion_hook_ran.load(Ordering::SeqCst),
+                "rejection must happen after the pre-promotion hook"
+            );
+            assert!(
+                !adapter.data_part_body_lengths().is_empty(),
+                "rejection must happen after native DATA records cross the adapter"
+            );
+            assert!(
+                target_store
+                    .resume_blob_upload_by_publication_id(publication_stream_id)
+                    .expect("lookup rejected native upload")
+                    .is_none(),
+                "terminal policy rejection must reclaim the provisional upload"
+            );
+            assert_eq!(
+                target_store
+                    .blob_stats()
+                    .expect("native target Blob stats after rejected promotion"),
+                target_stats_before,
+                "terminal policy rejection must return all Blob capacity and disk artifacts"
             );
             assert!(
                 target_store
@@ -53333,6 +53639,10 @@ mod tests {
                     .active_workers(),
                 0
             );
+            drop(target_store);
+            drop(source_store);
+            fs::remove_dir_all(source_state).expect("rejected promotion source cleanup");
+            fs::remove_dir_all(target_state).expect("rejected promotion target cleanup");
             return;
         }
         let (sent, received) = tokio::time::timeout(std::time::Duration::from_secs(15), async {
@@ -53376,7 +53686,7 @@ mod tests {
                     .expect("finite lifetime before failed native retry")
                     .expect("finite publication before failed native retry");
                 let failed_retry_adapter =
-                    blob_stream::tests::MemoryTransportAdapter::with_receive_failure(Some(2));
+                    blob_stream::tests::MemoryTransportAdapter::with_receive_failure(Some(3));
                 let (
                     mut failed_retry_sender_session,
                     mut failed_retry_receiver_session,
@@ -53439,6 +53749,10 @@ mod tests {
                     .await
                     .expect("failed zero-DATA native retry remains bounded");
                 assert!(failed_retry_sent.is_err() && failed_retry_received.is_err());
+                assert!(
+                    failed_retry_adapter.data_part_body_lengths().is_empty(),
+                    "exact existing-pack retry must reach FINISH without retransmitting DATA"
+                );
                 assert_eq!(
                     target_store.test_blob_logical_digest(),
                     digest_before_failed_retry
@@ -53629,6 +53943,11 @@ mod tests {
                 "native finite age and receiver-local checkpoint must survive restart"
             );
         }
+        drop(restarted_pack);
+        drop(reopened_target);
+        drop(source_store);
+        fs::remove_dir_all(source_state).expect("native Profile-5 source cleanup");
+        fs::remove_dir_all(target_state).expect("native Profile-5 target cleanup");
     }
 
     async fn assert_completed_canonical_blob_crossing(

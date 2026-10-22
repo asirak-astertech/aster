@@ -1099,6 +1099,13 @@ pub(super) fn bind_profile5_promotion_write(
     {
         return Err(blob_error(BlobStoreError::CompletionMismatch));
     }
+    super::lifecycle::ensure_lineage_fence(
+        write,
+        store.blob_lifecycle_limits,
+        variant,
+        *pack.physical_lineage(),
+        owner_binding,
+    )?;
     let capacity = super::pack_lifecycle::promote_write(
         write,
         variant,
@@ -1849,18 +1856,6 @@ impl Store {
             self.backing_identity,
             self.blob_depot_owner_token,
         )?;
-        let variant_id = super::blob_variant_id(
-            final_commitment.blob_id(),
-            &profile5.open.content_group(),
-            profile5.open.content_epoch(),
-        );
-        super::lifecycle::ensure_lineage_fence(
-            &write,
-            self.blob_lifecycle_limits,
-            variant_id,
-            *lineage.physical().binding(),
-            owner_binding,
-        )?;
         let pack = super::pack_lifecycle::BlobPackVariant::new(
             lineage.route(),
             lineage.physical(),
@@ -2128,17 +2123,23 @@ impl Store {
                     || admission.blob_id != completion.commitment().blob_id()
                     || admission.priority != profile5.open.priority()
                     || profile5.open.ttl_ms() != Some(admission.ttl_ms)
-                    || admission.forwarding_age_ms >= admission.ttl_ms
                 {
                     return Err(blob_error(BlobStoreError::PendingSourceConflict));
                 }
+                if admission.forwarding_age_ms >= admission.ttl_ms {
+                    return Err(blob_error(BlobStoreError::ExpiredOrRetired));
+                }
                 let continuity =
                     super::custody::observe_continuity_write(&write, admission.receiver_sample)?;
+                let forwarding_age_ms = admission.forwarding_age_at(continuity.sample())?;
+                if forwarding_age_ms >= admission.ttl_ms {
+                    return Err(blob_error(BlobStoreError::ExpiredOrRetired));
+                }
                 (
                     super::BlobLifetime::Finite {
                         ttl_ms: admission.ttl_ms,
                         age: super::custody::LowerBoundAgeCheckpoint {
-                            cumulative_age_ms: admission.forwarding_age_ms,
+                            cumulative_age_ms: forwarding_age_ms,
                             checkpoint: Some(continuity.sample()),
                             continuity_generation: continuity.generation(),
                             continuity_lost: false,

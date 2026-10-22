@@ -33,9 +33,9 @@ use aster_mesh::{
 use aster_redb_store::pack::{BlobPackWriter, PinnedBlobPackRoot};
 use aster_redb_store::{
     ApplyOutcome, BlobDepotCompletion, BlobOperationKey, BlobOperationOwner, BlobSourceProjection,
-    BlobSourceRetention, BlobSourceStageOutcome, BlobStreamResume, BlobTransferId,
+    BlobSourceRetention, BlobSourceStageOutcome, BlobStoreError, BlobStreamResume, BlobTransferId,
     BlobUploadCheckpoint, BlobUploadReservation, BlobVariantId, ControlPolicySnapshot, Store,
-    StoredBlob, profile5_pack_identities, profile5_pack_source_record_len,
+    StoreError, StoredBlob, profile5_pack_identities, profile5_pack_source_record_len,
 };
 use sha2::{Digest, Sha256};
 use std::{collections::VecDeque, future::Future, sync::Arc};
@@ -62,6 +62,21 @@ fn native_profile5_checkpoint_batch_bytes() -> u32 {
         return bytes;
     }
     MAX_STREAM_CHECKPOINT_BATCH_BYTES
+}
+
+fn terminal_profile5_promotion_error(error: &StoreError) -> bool {
+    matches!(
+        error,
+        StoreError::ControlPolicyUnsettled { .. }
+            | StoreError::ControlPolicyChanged
+            | StoreError::Blob(
+                BlobStoreError::PublisherRevoked(_)
+                    | BlobStoreError::KeyEpochStale { .. }
+                    | BlobStoreError::KeyEpochNotActive { .. }
+                    | BlobStoreError::ExpiredOrRetired
+                    | BlobStoreError::ReadPlanChanged
+            )
+    )
 }
 
 #[cfg(test)]
@@ -1881,6 +1896,10 @@ async fn send_native_profile5_pack(
             .map_err(|error| {
                 authentication_failure("seal native Profile-5 custody claim", error)
             })?;
+        #[cfg(test)]
+        super::apply_test_blob_finalization_delay().map_err(|error| {
+            lifecycle_failure("delay native Profile-5 custody finalization", error)
+        })?;
         let final_sample = super::contact_custody_sample()
             .map_err(|error| lifecycle_failure("finalize native Profile-5 custody clock", error))?
             .ok_or_else(|| {
@@ -2416,12 +2435,14 @@ async fn receive_native_profile5_pack(
     verified_open: VerifiedBlobStreamOpen,
     offer: &BlobStreamSourceOfferV1,
     mut opened_custody: Option<(BlobCustodyClaimV2, AuthenticatedBlobCustodyContactV2)>,
+    custody_received_sample: Option<aster_mesh::CustodySample>,
 ) -> Result<BlobNetworkReport, BlobNetworkError> {
     let open = verified_open.open();
     let wire_len = blob_pack_wire_len(open.total_len())
         .map_err(|error| failure("calculate received Profile-5 pack length", error))?;
     if (offer.finite != open.ttl_ms().is_some())
         || (offer.finite != opened_custody.is_some())
+        || (offer.finite != custody_received_sample.is_some())
         || open.publisher() == [0; 32]
         || open.topic() != &offer.topic
         || open.scope() != &offer.scope
@@ -2435,17 +2456,6 @@ async fn receive_native_profile5_pack(
             "authenticated open differs from PLAN/OPEN metadata",
         ));
     }
-    let custody_received_sample = if opened_custody.is_some() {
-        Some(
-            super::contact_custody_sample()
-                .map_err(|error| lifecycle_failure("sample native custody receipt clock", error))?
-                .ok_or_else(|| {
-                    lifecycle_failure("sample native custody receipt clock", "clock unavailable")
-                })?,
-        )
-    } else {
-        None
-    };
     if let Some((blob, pack)) =
         existing_native_profile5_pack(&store, policy, &verified_open, &transfer_open)?
     {
@@ -2808,7 +2818,6 @@ async fn receive_native_profile5_pack(
             "transport OPEN differs from signed Profile-5 source",
         ));
     }
-    run_native_profile5_prepromotion_hook();
     let imported_custody = if let Some((claim, authority)) = opened_custody {
         let ttl_ms = open.ttl_ms().ok_or_else(|| {
             authentication_failure(
@@ -2843,11 +2852,6 @@ async fn receive_native_profile5_pack(
                 "OPEN custody digest differs from authenticated claim",
             ));
         }
-        let promotion_sample = super::contact_custody_sample()
-            .map_err(|error| lifecycle_failure("sample native receiver custody clock", error))?
-            .ok_or_else(|| {
-                lifecycle_failure("sample native receiver custody clock", "clock unavailable")
-            })?;
         Some((
             verified,
             custody_received_sample.ok_or_else(|| {
@@ -2856,7 +2860,6 @@ async fn receive_native_profile5_pack(
                     "receipt sample unavailable",
                 )
             })?,
-            promotion_sample,
         ))
     } else {
         None
@@ -2877,45 +2880,77 @@ async fn receive_native_profile5_pack(
     let finish_store = Arc::clone(&store);
     let finish_policy = *policy;
     let finish_reservation = reservation.clone();
+    let projected = tokio::task::spawn_blocking(move || {
+        let completion = (|| {
+            let completion = writer
+                .finish_profile5(&verified_commitment)
+                .map_err(|error| {
+                    StoreError::Blob(BlobStoreError::Verification(error.to_string()))
+                })?;
+            let projected = finish_store.checkpoint_blob_upload(
+                &finish_policy,
+                &finish_reservation,
+                projected,
+                completion.checkpoint().clone(),
+            )?;
+            finish_store.complete_profile5_upload_pack(
+                &finish_policy,
+                &finish_reservation,
+                projected,
+                completion,
+                &verified_commitment,
+                lineage,
+            )
+        })();
+        if let Err(error) = &completion
+            && terminal_profile5_promotion_error(error)
+        {
+            finish_store.abort_blob_upload(&finish_reservation)?;
+        }
+        completion
+    })
+    .await
+    .map_err(|error| failure("join native Profile-5 pack completion", error))?
+    .map_err(|error| lifecycle_failure("complete native Profile-5 pack", error))?;
+    run_native_profile5_prepromotion_hook();
+    let imported_custody = match imported_custody {
+        Some((verified, received_sample)) => {
+            let promotion_sample = super::contact_custody_sample()
+                .map_err(|error| lifecycle_failure("sample native receiver custody clock", error))?
+                .ok_or_else(|| {
+                    lifecycle_failure("sample native receiver custody clock", "clock unavailable")
+                })?;
+            Some((verified, received_sample, promotion_sample))
+        }
+        None => None,
+    };
+    let promotion_store = Arc::clone(&store);
+    let promotion_policy = *policy;
+    let promotion_reservation = reservation.clone();
     let outcome = tokio::task::spawn_blocking(move || {
-        let completion = writer
-            .finish_profile5(&verified_commitment)
-            .map_err(|error| {
-                aster_redb_store::StoreError::Blob(aster_redb_store::BlobStoreError::Verification(
-                    error.to_string(),
-                ))
-            })?;
-        let projected = finish_store.checkpoint_blob_upload(
-            &finish_policy,
-            &finish_reservation,
-            projected,
-            completion.checkpoint().clone(),
-        )?;
-        let projected = finish_store.complete_profile5_upload_pack(
-            &finish_policy,
-            &finish_reservation,
-            projected,
-            completion,
-            &verified_commitment,
-            lineage,
-        )?;
-        match imported_custody {
-            Some((verified, received_sample, promotion_sample)) => finish_store
+        let promotion = match imported_custody {
+            Some((verified, received_sample, promotion_sample)) => promotion_store
                 .commit_received_profile5_upload_once_with_policy(
-                    &finish_policy,
-                    &finish_reservation,
+                    &promotion_policy,
+                    &promotion_reservation,
                     &projected,
                     verified,
                     received_sample,
                     promotion_sample,
                 ),
-            None => finish_store.commit_profile5_upload_once_with_policy(
-                &finish_policy,
-                &finish_reservation,
+            None => promotion_store.commit_profile5_upload_once_with_policy(
+                &promotion_policy,
+                &promotion_reservation,
                 &projected,
                 None,
             ),
+        };
+        if let Err(error) = &promotion
+            && terminal_profile5_promotion_error(error)
+        {
+            promotion_store.abort_blob_upload(&promotion_reservation)?;
         }
+        promotion
     })
     .await
     .map_err(|error| failure("join native Profile-5 promotion", error))?
@@ -3463,6 +3498,17 @@ pub(crate) async fn receive_canonical_blob_profile5(
     } else {
         None
     };
+    let custody_received_sample = if opened_custody.is_some() {
+        Some(
+            super::contact_custody_sample()
+                .map_err(|error| lifecycle_failure("sample native custody receipt clock", error))?
+                .ok_or_else(|| {
+                    lifecycle_failure("sample native custody receipt clock", "clock unavailable")
+                })?,
+        )
+    } else {
+        None
+    };
     let encoded_open =
         await_authenticated_progress("receive canonical open", attempt.receive_data())
             .await?
@@ -3504,6 +3550,7 @@ pub(crate) async fn receive_canonical_blob_profile5(
                 native_open,
                 offer,
                 opened_custody,
+                custody_received_sample,
             ))
             .await;
         }
@@ -5313,6 +5360,7 @@ pub(crate) mod tests {
         data: mpsc::UnboundedSender<Option<Vec<u8>>>,
         control: tokio::sync::Mutex<mpsc::UnboundedReceiver<Option<Vec<u8>>>>,
         pending_data_send_entered: Option<Arc<tokio::sync::Semaphore>>,
+        data_frames_sent: Arc<std::sync::atomic::AtomicUsize>,
         data_part_body_lengths: Arc<std::sync::Mutex<Vec<usize>>>,
     }
 
@@ -5367,6 +5415,7 @@ pub(crate) mod tests {
     impl StreamAttempt for MemorySenderAttempt {
         fn send_data<'a>(&'a self, frame: &'a [u8]) -> AdapterFuture<'a, ()> {
             Box::pin(async move {
+                self.data_frames_sent.fetch_add(1, Ordering::SeqCst);
                 self.data
                     .send(Some(frame.to_vec()))
                     .map_err(|_| StreamTransportError::Closed)
@@ -5379,6 +5428,7 @@ pub(crate) mod tests {
             body: &'a [u8],
         ) -> AdapterFuture<'a, ()> {
             Box::pin(async move {
+                self.data_frames_sent.fetch_add(1, Ordering::SeqCst);
                 self.data_part_body_lengths
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -5484,6 +5534,7 @@ pub(crate) mod tests {
                     data: data_send,
                     control: tokio::sync::Mutex::new(control_receive),
                     pending_data_send_entered: None,
+                    data_frames_sent: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                     data_part_body_lengths: Arc::new(std::sync::Mutex::new(Vec::new())),
                 }),
                 receiver: Arc::new(MemoryReceiverAttempt {
@@ -5508,6 +5559,7 @@ pub(crate) mod tests {
                         data: data_send,
                         control: tokio::sync::Mutex::new(control_receive),
                         pending_data_send_entered: Some(entered),
+                        data_frames_sent: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                         data_part_body_lengths: Arc::new(std::sync::Mutex::new(Vec::new())),
                     }),
                     receiver: Arc::new(MemoryReceiverAttempt {
@@ -5527,6 +5579,10 @@ pub(crate) mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone()
+        }
+
+        pub(crate) fn data_frames_sent(&self) -> usize {
+            self.sender.data_frames_sent.load(Ordering::SeqCst)
         }
     }
 
