@@ -149,11 +149,17 @@ staged or committed.
   support.
 - No cross-transport selection, cross-transport resume, or failover scenario
   has been physically or operationally validated; no such claim was added.
+  Production must keep exactly one contact-agreed adapter eligible until a
+  later protocol increment binds adapter choice across peers. The registry's
+  multi-registration tests prove that adapter implementations are not coupled
+  to Iroh; they do not authorize simultaneous multi-adapter operation.
 - The broader selected contact bootstrap and mission-session establishment are
   still Iroh-centric. A future non-Iroh contact path must authenticate the peer
   and supply the same narrow `AuthenticatedTransportContext` before registering
-  its stream adapter. That integration work no longer requires changes to the
-  stream protocol, pipeline, registry, or selector.
+  its stream adapter. Running that adapter as the single contact-agreed
+  transport does not require changes to the Blob stream codec, data pipeline,
+  registry, or selector. Coordinating it simultaneously with another eligible
+  transport remains separate protocol/bootstrap work.
 - Stable transport IDs require project-level allocation discipline. The
   registry rejects duplicate IDs in one composition, but this task did not add
   a global allocation document or ship another ID.

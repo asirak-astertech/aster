@@ -482,8 +482,9 @@ Use the `Link` trait and existing IP/BTLE adapters as semantic and test migratio
 sources. The selected node now has an adapter-neutral stream registry and
 deterministic selector, while `IrohQuicV1` remains the only adapter registered
 by the shipped production composition. Each adapter owns its connection state
-and attempt creation; registering another independently usable adapter does not
-require changing the stream protocol, pipeline, or selector. Candidate support
+and attempt creation. Implementing another adapter, or using it as the single
+contact-agreed adapter, does not require changing the Blob stream codec,
+pipeline, persistence, or selector. Candidate support
 and locators must come from local configuration, provisioned peer data, or
 authenticated discovery before `StreamOpen`; peer-supplied ranking is never
 accepted. The composition supplies that authenticated support plus local policy
@@ -499,9 +500,13 @@ outcomes, and checkpoint carry-forward, but they are not product transport
 support. This milestone claims automatic selection of the sole shipped Iroh
 adapter and authenticated Iroh reopen. It does not claim best-available
 cross-transport selection or failover because no second production adapter or
-physical cross-transport scenario has been validated. When another adapter is
-implemented, it uses the same registry and must not create a second persistence,
-reconciliation, authentication, or scheduling authority. Use the
+physical cross-transport scenario has been validated. Until a later protocol
+increment coordinates adapter choice across peers, production composition must
+make exactly one contact-agreed adapter eligible; local multi-registration tests
+are extension-seam evidence, not permission to enable competing adapters on a
+contact. When another adapter is implemented, it uses the same registry and
+must not create a second persistence, reconciliation, authentication, or
+scheduling authority. Use the
 [binding pattern](bindings/pattern.md) for a language API.
 
 ## Semantic protocol versions you may see
