@@ -70,11 +70,6 @@ fn maybe_inject_fault(path: &Path, point: BlobPackFaultPoint) -> Result<(), Blob
     Ok(())
 }
 
-#[cfg(not(test))]
-fn maybe_inject_fault(_path: &Path, _point: ()) -> Result<(), BlobPackError> {
-    Ok(())
-}
-
 pub(crate) fn reserved_upload_pack_bytes(total_len: u64) -> Result<u64, StoreError> {
     let segments = total_len
         .checked_add(BLOB_STREAM_SEGMENT_BYTES as u64 - 1)
@@ -390,6 +385,7 @@ impl BlobPackRoot {
         }
     }
 
+    #[cfg(test)]
     fn path(&self) -> &Path {
         match self {
             Self::Path(path) => path,

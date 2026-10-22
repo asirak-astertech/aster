@@ -588,6 +588,7 @@ pub enum BlobStoreError {
     LeaseCapacity,
     #[doc(hidden)]
     VariantDeleting,
+    UnsupportedExperimentalBlobStreamSchema,
     SchemaInvariant(&'static str),
     DepotIntegrity(&'static str),
     CompletionMismatch,
@@ -632,6 +633,9 @@ impl fmt::Display for BlobStoreError {
                 formatter.write_str("Blob reservation changed before commit")
             }
             Self::ReadPlanChanged => formatter.write_str("Blob read plan changed before use"),
+            Self::UnsupportedExperimentalBlobStreamSchema => formatter.write_str(
+                "unsupported experimental Blob stream schema contains durable authority",
+            ),
             Self::PublicationLimitExceeded { current, limit } => write!(
                 formatter,
                 "Blob publication set has {current} rows at its {limit}-row limit"
@@ -2556,6 +2560,9 @@ thread_local! {
         std::cell::Cell::new(0)
     };
     static TEST_PENDING_BLOB_SOURCE_ROWS_VISITED: std::cell::Cell<u64> = const {
+        std::cell::Cell::new(0)
+    };
+    static TEST_BLOB_SCHEMA_MIGRATION_FAULT: std::cell::Cell<u8> = const {
         std::cell::Cell::new(0)
     };
     static TEST_BLOB_ADMISSION_PRE_COMMIT_FAULT: std::cell::Cell<bool> = const {
@@ -15579,25 +15586,12 @@ pub(crate) fn blob_schema_present_write(
         .filter(|table| existing.contains(**table))
         .count();
     let upload_present = existing.contains(BLOB_UPLOADS.name());
-    let stream_legacy_predecessor = stream_present == 3
-        && existing.contains(BLOB_STREAM_RESERVATIONS.name())
-        && existing.contains(BLOB_STREAM_OPERATIONS.name())
-        && existing.contains(BLOB_STREAM_PUBLICATIONS.name())
-        && !existing.contains(BLOB_STREAM_CONFLICTS.name())
-        && !existing.contains(BLOB_STREAM_VARIANTS.name());
-    let stream_conflict_predecessor = stream_present == 4
-        && existing.contains(BLOB_STREAM_RESERVATIONS.name())
-        && existing.contains(BLOB_STREAM_OPERATIONS.name())
-        && existing.contains(BLOB_STREAM_PUBLICATIONS.name())
-        && existing.contains(BLOB_STREAM_CONFLICTS.name())
-        && !existing.contains(BLOB_STREAM_VARIANTS.name());
-    let stream_variant_predecessor = stream_present == 5
-        && existing.contains(BLOB_STREAM_RESERVATIONS.name())
-        && existing.contains(BLOB_STREAM_OPERATIONS.name())
-        && existing.contains(BLOB_STREAM_PUBLICATIONS.name())
-        && existing.contains(BLOB_STREAM_CONFLICTS.name())
-        && existing.contains(BLOB_STREAM_VARIANTS.name())
-        && !existing.contains(BLOB_STREAM_RETIREMENTS.name());
+    let extension_group_supported = matches!(
+        (network_present, upload_present),
+        (0, false) | (4, false) | (4, true) | (5, true)
+    );
+    #[cfg(test)]
+    let schema_migration_required = stream_present != 0 || network_predecessor || !upload_present;
     let metadata = write.open_table(METADATA)?;
     let global = blob_global_metadata_fields();
     let global_present = global
@@ -15617,16 +15611,46 @@ pub(crate) fn blob_schema_present_write(
     }
     if legacy_present != legacy.len()
         || !(network_present == 0 || network_predecessor || network_current)
-        || !(stream_present == 0
-            || stream_present == stream_tables.len()
-            || stream_legacy_predecessor
-            || stream_conflict_predecessor
-            || stream_variant_predecessor)
+        || !extension_group_supported
+        || !(stream_present == 0 || stream_present == stream_tables.len())
         || global_present.iter().any(|present| !present)
     {
         return Err(blob_error(BlobStoreError::SchemaInvariant(
             "mission-scoped Blob schema group is incomplete",
         )));
+    }
+    if stream_present == stream_tables.len() {
+        if write.open_table(BLOB_STREAM_RESERVATIONS)?.len()? != 0
+            || write.open_table(BLOB_STREAM_OPERATIONS)?.len()? != 0
+            || write.open_table(BLOB_STREAM_PUBLICATIONS)?.len()? != 0
+            || write.open_table(BLOB_STREAM_CONFLICTS)?.len()? != 0
+            || write.open_table(BLOB_STREAM_VARIANTS)?.len()? != 0
+            || write.open_table(BLOB_STREAM_RETIREMENTS)?.len()? != 0
+        {
+            return Err(blob_error(
+                BlobStoreError::UnsupportedExperimentalBlobStreamSchema,
+            ));
+        }
+        for table in [
+            BLOB_STREAM_RESERVATIONS,
+            BLOB_STREAM_OPERATIONS,
+            BLOB_STREAM_PUBLICATIONS,
+            BLOB_STREAM_CONFLICTS,
+            BLOB_STREAM_VARIANTS,
+            BLOB_STREAM_RETIREMENTS,
+        ] {
+            if !write.delete_table(table)? {
+                return Err(blob_error(BlobStoreError::SchemaInvariant(
+                    "experimental Blob stream schema changed during migration",
+                )));
+            }
+        }
+        #[cfg(test)]
+        if TEST_BLOB_SCHEMA_MIGRATION_FAULT.get() == 1 {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "injected Blob schema cleanup abort",
+            )));
+        }
     }
     if network_present == 0 {
         initialize_blob_network_schema(write)?;
@@ -15636,19 +15660,11 @@ pub(crate) fn blob_schema_present_write(
     if !upload_present {
         let _ = write.open_table(BLOB_UPLOADS)?;
     }
-    if stream_present == 0 {
-        initialize_blob_stream_schema(write)?;
-    } else if stream_legacy_predecessor {
-        let _ = write.open_table(BLOB_STREAM_CONFLICTS)?;
-        let _ = write.open_table(BLOB_STREAM_VARIANTS)?;
-        stream::migrate_blob_stream_variant_index_write(write)?;
-        let _ = write.open_table(BLOB_STREAM_RETIREMENTS)?;
-    } else if stream_conflict_predecessor {
-        let _ = write.open_table(BLOB_STREAM_VARIANTS)?;
-        stream::migrate_blob_stream_variant_index_write(write)?;
-        let _ = write.open_table(BLOB_STREAM_RETIREMENTS)?;
-    } else if stream_variant_predecessor {
-        let _ = write.open_table(BLOB_STREAM_RETIREMENTS)?;
+    #[cfg(test)]
+    if schema_migration_required && TEST_BLOB_SCHEMA_MIGRATION_FAULT.get() == 2 {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "injected Blob schema extension abort",
+        )));
     }
     Ok(true)
 }
@@ -16414,14 +16430,6 @@ pub(crate) fn audit_blob_tables_write(
     stats.carrier_prefixes = network.carrier_prefixes;
     stats.network_staging_bytes = network.staging.bytes;
     stats.carrier_fetch_cursors = network.carrier_cursors;
-    stream::audit_blob_stream_tables_write(
-        write,
-        read_mission_binding(write)?,
-        &accepted_dots,
-        &publisher_high,
-        &frontier,
-        shared,
-    )?;
     let mut metadata = write.open_table(METADATA)?;
     audit_or_initialize_counter(&mut metadata, BLOB_ITEM_COUNT, stats.publications)?;
     audit_or_initialize_counter(&mut metadata, BLOB_TOTAL_BYTES, stats.total_sealed_bytes)?;
@@ -16446,9 +16454,10 @@ pub(crate) fn inspect_blob_tables_read(
     read: &redb::ReadTransaction,
 ) -> Result<BlobAuditSnapshot, StoreError> {
     let tables = blob_table_names();
+    let stream_tables = stream_blob_table_names();
     if read
         .list_multimap_tables()?
-        .any(|table| tables.contains(&table.name()))
+        .any(|table| tables.contains(&table.name()) || stream_tables.contains(&table.name()))
     {
         return Err(blob_error(BlobStoreError::SchemaInvariant(
             "mission-scoped Blob schema has the wrong table kind",
@@ -16473,6 +16482,14 @@ pub(crate) fn inspect_blob_tables_read(
         && !existing.contains(BLOB_PROFILE5_RECEIPTS.name());
     let network_current = network_present == network.len();
     let upload_present = existing.contains(BLOB_UPLOADS.name());
+    let extension_group_supported = matches!(
+        (network_present, upload_present),
+        (0, false) | (4, false) | (4, true) | (5, true)
+    );
+    let stream_present = stream_tables
+        .iter()
+        .filter(|table| existing.contains(**table))
+        .count();
     let metadata = read.open_table(METADATA)?;
     let global = blob_global_metadata_fields();
     let global_present = global
@@ -16502,13 +16519,27 @@ pub(crate) fn inspect_blob_tables_read(
     }
     if legacy_present != legacy.len()
         || !(network_present == 0 || network_predecessor || network_current)
+        || !extension_group_supported
         || global_present.iter().any(|present| !present)
+        || !(stream_present == 0 || stream_present == stream_tables.len())
     {
         return Err(blob_error(BlobStoreError::SchemaInvariant(
             "mission-scoped Blob schema group is incomplete",
         )));
     }
     drop(metadata);
+    if stream_present == stream_tables.len()
+        && (read.open_table(BLOB_STREAM_RESERVATIONS)?.len()? != 0
+            || read.open_table(BLOB_STREAM_OPERATIONS)?.len()? != 0
+            || read.open_table(BLOB_STREAM_PUBLICATIONS)?.len()? != 0
+            || read.open_table(BLOB_STREAM_CONFLICTS)?.len()? != 0
+            || read.open_table(BLOB_STREAM_VARIANTS)?.len()? != 0
+            || read.open_table(BLOB_STREAM_RETIREMENTS)?.len()? != 0)
+    {
+        return Err(blob_error(
+            BlobStoreError::UnsupportedExperimentalBlobStreamSchema,
+        ));
+    }
     if upload_present {
         upload::audit_blob_uploads_read(read)?;
     }
@@ -17179,17 +17210,6 @@ fn initialize_blob_schema(write: &redb::WriteTransaction) -> Result<(), StoreErr
         BLOB_OPERATION_KEY_SCHEMA_VERSION,
     )?;
     initialize_blob_network_schema(write)?;
-    initialize_blob_stream_schema(write)?;
-    Ok(())
-}
-
-fn initialize_blob_stream_schema(write: &redb::WriteTransaction) -> Result<(), StoreError> {
-    let _ = write.open_table(BLOB_STREAM_RESERVATIONS)?;
-    let _ = write.open_table(BLOB_STREAM_OPERATIONS)?;
-    let _ = write.open_table(BLOB_STREAM_PUBLICATIONS)?;
-    let _ = write.open_table(BLOB_STREAM_CONFLICTS)?;
-    let _ = write.open_table(BLOB_STREAM_VARIANTS)?;
-    let _ = write.open_table(BLOB_STREAM_RETIREMENTS)?;
     Ok(())
 }
 
@@ -30793,6 +30813,316 @@ mod tests {
         ));
     }
 
+    fn blob_table_name_set(path: &Path) -> BTreeSet<String> {
+        let database = redb::Builder::new()
+            .open_read_only(path)
+            .expect("read Blob schema table names");
+        database
+            .begin_read()
+            .expect("Blob schema table-name transaction")
+            .list_tables()
+            .expect("Blob schema table names")
+            .map(|table| table.name().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn pre_pr110_blob_database_opens_without_content_migration() {
+        let root = BlobTestRoot::new("pre-pr110-canonical");
+        let mut services = blob_services(0x71);
+        let plaintext = b"pre-PR110 canonical Blob content remains byte-identical".to_vec();
+        let prepared = prepared_blob(&plaintext);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("current Blob fixture");
+        let (stored, _, _) = publish_blob(
+            &store,
+            &mut services,
+            &prepared,
+            &plaintext,
+            1,
+            b"pre-pr110-canonical-operation",
+        );
+        drop(store);
+        {
+            let database = Database::open(&root.database).expect("raw predecessor database");
+            let write = database.begin_write().expect("predecessor schema write");
+            assert!(write.delete_table(BLOB_UPLOADS).unwrap());
+            assert!(write.delete_table(BLOB_PROFILE5_RECEIPTS).unwrap());
+            for table in [
+                BLOB_STREAM_RESERVATIONS,
+                BLOB_STREAM_OPERATIONS,
+                BLOB_STREAM_PUBLICATIONS,
+                BLOB_STREAM_CONFLICTS,
+                BLOB_STREAM_VARIANTS,
+                BLOB_STREAM_RETIREMENTS,
+            ] {
+                let _ = write.delete_table(table).unwrap();
+            }
+            write.commit().expect("commit pre-PR110 schema");
+        }
+        let canonical_before = blob_database_digest(&root.database);
+        Store::inspect_existing(&root.database).expect("read-only predecessor audit");
+        drop(
+            Store::open_for_mission(&root.database, services.authority)
+                .expect("writable predecessor migration"),
+        );
+        assert_eq!(blob_database_digest(&root.database), canonical_before);
+        let reopened = Store::open_for_mission(&root.database, services.authority)
+            .expect("reopen migrated predecessor");
+        assert_eq!(
+            reopened
+                .get_blob(stored.transfer_id)
+                .expect("read preserved Blob")
+                .expect("preserved Blob publication")
+                .sealed,
+            stored.sealed
+        );
+    }
+
+    #[test]
+    fn empty_experimental_stream_tables_are_removed_atomically() {
+        let root = BlobTestRoot::new("empty-experimental-stream-schema");
+        let services = blob_services(0x72);
+        drop(
+            Store::open_for_mission(&root.database, services.authority)
+                .expect("experimental schema fixture"),
+        );
+        {
+            let database = Database::open(&root.database).expect("raw experimental database");
+            let write = database.begin_write().expect("experimental schema write");
+            let _ = write.open_table(BLOB_STREAM_RESERVATIONS).unwrap();
+            let _ = write.open_table(BLOB_STREAM_OPERATIONS).unwrap();
+            let _ = write.open_table(BLOB_STREAM_PUBLICATIONS).unwrap();
+            let _ = write.open_table(BLOB_STREAM_CONFLICTS).unwrap();
+            let _ = write.open_table(BLOB_STREAM_VARIANTS).unwrap();
+            let _ = write.open_table(BLOB_STREAM_RETIREMENTS).unwrap();
+            write.commit().expect("commit experimental schema");
+        }
+        let before = blob_table_name_set(&root.database);
+        assert!(
+            stream_blob_table_names()
+                .iter()
+                .all(|name| before.contains(*name))
+        );
+        drop(
+            Store::open_for_mission(&root.database, services.authority)
+                .expect("remove empty experimental schema"),
+        );
+        let after = blob_table_name_set(&root.database);
+        assert!(
+            stream_blob_table_names()
+                .iter()
+                .all(|name| !after.contains(*name))
+        );
+        assert!(after.contains(BLOB_UPLOADS.name()));
+        assert!(after.contains(BLOB_PROFILE5_RECEIPTS.name()));
+    }
+
+    #[test]
+    fn nonempty_experimental_stream_publications_fail_closed() {
+        let tables = [
+            BLOB_STREAM_RESERVATIONS,
+            BLOB_STREAM_OPERATIONS,
+            BLOB_STREAM_PUBLICATIONS,
+            BLOB_STREAM_CONFLICTS,
+            BLOB_STREAM_VARIANTS,
+            BLOB_STREAM_RETIREMENTS,
+        ];
+        for (index, populated) in tables.into_iter().enumerate() {
+            let root = BlobTestRoot::new(&format!("nonempty-experimental-stream-{index}"));
+            let services = blob_services(0x73 + index as u8);
+            drop(
+                Store::open_for_mission(&root.database, services.authority)
+                    .expect("experimental schema fixture"),
+            );
+            {
+                let database = Database::open(&root.database).expect("raw experimental database");
+                let write = database.begin_write().expect("experimental row write");
+                for table in tables {
+                    let mut table = write.open_table(table).unwrap();
+                    if table.name() == populated.name() {
+                        table
+                            .insert([0x11; 32].as_slice(), [0x22; 1].as_slice())
+                            .expect("experimental authority row");
+                    }
+                }
+                write.commit().expect("commit experimental row");
+            }
+            let before = blob_table_name_set(&root.database);
+            for error in [
+                Store::inspect_existing(&root.database)
+                    .expect_err("read-only open rejects nonempty experimental authority"),
+                Store::open_for_mission(&root.database, services.authority)
+                    .err()
+                    .expect("writable open rejects nonempty experimental authority"),
+            ] {
+                assert!(matches!(
+                    error,
+                    StoreError::Blob(BlobStoreError::UnsupportedExperimentalBlobStreamSchema)
+                ));
+            }
+            assert_eq!(blob_table_name_set(&root.database), before);
+        }
+    }
+
+    #[test]
+    fn read_only_open_never_migrates_stream_schema() {
+        let root = BlobTestRoot::new("read-only-experimental-stream-schema");
+        let services = blob_services(0x74);
+        drop(
+            Store::open_for_mission(&root.database, services.authority)
+                .expect("experimental schema fixture"),
+        );
+        {
+            let database = Database::open(&root.database).expect("raw experimental database");
+            let write = database.begin_write().expect("experimental schema write");
+            let _ = write.open_table(BLOB_STREAM_RESERVATIONS).unwrap();
+            let _ = write.open_table(BLOB_STREAM_OPERATIONS).unwrap();
+            let _ = write.open_table(BLOB_STREAM_PUBLICATIONS).unwrap();
+            let _ = write.open_table(BLOB_STREAM_CONFLICTS).unwrap();
+            let _ = write.open_table(BLOB_STREAM_VARIANTS).unwrap();
+            let _ = write.open_table(BLOB_STREAM_RETIREMENTS).unwrap();
+            write.commit().expect("commit experimental schema");
+        }
+        let before = blob_table_name_set(&root.database);
+        Store::inspect_existing(&root.database).expect("read-only audit accepts empty predecessor");
+        assert_eq!(blob_table_name_set(&root.database), before);
+    }
+
+    #[test]
+    fn experimental_stream_schema_cleanup_faults_roll_back_exactly() {
+        for boundary in [1, 2] {
+            let root = BlobTestRoot::new(&format!("experimental-cleanup-fault-{boundary}"));
+            let services = blob_services(0x75 + boundary);
+            drop(
+                Store::open_for_mission(&root.database, services.authority)
+                    .expect("current schema fixture"),
+            );
+            {
+                let database = Database::open(&root.database).expect("raw migration database");
+                let write = database.begin_write().expect("predecessor write");
+                assert!(write.delete_table(BLOB_UPLOADS).unwrap());
+                assert!(write.delete_table(BLOB_PROFILE5_RECEIPTS).unwrap());
+                let _ = write.open_table(BLOB_STREAM_RESERVATIONS).unwrap();
+                let _ = write.open_table(BLOB_STREAM_OPERATIONS).unwrap();
+                let _ = write.open_table(BLOB_STREAM_PUBLICATIONS).unwrap();
+                let _ = write.open_table(BLOB_STREAM_CONFLICTS).unwrap();
+                let _ = write.open_table(BLOB_STREAM_VARIANTS).unwrap();
+                let _ = write.open_table(BLOB_STREAM_RETIREMENTS).unwrap();
+                write.commit().expect("commit migration predecessor");
+            }
+            let before_tables = blob_table_name_set(&root.database);
+            let before_digest = blob_database_digest(&root.database);
+            TEST_BLOB_SCHEMA_MIGRATION_FAULT.set(boundary);
+            let error = Store::open_for_mission(&root.database, services.authority)
+                .err()
+                .expect("injected migration failure");
+            TEST_BLOB_SCHEMA_MIGRATION_FAULT.set(0);
+            assert_blob_schema_invariant(&error);
+            assert_eq!(blob_table_name_set(&root.database), before_tables);
+            assert_eq!(blob_database_digest(&root.database), before_digest);
+            drop(
+                Store::open_for_mission(&root.database, services.authority)
+                    .expect("migration retries atomically"),
+            );
+            let migrated = blob_table_name_set(&root.database);
+            assert!(migrated.contains(BLOB_UPLOADS.name()));
+            assert!(migrated.contains(BLOB_PROFILE5_RECEIPTS.name()));
+            assert!(
+                stream_blob_table_names()
+                    .iter()
+                    .all(|name| !migrated.contains(*name))
+            );
+        }
+    }
+
+    #[test]
+    fn partial_experimental_stream_schema_fails_closed_without_repair() {
+        let root = BlobTestRoot::new("partial-experimental-stream-schema");
+        let services = blob_services(0x78);
+        drop(
+            Store::open_for_mission(&root.database, services.authority)
+                .expect("current schema fixture"),
+        );
+        {
+            let database = Database::open(&root.database).expect("raw partial database");
+            let write = database.begin_write().expect("partial schema write");
+            let _ = write.open_table(BLOB_STREAM_PUBLICATIONS).unwrap();
+            write.commit().expect("commit partial schema");
+        }
+        let before = blob_table_name_set(&root.database);
+        assert_blob_schema_invariant(
+            &Store::inspect_existing(&root.database)
+                .expect_err("read-only partial schema rejection"),
+        );
+        assert_blob_schema_invariant(
+            &Store::open_for_mission(&root.database, services.authority)
+                .err()
+                .expect("writable partial schema rejection"),
+        );
+        assert_eq!(blob_table_name_set(&root.database), before);
+
+        let wrong_kind = BlobTestRoot::new("wrong-kind-experimental-stream-schema");
+        drop(
+            Store::open_for_mission(&wrong_kind.database, services.authority)
+                .expect("wrong-kind schema fixture"),
+        );
+        {
+            let database = Database::open(&wrong_kind.database).expect("raw wrong-kind database");
+            let write = database.begin_write().expect("wrong-kind schema write");
+            let definition =
+                redb::MultimapTableDefinition::<&[u8], &[u8]>::new(BLOB_STREAM_PUBLICATIONS.name());
+            let _ = write.open_multimap_table(definition).unwrap();
+            write.commit().expect("commit wrong-kind schema");
+        }
+        assert_blob_schema_invariant(
+            &Store::inspect_existing(&wrong_kind.database)
+                .expect_err("read-only wrong-kind schema rejection"),
+        );
+        assert_blob_schema_invariant(
+            &Store::open_for_mission(&wrong_kind.database, services.authority)
+                .err()
+                .expect("writable wrong-kind schema rejection"),
+        );
+    }
+
+    #[test]
+    fn blob_schema_rejects_arbitrary_count_only_extension_combinations() {
+        let services = blob_services(0x7a);
+        for orphan in ["upload", "network"] {
+            let root = BlobTestRoot::new(&format!("unsupported-extension-group-{orphan}"));
+            drop(
+                Store::open_for_mission(&root.database, services.authority)
+                    .expect("current extension schema fixture"),
+            );
+            {
+                let database = Database::open(&root.database).expect("raw extension database");
+                let write = database.begin_write().expect("unsupported extension write");
+                if orphan == "upload" {
+                    assert!(write.delete_table(BLOB_PENDING_SOURCES).unwrap());
+                    assert!(write.delete_table(BLOB_CARRIER_PREFIXES).unwrap());
+                    assert!(write.delete_table(BLOB_NETWORK_METADATA).unwrap());
+                    assert!(write.delete_table(BLOB_CARRIER_FETCH_CURSORS).unwrap());
+                    assert!(write.delete_table(BLOB_PROFILE5_RECEIPTS).unwrap());
+                } else {
+                    assert!(write.delete_table(BLOB_UPLOADS).unwrap());
+                }
+                write.commit().expect("commit unsupported extension group");
+            }
+            let before = blob_table_name_set(&root.database);
+            assert_blob_schema_invariant(
+                &Store::inspect_existing(&root.database)
+                    .expect_err("read-only rejects unsupported extension group"),
+            );
+            assert_blob_schema_invariant(
+                &Store::open_for_mission(&root.database, services.authority)
+                    .err()
+                    .expect("writable rejects unsupported extension group"),
+            );
+            assert_eq!(blob_table_name_set(&root.database), before);
+        }
+    }
+
     #[test]
     fn predecessor_blob_schema_requires_writable_network_and_pressure_migration() {
         let mut services = blob_services(0xc1);
@@ -30815,6 +31145,9 @@ mod tests {
             write
                 .delete_table(BLOB_PROFILE5_RECEIPTS)
                 .expect("delete predecessor receipt table");
+            write
+                .delete_table(BLOB_UPLOADS)
+                .expect("delete predecessor upload table");
             write
                 .delete_table(pressure::BLOB_PRESSURE_METADATA)
                 .expect("delete predecessor pressure metadata");

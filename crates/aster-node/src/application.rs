@@ -3090,6 +3090,7 @@ fn blob_store_error_kind(error: &BlobStoreError) -> ApplicationErrorKind {
         | BlobStoreError::VariantDeleting
         | BlobStoreError::Io(_) => ApplicationErrorKind::StateUnavailable,
         BlobStoreError::Verification(_)
+        | BlobStoreError::UnsupportedExperimentalBlobStreamSchema
         | BlobStoreError::SchemaInvariant(_)
         | BlobStoreError::DepotIntegrity(_)
         | BlobStoreError::CompletionMismatch

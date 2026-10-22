@@ -5855,6 +5855,7 @@ fn read_manifest_deletion_file(
 }
 
 impl OwnedDirectory {
+    #[cfg(test)]
     pub(super) fn path(&self) -> &Path {
         &self.path
     }

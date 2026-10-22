@@ -16,7 +16,7 @@ use crate::{
 use aster_mesh::{
     BlobManifest, BlobMetadata, BlobPublicationStreamId, NodeId, local_blob_publication_stream_id,
 };
-use redb::{Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata};
+use redb::{Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableHandle};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
@@ -574,6 +574,12 @@ pub(super) fn upload_capacity_usage_write(
 pub(super) fn upload_capacity_usage_read(
     read: &redb::ReadTransaction,
 ) -> Result<BlobUploadCapacity, StoreError> {
+    if !read
+        .list_tables()?
+        .any(|table| table.name() == super::BLOB_UPLOADS.name())
+    {
+        return Ok(BlobUploadCapacity::default());
+    }
     upload_capacity_usage_table(&read.open_table(super::BLOB_UPLOADS)?)
 }
 
@@ -586,6 +592,12 @@ pub(super) fn upload_pack_identities_write(
 pub(super) fn upload_pack_identities_read(
     read: &redb::ReadTransaction,
 ) -> Result<Vec<BlobPackIdentity>, StoreError> {
+    if !read
+        .list_tables()?
+        .any(|table| table.name() == super::BLOB_UPLOADS.name())
+    {
+        return Ok(Vec::new());
+    }
     upload_pack_identities_table(&read.open_table(super::BLOB_UPLOADS)?)
 }
 
