@@ -1350,6 +1350,11 @@ pub struct BlobReservation {
     previous_counter: u64,
     counter: u64,
     context: VersionVector,
+    /// True when the counter was durably and exclusively allocated before
+    /// publication (Profile-5 stream open). Such a reservation may be
+    /// accepted after later counters without rolling publisher high-water
+    /// backward.
+    durable_counter: bool,
 }
 
 struct BlobReservationInputs<'a> {
@@ -1375,6 +1380,22 @@ impl BlobReservation {
 
     pub const fn context(&self) -> &VersionVector {
         &self.context
+    }
+
+    pub const fn topic(&self) -> &Topic {
+        &self.topic
+    }
+
+    pub const fn scope(&self) -> &Scope {
+        &self.scope
+    }
+
+    pub const fn ttl_ms(&self) -> Option<u64> {
+        self.ttl_ms
+    }
+
+    pub const fn initial_custody(&self) -> Option<aster_mesh::CustodySample> {
+        self.local_initial_sample
     }
 
     /// Builds the exact selected Blob manifest-envelope header.
@@ -3624,6 +3645,7 @@ impl Store {
             previous_counter,
             counter,
             context,
+            durable_counter: false,
         })
     }
 
@@ -3708,6 +3730,7 @@ impl Store {
             previous_counter,
             counter,
             context,
+            durable_counter: false,
         })
     }
 
@@ -8477,7 +8500,9 @@ impl Store {
             .open_table(PUBLISHER_HIGH_WATER)?
             .get(reservation.publisher.as_slice())?
             .map_or(0, |value| value.value());
-        if current_counter != reservation.previous_counter {
+        if (!reservation.durable_counter && current_counter != reservation.previous_counter)
+            || (reservation.durable_counter && current_counter < reservation.counter)
+        {
             return Err(blob_error(BlobStoreError::ReservationChanged));
         }
         let dot_key = accepted_dot_key(prepared.header.stamp.dot);
@@ -16441,6 +16466,10 @@ pub(crate) fn audit_blob_tables_write(
         initialize_blob_schema(write)?;
     }
     upload::audit_blob_uploads_write(write)?;
+    upload::extend_profile5_reserved_publisher_high_write(
+        write,
+        &mut shared.expected_publisher_high,
+    )?;
     let publication_encoding = lifecycle::publication_encoding_migration_write(write)?;
     migrate_blob_operation_ownership_write(write, publication_encoding)?;
     let deletion_owner_binding = depot::depot_owner_binding_if_present_write(write)?;
@@ -17390,6 +17419,12 @@ pub(crate) fn inspect_blob_tables_read_with_shared(
         .list_tables()?
         .map(|table| table.name().to_owned())
         .collect::<BTreeSet<_>>();
+    if table_names.contains(BLOB_UPLOADS.name()) {
+        upload::extend_profile5_reserved_publisher_high_read(
+            read,
+            &mut shared.expected_publisher_high,
+        )?;
+    }
     if !table_names.contains(BLOB_PUBLICATIONS.name()) {
         return Ok(snapshot);
     }
@@ -21729,6 +21764,7 @@ mod tests {
             previous_counter: 0,
             counter: 1,
             context: VersionVector::default(),
+            durable_counter: false,
         };
         let (provisional_blob, _) = verified_blob_for_reservation(
             &mut services,

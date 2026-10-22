@@ -100,7 +100,7 @@ git commit -S -m "refactor(blob): restore profile-5 segment contract"
 
 **Interfaces:**
 - Consumes: `BlobOperationRequest`, `BlobReservation`, `BlobStreamOpen`, `VerifiedBlobStreamOpen`, `BlobUploadReservation`, control policy, custody samples, and operation-key retry rules.
-- Produces: `Store::reserve_profile5_upload_with_policy<F>(...) -> Result<(BlobUploadReservation, VerifiedBlobStreamOpen), StoreError>`, where `F: FnOnce(&BlobReservation) -> Result<(VerifiedBlobStreamOpen, Vec<u8>), StoreError>` supplies the provider-authenticated open and exact sealed bytes.
+- Produces: `Store::reserve_profile5_upload_with_policy<F>(...) -> Result<(BlobUploadReservation, BlobUploadCheckpoint, VerifiedBlobStreamOpen), StoreError>`, where `F: FnOnce(&BlobReservation, Option<&[u8]>) -> Result<(VerifiedBlobStreamOpen, Vec<u8>), StoreError>` signs a new open or re-verifies exact stored authenticated bytes after retry/restart. The Store never manufactures `VerifiedBlobStreamOpen` authority from persisted fields.
 
 - [ ] **Step 1: Add failing lifecycle-reservation tests**
 
@@ -127,6 +127,8 @@ Version the durable upload row for the unreleased format and persist the exact s
 - [ ] **Step 4: Implement `reserve_profile5_upload_with_policy`**
 
 Reserve the semantic counter/identity and provisional lifecycle state in one immediate redb transaction, but do not accept or expose that identity. Exact retries return the same reservation/open; conflicts and pre-commit faults leave no counter, operation, upload, or capacity mutation. Final promotion converts the reservation into the ordinary semantic publication without allocating a second identity. Do not add application visibility or causal accepted-dot state until that promotion.
+
+Publisher high-water is also the shared cross-data-class allocation fence. Advancing it at open reserves the dot, while accepted-dot and causal-frontier rows remain absent. A later publication may therefore commit at a higher counter before this upload finishes; promotion accepts the older reserved dot without requiring adjacent high-water and never lowers high-water.
 
 - [ ] **Step 5: Run the focused reservation and lifecycle tests**
 
