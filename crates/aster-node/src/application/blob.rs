@@ -1877,7 +1877,7 @@ enum PreparedBlobPublishFinalization {
 
 struct BlobFinalizeJob {
     mission: UnprotectedReferenceMission,
-    store: Arc<Store>,
+    store: BlobFinalizeStore,
     source_route_cache: Arc<AuthenticatedEventRouteCache>,
     custody_clock: NodeCustodyClock,
     reservation: BlobUploadReservation,
@@ -2370,10 +2370,36 @@ impl Drop for BlobFinalizePool {
 }
 
 impl BlobFinalizeJob {
+    fn new(
+        mission: UnprotectedReferenceMission,
+        store: BlobFinalizeStore,
+        source_route_cache: Arc<AuthenticatedEventRouteCache>,
+        custody_clock: NodeCustodyClock,
+        reservation: BlobUploadReservation,
+        cleanup_upload: bool,
+    ) -> Self {
+        Self {
+            mission,
+            store,
+            source_route_cache,
+            custody_clock,
+            reservation,
+            cleanup_upload,
+            #[cfg(test)]
+            gate: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_test_gate(mut self, gate: Option<BlobFinalizeTestGate>) -> Self {
+        self.gate = gate;
+        self
+    }
+
     fn run_measured(self) -> Result<(BlobPublishResult, BlobFinalizeMetrics), ApplicationError> {
         let BlobFinalizeJob {
             mission,
-            store: raw_store,
+            store,
             source_route_cache,
             custody_clock,
             reservation,
@@ -2385,7 +2411,6 @@ impl BlobFinalizeJob {
         if let Some(gate) = &gate {
             gate.enter();
         }
-        let store = BlobFinalizeStore::new(raw_store);
 
         // Replay current authority inside this owned job. This deliberately
         // happens after handoff from the application actor, so preparation and
@@ -3620,18 +3645,17 @@ impl SelectedBlobNode {
             .writer
             .finish()
             .map_err(|error| blob_pack_application_error("blob stream finish", error))?;
-        Ok(PreparedBlobPublishFinalization::Pending(Box::new(
-            BlobFinalizeJob {
-                mission: self.mission.clone(),
-                store: Arc::clone(&self.store),
-                source_route_cache: Arc::clone(&self.source_route_cache),
-                custody_clock: self.custody_clock.clone(),
-                reservation: stream.reservation,
-                cleanup_upload: true,
-                #[cfg(test)]
-                gate: self.stream_finalize_gate.clone(),
-            },
-        )))
+        let job = BlobFinalizeJob::new(
+            self.mission.clone(),
+            BlobFinalizeStore::new(Arc::clone(&self.store)),
+            Arc::clone(&self.source_route_cache),
+            self.custody_clock.clone(),
+            stream.reservation,
+            true,
+        );
+        #[cfg(test)]
+        let job = job.with_test_gate(self.stream_finalize_gate.clone());
+        Ok(PreparedBlobPublishFinalization::Pending(Box::new(job)))
     }
 
     #[cfg(test)]
@@ -8248,6 +8272,46 @@ pub(crate) mod tests {
             expected.push(BlobFinalizeStoreOperation::CompleteUpload);
         }
         expected
+    }
+
+    #[test]
+    fn finalizer_job_construction_requires_non_escaping_store_facade() {
+        type Constructor = fn(
+            UnprotectedReferenceMission,
+            BlobFinalizeStore,
+            Arc<AuthenticatedEventRouteCache>,
+            NodeCustodyClock,
+            BlobUploadReservation,
+            bool,
+        ) -> BlobFinalizeJob;
+
+        fn take_owned_store(job: BlobFinalizeJob) -> BlobFinalizeStore {
+            job.store
+        }
+
+        trait AmbiguousIfStoreDeref<Marker> {
+            fn assert_not_store_deref() {}
+        }
+        impl<T: ?Sized> AmbiguousIfStoreDeref<()> for T {}
+        impl<T: ?Sized + std::ops::Deref> AmbiguousIfStoreDeref<u8> for T {}
+
+        trait AmbiguousIfStoreAsRef<Marker> {
+            fn assert_not_store_as_ref() {}
+        }
+        impl<T: ?Sized> AmbiguousIfStoreAsRef<()> for T {}
+        impl<T: ?Sized + AsRef<Store>> AmbiguousIfStoreAsRef<u8> for T {}
+
+        trait AmbiguousIfArcStoreAsRef<Marker> {
+            fn assert_not_arc_store_as_ref() {}
+        }
+        impl<T: ?Sized> AmbiguousIfArcStoreAsRef<()> for T {}
+        impl<T: ?Sized + AsRef<Arc<Store>>> AmbiguousIfArcStoreAsRef<u8> for T {}
+
+        let _: Constructor = BlobFinalizeJob::new;
+        let _: fn(BlobFinalizeJob) -> BlobFinalizeStore = take_owned_store;
+        let _ = <BlobFinalizeStore as AmbiguousIfStoreDeref<_>>::assert_not_store_deref;
+        let _ = <BlobFinalizeStore as AmbiguousIfStoreAsRef<_>>::assert_not_store_as_ref;
+        let _ = <BlobFinalizeStore as AmbiguousIfArcStoreAsRef<_>>::assert_not_arc_store_as_ref;
     }
 
     #[test]
