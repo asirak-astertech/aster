@@ -2184,6 +2184,102 @@ mod tests {
         }
     }
 
+    #[test]
+    fn profile5_segment_is_the_storage_and_wire_partition() {
+        let (stream_id, open_digest, key, nonce) = identities();
+        let sealer = BlobStreamSegmentSealer::new(stream_id, open_digest, 7, key, nonce);
+        let opener = BlobStreamSegmentOpener::new(stream_id, open_digest, 7, key, nonce);
+        let total_len = BLOB_STREAM_SEGMENT_BYTES as u64 + 17;
+        let plaintexts = [vec![0x5a; BLOB_STREAM_SEGMENT_BYTES], vec![0xa5; 17]];
+
+        for (index, plaintext) in plaintexts.into_iter().enumerate() {
+            let offset = index as u64 * BLOB_STREAM_SEGMENT_BYTES as u64;
+            let partition = BlobStreamPlainPartition::new(
+                stream_id,
+                open_digest,
+                7,
+                index as u64,
+                offset,
+                total_len,
+                plaintext.clone(),
+            )
+            .expect("canonical Profile-5 partition");
+            let (segment, expected_leaves) = sealer.seal(partition).expect("seal segment");
+            let encoded = segment.encode();
+
+            assert_eq!(
+                encoded.len(),
+                plaintext.len() + BLOB_STREAM_SEGMENT_ENCODED_OVERHEAD_BYTES
+            );
+            assert_eq!(&encoded[..8], b"ASTRBS02");
+            let header = EncryptedBlobStreamSegment::inspect_encoded(&encoded)
+                .expect("inspect canonical segment");
+            assert_eq!(header.stream_id(), &stream_id);
+            assert_eq!(header.open_digest(), &open_digest);
+            assert_eq!(header.index(), index as u64);
+            assert_eq!(header.offset(), offset);
+            assert_eq!(header.total_len(), total_len);
+            assert_eq!(header.plaintext_len(), plaintext.len() as u32);
+            assert_eq!(header.ciphertext_len(), plaintext.len() as u32 + 16);
+
+            let (opened_header, opened, leaves) =
+                opener.open_encoded(&encoded).expect("open wire segment");
+            assert_eq!(opened_header, header);
+            assert_eq!(&*opened, plaintext.as_slice());
+            assert_eq!(leaves, expected_leaves);
+        }
+    }
+
+    #[test]
+    fn profile5_empty_and_exact_boundaries_are_canonical() {
+        let metadata = BlobMetadata::new(None, Vec::new()).expect("metadata");
+        let empty_open = VerifiedBlobStreamOpen::for_test(
+            open_with_len(metadata.clone(), 0).expect("empty open"),
+        );
+        let (empty_plain_root, empty_cipher_root) = BlobStreamFrontier::new()
+            .finish(0)
+            .expect("empty terminal roots");
+        let empty_commitment = BlobStreamFinalCommitment::new(
+            &empty_open,
+            empty_plain_root,
+            empty_cipher_root,
+            0,
+            None,
+        )
+        .expect("empty final commitment");
+        assert_eq!(empty_commitment.total_len(), 0);
+        assert_eq!(empty_commitment.segment_count(), 0);
+
+        let exact_len = 2 * BLOB_STREAM_SEGMENT_BYTES as u64;
+        let exact_open = VerifiedBlobStreamOpen::for_test(
+            open_with_len(metadata, exact_len).expect("exact-boundary open"),
+        );
+        let (stream_id, open_digest, key, nonce) = identities();
+        let sealer = BlobStreamSegmentSealer::new(stream_id, open_digest, 7, key, nonce);
+        let mut frontier = BlobStreamFrontier::new();
+        for index in 0..2 {
+            let partition = BlobStreamPlainPartition::new(
+                stream_id,
+                open_digest,
+                7,
+                index,
+                index * BLOB_STREAM_SEGMENT_BYTES as u64,
+                exact_len,
+                vec![index as u8; BLOB_STREAM_SEGMENT_BYTES],
+            )
+            .expect("full exact-boundary segment");
+            let leaves = sealer.seal(partition).expect("seal").1;
+            frontier
+                .append(BlobStreamSubtree::leaf(index, leaves))
+                .expect("ordered reduction");
+        }
+        let (plain_root, cipher_root) = frontier.finish(exact_len).expect("exact roots");
+        let commitment =
+            BlobStreamFinalCommitment::new(&exact_open, plain_root, cipher_root, 2, None)
+                .expect("exact-boundary commitment");
+        assert_eq!(commitment.segment_count(), 2);
+    }
+
     fn roots_for_order(order: &[usize]) -> ([u8; 32], [u8; 32]) {
         let (sealer, _) = contexts();
         let leaves = (0..4)

@@ -637,7 +637,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_v9_selects_blob_stream_without_profile_four_fallback() {
+    fn semantic_v9_blob_selection_requires_profile5() {
         let offer = TransferProfileOfferV1::for_semantic_version(9).expect("v9 offer");
         let blob = offer
             .known_lanes()

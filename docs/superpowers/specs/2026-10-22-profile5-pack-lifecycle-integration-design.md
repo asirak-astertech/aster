@@ -172,8 +172,11 @@ or prevent a future BLE adapter from carrying the same segment stream.
 5. Verify final lengths and ordered roots.
 6. Synchronize the completed pack and final checkpoint.
 7. In one lifecycle transaction, recheck authorization, quota, deletion
-   fences, operation-key intent, lineage, and policy; allocate final semantic
-   identity; register the pack variant; and expose the publication.
+   fences, operation-key intent, lineage, and policy; consume the exact semantic
+   identity and counter reserved by the authenticated stream open without
+   allocating a second identity; register the pack variant; and expose the
+   publication. The reservation remains invisible and unaccepted until this
+   atomic promotion.
 
 Cancellation or failure before step 7 exposes no publication. The provisional
 import and its capacity remain lifecycle-owned and can resume or be reclaimed
