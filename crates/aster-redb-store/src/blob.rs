@@ -3052,6 +3052,23 @@ impl Store {
         }))
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn test_revoke_blob_publisher_for_reclamation(
+        &self,
+        publisher: NodeId,
+    ) -> Result<(), StoreError> {
+        let authority = self.require_bound_mission()?;
+        let write = self.database.begin_write()?;
+        enforce_live_write(&write)?;
+        let encoded = encode_revocation_index(authority, 1, ControlTransferId::new([0xee; 32]));
+        write
+            .open_table(CONTROL_REVOCATIONS)?
+            .insert(publisher.as_slice(), encoded.as_slice())?;
+        write.commit()?;
+        Ok(())
+    }
+
     /// Test-only deterministic fault seam consumed after physical carrier
     /// installation and before logical prefix retirement.
     #[cfg(any(test, feature = "test-utils"))]
@@ -18426,12 +18443,11 @@ fn plan_pending_removal_authority_write(
     if pending != *expected || pending.metadata.transfer_id != source {
         return Err(blob_error(BlobStoreError::PendingSourceConflict));
     }
-    let receipt_charge = stream::profile5_receipt_expiry_charge_write(write, source)?;
-    if receipt_charge.0 != 0
+    let receipt_row = stream::profile5_receipt_maintenance_row_write(write, source)?;
+    if let Some((key, value_len)) = receipt_row.as_ref()
         && !charge.charge_row(
-            MaintenanceRowIdentity::new("aster.blob-profile5-receipts.v1", source.as_bytes()),
-            usize::try_from(receipt_charge.1)
-                .map_err(|_| StoreError::PayloadByteAccountingOverflow)?,
+            MaintenanceRowIdentity::new("aster.blob-profile5-receipts.v1", key),
+            *value_len,
         )?
     {
         return Ok(None);
@@ -18476,7 +18492,7 @@ fn plan_pending_removal_authority_write(
         staging_before,
         removed_rows,
         removed_bytes,
-        remove_profile5_receipt: receipt_charge.0 != 0,
+        remove_profile5_receipt: receipt_row.is_some(),
     }))
 }
 
@@ -20334,6 +20350,87 @@ mod tests {
                 &Store::open_for_mission(&root.database, services.authority)
                     .err()
                     .expect("writable rejects progress corruption"),
+            );
+            assert_eq!(blob_database_digest(&root.database), before);
+        }
+    }
+
+    #[test]
+    fn profile5_live_receipt_audit_rejects_every_noncanonical_terminal_field() {
+        for offset in [169usize, 177, 185, 193, 201] {
+            let root = BlobTestRoot::new(&format!("profile5-live-progress-corruption-{offset}"));
+            let mut services = blob_services(0xe3);
+            let plaintext = vec![0x4d; 2 * aster_mesh::MAX_BLOB_CHUNK_SIZE as usize];
+            let prepared = prepared_blob(&plaintext);
+            let store = Store::open_for_mission(&root.database, services.authority)
+                .expect("live progress corruption store");
+            let (stored, _, _) = publish_blob(
+                &store,
+                &mut services,
+                &prepared,
+                &plaintext,
+                1,
+                format!("profile5-live-progress-{offset}").as_bytes(),
+            );
+            let route = services
+                .reader
+                .verify_blob(&stored.sealed)
+                .expect("live route");
+            let BlobContentVerification::ContentVerified {
+                blob,
+                manifest_bytes,
+            } = services
+                .reader
+                .verify_blob_content(route, &stored.sealed)
+                .expect("live content")
+            else {
+                panic!("live source lost content")
+            };
+            let plan = blob.transfer_plan(&manifest_bytes).expect("live plan");
+            let policy = store.control_policy_snapshot().expect("live policy");
+            let (receipt, initial) = store
+                .reserve_profile5_receipt(&policy, &plan)
+                .expect("reserve live receipt");
+            let shape = aster_mesh::profile5_canonical_wire_shape(&plan).expect("live shape");
+            let terminal = shape.terminal();
+            store
+                .checkpoint_profile5_receipt(
+                    &receipt,
+                    initial,
+                    BlobStreamResume::profile5(
+                        shape.checkpoints().len() as u64 - 1,
+                        terminal.next_chunk_index,
+                        terminal.plaintext_offset,
+                        terminal.carrier_offset,
+                        terminal.wire_offset,
+                    ),
+                )
+                .expect("terminal live receipt");
+            drop(store);
+
+            let database = Database::open(&root.database).expect("raw live database");
+            let write = database.begin_write().expect("raw live write");
+            let mut table = write
+                .open_table(BLOB_PROFILE5_RECEIPTS)
+                .expect("live receipts");
+            let (key, mut encoded) = {
+                let (key, value) = table.iter().unwrap().next().unwrap().unwrap();
+                (key.value().to_vec(), value.value().to_vec())
+            };
+            encoded[offset + 7] ^= 1;
+            table.insert(key.as_slice(), encoded.as_slice()).unwrap();
+            drop(table);
+            write.commit().unwrap();
+            drop(database);
+            let before = blob_database_digest(&root.database);
+            assert_blob_schema_invariant(
+                &Store::inspect_existing(&root.database)
+                    .expect_err("read-only rejects live corruption"),
+            );
+            assert_blob_schema_invariant(
+                &Store::open_for_mission(&root.database, services.authority)
+                    .err()
+                    .expect("writable rejects live corruption"),
             );
             assert_eq!(blob_database_digest(&root.database), before);
         }
@@ -48539,6 +48636,42 @@ mod tests {
         };
         let (exact_rows, exact_bytes) = {
             let write = target.database.begin_write().unwrap();
+            let (receipt_key, receipt_value_len) =
+                stream::profile5_receipt_maintenance_row_write(&write, transfer)
+                    .unwrap()
+                    .expect("pressure receipt row");
+            assert_eq!(receipt_key.len(), 64);
+            assert_eq!(receipt_value_len, 209);
+            let receipt_identity =
+                MaintenanceRowIdentity::new("aster.blob-profile5-receipts.v1", receipt_key);
+            let exact_receipt_bytes = 64 + 209;
+            let mut exact_receipt = MaintenanceCharge::new(
+                lifecycle::BlobMaintenanceBudget::new(1, 1, exact_receipt_bytes).unwrap(),
+                0,
+                0,
+            );
+            assert!(
+                exact_receipt
+                    .charge_row(receipt_identity.clone(), receipt_value_len)
+                    .unwrap()
+            );
+            assert!(
+                exact_receipt
+                    .charge_row(receipt_identity.clone(), receipt_value_len)
+                    .unwrap()
+            );
+            assert_eq!((exact_receipt.rows, exact_receipt.bytes), (1, 273));
+            let mut one_byte_short = MaintenanceCharge::new(
+                lifecycle::BlobMaintenanceBudget::new(1, 1, exact_receipt_bytes - 1).unwrap(),
+                0,
+                0,
+            );
+            assert!(
+                !one_byte_short
+                    .charge_row(receipt_identity, receipt_value_len)
+                    .unwrap()
+            );
+            assert_eq!((one_byte_short.rows, one_byte_short.bytes), (0, 0));
             let mut charge = MaintenanceCharge::new(
                 lifecycle::BlobMaintenanceBudget::new(u64::MAX, 1, u64::MAX).unwrap(),
                 0,

@@ -373,7 +373,8 @@ pub(super) fn audit_profile5_receipts(
             {
                 return Err(schema_error());
             }
-        } else if record.receipt.max_wire_len != exact_shape.terminal().wire_offset
+        } else if !profile5_progress_matches_shape(&exact_shape, record.progress)
+            || record.receipt.max_wire_len != exact_shape.terminal().wire_offset
             || record.receipt.carrier_total_len != exact_shape.terminal().carrier_offset
             || record.progress.next_segment_index != chunk_count
             || record.progress.durable_plaintext_offset != total_len
@@ -406,6 +407,28 @@ pub(super) fn profile5_receipt_expiry_charge_write(
         return Err(schema_error());
     }
     Ok((1, PROFILE5_RECEIPT_KEY_BYTES + PROFILE5_RECEIPT_VALUE_BYTES))
+}
+
+pub(super) fn profile5_receipt_maintenance_row_write(
+    write: &redb::WriteTransaction,
+    transfer: BlobTransferId,
+) -> Result<Option<([u8; 64], usize)>, StoreError> {
+    let Some(authority) = super::read_mission_binding(write)? else {
+        return Err(StoreError::MissionNotBound);
+    };
+    let key = profile5_receipt_key(authority, transfer);
+    let value = write
+        .open_table(BLOB_PROFILE5_RECEIPTS)?
+        .get(key.as_slice())?
+        .map(|value| value.value().to_vec());
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let record = Profile5ReceiptRecord::decode(&value)?;
+    if record.receipt.receiving_authority != authority || record.receipt.source != transfer {
+        return Err(schema_error());
+    }
+    Ok(Some((key, value.len())))
 }
 
 pub(super) fn expire_profile5_receipt_write(

@@ -52662,6 +52662,64 @@ mod tests {
                 "canonical apply plus already-present retry delivers once"
             );
 
+            if label == "nonempty" {
+                let charged = target_store
+                    .blob_stats()
+                    .expect("profile-5 charge before retirement");
+                assert!(charged.committed_file_bytes > target_before.committed_file_bytes);
+                assert!(charged.reserved_file_bytes > target_before.reserved_file_bytes);
+                target_store
+                    .test_revoke_blob_publisher_for_reclamation(services.member.identity())
+                    .expect("revoke received profile-5 publisher");
+                let mut retired = None;
+                for _ in 0..256 {
+                    target_store
+                        .run_blob_maintenance_turn(blob_maintenance_runtime_budget())
+                        .expect("retire received profile-5 publication");
+                    let publication_retired = match target_store.get_blob(publication) {
+                        Ok(None) => true,
+                        Ok(Some(_)) => false,
+                        Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired)) => true,
+                        Err(error) => panic!("profile-5 retirement lookup: {error}"),
+                    };
+                    if publication_retired {
+                        retired = Some(
+                            target_store
+                                .blob_stats()
+                                .expect("capacity after canonical retirement"),
+                        );
+                        break;
+                    }
+                }
+                let retired = retired.expect("received profile-5 publication retires");
+                assert_eq!(retired.committed_file_bytes, charged.committed_file_bytes);
+                assert_eq!(retired.reserved_file_bytes, charged.reserved_file_bytes);
+                let mut reclaimed = retired;
+                for _ in 0..512 {
+                    target_store
+                        .run_blob_maintenance_turn(blob_maintenance_runtime_budget())
+                        .expect("reclaim received profile-5 variant");
+                    reclaimed = target_store
+                        .blob_stats()
+                        .expect("capacity during physical reclamation");
+                    if reclaimed.committed_file_bytes == target_before.committed_file_bytes
+                        && reclaimed.reserved_file_bytes == target_before.reserved_file_bytes
+                    {
+                        break;
+                    }
+                }
+                assert_eq!(
+                    (
+                        reclaimed.committed_file_bytes,
+                        reclaimed.reserved_file_bytes
+                    ),
+                    (
+                        target_before.committed_file_bytes,
+                        target_before.reserved_file_bytes
+                    )
+                );
+            }
+
             if finite {
                 let before_restart = target_store.test_blob_logical_digest();
                 let lifetime_before = target_store
