@@ -43,6 +43,81 @@ const PROFILE5_SENDER_ENCODING_WINDOW_BYTES: usize = PROFILE5_CANONICAL_EXTENT_B
 pub(crate) const PROFILE5_SENDER_OWNED_BYTES: usize =
     PROFILE5_SENDER_CARRIER_WINDOW_BYTES + PROFILE5_SENDER_ENCODING_WINDOW_BYTES;
 
+/// Drop-safe owner for the peer-visible DATA half of a transport attempt.
+/// Normal completion disarms it only after `finish_data` succeeds; every
+/// error or cancellation path synchronously signals adapter cancellation.
+struct SenderDataCancellation {
+    attempt: Arc<dyn StreamAttempt>,
+    armed: bool,
+}
+
+impl SenderDataCancellation {
+    fn new(attempt: Arc<dyn StreamAttempt>) -> Self {
+        Self {
+            attempt,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SenderDataCancellation {
+    fn drop(&mut self) {
+        if self.armed {
+            self.attempt.cancel_data();
+        }
+    }
+}
+
+/// Scope marker for the admission producer. The producer is a child future,
+/// not a task: dropping or completing the parent drops this marker only after
+/// the partition sender has been dropped, which is its structural join.
+struct SenderAdmissionLifecycle {
+    partition_tx: Option<mpsc::Sender<Result<StreamPartition, PipelineError>>>,
+    #[cfg(test)]
+    job: StreamJobId,
+}
+
+impl SenderAdmissionLifecycle {
+    fn new(
+        job: StreamJobId,
+        partition_tx: mpsc::Sender<Result<StreamPartition, PipelineError>>,
+    ) -> Self {
+        #[cfg(test)]
+        crate::stream_pipeline::PipelineTestProbe::observe_sender_producer_started(job);
+        #[cfg(not(test))]
+        let _ = job;
+        Self {
+            partition_tx: Some(partition_tx),
+            #[cfg(test)]
+            job,
+        }
+    }
+
+    async fn send(
+        &self,
+        partition: Result<StreamPartition, PipelineError>,
+    ) -> Result<(), PipelineError> {
+        self.partition_tx
+            .as_ref()
+            .expect("sender admission remains open")
+            .send(partition)
+            .await
+            .map_err(|_| PipelineError::WorkerPanicked)
+    }
+}
+
+impl Drop for SenderAdmissionLifecycle {
+    fn drop(&mut self) {
+        drop(self.partition_tx.take());
+        #[cfg(test)]
+        crate::stream_pipeline::PipelineTestProbe::observe_sender_producer_joined(self.job);
+    }
+}
+
 #[cfg(test)]
 use crate::stream_transfer::{
     PROFILE5_ATTEMPT_TIMEOUT, PROFILE5_LEGACY_SEGMENT_RECORD_BYTES, blob_pack_wire_len,
@@ -1587,6 +1662,7 @@ pub(crate) async fn send_canonical_blob_profile5(
         }),
     )
     .await?;
+    let mut data_cancellation = SenderDataCancellation::new(Arc::clone(&attempt));
     let stream_direction = match direction {
         EventDirection::ToSessionInitiator => StreamDirection::ToSessionInitiator,
         EventDirection::ToSessionResponder => StreamDirection::ToSessionResponder,
@@ -1671,7 +1747,8 @@ pub(crate) async fn send_canonical_blob_profile5(
         crate::stream_pipeline::PipelineTestProbe::mapped_ciphertext_observer_for_job(sender_job);
     let (partition_tx, partition_rx) = mpsc::channel(8);
     let producer_plan = Arc::clone(&source.plan);
-    let producer = tokio::spawn(async move {
+    let producer = async move {
+        let lifecycle = SenderAdmissionLifecycle::new(sender_job, partition_tx);
         for index in initial_chunk_index..producer_plan.manifest().chunk_count() {
             let carrier_id = producer_plan.carrier_id(index).map_err(|error| {
                 pipeline_adapter(verification_failure(
@@ -1690,17 +1767,16 @@ pub(crate) async fn send_canonical_blob_profile5(
                     })?,
             )
             .map_err(|error| pipeline_adapter(failure("bound canonical sender carrier", error)))?;
-            partition_tx
+            lifecycle
                 .send(Ok(StreamPartition::new_accounted(
                     index,
                     index.to_be_bytes().to_vec(),
                     carrier_len,
                 )))
-                .await
-                .map_err(|_| PipelineError::WorkerPanicked)?;
+                .await?;
         }
         Ok::<(), PipelineError>(())
-    });
+    };
     let map_store = Arc::clone(&store);
     let map_plan = Arc::clone(&source.plan);
     let sender_ownership = Arc::new(SenderByteOwnership::new(sender_job));
@@ -1723,7 +1799,7 @@ pub(crate) async fn send_canonical_blob_profile5(
         ownership: Arc::clone(&sender_ownership),
     }));
     let sink_for_pipeline = Arc::clone(&sink);
-    let pipeline_result = run_ordered_channel_pipeline_from(
+    let pipeline = run_ordered_channel_pipeline_from(
         sender_job,
         partition_rx,
         initial_chunk_index,
@@ -1754,12 +1830,14 @@ pub(crate) async fn send_canonical_blob_profile5(
             let sink = Arc::clone(&sink_for_pipeline);
             async move { sink.lock().await.accept(mapped).await }
         },
-    )
-    .await;
-    let producer_result = match producer.await {
-        Ok(result) => result.map_err(sender_pipeline_failure),
-        Err(error) => Err(failure("join canonical sender admission", error)),
+    );
+    tokio::pin!(producer);
+    tokio::pin!(pipeline);
+    let (producer_result, pipeline_result) = tokio::select! {
+        result = &mut producer => (result, pipeline.as_mut().await),
+        result = &mut pipeline => (producer.as_mut().await, result),
     };
+    let producer_result = producer_result.map_err(sender_pipeline_failure);
     let pipeline = match pipeline_result {
         Ok(report) if sender_ownership.peak() <= PROFILE5_SENDER_OWNED_BYTES => {
             report.include_owned_bytes(sender_ownership.peak(), sender_ownership.encoding_peak())
@@ -1883,6 +1961,7 @@ pub(crate) async fn send_canonical_blob_profile5(
     )
     .await?;
     await_authenticated_progress("finish canonical data stream", attempt.finish_data()).await?;
+    data_cancellation.disarm();
     if await_authenticated_progress("receive canonical control EOF", attempt.receive_control())
         .await?
         .is_some()
@@ -3167,6 +3246,8 @@ pub(crate) mod tests {
         fn finish_data(&self) -> AdapterFuture<'_, ()> {
             Box::pin(async { Ok(()) })
         }
+
+        fn cancel_data(&self) {}
     }
 
     #[tokio::test]
@@ -3758,6 +3839,10 @@ pub(crate) mod tests {
                     .map_err(|_| StreamTransportError::Closed)
             })
         }
+
+        fn cancel_data(&self) {
+            let _ = self.data.send(None);
+        }
     }
 
     impl StreamAttempt for MemorySenderAttempt {
@@ -3798,6 +3883,10 @@ pub(crate) mod tests {
                     .send(None)
                     .map_err(|_| StreamTransportError::Closed)
             })
+        }
+
+        fn cancel_data(&self) {
+            let _ = self.data.send(None);
         }
     }
 
@@ -3847,7 +3936,6 @@ pub(crate) mod tests {
 
     pub(crate) struct PendingDataSendControl {
         entered: Arc<tokio::sync::Semaphore>,
-        data: mpsc::UnboundedSender<Option<Vec<u8>>>,
     }
 
     impl PendingDataSendControl {
@@ -3857,10 +3945,6 @@ pub(crate) mod tests {
                 .await
                 .expect("pending DATA sender remains open")
                 .forget();
-        }
-
-        pub(crate) fn close_data(&self) {
-            let _ = self.data.send(None);
         }
     }
 
@@ -3893,7 +3977,6 @@ pub(crate) mod tests {
             let entered = Arc::new(tokio::sync::Semaphore::new(0));
             let control = PendingDataSendControl {
                 entered: Arc::clone(&entered),
-                data: data_send.clone(),
             };
             (
                 Self {

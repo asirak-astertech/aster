@@ -52806,7 +52806,6 @@ mod tests {
                     "production cancellation fixture must retain prepared carrier N+1 while send_data_parts is pending"
                 );
                 drop(sender_future);
-                control.close_data();
                 let receiver_result =
                     tokio::time::timeout(std::time::Duration::from_secs(10), &mut receiver_future)
                         .await
@@ -52833,6 +52832,14 @@ mod tests {
                 assert!(sender_pipeline_probe.cleanup_observed());
                 assert!(sender_pipeline_probe.cancellation_signalled());
                 assert!(sender_pipeline_probe.channels_closed());
+                assert_eq!(
+                    sender_pipeline_probe.sender_producer_exits(),
+                    sender_pipeline_probe.sender_producer_joins(),
+                    "sender admission producer must be structurally joined"
+                );
+                assert_eq!(sender_pipeline_probe.sender_producer_exits(), 1);
+                assert_eq!(sender_pipeline_probe.sender_producer_starts(), 1);
+                assert!(sender_pipeline_probe.sender_partition_channel_closed());
                 assert_eq!(sender_pipeline_probe.active_workers(), 0);
                 assert_eq!(
                     sender_pipeline_probe.worker_exits(),

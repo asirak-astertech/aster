@@ -143,6 +143,10 @@ struct PipelineTestProbeInner {
     sender_live_bytes: Arc<std::sync::atomic::AtomicUsize>,
     sender_peak_live_bytes: Arc<std::sync::atomic::AtomicUsize>,
     prepared_sender_carriers: std::sync::atomic::AtomicUsize,
+    sender_producer_starts: std::sync::atomic::AtomicUsize,
+    sender_producer_exits: std::sync::atomic::AtomicUsize,
+    sender_producer_joins: std::sync::atomic::AtomicUsize,
+    sender_partition_channel_closed: AtomicBool,
     received_extents: std::sync::atomic::AtomicUsize,
     available_item_permits: std::sync::atomic::AtomicUsize,
     available_byte_permits: std::sync::atomic::AtomicUsize,
@@ -250,6 +254,44 @@ impl PipelineTestProbe {
 
     pub(crate) fn prepared_sender_carriers(&self) -> usize {
         self.0.prepared_sender_carriers.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn sender_producer_exits(&self) -> usize {
+        self.0.sender_producer_exits.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn sender_producer_starts(&self) -> usize {
+        self.0.sender_producer_starts.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn sender_producer_joins(&self) -> usize {
+        self.0.sender_producer_joins.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn sender_partition_channel_closed(&self) -> bool {
+        self.0
+            .sender_partition_channel_closed
+            .load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn observe_sender_producer_started(job: StreamJobId) {
+        if let Some(probe) = Self::for_job(job) {
+            probe
+                .0
+                .sender_producer_starts
+                .fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    pub(crate) fn observe_sender_producer_joined(job: StreamJobId) {
+        if let Some(probe) = Self::for_job(job) {
+            probe.0.sender_producer_exits.fetch_add(1, Ordering::SeqCst);
+            probe.0.sender_producer_joins.fetch_add(1, Ordering::SeqCst);
+            probe
+                .0
+                .sender_partition_channel_closed
+                .store(true, Ordering::SeqCst);
+        }
     }
 
     pub(crate) fn received_extents(&self) -> usize {

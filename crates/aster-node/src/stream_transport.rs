@@ -1,7 +1,16 @@
 //! Internal selection and recovery for one active streaming transport.
 
 use aster_iroh::{BoundedReceiveStream, BoundedSendStream, Connection, SelectedPath};
-use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    future::Future,
+    ops::{Deref, DerefMut},
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 use tokio::{sync::Mutex, time::Instant};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -343,6 +352,12 @@ pub(crate) trait StreamAttempt: Send + Sync {
     fn send_data_parts<'a>(&'a self, prefix: &'a [u8], body: &'a [u8]) -> AdapterFuture<'a, ()>;
     fn receive_control(&self) -> AdapterFuture<'_, Option<Vec<u8>>>;
     fn finish_data(&self) -> AdapterFuture<'_, ()>;
+    /// Synchronously signals cancellation of the DATA half.
+    ///
+    /// Every adapter must make an in-flight send cancellation-safe: dropping
+    /// that send after this signal closes or resets the peer-visible DATA
+    /// stream without requiring another async poll.
+    fn cancel_data(&self);
 }
 
 pub(crate) trait StreamReceiveAttempt: Send + Sync {
@@ -377,6 +392,50 @@ impl IrohQuicV1Adapter {
 struct IrohSenderAttempt {
     data: Mutex<BoundedSendStream>,
     control: Mutex<BoundedReceiveStream>,
+    data_cancelled: AtomicBool,
+}
+
+struct IrohDataOperation<'a> {
+    stream: tokio::sync::MutexGuard<'a, BoundedSendStream>,
+    complete: bool,
+}
+
+impl Deref for IrohDataOperation<'_> {
+    type Target = BoundedSendStream;
+
+    fn deref(&self) -> &Self::Target {
+        &self.stream
+    }
+}
+
+impl DerefMut for IrohDataOperation<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.stream
+    }
+}
+
+impl Drop for IrohDataOperation<'_> {
+    fn drop(&mut self) {
+        if !self.complete {
+            let _ = self.stream.reset();
+        }
+    }
+}
+
+impl IrohSenderAttempt {
+    async fn begin_data_operation(&self) -> Result<IrohDataOperation<'_>, StreamTransportError> {
+        if self.data_cancelled.load(Ordering::Acquire) {
+            return Err(StreamTransportError::Closed);
+        }
+        let stream = self.data.lock().await;
+        if self.data_cancelled.load(Ordering::Acquire) {
+            return Err(StreamTransportError::Closed);
+        }
+        Ok(IrohDataOperation {
+            stream,
+            complete: false,
+        })
+    }
 }
 
 struct IrohReceiverAttempt {
@@ -419,22 +478,21 @@ impl StreamReceiveAttempt for IrohReceiverAttempt {
 impl StreamAttempt for IrohSenderAttempt {
     fn send_data<'a>(&'a self, frame: &'a [u8]) -> AdapterFuture<'a, ()> {
         Box::pin(async move {
-            self.data
-                .lock()
-                .await
-                .write_frame(frame)
-                .await
-                .map_err(map_iroh_error)
+            let mut operation = self.begin_data_operation().await?;
+            operation.write_frame(frame).await.map_err(map_iroh_error)?;
+            operation.complete = true;
+            Ok(())
         })
     }
     fn send_data_parts<'a>(&'a self, prefix: &'a [u8], body: &'a [u8]) -> AdapterFuture<'a, ()> {
         Box::pin(async move {
-            self.data
-                .lock()
-                .await
+            let mut operation = self.begin_data_operation().await?;
+            operation
                 .write_frame_parts(prefix, body)
                 .await
-                .map_err(map_iroh_error)
+                .map_err(map_iroh_error)?;
+            operation.complete = true;
+            Ok(())
         })
     }
     fn receive_control(&self) -> AdapterFuture<'_, Option<Vec<u8>>> {
@@ -449,13 +507,18 @@ impl StreamAttempt for IrohSenderAttempt {
     }
     fn finish_data(&self) -> AdapterFuture<'_, ()> {
         Box::pin(async move {
-            self.data
-                .lock()
-                .await
-                .finish()
-                .await
-                .map_err(map_iroh_error)
+            let mut operation = self.begin_data_operation().await?;
+            operation.finish().await.map_err(map_iroh_error)?;
+            operation.complete = true;
+            Ok(())
         })
+    }
+
+    fn cancel_data(&self) {
+        self.data_cancelled.store(true, Ordering::Release);
+        if let Ok(mut stream) = self.data.try_lock() {
+            let _ = stream.reset();
+        }
     }
 }
 
@@ -489,6 +552,7 @@ impl StreamTransportAdapter for IrohQuicV1Adapter {
             Ok(Arc::new(IrohSenderAttempt {
                 data: Mutex::new(pair.data),
                 control: Mutex::new(pair.control),
+                data_cancelled: AtomicBool::new(false),
             }) as Arc<dyn StreamAttempt>)
         })
     }
