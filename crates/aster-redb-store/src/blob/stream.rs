@@ -29,7 +29,7 @@ use super::pack::{BlobPackCheckpoint, BlobPackError};
 const PROFILE5_RECEIPT_MAGIC: &[u8; 8] = b"ASTRP5R1";
 const PROFILE5_RECEIPT_VERSION: u8 = 1;
 const PROFILE5_RECEIPT_KEY_BYTES: u64 = 64;
-const PROFILE5_RECEIPT_VALUE_BYTES: u64 = 201;
+const PROFILE5_RECEIPT_VALUE_BYTES: u64 = 209;
 /// Profile-5 settlement receipts share the existing durable acknowledgement
 /// ledger ceiling: both retain one fixed-size idempotency authority per source.
 pub const MAX_BLOB_PROFILE5_RECEIPTS: u64 =
@@ -60,6 +60,7 @@ pub struct BlobProfile5Receipt {
     store_binding: [u8; 32],
     total_len: u64,
     chunk_count: u64,
+    carrier_total_len: u64,
     max_wire_len: u64,
 }
 
@@ -114,27 +115,14 @@ fn profile5_plan_binding_fields(
 }
 
 fn profile5_max_wire_len(plan: &VerifiedBlobTransferPlan) -> Result<u64, StoreError> {
-    let mut total = 0u64;
-    for index in 0..plan.manifest().chunk_count() {
-        let carrier = plan
-            .carrier_id(index)
-            .map_err(|error| blob_error(BlobStoreError::Verification(error.to_string())))?;
-        let carrier_len = plan
-            .carrier_total_len(&carrier.wire_bytes())
-            .map_err(|error| blob_error(BlobStoreError::Verification(error.to_string())))?;
-        // Four bytes per carrier length plus one sixteen-byte extent header
-        // per carrier. Production batching can only reduce this bound.
-        total = total
-            .checked_add(carrier_len)
-            .and_then(|value| value.checked_add(20))
-            .ok_or(StoreError::PayloadByteAccountingOverflow)?;
-    }
-    Ok(total)
+    aster_mesh::profile5_canonical_wire_shape(plan)
+        .map(|shape| shape.terminal().wire_offset)
+        .map_err(|error| blob_error(BlobStoreError::Verification(error.to_string())))
 }
 
 impl Profile5ReceiptRecord {
-    fn encode(&self) -> [u8; 201] {
-        let mut out = [0u8; 201];
+    fn encode(&self) -> [u8; 209] {
+        let mut out = [0u8; 209];
         out[..8].copy_from_slice(PROFILE5_RECEIPT_MAGIC);
         out[8] = PROFILE5_RECEIPT_VERSION;
         out[9..41].copy_from_slice(&self.receipt.receiving_authority);
@@ -144,12 +132,13 @@ impl Profile5ReceiptRecord {
         for (offset, value) in [
             (137, self.receipt.total_len),
             (145, self.receipt.chunk_count),
-            (153, self.receipt.max_wire_len),
-            (161, self.progress.generation),
-            (169, self.progress.next_segment_index),
-            (177, self.progress.durable_plaintext_offset),
-            (185, self.progress.durable_pack_len),
-            (193, self.progress.durable_wire_offset),
+            (153, self.receipt.carrier_total_len),
+            (161, self.receipt.max_wire_len),
+            (169, self.progress.generation),
+            (177, self.progress.next_segment_index),
+            (185, self.progress.durable_plaintext_offset),
+            (193, self.progress.durable_pack_len),
+            (201, self.progress.durable_wire_offset),
         ] {
             out[offset..offset + 8].copy_from_slice(&value.to_be_bytes());
         }
@@ -157,7 +146,7 @@ impl Profile5ReceiptRecord {
     }
 
     fn decode(encoded: &[u8]) -> Result<Self, StoreError> {
-        if encoded.len() != 201
+        if encoded.len() != 209
             || &encoded[..8] != PROFILE5_RECEIPT_MAGIC
             || encoded[8] != PROFILE5_RECEIPT_VERSION
         {
@@ -171,14 +160,15 @@ impl Profile5ReceiptRecord {
                 store_binding: read_array(encoded, 105)?,
                 total_len: read_u64(encoded, 137)?,
                 chunk_count: read_u64(encoded, 145)?,
-                max_wire_len: read_u64(encoded, 153)?,
+                carrier_total_len: read_u64(encoded, 153)?,
+                max_wire_len: read_u64(encoded, 161)?,
             },
             progress: BlobStreamResume {
-                generation: read_u64(encoded, 161)?,
-                next_segment_index: read_u64(encoded, 169)?,
-                durable_plaintext_offset: read_u64(encoded, 177)?,
-                durable_pack_len: read_u64(encoded, 185)?,
-                durable_wire_offset: read_u64(encoded, 193)?,
+                generation: read_u64(encoded, 169)?,
+                next_segment_index: read_u64(encoded, 177)?,
+                durable_plaintext_offset: read_u64(encoded, 185)?,
+                durable_pack_len: read_u64(encoded, 193)?,
+                durable_wire_offset: read_u64(encoded, 201)?,
             },
         };
         if record.receipt.plan_binding == [0; 32]
@@ -190,6 +180,7 @@ impl Profile5ReceiptRecord {
                     .chunk_count
                     .checked_mul((aster_mesh::MAX_BLOB_TRANSFER_OBJECT_BYTES as u64) + 20)
                     .ok_or_else(schema_error)?
+            || record.receipt.carrier_total_len > record.receipt.max_wire_len
             || record.progress.next_segment_index > record.receipt.chunk_count
             || record.progress.durable_plaintext_offset > record.receipt.total_len
             || record.progress.durable_pack_len > record.receipt.max_wire_len
@@ -202,6 +193,7 @@ impl Profile5ReceiptRecord {
                     || record.progress.durable_wire_offset != 0))
             || (record.progress.next_segment_index == record.receipt.chunk_count
                 && (record.progress.durable_plaintext_offset != record.receipt.total_len
+                    || record.progress.durable_pack_len != record.receipt.carrier_total_len
                     || record.progress.durable_wire_offset != record.receipt.max_wire_len))
             || (record.progress.next_segment_index < record.receipt.chunk_count
                 && (record.progress.durable_plaintext_offset >= record.receipt.total_len
@@ -236,11 +228,68 @@ fn profile5_receipt_binding_from_metadata(
     ))
 }
 
+fn profile5_shape_from_pending(
+    pending: &super::PendingBlobSourceRecord,
+    total_len: u64,
+) -> Result<aster_mesh::Profile5CanonicalWireShape, StoreError> {
+    let mut carriers = pending.carriers.clone();
+    carriers.sort_by_key(|carrier| carrier.index);
+    if carriers
+        .iter()
+        .enumerate()
+        .any(|(index, carrier)| carrier.index != index as u64)
+    {
+        return Err(schema_error());
+    }
+    let chunk_size = u64::from(aster_mesh::MAX_BLOB_CHUNK_SIZE);
+    let lengths = carriers
+        .iter()
+        .map(|carrier| {
+            let offset = carrier
+                .index
+                .checked_mul(chunk_size)
+                .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+            let plaintext = total_len
+                .checked_sub(offset)
+                .ok_or_else(schema_error)?
+                .min(chunk_size);
+            if plaintext == 0 {
+                return Err(schema_error());
+            }
+            Ok((plaintext, carrier.total_len))
+        })
+        .collect::<Result<Vec<_>, StoreError>>()?;
+    aster_mesh::profile5_canonical_wire_shape_from_lengths(&lengths).map_err(|_| schema_error())
+}
+
+fn profile5_progress_checkpoint(
+    progress: BlobStreamResume,
+) -> aster_mesh::Profile5CanonicalCheckpoint {
+    aster_mesh::Profile5CanonicalCheckpoint {
+        next_chunk_index: progress.next_segment_index,
+        plaintext_offset: progress.durable_plaintext_offset,
+        carrier_offset: progress.durable_pack_len,
+        wire_offset: progress.durable_wire_offset,
+    }
+}
+
+fn profile5_progress_matches_shape(
+    shape: &aster_mesh::Profile5CanonicalWireShape,
+    progress: BlobStreamResume,
+) -> bool {
+    shape
+        .checkpoints()
+        .iter()
+        .position(|checkpoint| *checkpoint == profile5_progress_checkpoint(progress))
+        .is_some_and(|index| progress.generation == index as u64)
+}
+
 pub(super) fn audit_profile5_receipts(
     receipts: &impl ReadableTable<&'static [u8], &'static [u8]>,
     pending: &impl ReadableTable<&'static [u8], &'static [u8]>,
     publications: &impl ReadableTable<&'static [u8], &'static [u8]>,
     imports: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    chunks: &impl ReadableTable<&'static [u8], &'static [u8]>,
     mission_authority: Option<NodeId>,
     owner_binding: Option<[u8; 32]>,
     pending_encoding: super::PendingBlobEncodingGeneration,
@@ -296,10 +345,19 @@ pub(super) fn audit_profile5_receipts(
             .get(metadata.variant_id.as_bytes().as_slice())?
             .map(|value| value.value().to_vec())
             .ok_or_else(schema_error)?;
-        let (total_len, chunk_count) =
-            super::depot::profile5_import_shape_evidence(&import, metadata)?;
+        let (total_len, chunk_count) = if pending_record.is_some() {
+            super::depot::profile5_pending_import_shape_evidence(&import, metadata)?
+        } else {
+            super::depot::profile5_import_shape_evidence(&import, metadata)?
+        };
         let (binding, total_len, chunk_count) =
             profile5_receipt_binding_from_metadata(metadata, total_len, chunk_count)?;
+        let exact_shape = super::depot::profile5_import_wire_shape_evidence(
+            &import,
+            chunks,
+            metadata,
+            publication.is_some(),
+        )?;
         if record.receipt.plan_binding != binding
             || record.receipt.total_len != total_len
             || record.receipt.chunk_count != chunk_count
@@ -307,17 +365,20 @@ pub(super) fn audit_profile5_receipts(
             return Err(schema_error());
         }
         if let Some(pending) = pending_record.as_ref() {
-            let max_wire_len = pending.carriers.iter().try_fold(0u64, |total, carrier| {
-                total
-                    .checked_add(carrier.total_len)
-                    .and_then(|value| value.checked_add(20))
-                    .ok_or(StoreError::PayloadByteAccountingOverflow)
-            })?;
-            if record.receipt.max_wire_len != max_wire_len {
+            let shape = profile5_shape_from_pending(pending, total_len)?;
+            if shape != exact_shape
+                || record.receipt.max_wire_len != shape.terminal().wire_offset
+                || record.receipt.carrier_total_len != shape.terminal().carrier_offset
+                || !profile5_progress_matches_shape(&shape, record.progress)
+            {
                 return Err(schema_error());
             }
-        } else if record.progress.next_segment_index != chunk_count
+        } else if record.receipt.max_wire_len != exact_shape.terminal().wire_offset
+            || record.receipt.carrier_total_len != exact_shape.terminal().carrier_offset
+            || record.progress.next_segment_index != chunk_count
             || record.progress.durable_plaintext_offset != total_len
+            || record.progress.durable_pack_len != record.receipt.carrier_total_len
+            || record.progress.durable_wire_offset != record.receipt.max_wire_len
         {
             return Err(schema_error());
         }
@@ -1447,6 +1508,10 @@ impl Store {
             store_binding: self.blob_depot_owner_binding,
             total_len: plan.manifest().total_len(),
             chunk_count: plan.manifest().chunk_count(),
+            carrier_total_len: aster_mesh::profile5_canonical_wire_shape(plan)
+                .map_err(|error| blob_error(BlobStoreError::Verification(error.to_string())))?
+                .terminal()
+                .carrier_offset,
             max_wire_len: profile5_max_wire_len(plan)?,
         };
         let mut write = self.database.begin_write()?;
@@ -1537,6 +1602,11 @@ impl Store {
         if record.receipt != *receipt || record.progress != expected {
             return Err(blob_error(BlobStoreError::ReservationChanged));
         }
+        let pending = write
+            .open_table(super::BLOB_PENDING_SOURCES)?
+            .get(receipt.source.as_bytes().as_slice())?
+            .map(|row| super::decode_pending_blob_source(row.value()))
+            .transpose()?;
         if durable == expected {
             return Ok(expected);
         }
@@ -1560,6 +1630,21 @@ impl Store {
             || (durable.next_segment_index < receipt.chunk_count
                 && (durable.durable_plaintext_offset >= receipt.total_len
                     || durable.durable_wire_offset >= receipt.max_wire_len))
+        {
+            return Err(blob_error(BlobStoreError::ReservationChanged));
+        }
+        if let Some(pending) = pending.as_ref() {
+            let shape = profile5_shape_from_pending(pending, receipt.total_len)?;
+            if !profile5_progress_matches_shape(&shape, durable) {
+                return Err(blob_error(BlobStoreError::ReservationChanged));
+            }
+        } else if profile5_progress_checkpoint(durable)
+            != (aster_mesh::Profile5CanonicalCheckpoint {
+                next_chunk_index: receipt.chunk_count,
+                plaintext_offset: receipt.total_len,
+                carrier_offset: receipt.carrier_total_len,
+                wire_offset: receipt.max_wire_len,
+            })
         {
             return Err(blob_error(BlobStoreError::ReservationChanged));
         }
@@ -2315,7 +2400,7 @@ mod tests {
     fn profile5_receipt_capacity_is_fixed_and_fail_closed() {
         assert_eq!(
             MAX_BLOB_PROFILE5_RECEIPT_BYTES,
-            MAX_BLOB_PROFILE5_RECEIPTS * (64 + 201)
+            MAX_BLOB_PROFILE5_RECEIPTS * (64 + 209)
         );
         require_profile5_receipt_capacity(MAX_BLOB_PROFILE5_RECEIPTS - 1)
             .expect("last bounded receipt slot");
@@ -2324,6 +2409,26 @@ mod tests {
             Err(StoreError::BlobAcknowledgementReceiptLimitExceeded { current, limit })
                 if current == limit && limit == MAX_BLOB_PROFILE5_RECEIPTS
         ));
+    }
+
+    #[test]
+    fn network_blob_size_diagnostic_reports_selected_profile_limits() {
+        let v8 = BlobStoreError::NetworkBlobTooLarge {
+            total_len: 65 * 1024 * 1024,
+            chunk_count: 1_025,
+            max_total_len: super::super::MAX_NETWORK_BLOB_BYTES,
+            max_chunks: super::super::MAX_NETWORK_BLOB_CHUNKS,
+        }
+        .to_string();
+        assert!(v8.contains("67108864 bytes/1024 chunks"));
+        let v9 = BlobStoreError::NetworkBlobTooLarge {
+            total_len: 8 * 1024 * 1024 * 1024 + 1,
+            chunk_count: 131_073,
+            max_total_len: super::super::MAX_PROFILE5_NETWORK_BLOB_BYTES,
+            max_chunks: super::super::MAX_PROFILE5_NETWORK_BLOB_CHUNKS,
+        }
+        .to_string();
+        assert!(v9.contains("8589934592 bytes/131072 chunks"));
     }
 
     struct TestRoot(PathBuf);

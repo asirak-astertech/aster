@@ -173,8 +173,12 @@ pub use blob_stream::{
     BlobStreamPlainPartition, BlobStreamSegmentLeaves, BlobStreamSegmentOpener,
     BlobStreamSegmentSealer, BlobStreamSubtree, BlobUploadDescriptor, BlobUploadPlainPartition,
     BlobUploadSegmentOpener, BlobUploadSegmentSealer, EncryptedBlobStreamSegment,
-    EncryptedBlobStreamSegmentHeader, MAX_BLOB_STREAM_BYTES, VerifiedBlobStreamFinalCommitment,
-    VerifiedBlobStreamOpen, local_blob_publication_stream_id,
+    EncryptedBlobStreamSegmentHeader, MAX_BLOB_STREAM_BYTES,
+    PROFILE5_CANONICAL_CARRIER_PREFIX_BYTES, PROFILE5_CANONICAL_EXTENT_BYTES,
+    PROFILE5_CANONICAL_EXTENT_HEADER_BYTES, Profile5CanonicalCheckpoint,
+    Profile5CanonicalWireShape, VerifiedBlobStreamFinalCommitment, VerifiedBlobStreamOpen,
+    local_blob_publication_stream_id, profile5_canonical_wire_shape,
+    profile5_canonical_wire_shape_from_lengths,
 };
 #[cfg(feature = "reference-session")]
 pub use bridge_adapter::{

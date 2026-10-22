@@ -10251,6 +10251,8 @@ mod tests {
             BlobStoreError::NetworkBlobTooLarge {
                 total_len: 2,
                 chunk_count: 2,
+                max_total_len: 1,
+                max_chunks: 1,
             },
             BlobStoreError::NetworkSourceTooLarge {
                 sealed_len: 2,

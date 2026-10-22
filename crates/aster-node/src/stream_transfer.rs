@@ -13,8 +13,10 @@ pub(crate) const PROFILE5_CANONICAL_CARRIER_RECORD_BYTES: usize =
     aster_mesh::MAX_BLOB_TRANSFER_OBJECT_BYTES;
 /// Target encoded batch ceiling. Stream framing retains its independently
 /// bounded maximum so the sender can negotiate a smaller carrier batch.
-pub(crate) const PROFILE5_CANONICAL_EXTENT_BYTES: usize = 1024 * 1024;
-pub(crate) const CANONICAL_BLOB_EXTENT_HEADER_BYTES: usize = 4 + 8 + 4;
+pub(crate) const PROFILE5_CANONICAL_EXTENT_BYTES: usize =
+    aster_mesh::PROFILE5_CANONICAL_EXTENT_BYTES as usize;
+pub(crate) const CANONICAL_BLOB_EXTENT_HEADER_BYTES: usize =
+    aster_mesh::PROFILE5_CANONICAL_EXTENT_HEADER_BYTES as usize;
 pub(crate) const PROFILE5_RECORD_PREFIX_BYTES: usize = 4;
 /// One profile-5 data extent is one complete length-prefixed canonical Blob
 /// pack record. Keeping the transport and cryptographic partition boundaries

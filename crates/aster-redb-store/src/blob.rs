@@ -554,6 +554,8 @@ pub enum BlobStoreError {
     NetworkBlobTooLarge {
         total_len: u64,
         chunk_count: u64,
+        max_total_len: u64,
+        max_chunks: u64,
     },
     NetworkSourceTooLarge {
         sealed_len: usize,
@@ -694,9 +696,11 @@ impl fmt::Display for BlobStoreError {
             Self::NetworkBlobTooLarge {
                 total_len,
                 chunk_count,
+                max_total_len,
+                max_chunks,
             } => write!(
                 formatter,
-                "network Blob has {total_len} bytes/{chunk_count} chunks; limits are {MAX_NETWORK_BLOB_BYTES} bytes/{MAX_NETWORK_BLOB_CHUNKS} chunks"
+                "network Blob has {total_len} bytes/{chunk_count} chunks; limits are {max_total_len} bytes/{max_chunks} chunks"
             ),
             Self::NetworkSourceTooLarge { sealed_len, limit } => write!(
                 formatter,
@@ -3024,6 +3028,30 @@ impl Store {
         self.observe_blob_custody_sample(sample)
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn test_blob_finite_lifetime_evidence(
+        &self,
+        transfer: BlobTransferId,
+    ) -> Result<Option<(u64, u64, Option<aster_mesh::CustodySample>, u64, bool)>, StoreError> {
+        let read = self.database.begin_read()?;
+        let metadata = read
+            .open_table(BLOB_PUBLICATIONS)?
+            .get(transfer.as_bytes().as_slice())?
+            .map(|value| decode_blob_metadata(value.value()))
+            .transpose()?;
+        Ok(metadata.and_then(|metadata| match metadata.lifetime {
+            BlobLifetime::Durable => None,
+            BlobLifetime::Finite { ttl_ms, age, .. } => Some((
+                ttl_ms,
+                age.cumulative_age_ms,
+                age.checkpoint,
+                age.continuity_generation,
+                age.continuity_lost,
+            )),
+        }))
+    }
+
     /// Test-only deterministic fault seam consumed after physical carrier
     /// installation and before logical prefix retirement.
     #[cfg(any(test, feature = "test-utils"))]
@@ -4353,6 +4381,8 @@ impl Store {
             return Err(blob_error(BlobStoreError::NetworkBlobTooLarge {
                 total_len: manifest.total_len(),
                 chunk_count: manifest.chunk_count(),
+                max_total_len,
+                max_chunks,
             }));
         }
 
@@ -7424,7 +7454,7 @@ impl Store {
                 lifecycle::VariantReferenceOwner::PendingSource,
                 source,
             )?;
-            remove_pending_source_rows_write(
+            remove_pending_source_rows_after_ttl_move_write(
                 &write,
                 staging,
                 source,
@@ -13377,6 +13407,7 @@ struct PendingRemovalAuthorityPlan {
     staging_before: BlobNetworkStagingUsage,
     removed_rows: u64,
     removed_bytes: u64,
+    remove_profile5_receipt: bool,
 }
 
 /// One admitted whole-variant mutation. The shared pressure snapshot and
@@ -17275,8 +17306,9 @@ fn audit_blob_network_rows(
             )));
         };
         if record.metadata.transfer_id != source
-            || route.chunk_count() == 0
             || route.chunk_count() > MAX_PROFILE5_NETWORK_BLOB_CHUNKS
+            || (route.chunk_count() == 0
+                && (!record.carriers.is_empty() || record.metadata.header.blob_route.is_none()))
         {
             return Err(blob_error(BlobStoreError::SchemaInvariant(
                 "pending Blob source key or network profile is inconsistent",
@@ -17433,6 +17465,7 @@ fn audit_blob_network_tables_write_with_publications(
         &pending,
         publications,
         &imports,
+        &chunks,
         mission_authority,
         owner_binding,
         pending_encoding,
@@ -17475,6 +17508,7 @@ fn inspect_blob_network_tables_read_with_publications(
             &pending,
             publications,
             &imports,
+            &chunks,
             read_mission_binding_read(read)?,
             owner_binding,
             pending_encoding,
@@ -18392,6 +18426,16 @@ fn plan_pending_removal_authority_write(
     if pending != *expected || pending.metadata.transfer_id != source {
         return Err(blob_error(BlobStoreError::PendingSourceConflict));
     }
+    let receipt_charge = stream::profile5_receipt_expiry_charge_write(write, source)?;
+    if receipt_charge.0 != 0
+        && !charge.charge_row(
+            MaintenanceRowIdentity::new("aster.blob-profile5-receipts.v1", source.as_bytes()),
+            usize::try_from(receipt_charge.1)
+                .map_err(|_| StoreError::PayloadByteAccountingOverflow)?,
+        )?
+    {
+        return Ok(None);
+    }
     let mut prefixes = Vec::with_capacity(pending.carriers.len());
     let mut removed_rows = 1u64;
     let mut removed_bytes = staging_entry_bytes(32, encoded_pending.len())?;
@@ -18432,6 +18476,7 @@ fn plan_pending_removal_authority_write(
         staging_before,
         removed_rows,
         removed_bytes,
+        remove_profile5_receipt: receipt_charge.0 != 0,
     }))
 }
 
@@ -18479,6 +18524,14 @@ fn apply_pending_removal_authority_write(
     write
         .open_table(BLOB_PENDING_SOURCES)?
         .remove(plan.source.as_bytes().as_slice())?;
+    if plan.remove_profile5_receipt {
+        let removed = stream::expire_profile5_receipt_write(write, plan.source)?;
+        if removed.0 != 1 {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "planned profile-5 receipt disappeared before pending removal",
+            )));
+        }
+    }
     {
         let mut prefixes = write.open_table(BLOB_CARRIER_PREFIXES)?;
         for (key, _) in &plan.prefixes {
@@ -18577,6 +18630,9 @@ fn remove_pending_source_rows_write_inner(
     write
         .open_table(BLOB_PENDING_SOURCES)?
         .remove(source.as_bytes().as_slice())?;
+    if remove_ttl_deadline {
+        stream::expire_profile5_receipt_write(write, source)?;
+    }
     {
         let mut prefixes = write.open_table(BLOB_CARRIER_PREFIXES)?;
         for key in &prefix_rows {
@@ -20056,6 +20112,63 @@ mod tests {
     }
 
     #[test]
+    fn profile5_empty_pending_receipt_reopens_and_explicit_abort_reclaims_authority() {
+        let root = BlobTestRoot::new("profile5-empty-pending-reopen");
+        let mut services = blob_services(0xe1);
+        let plaintext = Vec::new();
+        let prepared = prepared_blob(&plaintext);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("empty profile-5 store");
+        let proof = prepare_blob_proof(&store, &mut services, &prepared, &plaintext, 1);
+        let plan = proof
+            .blob
+            .transfer_plan(&proof.manifest_bytes)
+            .expect("empty plan");
+        assert_eq!(
+            (plan.manifest().total_len(), plan.manifest().chunk_count()),
+            (0, 0)
+        );
+        store
+            .stage_verified_profile5_blob_source_with_policy(
+                &proof.policy,
+                &proof.blob,
+                &proof.sealed,
+                &plan,
+            )
+            .expect("stage empty profile-5 source");
+        let (receipt, progress) = store
+            .reserve_profile5_receipt(&proof.policy, &plan)
+            .expect("reserve empty profile-5 receipt");
+        assert_eq!(progress, BlobStreamResume::default());
+        drop((proof, store));
+
+        Store::inspect_existing(&root.database).expect("read-only empty pending audit");
+        let reopened = Store::open_for_mission(&root.database, services.authority)
+            .expect("writable empty pending audit");
+        assert_eq!(
+            reopened
+                .resume_profile5_receipt(receipt.source())
+                .expect("resume empty receipt"),
+            Some((receipt.clone(), progress))
+        );
+        assert!(
+            reopened
+                .abort_pending_blob_source(receipt.source())
+                .expect("abort empty pending")
+        );
+        assert_eq!(
+            reopened
+                .resume_profile5_receipt(receipt.source())
+                .expect("receipt reclaimed"),
+            None
+        );
+        drop(reopened);
+        Store::inspect_existing(&root.database).expect("read-only audit after empty reclamation");
+        Store::open_for_mission(&root.database, services.authority)
+            .expect("writable audit after empty reclamation");
+    }
+
+    #[test]
     fn profile5_already_present_receipt_is_terminal_and_retryable() {
         let root = BlobTestRoot::new("profile5-already-present");
         let mut services = blob_services(0xd8);
@@ -20161,6 +20274,69 @@ mod tests {
                 .expect("writable audit must reject malformed receipt"),
         );
         assert_eq!(blob_database_digest(&root.database), before);
+    }
+
+    #[test]
+    fn profile5_receipt_audit_rejects_every_noncanonical_progress_field() {
+        for offset in [169usize, 177, 185, 193, 201] {
+            let root = BlobTestRoot::new(&format!("profile5-progress-corruption-{offset}"));
+            let mut services = blob_services(0xe2);
+            let plaintext = vec![0x3c; 2 * aster_mesh::MAX_BLOB_CHUNK_SIZE as usize];
+            let prepared = prepared_blob(&plaintext);
+            let store = Store::open_for_mission(&root.database, services.authority)
+                .expect("progress corruption store");
+            let proof = prepare_blob_proof(&store, &mut services, &prepared, &plaintext, 1);
+            let plan = proof
+                .blob
+                .transfer_plan(&proof.manifest_bytes)
+                .expect("progress plan");
+            store
+                .stage_verified_profile5_blob_source_with_policy(
+                    &proof.policy,
+                    &proof.blob,
+                    &proof.sealed,
+                    &plan,
+                )
+                .expect("stage progress source");
+            store
+                .reserve_profile5_receipt(&proof.policy, &plan)
+                .expect("reserve progress receipt");
+            drop((proof, store));
+
+            let database = Database::open(&root.database).expect("raw progress database");
+            let write = database.begin_write().expect("raw progress write");
+            let mut table = write
+                .open_table(BLOB_PROFILE5_RECEIPTS)
+                .expect("receipt table");
+            let (key, mut encoded) = {
+                let (key, value) = table
+                    .iter()
+                    .expect("receipt rows")
+                    .next()
+                    .expect("receipt row")
+                    .expect("valid row");
+                (key.value().to_vec(), value.value().to_vec())
+            };
+            encoded[offset + 7] = 1;
+            table
+                .insert(key.as_slice(), encoded.as_slice())
+                .expect("corrupt progress");
+            drop(table);
+            write.commit().expect("commit progress corruption");
+            drop(database);
+
+            let before = blob_database_digest(&root.database);
+            assert_blob_schema_invariant(
+                &Store::inspect_existing(&root.database)
+                    .expect_err("read-only rejects progress corruption"),
+            );
+            assert_blob_schema_invariant(
+                &Store::open_for_mission(&root.database, services.authority)
+                    .err()
+                    .expect("writable rejects progress corruption"),
+            );
+            assert_eq!(blob_database_digest(&root.database), before);
+        }
     }
 
     #[test]
@@ -48056,6 +48232,9 @@ mod tests {
                 .expect("stage finite pending root"),
             BlobSourceStageOutcome::Inserted
         );
+        target
+            .reserve_profile5_receipt(&policy, &plan)
+            .expect("reserve finite pending receipt");
         let deadline = CustodySample {
             clock_id: checkpoint.clock_id,
             tick_ms: 150,
@@ -48099,6 +48278,7 @@ mod tests {
         assert_eq!(recovery.recovered_units(), 1);
         assert!(recovery.deficit_met());
         assert!(target.pending_blob_source(transfer).unwrap().is_none());
+        assert!(target.resume_profile5_receipt(transfer).unwrap().is_none());
         {
             let read = target.database.begin_read().unwrap();
             assert!(
@@ -48113,6 +48293,12 @@ mod tests {
         let reopened = Store::open_for_mission(&target_root.database, services.authority)
             .expect("reopen finite pending retirement");
         assert!(reopened.pending_blob_source(transfer).unwrap().is_none());
+        assert!(
+            reopened
+                .resume_profile5_receipt(transfer)
+                .unwrap()
+                .is_none()
+        );
         {
             let read = reopened.database.begin_read().unwrap();
             assert!(
@@ -48288,6 +48474,9 @@ mod tests {
         target
             .stage_verified_blob_source_with_policy(&policy, &proof.blob, &proof.sealed, &plan)
             .expect("stage pressure pending source");
+        target
+            .reserve_profile5_receipt(&policy, &plan)
+            .expect("reserve pressure pending receipt");
         let carrier = {
             let mut depot = source.blob_depot().expect("pressure source depot");
             CoreBlobStore::begin_blob_with_lineage(
@@ -48372,8 +48561,8 @@ mod tests {
             (charge.rows, charge.bytes)
         };
         assert_eq!(
-            exact_rows, 5,
-            "pending row, retained prefix, and three staging metadata rows"
+            exact_rows, 6,
+            "pending row, receipt, retained prefix, and three staging metadata rows"
         );
         let before_short = blob_complete_logical_digest(&target);
         for budget in [
@@ -48419,6 +48608,7 @@ mod tests {
         assert_eq!(recovered.recovered_units(), 2);
         assert!(recovered.deficit_met());
         assert!(target.pending_blob_source(transfer).unwrap().is_none());
+        assert!(target.resume_profile5_receipt(transfer).unwrap().is_none());
         let after = target.blob_stats().expect("after staging pressure stats");
         assert_eq!(after.pending_sources, 0);
         assert_eq!(after.carrier_prefixes, 0);

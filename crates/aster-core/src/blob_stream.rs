@@ -1,5 +1,5 @@
 use crate::{
-    blob::{BlobError, BlobId, BlobMetadata},
+    blob::{BlobError, BlobId, BlobMetadata, VerifiedBlobTransferPlan},
     custody::CustodySample,
     model::{Dot, MAX_CAUSAL_CONTEXT_ENTRIES, NodeId, Priority, Scope, Topic, VersionVector},
 };
@@ -12,6 +12,142 @@ use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
 pub const BLOB_STREAM_SEGMENT_BYTES: usize = 1024 * 1024;
+/// Maximum encoded size of one semantic-v9 ABX1 canonical carrier extent.
+pub const PROFILE5_CANONICAL_EXTENT_BYTES: u64 = 1024 * 1024;
+/// ABX1 fixed header: magic, first canonical index, and carrier count.
+pub const PROFILE5_CANONICAL_EXTENT_HEADER_BYTES: u64 = 4 + 8 + 4;
+/// ABX1 length prefix preceding each byte-identical ASTRBT01 carrier.
+pub const PROFILE5_CANONICAL_CARRIER_PREFIX_BYTES: u64 = 4;
+
+/// One exact resumable boundary in the canonical semantic-v9 ABX1 stream.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Profile5CanonicalCheckpoint {
+    pub next_chunk_index: u64,
+    pub plaintext_offset: u64,
+    pub carrier_offset: u64,
+    pub wire_offset: u64,
+}
+
+/// Deterministic ABX1 batching result derived only from an authenticated plan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Profile5CanonicalWireShape {
+    checkpoints: Vec<Profile5CanonicalCheckpoint>,
+}
+
+impl Profile5CanonicalWireShape {
+    pub fn checkpoints(&self) -> &[Profile5CanonicalCheckpoint] {
+        &self.checkpoints
+    }
+
+    pub fn terminal(&self) -> Profile5CanonicalCheckpoint {
+        *self.checkpoints.last().expect("wire shape includes origin")
+    }
+
+    pub fn checkpoint_for_wire_offset(&self, offset: u64) -> Option<Profile5CanonicalCheckpoint> {
+        self.checkpoints
+            .binary_search_by_key(&offset, |checkpoint| checkpoint.wire_offset)
+            .ok()
+            .map(|index| self.checkpoints[index])
+    }
+
+    pub fn contains(&self, checkpoint: Profile5CanonicalCheckpoint) -> bool {
+        self.checkpoints.contains(&checkpoint)
+    }
+}
+
+/// Computes the sole canonical semantic-v9 ABX1 extent partition and every
+/// resumable prefix. Empty input has exactly the origin/terminal checkpoint.
+pub fn profile5_canonical_wire_shape(
+    plan: &VerifiedBlobTransferPlan,
+) -> Result<Profile5CanonicalWireShape, BlobError> {
+    let lengths = (0..plan.manifest().chunk_count())
+        .map(|index| {
+            let carrier = plan.carrier_id(index)?;
+            Ok((
+                u64::from(plan.chunk_records()[index as usize].plaintext_len()),
+                plan.carrier_total_len(&carrier.wire_bytes())?,
+            ))
+        })
+        .collect::<Result<Vec<_>, BlobError>>()?;
+    profile5_canonical_wire_shape_from_lengths(&lengths)
+}
+
+/// Reconstructs ABX1 boundaries from authenticated manifest/carrier lengths.
+/// Store audit uses this form after independently validating those records.
+pub fn profile5_canonical_wire_shape_from_lengths(
+    lengths: &[(u64, u64)],
+) -> Result<Profile5CanonicalWireShape, BlobError> {
+    let mut checkpoints = vec![Profile5CanonicalCheckpoint::default()];
+    let mut next = 0u64;
+    let mut plaintext = 0u64;
+    let mut carriers = 0u64;
+    let mut wire = 0u64;
+    while next < lengths.len() as u64 {
+        let first = next;
+        let mut extent = PROFILE5_CANONICAL_EXTENT_HEADER_BYTES;
+        while next < lengths.len() as u64 {
+            let (plaintext_len, carrier_len) = lengths[next as usize];
+            if plaintext_len == 0 || carrier_len == 0 {
+                return Err(BlobError::InvalidManifest);
+            }
+            let candidate = extent
+                .checked_add(PROFILE5_CANONICAL_CARRIER_PREFIX_BYTES)
+                .and_then(|value| value.checked_add(carrier_len))
+                .ok_or(BlobError::LengthOverflow)?;
+            if candidate > PROFILE5_CANONICAL_EXTENT_BYTES {
+                if next == first {
+                    return Err(BlobError::InvalidManifest);
+                }
+                break;
+            }
+            extent = candidate;
+            plaintext = plaintext
+                .checked_add(plaintext_len)
+                .ok_or(BlobError::LengthOverflow)?;
+            carriers = carriers
+                .checked_add(carrier_len)
+                .ok_or(BlobError::LengthOverflow)?;
+            next += 1;
+        }
+        wire = wire.checked_add(extent).ok_or(BlobError::LengthOverflow)?;
+        checkpoints.push(Profile5CanonicalCheckpoint {
+            next_chunk_index: next,
+            plaintext_offset: plaintext,
+            carrier_offset: carriers,
+            wire_offset: wire,
+        });
+    }
+    Ok(Profile5CanonicalWireShape { checkpoints })
+}
+
+#[cfg(test)]
+mod profile5_wire_shape_tests {
+    use super::*;
+
+    #[test]
+    fn canonical_shape_batches_carriers_and_exposes_only_extent_boundaries() {
+        let lengths = vec![(64 * 1024, 100_000); 12];
+        let shape = profile5_canonical_wire_shape_from_lengths(&lengths).expect("ABX1 shape");
+        assert_eq!(shape.checkpoints().len(), 3);
+        assert_eq!(shape.checkpoints()[1].next_chunk_index, 10);
+        assert_eq!(shape.checkpoints()[1].plaintext_offset, 10 * 64 * 1024);
+        assert_eq!(shape.checkpoints()[1].carrier_offset, 1_000_000);
+        assert_eq!(shape.checkpoints()[1].wire_offset, 1_000_056);
+        assert_eq!(shape.terminal().next_chunk_index, 12);
+        assert_eq!(shape.terminal().wire_offset, 1_200_080);
+        assert!(shape.checkpoint_for_wire_offset(1_000_000).is_none());
+    }
+
+    #[test]
+    fn canonical_empty_shape_has_exact_zero_terminal() {
+        let shape = profile5_canonical_wire_shape_from_lengths(&[]).expect("empty ABX1 shape");
+        assert_eq!(
+            shape.checkpoints(),
+            &[Profile5CanonicalCheckpoint::default()]
+        );
+        assert_eq!(shape.terminal(), Profile5CanonicalCheckpoint::default());
+    }
+}
 /// Maximum plaintext length of one independently segmented Blob stream (8 GiB).
 ///
 /// This is intentionally distinct from the legacy profile-4 network Blob

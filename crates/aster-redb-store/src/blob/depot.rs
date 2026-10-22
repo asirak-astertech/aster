@@ -49,6 +49,7 @@ const CANONICAL_SUITE_ID: u16 = 1;
 const CANONICAL_MANIFEST_DIGEST_DOMAIN: &[u8] = b"aster/blob-manifest/v1";
 const CANONICAL_ROUTE_LEAF_DOMAIN: &[u8] = b"aster/blob-route-leaf/v1";
 const CANONICAL_ROUTE_NODE_DOMAIN: &[u8] = b"aster/blob-route-node/v1";
+const CANONICAL_ROUTE_EMPTY_DOMAIN: &[u8] = b"aster/blob-route-empty/v1";
 const CANONICAL_TRANSFER_ID_DOMAIN: &[u8] = b"aster/blob-transfer-object/v1";
 const CANONICAL_TRANSFER_FIXED_LEN: u64 = (8 + 2 + 32 + 32 + 8 + 32 + 4 + 1) as u64;
 const TEMP_PREFIX: &str = ".aster-blob-tmp-";
@@ -3264,6 +3265,101 @@ pub(super) fn profile5_import_shape_evidence(
     Ok((import.total_len, import.chunk_count))
 }
 
+pub(super) fn profile5_pending_import_shape_evidence(
+    encoded: &[u8],
+    metadata: &super::BlobMetadata,
+) -> Result<(u64, u64), StoreError> {
+    let import = decode_import(encoded)?;
+    let route = metadata
+        .header
+        .blob_route
+        .ok_or_else(|| blob_error(BlobStoreError::SchemaInvariant("Blob route is missing")))?;
+    if import.variant_id != metadata.variant_id
+        || import.blob_id != metadata.blob_id
+        || import.epoch != metadata.header.key_epoch
+        || import.chunk_count != route.chunk_count()
+        || import.physical_lineage != metadata.physical_lineage
+        || import
+            .finalized_manifest_digest
+            .is_some_and(|digest| digest != metadata.manifest_digest)
+    {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "pending profile-5 receipt differs from its depot import",
+        )));
+    }
+    Ok((import.total_len, import.chunk_count))
+}
+
+pub(super) fn profile5_import_wire_shape_evidence(
+    encoded: &[u8],
+    chunks: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    metadata: &super::BlobMetadata,
+    require_finalized: bool,
+) -> Result<aster_mesh::Profile5CanonicalWireShape, StoreError> {
+    let import = decode_import(encoded)?;
+    let route = metadata
+        .header
+        .blob_route
+        .ok_or_else(|| blob_error(BlobStoreError::SchemaInvariant("Blob route is missing")))?;
+    if import.variant_id != metadata.variant_id
+        || import.blob_id != metadata.blob_id
+        || import.epoch != metadata.header.key_epoch
+        || import.chunk_count != route.chunk_count()
+        || import.physical_lineage != metadata.physical_lineage
+        || (require_finalized && import.finalized_manifest_digest != Some(metadata.manifest_digest))
+        || import
+            .finalized_manifest_digest
+            .is_some_and(|digest| digest != metadata.manifest_digest)
+    {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "profile-5 receipt differs from its exact depot import",
+        )));
+    }
+    let mut records = Vec::with_capacity(
+        usize::try_from(import.chunk_count).map_err(|_| StoreError::ItemCountAccountingOverflow)?,
+    );
+    for index in 0..import.chunk_count {
+        let state = chunks
+            .get(chunk_key(import.variant_id, index).as_slice())?
+            .map(|value| decode_chunk_state(value.value()))
+            .transpose()?
+            .ok_or_else(|| {
+                blob_error(BlobStoreError::SchemaInvariant(
+                    "profile-5 receipt is missing an expected depot chunk",
+                ))
+            })?;
+        validate_chunk_state_lengths(&import, index, state)?;
+        records.push(state.expected.ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "profile-5 receipt has an unreserved depot chunk",
+            ))
+        })?);
+    }
+    let levels = exact_pending_route_levels(import.blob_id, &records)?;
+    let mut lengths = Vec::with_capacity(records.len());
+    for (index, record) in records.iter().copied().enumerate() {
+        let proof = exact_pending_route_proof(
+            &levels,
+            u64::try_from(index).map_err(|_| StoreError::ItemCountAccountingOverflow)?,
+        )?;
+        let carrier_len = CANONICAL_TRANSFER_FIXED_LEN
+            .checked_add(
+                u64::try_from(proof.len())
+                    .map_err(|_| StoreError::PayloadByteAccountingOverflow)?
+                    .checked_mul(32)
+                    .ok_or(StoreError::PayloadByteAccountingOverflow)?,
+            )
+            .and_then(|value| value.checked_add(u64::from(record.ciphertext_len())))
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+        lengths.push((u64::from(record.plaintext_len()), carrier_len));
+    }
+    aster_mesh::profile5_canonical_wire_shape_from_lengths(&lengths).map_err(|_| {
+        blob_error(BlobStoreError::SchemaInvariant(
+            "profile-5 receipt ABX1 shape is invalid",
+        ))
+    })
+}
+
 pub(super) fn audit_publication_import_read(
     read: &redb::ReadTransaction,
     variant_id: BlobVariantId,
@@ -3384,11 +3480,23 @@ pub(super) fn audit_pending_network_plan(
         )));
     }
     let levels = exact_pending_route_levels(blob_id, &records)?;
-    if levels
-        .last()
-        .and_then(|level| level.first())
-        .is_none_or(|root| root != route.root())
-    {
+    let exact_root = if records.is_empty() {
+        let mut digest = audit_domain_hasher(CANONICAL_ROUTE_EMPTY_DOMAIN);
+        digest.update(CANONICAL_PROTOCOL_VERSION.to_be_bytes());
+        digest.update(blob_id.as_bytes());
+        digest.update(0_u64.to_be_bytes());
+        digest.finalize().into()
+    } else {
+        *levels
+            .last()
+            .and_then(|level| level.first())
+            .ok_or_else(|| {
+                blob_error(BlobStoreError::SchemaInvariant(
+                    "pending Blob route tree is empty",
+                ))
+            })?
+    };
+    if &exact_root != route.root() {
         return Err(blob_error(BlobStoreError::SchemaInvariant(
             "pending Blob source differs from its exact route commitment",
         )));
@@ -4546,6 +4654,8 @@ pub(super) fn stage_verified_plan_write(
         return Err(blob_error(BlobStoreError::NetworkBlobTooLarge {
             total_len: incoming.total_len,
             chunk_count: incoming.chunk_count,
+            max_total_len,
+            max_chunks,
         }));
     }
     if incoming.chunk_count == 0 {

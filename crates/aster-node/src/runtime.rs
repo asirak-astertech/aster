@@ -38303,6 +38303,8 @@ mod tests {
             BlobStoreError::NetworkBlobTooLarge {
                 total_len: 1,
                 chunk_count: 1,
+                max_total_len: 0,
+                max_chunks: 0,
             },
             BlobStoreError::InvalidCarrierObjectId,
             BlobStoreError::PhysicalLineageConflict,
@@ -52201,12 +52203,9 @@ mod tests {
 
     #[tokio::test]
     async fn completed_canonical_blob_crosses_v9() {
+        let multi_extent = vec![0x5au8; 1024 * 1024 + 1];
         for (label, plaintext, finite) in [
-            (
-                "nonempty",
-                b"canonical profile-5 production crossing".as_slice(),
-                false,
-            ),
+            ("nonempty", multi_extent.as_slice(), false),
             ("empty", b"".as_slice(), false),
             (
                 "finite",
@@ -52222,8 +52221,12 @@ mod tests {
             let authority = services.member.mission_authority_id();
             let source_store = Store::open_for_mission(source_state.join(STORE_FILE), authority)
                 .expect("canonical v9 source store");
-            let target_store = Store::open_for_mission(target_state.join(STORE_FILE), authority)
-                .expect("canonical v9 target store");
+            let mut target_store =
+                Store::open_for_mission(target_state.join(STORE_FILE), authority)
+                    .expect("canonical v9 target store");
+            let target_before = target_store
+                .blob_stats()
+                .expect("target capacity before transfer");
             let mut source_verifier = open_test_sealer(&services.member);
             let publication = if finite {
                 publish_test_finite_blob(
@@ -52273,6 +52276,19 @@ mod tests {
             let plan = blob
                 .transfer_plan(&manifest_bytes)
                 .expect("canonical v9 source plan");
+            let wire_shape = aster_mesh::profile5_canonical_wire_shape(&plan)
+                .expect("canonical v9 ABX1 wire shape");
+            if label == "nonempty" {
+                assert!(plan.manifest().chunk_count() > 2);
+                assert!(
+                    wire_shape.checkpoints().len() > 2,
+                    "must span multiple extents"
+                );
+                assert!(
+                    wire_shape.checkpoints()[1].next_chunk_index > 1,
+                    "first extent must batch multiple carriers"
+                );
+            }
             assert_eq!(blob.mission_authority_id(), authority);
             assert_eq!(plan.source_envelope().into_bytes(), blob.envelope_id());
             assert_eq!(plan.manifest(), blob.manifest());
@@ -52325,9 +52341,13 @@ mod tests {
             let (mut sender_session, mut receiver_session, profile_digest) =
                 blob_stream::tests::mission_pair_from_bundles(&initiator_bytes, &responder_bytes);
             let adapter = if label == "nonempty" {
-                // OPEN, SOURCE, DATA, and FINISH are received; the injected
-                // close drops the sender's RESULT ACK after promotion.
-                blob_stream::tests::MemoryTransportAdapter::with_receive_failure(Some(4))
+                // Persist the first of multiple canonical extents, then lose
+                // the connection before the second extent is received.
+                blob_stream::tests::MemoryTransportAdapter::with_receive_failure(Some(3))
+            } else if label == "empty" {
+                // OPEN and empty SOURCE staging succeed; disconnect before
+                // FINISH so the exact (0, 0) pending receipt must reopen.
+                blob_stream::tests::MemoryTransportAdapter::with_receive_failure(Some(2))
             } else {
                 blob_stream::tests::MemoryTransportAdapter::new()
             };
@@ -52399,6 +52419,64 @@ mod tests {
             let (sent, received) = if label == "nonempty" {
                 assert!(
                     first.is_err(),
+                    "mid-DATA disconnect must interrupt transfer"
+                );
+                assert!(
+                    target_store
+                        .get_blob(publication)
+                        .expect("partial lookup")
+                        .is_none()
+                );
+                let (_, partial) = target_store
+                    .resume_profile5_receipt(publication)
+                    .expect("partial receipt lookup")
+                    .expect("partial receipt exists");
+                assert!(partial.durable_wire_offset() > 0);
+                assert!(partial.durable_wire_offset() < wire_shape.terminal().wire_offset);
+                let partial_stats = target_store
+                    .blob_stats()
+                    .expect("capacity after partial staging");
+                assert!(partial_stats.committed_file_bytes > target_before.committed_file_bytes);
+                assert!(partial_stats.reserved_file_bytes > target_before.reserved_file_bytes);
+                drop(target_store);
+                Store::inspect_existing(target_state.join(STORE_FILE))
+                    .expect("read-only audit interrupted receipt");
+                target_store = Store::open_for_mission(target_state.join(STORE_FILE), authority)
+                    .expect("reopen interrupted profile-5 receiver");
+
+                let (mut ack_sender, mut ack_receiver, ack_digest) =
+                    blob_stream::tests::mission_pair_from_bundles(
+                        &initiator_bytes,
+                        &responder_bytes,
+                    );
+                let ack_adapter =
+                    blob_stream::tests::MemoryTransportAdapter::with_receive_failure(Some(4));
+                let mut ack_verifier = open_test_sealer(&services.other);
+                let dropped_ack = tokio::try_join!(
+                    blob_stream::send_canonical_blob_profile5(
+                        &ack_adapter,
+                        &source_store,
+                        &source_policy,
+                        &source,
+                        &mut ack_sender,
+                        ack_digest,
+                        direction,
+                        [0xab; 32],
+                    ),
+                    blob_stream::receive_canonical_blob_profile5(
+                        &ack_adapter,
+                        &target_store,
+                        &target_policy,
+                        &mut ack_verifier,
+                        &mut ack_receiver,
+                        ack_digest,
+                        direction,
+                        [0xab; 32],
+                        &offer,
+                    ),
+                );
+                assert!(
+                    dropped_ack.is_err(),
                     "dropped RESULT ACK must interrupt settlement"
                 );
                 assert!(
@@ -52407,6 +52485,9 @@ mod tests {
                         .expect("canonical v9 promoted lookup after dropped ACK")
                         .is_some()
                 );
+                let promoted_stats = target_store
+                    .blob_stats()
+                    .expect("capacity after canonical promotion");
                 assert!(
                     target_store
                         .resume_profile5_receipt(publication)
@@ -52421,7 +52502,7 @@ mod tests {
                     );
                 let retry_adapter = blob_stream::tests::MemoryTransportAdapter::new();
                 let mut retry_verifier = open_test_sealer(&services.other);
-                tokio::try_join!(
+                let settled = tokio::try_join!(
                     blob_stream::send_canonical_blob_profile5(
                         &retry_adapter,
                         &source_store,
@@ -52444,7 +52525,72 @@ mod tests {
                         &offer,
                     ),
                 )
-                .expect("canonical v9 already-present retry")
+                .expect("canonical v9 already-present retry");
+                let settled_stats = target_store
+                    .blob_stats()
+                    .expect("capacity after profile-5 ACK");
+                assert_eq!(
+                    settled_stats.committed_file_bytes,
+                    promoted_stats.committed_file_bytes
+                );
+                assert_eq!(
+                    settled_stats.reserved_file_bytes,
+                    promoted_stats.reserved_file_bytes
+                );
+                settled
+            } else if label == "empty" {
+                assert!(
+                    first.is_err(),
+                    "post-SOURCE empty disconnect must interrupt transfer"
+                );
+                assert!(
+                    target_store
+                        .get_blob(publication)
+                        .expect("empty partial lookup")
+                        .is_none()
+                );
+                assert!(
+                    target_store
+                        .resume_profile5_receipt(publication)
+                        .expect("empty receipt lookup")
+                        .is_some()
+                );
+                drop(target_store);
+                Store::inspect_existing(target_state.join(STORE_FILE))
+                    .expect("read-only audit interrupted empty receipt");
+                target_store = Store::open_for_mission(target_state.join(STORE_FILE), authority)
+                    .expect("reopen interrupted empty profile-5 receiver");
+                let (mut retry_sender, mut retry_receiver, retry_digest) =
+                    blob_stream::tests::mission_pair_from_bundles(
+                        &initiator_bytes,
+                        &responder_bytes,
+                    );
+                let retry_adapter = blob_stream::tests::MemoryTransportAdapter::new();
+                let mut retry_verifier = open_test_sealer(&services.other);
+                tokio::try_join!(
+                    blob_stream::send_canonical_blob_profile5(
+                        &retry_adapter,
+                        &source_store,
+                        &source_policy,
+                        &source,
+                        &mut retry_sender,
+                        retry_digest,
+                        direction,
+                        [0xac; 32],
+                    ),
+                    blob_stream::receive_canonical_blob_profile5(
+                        &retry_adapter,
+                        &target_store,
+                        &target_policy,
+                        &mut retry_verifier,
+                        &mut retry_receiver,
+                        retry_digest,
+                        direction,
+                        [0xac; 32],
+                        &offer,
+                    ),
+                )
+                .expect("resume interrupted empty profile-5 transfer")
             } else {
                 first.expect("canonical v9 production crossing")
             };
@@ -52518,10 +52664,30 @@ mod tests {
 
             if finite {
                 let before_restart = target_store.test_blob_logical_digest();
+                let lifetime_before = target_store
+                    .test_blob_finite_lifetime_evidence(publication)
+                    .expect("finite receiver lifetime evidence")
+                    .expect("finite receiver lifetime");
+                assert_eq!(lifetime_before.0, 600_000);
+                assert!(lifetime_before.1 >= 25);
+                assert_eq!(
+                    lifetime_before
+                        .2
+                        .expect("receiver-local custody checkpoint")
+                        .clock_id,
+                    [0xb2; 16]
+                );
                 drop(target_store);
                 let reopened = Store::open_for_mission(target_state.join(STORE_FILE), authority)
                     .expect("reopen finite canonical v9 receiver");
                 assert_eq!(reopened.test_blob_logical_digest(), before_restart);
+                assert_eq!(
+                    reopened
+                        .test_blob_finite_lifetime_evidence(publication)
+                        .expect("reopened finite lifetime evidence")
+                        .expect("reopened finite lifetime"),
+                    lifetime_before
+                );
                 assert!(
                     reopened
                         .get_blob(publication)

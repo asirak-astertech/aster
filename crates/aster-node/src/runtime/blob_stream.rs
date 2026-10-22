@@ -148,69 +148,18 @@ impl CanonicalBlobSendSource {
     }
 }
 
-fn canonical_extent_shape(
-    plan: &VerifiedBlobTransferPlan,
-    first_chunk_index: u64,
-) -> Result<(u64, u64), BlobNetworkError> {
-    if first_chunk_index >= plan.manifest().chunk_count() {
-        return Err("canonical extent starts outside the manifest".into());
-    }
-    let mut encoded_len = crate::stream_transfer::CANONICAL_BLOB_EXTENT_HEADER_BYTES as u64;
-    let mut count = 0_u64;
-    for index in first_chunk_index..plan.manifest().chunk_count() {
-        let carrier = plan
-            .carrier_id(index)
-            .map_err(|error| verification_failure("derive canonical carrier ID", error))?;
-        let carrier_len = plan
-            .carrier_total_len(&carrier.wire_bytes())
-            .map_err(|error| verification_failure("derive canonical carrier length", error))?;
-        let next = encoded_len
-            .checked_add(4)
-            .and_then(|value| value.checked_add(carrier_len))
-            .ok_or("canonical extent length overflow")?;
-        if next > PROFILE5_CANONICAL_EXTENT_BYTES as u64 {
-            if count == 0 {
-                return Err("one canonical carrier exceeds the profile-5 extent bound".into());
-            }
-            break;
-        }
-        encoded_len = next;
-        count += 1;
-    }
-    Ok((count, encoded_len))
-}
-
 fn canonical_blob_wire_len(plan: &VerifiedBlobTransferPlan) -> Result<u64, BlobNetworkError> {
-    let mut index = 0_u64;
-    let mut total = 0_u64;
-    while index < plan.manifest().chunk_count() {
-        let (count, extent_len) = canonical_extent_shape(plan, index)?;
-        index = index
-            .checked_add(count)
-            .ok_or("canonical Blob chunk index overflow")?;
-        total = total
-            .checked_add(extent_len)
-            .ok_or("canonical Blob wire length overflow")?;
-    }
-    Ok(total)
+    Ok(aster_mesh::profile5_canonical_wire_shape(plan)
+        .map_err(|error| verification_failure("derive canonical ABX1 shape", error))?
+        .terminal()
+        .wire_offset)
 }
 
 fn canonical_blob_carrier_len(plan: &VerifiedBlobTransferPlan) -> Result<u64, BlobNetworkError> {
-    let mut total = 0u64;
-    for index in 0..plan.manifest().chunk_count() {
-        let carrier = plan
-            .carrier_id(index)
-            .map_err(|error| verification_failure("derive canonical carrier ID", error))?;
-        total = total
-            .checked_add(
-                plan.carrier_total_len(&carrier.wire_bytes())
-                    .map_err(|error| {
-                        verification_failure("derive canonical carrier length", error)
-                    })?,
-            )
-            .ok_or("canonical carrier length overflow")?;
-    }
-    Ok(total)
+    Ok(aster_mesh::profile5_canonical_wire_shape(plan)
+        .map_err(|error| verification_failure("derive canonical ABX1 shape", error))?
+        .terminal()
+        .carrier_offset)
 }
 
 const fn canonical_sender_requires_final_checkpoint(total: u64, durable: u64) -> bool {
@@ -221,6 +170,7 @@ struct CanonicalCarrierExtentSource<'a> {
     store: &'a Store,
     source: &'a CanonicalBlobSendSource,
     plan: &'a VerifiedBlobTransferPlan,
+    shape: aster_mesh::Profile5CanonicalWireShape,
     next_chunk_index: u64,
     wire_offset: u64,
 }
@@ -231,24 +181,17 @@ impl<'a> CanonicalCarrierExtentSource<'a> {
         source: &'a CanonicalBlobSendSource,
         wire_offset: u64,
     ) -> Result<Self, BlobNetworkError> {
-        let mut next_chunk_index = 0_u64;
-        let mut consumed = 0_u64;
-        while consumed < wire_offset {
-            let (count, extent_len) = canonical_extent_shape(&source.plan, next_chunk_index)?;
-            consumed = consumed
-                .checked_add(extent_len)
-                .ok_or("canonical Blob resume offset overflow")?;
-            next_chunk_index = next_chunk_index
-                .checked_add(count)
-                .ok_or("canonical Blob resume index overflow")?;
-        }
-        if consumed != wire_offset {
-            return Err("profile-5 resume offset is not a canonical extent boundary".into());
-        }
+        let shape = aster_mesh::profile5_canonical_wire_shape(&source.plan)
+            .map_err(|error| verification_failure("derive canonical ABX1 shape", error))?;
+        let next_chunk_index = shape
+            .checkpoint_for_wire_offset(wire_offset)
+            .ok_or("profile-5 resume offset is not a canonical extent boundary")?
+            .next_chunk_index;
         Ok(Self {
             store,
             source,
             plan: &source.plan,
+            shape,
             next_chunk_index,
             wire_offset,
         })
@@ -259,7 +202,20 @@ impl<'a> CanonicalCarrierExtentSource<'a> {
             return Ok(None);
         }
         let first_chunk_index = self.next_chunk_index;
-        let (count, expected_len) = canonical_extent_shape(self.plan, first_chunk_index)?;
+        let position = self
+            .shape
+            .checkpoints()
+            .iter()
+            .position(|checkpoint| checkpoint.next_chunk_index == first_chunk_index)
+            .ok_or("canonical extent starts outside the canonical partition")?;
+        let before = self.shape.checkpoints()[position];
+        let after = *self
+            .shape
+            .checkpoints()
+            .get(position + 1)
+            .ok_or("canonical extent has no successor")?;
+        let count = after.next_chunk_index - before.next_chunk_index;
+        let expected_len = after.wire_offset - before.wire_offset;
         let mut carriers = Vec::with_capacity(
             usize::try_from(count).map_err(|_| "canonical carrier count overflows")?,
         );
