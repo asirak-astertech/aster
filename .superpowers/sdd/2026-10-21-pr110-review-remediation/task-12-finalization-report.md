@@ -3,11 +3,11 @@
 ## Status and scope
 
 The original Phase B implementation is in signed commit
-`ff6bc04f8b561b2cf91d600bb077dfb5a1b8e755`. Review round 1 corrects every
-finding in `task-12-finalization-review.md`: atomic sidecar creation and crash
-recovery, worker-owned provisional decrypt, exact sidecar capacity migration,
-whole-finalizer metrics, canonical v3 validation, and zeroizing digest
-ownership. The signed correction commit is recorded below after creation.
+`ff6bc04f8b561b2cf91d600bb077dfb5a1b8e755`. Review round 1 corrected the
+durability, worker mapping, capacity, v3 validation, and zeroization findings.
+Review round 2 corrects the two remaining measurement findings from
+`task-12-finalization-rereview.md`: observed allocation peaks are now distinct
+from conservative bounds, and the selective Store phase counter is removed.
 
 No transport file, device, deployment, push, full workspace test suite, or
 ignored 800-MiB/1-GiB measurement run was touched or executed.
@@ -35,6 +35,18 @@ cargo test -p aster-node stream_upload_finalization_occupies_multiple_chunk_work
 The same tests are GREEN after the implementation. Additional crash/reopen,
 legacy-capacity pressure, privacy-boundary, one-pass, parity, cancellation, and
 zeroization regressions are listed under verification.
+
+Round 2 added its measurement/schema regression before implementation:
+
+```text
+cargo test -p aster-node stream_upload_finalization_is_one_pass_bounded_and_canonical --lib -- --nocapture
+  RED: exit 101; observed worker/publication/whole-buffer fields and the v2
+       measurement schema did not exist, while the old peak and selective
+       Store counter remained
+```
+
+The focused test is now GREEN and rejects JSON keys named `peak_owned_bytes`,
+`store_operations`, or `store_phase_calls`.
 
 ## Durable digest artifact and crash recovery
 
@@ -125,20 +137,34 @@ zeroizing plaintext/ciphertext owners.
 
 ## Whole-finalizer memory and operation measurements
 
-The runner's `pipeline_peak_owned_bytes` remains a pipeline-only observation.
-The JSON `peak_owned_bytes` is now the whole-finalizer peak across mutually
-exclusive preparation, pipeline, and manifest/route phases. It includes:
+Measurement schema `aster.local_blob_finalization.measurement.v2` separates
+observations from configuration:
 
-- the one retained canonical digest vector;
-- request/manifest metadata capacities;
-- provisional encoded record, decrypted segment, canonical plaintext/
-  ciphertext work, and mapped segment output for both inner workers;
-- complete manifest bytes;
-- every route-tree level, with route leaves moved into the tree rather than
-  cloned.
+- `observed_worker_buffer_peak_bytes` is maintained by a shared live-capacity
+  tracker across both map workers and queued/reorder results. Each guard reports
+  actual `Vec::capacity()` and container capacity while the encoded pack record
+  and decoded ciphertext overlap, while decoded ciphertext and plaintext
+  overlap, while each canonical plaintext copy is sealed, and while mapped
+  ciphertext bundles wait for the ordered sink.
+- `observed_publication_buffer_peak_bytes` observes the post-manifest phase. It
+  explicitly includes the simultaneously live retained manifest, sealed
+  envelope, and opened manifest, then the retained manifest, durable outcome
+  envelope, and stored-verification manifest through route caching.
+- `observed_buffer_peak_bytes` is the maximum of the observed preparation,
+  worker/queue, manifest/route, and publication buffer phases. It is an
+  observed capacity total for the named buffers, not a process allocator RSS
+  claim.
+- `conservative_owned_byte_bound` and
+  `aggregate_conservative_owned_byte_bound` are explicitly configured bounds,
+  never labeled as measured peaks.
 
-The conservative two-job bound exported to the measurement JSON and asserted
-in the regression is exactly the production constant:
+The old JSON keys `peak_owned_bytes` and `pipeline_peak_owned_bytes` are gone.
+`peak_in_flight_accounted_bytes` and
+`aggregate_pipeline_accounting_bound` retain the distinct admission-accounting
+meaning.
+
+The conservative two-job ownership bound is exported separately and asserted
+against the same production formula:
 
 ```text
 worker_peak = 3 * 1 MiB
@@ -146,28 +172,31 @@ worker_peak = 3 * 1 MiB
 
 per_job = (MAX_BLOB_CHUNKS * 32)                  digest material
         + 2 * worker_peak                         two inner workers
-        + MAX_BLOB_MANIFEST_BYTES                 complete manifest
+        + 4 * MAX_BLOB_MANIFEST_BYTES             publication overlap bound
         + (2 * MAX_BLOB_CHUNKS * 32
            + 32 * sizeof(Vec<[u8; 32]>))          route levels
+        + 1 MiB                                    provider-envelope overhead
         + 3 * (MAX_MEDIA_TYPE + MAX_SCHEMA_ID)    owned metadata
 
-aggregate_sensitive_byte_bound = 2 * per_job
-aggregate_pipeline_byte_bound  = 2 jobs * 2 bundles * 2 MiB
-aggregate_cpu_budget           = 4
+aggregate_conservative_owned_byte_bound = 2 * per_job
+aggregate_pipeline_accounting_bound     = 2 jobs * 2 bundles
+                                          * segment accounting
+aggregate_cpu_budget                    = 4
 ```
 
 The reorder peak now subtracts the expected next item only when it is actually
 present, so one genuinely out-of-order result reports one rather than zero.
 
-`store_operations` was removed because it overclaimed complete observation.
-The replacement `store_phase_calls` is deliberately narrow: it counts six
-explicit top-level finalizer calls into Store-backed helpers and says nothing
-about nested redb work. Actual chunk-depot work continues to be observed at
-the real `BlobStore` trait boundary by `MeasuredBlobStore`; adding a depot API
-call without going through that boundary changes the asserted formula. For N
-canonical chunks the successful measured path observes `4N + 2` depot calls,
-exact plaintext bytes, `Blob length + 16N` encrypted bytes, and exactly
-`ceil(Blob length / 1 MiB)` provisional reads.
+Both selective Store counters are removed. `Store` is a broad concrete owner
+whose relevant helpers contain nested policy, redb, verification, cache, and
+cleanup work; no stable complete Store trait boundary exists in this scope.
+Keeping a manually selected number would be less truthful than omitting it.
+The report and schema therefore claim only the boundary that is actually
+wrapped: `MeasuredBlobStore` observes every canonical chunk-depot API call.
+The focused schema regression rejects either Store counter key, while its exact
+`4N + 2` depot assertion detects added or removed depot-boundary work. The same
+successful path observes exact plaintext bytes, `Blob length + 16N` encrypted
+bytes, and `ceil(Blob length / 1 MiB)` provisional reads.
 
 ## Digest ownership and privacy boundary
 
@@ -203,6 +232,8 @@ cargo clippy -p aster-core -p aster-redb-store -p aster-node --lib --tests -- -D
 
 cargo test -p aster-node stream_upload_finalization_ --lib -- --nocapture
   5 passed; 0 failed; 2 ignored exact-size gates; 657 filtered
+cargo test -p aster-redb-store blob_pack_reader_observes_encoded_and_decoded_capacity_overlap --lib -- --nocapture
+  1 passed; 0 failed
 
 cargo test -p aster-redb-store upload_digest_ --lib -- --nocapture
   3 passed; 0 failed
@@ -220,6 +251,19 @@ cargo test -p aster-redb-store upload_sync_and_projection_faults_reopen_without_
   1 passed; 0 failed
 ```
 
+Round 2 reran the formatting/diff checks, the same node finalization group, and
+strict Clippy for `aster-core`, `aster-redb-store`, and `aster-node` after the
+metric changes. The one-pass regression additionally proves:
+
+- the worker observation contains at least the concurrently live encoded/
+  decoded or decoded/plaintext segment buffers and real mapped-container
+  capacity;
+- the publication observation contains at least three live manifest-sized
+  buffers;
+- the observed peak does not exceed the separately named conservative bound;
+- `depot_operations == 4N + 2` at the instrumented `BlobStore` boundary; and
+- the measurement JSON contains neither old peak nor Store-counter keys.
+
 The redb group covers partial atomic create, v2 torn-final recreation, header
 and combined-checkpoint durability states, pre-redb-projection tails, projected
 resume truncation, Store reopen, exact capacity pressure/retry/reopen, cleanup
@@ -234,6 +278,7 @@ run. No full workspace suite or broad check script was run in this fix round.
 - `ff6bc04f8b561b2cf91d600bb077dfb5a1b8e755` — initial Phase B implementation
 - `cb3822839d73cb178b6ab04a09aca4d65d7079c5` — initial Phase B report
 - `071c65ce97e26584897a74612ff1c94d4f5e4060` — review-round implementation corrections
+- `3640f492b504744ae4dab44e9f3b321d6efccde0` — review-round 2 measurement corrections
 - the signed documentation commit containing this report
 
 ## Remaining concerns
@@ -246,5 +291,7 @@ run. No full workspace suite or broad check script was run in this fix round.
 - Opening an independent pinned reader per segment repeats bounded checkpoint
   validation metadata I/O; it does not reread provisional plaintext, but a
   future measured optimization could pass a prevalidated pinned segment view.
-- `store_phase_calls` is intentionally not an all-redb-operation metric. Depot
-  operations are the real API-boundary observation used for growth detection.
+- There is no truthful complete Store-operation count without introducing a
+  new Store facade/trait boundary across policy, redb, verification, cache, and
+  cleanup helpers. This round removes the selective metric rather than
+  presenting it as complete; depot work retains real boundary instrumentation.
