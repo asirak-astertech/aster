@@ -10,7 +10,8 @@ Review round 2 corrects the two remaining measurement findings from
 from conservative bounds, and the selective Store phase counter is removed.
 Review round 3 satisfies the original Task 12 Store-count requirement with a
 complete private finalizer boundary rather than restoring that selective
-counter.
+counter. Review round 4 moves that boundary to job construction, so a
+`BlobFinalizeJob` never owns raw Store authority.
 
 No transport file, device, deployment, push, full workspace test suite, or
 ignored 800-MiB/1-GiB measurement run was touched or executed.
@@ -65,6 +66,17 @@ was GREEN at 10 attempted operations. The synchronous cleanup-gap regression
 initially exposed that its test helper discarded the measured report; the
 helper now returns that report directly and the regression is GREEN at the
 exact nine-operation prefix without `CompleteUpload`.
+
+Round 4 added structural type evidence before changing production ownership:
+
+```text
+cargo test -p aster-node finalizer_job_construction_requires_non_escaping_store_facade --lib -- --nocapture
+  RED: exit 101; BlobFinalizeJob::new did not exist and job.store was
+       Arc<Store>, not BlobFinalizeStore
+```
+
+The same test is GREEN after moving facade construction to the job-creation
+site.
 
 ## Durable digest artifact and crash recovery
 
@@ -205,12 +217,22 @@ aggregate_cpu_budget                    = 4
 The reorder peak now subtracts the expected next item only when it is actually
 present, so one genuinely out-of-order result reports one rather than zero.
 
-The finalizer now moves its `Arc<Store>` into a private `BlobFinalizeStore`
-facade at the start of `run_measured`. The facade deliberately implements no
-`Deref`, `AsRef<Store>`, or raw Store getter, and the moved raw binding cannot
-be reused. Verification that does not request completion checking is split
+The job-creation site now moves its cloned `Arc<Store>` immediately into a
+private `BlobFinalizeStore` facade and passes that facade to
+`BlobFinalizeJob::new`. The constructor requires `BlobFinalizeStore`, the job's
+field has that exact type, and `run_measured` only receives the already-wrapped
+facade. No job field, constructor parameter, or method has raw Store authority.
+The facade deliberately implements no `Deref`, `AsRef<Store>`, or raw Store
+getter. Verification that does not request completion checking remains split
 into a Store-free path, so every top-level Store-backed action in the finalizer
 is a named facade operation.
+
+A compile-time regression binds the constructor signature and extracts the
+owned job field as `BlobFinalizeStore`; changing either back to `Arc<Store>`
+fails compilation. Ambiguity-based negative trait assertions also fail to
+compile if the facade gains any `Deref`, `AsRef<Store>`, or
+`AsRef<Arc<Store>>`. The raw inner field remains private to the child module,
+avoiding a brittle source-text test for encapsulation.
 
 `store_boundary_operations` counts attempted top-level operations on entry to
 that facade; it intentionally does not count nested redb calls inside those
@@ -317,6 +339,20 @@ git diff --check
   passed
 ```
 
+Round 4 preserves the same exact 10/9 Store traces and `4N + 2` depot count.
+Fresh focused evidence:
+
+```text
+cargo test -p aster-node finalizer_job_construction_requires_non_escaping_store_facade --lib -- --nocapture
+  1 passed; 0 failed; 664 filtered
+cargo test -p aster-node stream_upload_finalization_ --lib -- --nocapture
+  5 passed; 0 failed; 2 ignored exact-size gates; 658 filtered
+cargo test -p aster-node stream_upload_prefers_canonical_result_over_residual_cleanup_authority --lib -- --nocapture
+  1 passed; 0 failed; 664 filtered
+cargo clippy -p aster-core -p aster-redb-store -p aster-node --lib --tests -- -D warnings
+  passed
+```
+
 The redb group covers partial atomic create, v2 torn-final recreation, header
 and combined-checkpoint durability states, pre-redb-projection tails, projected
 resume truncation, Store reopen, exact capacity pressure/retry/reopen, cleanup
@@ -333,6 +369,7 @@ run. No full workspace suite or broad check script was run in this fix round.
 - `071c65ce97e26584897a74612ff1c94d4f5e4060` — review-round implementation corrections
 - `3640f492b504744ae4dab44e9f3b321d6efccde0` — review-round 2 measurement corrections
 - `b1721b3e588db0ed9606af03d35c78970f7c4f6a` — review-round 3 Store-boundary implementation
+- `3d6b340642efd7dd78ee63337840d724063f831f` — review-round 4 Store-ownership implementation
 - the signed documentation commit containing this report
 
 ## Remaining concerns
