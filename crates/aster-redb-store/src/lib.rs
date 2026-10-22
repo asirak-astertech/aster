@@ -6240,6 +6240,7 @@ impl Store {
         // additive Blob migration. A foreign/pre-marker physical root blocks
         // migration while this exact writer transaction can still roll back.
         blob::depot::prepare_depot_owner_token_write(&write, &path)?;
+        blob::depot::recover_upload_pack_transitions_write(&write, &path, backing_identity)?;
         let operation_migration =
             event_operation::stage_legacy_event_operations_write(&write, operation_limits)?;
         // Audit all retained metadata, predecessor relations, witnesses and

@@ -933,6 +933,30 @@ impl EncryptedBlobStreamSegment {
         &self.ciphertext
     }
 
+    /// Reconstructs the transport-visible ciphertext leaf without requiring
+    /// plaintext or decryption authority. This is sufficient to audit a
+    /// durable ciphertext frontier projected by a receiver.
+    pub fn ciphertext_audit_leaves(&self) -> BlobStreamSegmentLeaves {
+        let aad = segment_aad(
+            self.stream_id,
+            self.open_digest,
+            self.content_epoch,
+            self.index,
+            self.offset,
+            self.total_len,
+            self.plaintext_len,
+        );
+        BlobStreamSegmentLeaves {
+            plaintext: [0; 32],
+            ciphertext: hash_parts(
+                b"ASTER/blob-stream/cipher-leaf/v2\0",
+                &[&aad, &self.ciphertext],
+            ),
+            plaintext_len: u64::from(self.plaintext_len),
+            ciphertext_len: self.ciphertext.len() as u64,
+        }
+    }
+
     pub fn header(&self) -> EncryptedBlobStreamSegmentHeader {
         EncryptedBlobStreamSegmentHeader {
             stream_id: self.stream_id,
@@ -1582,6 +1606,30 @@ impl BlobStreamCheckpoint {
 
     pub const fn ciphertext_len(&self) -> u64 {
         self.ciphertext_len
+    }
+
+    /// Digest of every ciphertext-relevant frontier field. Plaintext roots are
+    /// deliberately excluded so storage audit needs no content key.
+    pub fn ciphertext_commitment(&self) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        digest.update(b"ASTER/blob-stream/cipher-checkpoint/v1\0");
+        digest.update(self.next_index.to_be_bytes());
+        digest.update(self.plaintext_len.to_be_bytes());
+        digest.update(self.ciphertext_len.to_be_bytes());
+        for subtree in self.levels {
+            match subtree {
+                None => digest.update([0]),
+                Some(subtree) => {
+                    digest.update([1]);
+                    digest.update(subtree.first_index.to_be_bytes());
+                    digest.update(subtree.count.to_be_bytes());
+                    digest.update(subtree.plaintext_len.to_be_bytes());
+                    digest.update(subtree.ciphertext_len.to_be_bytes());
+                    digest.update(subtree.ciphertext_root);
+                }
+            }
+        }
+        digest.finalize().into()
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -2291,6 +2339,10 @@ mod tests {
         let encoded = segment.encode();
         let decoded = EncryptedBlobStreamSegment::decode(&encoded).expect("decode");
         assert_eq!(decoded, segment);
+        let audit = decoded.ciphertext_audit_leaves();
+        assert_eq!(audit.ciphertext, expected_leaves.ciphertext);
+        assert_eq!(audit.plaintext_len, expected_leaves.plaintext_len);
+        assert_eq!(audit.ciphertext_len, expected_leaves.ciphertext_len);
         assert_eq!(opener.open(&decoded).expect("open").1, expected_leaves);
         let (header, plaintext, leaves) = opener.open_encoded(&encoded).expect("open encoded");
         assert_eq!(header, segment.header());

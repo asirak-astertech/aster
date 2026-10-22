@@ -3097,7 +3097,12 @@ pub(crate) fn audit_depot_write(
             match root.read_owner_marker()? {
                 Some(_) => {
                     root.require_store_binding(store_path, backing_identity, owner_token)?;
-                    super::pack::audit_upload_packs_write(&root, &upload_packs)?;
+                    let completed = super::pack::audit_upload_packs_write(&root, &upload_packs)?;
+                    if !completed.is_empty() {
+                        return Err(blob_error(BlobStoreError::DepotIntegrity(
+                            "Blob upload cleanup was not recovered before accounting audit",
+                        )));
+                    }
                     reclaim_unmarked_artifacts(write, &root, &BTreeMap::new(), &deletion)?;
                 }
                 None => {
@@ -3119,13 +3124,44 @@ pub(crate) fn audit_depot_write(
         ))
     })?;
     root.require_store_binding(store_path, backing_identity, owner_token)?;
-    super::pack::audit_upload_packs_write(&root, &upload_packs)?;
+    let completed = super::pack::audit_upload_packs_write(&root, &upload_packs)?;
+    if !completed.is_empty() {
+        return Err(blob_error(BlobStoreError::DepotIntegrity(
+            "Blob upload cleanup was not recovered before accounting audit",
+        )));
+    }
     audit_deletion_storage(&root, &deletion, false)?;
     let mut committed = committed_chunk_map_write(write)?;
     let deletion_variants = protect_queued_deletion_chunks(&mut committed, &deletion)?;
     verify_all_marked_files_write(write, &root, &committed, &deletion_variants)?;
     reclaim_unmarked_artifacts(write, &root, &committed, &deletion)?;
     audit_deletion_storage(&root, &deletion, true)
+}
+
+pub(crate) fn recover_upload_pack_transitions_write(
+    write: &redb::WriteTransaction,
+    store_path: &Path,
+    backing_identity: StoreBackingIdentity,
+) -> Result<(), StoreError> {
+    if !write
+        .list_tables()?
+        .any(|table| table.name() == super::BLOB_UPLOADS.name())
+    {
+        return Ok(());
+    }
+    let expected = super::upload::upload_pack_expectations_write(write)?;
+    let Some(root) = OwnedDirectory::open_root_if_present(store_path)? else {
+        if expected.is_empty() {
+            return Ok(());
+        }
+        return Err(blob_error(BlobStoreError::DepotIntegrity(
+            "durable Blob upload depot root is missing",
+        )));
+    };
+    let owner_token = depot_owner_token_write(write)?;
+    root.require_store_binding(store_path, backing_identity, owner_token)?;
+    let completed = super::pack::audit_upload_packs_write(&root, &expected)?;
+    super::upload::finish_upload_cleanups_write(write, &completed)
 }
 
 pub(crate) fn audit_depot_read(

@@ -24,11 +24,21 @@ use std::sync::Arc;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UploadFaultPoint {
     CheckpointBeforeCommit,
+    ReservationIntentSynced,
+    ReservationPackSynced,
 }
 
 #[cfg(test)]
 static TEST_UPLOAD_FAULTS: std::sync::Mutex<Vec<(std::path::PathBuf, UploadFaultPoint)>> =
     std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn inject_test_fault(store: &Store, point: UploadFaultPoint) {
+    TEST_UPLOAD_FAULTS
+        .lock()
+        .expect("upload test fault lock")
+        .push((store.path.clone(), point));
+}
 
 #[cfg(test)]
 fn maybe_inject_test_fault(store: &Store, point: UploadFaultPoint) -> Result<(), StoreError> {
@@ -609,6 +619,38 @@ fn upload_pack_expectations_table(
         .collect()
 }
 
+pub(super) fn finish_upload_cleanups_write(
+    write: &redb::WriteTransaction,
+    completed: &[BlobPackIdentity],
+) -> Result<(), StoreError> {
+    if completed.is_empty() {
+        return Ok(());
+    }
+    let completed = completed
+        .iter()
+        .map(|identity| *identity.upload_id().as_bytes())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut remove = Vec::new();
+    {
+        let uploads = write.open_table(super::BLOB_UPLOADS)?;
+        for row in uploads.iter()? {
+            let (key, value) = row?;
+            let upload = DurableBlobUpload::decode(Arc::new(()), value.value())?;
+            if completed.contains(upload.reservation.pack_identity().upload_id().as_bytes()) {
+                remove.push(key.value().to_vec());
+            }
+        }
+    }
+    if remove.len() != completed.len() {
+        return Err(schema_error());
+    }
+    let mut uploads = write.open_table(super::BLOB_UPLOADS)?;
+    for key in remove {
+        uploads.remove(key.as_slice())?;
+    }
+    Ok(())
+}
+
 fn upload_capacity_usage_table(
     uploads: &impl ReadableTable<&'static [u8], &'static [u8]>,
 ) -> Result<BlobUploadCapacity, StoreError> {
@@ -826,6 +868,12 @@ impl Store {
         let staging_charge_bytes = super::depot::blob_upload_staging_charge(request.total_len)?;
         let conversion_overhead_bytes =
             super::depot::blob_upload_conversion_overhead(request.total_len)?;
+        let pack_root = PinnedBlobPackRoot::open(self)?;
+        let _depot_guard = self
+            .blob_depot_lock
+            .lock()
+            .map_err(|_| blob_error(BlobStoreError::DepotIntegrity("depot lock is poisoned")))?;
+        self.require_live()?;
         let mut write = self.database.begin_write()?;
         write.set_durability(Durability::Immediate)?;
         enforce_live_write(&write)?;
@@ -918,10 +966,31 @@ impl Store {
             consumed: BlobUploadCapacity::default(),
             bound_variant: None,
         };
+        // A previous crash may have committed removal of this deterministic
+        // upload while leaving only its physical cleanup tombstone.  The row
+        // absence checked above makes removing that tombstone safe before the
+        // same immutable request creates a new pack.
+        super::pack::finish_upload_pack_cleanup(&pack_root, &reservation.pack_identity())
+            .map_err(upload_pack_store_error)?;
+        super::pack::stage_upload_pack_reservation(&pack_root, &reservation.pack_identity())
+            .map_err(upload_pack_store_error)?;
+        #[cfg(test)]
+        maybe_inject_test_fault(self, UploadFaultPoint::ReservationIntentSynced)?;
+        drop(
+            super::pack::BlobPackWriter::create_upload_pinned(
+                &pack_root,
+                &reservation.pack_identity(),
+            )
+            .map_err(upload_pack_store_error)?,
+        );
+        #[cfg(test)]
+        maybe_inject_test_fault(self, UploadFaultPoint::ReservationPackSynced)?;
         write
             .open_table(super::BLOB_UPLOADS)?
             .insert(owner_key.as_slice(), upload.encode()?.as_slice())?;
         write.commit()?;
+        super::pack::finish_upload_pack_reservation(&pack_root, &reservation.pack_identity())
+            .map_err(upload_pack_store_error)?;
         Ok((reservation, upload.projection()?))
     }
 
@@ -1072,7 +1141,8 @@ impl Store {
                 .map(|value| decode_blob_operation_record(value.value()))
                 .transpose()?;
             return if operation.is_some_and(|operation| operation.transfer_id == publication) {
-                Ok(())
+                super::pack::finish_upload_pack_cleanup(&pack_root, &reservation.pack_identity())
+                    .map_err(upload_pack_store_error)
             } else {
                 Err(blob_error(BlobStoreError::ReservationChanged))
             };
@@ -1105,13 +1175,16 @@ impl Store {
         {
             return Err(blob_error(BlobStoreError::CompletionMismatch));
         }
+        super::pack::stage_upload_pack_cleanup(&pack_root, &reservation.pack_identity())
+            .map_err(upload_pack_store_error)?;
         remove_upload_pack(&pack_root, &reservation.pack_identity())
             .map_err(upload_pack_store_error)?;
         write
             .open_table(super::BLOB_UPLOADS)?
             .remove(owner_key.as_slice())?;
         write.commit()?;
-        Ok(())
+        super::pack::finish_upload_pack_cleanup(&pack_root, &reservation.pack_identity())
+            .map_err(upload_pack_store_error)
     }
 
     pub fn abort_blob_upload(
@@ -1134,6 +1207,8 @@ impl Store {
             .get(owner_key.as_slice())?
             .map(|value| value.value().to_vec());
         let Some(encoded) = encoded else {
+            super::pack::finish_upload_pack_cleanup(&pack_root, &reservation.pack_identity())
+                .map_err(upload_pack_store_error)?;
             return Ok(false);
         };
         let upload =
@@ -1141,12 +1216,16 @@ impl Store {
         if reservation_for_store(self, &upload) != *reservation {
             return Err(blob_error(BlobStoreError::ReservationChanged));
         }
+        super::pack::stage_upload_pack_cleanup(&pack_root, &reservation.pack_identity())
+            .map_err(upload_pack_store_error)?;
         remove_upload_pack(&pack_root, &reservation.pack_identity())
             .map_err(upload_pack_store_error)?;
         write
             .open_table(super::BLOB_UPLOADS)?
             .remove(owner_key.as_slice())?;
         write.commit()?;
+        super::pack::finish_upload_pack_cleanup(&pack_root, &reservation.pack_identity())
+            .map_err(upload_pack_store_error)?;
         Ok(true)
     }
 }
@@ -1418,8 +1497,8 @@ mod tests {
     ) -> BlobPackCheckpoint {
         let identity = reservation.pack_identity();
         let root = PinnedBlobPackRoot::open(&fixture.store).expect("pack root");
-        let mut writer =
-            BlobPackWriter::create_upload_pinned(&root, &identity).expect("create upload pack");
+        let mut writer = BlobPackWriter::open_projected_upload_pinned(&root, &identity, None)
+            .expect("open initial upload pack");
         let sealer = BlobStreamSegmentSealer::from_test_key(
             *identity.upload_id().as_bytes(),
             *identity.request_digest(),
@@ -1547,12 +1626,21 @@ mod tests {
                     .expect("truncate pack"),
                 "replaced-data" => {
                     let mut pack = OpenOptions::new()
+                        .read(true)
                         .write(true)
                         .open(pack_path.join("segments.pack"))
                         .expect("open pack for replacement");
-                    pack.seek(SeekFrom::Start(super::super::pack::PACK_HEADER_LEN + 4))
-                        .expect("seek first segment");
-                    pack.write_all(b"BROKEN!!").expect("replace segment magic");
+                    let ciphertext_offset = super::super::pack::PACK_HEADER_LEN
+                        + 4
+                        + (BLOB_STREAM_SEGMENT_ENCODED_OVERHEAD_BYTES - 16) as u64;
+                    pack.seek(SeekFrom::Start(ciphertext_offset))
+                        .expect("seek first ciphertext byte");
+                    let mut byte = [0];
+                    pack.read_exact(&mut byte).expect("read ciphertext byte");
+                    byte[0] ^= 0x80;
+                    pack.seek(SeekFrom::Start(ciphertext_offset))
+                        .expect("rewind ciphertext byte");
+                    pack.write_all(&byte).expect("replace ciphertext byte");
                     pack.sync_all().expect("sync replacement");
                 }
                 "checkpoint-mismatch" => {
@@ -1617,9 +1705,12 @@ mod tests {
         );
 
         let pack_root = PinnedBlobPackRoot::open(&fixture.store).expect("pack root");
-        let mut writer =
-            BlobPackWriter::create_upload_pinned(&pack_root, &reservation.pack_identity())
-                .expect("create upload pack");
+        let mut writer = BlobPackWriter::open_projected_upload_pinned(
+            &pack_root,
+            &reservation.pack_identity(),
+            None,
+        )
+        .expect("open initial upload pack");
         let durable = writer.checkpoint().expect("durable pack checkpoint");
 
         // The journal may lead redb, but restart must not invent that progress.
@@ -1906,15 +1997,19 @@ mod tests {
         );
         let authority = fixture.publisher.mission_authority_id();
         drop(fixture.store);
+        let reopened = Store::open_with_limits_and_blob_depot_limits_for_mission(
+            fixture.root.database(),
+            StoreLimits::default(),
+            BlobDepotLimits::new(exact_bytes, 1, 1).expect("cleanup-gap reopen limits"),
+            authority,
+        )
+        .expect("cleanup marker converges completed upload on reopen");
         assert!(
-            Store::open_with_limits_and_blob_depot_limits_for_mission(
-                fixture.root.database(),
-                StoreLimits::default(),
-                BlobDepotLimits::new(exact_bytes, 1, 1).expect("cleanup-gap reopen limits"),
-                authority,
-            )
-            .is_err(),
-            "a durable upload row whose pack was removed must fail closed"
+            reopened
+                .resume_blob_upload(&request.owner)
+                .expect("read converged completion")
+                .is_none(),
+            "canonical authority remains while provisional charge is released"
         );
     }
 
@@ -1937,12 +2032,6 @@ mod tests {
             .store
             .reserve_blob_upload_with_policy(&policy, &request)
             .expect("reserve credit");
-        let pack_root = PinnedBlobPackRoot::open(&fixture.store).expect("reserved pack root");
-        drop(
-            BlobPackWriter::create_upload_pinned(&pack_root, &reservation.pack_identity())
-                .expect("materialize reserved pack"),
-        );
-
         let unrelated = prepare_blob(
             &mut Cursor::new(vec![0x82; plaintext.len()]),
             crate::SELECTED_BLOB_CHUNK_SIZE,
@@ -2061,10 +2150,22 @@ mod tests {
 
         let authority = fixture.publisher.mission_authority_id();
         drop(fixture.store);
+        let reopened = Store::open_for_mission(fixture.root.database(), authority)
+            .expect("cleanup marker converges aborted upload on reopen");
         assert!(
-            Store::open_for_mission(fixture.root.database(), authority).is_err(),
-            "a durable upload row whose pack cleanup completed must fail closed"
+            reopened
+                .resume_blob_upload(&request.owner)
+                .expect("read converged abort")
+                .is_none()
         );
+        let (retry, initial) = reopened
+            .reserve_blob_upload_with_policy(&policy, &request)
+            .expect("deterministic retry removes stale cleanup marker");
+        assert_eq!(retry.upload_id, reservation.upload_id);
+        assert_eq!(initial.durable_plaintext_offset(), 0);
+        let root = PinnedBlobPackRoot::open(&reopened).expect("retry pack root");
+        BlobPackWriter::open_projected_upload_pinned(&root, &retry.pack_identity(), None)
+            .expect("retry has exactly one usable initial pack");
     }
 
     #[test]
@@ -2184,23 +2285,18 @@ mod tests {
     fn upload_sync_and_projection_faults_reopen_without_invented_progress() {
         // Break caught: data/journal durability or redb projection failures can
         // otherwise advance one authority without the other.
-        let fixture = fixture("sync-faults", 0x37, BlobDepotLimits::DEFAULT);
+        let mut fixture = fixture("sync-faults", 0x37, BlobDepotLimits::DEFAULT);
         let plaintext = vec![0xd1; 1_024];
         let request = request(&fixture, b"sync-faults", plaintext.len() as u64);
         let policy = fixture.store.control_policy_snapshot().expect("policy");
-        let (reservation, _initial) = fixture
+        let (reservation, initial) = fixture
             .store
             .reserve_blob_upload_with_policy(&policy, &request)
             .expect("reserve upload");
         let identity = reservation.pack_identity();
         let root = PinnedBlobPackRoot::open(&fixture.store).expect("pack root");
-        super::super::pack::inject_test_fault(
-            &root,
-            super::super::pack::BlobPackFaultPoint::CheckpointOneSynced,
-        );
-        assert!(BlobPackWriter::create_upload_pinned(&root, &identity).is_err());
         let mut writer = BlobPackWriter::open_projected_upload_pinned(&root, &identity, None)
-            .expect("recover first journal failure");
+            .expect("open initial pack");
         let sealer = BlobStreamSegmentSealer::from_test_key(
             *identity.upload_id().as_bytes(),
             *identity.request_digest(),
@@ -2229,26 +2325,165 @@ mod tests {
         );
         assert!(writer.checkpoint().is_err());
         drop(writer);
-        let writer = BlobPackWriter::open_projected_upload_pinned(&root, &identity, None)
-            .expect("recover initial projection");
-        assert_eq!(writer.plaintext_offset(), 0);
-        drop(writer);
-
-        let mut writer = BlobPackWriter::open_projected_upload_pinned(&root, &identity, None)
-            .expect("reopen for journal fault");
-        writer.append(&segment, leaves).expect("reappend");
-        super::super::pack::inject_test_fault(
-            &root,
-            super::super::pack::BlobPackFaultPoint::CheckpointZeroSynced,
-        );
-        assert!(writer.checkpoint().is_err());
-        drop(writer);
-
         let authority = fixture.publisher.mission_authority_id();
         drop(fixture.store);
+        fixture.store = Store::open_for_mission(fixture.root.database(), authority)
+            .expect("unprojected durable tail is a recoverable lifecycle window");
+        let (restarted, exact) = fixture
+            .store
+            .resume_blob_upload(&request.owner)
+            .expect("resume after physical lead")
+            .expect("upload remains");
+        assert_eq!(exact, initial, "redb must not invent physical progress");
+        let root = PinnedBlobPackRoot::open(&fixture.store).expect("reopened root");
+        let mut writer = BlobPackWriter::open_projected_upload_pinned(
+            &root,
+            &identity,
+            exact.durable_pack_checkpoint(),
+        )
+        .expect("truncate physical lead to projected boundary");
+        assert_eq!(writer.plaintext_offset(), 0);
+        writer
+            .append(&segment, leaves)
+            .expect("append after recovery");
+        let durable = writer.checkpoint().expect("durable checkpoint");
+        drop(writer);
+
+        inject_test_fault(&fixture.store, UploadFaultPoint::CheckpointBeforeCommit);
         assert!(
-            Store::open_for_mission(fixture.root.database(), authority).is_err(),
-            "unprojected data/journal state must fail closed without truncation"
+            fixture
+                .store
+                .checkpoint_blob_upload(&policy, &restarted, exact.clone(), durable)
+                .is_err(),
+            "injected failure leaves redb projection unchanged"
         );
+        assert_eq!(
+            fixture
+                .store
+                .resume_blob_upload(&request.owner)
+                .expect("resume after projection fault")
+                .expect("upload remains")
+                .1,
+            exact
+        );
+        drop(fixture.store);
+        fixture.store = Store::open_for_mission(fixture.root.database(), authority)
+            .expect("physical checkpoint lead converges on reopen");
+        let (_, reopened) = fixture
+            .store
+            .resume_blob_upload(&request.owner)
+            .expect("resume final")
+            .expect("upload remains final");
+        assert_eq!(reopened, initial);
+    }
+
+    #[test]
+    fn upload_reservation_pack_sync_before_row_converges_on_reopen() {
+        let mut fixture = fixture("reservation-pack-lead", 0x38, BlobDepotLimits::DEFAULT);
+        let request = request(&fixture, b"reservation-pack-lead", 1_024);
+        let policy = fixture.store.control_policy_snapshot().expect("policy");
+        inject_test_fault(&fixture.store, UploadFaultPoint::ReservationPackSynced);
+        assert!(
+            fixture
+                .store
+                .reserve_blob_upload_with_policy(&policy, &request)
+                .is_err(),
+            "injected failure leaves only an orphan initial pack"
+        );
+        let authority = fixture.publisher.mission_authority_id();
+        drop(fixture.store);
+        let database_before = fs::read(fixture.root.database()).expect("database before RO");
+        Store::inspect_existing(fixture.root.database())
+            .expect("read-only open accepts the provable reservation crash window");
+        assert_eq!(
+            fs::read(fixture.root.database()).expect("database after RO"),
+            database_before,
+            "read-only convergence audit must not mutate redb"
+        );
+        fixture.store = Store::open_for_mission(fixture.root.database(), authority)
+            .expect("writable reopen reclaims orphan reservation pack");
+        assert!(
+            fixture
+                .store
+                .resume_blob_upload(&request.owner)
+                .expect("read reservation")
+                .is_none()
+        );
+        let (reservation, initial) = fixture
+            .store
+            .reserve_blob_upload_with_policy(&policy, &request)
+            .expect("retry creates one coherent row and pack");
+        assert_eq!(initial.durable_plaintext_offset(), 0);
+        let root = PinnedBlobPackRoot::open(&fixture.store).expect("retry root");
+        BlobPackWriter::open_projected_upload_pinned(
+            &root,
+            &reservation.pack_identity(),
+            initial.durable_pack_checkpoint(),
+        )
+        .expect("retry pack matches projection");
+    }
+
+    #[test]
+    fn upload_reservation_intent_before_initial_pack_converges_on_reopen() {
+        let mut fixture = fixture("reservation-intent-lead", 0x3a, BlobDepotLimits::DEFAULT);
+        let request = request(&fixture, b"reservation-intent-lead", 1_024);
+        let policy = fixture.store.control_policy_snapshot().expect("policy");
+        inject_test_fault(&fixture.store, UploadFaultPoint::ReservationIntentSynced);
+        assert!(
+            fixture
+                .store
+                .reserve_blob_upload_with_policy(&policy, &request)
+                .is_err(),
+            "injected failure leaves the intent marker before initial pack creation"
+        );
+        let authority = fixture.publisher.mission_authority_id();
+        drop(fixture.store);
+        Store::inspect_existing(fixture.root.database())
+            .expect("read-only open accepts a durable intent without pack or row");
+        fixture.store = Store::open_for_mission(fixture.root.database(), authority)
+            .expect("writable reopen reclaims the incomplete intent");
+        assert!(
+            fixture
+                .store
+                .resume_blob_upload(&request.owner)
+                .expect("read upload")
+                .is_none()
+        );
+        fixture
+            .store
+            .reserve_blob_upload_with_policy(&policy, &request)
+            .expect("reservation retry succeeds after intent cleanup");
+    }
+
+    #[test]
+    fn upload_unexpected_pack_without_reservation_intent_still_fails_closed() {
+        let fixture = fixture("unexpected-pack", 0x39, BlobDepotLimits::DEFAULT);
+        let request = request(&fixture, b"unexpected-pack", 1_024);
+        let policy = fixture.store.control_policy_snapshot().expect("policy");
+        inject_test_fault(&fixture.store, UploadFaultPoint::ReservationPackSynced);
+        assert!(
+            fixture
+                .store
+                .reserve_blob_upload_with_policy(&policy, &request)
+                .is_err()
+        );
+        let digest = request_digest_for(&request).expect("request digest");
+        let identity = BlobPackIdentity::new(
+            upload_id_for(&request.owner, digest).expect("upload id"),
+            digest,
+            request.total_len,
+        );
+        let root = PinnedBlobPackRoot::open(&fixture.store).expect("pack root");
+        super::super::pack::finish_upload_pack_reservation(&root, &identity)
+            .expect("remove reservation intent to model an unexpected pack");
+        let pack_path = root.test_upload_path(&identity);
+        let before = upload_artifact_snapshot(&pack_path);
+        let authority = fixture.publisher.mission_authority_id();
+        drop(root);
+        drop(fixture.store);
+        assert!(Store::inspect_existing(fixture.root.database()).is_err());
+        assert_eq!(upload_artifact_snapshot(&pack_path), before);
+        assert!(Store::open_for_mission(fixture.root.database(), authority).is_err());
+        assert_eq!(upload_artifact_snapshot(&pack_path), before);
     }
 }

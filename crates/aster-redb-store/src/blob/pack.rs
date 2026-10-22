@@ -30,6 +30,10 @@ const MAX_RECORD_BYTES: usize = 2 * 1024 * 1024;
 const PACK_FIXED_RESERVATION_BYTES: u64 = 64 * 1024;
 const UPLOAD_MARKER: &str = ".aster-upload-v1";
 const UPLOAD_MARKER_MAGIC: &[u8; 8] = b"ASTRUM01";
+const UPLOAD_CLEANUP_MAGIC: &[u8; 8] = b"ASTRUC01";
+const UPLOAD_CLEANUP_PREFIX: &str = ".aster-upload-cleanup-";
+const UPLOAD_RESERVATION_MAGIC: &[u8; 8] = b"ASTRUR01";
+const UPLOAD_RESERVATION_PREFIX: &str = ".aster-upload-reservation-";
 const PACK_TEMP_PREFIX: &str = ".aster-blob-tmp-";
 const PACK_DIRECTORY: &str = "stream-packs-v2";
 
@@ -183,6 +187,108 @@ fn encode_upload_marker(identity: BlobPackIdentity) -> [u8; 80] {
     marker
 }
 
+fn cleanup_marker_name(identity: BlobPackIdentity) -> String {
+    format!(
+        "{UPLOAD_CLEANUP_PREFIX}{}",
+        hex32(identity.upload_id.as_bytes())
+    )
+}
+
+fn encode_cleanup_marker(identity: BlobPackIdentity) -> [u8; 80] {
+    let mut marker = encode_upload_marker(identity);
+    marker[..8].copy_from_slice(UPLOAD_CLEANUP_MAGIC);
+    marker
+}
+
+fn reservation_marker_name(identity: BlobPackIdentity) -> String {
+    format!(
+        "{UPLOAD_RESERVATION_PREFIX}{}",
+        hex32(identity.upload_id.as_bytes())
+    )
+}
+
+fn encode_reservation_marker(identity: BlobPackIdentity) -> [u8; 80] {
+    let mut marker = encode_upload_marker(identity);
+    marker[..8].copy_from_slice(UPLOAD_RESERVATION_MAGIC);
+    marker
+}
+
+fn decode_reservation_marker(marker: &[u8]) -> Result<BlobPackIdentity, BlobPackError> {
+    if marker.len() != 80 || &marker[..8] != UPLOAD_RESERVATION_MAGIC {
+        return Err(BlobPackError::Invalid(
+            "Blob upload reservation marker is invalid",
+        ));
+    }
+    let mut upload_marker = marker.to_vec();
+    upload_marker[..8].copy_from_slice(UPLOAD_MARKER_MAGIC);
+    decode_upload_marker(&upload_marker)
+}
+
+pub(super) fn stage_upload_pack_reservation(
+    root: &PinnedBlobPackRoot,
+    identity: &BlobPackIdentity,
+) -> Result<(), BlobPackError> {
+    let name = reservation_marker_name(*identity);
+    let expected = encode_reservation_marker(*identity);
+    match root.directory.read_private_file_if_present(&name, 80)? {
+        Some(marker) if marker == expected => Ok(()),
+        Some(_) => Err(BlobPackError::Invalid(
+            "Blob upload reservation marker mismatch",
+        )),
+        None => root
+            .directory
+            .write_atomic(&name, &expected)
+            .map_err(Into::into),
+    }
+}
+
+pub(super) fn finish_upload_pack_reservation(
+    root: &PinnedBlobPackRoot,
+    identity: &BlobPackIdentity,
+) -> Result<(), BlobPackError> {
+    root.directory
+        .remove_if_exists(&reservation_marker_name(*identity), false)?;
+    Ok(())
+}
+
+fn decode_cleanup_marker(marker: &[u8]) -> Result<BlobPackIdentity, BlobPackError> {
+    if marker.len() != 80 || &marker[..8] != UPLOAD_CLEANUP_MAGIC {
+        return Err(BlobPackError::Invalid(
+            "Blob upload cleanup marker is invalid",
+        ));
+    }
+    let mut upload_marker = marker.to_vec();
+    upload_marker[..8].copy_from_slice(UPLOAD_MARKER_MAGIC);
+    decode_upload_marker(&upload_marker)
+}
+
+pub(super) fn stage_upload_pack_cleanup(
+    root: &PinnedBlobPackRoot,
+    identity: &BlobPackIdentity,
+) -> Result<(), BlobPackError> {
+    let name = cleanup_marker_name(*identity);
+    let expected = encode_cleanup_marker(*identity);
+    match root.directory.read_private_file_if_present(&name, 80)? {
+        Some(marker) if marker == expected => Ok(()),
+        Some(_) => Err(BlobPackError::Invalid(
+            "Blob upload cleanup marker mismatch",
+        )),
+        None => root
+            .directory
+            .write_atomic(&name, &expected)
+            .map_err(Into::into),
+    }
+}
+
+pub(super) fn finish_upload_pack_cleanup(
+    root: &PinnedBlobPackRoot,
+    identity: &BlobPackIdentity,
+) -> Result<(), BlobPackError> {
+    root.directory
+        .remove_if_exists(&cleanup_marker_name(*identity), false)?;
+    Ok(())
+}
+
 fn decode_upload_marker(marker: &[u8]) -> Result<BlobPackIdentity, BlobPackError> {
     if marker.len() != 80 || &marker[..8] != UPLOAD_MARKER_MAGIC {
         return Err(BlobPackError::Invalid("Blob upload pack marker is invalid"));
@@ -329,17 +435,22 @@ fn audit_expected_upload_pack(
             "store-projected Blob upload checkpoint is unavailable",
         ))
     })?;
-    if data_len != projected.pack_len() {
-        return Err(blob_error(BlobStoreError::DepotIntegrity(
-            "Blob upload pack data boundary differs from its durable checkpoint",
-        )));
-    }
     data.seek(SeekFrom::Start(PACK_HEADER_LEN))
         .map_err(BlobStoreError::Io)
         .map_err(blob_error)?;
     let mut index = 0_u64;
     let mut plaintext_offset = 0_u64;
-    while index < projected.next_index() {
+    let mut frontier = BlobStreamFrontier::new();
+    let mut projected_verified = projected.next_index() == 0
+        && projected.pack_len() == PACK_HEADER_LEN
+        && projected.frontier().ciphertext_commitment()
+            == frontier.checkpoint().ciphertext_commitment();
+    while data
+        .stream_position()
+        .map_err(BlobStoreError::Io)
+        .map_err(blob_error)?
+        < data_len
+    {
         let mut length = [0; 4];
         data.read_exact(&mut length)
             .map_err(BlobStoreError::Io)
@@ -354,11 +465,12 @@ fn audit_expected_upload_pack(
         data.read_exact(&mut encoded)
             .map_err(BlobStoreError::Io)
             .map_err(blob_error)?;
-        let header = EncryptedBlobStreamSegment::inspect_encoded(&encoded).map_err(|_| {
+        let segment = EncryptedBlobStreamSegment::decode(&encoded).map_err(|_| {
             blob_error(BlobStoreError::DepotIntegrity(
                 "Blob upload pack contains an invalid segment",
             ))
         })?;
+        let header = segment.header();
         if header.index() != index
             || header.stream_id() != expected.identity.upload_id.as_bytes()
             || header.open_digest() != &expected.identity.request_digest
@@ -372,17 +484,31 @@ fn audit_expected_upload_pack(
         plaintext_offset = plaintext_offset
             .checked_add(u64::from(header.plaintext_len()))
             .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+        frontier
+            .append(BlobStreamSubtree::leaf(
+                index,
+                segment.ciphertext_audit_leaves(),
+            ))
+            .map_err(|_| {
+                blob_error(BlobStoreError::DepotIntegrity(
+                    "Blob upload pack ciphertext frontier is invalid",
+                ))
+            })?;
         index += 1;
+        if index == projected.next_index() {
+            let boundary = data
+                .stream_position()
+                .map_err(BlobStoreError::Io)
+                .map_err(blob_error)?;
+            projected_verified = boundary == projected.pack_len()
+                && plaintext_offset == projected.plaintext_offset()
+                && frontier.checkpoint().ciphertext_commitment()
+                    == projected.frontier().ciphertext_commitment();
+        }
     }
-    if plaintext_offset != projected.plaintext_offset()
-        || data
-            .stream_position()
-            .map_err(BlobStoreError::Io)
-            .map_err(blob_error)?
-            != data_len
-    {
+    if !projected_verified || plaintext_offset > expected.identity.total_len {
         return Err(blob_error(BlobStoreError::DepotIntegrity(
-            "Blob upload pack record boundary differs from its durable checkpoint",
+            "Blob upload pack content differs from its durable checkpoint",
         )));
     }
     Ok(())
@@ -391,18 +517,69 @@ fn audit_expected_upload_pack(
 fn audit_upload_packs(
     depot_root: &OwnedDirectory,
     expected: &[ExpectedBlobUploadPack],
-) -> Result<(), StoreError> {
+    recover: bool,
+) -> Result<Vec<BlobPackIdentity>, StoreError> {
     let Some(pack_root) = depot_root.open_child_directory_if_present(PACK_DIRECTORY)? else {
         return if expected.is_empty() {
-            Ok(())
+            Ok(Vec::new())
         } else {
             Err(blob_error(BlobStoreError::DepotIntegrity(
                 "durable Blob upload pack root is missing",
             )))
         };
     };
+    let entries = pack_root.entry_names()?;
+    let mut cleanup = std::collections::BTreeMap::new();
+    for name in entries
+        .iter()
+        .filter(|name| name.starts_with(UPLOAD_CLEANUP_PREFIX))
+    {
+        let marker = pack_root
+            .read_private_file_if_present(name, 80)?
+            .ok_or_else(|| {
+                blob_error(BlobStoreError::DepotIntegrity(
+                    "Blob upload cleanup marker disappeared during audit",
+                ))
+            })?;
+        let identity = decode_cleanup_marker(&marker).map_err(pack_marker_store_error)?;
+        if *name != cleanup_marker_name(identity)
+            || cleanup
+                .insert(*identity.upload_id.as_bytes(), identity)
+                .is_some()
+        {
+            return Err(blob_error(BlobStoreError::DepotIntegrity(
+                "Blob upload cleanup marker identity is inconsistent",
+            )));
+        }
+    }
+    let mut reservations = std::collections::BTreeMap::new();
+    for name in entries
+        .iter()
+        .filter(|name| name.starts_with(UPLOAD_RESERVATION_PREFIX))
+    {
+        let marker = pack_root
+            .read_private_file_if_present(name, 80)?
+            .ok_or_else(|| {
+                blob_error(BlobStoreError::DepotIntegrity(
+                    "Blob upload reservation marker disappeared during audit",
+                ))
+            })?;
+        let identity = decode_reservation_marker(&marker).map_err(pack_marker_store_error)?;
+        if *name != reservation_marker_name(identity)
+            || reservations
+                .insert(*identity.upload_id.as_bytes(), identity)
+                .is_some()
+        {
+            return Err(blob_error(BlobStoreError::DepotIntegrity(
+                "Blob upload reservation marker identity is inconsistent",
+            )));
+        }
+    }
     let mut seen = std::collections::BTreeSet::new();
-    for name in pack_root.entry_names()? {
+    let mut completed = Vec::new();
+    for name in entries.into_iter().filter(|name| {
+        !name.starts_with(UPLOAD_CLEANUP_PREFIX) && !name.starts_with(UPLOAD_RESERVATION_PREFIX)
+    }) {
         let directory = pack_root.open_child_directory(&name, false)?;
         let Some(marker) = directory.read_private_file_if_present(UPLOAD_MARKER, 80)? else {
             return Err(blob_error(BlobStoreError::DepotIntegrity(
@@ -415,44 +592,90 @@ fn audit_upload_packs(
                 "Blob upload pack directory differs from its marker",
             )));
         }
+        if cleanup
+            .get(identity.upload_id.as_bytes())
+            .is_some_and(|marker| marker != &identity)
+            || reservations
+                .get(identity.upload_id.as_bytes())
+                .is_some_and(|marker| marker != &identity)
+        {
+            return Err(blob_error(BlobStoreError::DepotIntegrity(
+                "Blob upload transition marker differs from its pack identity",
+            )));
+        }
         let expected_pack = expected
             .iter()
             .find(|expected| expected.identity == identity)
-            .ok_or_else(|| {
-                blob_error(BlobStoreError::DepotIntegrity(
-                    "unexpected Blob upload pack has no durable authority",
-                ))
-            })?;
+            .cloned();
+        let Some(expected_pack) = expected_pack else {
+            if reservations.get(identity.upload_id.as_bytes()) == Some(&identity) {
+                if recover {
+                    drop(directory);
+                    remove_upload_pack_directory(&pack_root, &identity)?;
+                    pack_root.remove_if_exists(&reservation_marker_name(identity), false)?;
+                }
+                continue;
+            }
+            return Err(blob_error(BlobStoreError::DepotIntegrity(
+                "unexpected Blob upload pack has no durable authority",
+            )));
+        };
         if !seen.insert(*identity.upload_id.as_bytes()) {
             return Err(blob_error(BlobStoreError::DepotIntegrity(
                 "duplicate Blob upload pack identity",
             )));
         }
-        audit_expected_upload_pack(&directory, expected_pack)?;
+        if cleanup.get(identity.upload_id.as_bytes()) == Some(&identity) {
+            if recover {
+                drop(directory);
+                remove_upload_pack_directory(&pack_root, &identity)?;
+            }
+            completed.push(identity);
+        } else {
+            audit_expected_upload_pack(&directory, &expected_pack)?;
+            if recover && reservations.get(identity.upload_id.as_bytes()) == Some(&identity) {
+                pack_root.remove_if_exists(&reservation_marker_name(identity), false)?;
+            }
+        }
     }
-    if expected
-        .iter()
-        .any(|expected| !seen.contains(expected.identity.upload_id.as_bytes()))
-    {
+    for expected in expected {
+        if seen.contains(expected.identity.upload_id.as_bytes()) {
+            continue;
+        }
+        if cleanup.get(expected.identity.upload_id.as_bytes()) == Some(&expected.identity) {
+            completed.push(expected.identity);
+            continue;
+        }
         return Err(blob_error(BlobStoreError::DepotIntegrity(
             "durable Blob upload pack is missing",
         )));
     }
-    Ok(())
+    if recover {
+        for identity in reservations.values() {
+            if !seen.contains(identity.upload_id.as_bytes())
+                && !expected
+                    .iter()
+                    .any(|expected| expected.identity == *identity)
+            {
+                pack_root.remove_if_exists(&reservation_marker_name(*identity), false)?;
+            }
+        }
+    }
+    Ok(completed)
 }
 
 pub(super) fn audit_upload_packs_write(
     depot_root: &OwnedDirectory,
     expected: &[ExpectedBlobUploadPack],
-) -> Result<(), StoreError> {
-    audit_upload_packs(depot_root, expected)
+) -> Result<Vec<BlobPackIdentity>, StoreError> {
+    audit_upload_packs(depot_root, expected, true)
 }
 
 pub(super) fn audit_upload_packs_read(
     depot_root: &OwnedDirectory,
     expected: &[ExpectedBlobUploadPack],
 ) -> Result<(), StoreError> {
-    audit_upload_packs(depot_root, expected)
+    audit_upload_packs(depot_root, expected, false).map(|_| ())
 }
 
 enum BlobPackRoot {
