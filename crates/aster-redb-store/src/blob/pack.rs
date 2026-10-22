@@ -2158,12 +2158,29 @@ impl BlobPackReader {
     }
 
     pub fn next_segment(&mut self) -> Result<Option<EncryptedBlobStreamSegment>, BlobPackError> {
+        self.next_segment_observing_owned_bytes(|_| {})
+    }
+
+    /// Decodes one segment while reporting actual live heap capacities before
+    /// and after the encoded record is released.
+    pub fn next_segment_observing_owned_bytes(
+        &mut self,
+        mut observe: impl FnMut(usize),
+    ) -> Result<Option<EncryptedBlobStreamSegment>, BlobPackError> {
         let Some(record) = self.next_record()? else {
             return Ok(None);
         };
-        EncryptedBlobStreamSegment::decode(&record.as_bytes()[4..])
-            .map(Some)
-            .map_err(|_| BlobPackError::Invalid("invalid Blob pack segment"))
+        let segment = EncryptedBlobStreamSegment::decode(&record.as_bytes()[4..])
+            .map_err(|_| BlobPackError::Invalid("invalid Blob pack segment"))?;
+        observe(
+            record
+                .bytes
+                .capacity()
+                .saturating_add(segment.owned_bytes()),
+        );
+        drop(record);
+        observe(segment.owned_bytes());
+        Ok(Some(segment))
     }
 
     pub fn next_record(&mut self) -> Result<Option<BlobPackRecord>, BlobPackError> {
@@ -2698,6 +2715,29 @@ mod tests {
         let record = reader.next_record().expect("read").expect("record");
         assert_eq!(record.as_bytes(), expected);
         assert!(reader.next_record().expect("eof").is_none());
+    }
+
+    #[test]
+    fn blob_pack_reader_observes_encoded_and_decoded_capacity_overlap() {
+        let root = TempRoot::new();
+        let open = open(BLOB_STREAM_SEGMENT_BYTES as u64);
+        let segments = segments(&open, 1);
+        let mut writer = BlobPackWriter::create(&root.0, &open).expect("create");
+        writer
+            .append(&segments[0].0, segments[0].1)
+            .expect("append");
+        writer.finish().expect("finish");
+
+        let mut observed = Vec::new();
+        let mut reader = BlobPackReader::open(&root.0, &open).expect("reader");
+        let segment = reader
+            .next_segment_observing_owned_bytes(|bytes| observed.push(bytes))
+            .expect("read")
+            .expect("segment");
+        assert_eq!(observed.len(), 2);
+        assert_eq!(observed[1], segment.owned_bytes());
+        assert!(observed[0] > observed[1]);
+        assert!(observed[0] >= 2 * BLOB_STREAM_SEGMENT_BYTES);
     }
 
     #[test]

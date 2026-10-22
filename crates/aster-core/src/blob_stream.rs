@@ -937,6 +937,11 @@ impl EncryptedBlobStreamSegment {
         &self.ciphertext
     }
 
+    /// Heap bytes owned by this decoded provisional segment.
+    pub fn owned_bytes(&self) -> usize {
+        self.ciphertext.capacity()
+    }
+
     /// Reconstructs the transport-visible ciphertext leaf without requiring
     /// plaintext or decryption authority. This is sufficient to audit a
     /// durable ciphertext frontier projected by a receiver.
