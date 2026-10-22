@@ -519,9 +519,7 @@ fn map_iroh_error(error: aster_iroh::CarrierError) -> StreamTransportError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::application::{
-        BlobId, BlobPublicationInspection, BlobPublicationPhase, BlobStreamPublicationId,
-    };
+    use crate::application::BlobPublicationPhase;
     use crate::stream_transfer::{
         StreamAction, StreamDataV1, StreamExtentAction, StreamFrame, StreamOpenV1,
         StreamReceiverState, StreamResultCode, StreamSenderState,
@@ -529,6 +527,231 @@ mod tests {
     use aster_iroh::{CarrierSecurityProfile, Endpoint, EndpointConfig, ExpectedPeer, SecretKey};
     use sha2::{Digest as _, Sha256};
     use std::collections::BTreeSet;
+
+    struct TestFrameReceiver {
+        frames: Mutex<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>,
+    }
+
+    impl StreamReceiveAttempt for TestFrameReceiver {
+        fn receive_data(&self) -> AdapterFuture<'_, Option<Vec<u8>>> {
+            Box::pin(async move { Ok(self.frames.lock().await.recv().await) })
+        }
+        fn send_control<'a>(&'a self, _frame: &'a [u8]) -> AdapterFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn finish_control(&self) -> AdapterFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    struct SmallMtuSender {
+        frames: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    }
+
+    impl StreamAttempt for SmallMtuSender {
+        fn send_data<'a>(&'a self, frame: &'a [u8]) -> AdapterFuture<'a, ()> {
+            Box::pin(async move {
+                let mut reassembled = Vec::with_capacity(frame.len());
+                for fragment in frame.chunks(3) {
+                    reassembled.extend_from_slice(fragment);
+                }
+                self.frames
+                    .send(reassembled)
+                    .map_err(|_| StreamTransportError::Closed)
+            })
+        }
+        fn send_data_parts<'a>(
+            &'a self,
+            prefix: &'a [u8],
+            body: &'a [u8],
+        ) -> AdapterFuture<'a, ()> {
+            Box::pin(async move {
+                let mut frame = Vec::with_capacity(prefix.len() + body.len());
+                frame.extend_from_slice(prefix);
+                frame.extend_from_slice(body);
+                self.send_data(&frame).await
+            })
+        }
+        fn receive_control(&self) -> AdapterFuture<'_, Option<Vec<u8>>> {
+            Box::pin(async { Ok(None) })
+        }
+        fn finish_data(&self) -> AdapterFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    struct SmallMtuAdapter {
+        sender: Arc<SmallMtuSender>,
+        receiver: Arc<TestFrameReceiver>,
+    }
+
+    impl SmallMtuAdapter {
+        fn new() -> Self {
+            let (frames, receive) = tokio::sync::mpsc::unbounded_channel();
+            Self {
+                sender: Arc::new(SmallMtuSender { frames }),
+                receiver: Arc::new(TestFrameReceiver {
+                    frames: Mutex::new(receive),
+                }),
+            }
+        }
+
+        async fn carry(&self, frame: StreamFrame) -> StreamFrame {
+            let encoded = frame.encode_for_context(9, 5).unwrap();
+            let request = AttemptOpenRequest {
+                deadline: Instant::now() + Duration::from_secs(1),
+                max_data_bytes: encoded.len(),
+                max_control_bytes: 1,
+            };
+            self.open_attempt(request)
+                .await
+                .unwrap()
+                .send_data(&encoded)
+                .await
+                .unwrap();
+            let received = self
+                .accept_attempt(request)
+                .await
+                .unwrap()
+                .receive_data()
+                .await
+                .unwrap()
+                .unwrap();
+            StreamFrame::decode_for_context(9, 5, &received).unwrap()
+        }
+    }
+
+    impl StreamTransportAdapter for SmallMtuAdapter {
+        fn id(&self) -> StreamTransportId {
+            StreamTransportId::IrohQuicV1
+        }
+        fn eligibility(&self, requirements: TransferRequirements) -> bool {
+            requirements.reliable_ordered && requirements.full_duplex
+        }
+        fn health(&self) -> CandidateHealth {
+            CandidateHealth::Degraded
+        }
+        fn open_attempt<'a>(
+            &'a self,
+            _request: AttemptOpenRequest,
+        ) -> AdapterFuture<'a, Arc<dyn StreamAttempt>> {
+            let sender = Arc::clone(&self.sender);
+            Box::pin(async move { Ok(sender as Arc<dyn StreamAttempt>) })
+        }
+        fn accept_attempt<'a>(
+            &'a self,
+            _request: AttemptOpenRequest,
+        ) -> AdapterFuture<'a, Arc<dyn StreamReceiveAttempt>> {
+            let receiver = Arc::clone(&self.receiver);
+            Box::pin(async move { Ok(receiver as Arc<dyn StreamReceiveAttempt>) })
+        }
+    }
+
+    struct LengthDelimitedSender {
+        frames: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    }
+
+    impl StreamAttempt for LengthDelimitedSender {
+        fn send_data<'a>(&'a self, frame: &'a [u8]) -> AdapterFuture<'a, ()> {
+            Box::pin(async move {
+                let mut wire = Vec::with_capacity(frame.len() + 4);
+                wire.extend_from_slice(&(frame.len() as u32).to_be_bytes());
+                wire.extend_from_slice(frame);
+                let declared = u32::from_be_bytes(wire[..4].try_into().unwrap()) as usize;
+                if wire.len() != declared + 4 {
+                    return Err(StreamTransportError::Bounds);
+                }
+                self.frames
+                    .send(wire.split_off(4))
+                    .map_err(|_| StreamTransportError::Closed)
+            })
+        }
+        fn send_data_parts<'a>(
+            &'a self,
+            prefix: &'a [u8],
+            body: &'a [u8],
+        ) -> AdapterFuture<'a, ()> {
+            Box::pin(async move {
+                let mut frame = Vec::with_capacity(prefix.len() + body.len());
+                frame.extend_from_slice(prefix);
+                frame.extend_from_slice(body);
+                self.send_data(&frame).await
+            })
+        }
+        fn receive_control(&self) -> AdapterFuture<'_, Option<Vec<u8>>> {
+            Box::pin(async { Ok(None) })
+        }
+        fn finish_data(&self) -> AdapterFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    struct LengthDelimitedAdapter {
+        sender: Arc<LengthDelimitedSender>,
+        receiver: Arc<TestFrameReceiver>,
+    }
+
+    impl LengthDelimitedAdapter {
+        fn new() -> Self {
+            let (frames, receive) = tokio::sync::mpsc::unbounded_channel();
+            Self {
+                sender: Arc::new(LengthDelimitedSender { frames }),
+                receiver: Arc::new(TestFrameReceiver {
+                    frames: Mutex::new(receive),
+                }),
+            }
+        }
+
+        async fn carry(&self, frame: StreamFrame) -> StreamFrame {
+            let encoded = frame.encode_for_context(9, 5).unwrap();
+            let request = AttemptOpenRequest {
+                deadline: Instant::now() + Duration::from_secs(1),
+                max_data_bytes: encoded.len() + 4,
+                max_control_bytes: 1,
+            };
+            self.open_attempt(request)
+                .await
+                .unwrap()
+                .send_data(&encoded)
+                .await
+                .unwrap();
+            let received = self
+                .accept_attempt(request)
+                .await
+                .unwrap()
+                .receive_data()
+                .await
+                .unwrap()
+                .unwrap();
+            StreamFrame::decode_for_context(9, 5, &received).unwrap()
+        }
+    }
+
+    impl StreamTransportAdapter for LengthDelimitedAdapter {
+        fn id(&self) -> StreamTransportId {
+            StreamTransportId::IrohQuicV1
+        }
+        fn eligibility(&self, requirements: TransferRequirements) -> bool {
+            requirements.reliable_ordered && requirements.full_duplex
+        }
+        fn health(&self) -> CandidateHealth {
+            CandidateHealth::Healthy
+        }
+        fn open_attempt<'a>(
+            &'a self,
+            _request: AttemptOpenRequest,
+        ) -> AdapterFuture<'a, Arc<dyn StreamAttempt>> {
+            let sender = Arc::clone(&self.sender);
+            Box::pin(async move { Ok(sender as Arc<dyn StreamAttempt>) })
+        }
+        fn accept_attempt<'a>(
+            &'a self,
+            _request: AttemptOpenRequest,
+        ) -> AdapterFuture<'a, Arc<dyn StreamReceiveAttempt>> {
+            let receiver = Arc::clone(&self.receiver);
+            Box::pin(async move { Ok(receiver as Arc<dyn StreamReceiveAttempt>) })
+        }
+    }
 
     fn candidate(priority: i16, health: CandidateHealth) -> TransportCandidate {
         TransportCandidate {
@@ -715,23 +938,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn publication_status_survives_small_mtu_interrupt_and_different_adapter_resume() {
-        struct FragmentingAdapter {
-            mtu: usize,
-        }
-        impl FragmentingAdapter {
-            fn carry(&self, frame: StreamFrame) -> StreamFrame {
-                let encoded = frame.encode_for_context(9, 5).unwrap();
-                let mut received = Vec::with_capacity(encoded.len());
-                for fragment in encoded.chunks(self.mtu) {
-                    received.extend_from_slice(fragment);
-                }
-                StreamFrame::decode_for_context(9, 5, &received).unwrap()
-            }
-        }
-
-        fn open(nonce: [u8; 32]) -> StreamOpenV1 {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn publication_status_survives_small_mtu_interrupt_and_different_adapter_resume() {
+        fn open(nonce: [u8; 32], publication_id: [u8; 32]) -> StreamOpenV1 {
             StreamOpenV1 {
                 class: crate::stream_transfer::StreamClass::Blob,
                 direction: crate::stream_transfer::StreamDirection::ToSessionResponder,
@@ -739,7 +948,7 @@ mod tests {
                 exchange_id: 4,
                 transfer_id: [1; 32],
                 source_transfer_id: [5; 32],
-                publication_id: [6; 32],
+                publication_id,
                 variant_id: [7; 32],
                 total_len: 32,
                 attempt_nonce: nonce,
@@ -773,19 +982,24 @@ mod tests {
 
         let payload: Vec<u8> = (0_u8..32).collect();
         let expected_blob_id: [u8; 32] = Sha256::digest(&payload).into();
-        let first_adapter = FragmentingAdapter { mtu: 3 };
-        let second_adapter = FragmentingAdapter { mtu: 5 };
+        let (interrupted_status, available_status) = tokio::task::block_in_place(
+            crate::application::real_canonical_publication_status_fixture,
+        );
+        let publication_id = *interrupted_status.publication_id.as_bytes();
+        let first_adapter = SmallMtuAdapter::new();
+        let second_adapter = LengthDelimitedAdapter::new();
 
-        let first_open = open([2; 32]);
+        let first_open = open([2; 32], publication_id);
         let mut first_receiver = StreamReceiverState::new(&first_open, 0, 1, 32, 16).unwrap();
         let mut first_sender = StreamSenderState::new([1; 32], [2; 32], 32);
         let accept = accepted(first_receiver.accept(16).unwrap());
-        let StreamFrame::Accept(accept) = first_adapter.carry(StreamFrame::Accept(accept)) else {
+        let StreamFrame::Accept(accept) = first_adapter.carry(StreamFrame::Accept(accept)).await
+        else {
             unreachable!()
         };
         first_sender.accept(accept).unwrap();
         let data = sent_data(first_sender.send_extent(payload[..16].to_vec()).unwrap());
-        let StreamFrame::Data(data) = first_adapter.carry(StreamFrame::Data(data)) else {
+        let StreamFrame::Data(data) = first_adapter.carry(StreamFrame::Data(data)).await else {
             unreachable!()
         };
         assert_eq!(
@@ -794,29 +1008,19 @@ mod tests {
         );
         let checkpoint = checkpoint_frame(first_receiver.persisted(16, 2, 32).unwrap());
         let interrupted_generation = checkpoint.checkpoint_generation;
-        let interrupted_status = BlobPublicationInspection {
-            publication_id: BlobStreamPublicationId::from_bytes(first_open.publication_id).unwrap(),
-            phase: BlobPublicationPhase::Receiving,
-            plaintext_total_bytes: first_open.total_len,
-            durable_plaintext_bytes: checkpoint.durable_offset,
-            transfer_total_bytes: first_open.total_len,
-            durable_transfer_bytes: checkpoint.durable_offset,
-            total_units: 2,
-            durable_units: 1,
-            blob_id: None,
-        };
-        let StreamFrame::Checkpoint(checkpoint) =
-            first_adapter.carry(StreamFrame::Checkpoint(checkpoint))
+        let StreamFrame::Checkpoint(checkpoint) = first_adapter
+            .carry(StreamFrame::Checkpoint(checkpoint))
+            .await
         else {
             unreachable!()
         };
         first_sender.checkpoint(checkpoint).unwrap();
 
-        let resumed_open = open([9; 32]);
+        let resumed_open = open([9; 32], publication_id);
         let mut resumed_receiver = StreamReceiverState::reopen(
             &first_open.attempt_nonce,
             &resumed_open,
-            interrupted_status.durable_transfer_bytes,
+            16,
             interrupted_generation,
             32,
             16,
@@ -824,12 +1028,13 @@ mod tests {
         .unwrap();
         let mut resumed_sender = StreamSenderState::new([1; 32], [9; 32], 32);
         let accept = accepted(resumed_receiver.accept(16).unwrap());
-        let StreamFrame::Accept(accept) = second_adapter.carry(StreamFrame::Accept(accept)) else {
+        let StreamFrame::Accept(accept) = second_adapter.carry(StreamFrame::Accept(accept)).await
+        else {
             unreachable!()
         };
         resumed_sender.accept(accept).unwrap();
         let data = sent_data(resumed_sender.send_extent(payload[16..].to_vec()).unwrap());
-        let StreamFrame::Data(data) = second_adapter.carry(StreamFrame::Data(data)) else {
+        let StreamFrame::Data(data) = second_adapter.carry(StreamFrame::Data(data)).await else {
             unreachable!()
         };
         assert_eq!(
@@ -837,8 +1042,9 @@ mod tests {
             StreamAction::Persist { through: 32 }
         );
         let checkpoint = checkpoint_frame(resumed_receiver.persisted(32, 3, 32).unwrap());
-        let StreamFrame::Checkpoint(checkpoint) =
-            second_adapter.carry(StreamFrame::Checkpoint(checkpoint))
+        let StreamFrame::Checkpoint(checkpoint) = second_adapter
+            .carry(StreamFrame::Checkpoint(checkpoint))
+            .await
         else {
             unreachable!()
         };
@@ -848,7 +1054,8 @@ mod tests {
         else {
             panic!("sender finish")
         };
-        let StreamFrame::Finish(finish) = second_adapter.carry(StreamFrame::Finish(finish)) else {
+        let StreamFrame::Finish(finish) = second_adapter.carry(StreamFrame::Finish(finish)).await
+        else {
             unreachable!()
         };
         assert_eq!(resumed_receiver.finish(finish), Ok(StreamAction::Promote));
@@ -856,41 +1063,17 @@ mod tests {
             resumed_receiver.promoted(StreamResultCode::Promoted, expected_blob_id),
             Ok(StreamAction::Send(StreamFrame::Result(_)))
         ));
-        let available_status = BlobPublicationInspection {
-            publication_id: BlobStreamPublicationId::from_bytes(resumed_open.publication_id)
-                .unwrap(),
-            phase: BlobPublicationPhase::Available,
-            plaintext_total_bytes: resumed_open.total_len,
-            durable_plaintext_bytes: 32,
-            transfer_total_bytes: resumed_open.total_len,
-            durable_transfer_bytes: 32,
-            total_units: 2,
-            durable_units: 2,
-            blob_id: Some(BlobId::from_bytes(expected_blob_id)),
-        };
-
+        assert_eq!(interrupted_status.phase, BlobPublicationPhase::Receiving);
+        assert_eq!(available_status.phase, BlobPublicationPhase::Available);
         assert_eq!(
             available_status.publication_id,
             interrupted_status.publication_id
         );
         assert!(
-            available_status.durable_transfer_bytes >= interrupted_status.durable_transfer_bytes
+            available_status.durable_plaintext_bytes >= interrupted_status.durable_plaintext_bytes
         );
-        assert_eq!(
-            available_status.blob_id,
-            Some(BlobId::from_bytes(Sha256::digest(&payload).into()))
-        );
-        let BlobPublicationInspection {
-            publication_id: _,
-            phase: _,
-            plaintext_total_bytes: _,
-            durable_plaintext_bytes: _,
-            transfer_total_bytes: _,
-            durable_transfer_bytes: _,
-            total_units: _,
-            durable_units: _,
-            blob_id: _,
-        } = available_status;
+        assert!(available_status.blob_id.is_some());
+        assert_eq!(first_open.publication_id, resumed_open.publication_id);
     }
 
     #[test]

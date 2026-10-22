@@ -5561,7 +5561,7 @@ fn blob_core_error(operation: &'static str, error: BlobError) -> ApplicationErro
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{
         fs,
         io::{Cursor, SeekFrom},
@@ -7947,6 +7947,68 @@ mod tests {
         assert_eq!(after, before);
         assert!(after.durable_plaintext_bytes > 0);
         assert!(after.durable_transfer_bytes > 0);
+    }
+
+    pub(crate) fn real_canonical_publication_status_fixture()
+    -> (BlobPublicationInspection, BlobPublicationInspection) {
+        let root = TestRoot::new("transport-independent-publication-status");
+        let bytes = payload(2 * BLOB_STREAM_SEGMENT_BYTES);
+        let stream_request = BlobPublishStreamRequest {
+            publication: request(b"blob/stream/transport-independent-status"),
+            options: BlobPublishOptions::durable(),
+            total_len: bytes.len() as u64,
+        };
+        let (publication_id, interrupted) = {
+            let mut node = selected_node(&root);
+            let opened = node
+                .open_publish_stream_inner(stream_request.clone())
+                .expect("open transport-independent stream");
+            node.publish_streams
+                .get_mut(&opened.token)
+                .expect("open transport-independent local stream")
+                .set_checkpoint_segments_for_test(1);
+            node.append_publish_stream_inner(
+                opened.token,
+                0,
+                Zeroizing::new(bytes[..BLOB_STREAM_SEGMENT_BYTES].to_vec()),
+            )
+            .expect("append first durable transport-independent segment");
+            let publication_id = BlobStreamPublicationId::from_bytes(opened.token).unwrap();
+            let status = node
+                .inspect_publication(BlobPublicationInspectionRequest {
+                    publication_id,
+                    topic: blob_topic(),
+                    scope: blob_scope(),
+                })
+                .expect("inspect interrupted canonical publication");
+            (publication_id, status)
+        };
+        let available = {
+            let mut node = selected_node(&root);
+            let resumed = node
+                .open_publish_stream_inner(stream_request)
+                .expect("resume canonical publication on another transport");
+            assert_eq!(resumed.token, *publication_id.as_bytes());
+            node.append_publish_stream_inner(
+                resumed.token,
+                BLOB_STREAM_SEGMENT_BYTES as u64,
+                Zeroizing::new(bytes[BLOB_STREAM_SEGMENT_BYTES..].to_vec()),
+            )
+            .expect("append resumed canonical segment");
+            let result = node
+                .finish_publish_stream_inner(resumed.token)
+                .expect("finish resumed canonical publication");
+            let status = node
+                .inspect_publication(BlobPublicationInspectionRequest {
+                    publication_id,
+                    topic: blob_topic(),
+                    scope: blob_scope(),
+                })
+                .expect("inspect available canonical publication");
+            assert_eq!(status.blob_id, Some(result.id));
+            status
+        };
+        (interrupted, available)
     }
 
     #[test]

@@ -2499,7 +2499,10 @@ pub(crate) mod tests {
         AdapterFuture, CandidateHealth, StreamAttempt, StreamReceiveAttempt,
         StreamTransportAdapter, StreamTransportError, StreamTransportId, TransferRequirements,
     };
-    use crate::{application::blob_stream::publish_blob_stream, stream_pipeline::PipelineLimits};
+    use crate::{
+        application::blob_stream::publish_blob_stream,
+        stream_pipeline::{PipelineLimits, PipelineTestProbe},
+    };
     use aster_iroh::{CarrierSecurityProfile, Endpoint, EndpointConfig, ExpectedPeer, SecretKey};
     use aster_mesh::{
         BLOB_STREAM_SEGMENT_BYTES, BlobMetadata, BlobPublicationStreamId,
@@ -3016,6 +3019,7 @@ pub(crate) mod tests {
         control: mpsc::UnboundedSender<Option<Vec<u8>>>,
         fail_after_receives: Option<usize>,
         receives: std::sync::atomic::AtomicUsize,
+        failure_worker_probe: Option<PipelineTestProbe>,
     }
 
     impl StreamReceiveAttempt for MemoryReceiverAttempt {
@@ -3026,6 +3030,11 @@ pub(crate) mod tests {
                     .fail_after_receives
                     .is_some_and(|limit| receive >= limit)
                 {
+                    if let Some(probe) = &self.failure_worker_probe {
+                        while probe.peak_active_workers() == 0 {
+                            tokio::task::yield_now().await;
+                        }
+                    }
                     let _ = self.control.send(None);
                     return Err(StreamTransportError::Closed);
                 }
@@ -3073,8 +3082,20 @@ pub(crate) mod tests {
                     control: control_send,
                     fail_after_receives,
                     receives: std::sync::atomic::AtomicUsize::new(0),
+                    failure_worker_probe: None,
                 }),
             }
+        }
+
+        fn with_receive_failure_after_worker_active(
+            fail_after_receives: usize,
+            probe: PipelineTestProbe,
+        ) -> Self {
+            let mut adapter = Self::with_receive_failure(Some(fail_after_receives));
+            Arc::get_mut(&mut adapter.receiver)
+                .expect("new adapter uniquely owns receiver")
+                .failure_worker_probe = Some(probe);
+            adapter
         }
     }
 
@@ -3121,6 +3142,7 @@ pub(crate) mod tests {
                 control,
                 fail_after_receives: None,
                 receives: std::sync::atomic::AtomicUsize::new(0),
+                failure_worker_probe: None,
             })
         }
 
@@ -3477,7 +3499,15 @@ pub(crate) mod tests {
         .unwrap();
         let roots = (published.plaintext_root, published.ciphertext_root);
         let wire_len = completed_pack_wire_len(&source_root.0, &open).unwrap();
-        let transport = MemoryTransportAdapter::with_receive_failure(Some(2));
+        let job = StreamJobId::from_bytes(
+            open.stream_id().as_bytes()[..16]
+                .try_into()
+                .expect("job ID"),
+        );
+        let probe = PipelineTestProbe::install(job);
+        probe.hold_workers_for_test();
+        let transport =
+            MemoryTransportAdapter::with_receive_failure_after_worker_active(3, probe.clone());
         let mut sender_codec = PlainBlobRecordCodec;
         let mut receiver_codec = PlainBlobRecordCodec;
 
@@ -3514,11 +3544,17 @@ pub(crate) mod tests {
         let error = received.expect_err("injected transport failure must terminate receive");
 
         assert_eq!(error.stage(), BlobNetworkStage::Transport);
-        let job = StreamJobId::from_bytes(
-            open.stream_id().as_bytes()[..16]
-                .try_into()
-                .expect("job ID"),
+        assert!(
+            probe.peak_active_workers() > 0,
+            "failure preceded worker activity"
         );
+        assert!(!probe.admission_open(), "pipeline admission remained open");
+        assert!(probe.cancellation_signalled(), "pipeline was not cancelled");
+        assert!(probe.channels_closed(), "pipeline channels remained open");
+        assert_eq!(probe.worker_exits(), 2, "not every receive worker joined");
+        assert_eq!(probe.available_item_permits(), 4);
+        assert_eq!(probe.available_byte_permits(), 5 * 1024 * 1024);
+        assert_eq!(probe.final_reorder_items(), 0);
         assert!(!ACTIVE_RECEIVE_PIPELINES.lock().unwrap().contains(&job));
     }
 
