@@ -117,7 +117,14 @@ impl BlobConnectService {
                 })
                 .await
                 .map_err(|error| connect_blob_application_error(error, operation))?;
-            if page.offset != state.offset || page.is_empty() {
+            let terminal_empty = page.is_empty()
+                && page.offset == 0
+                && page.next_offset() == 0
+                && page.total_len == 0
+                && page.complete
+                && state.offset == 0
+                && state.metadata.is_none();
+            if page.offset != state.offset || (page.is_empty() && !terminal_empty) {
                 return Err(internal(operation));
             }
             let observed = ReadMetadata::from_page(&page, &state.topic, &state.scope);
@@ -137,7 +144,8 @@ impl BlobConnectService {
             }
             let metadata = state.metadata.as_ref().ok_or_else(|| internal(operation))?;
             let response = read_response(metadata, page.offset, page.as_bytes().to_vec(), complete);
-            if next_offset <= state.offset || next_offset > observed.total_len {
+            if (!terminal_empty && next_offset <= state.offset) || next_offset > observed.total_len
+            {
                 return Err(internal(operation));
             }
             state.offset = next_offset;
@@ -1103,6 +1111,75 @@ mod tests {
             Some("durable object expired or was retired")
         );
 
+        node.shutdown().await.unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn read_stream_emits_one_empty_terminal_blob_page() {
+        let fixture = StagingTestRoot::new();
+        let state_root = fixture.0.join("empty-read-state");
+        fs::create_dir(&state_root).unwrap();
+        fs::set_permissions(&state_root, fs::Permissions::from_mode(0o700)).unwrap();
+        let topic = Topic::new("imagery.maps").unwrap();
+        let scope = Scope::new("mission/team/alpha").unwrap();
+        let access =
+            ProvisioningAccess::member(scope.clone(), vec![1], vec![topic.clone()]).unwrap();
+        let mut provisioner = ReferenceProvisioner::from_seed([0xb9; 32]).unwrap();
+        let mission = UnprotectedReferenceMission::from_bytes(
+            provisioner
+                .issue_node(1, &[access])
+                .unwrap()
+                .to_bytes()
+                .unwrap(),
+        )
+        .unwrap();
+        let node = start_node(NodeConfig {
+            state: state_root.clone(),
+            bind: "127.0.0.1:0".parse().unwrap(),
+            mission,
+            peers: Vec::new(),
+            mutable_interests: MutableSourceInterests::default(),
+            sync_interval: std::time::Duration::from_millis(50),
+            run_for: None,
+            application: NodeApplication::Relay,
+        })
+        .await
+        .unwrap();
+        let blobs = node.selected_blobs();
+        let stream = blobs
+            .open_publish_stream(BlobPublishStreamRequest {
+                publication: NodeBlobPublishRequest {
+                    operation_key: b"agent-empty-read".to_vec(),
+                    topic: topic.clone(),
+                    scope: scope.clone(),
+                    priority: Priority::Routine,
+                    media_type: None,
+                    schema_id: Vec::new(),
+                },
+                options: BlobPublishOptions::durable(),
+                total_len: 0,
+            })
+            .await
+            .unwrap();
+        let publication = stream.finish().await.unwrap();
+        let service = BlobConnectService::new(blobs, &state_root).unwrap();
+        let mut responses = service
+            .read(api::ReadBlobRequest {
+                id: publication.id.as_bytes().to_vec(),
+                topic: topic.as_str().to_owned(),
+                scope: scope.as_str().to_owned(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .body;
+        let page = responses.next().await.unwrap().unwrap();
+        assert!(page.chunk.is_empty());
+        assert_eq!(page.offset, 0);
+        assert_eq!(page.total_len, 0);
+        assert!(page.complete);
+        assert!(responses.next().await.is_none());
         node.shutdown().await.unwrap();
     }
 }

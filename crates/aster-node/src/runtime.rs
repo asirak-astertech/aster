@@ -7829,8 +7829,7 @@ impl AuthenticatedBlobRouteClaim {
     }
 
     fn has_canonical_manifest_shape(&self) -> bool {
-        self.total_len > 0
-            && self.chunk_size == aster_mesh::SELECTED_BLOB_CHUNK_SIZE
+        self.chunk_size == aster_mesh::SELECTED_BLOB_CHUNK_SIZE
             && self.chunk_count == self.total_len.div_ceil(u64::from(self.chunk_size))
     }
 
@@ -52303,6 +52302,7 @@ mod tests {
                     &stored.sealed,
                 )
                 .expect("canonical v9 retained completion");
+            let published_blob_id = *blob.blob_id().as_bytes();
             let source = if finite {
                 blob_stream::CanonicalBlobSendSource::new_with_lifetime(
                     stored,
@@ -52787,6 +52787,40 @@ mod tests {
                         .is_some()
                 );
                 drop((source_store, reopened));
+            } else if label == "empty" {
+                drop(target_store);
+                let mission_path = target_state.join("empty-profile5-reader.bundle");
+                let mission_bytes = services
+                    .other
+                    .fresh_bundle()
+                    .expect("fresh empty profile-5 reader bundle")
+                    .to_bytes()
+                    .expect("encode empty profile-5 reader bundle");
+                drop(
+                    crate::mission::UnprotectedReferenceMission::persist(
+                        &mission_path,
+                        mission_bytes,
+                    )
+                    .expect("persist empty profile-5 reader mission"),
+                );
+                let mut application =
+                    SelectedBlobNode::open_unprotected_reference(&target_state, &mission_path)
+                        .expect("open application over received empty profile-5 Blob");
+                let page = application
+                    .read_page(crate::application::BlobReadPageRequest {
+                        blob: crate::application::BlobReadRequest {
+                            id: crate::application::BlobId::from_bytes(published_blob_id),
+                            topic: services.topic.clone(),
+                            scope: services.scope.clone(),
+                        },
+                        offset: 0,
+                        max_bytes: 31,
+                    })
+                    .expect("read received empty profile-5 Blob EOF");
+                assert!(page.is_empty());
+                assert_eq!(page.next_offset(), 0);
+                assert!(page.complete);
+                drop((source_store, application));
             } else {
                 drop((source_store, target_store));
             }

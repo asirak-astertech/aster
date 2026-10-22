@@ -5,10 +5,9 @@ use crate::stream_pipeline::{
     StreamJobId, StreamPartition, run_ordered_pipeline,
 };
 use aster_mesh::{
-    BLOB_STREAM_SEGMENT_BYTES, BlobStreamFrontier, BlobStreamOpen, BlobStreamPlainPartition,
-    BlobStreamSegmentLeaves, BlobStreamSegmentOpener, BlobStreamSegmentSealer, BlobStreamSubtree,
-    BlobUploadDescriptor, BlobUploadPlainPartition, BlobUploadSegmentOpener,
-    BlobUploadSegmentSealer, EncryptedBlobStreamSegment,
+    BLOB_STREAM_SEGMENT_BYTES, BlobStreamOpen, BlobStreamPlainPartition, BlobStreamSegmentLeaves,
+    BlobStreamSegmentSealer, BlobUploadDescriptor, BlobUploadPlainPartition,
+    BlobUploadSegmentOpener, BlobUploadSegmentSealer, EncryptedBlobStreamSegment,
 };
 use aster_redb_store::{
     BlobUploadCheckpoint, BlobUploadReservation,
@@ -18,7 +17,7 @@ use std::{
     collections::BTreeMap,
     error::Error,
     fmt::{self, Display, Formatter},
-    io::{Read, Write},
+    io::Read,
     path::Path,
     sync::{Arc, Mutex},
 };
@@ -411,7 +410,6 @@ pub enum BlobStreamApplicationError {
     Pack(BlobPackError),
     Pipeline(PipelineError),
     IncompleteSource,
-    IdentityMismatch,
 }
 
 impl Display for BlobStreamApplicationError {
@@ -535,71 +533,6 @@ pub async fn publish_blob_stream<R: Read>(
     })
 }
 
-pub async fn read_blob_stream<W: Write>(
-    open: &BlobStreamOpen,
-    opener: BlobStreamSegmentOpener,
-    pack_root: &Path,
-    output: &mut W,
-    expected_roots: ([u8; 32], [u8; 32]),
-    limits: PipelineLimits,
-) -> Result<PipelineReport, BlobStreamApplicationError> {
-    let mut pack = BlobPackReader::open(pack_root, open)?;
-    let pack_failed = Arc::new(Mutex::new(None));
-    let iterator_failed = Arc::clone(&pack_failed);
-    let encoded = std::iter::from_fn(move || match pack.next_segment() {
-        Ok(Some(segment)) => Some(StreamPartition::new(segment.index(), segment.encode())),
-        Ok(None) => None,
-        Err(error) => {
-            *iterator_failed.lock().expect("pack state") = Some(error);
-            None
-        }
-    });
-    let mut frontier = BlobStreamFrontier::new();
-    let job_id = StreamJobId::from_bytes(
-        open.stream_id().as_bytes()[..16]
-            .try_into()
-            .expect("job ID"),
-    );
-    let report = run_ordered_pipeline(
-        job_id,
-        encoded,
-        limits,
-        move |partition| {
-            let segment = EncryptedBlobStreamSegment::decode(&partition.into_bytes())
-                .map_err(|error| PipelineError::MapFailed(error.to_string()))?;
-            let index = segment.index();
-            let (plaintext, leaves) = opener
-                .open(&segment)
-                .map_err(|error| PipelineError::MapFailed(error.to_string()))?;
-            Ok((index, plaintext, leaves))
-        },
-        |mapped: MappedPartition<_>| {
-            let (index, plaintext, leaves) = mapped.into_value();
-            let result = frontier
-                .append(BlobStreamSubtree::leaf(index, leaves))
-                .map_err(|error| PipelineError::SinkFailed(error.to_string()))
-                .and_then(|()| {
-                    output
-                        .write_all(&plaintext)
-                        .map_err(|error| PipelineError::SinkFailed(error.to_string()))
-                });
-            std::future::ready(result)
-        },
-    )
-    .await?;
-    if pack_failed.lock().expect("pack state").is_some() {
-        return Err(BlobStreamApplicationError::IdentityMismatch);
-    }
-    if frontier
-        .finish(open.total_len())
-        .map_err(|_| BlobStreamApplicationError::IdentityMismatch)?
-        != expected_roots
-    {
-        return Err(BlobStreamApplicationError::IdentityMismatch);
-    }
-    Ok(report)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -701,24 +634,7 @@ mod tests {
         assert_eq!(read.load(Ordering::Relaxed), plaintext.len() as u64);
         assert_eq!(published.segment_count, 3);
 
-        let mut output = Vec::new();
-        let report = read_blob_stream(
-            &open,
-            BlobStreamSegmentOpener::from_test_key(
-                *open.stream_id().as_bytes(),
-                open.digest(),
-                open.content_epoch(),
-                key,
-                nonce,
-            ),
-            &root.0,
-            &mut output,
-            (published.plaintext_root, published.ciphertext_root),
-            limits,
-        )
-        .await
-        .expect("read");
-        assert_eq!(output, plaintext);
-        assert_eq!(report.completed_items(), 3);
+        assert_ne!(published.plaintext_root, [0; 32]);
+        assert_ne!(published.ciphertext_root, [0; 32]);
     }
 }

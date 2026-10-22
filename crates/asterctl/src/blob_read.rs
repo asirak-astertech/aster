@@ -186,7 +186,6 @@ impl Validator {
                 .priority
                 .as_known()
                 .is_none_or(|priority| priority == api::Priority::Unspecified)
-            || observed.total_len == 0
             || observed
                 .media_type
                 .as_ref()
@@ -206,7 +205,13 @@ impl Validator {
         if page.offset != self.next_offset {
             return Err("ReadBlob failed: noncontiguous page offset");
         }
-        if page.chunk.is_empty() || page.chunk.len() > self.max_page_bytes {
+        let terminal_empty = page.chunk.is_empty()
+            && page.offset == 0
+            && observed.total_len == 0
+            && page.complete
+            && self.next_offset == 0
+            && self.metadata.is_none();
+        if (page.chunk.is_empty() && !terminal_empty) || page.chunk.len() > self.max_page_bytes {
             return Err("ReadBlob failed: invalid page length");
         }
         let page_len =
@@ -486,6 +491,23 @@ mod tests {
             .accept(&page(TEST_PAGE_BYTES as u64, vec![8], true))
             .unwrap();
         assert_eq!(validator.finish().unwrap().ttl_ms, Some(u64::MAX));
+    }
+
+    #[test]
+    fn blob_read_accepts_exactly_one_empty_terminal_page() {
+        let mut empty = page(0, Vec::new(), true);
+        empty.total_len = 0;
+        let mut validator = Validator::new(request());
+        validator.accept(&empty).expect("accept empty terminal EOF");
+        assert_eq!(validator.finish().expect("finish empty Blob").total_len, 0);
+
+        let mut nonterminal = empty.clone();
+        nonterminal.complete = false;
+        assert!(Validator::new(request()).accept(&nonterminal).is_err());
+
+        let mut wrong_offset = empty;
+        wrong_offset.offset = 1;
+        assert!(Validator::new(request()).accept(&wrong_offset).is_err());
     }
 
     #[test]

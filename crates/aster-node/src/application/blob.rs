@@ -4505,6 +4505,32 @@ impl SelectedBlobNode {
             return Err(actor_unavailable("blob read page"));
         }
         let total_len = selected.stored.blob.manifest().total_len();
+        if total_len == 0 {
+            if request.offset != 0 {
+                return Err(ApplicationError::new(
+                    ApplicationErrorKind::InvalidRequest,
+                    "blob read page",
+                ));
+            }
+            self.require_live_read_authority(&policy, &plan, &selected, 0, 0, fatal)?;
+            let metadata = selected.stored.blob.manifest().metadata();
+            return Ok(BlobReadPage {
+                publication: BlobPublicationId::from_store(selected.stored.semantic_id),
+                id: BlobId::from_core(selected.stored.blob.blob_id()),
+                publisher: selected.stored.blob.publisher(),
+                publisher_counter: selected.stored.blob.dot().counter,
+                priority: selected.stored.blob.priority(),
+                ttl_ms: selected.stored.blob.ttl_ms(),
+                total_len,
+                media_type: metadata.media_type().map(str::to_owned),
+                schema_id: metadata.schema_id().to_vec(),
+                acceptance_marker: selected.stored.acceptance_marker,
+                offset: 0,
+                complete: true,
+                next_offset: 0,
+                plaintext: Zeroizing::new(Vec::new()),
+            });
+        }
         if request.offset >= total_len {
             return Err(ApplicationError::new(
                 ApplicationErrorKind::InvalidRequest,
@@ -4975,7 +5001,17 @@ impl SelectedBlobNode {
                 "blob read page",
             ));
         }
-        if let Err(error) = self
+        if range_chunk_count == 0 {
+            if first_chunk != 0
+                || selected.stored.blob.manifest().total_len() != 0
+                || selected.stored.blob.manifest().chunk_count() != 0
+            {
+                return Err(ApplicationError::new(
+                    ApplicationErrorKind::Integrity,
+                    "blob read page",
+                ));
+            }
+        } else if let Err(error) = self
             .store
             .blob_depot_for_authenticated_read(&completion)
             .and_then(|mut depot| {
@@ -6152,6 +6188,12 @@ mod tests {
                 std::process::id()
             ));
             fs::create_dir(&path).expect("create Blob test root");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+                    .expect("make Blob test root private");
+            }
             Self(path)
         }
 
@@ -6361,6 +6403,82 @@ mod tests {
         node.store
             .ingest_verified_control(&verified, &sealed)
             .expect("commit open-node rekey");
+    }
+
+    fn apply_scope_rekey_to_store(
+        store: &Store,
+        services: &mut RekeyServices,
+        epoch: u64,
+        sequence: u64,
+        include_selected: bool,
+    ) {
+        let mut recipients = vec![
+            ScopeRekeyRecipient::member(services.control_authority.identity(), vec![blob_topic()])
+                .expect("authority recipient"),
+            ScopeRekeyRecipient::member(services.reader.identity(), vec![blob_topic()])
+                .expect("reader recipient"),
+        ];
+        if include_selected {
+            recipients.push(
+                ScopeRekeyRecipient::member(services.selected_identity, vec![blob_topic()])
+                    .expect("selected recipient"),
+            );
+        }
+        let (sealed, _) = services
+            .control_authority
+            .seal_chained_scope_rekey_control_from_registry(
+                &services.registry,
+                0,
+                blob_scope(),
+                epoch,
+                recipients,
+                sequence,
+                None,
+            )
+            .expect("seal concurrent rekey");
+        let verified = services
+            .reader
+            .verify_control(&sealed)
+            .expect("verify concurrent rekey");
+        store
+            .ingest_verified_control(&verified, &sealed)
+            .expect("commit concurrent rekey");
+    }
+
+    fn assert_post_decrypt_read_denied(
+        mut node: SelectedBlobNode,
+        blob: BlobReadRequest,
+        mutate: impl FnOnce(&Store),
+    ) -> ApplicationErrorKind {
+        let reached = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        node.set_final_read_gate(Arc::clone(&reached), Arc::clone(&release));
+        let store = Arc::clone(&node.store);
+        let admission = Arc::new(AtomicBool::new(true));
+        let worker_admission = Arc::clone(&admission);
+        let (response, received) = oneshot::channel();
+        let worker = std::thread::spawn(move || {
+            node.execute_live(
+                SelectedBlobCommand::ReadPage {
+                    request: BlobReadPageRequest {
+                        blob,
+                        offset: 0,
+                        max_bytes: 31,
+                    },
+                    response,
+                },
+                &worker_admission,
+            )
+        });
+        reached.wait();
+        mutate(&store);
+        release.wait();
+        let _ = worker.join().expect("join post-decrypt reader");
+        received
+            .blocking_recv()
+            .expect("post-decrypt response")
+            .expect_err("post-decrypt mutation cannot release plaintext")
+            .kind()
     }
 
     fn selected_node(root: &TestRoot) -> SelectedBlobNode {
@@ -6665,6 +6783,42 @@ mod tests {
     }
 
     #[test]
+    fn empty_stream_blob_returns_one_authorized_terminal_page() {
+        // Break caught: a canonical empty stream publication must expose one
+        // authenticated EOF page rather than being permanently unreadable.
+        let root = TestRoot::new("empty-stream-read");
+        let mut node = selected_node(&root);
+        let blob = finish_stream_read_fixture(
+            &mut node,
+            b"blob/read-empty-stream",
+            &[],
+            BlobPublishOptions::durable(),
+        );
+
+        let page = node
+            .read_page(BlobReadPageRequest {
+                blob: blob.clone(),
+                offset: 0,
+                max_bytes: 31,
+            })
+            .expect("read authenticated empty EOF");
+        assert!(page.is_empty());
+        assert_eq!(page.offset, 0);
+        assert_eq!(page.next_offset(), 0);
+        assert_eq!(page.total_len, 0);
+        assert!(page.complete);
+
+        let error = node
+            .read_page(BlobReadPageRequest {
+                blob,
+                offset: 1,
+                max_bytes: 31,
+            })
+            .expect_err("nonzero empty offset is invalid");
+        assert_eq!(error.kind(), ApplicationErrorKind::InvalidRequest);
+    }
+
+    #[test]
     fn cached_blob_reader_rechecks_revocation_epoch_grants_and_lifecycle_each_page() {
         // Break caught: a page-one authorization must not become reusable
         // plaintext authority after any control, selector, lifecycle, or
@@ -6812,6 +6966,117 @@ mod tests {
             .expect_err("shutdown denies page two");
         assert_eq!(error.kind(), ApplicationErrorKind::StateUnavailable);
         assert!(fatal.is_none());
+    }
+
+    #[test]
+    fn final_blob_read_gate_rechecks_every_authority_dimension_after_decrypt() {
+        let bytes = payload(97);
+
+        let policy_root = TestRoot::new("post-decrypt-policy");
+        let mut policy_services = persist_rekey_mission(&policy_root);
+        let mut policy_node = selected_node(&policy_root);
+        let policy_blob = finish_stream_read_fixture(
+            &mut policy_node,
+            b"blob/post-decrypt/policy",
+            &bytes,
+            BlobPublishOptions::durable(),
+        );
+        let kind = assert_post_decrypt_read_denied(policy_node, policy_blob.clone(), |store| {
+            apply_scope_rekey_to_store(store, &mut policy_services, 1, 1, true);
+        });
+        assert_ne!(kind, ApplicationErrorKind::Integrity);
+        let mut reopened = selected_node(&policy_root);
+        assert!(read_fixture_page(&mut reopened, policy_blob, 0).is_err());
+
+        let epoch_root = TestRoot::new("post-decrypt-epoch");
+        let mut epoch_services = persist_rekey_mission(&epoch_root);
+        let mut epoch_node = selected_node(&epoch_root);
+        let epoch_blob = finish_stream_read_fixture(
+            &mut epoch_node,
+            b"blob/post-decrypt/epoch",
+            &bytes,
+            BlobPublishOptions::durable(),
+        );
+        let kind = assert_post_decrypt_read_denied(epoch_node, epoch_blob.clone(), |store| {
+            apply_scope_rekey_to_store(store, &mut epoch_services, 2, 1, true);
+        });
+        assert_ne!(kind, ApplicationErrorKind::Integrity);
+        let mut reopened = selected_node(&epoch_root);
+        assert!(read_fixture_page(&mut reopened, epoch_blob, 0).is_err());
+
+        let grant_root = TestRoot::new("post-decrypt-grant");
+        let mut grant_services = persist_rekey_mission(&grant_root);
+        let mut grant_node = selected_node(&grant_root);
+        let grant_blob = finish_stream_read_fixture(
+            &mut grant_node,
+            b"blob/post-decrypt/grant",
+            &bytes,
+            BlobPublishOptions::durable(),
+        );
+        let kind = assert_post_decrypt_read_denied(grant_node, grant_blob, |store| {
+            apply_scope_rekey_to_store(store, &mut grant_services, 2, 1, false);
+        });
+        assert_ne!(kind, ApplicationErrorKind::Integrity);
+
+        let revocation_root = TestRoot::new("post-decrypt-revocation");
+        let mut revocation_services = persist_rekey_mission(&revocation_root);
+        let mut revocation_node = selected_node(&revocation_root);
+        let revocation_blob = finish_stream_read_fixture(
+            &mut revocation_node,
+            b"blob/post-decrypt/revocation",
+            &bytes,
+            BlobPublishOptions::durable(),
+        );
+        let selected = revocation_services.selected_identity;
+        let kind = assert_post_decrypt_read_denied(revocation_node, revocation_blob, |store| {
+            let sealed = revocation_services
+                .control_authority
+                .seal_chained_revocation_control(selected, 1, 1, None)
+                .expect("seal concurrent revocation");
+            let verified = revocation_services
+                .reader
+                .verify_control(&sealed)
+                .expect("verify concurrent revocation");
+            store
+                .ingest_verified_control(&verified, &sealed)
+                .expect("commit concurrent revocation");
+        });
+        assert_ne!(kind, ApplicationErrorKind::Integrity);
+        assert!(
+            SelectedBlobNode::open_unprotected_reference(
+                revocation_root.path(),
+                revocation_root.mission_path(),
+            )
+            .is_err()
+        );
+
+        let lifecycle_root = TestRoot::new("post-decrypt-lifecycle");
+        let mut lifecycle_node = selected_node(&lifecycle_root);
+        lifecycle_node.custody_clock = NodeCustodyClock::injected([0xe2; 16], 100, 0);
+        let lifecycle_blob = finish_stream_read_fixture(
+            &mut lifecycle_node,
+            b"blob/post-decrypt/lifecycle",
+            &bytes,
+            BlobPublishOptions::finite_ttl_ms(50).expect("finite lifecycle TTL"),
+        );
+        let kind =
+            assert_post_decrypt_read_denied(lifecycle_node, lifecycle_blob.clone(), |store| {
+                for _ in 0..16 {
+                    store
+                        .run_blob_maintenance_turn_with_sample(
+                            BlobMaintenanceBudget::new(64, 16, 128 * 1024 * 1024)
+                                .expect("post-decrypt maintenance budget"),
+                            Some(CustodySample {
+                                clock_id: [0xe2; 16],
+                                tick_ms: 151,
+                            }),
+                        )
+                        .expect("retire during post-decrypt gate");
+                }
+            });
+        assert_ne!(kind, ApplicationErrorKind::Integrity);
+        let mut reopened = selected_node(&lifecycle_root);
+        assert!(read_fixture_page(&mut reopened, lifecycle_blob, 0).is_err());
     }
 
     async fn schedule_stream_finalization_for_test(
