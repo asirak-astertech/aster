@@ -72,6 +72,18 @@ impl BlobProfile5Receipt {
     pub const fn source(&self) -> BlobTransferId {
         self.source
     }
+
+    pub const fn plaintext_total_bytes(&self) -> u64 {
+        self.total_len
+    }
+
+    pub const fn total_units(&self) -> u64 {
+        self.chunk_count
+    }
+
+    pub const fn transfer_total_bytes(&self) -> u64 {
+        self.max_wire_len
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

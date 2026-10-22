@@ -67,8 +67,6 @@ use crate::runtime::{
 use aster_redb_store::EventOperationKey;
 
 mod blob;
-#[cfg(test)]
-pub(crate) use blob::tests::real_canonical_publication_status_fixture;
 pub mod blob_stream;
 #[cfg(test)]
 #[path = "application/operation_capacity_test.rs"]

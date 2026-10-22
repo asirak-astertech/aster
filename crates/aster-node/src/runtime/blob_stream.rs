@@ -2977,6 +2977,50 @@ pub(crate) mod tests {
         control: tokio::sync::Mutex<mpsc::UnboundedReceiver<Option<Vec<u8>>>>,
     }
 
+    struct SmallMtuSenderAttempt {
+        data: mpsc::UnboundedSender<Option<Vec<u8>>>,
+        control: tokio::sync::Mutex<mpsc::UnboundedReceiver<Option<Vec<u8>>>>,
+    }
+
+    impl StreamAttempt for SmallMtuSenderAttempt {
+        fn send_data<'a>(&'a self, frame: &'a [u8]) -> AdapterFuture<'a, ()> {
+            Box::pin(async move {
+                let mut reassembled = Vec::with_capacity(frame.len());
+                for fragment in frame.chunks(3) {
+                    reassembled.extend_from_slice(fragment);
+                }
+                self.data
+                    .send(Some(reassembled))
+                    .map_err(|_| StreamTransportError::Closed)
+            })
+        }
+
+        fn send_data_parts<'a>(
+            &'a self,
+            prefix: &'a [u8],
+            body: &'a [u8],
+        ) -> AdapterFuture<'a, ()> {
+            Box::pin(async move {
+                let mut frame = Vec::with_capacity(prefix.len() + body.len());
+                frame.extend_from_slice(prefix);
+                frame.extend_from_slice(body);
+                self.send_data(&frame).await
+            })
+        }
+
+        fn receive_control(&self) -> AdapterFuture<'_, Option<Vec<u8>>> {
+            Box::pin(async move { Ok(self.control.lock().await.recv().await.flatten()) })
+        }
+
+        fn finish_data(&self) -> AdapterFuture<'_, ()> {
+            Box::pin(async move {
+                self.data
+                    .send(None)
+                    .map_err(|_| StreamTransportError::Closed)
+            })
+        }
+    }
+
     impl StreamAttempt for MemorySenderAttempt {
         fn send_data<'a>(&'a self, frame: &'a [u8]) -> AdapterFuture<'a, ()> {
             Box::pin(async move {
@@ -3110,6 +3154,61 @@ pub(crate) mod tests {
 
         fn health(&self) -> CandidateHealth {
             CandidateHealth::Healthy
+        }
+
+        fn open_attempt<'a>(
+            &'a self,
+            _request: AttemptOpenRequest,
+        ) -> AdapterFuture<'a, Arc<dyn StreamAttempt>> {
+            let sender = Arc::clone(&self.sender);
+            Box::pin(async move { Ok(sender as Arc<dyn StreamAttempt>) })
+        }
+
+        fn accept_attempt<'a>(
+            &'a self,
+            _request: AttemptOpenRequest,
+        ) -> AdapterFuture<'a, Arc<dyn StreamReceiveAttempt>> {
+            let receiver = Arc::clone(&self.receiver);
+            Box::pin(async move { Ok(receiver as Arc<dyn StreamReceiveAttempt>) })
+        }
+    }
+
+    pub(crate) struct SmallMtuTransportAdapter {
+        sender: Arc<SmallMtuSenderAttempt>,
+        receiver: Arc<MemoryReceiverAttempt>,
+    }
+
+    impl SmallMtuTransportAdapter {
+        pub(crate) fn with_receive_failure(fail_after_receives: usize) -> Self {
+            let (data_send, data_receive) = mpsc::unbounded_channel();
+            let (control_send, control_receive) = mpsc::unbounded_channel();
+            Self {
+                sender: Arc::new(SmallMtuSenderAttempt {
+                    data: data_send,
+                    control: tokio::sync::Mutex::new(control_receive),
+                }),
+                receiver: Arc::new(MemoryReceiverAttempt {
+                    data: tokio::sync::Mutex::new(data_receive),
+                    control: control_send,
+                    fail_after_receives: Some(fail_after_receives),
+                    receives: std::sync::atomic::AtomicUsize::new(0),
+                    failure_worker_probe: None,
+                }),
+            }
+        }
+    }
+
+    impl StreamTransportAdapter for SmallMtuTransportAdapter {
+        fn id(&self) -> StreamTransportId {
+            StreamTransportId::IrohQuicV1
+        }
+
+        fn eligibility(&self, requirements: TransferRequirements) -> bool {
+            requirements.reliable_ordered && requirements.full_duplex
+        }
+
+        fn health(&self) -> CandidateHealth {
+            CandidateHealth::Degraded
         }
 
         fn open_attempt<'a>(
@@ -3551,10 +3650,11 @@ pub(crate) mod tests {
         assert!(!probe.admission_open(), "pipeline admission remained open");
         assert!(probe.cancellation_signalled(), "pipeline was not cancelled");
         assert!(probe.channels_closed(), "pipeline channels remained open");
-        assert_eq!(probe.worker_exits(), 2, "not every receive worker joined");
+        assert_eq!(probe.worker_exits(), 2, "not every receive worker exited");
+        assert_eq!(probe.joined_workers(), 2, "not every receive worker joined");
         assert_eq!(probe.available_item_permits(), 4);
         assert_eq!(probe.available_byte_permits(), 5 * 1024 * 1024);
-        assert_eq!(probe.final_reorder_items(), 0);
+        assert_eq!(probe.current_reorder_items(), 0);
         assert!(!ACTIVE_RECEIVE_PIPELINES.lock().unwrap().contains(&job));
     }
 

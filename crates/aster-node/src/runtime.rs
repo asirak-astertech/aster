@@ -52201,7 +52201,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completed_canonical_blob_crosses_v9() {
+    async fn completed_canonical_blob_crosses_v9_publication_status_survives_small_mtu_interrupt_and_different_adapter_resume()
+     {
         let multi_extent = vec![0x5au8; 1024 * 1024 + 1];
         for (label, plaintext, finite) in [
             ("nonempty", multi_extent.as_slice(), false),
@@ -52340,16 +52341,18 @@ mod tests {
                 .expect("encode canonical v9 responder bundle");
             let (mut sender_session, mut receiver_session, profile_digest) =
                 blob_stream::tests::mission_pair_from_bundles(&initiator_bytes, &responder_bytes);
-            let adapter = if label == "nonempty" {
+            let adapter: Box<dyn crate::stream_transport::StreamTransportAdapter> = if label
+                == "nonempty"
+            {
                 // Persist the first of multiple canonical extents, then lose
                 // the connection before the second extent is received.
-                blob_stream::tests::MemoryTransportAdapter::with_receive_failure(Some(3))
+                Box::new(blob_stream::tests::SmallMtuTransportAdapter::with_receive_failure(3))
             } else if label == "empty" {
                 // OPEN and empty SOURCE staging succeed; disconnect before
                 // FINISH so the exact (0, 0) pending receipt must reopen.
-                blob_stream::tests::MemoryTransportAdapter::with_receive_failure(Some(2))
+                Box::new(blob_stream::tests::MemoryTransportAdapter::with_receive_failure(Some(2)))
             } else {
-                blob_stream::tests::MemoryTransportAdapter::new()
+                Box::new(blob_stream::tests::MemoryTransportAdapter::new())
             };
             let source_policy = source_store
                 .control_policy_snapshot()
@@ -52391,7 +52394,7 @@ mod tests {
                 CONTACT_EMISSION_GUARD.scope(
                     source_guard,
                     blob_stream::send_canonical_blob_profile5(
-                        &adapter,
+                        adapter.as_ref(),
                         &source_store,
                         &source_policy,
                         &source,
@@ -52404,7 +52407,7 @@ mod tests {
                 CONTACT_EMISSION_GUARD.scope(
                     target_guard,
                     blob_stream::receive_canonical_blob_profile5(
-                        &adapter,
+                        adapter.as_ref(),
                         &target_store,
                         &target_policy,
                         &mut target_verifier,
@@ -52441,6 +52444,44 @@ mod tests {
                 drop(target_store);
                 Store::inspect_existing(target_state.join(STORE_FILE))
                     .expect("read-only audit interrupted receipt");
+                let status_mission = target_state.join("profile5-status.bundle");
+                drop(
+                    crate::mission::UnprotectedReferenceMission::persist(
+                        &status_mission,
+                        responder_bytes.clone(),
+                    )
+                    .expect("persist profile-5 status mission"),
+                );
+                let publication_id = crate::application::BlobStreamPublicationId::from_bytes(
+                    *publication.as_bytes(),
+                )
+                .expect("profile-5 publication identity");
+                let interrupted_status = {
+                    let mut application = SelectedBlobNode::open_unprotected_reference(
+                        &target_state,
+                        &status_mission,
+                    )
+                    .expect("open application over interrupted profile-5 receipt");
+                    application
+                        .inspect_publication(crate::application::BlobPublicationInspectionRequest {
+                            publication_id,
+                            topic: services.topic.clone(),
+                            scope: services.scope.clone(),
+                        })
+                        .expect("inspect interrupted profile-5 publication")
+                };
+                assert_eq!(
+                    interrupted_status.phase,
+                    crate::application::BlobPublicationPhase::Receiving
+                );
+                assert_eq!(
+                    interrupted_status.durable_plaintext_bytes,
+                    partial.durable_plaintext_offset()
+                );
+                assert_eq!(
+                    interrupted_status.durable_transfer_bytes,
+                    partial.durable_wire_offset()
+                );
                 target_store = Store::open_for_mission(target_state.join(STORE_FILE), authority)
                     .expect("reopen interrupted profile-5 receiver");
 
@@ -52503,6 +52544,20 @@ mod tests {
                         .resume_profile5_receipt(publication)
                         .expect("canonical v9 interrupted receipt")
                         .is_some()
+                );
+                let (_, promoted_progress) = target_store
+                    .resume_profile5_receipt(publication)
+                    .expect("read receipt advanced by second adapter")
+                    .expect("dropped ACK retains terminal receipt");
+                assert!(promoted_progress.generation() > partial.generation());
+                assert!(promoted_progress.durable_wire_offset() > partial.durable_wire_offset());
+                assert_eq!(
+                    promoted_progress.durable_wire_offset(),
+                    wire_shape.terminal().wire_offset
+                );
+                assert_eq!(
+                    promoted_progress.durable_plaintext_offset(),
+                    plaintext.len() as u64
                 );
 
                 let (mut retry_sender, mut retry_receiver, retry_digest) =
@@ -52679,6 +52734,37 @@ mod tests {
             );
 
             if label == "nonempty" {
+                drop(target_store);
+                let status_mission = target_state.join("profile5-status.bundle");
+                let publication_id = crate::application::BlobStreamPublicationId::from_bytes(
+                    *publication.as_bytes(),
+                )
+                .expect("profile-5 publication identity");
+                let available_status = {
+                    let mut application = SelectedBlobNode::open_unprotected_reference(
+                        &target_state,
+                        &status_mission,
+                    )
+                    .expect("reopen application after profile-5 promotion");
+                    application
+                        .inspect_publication(crate::application::BlobPublicationInspectionRequest {
+                            publication_id,
+                            topic: services.topic.clone(),
+                            scope: services.scope.clone(),
+                        })
+                        .expect("inspect available profile-5 publication")
+                };
+                assert_eq!(
+                    available_status.phase,
+                    crate::application::BlobPublicationPhase::Available
+                );
+                assert_eq!(available_status.publication_id, publication_id);
+                assert_eq!(
+                    available_status.blob_id.map(|id| *id.as_bytes()),
+                    Some(published_blob_id)
+                );
+                target_store = Store::open_for_mission(target_state.join(STORE_FILE), authority)
+                    .expect("reopen target after application status inspection");
                 let charged = target_store
                     .blob_stats()
                     .expect("profile-5 charge before retirement");

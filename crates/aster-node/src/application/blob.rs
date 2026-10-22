@@ -4195,6 +4195,101 @@ impl SelectedBlobNode {
                 blob_id: None,
             });
         }
+        // Incoming profile-5 publication identity is the authenticated source
+        // transfer ID. Its receiver-owned receipt is the sole durable progress
+        // authority across transport attempts; no adapter identity is stored.
+        let profile5_source =
+            aster_redb_store::BlobTransferId::new(*request.publication_id.as_bytes());
+        if let Some((receipt, progress)) = self
+            .store
+            .resume_profile5_receipt(profile5_source)
+            .map_err(|error| application_error("blob publication status", error.into()))?
+        {
+            let projection = self
+                .store
+                .blob_source_projection(profile5_source)
+                .map_err(|error| application_error("blob publication status", error.into()))?
+                .ok_or_else(|| {
+                    ApplicationError::new(
+                        ApplicationErrorKind::StateUnavailable,
+                        "blob publication status",
+                    )
+                })?;
+            if projection.source.topic != request.topic || projection.source.scope != request.scope
+            {
+                return Err(ApplicationError::new(
+                    ApplicationErrorKind::NotFound,
+                    "blob publication status",
+                ));
+            }
+            let epoch = self.active_epoch(&request.scope, "blob publication status")?;
+            self.require_blob_grants(
+                &request.topic,
+                &request.scope,
+                epoch,
+                "blob publication status",
+            )?;
+            if projection.source.epoch != epoch {
+                return Err(ApplicationError::new(
+                    ApplicationErrorKind::ExpiredOrRetired,
+                    "blob publication status",
+                ));
+            }
+            return Ok(BlobPublicationInspection {
+                publication_id: request.publication_id,
+                phase: if progress.durable_plaintext_offset() == 0 {
+                    BlobPublicationPhase::AwaitingData
+                } else if progress.durable_plaintext_offset() < receipt.plaintext_total_bytes() {
+                    BlobPublicationPhase::Receiving
+                } else {
+                    BlobPublicationPhase::ReadyToFinalize
+                },
+                plaintext_total_bytes: receipt.plaintext_total_bytes(),
+                durable_plaintext_bytes: progress.durable_plaintext_offset(),
+                transfer_total_bytes: receipt.transfer_total_bytes(),
+                durable_transfer_bytes: progress.durable_wire_offset(),
+                total_units: receipt.total_units(),
+                durable_units: progress.next_segment_index(),
+                blob_id: None,
+            });
+        }
+        if let Some(stored) = self
+            .store
+            .get_blob(profile5_source)
+            .map_err(|error| application_error("blob publication status", error.into()))?
+        {
+            if stored.header.topic != request.topic || stored.header.scope != request.scope {
+                return Err(ApplicationError::new(
+                    ApplicationErrorKind::NotFound,
+                    "blob publication status",
+                ));
+            }
+            let epoch = self.active_epoch(&request.scope, "blob publication status")?;
+            self.require_blob_grants(
+                &request.topic,
+                &request.scope,
+                epoch,
+                "blob publication status",
+            )?;
+            let verified =
+                self.verify_stored_blob(&stored, None, epoch, "blob publication status", false)?;
+            let result = blob_publish_result(&verified, false);
+            return Ok(BlobPublicationInspection {
+                publication_id: request.publication_id,
+                phase: BlobPublicationPhase::Available,
+                plaintext_total_bytes: result.total_len,
+                durable_plaintext_bytes: result.total_len,
+                transfer_total_bytes: 0,
+                durable_transfer_bytes: 0,
+                total_units: result
+                    .total_len
+                    .div_ceil(u64::from(SELECTED_BLOB_CHUNK_SIZE)),
+                durable_units: result
+                    .total_len
+                    .div_ceil(u64::from(SELECTED_BLOB_CHUNK_SIZE)),
+                blob_id: Some(result.id),
+            });
+        }
         let inspection = self
             .store
             .inspect_blob_stream_with_policy(
@@ -7947,68 +8042,6 @@ pub(crate) mod tests {
         assert_eq!(after, before);
         assert!(after.durable_plaintext_bytes > 0);
         assert!(after.durable_transfer_bytes > 0);
-    }
-
-    pub(crate) fn real_canonical_publication_status_fixture()
-    -> (BlobPublicationInspection, BlobPublicationInspection) {
-        let root = TestRoot::new("transport-independent-publication-status");
-        let bytes = payload(2 * BLOB_STREAM_SEGMENT_BYTES);
-        let stream_request = BlobPublishStreamRequest {
-            publication: request(b"blob/stream/transport-independent-status"),
-            options: BlobPublishOptions::durable(),
-            total_len: bytes.len() as u64,
-        };
-        let (publication_id, interrupted) = {
-            let mut node = selected_node(&root);
-            let opened = node
-                .open_publish_stream_inner(stream_request.clone())
-                .expect("open transport-independent stream");
-            node.publish_streams
-                .get_mut(&opened.token)
-                .expect("open transport-independent local stream")
-                .set_checkpoint_segments_for_test(1);
-            node.append_publish_stream_inner(
-                opened.token,
-                0,
-                Zeroizing::new(bytes[..BLOB_STREAM_SEGMENT_BYTES].to_vec()),
-            )
-            .expect("append first durable transport-independent segment");
-            let publication_id = BlobStreamPublicationId::from_bytes(opened.token).unwrap();
-            let status = node
-                .inspect_publication(BlobPublicationInspectionRequest {
-                    publication_id,
-                    topic: blob_topic(),
-                    scope: blob_scope(),
-                })
-                .expect("inspect interrupted canonical publication");
-            (publication_id, status)
-        };
-        let available = {
-            let mut node = selected_node(&root);
-            let resumed = node
-                .open_publish_stream_inner(stream_request)
-                .expect("resume canonical publication on another transport");
-            assert_eq!(resumed.token, *publication_id.as_bytes());
-            node.append_publish_stream_inner(
-                resumed.token,
-                BLOB_STREAM_SEGMENT_BYTES as u64,
-                Zeroizing::new(bytes[BLOB_STREAM_SEGMENT_BYTES..].to_vec()),
-            )
-            .expect("append resumed canonical segment");
-            let result = node
-                .finish_publish_stream_inner(resumed.token)
-                .expect("finish resumed canonical publication");
-            let status = node
-                .inspect_publication(BlobPublicationInspectionRequest {
-                    publication_id,
-                    topic: blob_topic(),
-                    scope: blob_scope(),
-                })
-                .expect("inspect available canonical publication");
-            assert_eq!(status.blob_id, Some(result.id));
-            status
-        };
-        (interrupted, available)
     }
 
     #[test]

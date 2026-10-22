@@ -105,13 +105,15 @@ struct PipelineTestProbeInner {
     cancellation_signalled: AtomicBool,
     channels_closed: AtomicBool,
     worker_exits: std::sync::atomic::AtomicUsize,
+    joined_workers: std::sync::atomic::AtomicUsize,
     active_workers: std::sync::atomic::AtomicUsize,
     peak_active_workers: std::sync::atomic::AtomicUsize,
     hold_workers: AtomicBool,
     peak_reorder_items: std::sync::atomic::AtomicUsize,
-    final_reorder_items: std::sync::atomic::AtomicUsize,
+    current_reorder_items: std::sync::atomic::AtomicUsize,
     available_item_permits: std::sync::atomic::AtomicUsize,
     available_byte_permits: std::sync::atomic::AtomicUsize,
+    fail_spawn_at: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(test)]
@@ -162,17 +164,29 @@ impl PipelineTestProbe {
     pub(crate) fn worker_exits(&self) -> usize {
         self.0.worker_exits.load(Ordering::SeqCst)
     }
+    pub(crate) fn joined_workers(&self) -> usize {
+        self.0.joined_workers.load(Ordering::SeqCst)
+    }
+    pub(crate) fn active_workers(&self) -> usize {
+        self.0.active_workers.load(Ordering::SeqCst)
+    }
     pub(crate) fn peak_reorder_items(&self) -> usize {
         self.0.peak_reorder_items.load(Ordering::SeqCst)
     }
-    pub(crate) fn final_reorder_items(&self) -> usize {
-        self.0.final_reorder_items.load(Ordering::SeqCst)
+    pub(crate) fn current_reorder_items(&self) -> usize {
+        self.0.current_reorder_items.load(Ordering::SeqCst)
     }
     pub(crate) fn available_item_permits(&self) -> usize {
         self.0.available_item_permits.load(Ordering::SeqCst)
     }
     pub(crate) fn available_byte_permits(&self) -> usize {
         self.0.available_byte_permits.load(Ordering::SeqCst)
+    }
+
+    fn fail_spawn_at_for_test(&self, worker_index: usize) {
+        self.0
+            .fail_spawn_at
+            .store(worker_index.saturating_add(1), Ordering::SeqCst);
     }
 }
 
@@ -354,6 +368,69 @@ struct Pending<T> {
     _byte_permit: Option<OwnedSemaphorePermit>,
 }
 
+struct ReorderBuffer<T> {
+    items: BTreeMap<u64, Pending<T>>,
+    #[cfg(test)]
+    probe: Option<PipelineTestProbe>,
+}
+
+impl<T> ReorderBuffer<T> {
+    fn new(
+        #[cfg(test)] probe: Option<PipelineTestProbe>,
+        #[cfg(not(test))] _probe: Option<()>,
+    ) -> Self {
+        Self {
+            items: BTreeMap::new(),
+            #[cfg(test)]
+            probe,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    fn insert(&mut self, index: u64, pending: Pending<T>) -> Option<Pending<T>> {
+        let replaced = self.items.insert(index, pending);
+        self.observe();
+        replaced
+    }
+
+    fn remove(&mut self, index: &u64) -> Option<Pending<T>> {
+        let removed = self.items.remove(index);
+        self.observe();
+        removed
+    }
+
+    #[cfg(test)]
+    fn observe(&self) {
+        if let Some(probe) = &self.probe {
+            probe
+                .0
+                .peak_reorder_items
+                .fetch_max(self.items.len(), Ordering::SeqCst);
+            probe
+                .0
+                .current_reorder_items
+                .store(self.items.len(), Ordering::SeqCst);
+        }
+    }
+
+    #[cfg(not(test))]
+    fn observe(&self) {}
+}
+
+impl<T> Drop for ReorderBuffer<T> {
+    fn drop(&mut self) {
+        self.items.clear();
+        self.observe();
+    }
+}
+
 struct Work {
     partition: StreamPartition,
     queued_at: Instant,
@@ -397,93 +474,183 @@ impl<T: Send + 'static> FixedPartitionMapPool<T> {
     where
         Map: Fn(StreamPartition) -> Result<T, PipelineError> + Send + Sync + 'static,
     {
+        Self::new_with_probe_and_initial_work(
+            worker_count,
+            queue_capacity,
+            map,
+            #[cfg(test)]
+            probe,
+            #[cfg(not(test))]
+            _probe,
+            #[cfg(test)]
+            Vec::new(),
+        )
+    }
+
+    fn new_with_probe_and_initial_work<Map>(
+        worker_count: usize,
+        queue_capacity: usize,
+        map: Map,
+        #[cfg(test)] probe: Option<PipelineTestProbe>,
+        #[cfg(not(test))] _probe: Option<()>,
+        #[cfg(test)] initial_work: Vec<Work>,
+    ) -> Result<Self, PipelineError>
+    where
+        Map: Fn(StreamPartition) -> Result<T, PipelineError> + Send + Sync + 'static,
+    {
         if worker_count == 0 || queue_capacity == 0 {
             return Err(PipelineError::InvalidLimits);
         }
         let map = Arc::new(map);
         let cancelled = Arc::new(AtomicBool::new(false));
         let (work_sender, work_receiver) = std_mpsc::sync_channel::<Work>(queue_capacity);
+        #[cfg(test)]
+        for work in initial_work {
+            work_sender
+                .send(work)
+                .map_err(|_| PipelineError::WorkerPanicked)?;
+        }
         let work_receiver = Arc::new(Mutex::new(work_receiver));
-        let (result_sender, result_receiver) = mpsc::unbounded_channel();
-        let mut workers = Vec::with_capacity(worker_count);
+        let (result_sender, mut result_receiver) = mpsc::unbounded_channel();
+        let mut workers: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(worker_count);
         for worker_index in 0..worker_count {
             let receiver = Arc::clone(&work_receiver);
-            let results = result_sender.clone();
             let map = Arc::clone(&map);
-            let cancelled = Arc::clone(&cancelled);
+            let worker_cancelled = Arc::clone(&cancelled);
             #[cfg(test)]
-            let probe = probe.clone();
-            let worker = std::thread::Builder::new()
-                .name(format!("aster-stream-map-{worker_index}"))
-                .spawn(move || {
-                    loop {
-                        if cancelled.load(Ordering::Acquire) {
-                            break;
-                        }
-                        let work = match receiver.lock() {
-                            Ok(receiver) => receiver.recv(),
-                            Err(_) => {
-                                _ = results.send(Err(PipelineError::WorkerPanicked));
+            let worker_probe = probe.clone();
+            #[cfg(test)]
+            let injected_failure = probe.as_ref().is_some_and(|probe| {
+                probe.0.fail_spawn_at.load(Ordering::SeqCst) == worker_index + 1
+            });
+            #[cfg(not(test))]
+            let injected_failure = false;
+            let worker = if injected_failure {
+                Err(std::io::Error::other("injected worker spawn failure"))
+            } else {
+                let results = result_sender.clone();
+                std::thread::Builder::new()
+                    .name(format!("aster-stream-map-{worker_index}"))
+                    .spawn(move || {
+                        loop {
+                            if worker_cancelled.load(Ordering::Acquire) {
                                 break;
                             }
-                        };
-                        let Ok(work) = work else {
-                            break;
-                        };
-                        if cancelled.load(Ordering::Acquire) {
-                            break;
-                        }
-                        let started = Instant::now();
-                        let queue_wait = started.saturating_duration_since(work.queued_at);
-                        let index = work.partition.index;
-                        let bytes = work.partition.len();
-                        #[cfg(test)]
-                        if let Some(probe) = &probe {
-                            let active = probe.0.active_workers.fetch_add(1, Ordering::SeqCst) + 1;
-                            probe
-                                .0
-                                .peak_active_workers
-                                .fetch_max(active, Ordering::SeqCst);
-                            while probe.0.hold_workers.load(Ordering::SeqCst)
-                                && !cancelled.load(Ordering::Acquire)
-                            {
-                                std::thread::yield_now();
+                            let work = match receiver.lock() {
+                                Ok(receiver) => receiver.recv(),
+                                Err(_) => {
+                                    _ = results.send(Err(PipelineError::WorkerPanicked));
+                                    break;
+                                }
+                            };
+                            let Ok(work) = work else {
+                                break;
+                            };
+                            if worker_cancelled.load(Ordering::Acquire) {
+                                break;
+                            }
+                            let started = Instant::now();
+                            let queue_wait = started.saturating_duration_since(work.queued_at);
+                            let index = work.partition.index;
+                            let bytes = work.partition.len();
+                            #[cfg(test)]
+                            if let Some(probe) = &worker_probe {
+                                let active =
+                                    probe.0.active_workers.fetch_add(1, Ordering::SeqCst) + 1;
+                                probe
+                                    .0
+                                    .peak_active_workers
+                                    .fetch_max(active, Ordering::SeqCst);
+                                while probe.0.hold_workers.load(Ordering::SeqCst)
+                                    && !worker_cancelled.load(Ordering::Acquire)
+                                {
+                                    std::thread::yield_now();
+                                }
+                            }
+                            if worker_cancelled.load(Ordering::Acquire) {
+                                #[cfg(test)]
+                                if let Some(probe) = &worker_probe {
+                                    probe.0.active_workers.fetch_sub(1, Ordering::SeqCst);
+                                }
+                                break;
+                            }
+                            let mapped =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    map(work.partition)
+                                }));
+                            #[cfg(test)]
+                            if let Some(probe) = &worker_probe {
+                                probe.0.active_workers.fetch_sub(1, Ordering::SeqCst);
+                            }
+                            let result = match mapped {
+                                Ok(Ok(value)) => Ok(Pending {
+                                    mapped: MappedPartition {
+                                        index,
+                                        input_bytes: bytes,
+                                        value,
+                                    },
+                                    queue_wait,
+                                    map_time: started.elapsed(),
+                                    mapped_at: Instant::now(),
+                                    _item_permit: work.item_permit,
+                                    _byte_permit: work.byte_permit,
+                                }),
+                                Ok(Err(error)) => Err(error),
+                                Err(_) => Err(PipelineError::WorkerPanicked),
+                            };
+                            let terminal = result.is_err();
+                            if results.send(result).is_err() || terminal {
+                                break;
                             }
                         }
-                        let mapped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            map(work.partition)
-                        }));
                         #[cfg(test)]
-                        if let Some(probe) = &probe {
-                            probe.0.active_workers.fetch_sub(1, Ordering::SeqCst);
+                        if let Some(probe) = worker_probe {
+                            probe.0.worker_exits.fetch_add(1, Ordering::SeqCst);
                         }
-                        let result = match mapped {
-                            Ok(Ok(value)) => Ok(Pending {
-                                mapped: MappedPartition {
-                                    index,
-                                    input_bytes: bytes,
-                                    value,
-                                },
-                                queue_wait,
-                                map_time: started.elapsed(),
-                                mapped_at: Instant::now(),
-                                _item_permit: work.item_permit,
-                                _byte_permit: work.byte_permit,
-                            }),
-                            Ok(Err(error)) => Err(error),
-                            Err(_) => Err(PipelineError::WorkerPanicked),
-                        };
-                        let terminal = result.is_err();
-                        if results.send(result).is_err() || terminal {
-                            break;
+                    })
+            };
+            let worker = match worker {
+                Ok(worker) => worker,
+                Err(_) => {
+                    cancelled.store(true, Ordering::Release);
+                    drop(work_sender);
+                    drop(result_sender);
+                    for worker in workers.drain(..) {
+                        if worker.join().is_ok() {
+                            #[cfg(test)]
+                            if let Some(probe) = &probe {
+                                probe.0.joined_workers.fetch_add(1, Ordering::SeqCst);
+                            }
                         }
                     }
+                    if let Ok(receiver) = work_receiver.lock() {
+                        for mut work in receiver.try_iter() {
+                            work.partition.zeroize_now();
+                        }
+                    }
+                    while result_receiver.try_recv().is_ok() {}
                     #[cfg(test)]
-                    if let Some(probe) = probe {
-                        probe.0.worker_exits.fetch_add(1, Ordering::SeqCst);
+                    if let Some(probe) = &probe {
+                        probe.0.admission_open.store(false, Ordering::SeqCst);
+                        probe.0.cancellation_signalled.store(true, Ordering::SeqCst);
+                        let work_closed = work_receiver.lock().is_ok_and(|receiver| {
+                            matches!(
+                                receiver.try_recv(),
+                                Err(std_mpsc::TryRecvError::Disconnected)
+                            )
+                        });
+                        let results_closed = matches!(
+                            result_receiver.try_recv(),
+                            Err(mpsc::error::TryRecvError::Disconnected)
+                        );
+                        probe
+                            .0
+                            .channels_closed
+                            .store(work_closed && results_closed, Ordering::SeqCst);
                     }
-                })
-                .map_err(|_| PipelineError::WorkerPanicked)?;
+                    return Err(PipelineError::WorkerPanicked);
+                }
+            };
             workers.push(worker);
         }
         drop(result_sender);
@@ -573,7 +740,14 @@ impl<T: Send + 'static> FixedPartitionMapPool<T> {
         drop(self.work_sender.take());
         let mut panicked = false;
         for worker in self.workers.drain(..) {
-            panicked |= worker.join().is_err();
+            if worker.join().is_err() {
+                panicked = true;
+            } else {
+                #[cfg(test)]
+                if let Some(probe) = &self.test_probe {
+                    probe.0.joined_workers.fetch_add(1, Ordering::SeqCst);
+                }
+            }
         }
         if let Ok(receiver) = self.work_receiver.lock() {
             for mut work in receiver.try_iter() {
@@ -609,7 +783,14 @@ impl<T> Drop for FixedPartitionMapPool<T> {
         // map workers never outlive the job whose plaintext they own.
         let mut panicked = false;
         for worker in self.workers.drain(..) {
-            panicked |= worker.join().is_err();
+            if worker.join().is_err() {
+                panicked = true;
+            } else {
+                #[cfg(test)]
+                if let Some(probe) = &self.test_probe {
+                    probe.0.joined_workers.fetch_add(1, Ordering::SeqCst);
+                }
+            }
         }
         if let Ok(receiver) = self.work_receiver.lock() {
             for mut work in receiver.try_iter() {
@@ -619,8 +800,20 @@ impl<T> Drop for FixedPartitionMapPool<T> {
         while self.result_receiver.try_recv().is_ok() {}
         #[cfg(test)]
         if let Some(probe) = &self.test_probe {
-            probe.0.channels_closed.store(true, Ordering::SeqCst);
-            probe.0.final_reorder_items.store(0, Ordering::SeqCst);
+            let work_closed = self.work_receiver.lock().is_ok_and(|receiver| {
+                matches!(
+                    receiver.try_recv(),
+                    Err(std_mpsc::TryRecvError::Disconnected)
+                )
+            });
+            let results_closed = matches!(
+                self.result_receiver.try_recv(),
+                Err(mpsc::error::TryRecvError::Disconnected)
+            );
+            probe
+                .0
+                .channels_closed
+                .store(work_closed && results_closed, Ordering::SeqCst);
             if let Some(budget) = &self.test_item_budget {
                 probe
                     .0
@@ -813,7 +1006,7 @@ where
     map_pool.observe_budgets_for_test(Arc::clone(&item_budget), Arc::clone(&byte_budget));
 
     let outcome = async {
-        let mut reorder = BTreeMap::<u64, Pending<T>>::new();
+        let mut reorder = ReorderBuffer::new(test_probe.clone());
         let mut stages = [StageObservation::default(); PIPELINE_STAGE_COUNT];
         let mut accepted_items = 0_u64;
         let mut completed_items = 0_u64;
@@ -826,9 +1019,11 @@ where
 
         loop {
             let mut in_flight_items = limits.max_in_flight_items - item_budget.available_permits();
-            while in_flight_items < limits.max_in_flight_items
-                && in_flight_items < limits.max_reorder_items
-            {
+            let admission_limit = limits
+                .max_reorder_items
+                .saturating_add(1)
+                .min(limits.max_in_flight_items);
+            while in_flight_items < admission_limit {
                 if next_partition.is_none() && !source_done {
                     let next = if in_flight_items == 0 {
                         source.next_partition().await
@@ -909,24 +1104,33 @@ where
             let reorder_started = Instant::now();
             let index = pending.mapped.index;
             let bytes = pending.mapped.input_bytes;
-            if reorder.insert(index, pending).is_some() {
+            if index < next_index {
                 return Err(PipelineError::NonContiguousIndex {
                     expected: next_index,
                     actual: index,
                 });
             }
-            peak_reorder = peak_reorder.max(reorder.len());
-            #[cfg(test)]
-            if let Some(probe) = &test_probe {
-                probe
-                    .0
-                    .peak_reorder_items
-                    .fetch_max(reorder.len(), Ordering::SeqCst);
-                probe
-                    .0
-                    .final_reorder_items
-                    .store(reorder.len(), Ordering::SeqCst);
+            if index != next_index {
+                if reorder.len() >= limits.max_reorder_items
+                    || reorder.insert(index, pending).is_some()
+                {
+                    return Err(PipelineError::NonContiguousIndex {
+                        expected: next_index,
+                        actual: index,
+                    });
+                }
+                peak_reorder = peak_reorder.max(reorder.len());
+                add_observation(
+                    &mut stages,
+                    PipelineStage::Reorder,
+                    bytes,
+                    Duration::ZERO,
+                    reorder_started.elapsed(),
+                    Duration::ZERO,
+                );
+                continue;
             }
+
             add_observation(
                 &mut stages,
                 PipelineStage::Reorder,
@@ -936,14 +1140,8 @@ where
                 Duration::ZERO,
             );
 
-            while let Some(pending) = reorder.remove(&next_index) {
-                #[cfg(test)]
-                if let Some(probe) = &test_probe {
-                    probe
-                        .0
-                        .final_reorder_items
-                        .store(reorder.len(), Ordering::SeqCst);
-                }
+            let mut ready = Some(pending);
+            while let Some(pending) = ready.take().or_else(|| reorder.remove(&next_index)) {
                 let bytes = pending.mapped.input_bytes;
                 add_observation(
                     &mut stages,
@@ -994,7 +1192,6 @@ where
     #[cfg(test)]
     if let Some(probe) = &test_probe {
         probe.0.channels_closed.store(true, Ordering::SeqCst);
-        probe.0.final_reorder_items.store(0, Ordering::SeqCst);
         probe
             .0
             .available_item_permits
@@ -1325,9 +1522,9 @@ mod tests {
         .await
         .expect("pipeline");
         assert_eq!(report.peak_reorder_items(), 2);
-        assert!(report.peak_in_flight_items() <= 2);
+        assert!(report.peak_in_flight_items() <= 3);
         assert_eq!(probe.peak_reorder_items(), 2);
-        assert_eq!(probe.final_reorder_items(), 0);
+        assert_eq!(probe.current_reorder_items(), 0);
     }
 
     #[tokio::test]
@@ -1335,42 +1532,74 @@ mod tests {
         let job = StreamJobId::from_bytes([11; 16]);
         let probe = PipelineTestProbe::install(job);
         let zeroized = Arc::new(AtomicUsize::new(0));
-        let active = Arc::new(AtomicUsize::new(0));
-        let map_active = Arc::clone(&active);
-        let started = Arc::new((Mutex::new(0_usize), Condvar::new()));
-        let map_started = Arc::clone(&started);
-        let result = run_ordered_pipeline(
+        struct Plaintext {
+            bytes: Vec<u8>,
+            zeroized: Arc<AtomicUsize>,
+        }
+        impl Drop for Plaintext {
+            fn drop(&mut self) {
+                self.bytes.zeroize();
+                self.zeroized.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let map_release = Arc::clone(&release);
+        let map_zeroized = Arc::clone(&zeroized);
+        let (sender, receiver) = mpsc::channel(3);
+        for index in 0..3 {
+            sender
+                .send(Ok(StreamPartition::new(index, vec![0x5a; 16])
+                    .observe_zeroize_for_test(Arc::clone(&zeroized))))
+                .await
+                .unwrap();
+        }
+        let pipeline = tokio::spawn(run_ordered_channel_pipeline(
             job,
-            (0..2)
-                .map(|index| {
-                    StreamPartition::new(index, vec![0x5a; 16])
-                        .observe_zeroize_for_test(Arc::clone(&zeroized))
-                })
-                .collect::<Vec<_>>(),
-            PipelineLimits::new(2, 2, 32, 2).expect("limits"),
+            receiver,
+            PipelineLimits::new(2, 3, 48, 1).expect("limits"),
             move |partition| {
-                map_active.fetch_add(1, Ordering::SeqCst);
-                let (count, condition) = &*map_started;
-                let mut count = count.lock().expect("worker-start gate");
-                *count += 1;
-                condition.notify_all();
                 if partition.index() == 0 {
-                    while *count < 2 {
-                        count = condition.wait(count).expect("wait for active worker");
+                    let (released, condition) = &*map_release;
+                    let mut released = released.lock().expect("failure gate");
+                    while !*released {
+                        released = condition.wait(released).expect("wait for failure release");
                     }
-                    drop(count);
-                    std::thread::sleep(Duration::from_millis(10));
-                } else {
-                    drop(count);
                 }
-                map_active.fetch_sub(1, Ordering::SeqCst);
-                Ok(())
+                Ok(Plaintext {
+                    bytes: partition.into_bytes(),
+                    zeroized: Arc::clone(&map_zeroized),
+                })
             },
             |_| std::future::ready(Err(PipelineError::SinkFailed("cancel".into()))),
-        )
-        .await;
+        ));
+
+        while probe.current_reorder_items() != 1 || probe.active_workers() != 1 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            sender.capacity(),
+            2,
+            "one plaintext partition must remain queued"
+        );
+        assert_eq!(
+            zeroized.load(Ordering::SeqCst),
+            0,
+            "failure not injected yet"
+        );
+        {
+            let (released, condition) = &*release;
+            *released.lock().expect("release failure gate") = true;
+            condition.notify_all();
+        }
+        let result = pipeline.await.expect("join pipeline task");
         assert!(matches!(result, Err(PipelineError::SinkFailed(_))));
-        assert_eq!(active.load(Ordering::SeqCst), 0, "worker still running");
+        assert!(
+            sender
+                .send(Err(PipelineError::EmptyPartition))
+                .await
+                .is_err()
+        );
         assert!(!probe.admission_open(), "admission remained open");
         assert!(
             probe.cancellation_signalled(),
@@ -1378,16 +1607,48 @@ mod tests {
         );
         assert!(probe.channels_closed(), "pipeline channels remained open");
         assert_eq!(probe.worker_exits(), 2, "not every fixed worker exited");
+        assert_eq!(probe.joined_workers(), 2, "not every fixed worker joined");
         assert_eq!(probe.peak_active_workers(), 2);
-        assert_eq!(probe.peak_reorder_items(), 2);
-        assert_eq!(probe.available_item_permits(), 2);
-        assert_eq!(probe.available_byte_permits(), 32);
-        assert_eq!(probe.final_reorder_items(), 0);
-        assert!(
-            zeroized.load(Ordering::SeqCst) >= 2,
-            "queued plaintext buffers were not zeroized: {}",
-            zeroized.load(Ordering::SeqCst)
+        assert_eq!(probe.peak_reorder_items(), 1);
+        assert_eq!(probe.available_item_permits(), 3);
+        assert_eq!(probe.available_byte_permits(), 48);
+        assert_eq!(probe.current_reorder_items(), 0);
+        assert_eq!(zeroized.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn partial_worker_spawn_failure_joins_created_workers_before_returning() {
+        let job = StreamJobId::from_bytes([13; 16]);
+        let probe = PipelineTestProbe::install(job);
+        probe.hold_workers_for_test();
+        probe.fail_spawn_at_for_test(2);
+        let zeroized = Arc::new(AtomicUsize::new(0));
+        let item_budget = Arc::new(Semaphore::new(1));
+        let byte_budget = Arc::new(Semaphore::new(16));
+        let work = Work {
+            partition: StreamPartition::new(0, vec![0x5a; 16])
+                .observe_zeroize_for_test(Arc::clone(&zeroized)),
+            queued_at: Instant::now(),
+            item_permit: Some(Arc::clone(&item_budget).try_acquire_owned().unwrap()),
+            byte_permit: Some(Arc::clone(&byte_budget).try_acquire_many_owned(16).unwrap()),
+        };
+        let result = FixedPartitionMapPool::<Vec<u8>>::new_with_probe_and_initial_work(
+            3,
+            3,
+            |partition| Ok(partition.into_bytes()),
+            Some(probe.clone()),
+            vec![work],
         );
+        assert!(matches!(result, Err(PipelineError::WorkerPanicked)));
+        assert!(!probe.admission_open());
+        assert!(probe.cancellation_signalled());
+        assert!(probe.channels_closed());
+        assert_eq!(probe.worker_exits(), 2);
+        assert_eq!(probe.joined_workers(), 2);
+        assert_eq!(probe.active_workers(), 0);
+        assert_eq!(zeroized.load(Ordering::SeqCst), 1);
+        assert_eq!(item_budget.available_permits(), 1);
+        assert_eq!(byte_budget.available_permits(), 16);
     }
 
     #[tokio::test]
