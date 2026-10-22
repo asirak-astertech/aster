@@ -2,234 +2,249 @@
 
 ## Status and scope
 
-Implemented the remaining local finalization performance remediation in signed commit
-`ff6bc04f8b561b2cf91d600bb077dfb5a1b8e755` (`perf(blob): pipeline local
-finalization`). The change preserves the two-job finalizer admission/lifetime model while
-replacing each job's whole-Blob prepare replay and serial canonical encryption with a
-restart-safe digest artifact and a bounded canonical-chunk pipeline.
+The original Phase B implementation is in signed commit
+`ff6bc04f8b561b2cf91d600bb077dfb5a1b8e755`. Review round 1 corrects every
+finding in `task-12-finalization-review.md`: atomic sidecar creation and crash
+recovery, worker-owned provisional decrypt, exact sidecar capacity migration,
+whole-finalizer metrics, canonical v3 validation, and zeroizing digest
+ownership. The signed correction commit is recorded below after creation.
 
-No device, deployment, push, full workspace test suite, or ignored 800-MiB/1-GiB
-measurement run was performed.
+No transport file, device, deployment, push, full workspace test suite, or
+ignored 800-MiB/1-GiB measurement run was touched or executed.
 
 ## Test-first evidence
 
-The production-path occupancy regression was written before the implementation.
-
-RED command:
+The review fixes began with regressions that failed against the signed
+candidate:
 
 ```text
+cargo test -p aster-redb-store upload_digest_v2_resume_recreates_a_torn_unprojected_sidecar --lib -- --nocapture
+  RED: UnexpectedEof while opening the torn final-name sidecar
+
+cargo test -p aster-redb-store checkpoint_v3_rejects_missing_digest_projection --lib -- --nocapture
+  RED: v3 without a digest projection decoded successfully
+
+cargo test -p aster-redb-store upload_capacity_charges_the_exact_canonical_digest_artifact --lib -- --nocapture
+  RED: charged 196743 bytes, expected 196925 bytes (86 + 3*32 absent)
+
 cargo test -p aster-node stream_upload_finalization_occupies_multiple_chunk_workers --lib -- --nocapture
+  RED: the probe observed canonical encryption workers but no worker-owned
+       provisional decrypt/read
 ```
 
-RED result: exit 101. The old whole-Blob/serial implementation failed at
-`application::blob::tests::stream_upload_finalization_occupies_multiple_chunk_workers`
-with `one Blob occupied only 0 map worker`.
+The same tests are GREEN after the implementation. Additional crash/reopen,
+legacy-capacity pressure, privacy-boundary, one-pass, parity, cancellation, and
+zeroization regressions are listed under verification.
 
-After implementing the durable digest path and fixed-worker finalizer, the same command
-passed: 1 passed, 0 failed, 657 filtered out. The final focused group passed 9 runnable
-upload tests with 2 exact-size gates ignored by design.
+## Durable digest artifact and crash recovery
 
-## Design and execution DAG
-
-### Existing upload pass
+The fixed-stride artifact remains:
 
 ```text
-caller bytes
-  -> canonical 64-KiB incremental digest state (no extra plaintext chunk buffer)
-  -> fixed-stride 32-byte digest sidecar append
-  -> existing 1-MiB provisional segment seal/pack append
-  -> sidecar sync
-  -> pack sync
-  -> alternating combined checkpoint v3 sync
-  -> one redb upload-frontier projection
+86-byte versioned header
+  + 32 * ceil(total_len / 64 KiB) canonical plaintext digests
 ```
 
-The sidecar is private to the owner-qualified upload pack and starts with a versioned
-header containing the upload ID, immutable request digest, total length, and canonical
-chunk size. Its body is exactly one 32-byte digest per canonical chunk, bounded by
-`MAX_BLOB_CHUNKS`. The checkpoint records the digest count, exact projected file length,
-SHA-256 commitment, and incremental whole-plaintext SHA-256 state. This is O(n) durable
-data and avoids rewriting a growing digest vector into redb at every checkpoint.
+The header canonically binds the upload ID, immutable request digest, total
+length, and canonical chunk size. A v3 combined checkpoint binds the projected
+digest count, exact projected file length, SHA-256 artifact commitment, and a
+versioned/canonical whole-plaintext SHA-256 state. The SHA state is eight
+big-endian chaining words, a big-endian compressed-block count, one buffered
+length, and a zero-padded 64-byte partial block. Decode rejects impossible
+counts, lengths, padding, arithmetic, state/offset combinations, dependency
+round-trip disagreement, and identity mismatch before truncation or mutation.
 
-### Finalization
+First creation now uses the existing pinned-directory atomic writer: a
+same-directory private `O_NOFOLLOW`, `0600`, `CREATE|EXCL` temporary file is
+written completely, synchronized, atomically renamed, and followed by parent
+directory synchronization. Test path roots use the same create/write/sync/
+rename/parent-sync discipline. Partial private temporaries are invisible.
+
+If the authoritative checkpoint has no digest projection (`None` or genuine
+pack v2), an invalid unprojected final-name artifact can be discarded and
+atomically reconstructed. Pack audit permits such a torn unprojected artifact
+only after enforcing the private regular-file/owner/link/no-follow boundary.
+Once a v3 projection exists, header, commitment, length, count, and SHA state
+remain fail-closed. Unprojected tails after combined-checkpoint sync but before
+redb projection are validated and truncated back to the redb-authoritative
+frontier on resume.
+
+The one-time durable-v2 migration rereads/decrypts its already durable prefix
+exactly once to construct and project v3. A counter regression distinguishes
+that migration from normal operation: v3 resume/finalization rereads zero
+plaintext for digest reconstruction, v2 migration rereads its prefix once,
+and the next v3 reopen again rereads zero.
+
+## Exact capacity and legacy migration
+
+Fresh reservations now charge the provisional pack reservation plus the exact
+digest artifact size, including the 86-byte header for an empty Blob. Durable
+upload encoding is versioned: legacy row v1 validates with the legacy formula;
+current row v2 validates with the sidecar-inclusive formula.
+
+Before a legacy row can create a sidecar, its reserve transaction calculates
+the additional physical bytes and atomically checks/reserves them. Capacity
+pressure returns without changing the durable row or artifacts, so a later
+retry can succeed. The migration regression proves byte-for-byte unchanged
+state after failure, exact-limit success after reopening with sufficient
+capacity, audit equality, and cleanup returning to the baseline.
+
+## Finalization execution DAG
 
 ```text
-projected v3 checkpoint + sidecar
-  -> validate identity/count/length/commitment/SHA state
-  -> reconstruct PreparedBlob and canonical manifest without plaintext replay
-  -> open one projected provisional-pack reader
-  -> partition: read/decrypt one canonical 64-KiB chunk
-  -> bounded fixed map pool: canonical digest check + in-place canonical AEAD seal
-  -> bounded deterministic index reorder
-  -> ordered depot commit of complete canonical chunk records
-  -> finish manifest
-  -> existing single atomic publication transaction
-  -> existing cleanup/retry convergence
+coordinator: validate projected v3 checkpoint + load one zeroizing digest vector
+  -> submit bounded segment descriptors only
+
+two persistent map workers per Blob:
+  -> independently open exact projected provisional segment
+  -> decrypt/read that segment once under the global CPU permit
+  -> split into canonical 64-KiB chunks
+  -> borrow retained digest, validate, canonical-encrypt
+  -> return one ordered segment bundle
+
+ordered sink:
+  -> deterministic bounded reorder by segment index
+  -> commit canonical records/chunks
+  -> build measured manifest and route
+  -> existing atomic publication and cleanup convergence
 ```
 
-There is no serial compatibility fallback in normal v3 finalization. Every provisional
-segment is opened once and each plaintext byte is read/decrypted once during
-finalization. The map closure uses a provider-bound sealer rather than exporting key or
-algorithm controls. The ordered sink retains the existing depot and publication
-authorities.
+The coordinator never calls `UploadPackPlainReader::read_exact`. A production
+probe records decrypt observations from the named map workers, and the focused
+test requires multiple provisional segments, more than one worker, exact
+segment-read count, one read/decrypt per byte, and canonical identity/ciphertext
+parity with the serial reference. There is no whole-object plaintext buffer.
 
-## Durability, format, and crash boundaries
+Two finalizer jobs remain admitted. Each has two persistent map workers and at
+most two admitted/reorder segment bundles. A shared four-permit budget covers
+provisional open/decrypt/read plus canonical encryption, so the four-core CM4
+cannot run more than four cryptographic CPU phases across both jobs. All
+success, source/map/sink failure, cancellation, and panic paths close
+admission, drain owned queues/results/reorder values, join workers, and rely on
+zeroizing plaintext/ciphertext owners.
 
-Pack data remains format v2. Sidecar-free pack checkpoints remain actual checkpoint v2
-records, preserving supported pre-sidecar rows. Combined pack-plus-digest checkpoints
-are v3 records. Decoding retains the checkpoint version, and a nonzero one-time digest
-rebuild is authorized only by a genuine v2 checkpoint; a v3 checkpoint never receives
-that migration path.
+## Whole-finalizer memory and operation measurements
 
-The one-time v2 migration decrypts and rereads exactly the already-durable staged prefix,
-constructs the sidecar, writes a combined v3 checkpoint, and projects it. A focused
-counter assertion proves:
+The runner's `pipeline_peak_owned_bytes` remains a pipeline-only observation.
+The JSON `peak_owned_bytes` is now the whole-finalizer peak across mutually
+exclusive preparation, pipeline, and manifest/route phases. It includes:
 
-- normal v3 resume replays 0 bytes;
-- v2 migration replays exactly its durable prefix once;
-- the first resume after that v3 projection again replays 0 bytes.
+- the one retained canonical digest vector;
+- request/manifest metadata capacities;
+- provisional encoded record, decrypted segment, canonical plaintext/
+  ciphertext work, and mapped segment output for both inner workers;
+- complete manifest bytes;
+- every route-tree level, with route leaves moved into the tree rather than
+  cloned.
 
-At a normal checkpoint, durability is ordered sidecar sync, pack sync, alternating
-combined checkpoint sync, then redb projection. A crash before redb projection leaves
-only unprojected tails; resume validates every projected identity/count/length/hash/SHA
-field before truncating either artifact back to the projected boundary. A truncated,
-misbound, mismatched, or corrupt sidecar fails closed.
-
-The persisted SHA-256 snapshot is explicitly artifact format v1 and is not the raw sha2
-serialization. It consists of eight big-endian chaining words, a big-endian compressed
-64-byte-block count, one buffered-byte count, and a zero-padded 64-byte partial block.
-Restore rejects buffered counts at or above 64, nonzero padding, arithmetic overflow,
-state/offset disagreement, dependency deserialization failure, and non-canonical
-round-trips before caller-side truncation or mutation. The pinned sha2 representation is
-confined to an adapter at the artifact boundary.
-
-## Ownership, cancellation, and resource bounds
-
-One finalizer job uses 2 persistent map workers, at most 4 admitted canonical chunks,
-and at most 4 reorder entries. There is no per-chunk thread creation, unbounded queue,
-detached worker, or whole-object buffer. Worker map panics are caught as terminal pipeline
-errors. Success, source/map/sink failure, cancellation, and panic all close admission,
-signal cancellation, drain owned queued/results/reorder values, join every worker, and
-zeroize plaintext/ciphertext vectors through their owners.
-
-The plaintext vector reserves the AEAD tag in advance and becomes the ciphertext vector
-in place. The explicit production accounting is:
+The conservative two-job bound exported to the measurement JSON and asserted
+in the regression is exactly the production constant:
 
 ```text
-canonical owned bytes/chunk = 65,536 + 16 = 65,552
-per-job pipeline bound       = 4 * 65,552 = 262,208 bytes
-two-job pipeline bound       = 2 * 262,208 = 524,416 bytes
-one staged segment/job       = 1,048,576 bytes
-aggregate sensitive bound    = 2 * (1,048,576 + 262,208)
-                             = 2,621,568 bytes
+worker_peak = 3 * 1 MiB
+            + 16 * sizeof(BlobFinalizeMappedChunk)
+
+per_job = (MAX_BLOB_CHUNKS * 32)                  digest material
+        + 2 * worker_peak                         two inner workers
+        + MAX_BLOB_MANIFEST_BYTES                 complete manifest
+        + (2 * MAX_BLOB_CHUNKS * 32
+           + 32 * sizeof(Vec<[u8; 32]>))          route levels
+        + 3 * (MAX_MEDIA_TYPE + MAX_SCHEMA_ID)    owned metadata
+
+aggregate_sensitive_byte_bound = 2 * per_job
+aggregate_pipeline_byte_bound  = 2 jobs * 2 bundles * 2 MiB
+aggregate_cpu_budget           = 4
 ```
 
-Digest metadata is separately bounded by `MAX_BLOB_CHUNKS` and contains digests rather
-than retained plaintext. Upload-side fragmented chunk hashing is incremental, so the
-sidecar writer does not own another 64-KiB plaintext copy.
+The reorder peak now subtracts the expected next item only when it is actually
+present, so one genuinely out-of-order result reports one rather than zero.
 
-Across the two existing finalizer jobs, the execution topology is 2 coordinator threads
-plus 2 map workers per job. A shared four-permit production CPU budget covers both staged
-segment open/decrypt/read and canonical encryption. Therefore no more than four
-cryptographic CPU phases can execute concurrently on a four-core CM4, even though
-coordinators may concurrently block on I/O, ordering, or the sink. The regression asserts
-the two-job formula and the global budget value.
+`store_operations` was removed because it overclaimed complete observation.
+The replacement `store_phase_calls` is deliberately narrow: it counts six
+explicit top-level finalizer calls into Store-backed helpers and says nothing
+about nested redb work. Actual chunk-depot work continues to be observed at
+the real `BlobStore` trait boundary by `MeasuredBlobStore`; adding a depot API
+call without going through that boundary changes the asserted formula. For N
+canonical chunks the successful measured path observes `4N + 2` depot calls,
+exact plaintext bytes, `Blob length + 16N` encrypted bytes, and exactly
+`ceil(Blob length / 1 MiB)` provisional reads.
 
-## Measurements and operation counts
+## Digest ownership and privacy boundary
 
-`BlobFinalizeMetrics` retains real observations for admission, map, reorder, and sink
-items/bytes/queue-wait/service/output-blocked durations; partition count; configured and
-peak active workers; peak admitted items/bytes, owned bytes, encoding bytes, and reorder
-items; plaintext bytes read; encrypted bytes; provisional segment opens; depot calls; and
-store orchestration calls.
+Sidecar material, SHA snapshots/commitments, and the single retained digest
+vector use zeroizing ownership. `PreparedBlob` and map workers share one
+`Arc<Zeroizing<Vec<[u8; 32]>>>`; the earlier plain-vector clone is gone, and
+workers borrow each digest rather than creating a temporary copy. SHA-256
+state has a compile-time `ZeroizeOnDrop` assertion. Canonical chunk records
+necessarily retain their authenticated plaintext digest as part of the
+existing record format.
 
-For N canonical chunks on the successful measured path, the focused regression observes:
-
-```text
-plaintext bytes read = exact Blob length
-encrypted bytes      = Blob length + 16N
-provisional opens    = ceil(Blob length / 1 MiB)
-depot operations     = 4N + 2
-store operations     = 6 (including successful cleanup)
-```
-
-The depot count is measured around the actual `BlobStore` implementation, not inferred
-from a codec helper. A serial reference publication is installed first in the same
-provider/epoch; the pipelined publication produces the same canonical Blob ID and must
-idempotently match the already-stored canonical ciphertext/records.
-
-Ignored gates
-`stream_upload_finalization_measurement_800_mib` and
-`stream_upload_finalization_measurement_1_gib` compile locally and emit schema
-`aster.local_blob_finalization.measurement.v1`, including every metric above plus the
-aggregate CPU and byte bounds. They were intentionally not executed locally.
-
-## Compatibility analysis
-
-- Public application API shapes are unchanged.
-- Canonical chunk size, manifest encoding, Blob identity, content verification, and
-  canonical ciphertext construction are unchanged.
-- The existing two-job admission queue, caller-independent completion lifetime,
-  policy/epoch replay and recheck, exact-operation retry, capacity credit and limits,
-  atomic publication, cleanup-gap authority, and restart convergence remain in place.
-- Empty, exact-chunk, maximum-boundary, policy change, retry, cleanup-authority,
-  admission saturation, caller-drop, closed-pool, responsiveness, and worker-panic
-  focused regressions pass.
-- Existing v2 projected uploads are readable and are upgraded once. New normal uploads
-  project combined v3 checkpoints. No provisional data becomes readable.
+The artifact is not cryptographically protected at rest. The store layer has
+no provider/node/mission content key without introducing a second authority,
+so this increment deliberately keeps the reviewed filesystem boundary:
+pinned owner-qualified directory, `O_NOFOLLOW`, private `0600` file,
+same-owner regular-file validation, and link count one. This prevents broader
+filesystem disclosure and link/symlink substitution, but it does not protect
+against the same Unix account or offline disk access; raw unkeyed digests permit
+equality and dictionary attacks. Tests assert the boundary and symlink
+rejection without claiming encryption.
 
 ## Verification evidence
 
-All commands below completed successfully unless explicitly described as RED above.
+Fresh focused gates after review correction:
 
 ```text
 cargo fmt --all -- --check
-git diff --check
-cargo test -p aster-node stream_upload_ --lib -- --nocapture
-  9 passed; 0 failed; 2 ignored
-cargo test -p aster-node selected_blob_publish_stream_ --lib -- --nocapture
-  2 passed; 0 failed
-cargo test -p aster-node stream_finalize_ --lib -- --nocapture
-  5 passed; 0 failed
-cargo test -p aster-node stream_pipeline::tests --lib -- --nocapture
-  14 passed; 0 failed
-cargo test -p aster-redb-store pack::tests --lib -- --nocapture
-  7 passed; 0 failed
-cargo test -p aster-node --lib --no-run
-  success; ignored 800-MiB and 1-GiB gates compiled
-cargo check --locked --workspace --all-targets
-  success
-cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
-  success
-sh tools/check-cargo-lockfiles.sh
-  success for the workspace, fuzz, and evaluation-v0 lockfiles
-python3 tools/check-implementation-requirements.py
-  valid: 348 matrix IDs; 140 exact selected mappings
-python3 tools/check-protocol-version-contract.py
-  passed: semantic versions 1 through 9 align
-python3 tools/test-protocol-version-contract.py
-  36 passed
-python3 tools/check-selected-node-dependency-boundary.py
   passed
-python3 tools/check-project-license.py
-  passed for 18 packages
+git diff --check
+  passed
+cargo clippy -p aster-core -p aster-redb-store -p aster-node --lib --tests -- -D warnings
+  passed
+
+cargo test -p aster-node stream_upload_finalization_ --lib -- --nocapture
+  5 passed; 0 failed; 2 ignored exact-size gates; 657 filtered
+
+cargo test -p aster-redb-store upload_digest_ --lib -- --nocapture
+  3 passed; 0 failed
+cargo test -p aster-redb-store checkpoint_v3_rejects_missing_digest_projection --lib -- --nocapture
+  1 passed; 0 failed
+cargo test -p aster-redb-store upload_capacity_charges_the_exact_canonical_digest_artifact --lib -- --nocapture
+  1 passed; 0 failed
+cargo test -p aster-redb-store legacy_upload_capacity_upgrade_is_atomic_under_pressure_and_reopen --lib -- --nocapture
+  1 passed; 0 failed
+cargo test -p aster-redb-store store_reopen_accepts_and_new_upload_recreates_torn_unprojected_sidecar --lib -- --nocapture
+  1 passed; 0 failed
+cargo test -p aster-redb-store digest_sidecar_enforces_the_documented_local_private_boundary --lib -- --nocapture
+  1 passed; 0 failed
+cargo test -p aster-redb-store upload_sync_and_projection_faults_reopen_without_invented_progress --lib -- --nocapture
+  1 passed; 0 failed
 ```
 
-The full `mise run check` was not run because this task explicitly prohibited the full
-workspace test suite. Its required formatting, strict all-feature/all-target Clippy,
-all-target compile, relevant foundation/contract checks, and focused regressions were run
-individually instead.
+The redb group covers partial atomic create, v2 torn-final recreation, header
+and combined-checkpoint durability states, pre-redb-projection tails, projected
+resume truncation, Store reopen, exact capacity pressure/retry/reopen, cleanup
+baseline, v3 canonical rejection, and the stated local-private boundary.
+
+The ignored `stream_upload_finalization_measurement_800_mib` and
+`stream_upload_finalization_measurement_1_gib` gates still compile but were not
+run. No full workspace suite or broad check script was run in this fix round.
+
+## Signed commits
+
+- `ff6bc04f8b561b2cf91d600bb077dfb5a1b8e755` — initial Phase B implementation
+- `cb3822839d73cb178b6ab04a09aca4d65d7079c5` — initial Phase B report
+- `071c65ce97e26584897a74612ff1c94d4f5e4060` — review-round implementation corrections
+- the signed documentation commit containing this report
 
 ## Remaining concerns
 
-- The exact-size 800-MiB and 1-GiB gates are compiled but have no local runtime/throughput
-  receipt; they still require an authorized measurement host.
-- `cargo check --workspace --all-targets` reports a pre-existing configuration-specific
-  unused `SessionKeys` import and Cargo reports the existing future-incompatibility notice
-  for `proc-macro-error2 v2.0.1`. Strict all-feature Clippy passes, and neither warning is
-  introduced by this commit.
-- A future sha2 upgrade must keep or deliberately update the small dependency adapter;
-  the persisted artifact codec itself is versioned and canonical.
-
-The report is committed separately with a signed documentation commit; its exact ID is
-the commit containing this file in the branch history.
+- The exact-size 800-MiB and 1-GiB runtime/throughput receipts still require an
+  authorized measurement host.
+- The sidecar intentionally exposes unkeyed digest equality to the same Unix
+  account or offline disk access, as documented above; protecting it would
+  require a new Store-layer authority design.
+- Opening an independent pinned reader per segment repeats bounded checkpoint
+  validation metadata I/O; it does not reread provisional plaintext, but a
+  future measured optimization could pass a prevalidated pinned segment view.
+- `store_phase_calls` is intentionally not an all-redb-operation metric. Depot
+  operations are the real API-boundary observation used for growth detection.
