@@ -217,38 +217,121 @@ def validate_blob_documentation_contract(documents: dict[str, str]) -> None:
     for surface in ("node_api", "transports", "recipes"):
         require_document(surface, surface, profile_statement)
         require_document(surface, surface, chunk_statement)
-        normalized = " ".join(
-            documents.get(surface, "").replace("//!", "").split()
-        )
-        if re.search(
-            r"independently authenticated 1[- ]MiB segments", normalized, re.I
-        ):
-            fail(f"Blob documentation {surface} contradiction is present")
+        surface_text = documents.get(surface, "").replace("//!", "")
+        for statement in re.split(r"(?<=[.!?])\s+|\n+", surface_text):
+            segment_claim = " ".join(statement.lower().replace("-", " ").split())
+            explicitly_denies_segment_claim = bool(
+                re.search(
+                    r"\b(?:does|do|is|are|can|must)\s+not\b[^.]*"
+                    r"(?:\bindependen\w*\b|\bauthenticat\w*\b)|"
+                    r"\bnever\b[^.]*\bauthenticat\w*\b",
+                    segment_claim,
+                )
+            )
+            if not explicitly_denies_segment_claim and all(
+                re.search(term, segment_claim)
+                for term in (
+                    r"\b1\s*mib\b",
+                    r"\bsegments?\b",
+                    r"\bauthenticat\w*\b",
+                    r"\bindependen\w*\b",
+                )
+            ):
+                fail(f"Blob documentation {surface} contradiction is present")
 
     runbook = " ".join(documents.get("runbook", "").split())
-    if re.search(
-        r"(?:RESULT[^.]{0,120}ACK[^.]{0,120}before[^.]{0,80}(?:canonical )?promotion|"
-        r"promotion occurs only after[^.]{0,160}RESULT[^.]{0,80}ACK)",
-        runbook,
-        re.I,
-    ):
-        fail("Blob documentation receiver settlement contradiction is present")
     for sentence in re.split(r"(?<=[.!?])\s+", runbook):
         lowered = sentence.lower()
-        if (
-            "receipt" in lowered
-            and ("attempt nonce" in lowered or "attempt binding" in lowered)
-            and any(word in lowered for word in ("persists", "contains", "binds"))
-            and "does not persist" not in lowered
-            and "does not bind" not in lowered
+        has_settlement_terms = all(
+            term in lowered for term in ("promotion", "result", "ack")
+        )
+        result_and_ack_precede_promotion = re.search(
+            r"(?:result.*ack|ack.*result).*\bbefore\b.*promotion", lowered
+        )
+        promotion_follows_result_and_ack = re.search(
+            r"promotion.*\b(?:after|follows?|following)\b.*(?:result.*ack|ack.*result)",
+            lowered,
+        )
+        explicitly_denies_settlement_claim = bool(
+            re.search(
+                r"promotion.*\b(?:does|did|can|must)\s+not\s+"
+                r"(?:follow|occur|happen)",
+                lowered,
+            )
+        )
+        if not explicitly_denies_settlement_claim and has_settlement_terms and (
+            result_and_ack_precede_promotion or promotion_follows_result_and_ack
         ):
-            fail("Blob documentation receipt attempt contradiction is present")
+            fail("Blob documentation receiver settlement contradiction is present")
+
+        storage_verbs = {
+            "persist",
+            "persists",
+            "persisted",
+            "store",
+            "stores",
+            "stored",
+            "contain",
+            "contains",
+            "contained",
+            "bind",
+            "binds",
+            "bound",
+            "record",
+            "records",
+            "recorded",
+            "save",
+            "saves",
+            "saved",
+        }
+        for receipt_clause in re.split(r"[;]", lowered):
+            words = re.findall(r"[a-z]+", receipt_clause)
+            storage_pattern = (
+                r"(?:persist\w*|stor\w*|contain\w*|bind\w*|bound|record\w*|sav\w*)"
+            )
+            explicitly_denies_attempt_storage = bool(
+                re.search(
+                    rf"(?:does|do|did|can|must)\s+not\s+{storage_pattern}"
+                    rf"[^;]*attempt (?:nonce|binding)|"
+                    rf"attempt (?:nonce|binding)[^;]*\bnot\b[^;]*{storage_pattern}",
+                    receipt_clause,
+                )
+            )
+            positive_storage_claim = any(
+                word in storage_verbs
+                and not any(
+                    negation in words[max(0, index - 3) : index]
+                    for negation in ("no", "not", "never", "without")
+                )
+                for index, word in enumerate(words)
+            )
+            if (
+                "receipt" in lowered
+                and (
+                    "attempt nonce" in receipt_clause
+                    or "attempt binding" in receipt_clause
+                )
+                and positive_storage_claim
+                and not explicitly_denies_attempt_storage
+            ):
+                fail("Blob documentation receipt attempt contradiction is present")
     for clause in re.split(r"[.;]", runbook):
         lowered = clause.lower()
+        explicitly_denies_receiver_deadline = bool(
+            re.search(
+                r"(?:does|do|did|can|must)\s+not\s+"
+                r"(?:calculat\w*|deriv\w*|bas\w*|use\w*)[^;]*hard deadline",
+                lowered,
+            )
+        )
         if (
-            "receiver" in lowered
+            not explicitly_denies_receiver_deadline
+            and any(
+                role in lowered for role in ("receiver", "receiving", "incoming")
+            )
             and "hard deadline" in lowered
-            and ("exact content" in lowered or "exact canonical wire" in lowered)
+            and "exact" in lowered
+            and any(unit in lowered for unit in ("content", "wire", "bytes"))
         ):
             fail("Blob documentation receiver timeout contradiction is present")
 
@@ -265,13 +348,21 @@ def validate_blob_documentation_contract(documents: dict[str, str]) -> None:
     performance = " ".join(documents.get("performance", "").split())
     for sentence in re.split(r"(?<=[.!?])\s+", performance):
         lowered = sentence.lower()
+        support_verbs = r"(?:validat\w*|support\w*|qualif\w*|prov(?:e|es|ed|ing)|demonstrat\w*|establish\w*)"
+        explicitly_denies_current_support = bool(
+            re.search(
+                rf"(?:does|do|did|can)\s+not\s+{support_verbs}[^.]*\bcurrent\b|"
+                rf"\bnot\s+{support_verbs}[^.]*\bcurrent\b|"
+                rf"\bno\s+{support_verbs}\w*[^.]*\bcurrent\b",
+                lowered,
+            )
+        )
         if (
             ("legacy" in lowered or "2026-10-20" in lowered or "cm4" in lowered)
-            and any(word in lowered for word in ("validates", "supports", "qualifies"))
+            and re.search(support_verbs, lowered)
             and "current" in lowered
             and any(word in lowered for word in ("abx1", "batching", "candidate"))
-            and "does not" not in lowered
-            and "do not" not in lowered
+            and not explicitly_denies_current_support
         ):
             fail("Blob documentation legacy performance contradiction is present")
 

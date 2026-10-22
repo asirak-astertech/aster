@@ -229,6 +229,67 @@ Current qualification must measure 64-KiB canonical plaintext chunks carried as 
             ):
                 CHECKER.validate_blob_documentation_contract(damaged)
 
+        paraphrase_mutations = (
+            (
+                "node_api",
+                "node_api contradiction",
+                "Each 1-MiB segment is independently authenticated.",
+            ),
+            (
+                "transports",
+                "transports contradiction",
+                "Profile 5 authenticates each 1 MiB segment independently.",
+            ),
+            (
+                "recipes",
+                "recipes contradiction",
+                "Profile 5 consists of independent, authenticated 1-MiB segments.",
+            ),
+            (
+                "runbook",
+                "receiver settlement contradiction",
+                "Canonical promotion follows RESULT and ACK.",
+            ),
+            (
+                "runbook",
+                "receipt attempt contradiction",
+                "The durable receipt stores the fresh attempt nonce.",
+            ),
+            (
+                "runbook",
+                "receiver timeout contradiction",
+                "Incoming transfers calculate their hard deadline from exact content bytes after OPEN.",
+            ),
+            (
+                "performance",
+                "legacy performance contradiction",
+                "These legacy CM4 measurements prove the retained ABX1 batching policy for the current candidate.",
+            ),
+        )
+        for surface, label, contradiction in paraphrase_mutations:
+            damaged = dict(documents)
+            damaged[surface] += contradiction
+            with self.subTest(paraphrase=label), self.assertRaisesRegex(
+                CHECKER.ContractViolation, label
+            ):
+                CHECKER.validate_blob_documentation_contract(damaged)
+
+        allowed = dict(documents)
+        allowed["node_api"] += (
+            "Profile 5 does not use independently authenticated 1-MiB segments."
+        )
+        allowed["runbook"] += (
+            "Canonical promotion does not follow RESULT and ACK. "
+            "The durable receipt stores plan data but does not store the fresh "
+            "attempt nonce. Incoming transfers do not calculate their hard "
+            "deadline from exact content bytes."
+        )
+        allowed["performance"] += (
+            "The legacy CM4 measurements validate only the historical ASTRBS02 "
+            "candidate and do not validate the current ABX1 candidate."
+        )
+        CHECKER.validate_blob_documentation_contract(allowed)
+
     def test_v1_through_v9_contract_passes(self) -> None:
         self.validate()
 
