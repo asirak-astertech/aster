@@ -53,6 +53,28 @@ VALID_SELECTED_STATES = frozenset(
     {"observed-bounded", "implemented-uncredited", "open"}
 )
 
+
+def validate_blob_capability_documentation(text: str) -> None:
+    """Keep current Blob claims separate from explicitly open capabilities."""
+    normalized = " ".join(text.split())
+    requirements = (
+        (
+            "agent/CLI Blob capability",
+            "native-gRPC agent and asterctl bounded publication and authenticated read are implemented",
+        ),
+        ("peer-independent publication", "Local publication is peer-independent"),
+        ("peer/convergence status", "peer delivery and convergence status remain open"),
+        ("download resume", "Download resume remains post-merge work"),
+        ("BLE boundary", "BLE is not implemented"),
+        (
+            "CM4 evidence boundary",
+            "Three-CM4 validation of this candidate has not yet run",
+        ),
+    )
+    for label, statement in requirements:
+        if " ".join(statement.split()) not in normalized:
+            raise ValueError(f"Blob capability documentation {label} declaration is missing")
+
 RECEIPT = "docs/validation/requirements-status.md#reproducible-receipt"
 MISSION_RECEIPT = (
     "docs/validation/requirements-status.md#mission-authenticated-runtime-validation"
@@ -294,8 +316,12 @@ BLOB_NETWORK_SLICE = (
     "crates/aster-core/src/crypto/reference.rs; crates/aster-core/src/store.rs; "
     "crates/aster-redb-store/src/blob.rs; "
     "crates/aster-redb-store/src/blob/depot.rs; "
+    "crates/aster-redb-store/src/blob/stream.rs; "
     "crates/aster-redb-store/src/lib.rs; crates/aster-node/src/frame.rs; "
     "crates/aster-node/src/runtime.rs; "
+    "crates/aster-node/src/runtime/blob_stream.rs; "
+    "crates/aster-node/src/stream_transfer.rs; "
+    "crates/aster-node/src/stream_transport.rs; "
     "fuzz/fuzz_targets/selected_frame_decode.rs; "
     "crates/aster-core/src/source_blob.rs::tests::"
     "blob_peer_content_proof_is_exact_current_and_identity_bound; "
@@ -351,7 +377,13 @@ BLOB_NETWORK_SLICE = (
 BLOB_LIVE_SLICE = (
     "crates/aster-node/src/application.rs; "
     "crates/aster-node/src/application/blob.rs; "
+    "crates/aster-node/src/application/blob_stream.rs; "
+    "crates/aster-redb-store/src/blob/upload.rs; "
     "crates/aster-node/src/runtime.rs; crates/aster-node/src/lib.rs; "
+    "proto/aster/application/v1alpha1/aster.proto; "
+    "crates/aster-agent/src/blob_service.rs; "
+    "crates/asterctl/src/blob_publish.rs; crates/asterctl/src/blob_read.rs; "
+    "crates/asterctl/src/blob_status.rs; "
     "crates/aster-node/src/application/blob.rs::tests::"
     "live_blob_page_is_bounded_exact_and_rejects_invalid_ranges; "
     "crates/aster-node/src/application/blob.rs::tests::"
@@ -2096,6 +2128,9 @@ def main() -> int:
     try:
         verify_authority_hashes()
         verify_mapped_source_paths()
+        validate_blob_capability_documentation(
+            (ROOT / "docs/validation/capability-roadmap.md").read_text()
+        )
         expected = expected_rows(read_matrix())
         if args.write:
             write_trace(expected)

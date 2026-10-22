@@ -14,6 +14,15 @@ retain profile 4 for compatibility; a semantic-v9 peer selects profile 5.
 representation. The former `ASTRBS02` provisional upload-pack format is local
 staging only and has no semantic-v9 wire meaning.
 
+Blob profile negotiation: semantic v7/v8 select profile 4; semantic v9 selects
+profile 5. Profile 5 size terms: 65,536-byte canonical plaintext chunk;
+66,215-byte maximum encoded canonical chunk record; 1,048,576-byte maximum
+ABX1 batched extent. Profile 5 checkpoint maximum: 134,217,728 bytes (128 MiB).
+Canonical legacy eligibility: every pre-profile-5 canonical Blob remains
+eligible for profile 5 after upgrade. Unified capacity: provisional uploads,
+pending network receipts, and completed canonical variants share the
+configured Blob depot limits.
+
 | Selection | Object maximum | Canonical chunks | Authenticated source |
 | --- | ---: | ---: | ---: |
 | semantic v7/v8, profile 4 | 64 MiB | 1,024 | 1 MiB |
@@ -58,6 +67,13 @@ The current adapter is Iroh QUIC. The adapter interface is carrier-independent
 and retains the bindings needed by a reliable ordered full-duplex non-IP
 adapter. That keeps a future BLE adapter possible; this change does not
 implement BLE or multi-adapter failover.
+
+Current Blob API capability: the Rust API, native-gRPC agent, and asterctl
+support bounded local publication and authenticated reads. Status boundary:
+local publication success is a durable local commit; blob-status is
+receiver-local durable state, not remote delivery, peer status, or convergence
+status. Download resume: post-merge work; interrupted asterctl downloads
+currently restart at byte zero.
 
 ## Capacity and timeout bounds
 

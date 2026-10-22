@@ -146,6 +146,38 @@ def require_once(text: str, declaration: str, label: str) -> None:
         fail(f"{label} declaration must occur exactly once; found {count}")
 
 
+def validate_blob_documentation_contract(documents: dict[str, str]) -> None:
+    """Bind operator-facing Blob claims to the implemented profile-5 boundary."""
+    combined = " ".join("\n".join(documents.values()).split())
+    requirements = (
+        (
+            "profile 5 negotiation",
+            "semantic v7/v8 select profile 4; semantic v9 selects profile 5",
+        ),
+        ("separate size terms", "65,536-byte canonical plaintext chunk"),
+        (
+            "separate size terms",
+            "66,215-byte maximum encoded canonical chunk record",
+        ),
+        (
+            "separate size terms",
+            "1,048,576-byte maximum ABX1 batched extent",
+        ),
+        ("128 MiB checkpoint", "134,217,728 bytes (128 MiB)"),
+        ("canonical legacy eligibility", "every pre-profile-5 canonical Blob remains eligible"),
+        ("unified capacity", "share the configured Blob depot limits"),
+        ("agent and CLI capability", "native-gRPC agent, and asterctl support"),
+        (
+            "local versus convergence status",
+            "not remote delivery, peer status, or convergence status",
+        ),
+        ("download resume boundary", "Download resume: post-merge work"),
+    )
+    for label, statement in requirements:
+        if " ".join(statement.split()) not in combined:
+            fail(f"Blob documentation {label} declaration is missing")
+
+
 def parse_numeric_declaration(text: str, label: str) -> tuple[int, ...]:
     match = re.search(rf"^{re.escape(label)}:\s*([^\n]+)$", text, re.MULTILINE)
     if match is None:
@@ -744,6 +776,24 @@ def main() -> int:
         )
         validate_profile5_oracle()
         validate_profile5_runtime_flow()
+        validate_blob_documentation_contract(
+            {
+                "runbook": (
+                    ROOT / "docs/validation/blob-streaming-engineering-runbook.md"
+                ).read_text(),
+                "public_api": "\n".join(
+                    (ROOT / path).read_text()
+                    for path in (
+                        "README.md",
+                        "crates/aster-agent/README.md",
+                        "crates/asterctl/README.md",
+                        "docs/quickstart/selected-blob-api.md",
+                        "docs/operator-guide.md",
+                        "docs/validation/capability-roadmap.md",
+                    )
+                ),
+            }
+        )
     except (ContractViolation, OSError) as error:
         print(f"protocol version contract check failed: {error}", file=sys.stderr)
         return 1

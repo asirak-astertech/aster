@@ -21,6 +21,11 @@ profile-5 Blob publication identity and exact topic/scope selector. It does not
 report peer convergence, remote delivery, route selection, carrier state, or
 transport-specific details.
 .PP
+Local publication is peer-independent. Waiting for
+.B available
+observes one node's canonical publication state; it neither starts contact nor
+confirms that any other node has converged.
+.PP
 Snapshot mode performs one request and exits successfully for every valid
 state, including
 .BR missing .

@@ -148,6 +148,16 @@ provisioning remain open work.
 | **Security profiles** | Stock hybrid-PQ profile `0x0001`; additive P-256 Event/control profile `0x0002` with an exporter-bound two-node Iroh path | Stock runtime/CLI selection for `0x0002`, general negotiation, complete classical data/lifecycle coverage, and rollback policy |
 | **Operations** | Manually admitted direct addresses, one operator-pinned controlled relay, default-off time-windowed mDNS with bounded Aster admission, reference provisioning, and same-UID Unix software zeroization | Protected operational provisioning, hostile-LAN discovery, public/default relay selection, BTLE integration, and physical sanitization |
 
+Blob has one canonical publication authority. Provisional local uploads,
+pending network receipts, and completed canonical variants share the configured
+Blob depot limits; profile 5 does not create a separate capacity pool or
+publication representation. Existing canonical Blobs remain eligible after an
+upgrade: v9-to-v9 contacts select profile 5, while v7/v8 contacts select the
+compatible profile 4 when the publication fits its historical bounds. Local
+publication success is a durable local commit. It is not remote delivery, peer
+status, or convergence status. Interrupted CLI downloads currently restart at
+byte zero; download resume is post-merge work.
+
 Semantic v7 changes the network mechanics for Event synchronization,
 not publication semantics: a successful publish remains a local durable commit
 and never waits for a peer. State, Record, and EventBridge negotiate their

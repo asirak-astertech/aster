@@ -89,6 +89,24 @@ Use the capability roadmap for planning and merge review. The rows below are an
 exhaustive evidence trace, not a flat backlog, a completion denominator, or a
 release score.
 
+### Current semantic-v9/profile-5 Blob implementation boundary
+
+Current code keeps one canonical Blob publication authority. Semantic-v9 peers
+select profile 5; v7/v8 peers retain profile 4 for compatible canonical
+publications. Existing canonical Blobs need no content migration and remain
+eligible for profile 5 after upgrade. The 64-KiB canonical plaintext chunk,
+at-most-66,215-byte encoded record, at-most-1-MiB `ABX1` extent, and at-most
+128-MiB checkpoint batch are distinct limits. Provisional uploads, pending
+network receipts, and completed variants share configured Blob depot capacity.
+
+The native-gRPC agent and `asterctl` provide bounded publication and
+authenticated read as current-code, implemented-uncredited capability. Local
+publication is peer-independent; status is receiver-local durable state and is
+not peer delivery or convergence evidence. Node-to-node receipt resume is
+implemented, but CLI download resume is post-merge work. BLE is not
+implemented. The historical receipts below are unchanged and do not validate
+the remediated candidate; its three-CM4 validation remains a later gate.
+
 ### Compose credential-provider implementation evidence
 
 The Compose increment adds a statically composed provider, immutable

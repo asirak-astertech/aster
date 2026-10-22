@@ -4,6 +4,14 @@ Use this runbook to install and operate Aster without building software or
 writing an application. Both packaged paths include `asterctl` for Event and
 Blob operations.
 
+For Blob operations, local publication and network synchronization are
+separate. Publish success is a peer-independent durable local commit.
+`blob-status` observes receiver-local canonical state; it is not remote
+delivery, peer status, or convergence status. The agent and `asterctl` support
+bounded local publication and authenticated reads today. Node-to-node profile
+5 resumes from receiver checkpoints, while interrupted CLI downloads restart
+at byte zero; download resume is post-merge work.
+
 > [!IMPORTANT]
 > Aster is an evaluation-stage reference implementation, not a
 > production-authorized system. Follow site approval, credential custody,

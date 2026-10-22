@@ -104,27 +104,18 @@ Reproduction command:
 cargo test --release -p aster-node composite_profile5_records_process_256_mib_in_bounded_extents --lib -- --ignored --nocapture
 ```
 
-## Open qualification: canonical segment size
+## Open qualification: extent batching policy
 
-Profile 5 currently fixes one canonical Blob segment at 1 MiB of plaintext.
-That value is an authenticated format boundary, not a local runtime tuning
-option: it determines segment offsets, AEAD records, Merkle leaves, pack
-encoding, durable checkpoints, resume indices, and transport framing. The
-measurements above and the retained CM4 runs establish that 1-MiB segment
-processing is faster than the validated WLAN path; they do **not** establish
-that 1 MiB is the globally optimal size.
+The remediated profile uses the existing 64-KiB canonical plaintext chunk and
+an encoded canonical chunk record of at most 66,215 bytes. `ABX1` batches whole
+records into an extent of at most 1 MiB. The extent target is transfer policy,
+not the canonical plaintext chunk size and not a second Blob identity format.
 
-Before adding another segment-size profile, run the same warmed CM4 workload at
-256 KiB, 512 KiB, 1 MiB, 2 MiB, and 4 MiB. Retain end-to-end throughput and
-latency, CPU, peak RSS and in-flight bytes, checkpoint cost, retransmitted bytes,
-resume amplification, and behavior under loss and constrained MTU. Keep 1 MiB
-unless another size produces a material end-to-end improvement without
-violating memory, fairness, durability, or recovery bounds.
-
-Alternative sizes must be separate negotiated protocol profiles and must bind
-the selected canonical size into the authenticated open. A unilateral
-configuration setting is invalid because peers using different sizes would
-derive different records, checkpoints, roots, and Blob identities.
+Before changing batching policy, run the same warmed CM4 workload with smaller
+extent targets. Retain end-to-end throughput and latency, CPU, peak RSS and
+in-flight bytes, checkpoint cost, retransmitted bytes, resume amplification,
+and behavior under loss and constrained MTU. A peer may negotiate a smaller
+extent without changing canonical Blob identity.
 
 ## 2026-10-20 CM4 checkpoint and sender-copy requalification
 
@@ -136,7 +127,8 @@ an exact byte window admitted too few slightly-over-1-MiB pack records to reach
 the next checkpoint.
 
 The checkpoint batch is a durability/performance policy, independent of the
-1-MiB authenticated segment boundary. A receiver may negotiate a smaller batch;
+64-KiB canonical chunk and 1-MiB maximum batched extent. A receiver may
+negotiate a smaller batch;
 the profile-5 implementation caps the current batch at 128 MiB. Larger batches
 reduce synchronization and reverse-control overhead but increase the maximum
 uncheckpointed suffix that an interrupted attempt may replay. The attempt's
@@ -160,9 +152,9 @@ matching terminal roots. The immediately adjacent 1-GiB raw TCP run sustained
 passed the 80% floor. Receiver occupancy remained bounded at four items and
 4,194,840 bytes.
 
-This requalification still does not prove that the 1-MiB canonical segment is
-optimal. It does show that changing segment size is not required to remove the
-observed transport gap: the retained 1-MiB format exceeded the acceptance floor
-after credit, durability cadence, and sender ownership were corrected. The
-segment-size matrix above remains required before defining another negotiated
-profile.
+This historical requalification does not prove that the 1-MiB extent target is
+optimal. It shows that changing the canonical 64-KiB chunk was not required to
+remove the observed transport gap: the retained batching policy exceeded the
+acceptance floor after credit, durability cadence, and sender ownership were
+corrected. These measurements predate the current canonical-authority
+remediation and are not validation of this candidate.

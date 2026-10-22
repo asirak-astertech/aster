@@ -28,6 +28,14 @@ profile 4. `EventPagesV1` is Event-only. The default semantic offer is
 `[9, 8, 7, 6, 5, 4, 3, 2, 1]`; stable wire/ABI, source, manifest, and
 `ASTRBT01` formats remain version 1.
 
+There is one canonical durable Blob authority. Every pre-profile-5 canonical
+Blob remains eligible for profile 5 after upgrade; profile selection changes
+the transfer mechanics, not stored identity. A canonical plaintext chunk is
+65,536 bytes, a maximum encoded canonical chunk record is 66,215 bytes, and an
+`ABX1` batched extent is at most 1,048,576 bytes. One negotiated checkpoint
+batch is at most 134,217,728 bytes (128 MiB). Provisional uploads, pending
+network receipts, and completed variants share the configured depot limits.
+
 ## Use the live actor API
 
 Start the node as described in the [selected Event quickstart](selected-event-api.md),
@@ -174,6 +182,10 @@ not hold space for a later attempt and does not include filesystem, database,
 journal, temporary, or operational reserve. `blob-status` is likewise local:
 run it on the intended receiver to wait for `AVAILABLE`; it does not coordinate
 publication, prove peer convergence, or expose an IP/Iroh/BLE transport.
+
+Download resume is post-merge work. An interrupted `asterctl blob-read`
+currently restarts at byte zero; this does not affect receiver-authoritative
+node-to-node profile-5 resume.
 
 The RPC and CLI use checked `u64` lengths and bounded 512-KiB application
 frames/pages. The resumable stream protocol has an explicit 8-GiB per-object

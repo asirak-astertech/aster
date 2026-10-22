@@ -112,6 +112,39 @@ class ProtocolVersionContractTests(unittest.TestCase):
             cddl if cddl is not None else cddl_contract(),
         )
 
+    def test_blob_documentation_contract_rejects_each_capability_drift(self) -> None:
+        documents = {
+            "runbook": """Blob profile negotiation: semantic v7/v8 select profile 4; semantic v9 selects profile 5.
+Profile 5 size terms: 65,536-byte canonical plaintext chunk; 66,215-byte maximum encoded canonical chunk record; 1,048,576-byte maximum ABX1 batched extent.
+Profile 5 checkpoint maximum: 134,217,728 bytes (128 MiB).
+Canonical legacy eligibility: every pre-profile-5 canonical Blob remains eligible for profile 5 after upgrade.
+Unified capacity: provisional uploads, pending network receipts, and completed canonical variants share the configured Blob depot limits.
+""",
+            "public_api": """Current Blob API capability: the Rust API, native-gRPC agent, and asterctl support bounded local publication and authenticated reads.
+Status boundary: local publication success is a durable local commit; blob-status is receiver-local durable state, not remote delivery, peer status, or convergence status.
+Download resume: post-merge work; interrupted asterctl downloads currently restart at byte zero.
+""",
+        }
+        CHECKER.validate_blob_documentation_contract(documents)
+        mutations = (
+            ("profile 5 negotiation", "semantic v9 selects profile 5", "semantic v9 selects profile 4"),
+            ("separate size terms", "66,215-byte maximum encoded canonical chunk record", "65,536-byte maximum encoded canonical chunk record"),
+            ("128 MiB checkpoint", "134,217,728 bytes (128 MiB)", "67,108,864 bytes (64 MiB)"),
+            ("canonical legacy eligibility", "every pre-profile-5 canonical Blob remains eligible", "new Blobs remain eligible"),
+            ("unified capacity", "share the configured Blob depot limits", "use a separate stream pool"),
+            ("agent and CLI capability", "native-gRPC agent, and asterctl support", "native-gRPC agent may eventually support"),
+            ("local versus convergence status", "not remote delivery, peer status, or convergence status", "reports remote delivery and convergence status"),
+            ("download resume boundary", "post-merge work", "current capability"),
+        )
+        for label, old, new in mutations:
+            damaged = dict(documents)
+            target = "runbook" if old in damaged["runbook"] else "public_api"
+            damaged[target] = damaged[target].replace(old, new, 1)
+            with self.subTest(label=label), self.assertRaisesRegex(
+                CHECKER.ContractViolation, label
+            ):
+                CHECKER.validate_blob_documentation_contract(damaged)
+
     def test_v1_through_v9_contract_passes(self) -> None:
         self.validate()
 

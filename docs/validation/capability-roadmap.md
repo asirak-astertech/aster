@@ -8,6 +8,17 @@
 - Atomic trace: [`requirements-implementation.csv`](requirements-implementation.csv)
 - Current release posture: **evaluation-stage; not production-authorized**
 
+## Current Blob claim boundary
+
+Current Blob capability: native-gRPC agent and asterctl bounded publication and
+authenticated read are implemented. Local publication is peer-independent and
+completes at the local durable commit. `blob-status` reports local durable
+publication state; peer delivery and convergence status remain open.
+Node-to-node receiver-checkpoint resume is implemented. Download resume remains
+post-merge work and `asterctl` restarts at byte zero. BLE is not implemented.
+Three-CM4 validation of this candidate has not yet run; historical CM4 receipts
+below retain their original commit and environment boundaries.
+
 ## Purpose
 
 This is the planning and review view of the data-mesh requirements. It groups

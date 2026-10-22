@@ -95,6 +95,14 @@ normal-success timeout.
 
 ## Publish and read Blobs
 
+The native-gRPC agent and `asterctl` provide current bounded Blob publication
+and authenticated-read capability. A successful publish is a peer-independent
+durable commit to the local canonical Blob authority. `blob-status` reports
+receiver-local durable state only; it does not report remote delivery, peer
+status, or convergence status. Node-to-node profile-5 transfer resumes from a
+receiver checkpoint, but interrupted `blob-read` output currently restarts at
+byte zero. Download resume is post-merge work.
+
 ```sh
 asterctl --token-file ./client.token --json blob-publish \
     --file ./map.bin --topic imagery.maps --scope mission/team/alpha \

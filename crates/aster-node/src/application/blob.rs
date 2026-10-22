@@ -948,7 +948,10 @@ impl BlobReadPage {
         self.plaintext.len()
     }
 
-    /// This profile never returns an empty live page.
+    /// True only for the authenticated empty terminal EOF page.
+    ///
+    /// Missing or unauthorized content and offsets beyond a nonempty Blob are
+    /// errors and never manufacture an empty page.
     pub fn is_empty(&self) -> bool {
         self.plaintext.is_empty()
     }

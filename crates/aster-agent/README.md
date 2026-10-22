@@ -89,6 +89,13 @@ two commands. The plaintext listener remains loopback-only, and every command
 requires exactly one bearer-token source. Prefer a protected token file rather
 than a literal token in shell history:
 
+This is a current capability: the native-gRPC agent and `asterctl` support
+bounded local publication and authenticated reads. Publication commits to the
+local canonical Blob authority without waiting for a peer. The agent does not
+expose peer-delivery or convergence status, and interrupted CLI reads restart
+at byte zero. Node-to-node profile-5 receipt resume is separate from download
+resume; download resume is post-merge work.
+
 ```sh
 TOKEN_FILE=/run/aster/client.token
 
@@ -140,6 +147,10 @@ The CLI and wire fields use checked `u64` lengths. The semantic-v9/profile-5
 stream admits at most 8 GiB per Blob and uses bounded 512-KiB application
 frames. Node-to-node DATA carries canonical 64-KiB chunks as complete records
 inside at-most-1-MiB `ABX1` extents; checkpoint batches are at most 128 MiB.
+The exact maxima are 65,536 plaintext bytes, 66,215 encoded-record bytes,
+1,048,576 batched-extent bytes, and 134,217,728 checkpoint bytes. Provisional
+uploads, pending receipts, and completed variants all use the configured
+canonical Blob depot limits; there is no independent stream pool.
 Its two-minute progress timeout and size-derived hard deadline (`ceil(bytes /
 128 KiB/s) + 20 minutes`) are independent of this agent's local RPC deadline.
 Blob RPCs currently default to 15 minutes; other RPCs retain the 10-second
