@@ -23,13 +23,17 @@ use std::{
 };
 
 use aster_mesh::{
-    BLOB_STREAM_SEGMENT_BYTES, BlobContentVerification, BlobError, BlobId as CoreBlobId,
-    BlobMetadata as CoreBlobMetadata, BlobPublicationStreamId, BlobUploadDescriptor,
+    BLOB_STREAM_SEGMENT_BYTES, BlobChunkRecord, BlobContentVerification, BlobError,
+    BlobId as CoreBlobId, BlobManifest, BlobMetadata as CoreBlobMetadata, BlobPhysicalLineage,
+    BlobPublicationStreamId, BlobStore as CoreBlobStore, BlobUploadDescriptor,
     ContentVerifiedBlobEnvelope, CustodySample, MAX_BLOB_CHUNKS, MAX_BLOB_MEDIA_TYPE_BYTES,
     MAX_BLOB_SCHEMA_ID_BYTES, NodeId, PreparedBlob, Priority, ReferenceEnvelopeSealer,
-    SELECTED_BLOB_CHUNK_SIZE, Scope, Topic, local_blob_publication_stream_id, prepare_blob,
+    SELECTED_BLOB_CHUNK_SIZE, Scope, SealedCanonicalBlobChunk, Topic,
+    local_blob_publication_stream_id, prepare_blob,
 };
-use aster_redb_store::pack::{BlobPackWriter, PinnedBlobPackRoot};
+use aster_redb_store::pack::{
+    BlobPackWriter, BlobUploadDigestWriter, PinnedBlobPackRoot, load_upload_digest_material,
+};
 #[cfg(test)]
 use aster_redb_store::{BlobCapacityGcTarget, BlobMaintenanceBudget};
 use aster_redb_store::{
@@ -60,6 +64,8 @@ use super::{
     ApplicationError, ApplicationErrorKind, SelectedApplicationCommand, actor_unavailable,
     application_error, store_error_kind,
 };
+#[cfg(test)]
+use crate::stream_pipeline::{PipelineStage, PipelineTestProbe, StreamJobId};
 use crate::{
     NodeError,
     mission::UnprotectedReferenceMission,
@@ -70,7 +76,10 @@ use crate::{
         open_replayed_verifier, open_startup_event_verifier_and_cache,
         recover_local_blob_capacity_after_cleanup, refresh_application_policy,
     },
-    stream_pipeline::StreamPartition,
+    stream_pipeline::{
+        PipelineLimits, PipelineReport, StreamJobId as PipelineJobId, StreamPartition,
+        run_ordered_blocking_pipeline,
+    },
 };
 
 #[derive(Clone, Eq, PartialEq)]
@@ -1581,11 +1590,68 @@ impl VerifiedBlobDeliveryMetadata {
     }
 }
 
-// Two finalizers bound the simultaneous two-pass decrypt/encrypt memory and
-// CPU cost. Two additional queued jobs absorb a short burst without creating
+// Two finalizers bound simultaneous staged-read/encryption memory. Two
+// additional queued jobs absorb a short burst without creating
 // an application-visible configuration contract in this increment.
 const BLOB_FINALIZE_WORKERS: usize = 2;
 const BLOB_FINALIZE_QUEUE_CAPACITY: usize = 2;
+const BLOB_FINALIZE_CHUNK_WORKERS: usize = 2;
+const BLOB_FINALIZE_MAX_IN_FLIGHT_CHUNKS: usize = 4;
+const BLOB_FINALIZE_AEAD_TAG_BYTES: usize = 16;
+const BLOB_FINALIZE_CPU_BUDGET: usize = 4;
+const BLOB_FINALIZE_CHUNK_OWNED_BYTES: usize =
+    SELECTED_BLOB_CHUNK_SIZE as usize + BLOB_FINALIZE_AEAD_TAG_BYTES;
+const BLOB_FINALIZE_PIPELINE_BYTES_PER_JOB: usize =
+    BLOB_FINALIZE_MAX_IN_FLIGHT_CHUNKS * BLOB_FINALIZE_CHUNK_OWNED_BYTES;
+const BLOB_FINALIZE_AGGREGATE_PIPELINE_BYTES: usize =
+    BLOB_FINALIZE_WORKERS * BLOB_FINALIZE_PIPELINE_BYTES_PER_JOB;
+const BLOB_FINALIZE_AGGREGATE_SENSITIVE_BYTES: usize =
+    BLOB_FINALIZE_WORKERS * (BLOB_STREAM_SEGMENT_BYTES + BLOB_FINALIZE_PIPELINE_BYTES_PER_JOB);
+
+struct BlobFinalizeCpuBudget {
+    available: std::sync::Mutex<usize>,
+    wake: std::sync::Condvar,
+}
+
+struct BlobFinalizeCpuPermit(&'static BlobFinalizeCpuBudget);
+
+impl BlobFinalizeCpuBudget {
+    fn acquire(&'static self) -> BlobFinalizeCpuPermit {
+        let mut available = self
+            .available
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while *available == 0 {
+            available = self
+                .wake
+                .wait(available)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        *available -= 1;
+        BlobFinalizeCpuPermit(self)
+    }
+}
+
+impl Drop for BlobFinalizeCpuPermit {
+    fn drop(&mut self) {
+        let mut available = self
+            .0
+            .available
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *available += 1;
+        debug_assert!(*available <= BLOB_FINALIZE_CPU_BUDGET);
+        self.0.wake.notify_one();
+    }
+}
+
+fn blob_finalize_cpu_budget() -> &'static BlobFinalizeCpuBudget {
+    static BUDGET: std::sync::OnceLock<BlobFinalizeCpuBudget> = std::sync::OnceLock::new();
+    BUDGET.get_or_init(|| BlobFinalizeCpuBudget {
+        available: std::sync::Mutex::new(BLOB_FINALIZE_CPU_BUDGET),
+        wake: std::sync::Condvar::new(),
+    })
+}
 
 pub(crate) type BlobFinalizeCompletion =
     oneshot::Receiver<Result<BlobPublishResult, ApplicationError>>;
@@ -1622,6 +1688,168 @@ struct BlobFinalizeCounts {
     completed: AtomicU64,
     active: AtomicUsize,
     peak_active: AtomicUsize,
+    last_report: std::sync::Mutex<Option<BlobFinalizeMetrics>>,
+}
+
+#[derive(Clone, Debug)]
+struct BlobFinalizeMetrics {
+    pipeline: PipelineReport,
+    plaintext_bytes_read: u64,
+    encrypted_bytes: u64,
+    provisional_segment_reads: u64,
+    depot_operations: u64,
+    store_operations: u64,
+}
+
+struct BlobFinalizeMappedChunk {
+    sealed: SealedCanonicalBlobChunk,
+    #[cfg(test)]
+    zeroized: BlobFinalizeZeroizeObserver,
+}
+
+#[cfg(test)]
+struct BlobFinalizeZeroizeObserver(Arc<AtomicUsize>);
+
+#[cfg(test)]
+impl Drop for BlobFinalizeZeroizeObserver {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl BlobFinalizeMappedChunk {
+    fn owned_bytes(&self) -> usize {
+        self.sealed.owned_bytes()
+    }
+}
+
+struct MeasuredBlobStore<S> {
+    inner: S,
+    operations: Arc<AtomicU64>,
+}
+
+impl<S> MeasuredBlobStore<S> {
+    fn new(inner: S, operations: Arc<AtomicU64>) -> Self {
+        Self { inner, operations }
+    }
+
+    fn observe(&self) {
+        self.operations.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+impl<S: CoreBlobStore> CoreBlobStore for MeasuredBlobStore<S> {
+    type StoreError = S::StoreError;
+
+    fn begin_blob(&mut self, manifest: &BlobManifest) -> Result<(), Self::StoreError> {
+        self.observe();
+        self.inner.begin_blob(manifest)
+    }
+
+    fn begin_blob_with_lineage(
+        &mut self,
+        manifest: &BlobManifest,
+        lineage: BlobPhysicalLineage,
+    ) -> Result<(), Self::StoreError> {
+        self.observe();
+        self.inner.begin_blob_with_lineage(manifest, lineage)
+    }
+
+    fn select_blob_for_read_with_lineage(
+        &mut self,
+        manifest: &BlobManifest,
+        lineage: BlobPhysicalLineage,
+    ) -> Result<(), Self::StoreError> {
+        self.observe();
+        self.inner
+            .select_blob_for_read_with_lineage(manifest, lineage)
+    }
+
+    fn put_plaintext_digest(
+        &mut self,
+        id: CoreBlobId,
+        index: u64,
+        digest: [u8; 32],
+    ) -> Result<(), Self::StoreError> {
+        self.observe();
+        self.inner.put_plaintext_digest(id, index, digest)
+    }
+
+    fn plaintext_digest(
+        &mut self,
+        id: CoreBlobId,
+        index: u64,
+    ) -> Result<Option<[u8; 32]>, Self::StoreError> {
+        self.observe();
+        self.inner.plaintext_digest(id, index)
+    }
+
+    fn chunk_record(
+        &mut self,
+        id: CoreBlobId,
+        index: u64,
+    ) -> Result<Option<BlobChunkRecord>, Self::StoreError> {
+        self.observe();
+        self.inner.chunk_record(id, index)
+    }
+
+    fn put_expected_chunk_record(
+        &mut self,
+        id: CoreBlobId,
+        index: u64,
+        record: BlobChunkRecord,
+    ) -> Result<(), Self::StoreError> {
+        self.observe();
+        self.inner.put_expected_chunk_record(id, index, record)
+    }
+
+    fn expected_chunk_record(
+        &mut self,
+        id: CoreBlobId,
+        index: u64,
+    ) -> Result<Option<BlobChunkRecord>, Self::StoreError> {
+        self.observe();
+        self.inner.expected_chunk_record(id, index)
+    }
+
+    fn commit_verified_chunk(
+        &mut self,
+        id: CoreBlobId,
+        index: u64,
+        record: BlobChunkRecord,
+        ciphertext: &[u8],
+    ) -> Result<(), Self::StoreError> {
+        self.observe();
+        self.inner
+            .commit_verified_chunk(id, index, record, ciphertext)
+    }
+
+    fn read_verified_chunk(
+        &mut self,
+        id: CoreBlobId,
+        index: u64,
+        output: &mut Vec<u8>,
+    ) -> Result<bool, Self::StoreError> {
+        self.observe();
+        self.inner.read_verified_chunk(id, index, output)
+    }
+
+    fn finalize_blob(
+        &mut self,
+        id: CoreBlobId,
+        manifest_digest: [u8; 32],
+    ) -> Result<(), Self::StoreError> {
+        self.observe();
+        self.inner.finalize_blob(id, manifest_digest)
+    }
+
+    fn finalized_manifest_digest(
+        &mut self,
+        id: CoreBlobId,
+    ) -> Result<Option<[u8; 32]>, Self::StoreError> {
+        self.observe();
+        self.inner.finalized_manifest_digest(id)
+    }
 }
 
 struct BlobFinalizePool {
@@ -1674,6 +1902,17 @@ impl BlobFinalizeTestGate {
 
 impl BlobFinalizePool {
     fn new() -> Result<Self, ApplicationError> {
+        debug_assert_eq!(
+            BLOB_FINALIZE_AGGREGATE_PIPELINE_BYTES,
+            BLOB_FINALIZE_WORKERS
+                * BLOB_FINALIZE_MAX_IN_FLIGHT_CHUNKS
+                * BLOB_FINALIZE_CHUNK_OWNED_BYTES
+        );
+        debug_assert_eq!(
+            BLOB_FINALIZE_AGGREGATE_SENSITIVE_BYTES,
+            BLOB_FINALIZE_WORKERS
+                * (BLOB_STREAM_SEGMENT_BYTES + BLOB_FINALIZE_PIPELINE_BYTES_PER_JOB)
+        );
         let (sender, receiver) =
             std::sync::mpsc::sync_channel::<BlobFinalizeWork>(BLOB_FINALIZE_QUEUE_CAPACITY);
         let receiver = Arc::new(std::sync::Mutex::new(receiver));
@@ -1697,13 +1936,20 @@ impl BlobFinalizePool {
                         #[cfg(test)]
                         let gate = work.job.gate.clone();
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            work.job.run()
+                            work.job.run_measured()
                         }))
                         .unwrap_or_else(|_| {
                             Err(ApplicationError::new(
                                 ApplicationErrorKind::StateUnavailable,
                                 "blob stream finish",
                             ))
+                        })
+                        .map(|(result, report)| {
+                            *counts
+                                .last_report
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(report);
+                            result
                         });
                         counts.active.fetch_sub(1, Ordering::AcqRel);
                         counts.completed.fetch_add(1, Ordering::AcqRel);
@@ -1761,6 +2007,16 @@ impl BlobFinalizePool {
         }
     }
 
+    #[cfg(test)]
+    fn last_report_for_test(&self) -> BlobFinalizeMetrics {
+        self.counts
+            .last_report
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .expect("completed local finalization report")
+    }
+
     fn shutdown(&mut self) {
         drop(self.sender.take());
         for worker in self.workers.drain(..) {
@@ -1772,6 +2028,26 @@ impl BlobFinalizePool {
             self.counts.completed.load(Ordering::Acquire)
         );
         debug_assert!(self.counts.peak_active.load(Ordering::Acquire) <= BLOB_FINALIZE_WORKERS);
+        if let Some(report) = self
+            .counts
+            .last_report
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            debug_assert_eq!(
+                report.pipeline.accepted_items(),
+                report.pipeline.completed_items()
+            );
+            debug_assert!(
+                report.pipeline.peak_owned_bytes() <= BLOB_FINALIZE_PIPELINE_BYTES_PER_JOB
+            );
+            debug_assert!(report.plaintext_bytes_read >= report.pipeline.completed_items());
+            debug_assert!(report.encrypted_bytes >= report.plaintext_bytes_read);
+            debug_assert!(report.provisional_segment_reads <= report.pipeline.completed_items());
+            debug_assert!(report.depot_operations >= report.pipeline.completed_items());
+            debug_assert!(report.store_operations >= 4);
+        }
     }
 }
 
@@ -1785,17 +2061,25 @@ impl Drop for BlobFinalizePool {
 }
 
 impl BlobFinalizeJob {
+    #[cfg(test)]
     fn run(self) -> Result<BlobPublishResult, ApplicationError> {
+        self.run_measured().map(|(result, _report)| result)
+    }
+
+    fn run_measured(self) -> Result<(BlobPublishResult, BlobFinalizeMetrics), ApplicationError> {
         #[cfg(test)]
         if let Some(gate) = &self.gate {
             gate.enter();
         }
+
+        let mut store_operations = 0_u64;
 
         // Replay current authority inside this owned job. This deliberately
         // happens after handoff from the application actor, so preparation and
         // canonical encryption cannot stall unrelated application commands.
         let mut verifier = open_replayed_verifier(&self.store, &self.mission)
             .map_err(|error| application_error("blob stream finish", error))?;
+        store_operations += 1;
         let mut verifier_head = self
             .store
             .control_head()
@@ -1816,6 +2100,7 @@ impl BlobFinalizeJob {
             Err(error) => return Err(application_error("blob stream finish", error)),
         };
         let request = self.reservation.request().clone();
+        store_operations += 1;
         let (current, checkpoint) = self
             .store
             .reserve_blob_upload_with_policy(&policy, &request)
@@ -1842,46 +2127,189 @@ impl BlobFinalizeJob {
             .map_err(|error| application_error("blob stream finish", error.into()))?;
         let metadata = CoreBlobMetadata::new(request.media_type.clone(), request.schema_id.clone())
             .map_err(|error| blob_core_error("blob stream finish", error))?;
-        let mut preparation_source =
-            UploadPackPlainReader::open(root, &current, &checkpoint, opener.clone())?;
-        let prepared = prepare_blob(&mut preparation_source, SELECTED_BLOB_CHUNK_SIZE, metadata)
-            .map_err(blob_prepare_error)?;
+        let durable = checkpoint.durable_pack_checkpoint().ok_or_else(|| {
+            ApplicationError::new(ApplicationErrorKind::Integrity, "blob stream finish")
+        })?;
+        let (plaintext_digests, whole_plaintext_sha256) =
+            load_upload_digest_material(&root, &identity, durable)
+                .map_err(|error| blob_pack_application_error("blob stream finish", error))?
+                .into_parts();
+        let retained_digests = Arc::new(plaintext_digests.clone());
+        let prepared = Arc::new(
+            PreparedBlob::from_retained_digests(
+                request.total_len,
+                SELECTED_BLOB_CHUNK_SIZE,
+                metadata,
+                whole_plaintext_sha256,
+                plaintext_digests,
+            )
+            .map_err(|error| blob_core_error("blob stream finish", error))?,
+        );
         if prepared.total_len() != request.total_len {
             return Err(ApplicationError::new(
                 ApplicationErrorKind::Integrity,
                 "blob stream finish",
             ));
         }
-        let root = PinnedBlobPackRoot::open(&self.store)
-            .map_err(|error| application_error("blob stream finish", error.into()))?;
         let mut encryption_source =
             UploadPackPlainReader::open(root, &current, &checkpoint, opener)?;
+        let depot_operations = Arc::new(AtomicU64::new(0));
+        store_operations += 1;
         let mut service = verifier
             .blob_service_with_store(
                 &request.scope,
                 &request.topic,
                 current.content_epoch(),
-                self.store
-                    .blob_depot_for_upload(&current)
-                    .map_err(|error| application_error("blob stream finish", error.into()))?,
+                MeasuredBlobStore::new(
+                    self.store
+                        .blob_depot_for_upload(&current)
+                        .map_err(|error| application_error("blob stream finish", error.into()))?,
+                    Arc::clone(&depot_operations),
+                ),
             )
             .map_err(|error| application_error("blob stream finish", error.into()))?;
-        let manifest = service
-            .install_prepared(&prepared)
+        let manifest = Arc::new(
+            service
+                .install_prepared(&prepared)
+                .map_err(|error| blob_core_error("blob stream finish", error))?,
+        );
+        let sealer = service
+            .canonical_chunk_sealer()
             .map_err(|error| blob_core_error("blob stream finish", error))?;
-        let progress = service
-            .encrypt_some(&mut encryption_source, &manifest, prepared.chunk_count())
-            .map_err(|error| blob_core_error("blob stream finish", error))?;
-        if !progress.complete || progress.verified_chunks != prepared.chunk_count() {
+        let token = *local_blob_publication_stream_id(
+            request.owner.publisher,
+            request.owner.operation.as_bytes(),
+        )
+        .as_bytes();
+        let job_id = PipelineJobId::from_bytes(token[..16].try_into().map_err(|_| {
+            ApplicationError::new(ApplicationErrorKind::Integrity, "blob stream finish")
+        })?);
+        let limits = PipelineLimits::new(
+            BLOB_FINALIZE_CHUNK_WORKERS,
+            BLOB_FINALIZE_MAX_IN_FLIGHT_CHUNKS,
+            BLOB_FINALIZE_PIPELINE_BYTES_PER_JOB,
+            BLOB_FINALIZE_MAX_IN_FLIGHT_CHUNKS,
+        )
+        .map_err(blob_stream_pipeline_error)?;
+        let chunk_count = prepared.chunk_count();
+        let total_len = prepared.total_len();
+        let mut next_partition = 0_u64;
+        let mut plaintext_bytes_read = 0_u64;
+        let partitions = std::iter::from_fn(|| {
+            if next_partition == chunk_count {
+                return None;
+            }
+            let index = next_partition;
+            next_partition += 1;
+            let offset = index * u64::from(SELECTED_BLOB_CHUNK_SIZE);
+            let plaintext_len =
+                usize::try_from((total_len - offset).min(u64::from(SELECTED_BLOB_CHUNK_SIZE)))
+                    .expect("selected Blob chunk length fits usize");
+            let mut bytes = Vec::with_capacity(plaintext_len + BLOB_FINALIZE_AEAD_TAG_BYTES);
+            bytes.resize(plaintext_len, 0);
+            let cpu_permit = blob_finalize_cpu_budget().acquire();
+            let read = encryption_source.read_exact(&mut bytes);
+            drop(cpu_permit);
+            Some(match read {
+                Ok(()) => {
+                    plaintext_bytes_read += plaintext_len as u64;
+                    let accounted_bytes = bytes.capacity();
+                    Ok(StreamPartition::new_accounted(
+                        index,
+                        bytes,
+                        accounted_bytes,
+                    ))
+                }
+                Err(error) => Err(crate::stream_pipeline::PipelineError::Adapter(Arc::new(
+                    error,
+                ))),
+            })
+        });
+        let map_manifest = Arc::clone(&manifest);
+        let map_digests = Arc::clone(&retained_digests);
+        #[cfg(test)]
+        let mapped_zeroized = PipelineTestProbe::mapped_ciphertext_observer_for_job(job_id)
+            .unwrap_or_else(|| Arc::new(AtomicUsize::new(0)));
+        let mut encrypted_bytes = 0_u64;
+        let report = run_ordered_blocking_pipeline(
+            job_id,
+            partitions,
+            limits,
+            move |partition| {
+                let _cpu_permit = blob_finalize_cpu_budget().acquire();
+                let index = partition.index();
+                #[cfg(test)]
+                if PipelineTestProbe::finalizer_map_failure_for_job(job_id, index) {
+                    return Err(crate::stream_pipeline::PipelineError::MapFailed(
+                        "injected local finalizer map failure".into(),
+                    ));
+                }
+                let digest = map_digests
+                    .get(usize::try_from(index).map_err(|_| {
+                        crate::stream_pipeline::PipelineError::MapFailed(
+                            "canonical chunk index overflow".into(),
+                        )
+                    })?)
+                    .copied()
+                    .ok_or_else(|| {
+                        crate::stream_pipeline::PipelineError::MapFailed(
+                            "canonical chunk digest is missing".into(),
+                        )
+                    })?;
+                let sealed = sealer
+                    .seal(&map_manifest, index, digest, partition.into_bytes())
+                    .map_err(|error| {
+                        crate::stream_pipeline::PipelineError::MapFailed(error.to_string())
+                    })?;
+                Ok(BlobFinalizeMappedChunk {
+                    sealed,
+                    #[cfg(test)]
+                    zeroized: BlobFinalizeZeroizeObserver(Arc::clone(&mapped_zeroized)),
+                })
+            },
+            BlobFinalizeMappedChunk::owned_bytes,
+            |mapped| {
+                #[cfg(test)]
+                let index = mapped.index();
+                #[cfg(test)]
+                if PipelineTestProbe::finalizer_sink_failure_for_job(job_id, index) {
+                    return Err(crate::stream_pipeline::PipelineError::SinkFailed(
+                        "injected local finalizer sink failure".into(),
+                    ));
+                }
+                let BlobFinalizeMappedChunk {
+                    sealed,
+                    #[cfg(test)]
+                    zeroized,
+                } = mapped.into_value();
+                encrypted_bytes = encrypted_bytes.saturating_add(sealed.ciphertext_len() as u64);
+                let committed = service
+                    .commit_sealed_chunk(&manifest, sealed)
+                    .map_err(|error| {
+                        crate::stream_pipeline::PipelineError::SinkFailed(error.to_string())
+                    });
+                #[cfg(test)]
+                drop(zeroized);
+                committed
+            },
+        )
+        .map_err(blob_stream_pipeline_error)?;
+        if report.accepted_items() != chunk_count
+            || report.completed_items() != chunk_count
+            || plaintext_bytes_read != request.total_len
+        {
             return Err(ApplicationError::new(
                 ApplicationErrorKind::Integrity,
                 "blob stream finish",
             ));
         }
+        let provisional_segment_reads = encryption_source.loaded_segments();
         let finished = service
             .finish_manifest(&manifest)
             .map_err(|error| blob_core_error("blob stream finish", error))?;
         drop(service);
+        let depot_operations = depot_operations.load(Ordering::Relaxed);
+        store_operations += 1;
         let completion = self
             .store
             .completed_prepared_local_blob(&manifest, *finished.manifest_digest())
@@ -1905,6 +2333,7 @@ impl BlobFinalizeJob {
         } else {
             None
         };
+        store_operations += 1;
         let outcome = self
             .store
             .commit_prepared_local_blob_once_with_policy(
@@ -1969,18 +2398,24 @@ impl BlobFinalizeJob {
         )
         .map_err(|error| application_error("blob stream finish", error))?;
         if self.cleanup_upload {
+            store_operations += 1;
             self.store
                 .complete_blob_upload(&current, outcome.blob().transfer_id)
                 .map_err(|error| application_error("blob stream finish", error.into()))?;
         }
-        let token = *local_blob_publication_stream_id(
-            request.owner.publisher,
-            request.owner.operation.as_bytes(),
-        )
-        .as_bytes();
         let mut result = blob_publish_result(&stored, outcome.inserted());
         result.publication_id = Some(BlobStreamPublicationId::from_bytes(token)?);
-        Ok(result)
+        Ok((
+            result,
+            BlobFinalizeMetrics {
+                pipeline: report,
+                plaintext_bytes_read,
+                encrypted_bytes,
+                provisional_segment_reads,
+                depot_operations,
+                store_operations,
+            },
+        ))
     }
 }
 
@@ -2529,7 +2964,57 @@ impl SelectedBlobNode {
             checkpoint.durable_pack_checkpoint(),
         )
         .map_err(|error| blob_pack_application_error("blob stream open", error))?;
+        let mut digest_writer = BlobUploadDigestWriter::open_projected_upload_pinned(
+            &root,
+            &identity,
+            checkpoint.durable_pack_checkpoint(),
+        )
+        .map_err(|error| blob_pack_application_error("blob stream open", error))?;
         let durable_offset = checkpoint.durable_plaintext_offset();
+        let mut writer = writer;
+        let mut checkpoint = checkpoint;
+        let digest_migration_bytes = digest_writer
+            .migration_rebuild_bytes(durable_offset)
+            .map_err(|error| blob_pack_application_error("blob stream open", error))?;
+        if digest_migration_bytes != 0 {
+            let opener = self
+                .verifier
+                .blob_upload_segment_opener(
+                    &request.publication.scope,
+                    &request.publication.topic,
+                    &upload,
+                )
+                .map_err(|error| application_error("blob stream open", error.into()))?;
+            let mut source = UploadPackPlainReader::open(
+                PinnedBlobPackRoot::open(&self.store)
+                    .map_err(|error| application_error("blob stream open", error.into()))?,
+                &reservation,
+                &checkpoint,
+                opener,
+            )?;
+            let mut buffer = Zeroizing::new(vec![0_u8; SELECTED_BLOB_CHUNK_SIZE as usize]);
+            let mut remaining = digest_migration_bytes;
+            while remaining > 0 {
+                let take = usize::try_from(remaining.min(u64::from(SELECTED_BLOB_CHUNK_SIZE)))
+                    .map_err(|_| {
+                        ApplicationError::new(ApplicationErrorKind::Integrity, "blob stream open")
+                    })?;
+                source
+                    .read_exact(&mut buffer[..take])
+                    .map_err(|error| application_error("blob stream open", error.into()))?;
+                digest_writer
+                    .append(&buffer[..take])
+                    .map_err(|error| blob_pack_application_error("blob stream open", error))?;
+                remaining -= take as u64;
+            }
+            let durable = writer
+                .checkpoint_upload(&mut digest_writer)
+                .map_err(|error| blob_pack_application_error("blob stream open", error))?;
+            checkpoint = self
+                .store
+                .checkpoint_blob_upload(&policy, &reservation, checkpoint, durable)
+                .map_err(|error| application_error("blob stream open", error.into()))?;
+        }
         let next_segment_index = checkpoint
             .durable_pack_checkpoint()
             .map_or(0, |checkpoint| checkpoint.next_index());
@@ -2540,6 +3025,7 @@ impl SelectedBlobNode {
                 reservation,
                 checkpoint,
                 writer,
+                digest_writer,
                 request: request.publication,
                 options: request.options,
                 total_len: request.total_len,
@@ -2591,6 +3077,10 @@ impl SelectedBlobNode {
             ));
         }
         stream.pending.extend_from_slice(&bytes);
+        stream
+            .digest_writer
+            .append(&bytes)
+            .map_err(|error| blob_pack_application_error("blob stream write", error))?;
         stream.accepted_offset = end;
         if stream.pending.len() == BLOB_STREAM_SEGMENT_BYTES || end == stream.total_len {
             let pending = std::mem::replace(
@@ -2613,7 +3103,7 @@ impl SelectedBlobNode {
         if stream.durable_checkpoint_due() || stream.writer.plaintext_offset() == stream.total_len {
             let checkpoint = stream
                 .writer
-                .checkpoint()
+                .checkpoint_upload(&mut stream.digest_writer)
                 .map_err(|error| blob_pack_application_error("blob stream write", error))?;
             stream.checkpoint = self
                 .store
@@ -2690,7 +3180,7 @@ impl SelectedBlobNode {
             let policy = self.current_policy("blob stream finish")?;
             let durable = stream
                 .writer
-                .checkpoint()
+                .checkpoint_upload(&mut stream.digest_writer)
                 .map_err(|error| blob_pack_application_error("blob stream finish", error))?;
             stream.checkpoint = self
                 .store
@@ -7089,6 +7579,330 @@ pub(crate) mod tests {
             restored.extend_from_slice(page.as_bytes());
         }
         assert_eq!(restored, bytes);
+    }
+
+    #[test]
+    fn stream_upload_finalization_occupies_multiple_chunk_workers() {
+        // Break caught: whole-Blob finalizer threads do not parallelize the
+        // canonical 64-KiB chunks of one large upload.
+        let root = TestRoot::new("stream-finalize-chunk-workers");
+        let bytes = payload(8 * SELECTED_BLOB_CHUNK_SIZE as usize + 19);
+        let mut node = selected_node(&root);
+        let opened = node
+            .open_publish_stream_inner(BlobPublishStreamRequest {
+                publication: request(b"blob/stream/chunk-workers"),
+                options: BlobPublishOptions::durable(),
+                total_len: bytes.len() as u64,
+            })
+            .expect("open chunk-worker upload");
+        for (offset, chunk) in bytes.chunks(64 * 1024).enumerate() {
+            node.append_publish_stream_inner(
+                opened.token,
+                (offset * 64 * 1024) as u64,
+                Zeroizing::new(chunk.to_vec()),
+            )
+            .expect("append chunk-worker upload");
+        }
+
+        let job = StreamJobId::from_bytes(opened.token[..16].try_into().expect("job ID"));
+        let probe = PipelineTestProbe::install(job);
+        probe.hold_workers_for_test();
+        let (finished, received) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            _ = finished.send(node.finish_publish_stream_inner(opened.token));
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while probe.peak_active_workers() < 2 && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let peak = probe.peak_active_workers();
+        probe.release_workers_for_test();
+        let result = received
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("finalization completes after worker release");
+        worker.join().expect("join chunk-worker finalization");
+        result.expect("chunk-worker finalization succeeds");
+        assert!(peak > 1, "one Blob occupied only {peak} map worker");
+    }
+
+    #[test]
+    fn stream_upload_finalization_is_one_pass_bounded_and_canonical() {
+        let root = TestRoot::new("stream-finalize-measurements");
+        let bytes = payload(2 * BLOB_STREAM_SEGMENT_BYTES + 19);
+        let publication = request(b"blob/stream/finalize-measurements");
+        let serial = prepare_blob(
+            &mut Cursor::new(bytes.clone()),
+            SELECTED_BLOB_CHUNK_SIZE,
+            CoreBlobMetadata::new(
+                publication.media_type.clone(),
+                publication.schema_id.clone(),
+            )
+            .expect("canonical reference metadata"),
+        )
+        .expect("canonical serial reference");
+        let mut node = selected_node(&root);
+        let serial_publication = node
+            .publish(
+                request(b"blob/stream/finalize-measurements-serial"),
+                &mut Cursor::new(bytes.clone()),
+            )
+            .expect("publish canonical serial reference");
+        let opened = node
+            .open_publish_stream_inner(BlobPublishStreamRequest {
+                publication,
+                options: BlobPublishOptions::durable(),
+                total_len: bytes.len() as u64,
+            })
+            .expect("open measured stream");
+        for (index, chunk) in bytes.chunks(64 * 1024).enumerate() {
+            node.append_publish_stream_inner(
+                opened.token,
+                (index * 64 * 1024) as u64,
+                Zeroizing::new(chunk.to_vec()),
+            )
+            .expect("append measured stream");
+        }
+        let result = node
+            .finish_publish_stream_inner(opened.token)
+            .expect("finish measured stream");
+        let measured = node.finalize_pool.last_report_for_test();
+        let chunks = (bytes.len() as u64).div_ceil(u64::from(SELECTED_BLOB_CHUNK_SIZE));
+
+        assert_eq!(result.id.into_core(), serial.id());
+        assert_eq!(result.id, serial_publication.id);
+        assert_eq!(measured.pipeline.accepted_items(), chunks);
+        assert_eq!(measured.pipeline.completed_items(), chunks);
+        assert_eq!(
+            measured.pipeline.worker_count(),
+            BLOB_FINALIZE_CHUNK_WORKERS
+        );
+        assert!(measured.pipeline.peak_in_flight_items() <= BLOB_FINALIZE_MAX_IN_FLIGHT_CHUNKS);
+        assert!(measured.pipeline.peak_reorder_items() < BLOB_FINALIZE_MAX_IN_FLIGHT_CHUNKS);
+        assert!(measured.pipeline.peak_owned_bytes() <= BLOB_FINALIZE_PIPELINE_BYTES_PER_JOB);
+        assert_eq!(measured.plaintext_bytes_read, bytes.len() as u64);
+        assert_eq!(
+            measured.provisional_segment_reads,
+            (bytes.len() as u64).div_ceil(BLOB_STREAM_SEGMENT_BYTES as u64)
+        );
+        assert_eq!(
+            measured.encrypted_bytes,
+            bytes.len() as u64 + chunks * BLOB_FINALIZE_AEAD_TAG_BYTES as u64
+        );
+        assert_eq!(measured.depot_operations, 4 * chunks + 2);
+        assert_eq!(measured.store_operations, 6);
+        assert_eq!(
+            measured.pipeline.stage(PipelineStage::Admission).items,
+            chunks
+        );
+        assert_eq!(measured.pipeline.stage(PipelineStage::Map).items, chunks);
+        assert_eq!(
+            measured.pipeline.stage(PipelineStage::Reorder).items,
+            chunks
+        );
+        assert_eq!(measured.pipeline.stage(PipelineStage::Sink).items, chunks);
+        assert_eq!(
+            BLOB_FINALIZE_AGGREGATE_PIPELINE_BYTES,
+            2 * 4 * (64 * 1024 + 16)
+        );
+        assert_eq!(
+            BLOB_FINALIZE_AGGREGATE_SENSITIVE_BYTES,
+            2 * (BLOB_STREAM_SEGMENT_BYTES + 4 * (64 * 1024 + 16))
+        );
+        assert_eq!(BLOB_FINALIZE_CPU_BUDGET, 4);
+    }
+
+    #[test]
+    fn stream_upload_finalization_map_failure_joins_and_zeroizes_then_retries() {
+        stream_upload_finalization_failure_retries(false);
+    }
+
+    #[test]
+    fn stream_upload_finalization_sink_failure_joins_and_zeroizes_then_retries() {
+        stream_upload_finalization_failure_retries(true);
+    }
+
+    fn stream_upload_finalization_failure_retries(fail_sink: bool) {
+        let label = if fail_sink { "sink" } else { "map" };
+        let root = TestRoot::new(&format!("stream-finalize-{label}-failure"));
+        let bytes = payload(8 * SELECTED_BLOB_CHUNK_SIZE as usize + 29);
+        let operation = format!("blob/stream/finalize-{label}-failure");
+        let request = BlobPublishStreamRequest {
+            publication: request(operation.as_bytes()),
+            options: BlobPublishOptions::durable(),
+            total_len: bytes.len() as u64,
+        };
+        let mut node = selected_node(&root);
+        let opened = node
+            .open_publish_stream_inner(request.clone())
+            .expect("open failure stream");
+        for (index, chunk) in bytes.chunks(64 * 1024).enumerate() {
+            node.append_publish_stream_inner(
+                opened.token,
+                (index * 64 * 1024) as u64,
+                Zeroizing::new(chunk.to_vec()),
+            )
+            .expect("append failure stream");
+        }
+        let job = StreamJobId::from_bytes(opened.token[..16].try_into().expect("job ID"));
+        let probe = PipelineTestProbe::install(job);
+        if fail_sink {
+            probe.inject_finalizer_sink_failure(0);
+        } else {
+            probe.inject_finalizer_map_failure(2);
+        }
+        let error = node
+            .finish_publish_stream_inner(opened.token)
+            .expect_err("injected pipeline failure");
+        assert_eq!(error.kind(), ApplicationErrorKind::Integrity);
+        assert!(probe.cleanup_observed());
+        assert!(probe.cancellation_signalled());
+        assert!(probe.channels_closed());
+        assert_eq!(probe.active_workers(), 0);
+        assert_eq!(probe.worker_exits(), BLOB_FINALIZE_CHUNK_WORKERS);
+        assert_eq!(probe.joined_workers(), BLOB_FINALIZE_CHUNK_WORKERS);
+        assert!(
+            probe.mapped_ciphertext_zeroizations() > 0,
+            "mapped ciphertext was not observed dropping after {label} failure"
+        );
+        drop(probe);
+        drop(node);
+
+        let mut reopened = selected_node(&root);
+        let resumed = reopened
+            .open_publish_stream_inner(request)
+            .expect("resume failed finalization");
+        assert_eq!(resumed.progress.durable_offset, bytes.len() as u64);
+        reopened
+            .finish_publish_stream_inner(resumed.token)
+            .expect("retry converges after joined failure");
+    }
+
+    #[test]
+    fn stream_upload_finalization_rejects_corrupt_digest_artifact() {
+        let root = TestRoot::new("stream-finalize-corrupt-digests");
+        let bytes = payload(3 * SELECTED_BLOB_CHUNK_SIZE as usize + 7);
+        let mut node = selected_node(&root);
+        let (token, _) =
+            prepare_ready_stream(&mut node, b"blob/stream/finalize-corrupt-digests", &bytes);
+        let upload_id = *node
+            .publish_streams
+            .get(&token)
+            .expect("open corrupt-digest stream")
+            .reservation
+            .pack_identity()
+            .upload_id()
+            .as_bytes();
+        let upload = upload_id
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let digests = root
+            .depot_path()
+            .join("stream-packs-v2")
+            .join(upload)
+            .join("canonical-digests-v1.bin");
+        let mut artifact = fs::read(&digests).expect("read canonical digest artifact");
+        *artifact.last_mut().expect("nonempty digest artifact") ^= 0x80;
+        fs::write(digests, artifact).expect("corrupt canonical digest artifact");
+
+        let error = node
+            .finish_publish_stream_inner(token)
+            .expect_err("digest commitment mismatch fails closed");
+        assert_eq!(error.kind(), ApplicationErrorKind::Integrity);
+    }
+
+    fn run_stream_finalization_measurement_gate(label: &str, total_len: u64) {
+        let root = TestRoot::new(label);
+        persist_member_mission(&root);
+        let mut node = SelectedBlobNode::open_unprotected_reference_with_options(
+            root.path(),
+            root.mission_path(),
+            SelectedBlobOptions {
+                depot_limits: BlobDepotLimits::new(3 * 1024 * 1024 * 1024, MAX_BLOB_CHUNKS, 2)
+                    .expect("measurement depot limits"),
+            },
+        )
+        .expect("open measurement node");
+        let opened = node
+            .open_publish_stream_inner(BlobPublishStreamRequest {
+                publication: request(label.as_bytes()),
+                options: BlobPublishOptions::durable(),
+                total_len,
+            })
+            .expect("open measurement stream");
+        let mut offset = 0_u64;
+        while offset < total_len {
+            let len =
+                usize::try_from((total_len - offset).min(u64::from(SELECTED_BLOB_CHUNK_SIZE)))
+                    .expect("measurement chunk length");
+            let bytes = (0..len)
+                .map(|index| ((offset as usize + index) % 251) as u8)
+                .collect::<Vec<_>>();
+            node.append_publish_stream_inner(opened.token, offset, Zeroizing::new(bytes))
+                .expect("append measurement stream");
+            offset += len as u64;
+        }
+        node.finish_publish_stream_inner(opened.token)
+            .expect("finish measurement stream");
+        let measured = node.finalize_pool.last_report_for_test();
+        let stage = |name, stage| {
+            let observed = measured.pipeline.stage(stage);
+            serde_json::json!({
+                "name": name,
+                "items": observed.items,
+                "bytes": observed.bytes,
+                "queue_wait_ns": observed.queue_wait_ns,
+                "service_ns": observed.service_ns,
+                "output_blocked_ns": observed.output_blocked_ns,
+            })
+        };
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema": "aster.local_blob_finalization.measurement.v1",
+                "requested_plaintext_bytes": total_len,
+                "partitions": measured.pipeline.completed_items(),
+                "worker_count": measured.pipeline.worker_count(),
+                "peak_active_workers": measured.pipeline.peak_active_workers(),
+                "peak_in_flight_items": measured.pipeline.peak_in_flight_items(),
+                "peak_in_flight_bytes": measured.pipeline.peak_in_flight_bytes(),
+                "peak_owned_bytes": measured.pipeline.peak_owned_bytes(),
+                "peak_encoding_bytes": measured.pipeline.peak_encoding_bytes(),
+                "peak_reorder_items": measured.pipeline.peak_reorder_items(),
+                "plaintext_bytes_read": measured.plaintext_bytes_read,
+                "encrypted_bytes": measured.encrypted_bytes,
+                "provisional_segment_reads": measured.provisional_segment_reads,
+                "depot_operations": measured.depot_operations,
+                "store_operations": measured.store_operations,
+                "aggregate_cpu_budget": BLOB_FINALIZE_CPU_BUDGET,
+                "aggregate_pipeline_byte_bound": BLOB_FINALIZE_AGGREGATE_PIPELINE_BYTES,
+                "aggregate_sensitive_byte_bound": BLOB_FINALIZE_AGGREGATE_SENSITIVE_BYTES,
+                "stages": [
+                    stage("admission", PipelineStage::Admission),
+                    stage("map", PipelineStage::Map),
+                    stage("reorder", PipelineStage::Reorder),
+                    stage("sink", PipelineStage::Sink),
+                ],
+            })
+        );
+    }
+
+    #[test]
+    #[ignore = "exact-size local performance gate; run on an authorized measurement host"]
+    fn stream_upload_finalization_measurement_800_mib() {
+        run_stream_finalization_measurement_gate(
+            "blob/stream/finalization-measurement-800-mib",
+            800 * 1024 * 1024,
+        );
+    }
+
+    #[test]
+    #[ignore = "exact-size local performance gate; run on an authorized measurement host"]
+    fn stream_upload_finalization_measurement_1_gib() {
+        run_stream_finalization_measurement_gate(
+            "blob/stream/finalization-measurement-1-gib",
+            1024 * 1024 * 1024,
+        );
     }
 
     #[test]

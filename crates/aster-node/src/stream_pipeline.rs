@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
 use std::{
     collections::BTreeMap,
     error::Error,
@@ -90,7 +92,10 @@ impl StreamPartition {
     }
 
     #[cfg(test)]
-    fn observe_zeroize_for_test(mut self, observer: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+    pub(crate) fn observe_zeroize_for_test(
+        mut self,
+        observer: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
         self.zeroize_observer = Some(observer);
         self
     }
@@ -152,6 +157,8 @@ struct PipelineTestProbeInner {
     available_byte_permits: std::sync::atomic::AtomicUsize,
     fail_spawn_at: std::sync::atomic::AtomicUsize,
     sender_sink_failure: std::sync::atomic::AtomicUsize,
+    finalizer_map_failure: AtomicU64,
+    finalizer_sink_failure: AtomicU64,
     sender_send_gate: Mutex<Option<SenderSendGate>>,
 }
 
@@ -201,6 +208,30 @@ impl PipelineTestProbe {
 
     pub(crate) fn mapped_ciphertext_zeroizations(&self) -> usize {
         self.0.mapped_ciphertext_zeroizations.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn inject_finalizer_map_failure(&self, index: u64) {
+        self.0
+            .finalizer_map_failure
+            .store(index.saturating_add(1), Ordering::SeqCst);
+    }
+
+    pub(crate) fn inject_finalizer_sink_failure(&self, index: u64) {
+        self.0
+            .finalizer_sink_failure
+            .store(index.saturating_add(1), Ordering::SeqCst);
+    }
+
+    pub(crate) fn finalizer_map_failure_for_job(job: StreamJobId, index: u64) -> bool {
+        Self::for_job(job).is_some_and(|probe| {
+            probe.0.finalizer_map_failure.load(Ordering::SeqCst) == index.saturating_add(1)
+        })
+    }
+
+    pub(crate) fn finalizer_sink_failure_for_job(job: StreamJobId, index: u64) -> bool {
+        Self::for_job(job).is_some_and(|probe| {
+            probe.0.finalizer_sink_failure.load(Ordering::SeqCst) == index.saturating_add(1)
+        })
     }
 
     pub(crate) fn sender_ownership_observers_for_job(
@@ -362,6 +393,9 @@ impl PipelineTestProbe {
     pub(crate) fn hold_workers_for_test(&self) {
         self.0.hold_workers.store(true, Ordering::SeqCst);
     }
+    pub(crate) fn release_workers_for_test(&self) {
+        self.0.hold_workers.store(false, Ordering::SeqCst);
+    }
     pub(crate) fn peak_active_workers(&self) -> usize {
         self.0.peak_active_workers.load(Ordering::SeqCst)
     }
@@ -515,6 +549,7 @@ pub struct PipelineReport {
     peak_encoding_bytes: usize,
     peak_reorder_items: usize,
     worker_count: usize,
+    peak_active_workers: usize,
     stages: [StageObservation; PIPELINE_STAGE_COUNT],
 }
 
@@ -554,6 +589,9 @@ impl PipelineReport {
     pub const fn worker_count(&self) -> usize {
         self.worker_count
     }
+    pub const fn peak_active_workers(&self) -> usize {
+        self.peak_active_workers
+    }
     pub const fn stage(&self, stage: PipelineStage) -> StageObservation {
         self.stages[stage as usize]
     }
@@ -563,8 +601,9 @@ impl Display for PipelineReport {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "workers:{};peak_items:{};peak_bytes:{};peak_owned_bytes:{};peak_encoding_bytes:{};peak_reorder:{}",
+            "workers:{};peak_active_workers:{};peak_items:{};peak_bytes:{};peak_owned_bytes:{};peak_encoding_bytes:{};peak_reorder:{}",
             self.worker_count,
+            self.peak_active_workers,
             self.peak_in_flight_items,
             self.peak_in_flight_bytes,
             self.peak_owned_bytes,
@@ -756,6 +795,8 @@ pub(crate) struct FixedPartitionMapPool<T> {
     admission_accepting: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
     workers: Vec<std::thread::JoinHandle<()>>,
+    active_workers: Arc<std::sync::atomic::AtomicUsize>,
+    peak_active_workers: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
     test_probe: Option<PipelineTestProbe>,
     #[cfg(test)]
@@ -825,11 +866,15 @@ impl<T: Send + 'static> FixedPartitionMapPool<T> {
         }
         let work_receiver = Arc::new(Mutex::new(work_receiver));
         let (result_sender, mut result_receiver) = mpsc::unbounded_channel();
+        let active_workers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak_active_workers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut workers: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(worker_count);
         for worker_index in 0..worker_count {
             let receiver = Arc::clone(&work_receiver);
             let map = Arc::clone(&map);
             let worker_cancelled = Arc::clone(&cancelled);
+            let worker_active = Arc::clone(&active_workers);
+            let worker_peak_active = Arc::clone(&peak_active_workers);
             #[cfg(test)]
             let worker_probe = probe.clone();
             #[cfg(test)]
@@ -866,6 +911,8 @@ impl<T: Send + 'static> FixedPartitionMapPool<T> {
                             let queue_wait = started.saturating_duration_since(work.queued_at);
                             let index = work.partition.index;
                             let bytes = work.partition.len();
+                            let active = worker_active.fetch_add(1, Ordering::AcqRel) + 1;
+                            worker_peak_active.fetch_max(active, Ordering::AcqRel);
                             #[cfg(test)]
                             if let Some(probe) = &worker_probe {
                                 let active =
@@ -881,6 +928,7 @@ impl<T: Send + 'static> FixedPartitionMapPool<T> {
                                 }
                             }
                             if worker_cancelled.load(Ordering::Acquire) {
+                                worker_active.fetch_sub(1, Ordering::AcqRel);
                                 #[cfg(test)]
                                 if let Some(probe) = &worker_probe {
                                     probe.0.active_workers.fetch_sub(1, Ordering::SeqCst);
@@ -891,6 +939,7 @@ impl<T: Send + 'static> FixedPartitionMapPool<T> {
                                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                     map(work.partition)
                                 }));
+                            worker_active.fetch_sub(1, Ordering::AcqRel);
                             #[cfg(test)]
                             if let Some(probe) = &worker_probe {
                                 probe.0.active_workers.fetch_sub(1, Ordering::SeqCst);
@@ -986,6 +1035,8 @@ impl<T: Send + 'static> FixedPartitionMapPool<T> {
             admission_accepting,
             cancelled,
             workers,
+            active_workers,
+            peak_active_workers,
             #[cfg(test)]
             test_probe: probe,
             #[cfg(test)]
@@ -1057,6 +1108,16 @@ impl<T: Send + 'static> FixedPartitionMapPool<T> {
             .map(|pending| pending.mapped)
     }
 
+    fn recv_pending_blocking(&mut self) -> Result<Pending<T>, PipelineError> {
+        self.result_receiver
+            .blocking_recv()
+            .ok_or(PipelineError::WorkerPanicked)?
+    }
+
+    fn peak_active_workers(&self) -> usize {
+        self.peak_active_workers.load(Ordering::Acquire)
+    }
+
     pub(crate) fn shutdown(mut self) -> Result<(), PipelineError> {
         self.admission_accepting.store(false, Ordering::Release);
         self.cancelled.store(true, Ordering::Release);
@@ -1076,6 +1137,7 @@ impl<T: Send + 'static> FixedPartitionMapPool<T> {
                 }
             }
         }
+        debug_assert_eq!(self.active_workers.load(Ordering::Acquire), 0);
         if let Ok(receiver) = self.work_receiver.lock() {
             for mut work in receiver.try_iter() {
                 work.partition.zeroize_now();
@@ -1119,6 +1181,7 @@ impl<T> Drop for FixedPartitionMapPool<T> {
                 }
             }
         }
+        debug_assert_eq!(self.active_workers.load(Ordering::Acquire), 0);
         if let Ok(receiver) = self.work_receiver.lock() {
             for mut work in receiver.try_iter() {
                 work.partition.zeroize_now();
@@ -1240,6 +1303,177 @@ impl PartitionSource for ChannelPartitionSource {
     ) -> Pin<Box<dyn Future<Output = Result<Option<StreamPartition>, PipelineError>> + Send + '_>>
     {
         Box::pin(async move { self.receiver.recv().await.transpose() })
+    }
+}
+
+/// Synchronous fixed-worker partition/map/reorder/sink runner for owned local
+/// storage jobs. Admission is bounded by `max_in_flight_items`; map results may
+/// arrive out of order, but the sink observes exactly increasing indices.
+pub(crate) fn run_ordered_blocking_pipeline<I, T, Map, MappedBytes, Sink>(
+    job_id: StreamJobId,
+    partitions: I,
+    limits: PipelineLimits,
+    map: Map,
+    mapped_bytes: MappedBytes,
+    mut sink: Sink,
+) -> Result<PipelineReport, PipelineError>
+where
+    I: IntoIterator<Item = Result<StreamPartition, PipelineError>>,
+    T: Send + 'static,
+    Map: Fn(StreamPartition) -> Result<T, PipelineError> + Send + Sync + 'static,
+    MappedBytes: Fn(&T) -> usize,
+    Sink: FnMut(MappedPartition<T>) -> Result<(), PipelineError>,
+{
+    #[cfg(test)]
+    let probe = PipelineTestProbe::for_job(job_id);
+    #[cfg(not(test))]
+    let probe = None;
+    let mut pool = FixedPartitionMapPool::new_with_probe(
+        limits.workers,
+        limits.max_in_flight_items,
+        map,
+        probe,
+    )?;
+    let outcome = (|| {
+        let mut source = partitions.into_iter();
+        let mut source_done = false;
+        let mut reorder = BTreeMap::<u64, Pending<T>>::new();
+        let mut stages = [StageObservation::default(); PIPELINE_STAGE_COUNT];
+        let mut accepted_items = 0_u64;
+        let mut completed_items = 0_u64;
+        let mut next_index = 0_u64;
+        let mut in_flight = 0_usize;
+        let mut live_owned_bytes = 0_usize;
+        let mut peak_items = 0_usize;
+        let mut peak_bytes = 0_usize;
+        let mut peak_owned_bytes = 0_usize;
+        let mut peak_encoding_bytes = 0_usize;
+        let mut peak_reorder = 0_usize;
+
+        loop {
+            while !source_done && in_flight < limits.max_in_flight_items {
+                let Some(partition) = source.next() else {
+                    source_done = true;
+                    break;
+                };
+                let partition = partition?;
+                if partition.is_empty() {
+                    return Err(PipelineError::EmptyPartition);
+                }
+                if partition.len() > limits.max_in_flight_bytes {
+                    return Err(PipelineError::PartitionTooLarge);
+                }
+                if live_owned_bytes.saturating_add(partition.len()) > limits.max_in_flight_bytes {
+                    return Err(PipelineError::PartitionTooLarge);
+                }
+                if partition.index() != accepted_items {
+                    return Err(PipelineError::NonContiguousIndex {
+                        expected: accepted_items,
+                        actual: partition.index(),
+                    });
+                }
+                let bytes = partition.len();
+                let admitted = Instant::now();
+                pool.submit_unbudgeted(partition)?;
+                add_observation(
+                    &mut stages,
+                    PipelineStage::Admission,
+                    bytes,
+                    Duration::ZERO,
+                    admitted.elapsed(),
+                    Duration::ZERO,
+                );
+                accepted_items += 1;
+                in_flight += 1;
+                live_owned_bytes = live_owned_bytes.saturating_add(bytes);
+                peak_items = peak_items.max(in_flight);
+                peak_bytes = peak_bytes.max(live_owned_bytes);
+                peak_owned_bytes = peak_owned_bytes.max(live_owned_bytes);
+            }
+
+            if in_flight == 0 {
+                if source_done {
+                    break;
+                }
+                continue;
+            }
+
+            let pending = pool.recv_pending_blocking()?;
+            let index = pending.mapped.index;
+            let input_bytes = pending.mapped.input_bytes;
+            let output_bytes = mapped_bytes(&pending.mapped.value);
+            live_owned_bytes = live_owned_bytes
+                .saturating_sub(input_bytes)
+                .saturating_add(output_bytes);
+            peak_encoding_bytes = peak_encoding_bytes.max(output_bytes);
+            peak_owned_bytes = peak_owned_bytes.max(live_owned_bytes);
+            let reorder_started = Instant::now();
+            if index < next_index
+                || (index != next_index && reorder.len() >= limits.max_reorder_items)
+                || reorder.insert(index, pending).is_some()
+            {
+                return Err(PipelineError::NonContiguousIndex {
+                    expected: next_index,
+                    actual: index,
+                });
+            }
+            peak_reorder = peak_reorder.max(reorder.len().saturating_sub(1));
+            add_observation(
+                &mut stages,
+                PipelineStage::Reorder,
+                input_bytes,
+                Duration::ZERO,
+                reorder_started.elapsed(),
+                Duration::ZERO,
+            );
+
+            while let Some(pending) = reorder.remove(&next_index) {
+                let bytes = pending.mapped.input_bytes;
+                let output_bytes = mapped_bytes(&pending.mapped.value);
+                add_observation(
+                    &mut stages,
+                    PipelineStage::Map,
+                    bytes,
+                    pending.queue_wait,
+                    pending.map_time,
+                    pending.mapped_at.elapsed(),
+                );
+                let sink_started = Instant::now();
+                sink(pending.mapped)?;
+                add_observation(
+                    &mut stages,
+                    PipelineStage::Sink,
+                    bytes,
+                    Duration::ZERO,
+                    sink_started.elapsed(),
+                    Duration::ZERO,
+                );
+                live_owned_bytes = live_owned_bytes.saturating_sub(output_bytes);
+                completed_items += 1;
+                next_index += 1;
+                in_flight -= 1;
+            }
+        }
+
+        Ok(PipelineReport {
+            job_id,
+            accepted_items,
+            completed_items,
+            peak_in_flight_items: peak_items,
+            peak_in_flight_bytes: peak_bytes,
+            peak_owned_bytes,
+            peak_encoding_bytes,
+            peak_reorder_items: peak_reorder,
+            worker_count: limits.workers,
+            peak_active_workers: pool.peak_active_workers(),
+            stages,
+        })
+    })();
+    let worker_panicked = pool.shutdown().is_err();
+    if worker_panicked && outcome.is_ok() {
+        Err(PipelineError::WorkerPanicked)
+    } else {
+        outcome
     }
 }
 
@@ -1520,6 +1754,7 @@ where
             peak_encoding_bytes: 0,
             peak_reorder_items: peak_reorder,
             worker_count: limits.workers,
+            peak_active_workers: map_pool.peak_active_workers(),
             stages,
         })
     }
@@ -1826,7 +2061,7 @@ mod tests {
         assert!(map.service_ns > 0);
         assert!(map.output_blocked_ns > 0);
         let metrics = report.to_string();
-        assert!(metrics.starts_with("workers:2;peak_items:"));
+        assert!(metrics.starts_with("workers:2;peak_active_workers:"));
         assert!(metrics.contains(";map:8:128:"));
         assert!(metrics.contains(";sink:8:128:"));
     }

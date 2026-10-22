@@ -148,10 +148,11 @@ pub use blob::ReferenceBlobReader;
 pub use blob::{
     BlobCarrierId, BlobChunkRecord, BlobError, BlobId, BlobManifest, BlobMetadata,
     BlobPhysicalLineage, BlobRangeReadStats, BlobReadStats, BlobReader, BlobRouteCommitment,
-    BlobStore, BlobStoreConfig, BlobWriteProgress, BuiltBlobTransferObject, FinishedBlob,
-    MAX_BLOB_CHUNK_SIZE, MAX_BLOB_CHUNKS, MAX_BLOB_MANIFEST_BYTES, MAX_BLOB_MEDIA_TYPE_BYTES,
-    MAX_BLOB_SCHEMA_ID_BYTES, MAX_BLOB_TRANSFER_OBJECT_BYTES, MIN_BLOB_CHUNK_SIZE, PreparedBlob,
-    ReferenceBlobService, SELECTED_BLOB_CHUNK_SIZE, VerifiedBlobContentCompletion,
+    BlobStore, BlobStoreConfig, BlobWriteProgress, BuiltBlobTransferObject,
+    CanonicalBlobChunkSealer, FinishedBlob, MAX_BLOB_CHUNK_SIZE, MAX_BLOB_CHUNKS,
+    MAX_BLOB_MANIFEST_BYTES, MAX_BLOB_MEDIA_TYPE_BYTES, MAX_BLOB_SCHEMA_ID_BYTES,
+    MAX_BLOB_TRANSFER_OBJECT_BYTES, MIN_BLOB_CHUNK_SIZE, PreparedBlob, ReferenceBlobService,
+    SELECTED_BLOB_CHUNK_SIZE, SealedCanonicalBlobChunk, VerifiedBlobContentCompletion,
     VerifiedBlobTransferObject, VerifiedBlobTransferPlan, prepare_blob,
 };
 /// Fuzz-harness bridge to the production canonical carrier inspector.

@@ -251,6 +251,46 @@ impl PreparedBlob {
     pub const fn metadata(&self) -> &BlobMetadata {
         &self.metadata
     }
+
+    /// Reconstructs the canonical preparation result from a durable ordered
+    /// digest artifact and its incrementally retained whole-plaintext digest.
+    /// No plaintext is retained by this value.
+    pub fn from_retained_digests(
+        total_len: u64,
+        chunk_size: u32,
+        metadata: BlobMetadata,
+        whole_plaintext_sha256: [u8; 32],
+        plaintext_digests: Vec<[u8; 32]>,
+    ) -> Result<Self, BlobError> {
+        validate_chunk_size(chunk_size)?;
+        let chunk_count = chunk_count(total_len, chunk_size)?;
+        if chunk_count > MAX_BLOB_CHUNKS
+            || usize::try_from(chunk_count).ok() != Some(plaintext_digests.len())
+        {
+            return Err(BlobError::InvalidManifest);
+        }
+        let mut id_hasher = domain_hasher(BLOB_ID_DOMAIN);
+        encode_blob_identity_prefix(
+            &mut id_hasher,
+            total_len,
+            chunk_size,
+            chunk_count,
+            &metadata,
+        );
+        for digest in &plaintext_digests {
+            id_hasher.update(digest);
+        }
+        id_hasher.update(whole_plaintext_sha256);
+        Ok(Self {
+            id: BlobId(finalize_sha256(id_hasher)),
+            total_len,
+            chunk_size,
+            chunk_count,
+            whole_plaintext_sha256,
+            metadata,
+            plaintext_digests: Zeroizing::new(plaintext_digests),
+        })
+    }
 }
 
 impl Drop for PreparedBlob {
@@ -1048,6 +1088,84 @@ pub(crate) struct BlobAccess {
     content_group: [u8; 32],
     epoch: u64,
     physical_lineage: BlobPhysicalLineage,
+}
+
+/// Provider-bound, cloneable canonical chunk mapper. The content-grant
+/// material is immutable while shared and every owned copy is zeroized when
+/// dropped.
+#[derive(Clone)]
+pub struct CanonicalBlobChunkSealer {
+    epoch_seed: [u8; 32],
+    content_group: [u8; 32],
+    epoch: u64,
+    physical_lineage: BlobPhysicalLineage,
+}
+
+impl Drop for CanonicalBlobChunkSealer {
+    fn drop(&mut self) {
+        self.epoch_seed.zeroize();
+    }
+}
+
+/// One independently mapped canonical chunk. Ciphertext is zeroized when the
+/// ordered sink consumes or abandons it.
+pub struct SealedCanonicalBlobChunk {
+    index: u64,
+    record: BlobChunkRecord,
+    ciphertext: Zeroizing<Vec<u8>>,
+}
+
+impl SealedCanonicalBlobChunk {
+    pub const fn index(&self) -> u64 {
+        self.index
+    }
+
+    pub fn owned_bytes(&self) -> usize {
+        self.ciphertext.capacity()
+    }
+
+    pub fn ciphertext_len(&self) -> usize {
+        self.ciphertext.len()
+    }
+}
+
+impl CanonicalBlobChunkSealer {
+    pub fn seal(
+        &self,
+        manifest: &BlobManifest,
+        index: u64,
+        expected_digest: [u8; 32],
+        plaintext: Vec<u8>,
+    ) -> Result<SealedCanonicalBlobChunk, BlobError> {
+        validate_selected_manifest(manifest)?;
+        if manifest.content_group != self.content_group || manifest.content_epoch != self.epoch {
+            return Err(BlobError::AuthenticationFailed);
+        }
+        let expected = manifest.plaintext_len(index)?;
+        let mut ciphertext = Zeroizing::new(plaintext);
+        if ciphertext.len() != expected || sha256(&ciphertext) != expected_digest {
+            return Err(BlobError::SourceChanged);
+        }
+        let access = BlobAccess {
+            epoch_seed: BlobSecret(self.epoch_seed),
+            content_group: self.content_group,
+            epoch: self.epoch,
+            physical_lineage: self.physical_lineage,
+        };
+        encrypt_chunk(&access, manifest, index, &mut ciphertext)?;
+        let record = BlobChunkRecord {
+            plaintext_sha256: expected_digest,
+            ciphertext_sha256: sha256(&ciphertext),
+            plaintext_len: u32::try_from(expected).map_err(|_| BlobError::LengthOverflow)?,
+            ciphertext_len: u32::try_from(ciphertext.len())
+                .map_err(|_| BlobError::LengthOverflow)?,
+        };
+        Ok(SealedCanonicalBlobChunk {
+            index,
+            record,
+            ciphertext,
+        })
+    }
 }
 
 impl BlobAccess {
@@ -2773,6 +2891,34 @@ impl<S: BlobStore> ReferenceBlobService<S> {
     ) -> Result<BlobWriteProgress, BlobError> {
         let access = self.access()?;
         BlobWriter::new(&mut self.store, access).encrypt_some(source, manifest, max_new_chunks)
+    }
+
+    /// Creates a provider-bound fixed-worker mapper without exporting content
+    /// keys or algorithm controls.
+    pub fn canonical_chunk_sealer(&self) -> Result<CanonicalBlobChunkSealer, BlobError> {
+        self.ensure_live()?;
+        Ok(CanonicalBlobChunkSealer {
+            epoch_seed: *self.epoch_seed.expose(),
+            content_group: self.content_group,
+            epoch: self.epoch,
+            physical_lineage: self.physical_lineage,
+        })
+    }
+
+    /// Commits one independently mapped chunk through the bound durable
+    /// adapter. Ordering remains the caller's responsibility.
+    pub fn commit_sealed_chunk(
+        &mut self,
+        manifest: &BlobManifest,
+        sealed: SealedCanonicalBlobChunk,
+    ) -> Result<(), BlobError> {
+        self.ensure_live()?;
+        let access = self.access()?;
+        BlobWriter::new(&mut self.store, access).validate_access(manifest)?;
+        validate_record(manifest, sealed.index, &sealed.record)?;
+        self.store
+            .commit_verified_chunk(manifest.id, sealed.index, sealed.record, &sealed.ciphertext)
+            .map_err(store_error)
     }
 
     pub fn write_manifest<W: Write>(
