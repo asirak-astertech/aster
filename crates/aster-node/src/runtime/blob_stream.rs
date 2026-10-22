@@ -3653,6 +3653,14 @@ pub(crate) mod tests {
             "pipeline internal admission still accepts"
         );
         assert!(
+            probe.rejected_plaintext_zeroized(),
+            "rejected sentinel plaintext was not zeroized"
+        );
+        assert!(
+            probe.rejected_permits_reclaimed(),
+            "rejected sentinel permits leaked"
+        );
+        assert!(
             probe.cleanup_observed(),
             "pipeline cleanup was not observed"
         );

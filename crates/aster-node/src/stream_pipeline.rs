@@ -104,6 +104,8 @@ struct PipelineTestProbeInner {
     cleanup_observed: AtomicBool,
     admission_open: AtomicBool,
     admission_rejected: AtomicBool,
+    rejected_plaintext_zeroized: AtomicBool,
+    rejected_permits_reclaimed: AtomicBool,
     cancellation_signalled: AtomicBool,
     channels_closed: AtomicBool,
     worker_exits: std::sync::atomic::AtomicUsize,
@@ -158,6 +160,12 @@ impl PipelineTestProbe {
     }
     pub(crate) fn admission_rejected(&self) -> bool {
         self.0.admission_rejected.load(Ordering::SeqCst)
+    }
+    pub(crate) fn rejected_plaintext_zeroized(&self) -> bool {
+        self.0.rejected_plaintext_zeroized.load(Ordering::SeqCst)
+    }
+    pub(crate) fn rejected_permits_reclaimed(&self) -> bool {
+        self.0.rejected_permits_reclaimed.load(Ordering::SeqCst)
     }
     pub(crate) fn cleanup_observed(&self) -> bool {
         self.0.cleanup_observed.load(Ordering::SeqCst)
@@ -445,6 +453,59 @@ struct Work {
     byte_permit: Option<OwnedSemaphorePermit>,
 }
 
+fn submit_work_through_admission(
+    admission_accepting: &AtomicBool,
+    work_sender: Option<&std_mpsc::SyncSender<Work>>,
+    work: Work,
+) -> Result<(), PipelineError> {
+    if !admission_accepting.load(Ordering::Acquire) {
+        return Err(PipelineError::WorkerPanicked);
+    }
+    work_sender
+        .ok_or(PipelineError::WorkerPanicked)?
+        .send(work)
+        .map_err(|_| PipelineError::WorkerPanicked)
+}
+
+#[cfg(test)]
+fn observe_rejected_submission(
+    admission_accepting: &AtomicBool,
+    work_sender: &std_mpsc::SyncSender<Work>,
+    probe: &PipelineTestProbe,
+) {
+    let zeroized = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let item_budget = Arc::new(Semaphore::new(1));
+    let byte_budget = Arc::new(Semaphore::new(16));
+    let sentinel = Work {
+        partition: StreamPartition::new(u64::MAX, vec![0xa5; 16])
+            .observe_zeroize_for_test(Arc::clone(&zeroized)),
+        queued_at: Instant::now(),
+        item_permit: Some(
+            Arc::clone(&item_budget)
+                .try_acquire_owned()
+                .expect("sentinel item permit"),
+        ),
+        byte_permit: Some(
+            Arc::clone(&byte_budget)
+                .try_acquire_many_owned(16)
+                .expect("sentinel byte permits"),
+        ),
+    };
+    let rejected = matches!(
+        submit_work_through_admission(admission_accepting, Some(work_sender), sentinel),
+        Err(PipelineError::WorkerPanicked)
+    );
+    probe.0.admission_rejected.store(rejected, Ordering::SeqCst);
+    probe
+        .0
+        .rejected_plaintext_zeroized
+        .store(zeroized.load(Ordering::SeqCst) == 1, Ordering::SeqCst);
+    probe.0.rejected_permits_reclaimed.store(
+        item_budget.available_permits() == 1 && byte_budget.available_permits() == 16,
+        Ordering::SeqCst,
+    );
+}
+
 pub(crate) struct FixedPartitionMapPool<T> {
     work_sender: Option<std_mpsc::SyncSender<Work>>,
     work_receiver: Arc<Mutex<std_mpsc::Receiver<Work>>>,
@@ -623,6 +684,10 @@ impl<T: Send + 'static> FixedPartitionMapPool<T> {
                 Err(_) => {
                     admission_accepting.store(false, Ordering::Release);
                     cancelled.store(true, Ordering::Release);
+                    #[cfg(test)]
+                    if let Some(probe) = &probe {
+                        observe_rejected_submission(&admission_accepting, &work_sender, probe);
+                    }
                     drop(work_sender);
                     drop(result_sender);
                     for worker in workers.drain(..) {
@@ -663,10 +728,6 @@ impl<T: Send + 'static> FixedPartitionMapPool<T> {
                             .0
                             .channels_closed
                             .store(work_closed && results_closed, Ordering::SeqCst);
-                        probe.0.admission_rejected.store(
-                            !admission_accepting.load(Ordering::Acquire) && work_closed,
-                            Ordering::SeqCst,
-                        );
                         probe.0.cleanup_observed.store(true, Ordering::SeqCst);
                     }
                     return Err(PipelineError::WorkerPanicked);
@@ -716,14 +777,7 @@ impl<T: Send + 'static> FixedPartitionMapPool<T> {
     }
 
     fn submit_work(&self, work: Work) -> Result<(), PipelineError> {
-        if !self.admission_accepting.load(Ordering::Acquire) {
-            return Err(PipelineError::WorkerPanicked);
-        }
-        self.work_sender
-            .as_ref()
-            .ok_or(PipelineError::WorkerPanicked)?
-            .send(work)
-            .map_err(|_| PipelineError::WorkerPanicked)
+        submit_work_through_admission(&self.admission_accepting, self.work_sender.as_ref(), work)
     }
 
     async fn recv(&mut self) -> Result<Pending<T>, PipelineError> {
@@ -763,6 +817,10 @@ impl<T: Send + 'static> FixedPartitionMapPool<T> {
     pub(crate) fn shutdown(mut self) -> Result<(), PipelineError> {
         self.admission_accepting.store(false, Ordering::Release);
         self.cancelled.store(true, Ordering::Release);
+        #[cfg(test)]
+        if let (Some(probe), Some(work_sender)) = (&self.test_probe, &self.work_sender) {
+            observe_rejected_submission(&self.admission_accepting, work_sender, probe);
+        }
         drop(self.work_sender.take());
         let mut panicked = false;
         for worker in self.workers.drain(..) {
@@ -800,6 +858,10 @@ impl<T> Drop for FixedPartitionMapPool<T> {
     fn drop(&mut self) {
         self.admission_accepting.store(false, Ordering::Release);
         self.cancelled.store(true, Ordering::Release);
+        #[cfg(test)]
+        if let (Some(probe), Some(work_sender)) = (&self.test_probe, &self.work_sender) {
+            observe_rejected_submission(&self.admission_accepting, work_sender, probe);
+        }
         drop(self.work_sender.take());
         // Normal paths call shutdown. On cancellation, joining here guarantees
         // map workers never outlive the job whose plaintext they own.
@@ -824,10 +886,6 @@ impl<T> Drop for FixedPartitionMapPool<T> {
         if let Some(probe) = &self.test_probe {
             probe.0.admission_open.store(
                 self.admission_accepting.load(Ordering::Acquire) && self.work_sender.is_some(),
-                Ordering::SeqCst,
-            );
-            probe.0.admission_rejected.store(
-                !self.admission_accepting.load(Ordering::Acquire) && self.work_sender.is_none(),
                 Ordering::SeqCst,
             );
             probe
@@ -1621,6 +1679,14 @@ mod tests {
             probe.admission_rejected(),
             "internal admission still accepts"
         );
+        assert!(
+            probe.rejected_plaintext_zeroized(),
+            "rejected sentinel plaintext was not zeroized"
+        );
+        assert!(
+            probe.rejected_permits_reclaimed(),
+            "rejected sentinel permits leaked"
+        );
         assert!(probe.cleanup_observed(), "cleanup state was not observed");
         assert!(
             probe.cancellation_signalled(),
@@ -1663,6 +1729,8 @@ mod tests {
         assert!(matches!(result, Err(PipelineError::WorkerPanicked)));
         assert!(!probe.admission_open());
         assert!(probe.admission_rejected());
+        assert!(probe.rejected_plaintext_zeroized());
+        assert!(probe.rejected_permits_reclaimed());
         assert!(probe.cleanup_observed());
         assert!(probe.cancellation_signalled());
         assert!(probe.channels_closed());
