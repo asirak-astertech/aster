@@ -224,6 +224,43 @@ for _surface in (
         "surface": _surface,
         **BLOB_PUBLIC_API_FIELDS,
     }
+BLOB_DOCUMENTATION_CAPABILITIES.update(
+    {
+        "blob_publish_man": {
+            "schema": 1,
+            "surface": "blob_publish_man",
+            "local_publish_waits_for_peer": False,
+            "capacity_authority": "configured_blob_depot_limits",
+        },
+        "blob_read_man": {
+            "schema": 1,
+            "surface": "blob_read_man",
+            "cli_download_resume": "post_merge",
+            "node_to_node_receiver_checkpoint_resume": "implemented",
+        },
+        "blob_status_man": {
+            "schema": 1,
+            "surface": "blob_status_man",
+            "blob_status_scope": "receiver_local_durable_state",
+            "blob_status_reports_remote_delivery_peer_or_convergence": False,
+        },
+    }
+)
+
+REQUIREMENTS_CURRENT_SECTION_NAMES = (
+    "selected-lane-summary",
+    "live-selected-blob",
+    "current-automation",
+    "selected-blob-network",
+    "production-blob-network",
+    "production-blob-read",
+    "production-blob-lifecycle",
+)
+_REQUIREMENTS_CURRENT_TEXT = (
+    "Current Blob transfer uses semantic v9 profile 5 with receiver-authoritative "
+    "checkpoints and ABX1 canonical extents, bounded at 8 GiB and 131,072 chunks; "
+    "semantic v7/v8 profile 4 remains compatibility-only at 64 MiB and 1,024 chunks."
+)
 
 _CAPABILITY_BLOCK = re.compile(
     r"<!-- ASTER-BLOB-CAPABILITY:BEGIN -->\s*"
@@ -239,6 +276,11 @@ _CODE_FENCE = re.compile(r"```.*?```", re.DOTALL)
 _CAPABILITY_MARKER = re.compile(r"ASTER-BLOB-CAPABILITY:(?:BEGIN|RENDERED|END)", re.IGNORECASE)
 _LEGACY_BLOCK = re.compile(
     r"<!-- ASTER-BLOB-LEGACY:BEGIN -->.*?<!-- ASTER-BLOB-LEGACY:END -->",
+    re.DOTALL,
+)
+_REQUIREMENTS_CURRENT_BLOCK = re.compile(
+    r"<!-- ASTER-BLOB-CURRENT:([a-z0-9-]+):BEGIN -->\s*(.*?)\s*"
+    r"<!-- ASTER-BLOB-CURRENT:\1:END -->",
     re.DOTALL,
 )
 
@@ -280,6 +322,21 @@ def render_blob_documentation_capability(surface: str) -> str:
             "Semantic v9 selects profile 5 BlobStreamV1; semantic v7/v8 retain "
             "compatibility profile 4 BlobRangesStreamV1."
         )
+    if surface == "blob_publish_man":
+        return (
+            "Publication commits to the local canonical Blob authority without waiting "
+            "for a peer, and all Blob states share configured depot limits."
+        )
+    if surface == "blob_read_man":
+        return (
+            "Interrupted CLI downloads restart at byte zero; node-to-node profile-5 "
+            "receiver-checkpoint resume is implemented independently."
+        )
+    if surface == "blob_status_man":
+        return (
+            "blob-status reports receiver-local durable state, not remote delivery, "
+            "peer status, or convergence."
+        )
     if all(value.get(key) == expected for key, expected in BLOB_PUBLIC_API_FIELDS.items()):
         return (
             "Local Blob publication commits without waiting for a peer. Rust, the "
@@ -301,6 +358,16 @@ def blob_documentation_capability_block(surface: str) -> str:
         "<!-- ASTER-BLOB-CAPABILITY:RENDERED -->\n"
         f"{render_blob_documentation_capability(surface)}\n"
         "<!-- ASTER-BLOB-CAPABILITY:END -->"
+    )
+
+
+def render_requirements_current_section(name: str) -> str:
+    if name not in REQUIREMENTS_CURRENT_SECTION_NAMES:
+        raise KeyError(name)
+    return (
+        f"<!-- ASTER-BLOB-CURRENT:{name}:BEGIN -->\n"
+        f"{_REQUIREMENTS_CURRENT_TEXT}\n"
+        f"<!-- ASTER-BLOB-CURRENT:{name}:END -->\n"
     )
 
 
@@ -339,18 +406,41 @@ def _reject_capability_shaped_json(surface: str, text: str) -> None:
         for key in value
         if key not in {"schema", "surface"}
     }
+    def contains_governed_key(value: object) -> bool:
+        if isinstance(value, dict):
+            return bool(governed_keys.intersection(value)) or any(
+                contains_governed_key(child) for child in value.values()
+            )
+        if isinstance(value, list):
+            return any(contains_governed_key(child) for child in value)
+        return False
+
     for match in _JSON_FENCE.finditer(text):
         try:
             value = json.loads(match.group(1))
         except json.JSONDecodeError:
             continue
-        if isinstance(value, dict) and governed_keys.intersection(value):
+        if contains_governed_key(value):
             fail(f"Blob documentation {surface} has an extra capability-shaped JSON block")
+
+
+def _validate_requirements_current_sections(text: str) -> str:
+    matches = list(_REQUIREMENTS_CURRENT_BLOCK.finditer(text))
+    names = [match.group(1) for match in matches]
+    if sorted(names) != sorted(REQUIREMENTS_CURRENT_SECTION_NAMES):
+        fail("Blob documentation requirements_status current section set differs")
+    for match in matches:
+        name = match.group(1)
+        if " ".join(match.group(2).split()) != " ".join(_REQUIREMENTS_CURRENT_TEXT.split()):
+            fail(f"Blob documentation requirements_status {name} current section differs")
+    return _REQUIREMENTS_CURRENT_BLOCK.sub("", text)
 
 
 def _unstructured_capability_text(surface: str, text: str) -> str:
     if surface == "node_api":
         text = re.sub(r"(?m)^//! ?", "", text)
+    if surface in {"blob_publish_man", "blob_read_man", "blob_status_man"}:
+        text = re.sub(r'(?m)^\.\\" ?', "", text)
     markers = list(_CAPABILITY_MARKER.finditer(text))
     matches = list(_CAPABILITY_BLOCK.finditer(text))
     if len(markers) != 3 or len(matches) != 1:
@@ -381,6 +471,9 @@ def validate_blob_documentation_contract(documents: dict[str, str]) -> None:
         surface: _unstructured_capability_text(surface, documents[surface])
         for surface in BLOB_DOCUMENTATION_CAPABILITIES
     }
+    prose["requirements_status"] = _validate_requirements_current_sections(
+        prose["requirements_status"]
+    )
 
     for surface in ("node_api", "transports", "recipes"):
         for words in _documentation_sentences(prose[surface]):
@@ -1075,6 +1168,15 @@ def main() -> int:
                 ).read_text(),
                 "requirements_status": (
                     ROOT / "docs/validation/requirements-status.md"
+                ).read_text(),
+                "blob_publish_man": (
+                    ROOT / "crates/asterctl/asterctl-blob-publish.1"
+                ).read_text(),
+                "blob_read_man": (
+                    ROOT / "crates/asterctl/asterctl-blob-read.1"
+                ).read_text(),
+                "blob_status_man": (
+                    ROOT / "crates/asterctl/asterctl-blob-status.1"
                 ).read_text(),
             }
         )

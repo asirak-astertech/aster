@@ -2,6 +2,18 @@
 ." SPDX-License-Identifier: Apache-2.0
 ." Clean Room — Privileged
 .TH ASTERCTL-BLOB-READ 1 "2026-10-16" "Aster" "User Commands"
+.\" <!-- ASTER-BLOB-CAPABILITY:BEGIN -->
+.\" ```json
+.\" {
+.\"   "schema": 1,
+.\"   "surface": "blob_read_man",
+.\"   "cli_download_resume": "post_merge",
+.\"   "node_to_node_receiver_checkpoint_resume": "implemented"
+.\" }
+.\" ```
+.\" <!-- ASTER-BLOB-CAPABILITY:RENDERED -->
+.\" Interrupted CLI downloads restart at byte zero; node-to-node profile-5 receiver-checkpoint resume is implemented independently.
+.\" <!-- ASTER-BLOB-CAPABILITY:END -->
 .SH NAME
 asterctl-blob-read \- read an authenticated Aster Blob to a new local file
 .SH SYNOPSIS

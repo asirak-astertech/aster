@@ -54,6 +54,29 @@ BLE is not implemented. Three-CM4 validation of this candidate has not yet run.
                     text.replace(old, new, 1)
                 )
 
+    def test_requirements_totals_are_rendered_from_trace(self) -> None:
+        rows = [
+            {"id": "DM-1-01", "selected_status": "implemented-uncredited"},
+            {"id": "DM-1-02", "selected_status": "observed-bounded"},
+            {"id": "DM-2-01", "selected_status": "open"},
+        ]
+        rendered = CHECKER.render_requirements_totals(rows, 2)
+        CHECKER.validate_requirements_totals(rendered, rows, 2)
+
+        for label, damaged in (
+            ("totals", rendered.replace("implemented-uncredited=1", "implemented-uncredited=2")),
+            ("mapping", rendered.replace("exact-selected-mappings=2", "exact-selected-mappings=1")),
+            ("family", rendered.replace("DM-1 | 1 | 1 | 0 | 2", "DM-1 | 0 | 1 | 1 | 2")),
+        ):
+            with self.subTest(label=label), self.assertRaisesRegex(ValueError, label):
+                CHECKER.validate_requirements_totals(damaged, rows, 2)
+
+    def test_duplicate_current_totals_are_rejected(self) -> None:
+        rows = [{"id": "DM-1-01", "selected_status": "open"}]
+        rendered = CHECKER.render_requirements_totals(rows, 0)
+        with self.assertRaisesRegex(ValueError, "exactly one"):
+            CHECKER.validate_requirements_totals(rendered + rendered, rows, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

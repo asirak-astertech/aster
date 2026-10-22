@@ -120,11 +120,34 @@ for _surface in (
         **PUBLIC_API_FIELDS,
     }
 
+DOCUMENTATION_CAPABILITIES.update(
+    {
+        "blob_publish_man": {
+            "schema": 1,
+            "surface": "blob_publish_man",
+            "local_publish_waits_for_peer": False,
+            "capacity_authority": "configured_blob_depot_limits",
+        },
+        "blob_read_man": {
+            "schema": 1,
+            "surface": "blob_read_man",
+            "cli_download_resume": "post_merge",
+            "node_to_node_receiver_checkpoint_resume": "implemented",
+        },
+        "blob_status_man": {
+            "schema": 1,
+            "surface": "blob_status_man",
+            "blob_status_scope": "receiver_local_durable_state",
+            "blob_status_reports_remote_delivery_peer_or_convergence": False,
+        },
+    }
+)
+
 
 def capability_block(surface: str, *, value=None) -> str:
     payload = DOCUMENTATION_CAPABILITIES[surface] if value is None else value
     rendered = CHECKER.render_blob_documentation_capability(surface)
-    return (
+    block = (
         "<!-- ASTER-BLOB-CAPABILITY:BEGIN -->\n"
         "```json\n"
         f"{json.dumps(payload, indent=2)}\n"
@@ -133,6 +156,12 @@ def capability_block(surface: str, *, value=None) -> str:
         f"{rendered}\n"
         "<!-- ASTER-BLOB-CAPABILITY:END -->\n"
     )
+    if surface == "requirements_status":
+        block += "\n".join(
+            CHECKER.render_requirements_current_section(name)
+            for name in CHECKER.REQUIREMENTS_CURRENT_SECTION_NAMES
+        )
+    return block
 
 
 def core_contract() -> str:
@@ -331,6 +360,8 @@ class ProtocolVersionContractTests(unittest.TestCase):
 
         for extra in (
             """```json\n{\"semantic_v9_profile\": \"4:BlobRangesStreamV1\"}\n```\n""",
+            """```json\n{\"capability\": {\"semantic_v9_profile\": \"4:BlobRangesStreamV1\"}}\n```\n""",
+            """```json\n[{\"semantic_v9_profile\": \"4:BlobRangesStreamV1\"}]\n```\n""",
             capability_block("node_api").replace("ASTER-BLOB-CAPABILITY", "aster-blob-capability"),
         ):
             damaged = dict(documents)
@@ -341,8 +372,75 @@ class ProtocolVersionContractTests(unittest.TestCase):
                 CHECKER.validate_blob_documentation_contract(damaged)
 
         unrelated_example = dict(documents)
-        unrelated_example["readme"] += """```json\n{\"topic\": \"maps\", \"limit\": 4}\n```\n"""
+        unrelated_example["readme"] += (
+            """```json\n{\"topic\": \"maps\", \"limit\": 4}\n```\n"""
+            """```json\n[{\"example\": {\"topic\": \"maps\", \"limit\": 4}}]\n```\n"""
+        )
         CHECKER.validate_blob_documentation_contract(unrelated_example)
+
+    def test_requirements_current_sections_are_exact_and_exhaustive(self) -> None:
+        documents = {
+            surface: capability_block(surface) for surface in DOCUMENTATION_CAPABILITIES
+        }
+        CHECKER.validate_blob_documentation_contract(documents)
+
+        first = CHECKER.REQUIREMENTS_CURRENT_SECTION_NAMES[0]
+        damaged = dict(documents)
+        damaged["requirements_status"] = damaged["requirements_status"].replace(
+            CHECKER.render_requirements_current_section(first), "", 1
+        )
+        with self.assertRaisesRegex(CHECKER.ContractViolation, "current section set"):
+            CHECKER.validate_blob_documentation_contract(damaged)
+
+        damaged = dict(documents)
+        damaged["requirements_status"] += CHECKER.render_requirements_current_section(first)
+        with self.assertRaisesRegex(CHECKER.ContractViolation, "current section set"):
+            CHECKER.validate_blob_documentation_contract(damaged)
+
+        damaged = dict(documents)
+        damaged["requirements_status"] += (
+            "<!-- ASTER-BLOB-CURRENT:unexpected:BEGIN -->\nextra\n"
+            "<!-- ASTER-BLOB-CURRENT:unexpected:END -->\n"
+        )
+        with self.assertRaisesRegex(CHECKER.ContractViolation, "current section set"):
+            CHECKER.validate_blob_documentation_contract(damaged)
+
+        damaged = dict(documents)
+        expected = CHECKER.render_requirements_current_section(first)
+        damaged["requirements_status"] = damaged["requirements_status"].replace(
+            expected, expected.replace("receiver-authoritative", "sender-authoritative"), 1
+        )
+        with self.assertRaisesRegex(CHECKER.ContractViolation, first):
+            CHECKER.validate_blob_documentation_contract(damaged)
+
+    def test_documentation_surface_set_is_exact(self) -> None:
+        documents = {
+            surface: capability_block(surface) for surface in DOCUMENTATION_CAPABILITIES
+        }
+        missing = dict(documents)
+        del missing["blob_read_man"]
+        with self.assertRaisesRegex(CHECKER.ContractViolation, "surfaces differ"):
+            CHECKER.validate_blob_documentation_contract(missing)
+
+        extra = dict(documents)
+        extra["aggregate_cli_man"] = capability_block("blob_status_man")
+        with self.assertRaisesRegex(CHECKER.ContractViolation, "surfaces differ"):
+            CHECKER.validate_blob_documentation_contract(extra)
+
+        for surface in ("blob_publish_man", "blob_read_man", "blob_status_man"):
+            damaged = dict(documents)
+            damaged[surface] = damaged[surface].replace('"schema": 1', '"schema": 2', 1)
+            with self.subTest(surface=surface), self.assertRaisesRegex(
+                CHECKER.ContractViolation, f"{surface}.*fields"
+            ):
+                CHECKER.validate_blob_documentation_contract(damaged)
+
+            duplicate = dict(documents)
+            duplicate[surface] += capability_block(surface)
+            with self.subTest(surface=f"{surface}-duplicate"), self.assertRaisesRegex(
+                CHECKER.ContractViolation, f"{surface}.*exactly one"
+            ):
+                CHECKER.validate_blob_documentation_contract(duplicate)
 
         public_claims = (
             "Local publication waits for a peer before it commits.",

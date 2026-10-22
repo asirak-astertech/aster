@@ -2,6 +2,18 @@
 ." SPDX-License-Identifier: Apache-2.0
 ." Clean Room — Privileged
 .TH ASTERCTL-BLOB-STATUS 1 "2026-10-20" "Aster" "User Commands"
+.\" <!-- ASTER-BLOB-CAPABILITY:BEGIN -->
+.\" ```json
+.\" {
+.\"   "schema": 1,
+.\"   "surface": "blob_status_man",
+.\"   "blob_status_scope": "receiver_local_durable_state",
+.\"   "blob_status_reports_remote_delivery_peer_or_convergence": false
+.\" }
+.\" ```
+.\" <!-- ASTER-BLOB-CAPABILITY:RENDERED -->
+.\" blob-status reports receiver-local durable state, not remote delivery, peer status, or convergence.
+.\" <!-- ASTER-BLOB-CAPABILITY:END -->
 .SH NAME
 asterctl-blob-status \- inspect or wait for receiver-local Blob publication state
 .SH SYNOPSIS

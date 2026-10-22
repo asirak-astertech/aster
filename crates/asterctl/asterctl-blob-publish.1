@@ -2,6 +2,18 @@
 ." SPDX-License-Identifier: Apache-2.0
 ." Clean Room — Privileged
 .TH ASTERCTL-BLOB-PUBLISH 1 "2026-10-15" "Aster" "User Commands"
+.\" <!-- ASTER-BLOB-CAPABILITY:BEGIN -->
+.\" ```json
+.\" {
+.\"   "schema": 1,
+.\"   "surface": "blob_publish_man",
+.\"   "local_publish_waits_for_peer": false,
+.\"   "capacity_authority": "configured_blob_depot_limits"
+.\" }
+.\" ```
+.\" <!-- ASTER-BLOB-CAPABILITY:RENDERED -->
+.\" Publication commits to the local canonical Blob authority without waiting for a peer, and all Blob states share configured depot limits.
+.\" <!-- ASTER-BLOB-CAPABILITY:END -->
 .SH NAME
 asterctl-blob-publish \- publish a local file as an immutable Aster Blob
 .SH SYNOPSIS

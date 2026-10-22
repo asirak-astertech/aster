@@ -54,6 +54,84 @@ VALID_SELECTED_STATES = frozenset(
     {"observed-bounded", "implemented-uncredited", "open"}
 )
 
+_TOTALS_BLOCK = re.compile(
+    r"<!-- ASTER-REQUIREMENTS-TOTALS:BEGIN -->\s*(.*?)\s*"
+    r"<!-- ASTER-REQUIREMENTS-TOTALS:END -->",
+    re.DOTALL,
+)
+
+
+def _requirement_family(requirement_id: str) -> str:
+    return requirement_id.split("-", 2)[1].split(".", 1)[0]
+
+
+def render_requirements_totals(
+    rows: list[dict[str, str]], mapping_count: int
+) -> str:
+    statuses = Counter(row["selected_status"] for row in rows)
+    by_family: dict[str, Counter[str]] = {}
+    for row in rows:
+        family = _requirement_family(row["id"])
+        by_family.setdefault(family, Counter())[row["selected_status"]] += 1
+    lines = [
+        "<!-- ASTER-REQUIREMENTS-TOTALS:BEGIN -->",
+        (
+            "Generated selected-status totals: "
+            f"implemented-uncredited={statuses['implemented-uncredited']}; "
+            f"observed-bounded={statuses['observed-bounded']}; "
+            f"open={statuses['open']}; exact-selected-mappings={mapping_count}."
+        ),
+        "",
+        "| Requirement family | Implemented, not fully credited | Observed, bounded | Open | Total |",
+        "|---|---:|---:|---:|---:|",
+    ]
+    for family in sorted(by_family, key=int):
+        counts = by_family[family]
+        total = sum(counts.values())
+        lines.append(
+            f"| DM-{family} | {counts['implemented-uncredited']} | "
+            f"{counts['observed-bounded']} | {counts['open']} | {total} |"
+        )
+    lines.extend(
+        [
+            (
+                f"| **Total** | **{statuses['implemented-uncredited']}** | "
+                f"**{statuses['observed-bounded']}** | **{statuses['open']}** | "
+                f"**{len(rows)}** |"
+            ),
+            "<!-- ASTER-REQUIREMENTS-TOTALS:END -->",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def validate_requirements_totals(
+    text: str, rows: list[dict[str, str]], mapping_count: int
+) -> None:
+    matches = list(_TOTALS_BLOCK.finditer(text))
+    if len(matches) != 1:
+        raise ValueError(
+            f"requirements totals block must occur exactly one time; found {len(matches)}"
+        )
+    actual = " ".join(matches[0].group(1).split())
+    expected_block = render_requirements_totals(rows, mapping_count)
+    expected_match = _TOTALS_BLOCK.search(expected_block)
+    assert expected_match is not None
+    expected = " ".join(expected_match.group(1).split())
+    if actual != expected:
+        actual_header = actual.split("| Requirement family", 1)[0]
+        expected_header = expected.split("| Requirement family", 1)[0]
+        label = "totals"
+        if "exact-selected-mappings" in actual_header and actual_header != expected_header:
+            label = "mapping" if all(
+                f"{state}={Counter(row['selected_status'] for row in rows)[state]}"
+                in actual_header
+                for state in VALID_SELECTED_STATES
+            ) else "totals"
+        elif actual_header == expected_header:
+            label = "family"
+        raise ValueError(f"requirements {label} render differs from generated trace")
+
 
 def validate_blob_capability_documentation(text: str) -> None:
     """Keep current Blob claims separate from explicitly open capabilities."""
@@ -2162,6 +2240,9 @@ def main() -> int:
         if args.write:
             write_trace(expected)
         errors = validate_trace(expected)
+        validate_requirements_totals(
+            LEDGER.read_text(encoding="utf-8"), expected, len(SELECTED_OVERRIDES)
+        )
     except (OSError, csv.Error, ValueError) as error:
         print(f"requirements trace validation failed: {error}", file=sys.stderr)
         return 1
