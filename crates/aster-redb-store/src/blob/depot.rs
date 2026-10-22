@@ -2725,8 +2725,12 @@ pub(crate) fn prepare_depot_owner_token_write(
         .iter()
         .filter(|table| existing.contains(**table))
         .count();
+    let network_predecessor = network_present == 4
+        && network[..4].iter().all(|table| existing.contains(*table))
+        && !existing.contains(BLOB_PROFILE5_RECEIPTS.name());
+    let network_current = network_present == network.len();
     if legacy.iter().any(|table| !existing.contains(*table))
-        || !matches!(network_present, 0 | 4 | 5)
+        || !(network_present == 0 || network_predecessor || network_current)
     {
         return Err(blob_error(BlobStoreError::SchemaInvariant(
             "mission-scoped Blob schema group is incomplete",
@@ -2758,7 +2762,7 @@ pub(crate) fn prepare_depot_owner_token_write(
         || write.open_table(BLOB_OPERATIONS)?.len()? != 0
         || write.open_table(BLOB_IMPORTS)?.len()? != 0
         || write.open_table(BLOB_CHUNKS)?.len()? != 0
-        || (network_present == network.len()
+        || ((network_predecessor || network_current)
             && (write.open_table(BLOB_PENDING_SOURCES)?.len()? != 0
                 || write.open_table(BLOB_CARRIER_PREFIXES)?.len()? != 0
                 || write.open_table(BLOB_CARRIER_FETCH_CURSORS)?.len()? != 0));
@@ -3237,6 +3241,27 @@ pub(super) fn audit_publication_import_evidence(
         chunk_count,
         physical_lineage,
     )
+}
+
+pub(super) fn profile5_import_shape_evidence(
+    encoded: &[u8],
+    metadata: &super::BlobMetadata,
+) -> Result<(u64, u64), StoreError> {
+    let import = decode_import(encoded)?;
+    audit_publication_import_record(
+        &import,
+        metadata.variant_id,
+        metadata.blob_id,
+        metadata.header.key_epoch,
+        metadata.manifest_digest,
+        metadata
+            .header
+            .blob_route
+            .ok_or_else(|| blob_error(BlobStoreError::SchemaInvariant("Blob route is missing")))?
+            .chunk_count(),
+        metadata.physical_lineage,
+    )?;
+    Ok((import.total_len, import.chunk_count))
 }
 
 pub(super) fn audit_publication_import_read(
@@ -4509,17 +4534,25 @@ pub(super) fn stage_verified_plan_write(
     write: &redb::WriteTransaction,
     limits: BlobDepotLimits,
     plan: &VerifiedBlobTransferPlan,
+    max_total_len: u64,
+    max_chunks: u64,
 ) -> Result<(), StoreError> {
     let manifest = plan.manifest();
-    let incoming = ImportRecord::from_manifest(manifest, Some(plan.physical_lineage()))?;
-    if incoming.total_len > MAX_NETWORK_BLOB_BYTES
-        || incoming.chunk_count > MAX_NETWORK_BLOB_CHUNKS
+    let mut incoming = ImportRecord::from_manifest(manifest, Some(plan.physical_lineage()))?;
+    if incoming.total_len > max_total_len
+        || incoming.chunk_count > max_chunks
         || usize::try_from(incoming.chunk_count).ok() != Some(plan.chunk_records().len())
     {
         return Err(blob_error(BlobStoreError::NetworkBlobTooLarge {
             total_len: incoming.total_len,
             chunk_count: incoming.chunk_count,
         }));
+    }
+    if incoming.chunk_count == 0 {
+        // The canonical empty Blob has no DATA carrier whose commit could
+        // otherwise finalize the import. The authenticated manifest plan is
+        // itself the complete physical proof for the exact `(0, 0)` shape.
+        incoming.finalized_manifest_digest = Some(*plan.manifest_digest());
     }
 
     let existing_import = load_import_write(write, incoming.variant_id)?;

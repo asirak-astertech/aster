@@ -28,6 +28,24 @@ use super::pack::{BlobPackCheckpoint, BlobPackError};
 
 const PROFILE5_RECEIPT_MAGIC: &[u8; 8] = b"ASTRP5R1";
 const PROFILE5_RECEIPT_VERSION: u8 = 1;
+const PROFILE5_RECEIPT_KEY_BYTES: u64 = 64;
+const PROFILE5_RECEIPT_VALUE_BYTES: u64 = 201;
+/// Profile-5 settlement receipts share the existing durable acknowledgement
+/// ledger ceiling: both retain one fixed-size idempotency authority per source.
+pub const MAX_BLOB_PROFILE5_RECEIPTS: u64 =
+    crate::blob_subscription::MAX_BLOB_ACKNOWLEDGEMENT_RECEIPTS;
+pub const MAX_BLOB_PROFILE5_RECEIPT_BYTES: u64 =
+    MAX_BLOB_PROFILE5_RECEIPTS * (PROFILE5_RECEIPT_KEY_BYTES + PROFILE5_RECEIPT_VALUE_BYTES);
+
+fn require_profile5_receipt_capacity(current: u64) -> Result<(), StoreError> {
+    if current >= MAX_BLOB_PROFILE5_RECEIPTS {
+        return Err(StoreError::BlobAcknowledgementReceiptLimitExceeded {
+            current,
+            limit: MAX_BLOB_PROFILE5_RECEIPTS,
+        });
+    }
+    Ok(())
+}
 
 /// Durable receiver-owned progress for one canonical semantic-v9 Blob source.
 ///
@@ -69,13 +87,29 @@ fn profile5_receipt_key(authority: NodeId, source: BlobTransferId) -> [u8; 64] {
 }
 
 fn profile5_plan_binding(plan: &VerifiedBlobTransferPlan) -> [u8; 32] {
+    profile5_plan_binding_fields(
+        plan.source_envelope().into_bytes(),
+        *plan.manifest_digest(),
+        *plan.physical_lineage().binding(),
+        plan.manifest().total_len(),
+        plan.manifest().chunk_count(),
+    )
+}
+
+fn profile5_plan_binding_fields(
+    source: [u8; 32],
+    manifest_digest: [u8; 32],
+    physical_lineage: [u8; 32],
+    total_len: u64,
+    chunk_count: u64,
+) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(b"aster/profile5-receipt-plan/v1\0");
-    hasher.update(plan.source_envelope().into_bytes());
-    hasher.update(plan.manifest_digest());
-    hasher.update(plan.physical_lineage().binding());
-    hasher.update(plan.manifest().total_len().to_be_bytes());
-    hasher.update(plan.manifest().chunk_count().to_be_bytes());
+    hasher.update(source);
+    hasher.update(manifest_digest);
+    hasher.update(physical_lineage);
+    hasher.update(total_len.to_be_bytes());
+    hasher.update(chunk_count.to_be_bytes());
     hasher.finalize().into()
 }
 
@@ -149,14 +183,185 @@ impl Profile5ReceiptRecord {
         };
         if record.receipt.plan_binding == [0; 32]
             || record.receipt.store_binding == [0; 32]
+            || record.receipt.chunk_count > aster_mesh::MAX_BLOB_CHUNKS
+            || record.receipt.max_wire_len
+                > record
+                    .receipt
+                    .chunk_count
+                    .checked_mul((aster_mesh::MAX_BLOB_TRANSFER_OBJECT_BYTES as u64) + 20)
+                    .ok_or_else(schema_error)?
             || record.progress.next_segment_index > record.receipt.chunk_count
             || record.progress.durable_plaintext_offset > record.receipt.total_len
+            || record.progress.durable_pack_len > record.receipt.max_wire_len
             || record.progress.durable_wire_offset > record.receipt.max_wire_len
+            || record.progress.durable_wire_offset < record.progress.durable_pack_len
+            || (record.progress.generation == 0 && record.progress != BlobStreamResume::default())
+            || (record.progress.next_segment_index == 0
+                && (record.progress.durable_plaintext_offset != 0
+                    || record.progress.durable_pack_len != 0
+                    || record.progress.durable_wire_offset != 0))
+            || (record.progress.next_segment_index == record.receipt.chunk_count
+                && (record.progress.durable_plaintext_offset != record.receipt.total_len
+                    || record.progress.durable_wire_offset != record.receipt.max_wire_len))
+            || (record.progress.next_segment_index < record.receipt.chunk_count
+                && (record.progress.durable_plaintext_offset >= record.receipt.total_len
+                    || record.progress.durable_wire_offset >= record.receipt.max_wire_len))
         {
             return Err(schema_error());
         }
         Ok(record)
     }
+}
+
+fn profile5_receipt_binding_from_metadata(
+    metadata: &super::BlobMetadata,
+    total_len: u64,
+    chunk_count: u64,
+) -> Result<([u8; 32], u64, u64), StoreError> {
+    let route = metadata.header.blob_route.ok_or_else(schema_error)?;
+    let physical_lineage = metadata.physical_lineage.ok_or_else(schema_error)?;
+    if route.chunk_count() != chunk_count {
+        return Err(schema_error());
+    }
+    Ok((
+        profile5_plan_binding_fields(
+            *metadata.transfer_id.as_bytes(),
+            metadata.manifest_digest,
+            physical_lineage,
+            total_len,
+            chunk_count,
+        ),
+        total_len,
+        chunk_count,
+    ))
+}
+
+pub(super) fn audit_profile5_receipts(
+    receipts: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    pending: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    publications: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    imports: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    mission_authority: Option<NodeId>,
+    owner_binding: Option<[u8; 32]>,
+    pending_encoding: super::PendingBlobEncodingGeneration,
+    publication_encoding: super::lifecycle::PublicationEncodingGeneration,
+) -> Result<(), StoreError> {
+    let rows = receipts.len()?;
+    let bytes = rows
+        .checked_mul(PROFILE5_RECEIPT_KEY_BYTES + PROFILE5_RECEIPT_VALUE_BYTES)
+        .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+    if rows > MAX_BLOB_PROFILE5_RECEIPTS || bytes > MAX_BLOB_PROFILE5_RECEIPT_BYTES {
+        return Err(schema_error());
+    }
+    if rows != 0 && (mission_authority.is_none() || owner_binding.is_none()) {
+        return Err(schema_error());
+    }
+    for row in receipts.iter()? {
+        let (key, value) = row?;
+        let key: [u8; 64] = key.value().try_into().map_err(|_| schema_error())?;
+        if value.value().len() as u64 != PROFILE5_RECEIPT_VALUE_BYTES {
+            return Err(schema_error());
+        }
+        let record = Profile5ReceiptRecord::decode(value.value())?;
+        let authority = mission_authority.ok_or_else(schema_error)?;
+        let owner = owner_binding.ok_or_else(schema_error)?;
+        if record.receipt.receiving_authority != authority
+            || record.receipt.store_binding != owner
+            || profile5_receipt_key(authority, record.receipt.source) != key
+        {
+            return Err(schema_error());
+        }
+        let source_key = record.receipt.source.as_bytes().as_slice();
+        let pending_record = pending
+            .get(source_key)?
+            .map(|value| {
+                super::decode_pending_blob_source_for_encoding(value.value(), pending_encoding)
+            })
+            .transpose()?;
+        let publication = publications
+            .get(source_key)?
+            .map(|value| {
+                super::decode_blob_metadata_for_encoding(value.value(), publication_encoding)
+            })
+            .transpose()?;
+        if pending_record.is_some() == publication.is_some() {
+            return Err(schema_error());
+        }
+        let metadata = pending_record
+            .as_ref()
+            .map(|pending| &pending.metadata)
+            .or(publication.as_ref())
+            .ok_or_else(schema_error)?;
+        let import = imports
+            .get(metadata.variant_id.as_bytes().as_slice())?
+            .map(|value| value.value().to_vec())
+            .ok_or_else(schema_error)?;
+        let (total_len, chunk_count) =
+            super::depot::profile5_import_shape_evidence(&import, metadata)?;
+        let (binding, total_len, chunk_count) =
+            profile5_receipt_binding_from_metadata(metadata, total_len, chunk_count)?;
+        if record.receipt.plan_binding != binding
+            || record.receipt.total_len != total_len
+            || record.receipt.chunk_count != chunk_count
+        {
+            return Err(schema_error());
+        }
+        if let Some(pending) = pending_record.as_ref() {
+            let max_wire_len = pending.carriers.iter().try_fold(0u64, |total, carrier| {
+                total
+                    .checked_add(carrier.total_len)
+                    .and_then(|value| value.checked_add(20))
+                    .ok_or(StoreError::PayloadByteAccountingOverflow)
+            })?;
+            if record.receipt.max_wire_len != max_wire_len {
+                return Err(schema_error());
+            }
+        } else if record.progress.next_segment_index != chunk_count
+            || record.progress.durable_plaintext_offset != total_len
+        {
+            return Err(schema_error());
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn profile5_receipt_expiry_charge_write(
+    write: &redb::WriteTransaction,
+    transfer: BlobTransferId,
+) -> Result<(u64, u64), StoreError> {
+    let Some(authority) = super::read_mission_binding(write)? else {
+        return Err(StoreError::MissionNotBound);
+    };
+    let key = profile5_receipt_key(authority, transfer);
+    let value = write
+        .open_table(BLOB_PROFILE5_RECEIPTS)?
+        .get(key.as_slice())?
+        .map(|value| value.value().to_vec());
+    let Some(value) = value else {
+        return Ok((0, 0));
+    };
+    let record = Profile5ReceiptRecord::decode(&value)?;
+    if record.receipt.receiving_authority != authority || record.receipt.source != transfer {
+        return Err(schema_error());
+    }
+    Ok((1, PROFILE5_RECEIPT_KEY_BYTES + PROFILE5_RECEIPT_VALUE_BYTES))
+}
+
+pub(super) fn expire_profile5_receipt_write(
+    write: &redb::WriteTransaction,
+    transfer: BlobTransferId,
+) -> Result<(u64, u64), StoreError> {
+    let charge = profile5_receipt_expiry_charge_write(write, transfer)?;
+    if charge.0 == 0 {
+        return Ok(charge);
+    }
+    let authority = super::read_mission_binding(write)?.ok_or(StoreError::MissionNotBound)?;
+    let key = profile5_receipt_key(authority, transfer);
+    write
+        .open_table(BLOB_PROFILE5_RECEIPTS)?
+        .remove(key.as_slice())?
+        .ok_or_else(schema_error)?;
+    Ok(charge)
 }
 
 const PROVISIONAL_MAGIC: &[u8; 8] = b"ASTRPR02";
@@ -1296,9 +1501,11 @@ impl Store {
             receipt: receipt.clone(),
             progress,
         };
-        write
-            .open_table(BLOB_PROFILE5_RECEIPTS)?
-            .insert(key.as_slice(), record.encode().as_slice())?;
+        let mut receipts = write.open_table(BLOB_PROFILE5_RECEIPTS)?;
+        let current = receipts.len()?;
+        require_profile5_receipt_capacity(current)?;
+        receipts.insert(key.as_slice(), record.encode().as_slice())?;
+        drop(receipts);
         write.commit()?;
         Ok((receipt, progress))
     }
@@ -1344,7 +1551,15 @@ impl Store {
             || durable.durable_wire_offset < expected.durable_wire_offset
             || durable.next_segment_index > receipt.chunk_count
             || durable.durable_plaintext_offset > receipt.total_len
+            || durable.durable_pack_len > receipt.max_wire_len
             || durable.durable_wire_offset > receipt.max_wire_len
+            || durable.durable_wire_offset < durable.durable_pack_len
+            || (durable.next_segment_index == receipt.chunk_count
+                && (durable.durable_plaintext_offset != receipt.total_len
+                    || durable.durable_wire_offset != receipt.max_wire_len))
+            || (durable.next_segment_index < receipt.chunk_count
+                && (durable.durable_plaintext_offset >= receipt.total_len
+                    || durable.durable_wire_offset >= receipt.max_wire_len))
         {
             return Err(blob_error(BlobStoreError::ReservationChanged));
         }
@@ -2094,6 +2309,21 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(&first[..32], &[0x61; 32]);
         assert_eq!(&first[32..], source.as_bytes());
+    }
+
+    #[test]
+    fn profile5_receipt_capacity_is_fixed_and_fail_closed() {
+        assert_eq!(
+            MAX_BLOB_PROFILE5_RECEIPT_BYTES,
+            MAX_BLOB_PROFILE5_RECEIPTS * (64 + 201)
+        );
+        require_profile5_receipt_capacity(MAX_BLOB_PROFILE5_RECEIPTS - 1)
+            .expect("last bounded receipt slot");
+        assert!(matches!(
+            require_profile5_receipt_capacity(MAX_BLOB_PROFILE5_RECEIPTS),
+            Err(StoreError::BlobAcknowledgementReceiptLimitExceeded { current, limit })
+                if current == limit && limit == MAX_BLOB_PROFILE5_RECEIPTS
+        ));
     }
 
     struct TestRoot(PathBuf);

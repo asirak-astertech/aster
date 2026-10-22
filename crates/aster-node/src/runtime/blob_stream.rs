@@ -213,6 +213,10 @@ fn canonical_blob_carrier_len(plan: &VerifiedBlobTransferPlan) -> Result<u64, Bl
     Ok(total)
 }
 
+const fn canonical_sender_requires_final_checkpoint(total: u64, durable: u64) -> bool {
+    total != 0 && durable < total
+}
+
 struct CanonicalCarrierExtentSource<'a> {
     store: &'a Store,
     source: &'a CanonicalBlobSendSource,
@@ -1296,7 +1300,7 @@ pub(crate) async fn send_canonical_blob_profile5(
             }
         }
     }
-    if wire_len != 0 {
+    if canonical_sender_requires_final_checkpoint(wire_len, resume_offset) {
         let checkpoint = await_authenticated_progress(
             "receive final canonical checkpoint",
             attempt.receive_control(),
@@ -1553,7 +1557,7 @@ pub(crate) async fn receive_canonical_blob_profile5(
             .map_err(|error| lifecycle_failure("stage finite canonical pending source", error))?
     } else {
         store
-            .stage_verified_blob_source_with_policy(policy, &blob, &sealed, &plan)
+            .stage_verified_profile5_blob_source_with_policy(policy, &blob, &sealed, &plan)
             .map_err(|error| lifecycle_failure("stage canonical pending source", error))?
     };
     let source = BlobTransferId::new(offer.transfer_id);
@@ -2513,7 +2517,7 @@ async fn receive_completed_pack_inner(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::mission::{MissionPeerBinding, MissionSessionInitiator, MissionSessionResponder};
     use crate::stream_transfer::PROFILE5_SOURCE_CHUNK_BYTES;
@@ -2600,42 +2604,28 @@ mod tests {
         assert!(error.to_string().contains("idle timeout"));
     }
 
-    fn mission_pair() -> (MissionSession, MissionSession, [u8; 32]) {
-        let scope = Scope::new("mission/alpha").unwrap();
-        let access =
-            ProvisioningAccess::member(scope, vec![1], vec![Topic::new("imagery").unwrap()])
-                .unwrap();
-        let mut provisioner = ReferenceProvisioner::from_seed([0xc1; 32]).unwrap();
-        let initiator_bytes = provisioner
-            .issue_node(1, std::slice::from_ref(&access))
-            .unwrap()
-            .to_bytes()
-            .unwrap();
-        let responder_bytes = provisioner
-            .issue_node(2, &[access])
-            .unwrap()
-            .to_bytes()
-            .unwrap();
-        let initiator_identity = ReferenceEnvelopeSealer::open(
-            ProvisioningBundle::from_bytes(&initiator_bytes).unwrap(),
-        )
-        .unwrap()
-        .identity();
-        let responder_identity = ReferenceEnvelopeSealer::open(
-            ProvisioningBundle::from_bytes(&responder_bytes).unwrap(),
-        )
-        .unwrap()
-        .identity();
+    pub(crate) fn mission_pair_from_bundles(
+        initiator_bytes: &[u8],
+        responder_bytes: &[u8],
+    ) -> (MissionSession, MissionSession, [u8; 32]) {
+        let initiator_identity =
+            ReferenceEnvelopeSealer::open(ProvisioningBundle::from_bytes(initiator_bytes).unwrap())
+                .unwrap()
+                .identity();
+        let responder_identity =
+            ReferenceEnvelopeSealer::open(ProvisioningBundle::from_bytes(responder_bytes).unwrap())
+                .unwrap()
+                .identity();
         let initiator_carrier = SecretKey::generate();
         let responder_carrier = SecretKey::generate();
         let (initiator, first) = MissionSessionInitiator::start(
-            ProvisioningBundle::from_bytes(&initiator_bytes).unwrap(),
+            ProvisioningBundle::from_bytes(initiator_bytes).unwrap(),
             MissionPeerBinding::new(responder_carrier.public(), responder_identity),
             responder_carrier.public(),
         )
         .unwrap();
         let responder = MissionSessionResponder::open(
-            ProvisioningBundle::from_bytes(&responder_bytes).unwrap(),
+            ProvisioningBundle::from_bytes(responder_bytes).unwrap(),
             MissionPeerBinding::new(initiator_carrier.public(), initiator_identity),
             initiator_carrier.public(),
         )
@@ -2657,6 +2647,32 @@ mod tests {
         let negotiated = crate::event_pages::negotiate_transfer_profiles(&offer, &offer).unwrap();
         let digest = crate::event_pages::transfer_profile_digest(&offer, &offer, &negotiated);
         (initiator, responder, digest)
+    }
+
+    fn mission_pair() -> (MissionSession, MissionSession, [u8; 32]) {
+        let scope = Scope::new("mission/alpha").unwrap();
+        let access =
+            ProvisioningAccess::member(scope, vec![1], vec![Topic::new("imagery").unwrap()])
+                .unwrap();
+        let mut provisioner = ReferenceProvisioner::from_seed([0xc1; 32]).unwrap();
+        let initiator_bytes = provisioner
+            .issue_node(1, std::slice::from_ref(&access))
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+        let responder_bytes = provisioner
+            .issue_node(2, &[access])
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+        mission_pair_from_bundles(&initiator_bytes, &responder_bytes)
+    }
+
+    #[test]
+    fn fully_checkpointed_accept_advances_to_finish_without_final_checkpoint_wait() {
+        assert!(!canonical_sender_requires_final_checkpoint(1024, 1024));
+        assert!(canonical_sender_requires_final_checkpoint(1024, 512));
+        assert!(!canonical_sender_requires_final_checkpoint(0, 0));
     }
 
     #[test]
@@ -3043,17 +3059,17 @@ mod tests {
         }
     }
 
-    struct MemoryTransportAdapter {
+    pub(crate) struct MemoryTransportAdapter {
         sender: Arc<MemorySenderAttempt>,
         receiver: Arc<MemoryReceiverAttempt>,
     }
 
     impl MemoryTransportAdapter {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             Self::with_receive_failure(None)
         }
 
-        fn with_receive_failure(fail_after_receives: Option<usize>) -> Self {
+        pub(crate) fn with_receive_failure(fail_after_receives: Option<usize>) -> Self {
             let (data_send, data_receive) = mpsc::unbounded_channel();
             let (control_send, control_receive) = mpsc::unbounded_channel();
             Self {

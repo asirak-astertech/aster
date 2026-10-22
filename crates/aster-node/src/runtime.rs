@@ -172,6 +172,7 @@ use crate::{
 use aster_mesh::{ReferenceSessionInitiator, ReferenceSessionResponder, UnprotectedProvisioning};
 #[cfg(test)]
 use aster_redb_store::{
+    BlobDeliveryAck, BlobSubscriptionKey, BlobSubscriptionPollSelection, BlobSubscriptionSpec,
     CUSTODY_EMERGENCY_BYTE_RESERVE, CUSTODY_EMERGENCY_ITEM_RESERVE,
     DEFAULT_MAX_TOTAL_PAYLOAD_BYTES, MAX_CONTROL_BYTES, MAX_CONTROL_ITEMS,
 };
@@ -52196,6 +52197,344 @@ mod tests {
 
         drop(store);
         fs::remove_dir_all(state).expect("canonical capability cleanup");
+    }
+
+    #[tokio::test]
+    async fn completed_canonical_blob_crosses_v9() {
+        for (label, plaintext, finite) in [
+            (
+                "nonempty",
+                b"canonical profile-5 production crossing".as_slice(),
+                false,
+            ),
+            ("empty", b"".as_slice(), false),
+            (
+                "finite",
+                b"finite canonical profile-5 production crossing".as_slice(),
+                true,
+            ),
+        ] {
+            let services = control_test_services([0xa8; 32]);
+            let source_state = root(&format!("canonical-v9-source-{label}"));
+            let target_state = root(&format!("canonical-v9-target-{label}"));
+            fs::create_dir_all(&source_state).expect("canonical v9 source state");
+            fs::create_dir_all(&target_state).expect("canonical v9 target state");
+            let authority = services.member.mission_authority_id();
+            let source_store = Store::open_for_mission(source_state.join(STORE_FILE), authority)
+                .expect("canonical v9 source store");
+            let target_store = Store::open_for_mission(target_state.join(STORE_FILE), authority)
+                .expect("canonical v9 target store");
+            let mut source_verifier = open_test_sealer(&services.member);
+            let publication = if finite {
+                publish_test_finite_blob(
+                    &source_store,
+                    &mut source_verifier,
+                    &services.topic,
+                    &services.scope,
+                    1,
+                    plaintext,
+                    600_000,
+                    25,
+                    CustodySample {
+                        clock_id: [0xb1; 16],
+                        tick_ms: 0,
+                    },
+                )
+            } else {
+                publish_test_blob(
+                    &source_store,
+                    &mut source_verifier,
+                    &services.topic,
+                    &services.scope,
+                    1,
+                    plaintext,
+                )
+            };
+            let retained = source_store
+                .blob_source_projection(publication)
+                .expect("canonical v9 source projection")
+                .expect("canonical v9 retained source");
+            let stored = source_store
+                .get_blob(publication)
+                .expect("canonical v9 source lookup")
+                .expect("canonical v9 source exists");
+            let route = source_verifier
+                .verify_blob(&stored.sealed)
+                .expect("canonical v9 source route");
+            let BlobContentVerification::ContentVerified {
+                blob,
+                manifest_bytes,
+            } = source_verifier
+                .verify_blob_content(route, &stored.sealed)
+                .expect("canonical v9 source content")
+            else {
+                panic!("canonical v9 source lost content access")
+            };
+            let plan = blob
+                .transfer_plan(&manifest_bytes)
+                .expect("canonical v9 source plan");
+            assert_eq!(blob.mission_authority_id(), authority);
+            assert_eq!(plan.source_envelope().into_bytes(), blob.envelope_id());
+            assert_eq!(plan.manifest(), blob.manifest());
+            assert_eq!(plan.manifest_digest(), blob.manifest_digest());
+            assert_eq!(plan.physical_lineage(), blob.physical_lineage());
+            let completion = source_store
+                .completed_retained_blob(
+                    &retained.source,
+                    retained.retention,
+                    &blob,
+                    &manifest_bytes,
+                    &stored.sealed,
+                )
+                .expect("canonical v9 retained completion");
+            let source = if finite {
+                blob_stream::CanonicalBlobSendSource::new_with_lifetime(
+                    stored,
+                    plan,
+                    completion,
+                    blob,
+                    retained.source.clone(),
+                    retained.retention,
+                )
+            } else {
+                blob_stream::CanonicalBlobSendSource::new(stored, plan, completion)
+            }
+            .expect("canonical v9 send authority");
+            let offer = BlobStreamSourceOfferV1 {
+                transfer_id: *source.publication().as_bytes(),
+                topic: source.topic().clone(),
+                scope: source.scope().clone(),
+                key_epoch: source.key_epoch(),
+                source_len: u32::try_from(source.authenticated_open().len())
+                    .expect("canonical v9 source length"),
+                source_digest: Sha256::digest(source.authenticated_open()).into(),
+                finite: source.is_finite(),
+            };
+            let initiator_bytes = services
+                .member
+                .fresh_bundle()
+                .expect("canonical v9 initiator bundle")
+                .to_bytes()
+                .expect("encode canonical v9 initiator bundle");
+            let responder_bytes = services
+                .other
+                .fresh_bundle()
+                .expect("canonical v9 responder bundle")
+                .to_bytes()
+                .expect("encode canonical v9 responder bundle");
+            let (mut sender_session, mut receiver_session, profile_digest) =
+                blob_stream::tests::mission_pair_from_bundles(&initiator_bytes, &responder_bytes);
+            let adapter = if label == "nonempty" {
+                // OPEN, SOURCE, DATA, and FINISH are received; the injected
+                // close drops the sender's RESULT ACK after promotion.
+                blob_stream::tests::MemoryTransportAdapter::with_receive_failure(Some(4))
+            } else {
+                blob_stream::tests::MemoryTransportAdapter::new()
+            };
+            let source_policy = source_store
+                .control_policy_snapshot()
+                .expect("canonical v9 source policy");
+            let target_policy = target_store
+                .control_policy_snapshot()
+                .expect("canonical v9 target policy");
+            let subscription = target_store
+                .create_blob_subscription_with_policy(
+                    &target_policy,
+                    &BlobSubscriptionKey::new(
+                        format!("canonical-v9-subscription-{label}").into_bytes(),
+                    )
+                    .expect("canonical v9 subscription key"),
+                    BlobSubscriptionSpec {
+                        topic: services.topic.clone(),
+                        scope: services.scope.clone(),
+                        include_descendant_scopes: false,
+                    },
+                )
+                .expect("canonical v9 subscription");
+            let mut target_verifier = open_test_sealer(&services.other);
+            let attempt_nonce = [0xa9; 32];
+            let direction = EventDirection::ToSessionResponder;
+            let source_live = Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal));
+            let source_guard = ContactEmissionGuard {
+                captured: source_live.snapshot().expect("source emission snapshot"),
+                live: source_live,
+                custody_clock: NodeCustodyClock::injected([0xb1; 16], 100, 0),
+            };
+            let target_live = Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal));
+            let target_guard = ContactEmissionGuard {
+                captured: target_live.snapshot().expect("target emission snapshot"),
+                live: target_live,
+                custody_clock: NodeCustodyClock::injected([0xb2; 16], 1_000, 0),
+            };
+
+            let first = tokio::try_join!(
+                CONTACT_EMISSION_GUARD.scope(
+                    source_guard,
+                    blob_stream::send_canonical_blob_profile5(
+                        &adapter,
+                        &source_store,
+                        &source_policy,
+                        &source,
+                        &mut sender_session,
+                        profile_digest,
+                        direction,
+                        attempt_nonce,
+                    ),
+                ),
+                CONTACT_EMISSION_GUARD.scope(
+                    target_guard,
+                    blob_stream::receive_canonical_blob_profile5(
+                        &adapter,
+                        &target_store,
+                        &target_policy,
+                        &mut target_verifier,
+                        &mut receiver_session,
+                        profile_digest,
+                        direction,
+                        attempt_nonce,
+                        &offer,
+                    ),
+                ),
+            );
+            let (sent, received) = if label == "nonempty" {
+                assert!(
+                    first.is_err(),
+                    "dropped RESULT ACK must interrupt settlement"
+                );
+                assert!(
+                    target_store
+                        .get_blob(publication)
+                        .expect("canonical v9 promoted lookup after dropped ACK")
+                        .is_some()
+                );
+                assert!(
+                    target_store
+                        .resume_profile5_receipt(publication)
+                        .expect("canonical v9 interrupted receipt")
+                        .is_some()
+                );
+
+                let (mut retry_sender, mut retry_receiver, retry_digest) =
+                    blob_stream::tests::mission_pair_from_bundles(
+                        &initiator_bytes,
+                        &responder_bytes,
+                    );
+                let retry_adapter = blob_stream::tests::MemoryTransportAdapter::new();
+                let mut retry_verifier = open_test_sealer(&services.other);
+                tokio::try_join!(
+                    blob_stream::send_canonical_blob_profile5(
+                        &retry_adapter,
+                        &source_store,
+                        &source_policy,
+                        &source,
+                        &mut retry_sender,
+                        retry_digest,
+                        direction,
+                        [0xaa; 32],
+                    ),
+                    blob_stream::receive_canonical_blob_profile5(
+                        &retry_adapter,
+                        &target_store,
+                        &target_policy,
+                        &mut retry_verifier,
+                        &mut retry_receiver,
+                        retry_digest,
+                        direction,
+                        [0xaa; 32],
+                        &offer,
+                    ),
+                )
+                .expect("canonical v9 already-present retry")
+            } else {
+                first.expect("canonical v9 production crossing")
+            };
+            assert_eq!(sent.roots, received.roots);
+            if label == "nonempty" {
+                assert_eq!(sent.resumed_from, sent.wire_bytes);
+                assert_eq!(received.resumed_from, received.wire_bytes);
+                assert!(sent.resumed_from > 0);
+            } else {
+                assert_eq!(sent.resumed_from, 0);
+                assert_eq!(received.resumed_from, 0);
+            }
+            assert!(
+                target_store
+                    .get_blob(publication)
+                    .expect("canonical v9 target lookup")
+                    .is_some()
+            );
+            assert_eq!(
+                target_store
+                    .resume_profile5_receipt(publication)
+                    .expect("canonical v9 settled receipt"),
+                None,
+                "ACK retires the bounded settlement receipt"
+            );
+            let poll = target_store
+                .prepare_blob_subscription_poll_with_policy(&target_policy, subscription.id, 1, 8)
+                .expect("canonical v9 first subscription poll");
+            assert_eq!(poll.candidates().len(), 1);
+            let semantic = poll.candidates()[0].projection().semantic_id;
+            let page = target_store
+                .commit_blob_subscription_poll_with_policy(
+                    &target_policy,
+                    &poll,
+                    &BlobSubscriptionPollSelection {
+                        deliverable: vec![semantic],
+                        inactive: Vec::new(),
+                    },
+                )
+                .expect("canonical v9 first subscription delivery");
+            assert_eq!(page.deliveries.len(), 1);
+            let delivery = page.deliveries[0].clone();
+            assert_eq!(
+                target_store
+                    .acknowledge_blob_delivery_with_policy(
+                        &target_policy,
+                        subscription.id,
+                        delivery.semantic_id,
+                        delivery.token,
+                    )
+                    .expect("acknowledge canonical v9 subscription delivery"),
+                BlobDeliveryAck::Acknowledged
+            );
+            let retry_poll = target_store
+                .prepare_blob_subscription_poll_with_policy(&target_policy, subscription.id, 1, 8)
+                .expect("canonical v9 retry subscription poll");
+            let retry_page = target_store
+                .commit_blob_subscription_poll_with_policy(
+                    &target_policy,
+                    &retry_poll,
+                    &BlobSubscriptionPollSelection {
+                        deliverable: vec![semantic],
+                        inactive: Vec::new(),
+                    },
+                )
+                .expect("canonical v9 subscription retry");
+            assert!(
+                retry_page.deliveries.is_empty(),
+                "canonical apply plus already-present retry delivers once"
+            );
+
+            if finite {
+                let before_restart = target_store.test_blob_logical_digest();
+                drop(target_store);
+                let reopened = Store::open_for_mission(target_state.join(STORE_FILE), authority)
+                    .expect("reopen finite canonical v9 receiver");
+                assert_eq!(reopened.test_blob_logical_digest(), before_restart);
+                assert!(
+                    reopened
+                        .get_blob(publication)
+                        .expect("reopened finite canonical v9 lookup")
+                        .is_some()
+                );
+                drop((source_store, reopened));
+            } else {
+                drop((source_store, target_store));
+            }
+            fs::remove_dir_all(source_state).expect("canonical v9 source cleanup");
+            fs::remove_dir_all(target_state).expect("canonical v9 target cleanup");
+        }
     }
 
     #[tokio::test]
