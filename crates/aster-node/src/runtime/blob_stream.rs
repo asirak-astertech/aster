@@ -17,9 +17,8 @@ use crate::{
     },
     stream_transport::{
         AttemptOpenRequest, AuthenticatedPeerSupport, AuthenticatedSupportSource,
-        IrohQuicV1Adapter, StreamAttempt, StreamReceiveAttempt, StreamTransportAdapter,
-        StreamTransportId, TransferRequirements, TransportAdapterCandidate, TransportCandidate,
-        TransportSelector,
+        AuthenticatedTransportContext, IrohQuicV1Adapter, StreamAttempt, StreamReceiveAttempt,
+        StreamTransportAdapter, StreamTransportRegistry, TransferRequirements,
     },
 };
 use aster_iroh::Connection;
@@ -866,34 +865,48 @@ fn settlement_failure(
     BlobNetworkError::new(BlobNetworkStage::Settlement, context, error)
 }
 
-pub(crate) fn select_stream_transport(
+pub(crate) fn production_stream_transport_registry(
     connection: Connection,
-) -> Result<Arc<dyn StreamTransportAdapter>, BlobNetworkError> {
+) -> Result<StreamTransportRegistry, BlobNetworkError> {
     let adapter: Arc<dyn StreamTransportAdapter> = Arc::new(IrohQuicV1Adapter::new(connection));
-    let candidates = [TransportAdapterCandidate {
-        candidate: TransportCandidate {
-            id: StreamTransportId::IrohQuicV1,
-            locally_enabled: true,
-            policy_allowed: true,
-            peer_support: Some(AuthenticatedPeerSupport::new(
-                AuthenticatedSupportSource::MissionSessionNegotiation,
-                true,
-            )),
-            reliable_ordered: true,
-            full_duplex: true,
-            health: adapter.health(),
-            configured_priority: 0,
-        },
-        adapter,
-    }];
-    TransportSelector::select_adapter(TransferRequirements::default(), &candidates).ok_or_else(
-        || {
+    let mut registry = StreamTransportRegistry::new();
+    registry
+        .register(
+            adapter,
+            AuthenticatedTransportContext {
+                locally_enabled: true,
+                policy_allowed: true,
+                peer_support: Some(AuthenticatedPeerSupport::new(
+                    AuthenticatedSupportSource::MissionSessionNegotiation,
+                    true,
+                )),
+                configured_priority: 0,
+            },
+        )
+        .map_err(|error| {
+            transport_failure("register production stream transport", format!("{error:?}"))
+        })?;
+    Ok(registry)
+}
+
+pub(crate) fn select_stream_transport(
+    registry: &StreamTransportRegistry,
+) -> Result<Arc<dyn StreamTransportAdapter>, BlobNetworkError> {
+    registry
+        .select(TransferRequirements::default())
+        .ok_or_else(|| {
             transport_failure(
                 "select stream transport",
                 "no eligible transport is available",
             )
-        },
-    )
+        })
+}
+
+pub(crate) fn select_production_stream_transport(
+    connection: Connection,
+) -> Result<Arc<dyn StreamTransportAdapter>, BlobNetworkError> {
+    let registry = production_stream_transport_registry(connection)?;
+    select_stream_transport(&registry)
 }
 
 #[cfg(test)]
@@ -1500,7 +1513,7 @@ pub(crate) async fn send_completed_pack(
     semantic_commitment: Vec<u8>,
 ) -> Result<BlobNetworkReport, BlobNetworkError> {
     let mut codec = PlainBlobRecordCodec;
-    let transport = select_stream_transport(connection)?;
+    let transport = select_production_stream_transport(connection)?;
     send_completed_pack_inner(
         transport.as_ref(),
         open,
@@ -2917,7 +2930,7 @@ pub(crate) async fn receive_completed_pack(
     limits: PipelineLimits,
 ) -> Result<BlobNetworkReport, BlobNetworkError> {
     let mut codec = PlainBlobRecordCodec;
-    let transport = select_stream_transport(connection)?;
+    let transport = select_production_stream_transport(connection)?;
     receive_completed_pack_inner(
         CompletedPackReceive {
             transport: transport.as_ref(),
@@ -3201,7 +3214,8 @@ pub(crate) mod tests {
     use crate::stream_transfer::PROFILE5_SOURCE_CHUNK_BYTES;
     use crate::stream_transport::{
         AdapterFuture, CandidateHealth, StreamAttempt, StreamReceiveAttempt,
-        StreamTransportAdapter, StreamTransportError, StreamTransportId, TransferRequirements,
+        StreamTransportAdapter, StreamTransportCapabilities, StreamTransportError,
+        StreamTransportId,
     };
     use crate::{application::blob_stream::publish_blob_stream, stream_pipeline::PipelineLimits};
     use aster_iroh::{CarrierSecurityProfile, Endpoint, EndpointConfig, ExpectedPeer, SecretKey};
@@ -3999,11 +4013,14 @@ pub(crate) mod tests {
 
     impl StreamTransportAdapter for MemoryTransportAdapter {
         fn id(&self) -> StreamTransportId {
-            StreamTransportId::IrohQuicV1
+            StreamTransportId::IROH_QUIC_V1
         }
 
-        fn eligibility(&self, requirements: TransferRequirements) -> bool {
-            requirements.reliable_ordered && requirements.full_duplex
+        fn capabilities(&self) -> StreamTransportCapabilities {
+            StreamTransportCapabilities {
+                reliable_ordered: true,
+                full_duplex: true,
+            }
         }
 
         fn health(&self) -> CandidateHealth {
@@ -4053,11 +4070,14 @@ pub(crate) mod tests {
 
     impl StreamTransportAdapter for SmallMtuTransportAdapter {
         fn id(&self) -> StreamTransportId {
-            StreamTransportId::IrohQuicV1
+            StreamTransportId::IROH_QUIC_V1
         }
 
-        fn eligibility(&self, requirements: TransferRequirements) -> bool {
-            requirements.reliable_ordered && requirements.full_duplex
+        fn capabilities(&self) -> StreamTransportCapabilities {
+            StreamTransportCapabilities {
+                reliable_ordered: true,
+                full_duplex: true,
+            }
         }
 
         fn health(&self) -> CandidateHealth {

@@ -479,23 +479,29 @@ core owns fragmentation, handshake, replay defense, exact reconciliation,
 source verification, and reducers.
 
 Use the `Link` trait and existing IP/BTLE adapters as semantic and test migration
-sources. The selected node now has an internal stream-adapter and deterministic
-selector seam, but `IrohQuicV1` is its only production stream adapter. Candidate
-support and locators must come from local configuration, provisioned peer data,
-or authenticated discovery before `StreamOpen`; peer-supplied ranking is never
-accepted. The selector filters policy and stream-contract eligibility, then
-orders health, configured priority, and stable adapter ID. Exactly one adapter
-carries a logical attempt. Iroh direct versus relay remains an Iroh-local path
-observation, not two selectable Aster transports.
+sources. The selected node now has an adapter-neutral stream registry and
+deterministic selector, while `IrohQuicV1` remains the only adapter registered
+by the shipped production composition. Each adapter owns its connection state
+and attempt creation; registering another independently usable adapter does not
+require changing the stream protocol, pipeline, or selector. Candidate support
+and locators must come from local configuration, provisioned peer data, or
+authenticated discovery before `StreamOpen`; peer-supplied ranking is never
+accepted. The composition supplies that authenticated support plus local policy
+and configured priority to the registry. The selector filters those values and
+the stream contract, then orders adapter-reported health, configured priority,
+and stable adapter ID. Exactly one adapter carries a logical attempt. Iroh
+direct versus relay remains an Iroh-local path observation, not two selectable
+Aster transports.
 
-Fake adapters validate ranking, retry, cancellation, terminal outcomes, and
-checkpoint carry-forward, but they are not product transport support. This
-milestone may claim automatic selection of the sole eligible Iroh adapter and
-authenticated Iroh reopen. It must not claim best-available cross-transport
-selection or failover until a second independently usable production adapter
-and its physical scenario are reviewed. A new production adapter must not
-create a second persistence, reconciliation, authentication, or scheduling
-authority. Use the
+Fake adapters validate multi-registration ranking, requirement and policy
+filtering, adapter-owned attempt creation, retry, cancellation, terminal
+outcomes, and checkpoint carry-forward, but they are not product transport
+support. This milestone claims automatic selection of the sole shipped Iroh
+adapter and authenticated Iroh reopen. It does not claim best-available
+cross-transport selection or failover because no second production adapter or
+physical cross-transport scenario has been validated. When another adapter is
+implemented, it uses the same registry and must not create a second persistence,
+reconciliation, authentication, or scheduling authority. Use the
 [binding pattern](bindings/pattern.md) for a language API.
 
 ## Semantic protocol versions you may see
@@ -510,10 +516,10 @@ descending order:
   selects Blob profile 5 `BlobStreamV1`. Profile 5 is a distinct allocation,
   never a reinterpretation or in-attempt downgrade of profile 4. Its
   `0xd6..0xdc` records, v9 custody/record protection, concurrent Iroh
-  data/control pair, internal one-adapter selector, bounded parallel segment
-  verification, durable pack checkpoints, resume, and lifecycle promotion are
-  implemented. The current production stream-adapter set contains only
-  `IrohQuicV1`; automatic selection therefore does not yet mean
+  data/control pair, adapter-neutral registry and selector, bounded parallel
+  segment verification, durable pack checkpoints, resume, and lifecycle
+  promotion are implemented. The shipped production registry currently
+  contains only `IrohQuicV1`; automatic selection therefore does not yet mean
   cross-transport failover.
 - **Semantic version 8** inherits semantic-v7 profile
   negotiation and receipt-free Event pages, while profile 4 adds authenticated

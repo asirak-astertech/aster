@@ -27200,7 +27200,7 @@ async fn send_profile5_blob_direction(
     // Keep the profile-5 state machine off the contact worker's stack. Debug
     // builds on smaller-stack targets still retain scoped cancellation inside
     // the boxed operation.
-    let transport = blob_stream::select_stream_transport(connection.clone())
+    let transport = blob_stream::select_production_stream_transport(connection.clone())
         .map_err(profile5_blob_network_error)?;
     let report = Box::pin(blob_stream::send_canonical_blob_profile5(
         transport.as_ref(),
@@ -27314,7 +27314,7 @@ async fn receive_profile5_blob_direction(
         ));
     }
     guard.check(&store)?;
-    let transport = blob_stream::select_stream_transport(connection.clone())
+    let transport = blob_stream::select_production_stream_transport(connection.clone())
         .map_err(profile5_blob_network_error)?;
     let report = Box::pin(blob_stream::receive_canonical_blob_profile5(
         transport.as_ref(),

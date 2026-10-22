@@ -14,9 +14,18 @@ use std::{
 use tokio::{sync::Mutex, time::Instant};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-#[repr(u16)]
-pub(crate) enum StreamTransportId {
-    IrohQuicV1 = 1,
+pub(crate) struct StreamTransportId(u16);
+
+impl StreamTransportId {
+    pub(crate) const IROH_QUIC_V1: Self = Self(1);
+
+    pub(crate) const fn new(value: u16) -> Option<Self> {
+        if value == 0 { None } else { Some(Self(value)) }
+    }
+
+    pub(crate) const fn get(self) -> u16 {
+        self.0
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -50,6 +59,14 @@ pub(crate) struct AuthenticatedPeerSupport {
     source: AuthenticatedSupportSource,
     stream_v1: bool,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AuthenticatedTransportContext {
+    pub locally_enabled: bool,
+    pub policy_allowed: bool,
+    pub peer_support: Option<AuthenticatedPeerSupport>,
+    pub configured_priority: i16,
+}
 impl AuthenticatedPeerSupport {
     pub(crate) const fn new(source: AuthenticatedSupportSource, stream_v1: bool) -> Self {
         Self { source, stream_v1 }
@@ -73,10 +90,93 @@ pub(crate) struct TransportAdapterCandidate {
     pub adapter: Arc<dyn StreamTransportAdapter>,
 }
 
+struct RegisteredStreamTransport {
+    context: AuthenticatedTransportContext,
+    adapter: Arc<dyn StreamTransportAdapter>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StreamTransportRegistrationError {
+    DuplicateId(StreamTransportId),
+}
+
+#[derive(Default)]
+pub(crate) struct StreamTransportRegistry {
+    registrations: Vec<RegisteredStreamTransport>,
+}
+
+impl StreamTransportRegistry {
+    pub(crate) const fn new() -> Self {
+        Self {
+            registrations: Vec::new(),
+        }
+    }
+
+    pub(crate) fn register(
+        &mut self,
+        adapter: Arc<dyn StreamTransportAdapter>,
+        context: AuthenticatedTransportContext,
+    ) -> Result<(), StreamTransportRegistrationError> {
+        let id = adapter.id();
+        if self
+            .registrations
+            .iter()
+            .any(|registered| registered.adapter.id() == id)
+        {
+            return Err(StreamTransportRegistrationError::DuplicateId(id));
+        }
+        self.registrations
+            .push(RegisteredStreamTransport { context, adapter });
+        Ok(())
+    }
+
+    pub(crate) fn candidates(&self) -> Vec<TransportAdapterCandidate> {
+        self.registrations
+            .iter()
+            .map(|registered| {
+                let capabilities = registered.adapter.capabilities();
+                TransportAdapterCandidate {
+                    candidate: TransportCandidate {
+                        id: registered.adapter.id(),
+                        locally_enabled: registered.context.locally_enabled,
+                        policy_allowed: registered.context.policy_allowed,
+                        peer_support: registered.context.peer_support,
+                        reliable_ordered: capabilities.reliable_ordered,
+                        full_duplex: capabilities.full_duplex,
+                        health: registered.adapter.health(),
+                        configured_priority: registered.context.configured_priority,
+                    },
+                    adapter: Arc::clone(&registered.adapter),
+                }
+            })
+            .collect()
+    }
+
+    pub(crate) fn select(
+        &self,
+        requirements: TransferRequirements,
+    ) -> Option<Arc<dyn StreamTransportAdapter>> {
+        TransportSelector::select_adapter(requirements, &self.candidates())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct TransferRequirements {
     pub reliable_ordered: bool,
     pub full_duplex: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct StreamTransportCapabilities {
+    pub reliable_ordered: bool,
+    pub full_duplex: bool,
+}
+
+impl StreamTransportCapabilities {
+    const fn supports(self, requirements: TransferRequirements) -> bool {
+        (!requirements.reliable_ordered || self.reliable_ordered)
+            && (!requirements.full_duplex || self.full_duplex)
+    }
 }
 impl Default for TransferRequirements {
     fn default() -> Self {
@@ -368,7 +468,10 @@ pub(crate) trait StreamReceiveAttempt: Send + Sync {
 
 pub(crate) trait StreamTransportAdapter: Send + Sync {
     fn id(&self) -> StreamTransportId;
-    fn eligibility(&self, requirements: TransferRequirements) -> bool;
+    fn capabilities(&self) -> StreamTransportCapabilities;
+    fn eligibility(&self, requirements: TransferRequirements) -> bool {
+        self.capabilities().supports(requirements)
+    }
     fn health(&self) -> CandidateHealth;
     fn open_attempt<'a>(
         &'a self,
@@ -524,10 +627,13 @@ impl StreamAttempt for IrohSenderAttempt {
 
 impl StreamTransportAdapter for IrohQuicV1Adapter {
     fn id(&self) -> StreamTransportId {
-        StreamTransportId::IrohQuicV1
+        StreamTransportId::IROH_QUIC_V1
     }
-    fn eligibility(&self, requirements: TransferRequirements) -> bool {
-        requirements.reliable_ordered && requirements.full_duplex
+    fn capabilities(&self) -> StreamTransportCapabilities {
+        StreamTransportCapabilities {
+            reliable_ordered: true,
+            full_duplex: true,
+        }
     }
     fn health(&self) -> CandidateHealth {
         match self.connection.path_witness().selected {
@@ -596,7 +702,7 @@ mod tests {
 
     fn candidate(priority: i16, health: CandidateHealth) -> TransportCandidate {
         TransportCandidate {
-            id: StreamTransportId::IrohQuicV1,
+            id: StreamTransportId::IROH_QUIC_V1,
             locally_enabled: true,
             policy_allowed: true,
             peer_support: Some(AuthenticatedPeerSupport::new(
@@ -629,16 +735,22 @@ mod tests {
     }
 
     struct SelectionAdapter {
+        id: StreamTransportId,
         health: CandidateHealth,
+        reliable_ordered: bool,
+        full_duplex: bool,
     }
 
     impl StreamTransportAdapter for SelectionAdapter {
         fn id(&self) -> StreamTransportId {
-            StreamTransportId::IrohQuicV1
+            self.id
         }
 
-        fn eligibility(&self, requirements: TransferRequirements) -> bool {
-            requirements.reliable_ordered && requirements.full_duplex
+        fn capabilities(&self) -> StreamTransportCapabilities {
+            StreamTransportCapabilities {
+                reliable_ordered: self.reliable_ordered,
+                full_duplex: self.full_duplex,
+            }
         }
 
         fn health(&self) -> CandidateHealth {
@@ -649,7 +761,7 @@ mod tests {
             &'a self,
             _request: AttemptOpenRequest,
         ) -> AdapterFuture<'a, Arc<dyn StreamAttempt>> {
-            Box::pin(async { Err(StreamTransportError::Closed) })
+            Box::pin(async { Ok(Arc::new(SelectionAttempt) as Arc<dyn StreamAttempt>) })
         }
 
         fn accept_attempt<'a>(
@@ -660,16 +772,51 @@ mod tests {
         }
     }
 
+    struct SelectionAttempt;
+
+    impl StreamAttempt for SelectionAttempt {
+        fn send_data<'a>(&'a self, _frame: &'a [u8]) -> AdapterFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn send_data_parts<'a>(
+            &'a self,
+            _prefix: &'a [u8],
+            _body: &'a [u8],
+        ) -> AdapterFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn receive_control(&self) -> AdapterFuture<'_, Option<Vec<u8>>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn finish_data(&self) -> AdapterFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn cancel_data(&self) {}
+    }
+
     #[test]
     fn stream_transport_selector_returns_best_eligible_adapter() {
         let unavailable = Arc::new(SelectionAdapter {
+            id: StreamTransportId::IROH_QUIC_V1,
             health: CandidateHealth::Healthy,
+            reliable_ordered: true,
+            full_duplex: true,
         });
         let degraded: Arc<dyn StreamTransportAdapter> = Arc::new(SelectionAdapter {
+            id: StreamTransportId::IROH_QUIC_V1,
             health: CandidateHealth::Degraded,
+            reliable_ordered: true,
+            full_duplex: true,
         });
         let healthy: Arc<dyn StreamTransportAdapter> = Arc::new(SelectionAdapter {
+            id: StreamTransportId::IROH_QUIC_V1,
             health: CandidateHealth::Healthy,
+            reliable_ordered: true,
+            full_duplex: true,
         });
 
         let selected = TransportSelector::select_adapter(
@@ -696,6 +843,183 @@ mod tests {
 
         assert!(Arc::ptr_eq(&selected, &healthy));
         assert!(!Arc::ptr_eq(&selected, &degraded));
+    }
+
+    #[tokio::test]
+    async fn registry_selects_independent_adapter_by_authenticated_requirements_and_rank() {
+        let registered_id = |value| StreamTransportId::new(value).expect("nonzero stable ID");
+        let context = |policy_allowed, priority| AuthenticatedTransportContext {
+            locally_enabled: true,
+            policy_allowed,
+            peer_support: Some(AuthenticatedPeerSupport::new(
+                AuthenticatedSupportSource::MissionSessionNegotiation,
+                true,
+            )),
+            configured_priority: priority,
+        };
+        let adapter = |id, health, reliable_ordered, full_duplex| {
+            Arc::new(SelectionAdapter {
+                id,
+                health,
+                reliable_ordered,
+                full_duplex,
+            }) as Arc<dyn StreamTransportAdapter>
+        };
+        let mut registry = StreamTransportRegistry::new();
+        registry
+            .register(
+                adapter(registered_id(1), CandidateHealth::Degraded, true, true),
+                context(true, 100),
+            )
+            .unwrap();
+        registry
+            .register(
+                adapter(registered_id(2), CandidateHealth::Healthy, true, true),
+                context(true, 7),
+            )
+            .unwrap();
+        registry
+            .register(
+                adapter(registered_id(3), CandidateHealth::Healthy, true, true),
+                context(true, 7),
+            )
+            .unwrap();
+        registry
+            .register(
+                adapter(registered_id(4), CandidateHealth::Healthy, true, false),
+                context(true, 100),
+            )
+            .unwrap();
+        registry
+            .register(
+                adapter(registered_id(5), CandidateHealth::Healthy, true, true),
+                context(false, 100),
+            )
+            .unwrap();
+        registry
+            .register(
+                adapter(registered_id(6), CandidateHealth::Unavailable, true, true),
+                context(true, 100),
+            )
+            .unwrap();
+        registry
+            .register(
+                adapter(registered_id(7), CandidateHealth::Healthy, true, true),
+                context(true, 6),
+            )
+            .unwrap();
+        registry
+            .register(
+                adapter(registered_id(8), CandidateHealth::Healthy, true, true),
+                AuthenticatedTransportContext {
+                    peer_support: None,
+                    ..context(true, 100)
+                },
+            )
+            .unwrap();
+
+        let ranked = TransportSelector::rank(
+            TransferRequirements::default(),
+            &registry
+                .candidates()
+                .into_iter()
+                .map(|candidate| candidate.candidate)
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            ranked
+                .iter()
+                .map(|candidate| candidate.id)
+                .collect::<Vec<_>>(),
+            [
+                registered_id(2),
+                registered_id(3),
+                registered_id(7),
+                registered_id(1),
+            ]
+        );
+
+        let selected = registry
+            .select(TransferRequirements::default())
+            .expect("one independently usable adapter is eligible");
+        assert_eq!(selected.id(), registered_id(2));
+
+        let attempt = selected
+            .open_attempt(AttemptOpenRequest {
+                deadline: Instant::now() + Duration::from_secs(1),
+                max_data_bytes: 16,
+                max_control_bytes: 16,
+            })
+            .await
+            .expect("selected adapter creates its own attempt");
+        attempt.send_data(b"not-iroh").await.unwrap();
+    }
+
+    #[test]
+    fn registry_keeps_reliable_and_full_duplex_capabilities_independent() {
+        let reliable_id = StreamTransportId::new(9).unwrap();
+        let full_duplex_id = StreamTransportId::new(10).unwrap();
+        let context = AuthenticatedTransportContext {
+            locally_enabled: true,
+            policy_allowed: true,
+            peer_support: Some(AuthenticatedPeerSupport::new(
+                AuthenticatedSupportSource::ProvisionedPeer,
+                true,
+            )),
+            configured_priority: 0,
+        };
+        let mut registry = StreamTransportRegistry::new();
+        registry
+            .register(
+                Arc::new(SelectionAdapter {
+                    id: reliable_id,
+                    health: CandidateHealth::Healthy,
+                    reliable_ordered: true,
+                    full_duplex: false,
+                }),
+                context,
+            )
+            .unwrap();
+        registry
+            .register(
+                Arc::new(SelectionAdapter {
+                    id: full_duplex_id,
+                    health: CandidateHealth::Healthy,
+                    reliable_ordered: false,
+                    full_duplex: true,
+                }),
+                context,
+            )
+            .unwrap();
+
+        let reliable_only = TransferRequirements {
+            reliable_ordered: true,
+            full_duplex: false,
+        };
+        let reliable_candidates = registry.candidates();
+        let reliable = reliable_candidates
+            .iter()
+            .find(|candidate| candidate.candidate.id == reliable_id)
+            .unwrap();
+        assert!(reliable.candidate.reliable_ordered);
+        assert!(!reliable.candidate.full_duplex);
+        assert_eq!(registry.select(reliable_only).unwrap().id(), reliable_id);
+
+        let full_duplex_only = TransferRequirements {
+            reliable_ordered: false,
+            full_duplex: true,
+        };
+        let full_duplex_candidates = registry.candidates();
+        let full_duplex = full_duplex_candidates
+            .iter()
+            .find(|candidate| candidate.candidate.id == full_duplex_id)
+            .unwrap();
+        assert!(!full_duplex.candidate.reliable_ordered);
+        assert!(full_duplex.candidate.full_duplex);
+        assert_eq!(
+            registry.select(full_duplex_only).unwrap().id(),
+            full_duplex_id
+        );
     }
 
     fn authority(seed: u8, age: u64, offset: u64, generation: u64) -> AttemptAuthority {
@@ -781,7 +1105,7 @@ mod tests {
 
     #[test]
     fn stream_iroh_adapter_reports_one_production_transport() {
-        assert_eq!(StreamTransportId::IrohQuicV1 as u16, 1);
+        assert_eq!(StreamTransportId::IROH_QUIC_V1.get(), 1);
     }
 
     #[tokio::test]
@@ -837,8 +1161,14 @@ mod tests {
             })
             .await
             .unwrap();
+        let production_registry =
+            crate::runtime::blob_stream::production_stream_transport_registry(connection.clone())
+                .expect("production transport registration");
+        let production = crate::runtime::blob_stream::select_stream_transport(&production_registry)
+            .expect("Iroh remains the shipped production adapter");
+        assert_eq!(production.id(), StreamTransportId::IROH_QUIC_V1);
         let adapter = IrohQuicV1Adapter::new(connection.clone());
-        assert_eq!(adapter.id(), StreamTransportId::IrohQuicV1);
+        assert_eq!(adapter.id(), StreamTransportId::IROH_QUIC_V1);
         for (prefix, body) in [
             (b"first".as_slice(), b"".as_slice()),
             (b"header".as_slice(), b"body".as_slice()),
