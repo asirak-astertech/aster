@@ -845,7 +845,11 @@ impl<'a> BlobDepot<'a> {
             self.active = Some(active);
             Ok(active)
         } else {
-            self.begin_blob_internal(plan.manifest(), Some(plan.physical_lineage()))?;
+            self.begin_blob_internal_observed(
+                plan.manifest(),
+                Some(plan.physical_lineage()),
+                true,
+            )?;
             self.require_active(plan.manifest().id())
         }
     }
@@ -862,9 +866,11 @@ impl<'a> BlobDepot<'a> {
         self.store.require_live()?;
         let authority = self.store.require_bound_mission()?;
         let active = self.activate_verified_plan(plan)?;
-        let variant = self
-            .root
-            .open_child_directory(&hex32(active.variant_id.as_bytes()), true)?;
+        let variant = self.root.open_child_directory_profile5(
+            &hex32(active.variant_id.as_bytes()),
+            true,
+            self.store,
+        )?;
 
         let read = self.store.database.begin_read()?;
         super::deletion::require_variant_available_read(&read, active.variant_id)?;
@@ -950,12 +956,7 @@ impl<'a> BlobDepot<'a> {
                 let name = chunk_file_name(index);
                 variant.remove_if_exists(&name, false)?;
                 let encoded = encode_chunk_file(active, index, record, verified.ciphertext())?;
-                variant.write_atomic(&name, &encoded)?;
-                #[cfg(any(test, feature = "test-utils"))]
-                self.store
-                    .profile5_batch_test_counters
-                    .file_sync_operations
-                    .fetch_add(2, Ordering::Relaxed);
+                variant.write_atomic_profile5(&name, &encoded, self.store)?;
             }
         }
 
@@ -975,12 +976,12 @@ impl<'a> BlobDepot<'a> {
             }
         }
 
+        let mut write = self.store.database.begin_write()?;
         #[cfg(any(test, feature = "test-utils"))]
         self.store
             .profile5_batch_test_counters
             .redb_write_begins
             .fetch_add(1, Ordering::Relaxed);
-        let mut write = self.store.database.begin_write()?;
         write.set_durability(redb::Durability::Immediate)?;
         enforce_live_write(&write)?;
         super::deletion::require_variant_available_write(&write, active.variant_id)?;
@@ -1765,6 +1766,15 @@ impl<'a> BlobDepot<'a> {
         manifest: &BlobManifest,
         physical_lineage: Option<BlobPhysicalLineage>,
     ) -> Result<(), StoreError> {
+        self.begin_blob_internal_observed(manifest, physical_lineage, false)
+    }
+
+    fn begin_blob_internal_observed(
+        &mut self,
+        manifest: &BlobManifest,
+        physical_lineage: Option<BlobPhysicalLineage>,
+        observe_profile5: bool,
+    ) -> Result<(), StoreError> {
         self.store.require_live()?;
         let incoming = ImportRecord::from_manifest(manifest, physical_lineage)?;
         // Explicit publish/chunk entrypoints install bounded leases because
@@ -1785,6 +1795,13 @@ impl<'a> BlobDepot<'a> {
             .begin_write_transactions
             .fetch_add(1, Ordering::Relaxed);
         let write = self.store.database.begin_write()?;
+        #[cfg(any(test, feature = "test-utils"))]
+        if observe_profile5 {
+            self.store
+                .profile5_batch_test_counters
+                .redb_write_begins
+                .fetch_add(1, Ordering::Relaxed);
+        }
         enforce_live_write(&write)?;
         super::deletion::require_variant_available_write(&write, incoming.variant_id)?;
         super::lifecycle::require_import_lineage(&write, incoming.physical_lineage)?;
@@ -1895,8 +1912,23 @@ impl<'a> BlobDepot<'a> {
             }
         }
         write.commit()?;
-        self.root
-            .open_child_directory(&hex32(incoming.variant_id.as_bytes()), true)?;
+        #[cfg(any(test, feature = "test-utils"))]
+        if observe_profile5 {
+            self.store
+                .profile5_batch_test_counters
+                .redb_write_commits
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if observe_profile5 {
+            self.root.open_child_directory_profile5(
+                &hex32(incoming.variant_id.as_bytes()),
+                true,
+                self.store,
+            )?;
+        } else {
+            self.root
+                .open_child_directory(&hex32(incoming.variant_id.as_bytes()), true)?;
+        }
         self.active = Some(active_from_import(&incoming));
         Ok(())
     }
@@ -6027,6 +6059,30 @@ fn hex_nibble(byte: u8) -> Option<u8> {
     }
 }
 
+fn record_profile5_temp_file_sync(store: Option<&Store>) {
+    #[cfg(any(test, feature = "test-utils"))]
+    if let Some(store) = store {
+        store
+            .profile5_batch_test_counters
+            .temp_file_syncs
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    #[cfg(not(any(test, feature = "test-utils")))]
+    let _ = store;
+}
+
+fn record_profile5_parent_directory_sync(store: Option<&Store>) {
+    #[cfg(any(test, feature = "test-utils"))]
+    if let Some(store) = store {
+        store
+            .profile5_batch_test_counters
+            .parent_directory_syncs
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    #[cfg(not(any(test, feature = "test-utils")))]
+    let _ = store;
+}
+
 pub(super) struct OwnedDirectory {
     path: PathBuf,
     created_by_open: bool,
@@ -7134,6 +7190,26 @@ impl OwnedDirectory {
         name: &str,
         create: bool,
     ) -> Result<Self, StoreError> {
+        self.open_child_directory_observed(name, create, None)
+    }
+
+    #[cfg(unix)]
+    fn open_child_directory_profile5(
+        &self,
+        name: &str,
+        create: bool,
+        store: &Store,
+    ) -> Result<Self, StoreError> {
+        self.open_child_directory_observed(name, create, Some(store))
+    }
+
+    #[cfg(unix)]
+    fn open_child_directory_observed(
+        &self,
+        name: &str,
+        create: bool,
+        observed_store: Option<&Store>,
+    ) -> Result<Self, StoreError> {
         let mut created = false;
         let descriptor = match rustix::fs::openat(
             &self.file,
@@ -7177,6 +7253,7 @@ impl OwnedDirectory {
         validate_directory(&file)?;
         if created {
             self.sync()?;
+            record_profile5_parent_directory_sync(observed_store);
         }
         Ok(Self {
             path: self.path.join(name),
@@ -7210,6 +7287,16 @@ impl OwnedDirectory {
         })
     }
 
+    #[cfg(not(unix))]
+    fn open_child_directory_profile5(
+        &self,
+        name: &str,
+        create: bool,
+        _store: &Store,
+    ) -> Result<Self, StoreError> {
+        self.open_child_directory(name, create)
+    }
+
     pub(super) fn open_child_directory_if_present(
         &self,
         name: &str,
@@ -7227,6 +7314,26 @@ impl OwnedDirectory {
 
     #[cfg(unix)]
     pub(super) fn write_atomic(&self, final_name: &str, bytes: &[u8]) -> Result<(), StoreError> {
+        self.write_atomic_observed(final_name, bytes, None)
+    }
+
+    #[cfg(unix)]
+    fn write_atomic_profile5(
+        &self,
+        final_name: &str,
+        bytes: &[u8],
+        store: &Store,
+    ) -> Result<(), StoreError> {
+        self.write_atomic_observed(final_name, bytes, Some(store))
+    }
+
+    #[cfg(unix)]
+    fn write_atomic_observed(
+        &self,
+        final_name: &str,
+        bytes: &[u8],
+        observed_store: Option<&Store>,
+    ) -> Result<(), StoreError> {
         let temp_name = format!(
             "{TEMP_PREFIX}{}-{}",
             std::process::id(),
@@ -7248,6 +7355,7 @@ impl OwnedDirectory {
             let _ = rustix::fs::unlinkat(&self.file, &temp_name, rustix::fs::AtFlags::empty());
             return Err(blob_error(BlobStoreError::Io(error)));
         }
+        record_profile5_temp_file_sync(observed_store);
         // Fault exits intentionally retain the exact artifact a process crash
         // would leave; writable reopen treats it as non-authoritative and
         // reclaims it before a retry.
@@ -7260,12 +7368,33 @@ impl OwnedDirectory {
         self.file
             .sync_all()
             .map_err(|error| blob_error(BlobStoreError::Io(error)))?;
+        record_profile5_parent_directory_sync(observed_store);
         maybe_inject_fault(&self.path, DepotFaultPoint::DirectorySynced)?;
         Ok(())
     }
 
     #[cfg(not(unix))]
     pub(super) fn write_atomic(&self, final_name: &str, bytes: &[u8]) -> Result<(), StoreError> {
+        self.write_atomic_observed(final_name, bytes, None)
+    }
+
+    #[cfg(not(unix))]
+    fn write_atomic_profile5(
+        &self,
+        final_name: &str,
+        bytes: &[u8],
+        store: &Store,
+    ) -> Result<(), StoreError> {
+        self.write_atomic_observed(final_name, bytes, Some(store))
+    }
+
+    #[cfg(not(unix))]
+    fn write_atomic_observed(
+        &self,
+        final_name: &str,
+        bytes: &[u8],
+        observed_store: Option<&Store>,
+    ) -> Result<(), StoreError> {
         let temp = self.path.join(format!(
             "{TEMP_PREFIX}{}-{}",
             std::process::id(),
@@ -7278,10 +7407,12 @@ impl OwnedDirectory {
             .open(&temp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
+        record_profile5_temp_file_sync(observed_store);
         maybe_inject_fault(&self.path, DepotFaultPoint::TempSynced)?;
         std::fs::rename(&temp, &final_path)?;
         maybe_inject_fault(&self.path, DepotFaultPoint::Renamed)?;
         File::open(&self.path)?.sync_all()?;
+        record_profile5_parent_directory_sync(observed_store);
         maybe_inject_fault(&self.path, DepotFaultPoint::DirectorySynced)?;
         Ok(())
     }

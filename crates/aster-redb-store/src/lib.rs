@@ -5283,7 +5283,8 @@ struct Profile5BatchTestCounters {
     installed_carriers: std::sync::atomic::AtomicU64,
     redb_write_begins: std::sync::atomic::AtomicU64,
     redb_write_commits: std::sync::atomic::AtomicU64,
-    file_sync_operations: std::sync::atomic::AtomicU64,
+    temp_file_syncs: std::sync::atomic::AtomicU64,
+    parent_directory_syncs: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(test)]

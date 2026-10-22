@@ -57,7 +57,8 @@ pub struct Profile5BatchTestCounts {
     pub installed_carriers: u64,
     pub redb_write_begins: u64,
     pub redb_write_commits: u64,
-    pub file_sync_operations: u64,
+    pub temp_file_syncs: u64,
+    pub parent_directory_syncs: u64,
 }
 
 pub(crate) const BLOB_PUBLICATIONS: TableDefinition<&[u8], &[u8]> =
@@ -4504,7 +4505,17 @@ impl Store {
         // redb import becomes durable, while retaining the single-owner lock.
         let _depot_guard = BlobDepot::open_network_mutation(self, true)?;
         self.require_live()?;
+        #[cfg(any(test, feature = "test-utils"))]
+        let observe_profile5 = limits.total_len == PROFILE5_BLOB_NETWORK_SOURCE_LIMITS.total_len
+            && limits.source_len == PROFILE5_BLOB_NETWORK_SOURCE_LIMITS.source_len
+            && limits.chunks == PROFILE5_BLOB_NETWORK_SOURCE_LIMITS.chunks;
         let write = self.database.begin_write()?;
+        #[cfg(any(test, feature = "test-utils"))]
+        if observe_profile5 {
+            self.profile5_batch_test_counters
+                .redb_write_begins
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         enforce_live_write(&write)?;
         let admission_continuity = if let Some(verified) = finite.as_ref() {
             let continuity = custody::observe_continuity_write(&write, verified.receiver_sample)?;
@@ -4677,6 +4688,12 @@ impl Store {
                 )?;
             }
             write.commit()?;
+            #[cfg(any(test, feature = "test-utils"))]
+            if observe_profile5 {
+                self.profile5_batch_test_counters
+                    .redb_write_commits
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             return Ok(BlobSourceStageOutcome::Duplicate);
         }
         if lifecycle::check_replay_fence(&write, replay_fence)?
@@ -4860,6 +4877,12 @@ impl Store {
             )?;
         }
         write.commit()?;
+        #[cfg(any(test, feature = "test-utils"))]
+        if observe_profile5 {
+            self.profile5_batch_test_counters
+                .redb_write_commits
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         Ok(if existing.is_some() {
             BlobSourceStageOutcome::Duplicate
         } else {
@@ -6801,9 +6824,13 @@ impl Store {
                 .profile5_batch_test_counters
                 .redb_write_commits
                 .load(std::sync::atomic::Ordering::Relaxed),
-            file_sync_operations: self
+            temp_file_syncs: self
                 .profile5_batch_test_counters
-                .file_sync_operations
+                .temp_file_syncs
+                .load(std::sync::atomic::Ordering::Relaxed),
+            parent_directory_syncs: self
+                .profile5_batch_test_counters
+                .parent_directory_syncs
                 .load(std::sync::atomic::Ordering::Relaxed),
         }
     }
@@ -20491,6 +20518,18 @@ mod tests {
                         .committed_chunks,
                     0
                 );
+                assert_eq!(
+                    target.profile5_batch_test_counts(),
+                    Profile5BatchTestCounts {
+                        durable_batches: 0,
+                        installed_carriers: 0,
+                        redb_write_begins: 2,
+                        redb_write_commits: 1,
+                        temp_file_syncs: 1,
+                        parent_directory_syncs: 2,
+                    },
+                    "policy rejection observes activation, file syncs, and the failed extent transaction at their actual sites"
+                );
 
                 policy = target
                     .control_policy_snapshot()
@@ -20523,6 +20562,18 @@ mod tests {
                     .expect("interrupted batch stats")
                     .committed_chunks,
                 0
+            );
+            let interrupted_counts = target.profile5_batch_test_counts();
+            let policy_prefix = u64::from(label == "temp-synced");
+            assert_eq!(interrupted_counts.durable_batches, 0);
+            assert_eq!(interrupted_counts.installed_carriers, 0);
+            assert_eq!(interrupted_counts.redb_write_begins, 1 + policy_prefix);
+            assert_eq!(interrupted_counts.redb_write_commits, 1);
+            assert_eq!(interrupted_counts.temp_file_syncs, 1 + policy_prefix);
+            assert_eq!(
+                interrupted_counts.parent_directory_syncs,
+                1 + policy_prefix + u64::from(point == depot::DepotFaultPoint::DirectorySynced),
+                "only directory syncs reached before the injected boundary are counted"
             );
             drop(target);
 
@@ -20610,8 +20661,11 @@ mod tests {
         );
         assert_eq!(
             target.profile5_batch_test_counts(),
-            Profile5BatchTestCounts::default(),
-            "capacity must reject before a file sync or final redb transaction"
+            Profile5BatchTestCounts {
+                redb_write_begins: 1,
+                ..Profile5BatchTestCounts::default()
+            },
+            "capacity must reject inside source staging before commit, receipt, file sync, or final extent transaction"
         );
     }
 

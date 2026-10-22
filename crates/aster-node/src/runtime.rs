@@ -52275,9 +52275,92 @@ mod tests {
         fs::remove_dir_all(state).expect("canonical capability cleanup");
     }
 
-    async fn assert_completed_canonical_blob_crossing(sustained_pipeline_bytes: usize) {
+    #[derive(Debug)]
+    struct Profile5ReceiverMeasurementReceipt {
+        payload_bytes: u64,
+        wall_time_ns: u64,
+        bytes_per_second: f64,
+        mib_per_second: f64,
+        pipeline: crate::stream_pipeline::PipelineReport,
+        store: aster_redb_store::Profile5BatchTestCounts,
+    }
+
+    impl Profile5ReceiverMeasurementReceipt {
+        fn new(
+            payload_bytes: usize,
+            wall_time: std::time::Duration,
+            pipeline: crate::stream_pipeline::PipelineReport,
+            store: aster_redb_store::Profile5BatchTestCounts,
+        ) -> Self {
+            let payload_bytes = u64::try_from(payload_bytes).expect("profile-5 fixture size");
+            let wall_time_ns = u64::try_from(wall_time.as_nanos()).unwrap_or(u64::MAX);
+            let bytes_per_second = payload_bytes as f64 / wall_time.as_secs_f64().max(f64::EPSILON);
+            Self {
+                payload_bytes,
+                wall_time_ns,
+                bytes_per_second,
+                mib_per_second: bytes_per_second / (1024.0 * 1024.0),
+                pipeline,
+                store,
+            }
+        }
+
+        fn stage_line(&self, stage: crate::stream_pipeline::PipelineStage) -> String {
+            let observation = self.pipeline.stage(stage);
+            format!(
+                "{{\"items\":{},\"bytes\":{},\"queue_wait_ns\":{},\"service_ns\":{},\"output_blocked_ns\":{}}}",
+                observation.items,
+                observation.bytes,
+                observation.queue_wait_ns,
+                observation.service_ns,
+                observation.output_blocked_ns,
+            )
+        }
+
+        fn structured_line(&self) -> String {
+            format!(
+                concat!(
+                    "{{\"schema\":\"aster.profile5-receiver-measurement.v1\",",
+                    "\"payload_bytes\":{},\"wall_time_ns\":{},",
+                    "\"bytes_per_second\":{:.3},\"mib_per_second\":{:.3},",
+                    "\"pipeline\":{{\"accepted_items\":{},\"completed_items\":{},",
+                    "\"workers\":{},\"peak_in_flight_items\":{},",
+                    "\"peak_in_flight_bytes\":{},\"peak_reorder_items\":{},",
+                    "\"stages\":{{\"admission\":{},\"map\":{},\"reorder\":{},\"sink\":{}}}}},",
+                    "\"store\":{{\"durable_batches\":{},\"installed_carriers\":{},",
+                    "\"redb_write_begins\":{},\"redb_write_commits\":{},",
+                    "\"temp_file_syncs\":{},\"parent_directory_syncs\":{}}}}}"
+                ),
+                self.payload_bytes,
+                self.wall_time_ns,
+                self.bytes_per_second,
+                self.mib_per_second,
+                self.pipeline.accepted_items(),
+                self.pipeline.completed_items(),
+                self.pipeline.worker_count(),
+                self.pipeline.peak_in_flight_items(),
+                self.pipeline.peak_in_flight_bytes(),
+                self.pipeline.peak_reorder_items(),
+                self.stage_line(crate::stream_pipeline::PipelineStage::Admission),
+                self.stage_line(crate::stream_pipeline::PipelineStage::Map),
+                self.stage_line(crate::stream_pipeline::PipelineStage::Reorder),
+                self.stage_line(crate::stream_pipeline::PipelineStage::Sink),
+                self.store.durable_batches,
+                self.store.installed_carriers,
+                self.store.redb_write_begins,
+                self.store.redb_write_commits,
+                self.store.temp_file_syncs,
+                self.store.parent_directory_syncs,
+            )
+        }
+    }
+
+    async fn assert_completed_canonical_blob_crossing(
+        sustained_pipeline_bytes: usize,
+    ) -> Profile5ReceiverMeasurementReceipt {
         let multi_extent = vec![0x5au8; 1024 * 1024 + 1];
         let sustained_pipeline = vec![0x6bu8; sustained_pipeline_bytes];
+        let mut pipeline_measurement = None;
         for (label, plaintext, finite) in [
             ("nonempty", multi_extent.as_slice(), false),
             ("pipeline", sustained_pipeline.as_slice(), false),
@@ -52496,6 +52579,7 @@ mod tests {
                 None
             };
 
+            let transfer_started = std::time::Instant::now();
             let (first_sender, first_receiver) = tokio::join!(
                 CONTACT_EMISSION_GUARD.scope(
                     source_guard,
@@ -52525,6 +52609,7 @@ mod tests {
                     ),
                 ),
             );
+            let transfer_wall_time = transfer_started.elapsed();
             let first = match (first_sender, first_receiver) {
                 (Ok(sent), Ok(received)) => Ok((sent, received)),
                 (Err(error), _) | (_, Err(error)) => Err(error),
@@ -52909,6 +52994,12 @@ mod tests {
                 );
                 assert_eq!(pipeline.accepted_items(), canonical_chunk_count);
                 let batch_counts = target_store.profile5_batch_test_counts();
+                pipeline_measurement = Some(Profile5ReceiverMeasurementReceipt::new(
+                    plaintext.len(),
+                    transfer_wall_time,
+                    pipeline.clone(),
+                    batch_counts,
+                ));
                 assert_eq!(batch_counts.installed_carriers, canonical_chunk_count);
                 assert_eq!(
                     batch_counts.durable_batches,
@@ -52917,17 +53008,23 @@ mod tests {
                 );
                 assert!(batch_counts.durable_batches < batch_counts.installed_carriers);
                 assert_eq!(
-                    batch_counts.redb_write_begins, batch_counts.durable_batches,
-                    "each ABX1 extent uses one real redb write transaction"
+                    batch_counts.redb_write_begins,
+                    batch_counts.durable_batches + 1,
+                    "extent transactions plus one source-stage import activation are observed at their actual begin sites"
                 );
                 assert_eq!(
-                    batch_counts.redb_write_commits, batch_counts.durable_batches,
-                    "each successful extent commits exactly one redb transaction"
+                    batch_counts.redb_write_commits,
+                    batch_counts.durable_batches + 1,
+                    "extent transactions plus one source-stage import activation commit successfully"
                 );
                 assert_eq!(
-                    batch_counts.file_sync_operations,
-                    batch_counts.installed_carriers * 2,
-                    "each newly installed carrier performs one file and one directory sync"
+                    batch_counts.temp_file_syncs, batch_counts.installed_carriers,
+                    "each newly installed carrier performs one observed temp-file sync"
+                );
+                assert_eq!(
+                    batch_counts.parent_directory_syncs,
+                    batch_counts.installed_carriers + 1,
+                    "each carrier plus first-extent variant-directory activation synchronizes its parent"
                 );
                 assert!(
                     pipeline
@@ -53203,19 +53300,37 @@ mod tests {
             fs::remove_dir_all(source_state).expect("canonical v9 source cleanup");
             fs::remove_dir_all(target_state).expect("canonical v9 target cleanup");
         }
+        pipeline_measurement.expect("canonical profile-5 pipeline measurement")
     }
 
     #[tokio::test]
     async fn completed_canonical_blob_crosses_v9_publication_status_survives_small_mtu_interrupt_and_different_adapter_resume()
      {
-        assert_completed_canonical_blob_crossing(4 * 1024 * 1024 + 1).await;
+        let receipt = assert_completed_canonical_blob_crossing(4 * 1024 * 1024 + 1).await;
+        let structured: serde_json::Value = serde_json::from_str(&receipt.structured_line())
+            .expect("profile-5 measurement receipt is valid JSON");
+        assert_eq!(
+            structured["schema"],
+            "aster.profile5-receiver-measurement.v1"
+        );
+        assert_eq!(structured["payload_bytes"], 4 * 1024 * 1024 + 1);
     }
 
     #[tokio::test]
     #[ignore = "release-only real production path; requires multi-GiB RAM/disk and is not a default local gate"]
     async fn release_profile5_receiver_real_path_covers_exact_800_mib_and_1_gib() {
         for bytes in [800 * 1024 * 1024, 1024 * 1024 * 1024] {
-            assert_completed_canonical_blob_crossing(bytes).await;
+            let receipt = assert_completed_canonical_blob_crossing(bytes).await;
+            assert_eq!(receipt.payload_bytes, bytes as u64);
+            assert!(receipt.wall_time_ns > 0);
+            assert!(receipt.bytes_per_second > 0.0);
+            assert!(receipt.mib_per_second > 0.0);
+            assert!(receipt.pipeline.completed_items() > 0);
+            assert_eq!(
+                receipt.store.temp_file_syncs,
+                receipt.store.installed_carriers
+            );
+            println!("{}", receipt.structured_line());
         }
     }
 
