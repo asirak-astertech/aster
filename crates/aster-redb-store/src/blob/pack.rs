@@ -689,20 +689,37 @@ pub(super) fn reclaim_row_absent_cleanup_markers(
     let Some(pack_root) = depot_root.open_child_directory_if_present(PACK_DIRECTORY)? else {
         return Ok(());
     };
-    for name in pack_root
+    reclaim_cleanup_markers_in_pack_root(&pack_root, expected)
+}
+
+fn reclaim_cleanup_markers_in_pack_root(
+    pack_root: &OwnedDirectory,
+    expected: &[ExpectedBlobUploadPack],
+) -> Result<(), StoreError> {
+    let names = pack_root
         .entry_names()?
         .into_iter()
         .filter(|name| name.starts_with(UPLOAD_CLEANUP_PREFIX))
-    {
+        .collect::<Vec<_>>();
+    reclaim_cleanup_markers_in_order(pack_root, expected, &names)
+}
+
+fn reclaim_cleanup_markers_in_order(
+    pack_root: &OwnedDirectory,
+    expected: &[ExpectedBlobUploadPack],
+    names: &[String],
+) -> Result<(), StoreError> {
+    let mut reclaim = Vec::new();
+    for name in names {
         let marker = pack_root
-            .read_private_file_if_present(&name, 80)?
+            .read_private_file_if_present(name, 80)?
             .ok_or_else(|| {
                 blob_error(BlobStoreError::DepotIntegrity(
                     "Blob upload cleanup marker disappeared during reclaim",
                 ))
             })?;
         let identity = decode_cleanup_marker(&marker).map_err(pack_marker_store_error)?;
-        if name != cleanup_marker_name(identity) {
+        if *name != cleanup_marker_name(identity) {
             return Err(blob_error(BlobStoreError::DepotIntegrity(
                 "Blob upload cleanup marker identity is inconsistent",
             )));
@@ -717,10 +734,27 @@ pub(super) fn reclaim_row_absent_cleanup_markers(
                     "Blob upload cleanup marker differs from durable upload identity",
                 )));
             }
-            None => pack_root.remove_if_exists(&name, false)?,
+            None => reclaim.push(name),
         }
     }
+    for name in reclaim {
+        pack_root.remove_if_exists(name, false)?;
+    }
     Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn reclaim_cleanup_markers_from_pinned_root_for_test(
+    root: &PinnedBlobPackRoot,
+    expected: &[ExpectedBlobUploadPack],
+    names: &[String],
+) -> Result<(), StoreError> {
+    reclaim_cleanup_markers_in_order(&root.directory, expected, names)
+}
+
+#[cfg(test)]
+pub(super) fn cleanup_marker_name_for_test(identity: BlobPackIdentity) -> String {
+    cleanup_marker_name(identity)
 }
 
 enum BlobPackRoot {

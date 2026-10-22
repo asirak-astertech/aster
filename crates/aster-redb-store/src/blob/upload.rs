@@ -1332,7 +1332,7 @@ mod tests {
     };
     use std::fs::{self, OpenOptions};
     use std::io::{Cursor, Read, Seek, SeekFrom, Write};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
@@ -1595,6 +1595,41 @@ mod tests {
                 (name, bytes)
             })
             .collect::<Vec<_>>();
+        rows.sort_by(|left, right| left.0.cmp(&right.0));
+        Some(rows)
+    }
+
+    fn upload_pack_tree_snapshot(root: &TestRoot) -> Option<Vec<(String, Option<Vec<u8>>)>> {
+        fn visit(base: &Path, directory: &Path, rows: &mut Vec<(String, Option<Vec<u8>>)>) {
+            for entry in fs::read_dir(directory).expect("read upload pack tree") {
+                let entry = entry.expect("upload pack tree entry");
+                let path = entry.path();
+                let relative = path
+                    .strip_prefix(base)
+                    .expect("upload pack path is below root")
+                    .to_str()
+                    .expect("UTF-8 upload pack path")
+                    .to_owned();
+                let file_type = entry.file_type().expect("upload pack tree entry type");
+                if file_type.is_dir() {
+                    rows.push((relative, None));
+                    visit(base, &path, rows);
+                } else {
+                    assert!(file_type.is_file(), "upload pack tree contains only files");
+                    rows.push((
+                        relative,
+                        Some(fs::read(path).expect("read upload pack tree file")),
+                    ));
+                }
+            }
+        }
+
+        let path = root.0.join("blob-depot-v1").join("stream-packs-v2");
+        if !path.exists() {
+            return None;
+        }
+        let mut rows = Vec::new();
+        visit(&path, &path, &mut rows);
         rows.sort_by(|left, right| left.0.cmp(&right.0));
         Some(rows)
     }
@@ -2303,6 +2338,126 @@ mod tests {
         assert_eq!(upload_pack_root_snapshot(&fixture.root), before);
         assert!(Store::open_for_mission(fixture.root.database(), authority).is_err());
         assert_eq!(upload_pack_root_snapshot(&fixture.root), before);
+    }
+
+    #[test]
+    fn upload_reclaim_validates_all_markers_before_mixed_malformed_cleanup() {
+        // Break caught: reclaiming a valid marker before validating a later
+        // malformed marker makes a failed writable open mutate physical state.
+        let fixture = fixture("mixed-malformed-cleanup", 0x3d, BlobDepotLimits::DEFAULT);
+        let request = request(&fixture, b"mixed-malformed-cleanup", 1_024);
+        let policy = fixture.store.control_policy_snapshot().expect("policy");
+        let (reservation, _) = fixture
+            .store
+            .reserve_blob_upload_with_policy(&policy, &request)
+            .expect("reserve upload");
+        assert!(
+            fixture
+                .store
+                .abort_blob_upload(&reservation)
+                .expect("remove upload row and pack")
+        );
+        let root = PinnedBlobPackRoot::open(&fixture.store).expect("pack root");
+        super::super::pack::stage_upload_pack_cleanup(&root, &reservation.pack_identity())
+            .expect("stage valid row-absent cleanup marker");
+        let pack_root = fixture.root.0.join("blob-depot-v1").join("stream-packs-v2");
+        fs::write(
+            pack_root.join(format!(".aster-upload-cleanup-{}", "ff".repeat(32))),
+            [0x5a; 80],
+        )
+        .expect("write later malformed cleanup marker");
+        let before_reclaim = upload_pack_tree_snapshot(&fixture.root);
+        let reclaim_order = [
+            super::super::pack::cleanup_marker_name_for_test(reservation.pack_identity()),
+            format!(".aster-upload-cleanup-{}", "ff".repeat(32)),
+        ];
+        assert!(
+            super::super::pack::reclaim_cleanup_markers_from_pinned_root_for_test(
+                &root,
+                &[],
+                &reclaim_order,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            upload_pack_tree_snapshot(&fixture.root),
+            before_reclaim,
+            "failed reclamation must preserve every marker"
+        );
+        drop(root);
+        let authority = fixture.publisher.mission_authority_id();
+        drop(fixture.store);
+        let before_open = upload_pack_tree_snapshot(&fixture.root);
+        assert!(Store::inspect_existing(fixture.root.database()).is_err());
+        assert_eq!(upload_pack_tree_snapshot(&fixture.root), before_open);
+        assert!(Store::open_for_mission(fixture.root.database(), authority).is_err());
+        assert_eq!(upload_pack_tree_snapshot(&fixture.root), before_open);
+    }
+
+    #[test]
+    fn upload_reclaim_validates_all_markers_before_mixed_identity_conflict() {
+        // Break caught: reclaiming a row-absent marker before validating a
+        // marker which conflicts with a durable row makes failure destructive.
+        let fixture = fixture("mixed-conflicting-cleanup", 0x3e, BlobDepotLimits::DEFAULT);
+        let policy = fixture.store.control_policy_snapshot().expect("policy");
+        let active_request = request(&fixture, b"active-conflicting-cleanup", 1_024);
+        let (active, _) = fixture
+            .store
+            .reserve_blob_upload_with_policy(&policy, &active_request)
+            .expect("reserve durable upload");
+        let orphan_request = request(&fixture, b"orphan-before-conflict", 1_024);
+        let (orphan, _) = fixture
+            .store
+            .reserve_blob_upload_with_policy(&policy, &orphan_request)
+            .expect("reserve row-absent upload");
+        assert!(
+            fixture
+                .store
+                .abort_blob_upload(&orphan)
+                .expect("remove orphan upload row and pack")
+        );
+        let root = PinnedBlobPackRoot::open(&fixture.store).expect("pack root");
+        super::super::pack::stage_upload_pack_cleanup(&root, &orphan.pack_identity())
+            .expect("stage valid row-absent cleanup marker");
+        let mut wrong_digest = *active.pack_identity().request_digest();
+        wrong_digest[0] ^= 0x80;
+        let conflicting = BlobPackIdentity::new(
+            active.pack_identity().upload_id(),
+            wrong_digest,
+            active.pack_identity().total_len(),
+        );
+        super::super::pack::stage_upload_pack_cleanup(&root, &conflicting)
+            .expect("stage cleanup marker conflicting with durable upload");
+        let expected = [super::super::pack::ExpectedBlobUploadPack {
+            identity: active.pack_identity(),
+            checkpoint: None,
+        }];
+        let before_reclaim = upload_pack_tree_snapshot(&fixture.root);
+        let reclaim_order = [
+            super::super::pack::cleanup_marker_name_for_test(orphan.pack_identity()),
+            super::super::pack::cleanup_marker_name_for_test(conflicting),
+        ];
+        assert!(
+            super::super::pack::reclaim_cleanup_markers_from_pinned_root_for_test(
+                &root,
+                &expected,
+                &reclaim_order,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            upload_pack_tree_snapshot(&fixture.root),
+            before_reclaim,
+            "identity conflict must preserve every marker"
+        );
+        drop(root);
+        let authority = fixture.publisher.mission_authority_id();
+        drop(fixture.store);
+        let before_open = upload_pack_tree_snapshot(&fixture.root);
+        assert!(Store::inspect_existing(fixture.root.database()).is_err());
+        assert_eq!(upload_pack_tree_snapshot(&fixture.root), before_open);
+        assert!(Store::open_for_mission(fixture.root.database(), authority).is_err());
+        assert_eq!(upload_pack_tree_snapshot(&fixture.root), before_open);
     }
 
     #[test]
