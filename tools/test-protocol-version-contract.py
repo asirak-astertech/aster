@@ -529,6 +529,48 @@ class ProtocolVersionContractTests(unittest.TestCase):
             with self.subTest(name=name), self.assertRaises(CHECKER.ContractViolation):
                 CHECKER.validate_profile5_schema(schema, changed)
 
+    def test_profile_five_encoder_enum_and_minimum_drift_fail(self) -> None:
+        root = CHECKER_PATH.parents[1]
+        schema = json.loads((root / "conformance/profile5-wire-schema.json").read_text())
+        rust = (root / "crates/aster-node/src/stream_transfer.rs").read_text()
+        mutations = (
+            (
+                "OPEN custody encoder discriminant",
+                rust.replace("None => o.push(0)", "None => o.push(2)", 1),
+                r"OPEN encoder validator differs at None => o\.push\(0\)",
+            ),
+            (
+                "OPEN custody-present encoder discriminant",
+                rust.replace(
+                    "o.push(1);\n                        o.extend(d)",
+                    "o.push(2);\n                        o.extend(d)",
+                    1,
+                ),
+                r"OPEN encoder validator differs at Some\(d\) => \{ o\.push\(1\)",
+            ),
+            (
+                "ABX1 nonempty carrier encoder predicate",
+                rust.replace("if self.carriers.is_empty()", "if false", 1),
+                r"ABX1 validator differs at self\.carriers\.is_empty\(\)",
+            ),
+            (
+                "ABX1 nonempty carrier-record encoder predicate",
+                rust.replace("if carrier.is_empty()", "if false", 1),
+                r"ABX1 validator differs at carrier\.is_empty\(\)",
+            ),
+            (
+                "ASD1 nonempty protected-header encoder predicate",
+                rust.replace("if protected_header.is_empty()", "if false", 1),
+                r"ASD1 validator differs at protected_header\.is_empty\(\)",
+            ),
+        )
+        for name, changed, reason in mutations:
+            self.assertNotEqual(changed, rust, name)
+            with self.subTest(name=name), self.assertRaisesRegex(
+                CHECKER.ContractViolation, reason
+            ):
+                CHECKER.validate_profile5_schema(schema, changed)
+
     def test_profile_five_executable_wire_ceiling_drift_fails(self) -> None:
         root = CHECKER_PATH.parents[1]
         paths = [

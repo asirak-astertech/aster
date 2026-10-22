@@ -268,3 +268,45 @@ Focused verification:
 - `cargo fmt --all -- --check` and `git diff --check` — PASS.
 
 No full suite, push, deployment, or device validation was run.
+
+## Review remediation round 4
+
+The remaining Important finding in `task-9-rereview-3.md` is addressed.
+
+- The structured-contract checker now binds the OPEN custody encoder's exact
+  canonical discriminants (`None => 0`, `Some => 1`) inside the OPEN encoder
+  arm. Executable mutation tests prove that changing either emitted value is
+  rejected for the custody-discriminant reason.
+- The checker now binds the ABX1 encoder's nonempty carrier-list predicate and
+  the ASD1 encoder's nonempty protected-header predicate in their respective
+  executable codec sections. The exact reviewer mutations from `is_empty()` to
+  `false` are rejected with constraint-specific diagnostics.
+- The sibling minimum-constraint audit found one further omission of the same
+  class: each ABX1 carrier record must itself be nonempty. The checker now binds
+  `carrier.is_empty()` and an executable mutation proves this minimum cannot
+  drift. Other encoder enum and minimum constraints are already bound through
+  exact enum mappings or scoped shared validators.
+
+TDD evidence:
+
+- Red: the new mutation test failed all three reviewer probes because the
+  checker accepted the modified production source.
+- Green: `python3 -m unittest tools.test-protocol-version-contract.ProtocolVersionContractTests.test_profile_five_encoder_enum_and_minimum_drift_fail`
+  — PASS, including both custody discriminants and all three nonempty encoder
+  predicates.
+
+Focused verification:
+
+- `python3 conformance/blob_stream_oracle.py` — PASS.
+- `python3 tools/check-protocol-version-contract.py` — PASS; semantic versions
+  1 through 9 align.
+- `python3 tools/test-protocol-version-contract.py` — PASS, 31 tests.
+- `python3 tools/test-run-fuzz-smoke.py` — PASS, 3 tests.
+- `cargo test -p aster-node --features fuzzing production_composite_seeds_open_and_every_carrier_authenticates -- --nocapture`
+  — PASS, 1 test.
+- `cargo test -p aster-node --features fuzzing transcript_seed_expectations_match_model_and_production_states -- --nocapture`
+  — PASS, 1 test.
+- `cargo test --manifest-path fuzz/Cargo.toml --lib` — PASS, 3 tests.
+- `cargo fmt --all -- --check` and `git diff --check` — PASS.
+
+No full suite, push, deployment, or device validation was run.

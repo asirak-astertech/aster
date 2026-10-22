@@ -545,7 +545,15 @@ def validate_profile5_schema(schema: dict, stream_transfer: str, root: Path = RO
                 fail(f"executable profile 5 {name} decoder field order differs at {token}")
             cursor = position
     encoder_validators = {
-        "OPEN": ("nonce(&x.attempt_nonce)?", "validate_profile5_wire_len(x.total_len)?", "x.source_len == 0", "length > MAX_STREAM_AUTHENTICATED_OPEN_BYTES", "match x.custody_digest"),
+        "OPEN": (
+            "nonce(&x.attempt_nonce)?",
+            "validate_profile5_wire_len(x.total_len)?",
+            "x.source_len == 0",
+            "length > MAX_STREAM_AUTHENTICATED_OPEN_BYTES",
+            "match x.custody_digest",
+            "None => o.push(0)",
+            "Some(d) => { o.push(1)",
+        ),
         "SOURCE": ("nonce(&x.attempt_nonce)?", "x.bytes.is_empty()", "x.bytes.len() > PROFILE5_SOURCE_CHUNK_BYTES", "x.total_len == 0", "length > MAX_STREAM_AUTHENTICATED_OPEN_BYTES", "x.offset .checked_add", "end > x.total_len"),
         "ACCEPT": ("nonce(&x.attempt_nonce)?", "extent(x.max_extent_bytes)?", "x.absolute_receive_limit < x.durable_offset", "x.checkpoint_batch_bytes == 0", "x.checkpoint_batch_bytes > MAX_STREAM_CHECKPOINT_BATCH_BYTES"),
         "DATA": ("nonce(&x.attempt_nonce)?", "u32::try_from(x.bytes.len())", "extent(l)?", "x.offset .checked_add"),
@@ -611,8 +619,10 @@ def validate_profile5_schema(schema: dict, stream_transfer: str, root: Path = RO
     abx1_source = compact_stream[abx1_start:abx1_end]
     for fragment in (
         'CANONICAL_BLOB_EXTENT_MAGIC: &[u8; 4] = b"ABX1"',
+        "self.carriers.is_empty()",
         ".checked_add(self.carriers.len() as u64)",
         "end > aster_mesh::MAX_BLOB_CHUNKS",
+        "carrier.is_empty()",
         "carrier.len() > PROFILE5_CANONICAL_CARRIER_RECORD_BYTES",
         "encoded_len > PROFILE5_CANONICAL_EXTENT_BYTES",
         "u32::try_from(self.carriers.len())", "u32::try_from(carrier.len())",
@@ -633,6 +643,7 @@ def validate_profile5_schema(schema: dict, stream_transfer: str, root: Path = RO
     composite_source = compact_stream[composite_start:composite_end]
     for fragment in (
         'COMPOSITE_DATA_MAGIC: &[u8; 4] = b"ASD1"',
+        "protected_header.is_empty()",
         "protected_header.len() > MAX_PROTECTED_STREAM_DATA_HEADER_BYTES",
         "u32::try_from(protected_header.len())", "output.extend_from_slice(protected_header)",
         "&bytes[..4] != COMPOSITE_DATA_MAGIC", "bytes[4..8]", "protected_len == 0",
