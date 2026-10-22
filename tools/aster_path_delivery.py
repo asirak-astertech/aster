@@ -124,7 +124,10 @@ def _pinned_docker(run: Callable) -> Callable:
 class OwnedDocker:
     """Resources for the fixed delivery run, never authorized by container name."""
 
-    def __init__(self, docker: str, directory: Path, run: Callable):
+    def __init__(self, docker: str, directory: Path, run: Callable, *, image: str = "aster-path-delivery:local"):
+        if not isinstance(image, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/:@-]{0,255}", image) is None:
+            raise ExecutionError("image-reference-invalid")
+        self.image = image
         metadata = directory.lstat()
         if (directory.is_symlink() or not stat.S_ISDIR(metadata.st_mode)
                 or metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) != 0o700):
@@ -216,7 +219,7 @@ class OwnedDocker:
                 "--label", self.label, "--cap-drop", "ALL", "--user", "0:0" if caps else "10001:10001",
                 "--security-opt", "no-new-privileges", "--log-driver", "none",
                 *[part for cap in caps for part in ("--cap-add", cap)],
-                *network, "aster-path-delivery:local", *command,
+                *network, self.image, *command,
             ], 30)
         finally:
             if cidfile.exists() or cidfile.is_symlink():

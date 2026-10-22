@@ -31,10 +31,20 @@ MAX_COMPOSE_BYTES = 256 * 1024
 MAX_CONFIG_BYTES = 256 * 1024
 MAX_MANIFEST_BYTES = 64 * 1024
 COMPOSE_BUILD_WORKFLOW_SHA256 = (
-    "596dacb712f3537651b3475724052310383f79e2bb2952e53682bd20f350a14e"
+    "090c33a73a4953b58d76ff2e876979dedbf46392073b685b2732e4eceae39922"
 )
-SETUP_BUILDX_ACTION = (
-    "docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069"
+APPROVED_WORKFLOW_ACTIONS = (
+    "actions/checkout",
+    "docker/setup-buildx-action",
+    "jdx/mise-action",
+    "actions/upload-artifact",
+)
+ACTION_USE_RE = re.compile(
+    r"(?m)^(?P<prefix>[ \t]*uses:[ \t]*)"
+    r"(?P<repository>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)"
+    r"@(?P<sha>[0-9a-f]{40})"
+    r"(?P<comment_prefix>[ \t]+#[ \t]+)"
+    r"(?P<version>v[0-9]+(?:\.[0-9]+){0,2})(?P<suffix>[ \t]*)$"
 )
 BUILDKIT_IMAGE = (
     "moby/buildkit:buildx-stable-1@sha256:"
@@ -110,10 +120,31 @@ def validate_policy_texts(texts: Mapping[str, str]) -> None:
             raise ValidationError("compose-delivery-policy-invalid")
 
 
+def normalize_workflow_action_pins(workflow: str) -> str:
+    """Normalize reviewed Action pins while preserving their identities."""
+
+    matches = tuple(ACTION_USE_RE.finditer(workflow))
+    action_lines = re.findall(r"(?m)^\s*uses:\s*[^\n]+$", workflow)
+    repositories = tuple(match.group("repository") for match in matches)
+    if len(matches) != len(action_lines) or repositories != APPROVED_WORKFLOW_ACTIONS:
+        raise ValidationError("compose-delivery-policy-invalid")
+    return ACTION_USE_RE.sub(
+        lambda match: (
+            f'{match.group("prefix")}{match.group("repository")}@ACTION_SHA'
+            f'{match.group("comment_prefix")}ACTION_VERSION{match.group("suffix")}'
+        ),
+        workflow,
+    )
+
+
 def validate_workflow_policy(workflow: str, ci: str) -> None:
     """Validate release packaging and the daemon-free normal-CI hook."""
 
-    if hashlib.sha256(workflow.encode()).hexdigest() != COMPOSE_BUILD_WORKFLOW_SHA256:
+    normalized_workflow = normalize_workflow_action_pins(workflow)
+    if (
+        hashlib.sha256(normalized_workflow.encode()).hexdigest()
+        != COMPOSE_BUILD_WORKFLOW_SHA256
+    ):
         raise ValidationError("compose-delivery-policy-invalid")
     if "\r" in workflow or "\t" in workflow:
         raise ValidationError("compose-delivery-policy-invalid")
@@ -163,13 +194,13 @@ def validate_workflow_policy(workflow: str, ci: str) -> None:
     buildx_setup = (
         "      - name: Set up pinned OCI-capable Buildx builder\n"
         "        id: buildx\n"
-        f"        uses: {SETUP_BUILDX_ACTION} # v4.4.1\n"
+        "        uses: docker/setup-buildx-action@ACTION_SHA # ACTION_VERSION\n"
         "        with:\n"
         "          driver: docker-container\n"
         "          driver-opts: |\n"
         f"            image={BUILDKIT_IMAGE}\n"
     )
-    if workflow.count(buildx_setup) != 1:
+    if normalized_workflow.count(buildx_setup) != 1:
         raise ValidationError("compose-delivery-policy-invalid")
 
     docker_commands = re.findall(r"\bdocker\s+([a-zA-Z0-9_-]+)", workflow)
