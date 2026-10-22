@@ -35,11 +35,6 @@ is not buffered in memory. Chunks are at most 512 KiB. The CLI and wire contract
 do not impose a total-size maximum; the agent may reject a source above its
 configured backend limit.
 .PP
-Publication commits to the local canonical Blob authority and does not wait
-for a peer. Provisional upload bytes, pending network receipt bytes, and
-completed canonical variants share the configured Blob depot limits; there is
-no separate streaming capacity pool.
-.PP
 The opened source file's contents and length must remain unchanged until the
 command exits. A detectable size change fails with an unknown publication
 outcome. In-place same-length mutation is outside the command contract and can

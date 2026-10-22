@@ -249,6 +249,7 @@ BLOB_DOCUMENTATION_CAPABILITIES.update(
 
 REQUIREMENTS_CURRENT_SECTION_NAMES = (
     "selected-lane-summary",
+    "current-selected-blob-evidence",
     "running-node-selected-blobs",
     "live-selected-blob",
     "current-automation",
@@ -564,50 +565,28 @@ def validate_blob_documentation_contract(documents: dict[str, str]) -> None:
             if governed:
                 fail(f"Blob documentation {surface} governed claim is outside its capability block")
 
-    for sentence, words in _documentation_sentence_text(prose["blob_publish_man"]):
-        waits_for_peer = (
-            {"local", "peer"} <= words
-            and _contains_any(words, ("publish", "publicat"))
-            and _contains_any(words, ("wait",))
-        )
-        denied = bool(
-            re.search(r"\b(?:do|does|did|will|must|need) not wait\b", sentence)
-            or re.search(r"\bwithout waiting\b", sentence)
-        )
-        if waits_for_peer and not denied:
+    for words in _documentation_sentences(prose["blob_publish_man"]):
+        if "peer" in words and _contains_any(words, ("publish", "publicat")):
             fail(
                 "Blob documentation blob_publish_man governed claim is outside "
                 "its capability block"
             )
 
-    for sentence, words in _documentation_sentence_text(prose["blob_read_man"]):
-        positive_resume = (
-            {"cli", "download", "resume"} <= words
-            and bool(words & {"implemented", "continues", "continue", "supported"})
+    for words in _documentation_sentences(prose["blob_read_man"]):
+        read_resume_topic = _contains_any(words, ("resume",)) and (
+            _contains_any(words, ("download",))
+            or {"asterctl", "blob", "read"} <= words
         )
-        denied = bool(
-            re.search(r"\b(?:is|are) not (?:yet )?(?:implemented|supported)\b", sentence)
-            or "post merge" in sentence
-            or "restart at byte zero" in sentence
-            or "restarts at byte zero" in sentence
-        )
-        if positive_resume and not denied:
+        if read_resume_topic:
             fail(
                 "Blob documentation blob_read_man governed claim is outside "
                 "its capability block"
             )
 
-    for sentence, words in _documentation_sentence_text(prose["blob_status_man"]):
-        remote_status = (
-            "blobstatus" in words
-            and _contains_any(words, ("report",))
-            and bool(words & {"remote", "peer", "convergence"})
-        )
-        denied = bool(
-            re.search(r"\b(?:do|does|will) not report\b", sentence)
-            or re.search(r"\breports? no\b", sentence)
-        )
-        if remote_status and not denied:
+    for words in _documentation_sentences(prose["blob_status_man"]):
+        if "blobstatus" in words and bool(
+            words & {"remote", "peer", "delivery", "convergence"}
+        ):
             fail(
                 "Blob documentation blob_status_man governed claim is outside "
                 "its capability block"
@@ -621,6 +600,12 @@ def validate_blob_documentation_contract(documents: dict[str, str]) -> None:
         "enter current carrier IO only through the v7/v8 profile-4 stream",
     )
     requirements = prose["requirements_status"]
+    stale_current_blob_evidence = (
+        "Current v7/v8 profile-4 streaming, semantic-v8 finite custody, bounded "
+        "pressure, and GC remain current-code evidence only."
+    )
+    if stale_current_blob_evidence.lower() in " ".join(requirements.split()).lower():
+        fail("Blob documentation requirements_status retains stale selected Blob mechanism")
     for stale in stale_current_requirements:
         if stale.lower() in requirements.lower():
             fail("Blob documentation requirements_status retains stale current-v8 wording")

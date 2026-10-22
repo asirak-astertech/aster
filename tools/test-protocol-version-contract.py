@@ -451,6 +451,37 @@ class ProtocolVersionContractTests(unittest.TestCase):
         ):
             CHECKER.validate_blob_documentation_contract(stale_running_node)
 
+        current_evidence = "current-selected-blob-evidence"
+        self.assertIn(current_evidence, CHECKER.REQUIREMENTS_CURRENT_SECTION_NAMES)
+        omitted_v9 = dict(documents)
+        expected = CHECKER.render_requirements_current_section(current_evidence)
+        omitted_v9["requirements_status"] = omitted_v9["requirements_status"].replace(
+            expected,
+            expected.replace(
+                "Current Blob transfer uses semantic v9 profile 5 with "
+                "receiver-authoritative checkpoints and ABX1 canonical extents, "
+                "bounded at 8 GiB and 131,072 chunks; semantic v7/v8 profile 4 "
+                "remains compatibility-only at 64 MiB and 1,024 chunks.",
+                "Current v7/v8 profile-4 streaming, semantic-v8 finite custody, "
+                "bounded pressure, and GC remain current-code evidence only.",
+            ),
+            1,
+        )
+        with self.assertRaisesRegex(
+            CHECKER.ContractViolation, "current-selected-blob-evidence"
+        ):
+            CHECKER.validate_blob_documentation_contract(omitted_v9)
+
+        stale_current_evidence = dict(documents)
+        stale_current_evidence["requirements_status"] += (
+            "Current v7/v8 profile-4 streaming, semantic-v8 finite custody, "
+            "bounded pressure, and GC remain current-code evidence only."
+        )
+        with self.assertRaisesRegex(
+            CHECKER.ContractViolation, "requirements_status.*selected Blob mechanism"
+        ):
+            CHECKER.validate_blob_documentation_contract(stale_current_evidence)
+
     def test_documentation_surface_set_is_exact(self) -> None:
         documents = {
             surface: capability_block(surface) for surface in DOCUMENTATION_CAPABILITIES
@@ -480,7 +511,7 @@ class ProtocolVersionContractTests(unittest.TestCase):
             ):
                 CHECKER.validate_blob_documentation_contract(duplicate)
 
-        man_contradictions = (
+        man_governed_claims = (
             (
                 "blob_publish_man",
                 "Local publication waits for a peer before it commits.",
@@ -493,8 +524,45 @@ class ProtocolVersionContractTests(unittest.TestCase):
                 "blob_status_man",
                 "blob-status reports remote delivery, peer status, and convergence.",
             ),
+            (
+                "blob_publish_man",
+                "Local publication blocks until a peer is available.",
+            ),
+            (
+                "blob_publish_man",
+                "A peer must be available before local publication commits.",
+            ),
+            (
+                "blob_read_man",
+                "The CLI can resume an interrupted download at its previous offset.",
+            ),
+            (
+                "blob_read_man",
+                "asterctl blob-read resumes partial downloads.",
+            ),
+            (
+                "blob_status_man",
+                "blob-status shows remote delivery and convergence.",
+            ),
+            (
+                "blob_status_man",
+                "Remote peer delivery is visible in blob-status.",
+            ),
+            (
+                "blob_publish_man",
+                "Local publication never waits for a peer before committing.",
+            ),
+            (
+                "blob_status_man",
+                "blob-status reports receiver-local state rather than remote peer "
+                "delivery or convergence.",
+            ),
+            (
+                "blob_status_man",
+                "blob-status reports only local state and excludes remote peer delivery.",
+            ),
         )
-        for surface, claim in man_contradictions:
+        for surface, claim in man_governed_claims:
             damaged = dict(documents)
             damaged[surface] += claim
             with self.subTest(surface=surface), self.assertRaisesRegex(
@@ -502,17 +570,39 @@ class ProtocolVersionContractTests(unittest.TestCase):
             ):
                 CHECKER.validate_blob_documentation_contract(damaged)
 
-        accurate_man_prose = dict(documents)
-        accurate_man_prose["blob_publish_man"] += (
-            "Local publication does not wait for a peer before it commits."
+        duplicate_accurate_man_claims = (
+            (
+                "blob_publish_man",
+                "Local publication does not wait for a peer before it commits.",
+            ),
+            (
+                "blob_read_man",
+                "CLI download resume is not supported; interrupted downloads restart at byte zero.",
+            ),
+            (
+                "blob_status_man",
+                "blob-status does not report remote delivery, peer status, or convergence.",
+            ),
         )
-        accurate_man_prose["blob_read_man"] += (
-            "CLI download resume is not supported; interrupted downloads restart at byte zero."
+        for surface, claim in duplicate_accurate_man_claims:
+            damaged = dict(documents)
+            damaged[surface] += claim
+            with self.subTest(surface=surface), self.assertRaisesRegex(
+                CHECKER.ContractViolation, f"{surface}.*governed claim"
+            ):
+                CHECKER.validate_blob_documentation_contract(damaged)
+
+        operational_man_prose = dict(documents)
+        operational_man_prose["blob_publish_man"] += (
+            "The --progress flag controls terminal progress output."
         )
-        accurate_man_prose["blob_status_man"] += (
-            "blob-status does not report remote delivery, peer status, or convergence."
+        operational_man_prose["blob_read_man"] += (
+            "The --output flag names the new destination path."
         )
-        CHECKER.validate_blob_documentation_contract(accurate_man_prose)
+        operational_man_prose["blob_status_man"] += (
+            "The --wait flag polls until an available or terminal state."
+        )
+        CHECKER.validate_blob_documentation_contract(operational_man_prose)
 
         public_claims = (
             "Local publication waits for a peer before it commits.",

@@ -453,8 +453,11 @@ carrier-prefix/network, and authenticated-cache visibility while deliberately
 retaining bounded quota-charged depot expected or committed staging, backing
 files/chunks where present, reserved-byte authority, and the unfinished
 physical-lineage fence until exact manifest-backed reclamation finalizes.
-Current v7/v8 profile-4 streaming, semantic-v8 finite custody, bounded pressure,
-and GC remain current-code evidence only. Durable source/cache transitions
+<!-- ASTER-BLOB-CURRENT:current-selected-blob-evidence:BEGIN -->
+Current Blob transfer uses semantic v9 profile 5 with receiver-authoritative checkpoints and ABX1 canonical extents, bounded at 8 GiB and 131,072 chunks; semantic v7/v8 profile 4 remains compatibility-only at 64 MiB and 1,024 chunks.
+<!-- ASTER-BLOB-CURRENT:current-selected-blob-evidence:END -->
+Semantic-v8 finite-custody, bounded-pressure, and GC evidence remains relevant
+to the v7/v8 compatibility path. Durable source/cache transitions
 remain lifecycle-serialized; terminal content failure aborts the exact source
 without cursor movement, while authorized terminal source rotation uses the
 lexicographically greatest carrier ID. The retained v2 receipt
