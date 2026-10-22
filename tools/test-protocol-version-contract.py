@@ -28,6 +28,14 @@ ORACLE = importlib.util.module_from_spec(ORACLE_SPEC)
 ORACLE_SPEC.loader.exec_module(ORACLE)
 
 
+PUBLIC_API_FIELDS = {
+    "local_publish_waits_for_peer": False,
+    "rust_agent_asterctl_publish_read": "implemented",
+    "blob_status_scope": "receiver_local_durable_state",
+    "blob_status_reports_remote_delivery_peer_or_convergence": False,
+    "cli_download_resume": "post_merge",
+}
+
 DOCUMENTATION_CAPABILITIES = {
     "node_api": {
         "schema": 1,
@@ -79,15 +87,6 @@ DOCUMENTATION_CAPABILITIES = {
         "pre_profile5_canonical_blob_profile5_eligible": True,
         "capacity_authority": "configured_blob_depot_limits",
     },
-    "public_api": {
-        "schema": 1,
-        "surface": "public_api",
-        "local_publish_waits_for_peer": False,
-        "rust_agent_asterctl_publish_read": "implemented",
-        "blob_status_scope": "receiver_local_durable_state",
-        "blob_status_reports_remote_delivery_peer_or_convergence": False,
-        "cli_download_resume": "post_merge",
-    },
     "performance": {
         "schema": 1,
         "surface": "performance",
@@ -98,16 +97,40 @@ DOCUMENTATION_CAPABILITIES = {
         "current_extent": "ABX1, at most 1048576 bytes",
         "current_cm4_qualification": "pending_task_13",
     },
+    "requirements_status": {
+        "schema": 1,
+        "surface": "requirements_status",
+        "default_semantic_offer": [9, 8, 7, 6, 5, 4, 3, 2, 1],
+        "semantic_v7_v8_profile": "4:BlobRangesStreamV1",
+        "semantic_v9_profile": "5:BlobStreamV1",
+        "current_blob_network": "semantic_v9_profile5_with_v7_v8_compatibility",
+    },
 }
+for _surface in (
+    "readme",
+    "agent_readme",
+    "asterctl_readme",
+    "selected_blob_api",
+    "operator_guide",
+    "capability_roadmap",
+):
+    DOCUMENTATION_CAPABILITIES[_surface] = {
+        "schema": 1,
+        "surface": _surface,
+        **PUBLIC_API_FIELDS,
+    }
 
 
 def capability_block(surface: str, *, value=None) -> str:
     payload = DOCUMENTATION_CAPABILITIES[surface] if value is None else value
+    rendered = CHECKER.render_blob_documentation_capability(surface)
     return (
         "<!-- ASTER-BLOB-CAPABILITY:BEGIN -->\n"
         "```json\n"
         f"{json.dumps(payload, indent=2)}\n"
         "```\n"
+        "<!-- ASTER-BLOB-CAPABILITY:RENDERED -->\n"
+        f"{rendered}\n"
         "<!-- ASTER-BLOB-CAPABILITY:END -->\n"
     )
 
@@ -235,12 +258,12 @@ class ProtocolVersionContractTests(unittest.TestCase):
             CHECKER.validate_blob_documentation_contract(extra_field)
 
         missing_field = dict(documents)
-        missing_payload = dict(DOCUMENTATION_CAPABILITIES["public_api"])
+        missing_payload = dict(DOCUMENTATION_CAPABILITIES["readme"])
         del missing_payload["cli_download_resume"]
-        missing_field["public_api"] = capability_block(
-            "public_api", value=missing_payload
+        missing_field["readme"] = capability_block(
+            "readme", value=missing_payload
         )
-        with self.assertRaisesRegex(CHECKER.ContractViolation, "public_api.*fields"):
+        with self.assertRaisesRegex(CHECKER.ContractViolation, "readme.*fields"):
             CHECKER.validate_blob_documentation_contract(missing_field)
 
         malformed_json = dict(documents)
@@ -295,51 +318,108 @@ class ProtocolVersionContractTests(unittest.TestCase):
             ):
                 CHECKER.validate_blob_documentation_contract(damaged)
 
-        valid_distinctions = dict(documents)
-        valid_distinctions["node_api"] += (
-            "A 1 MiB segment is independently encrypted, while every 64 KiB "
-            "chunk is authenticated."
+        neutral = dict(documents)
+        neutral["node_api"] += "The transport adapter exposes bounded frames."
+        neutral["runbook"] += "Operators retain logs for incident review."
+        neutral["performance"] += "The raw receipt records elapsed time."
+        CHECKER.validate_blob_documentation_contract(neutral)
+
+    def test_blob_documentation_contract_rejects_unmarked_authority_and_topic_claims(self) -> None:
+        documents = {
+            surface: capability_block(surface) for surface in DOCUMENTATION_CAPABILITIES
+        }
+
+        for extra in (
+            """```json\n{\"semantic_v9_profile\": \"4:BlobRangesStreamV1\"}\n```\n""",
+            capability_block("node_api").replace("ASTER-BLOB-CAPABILITY", "aster-blob-capability"),
+        ):
+            damaged = dict(documents)
+            damaged["node_api"] += extra
+            with self.subTest(extra=extra[:24]), self.assertRaisesRegex(
+                CHECKER.ContractViolation, "node_api.*capability"
+            ):
+                CHECKER.validate_blob_documentation_contract(damaged)
+
+        unrelated_example = dict(documents)
+        unrelated_example["readme"] += """```json\n{\"topic\": \"maps\", \"limit\": 4}\n```\n"""
+        CHECKER.validate_blob_documentation_contract(unrelated_example)
+
+        public_claims = (
+            "Local publication waits for a peer before it commits.",
+            "blob-status reports remote delivery, peer status, and convergence.",
+            "CLI download resume is implemented and continues from the previous byte.",
+            "The Rust API supports Blob publication, but the agent and asterctl do not.",
         )
-        valid_distinctions["runbook"] += (
-            "Canonical promotion happens before RESULT and ACK, rather than "
-            "after RESULT and ACK. The durable receipt stores plan data, not "
-            "the fresh attempt nonce."
+        for surface in (
+            "readme", "agent_readme", "asterctl_readme", "selected_blob_api",
+            "operator_guide", "capability_roadmap",
+        ):
+            for claim in public_claims:
+                damaged = dict(documents)
+                damaged[surface] += claim
+                with self.subTest(surface=surface, claim=claim), self.assertRaisesRegex(
+                    CHECKER.ContractViolation, f"{surface}.*governed claim"
+                ):
+                    CHECKER.validate_blob_documentation_contract(damaged)
+
+        unrelated_negations = (
+            (
+                "node_api",
+                "Profile 5 does not compress data, and each 1 MiB segment is authenticated.",
+            ),
+            (
+                "runbook",
+                "The durable receipt does not compress content and retains the fresh attempt nonce.",
+            ),
+            (
+                "runbook",
+                "The incoming path does not compress content and calculates the exact byte deadline.",
+            ),
+            (
+                "performance",
+                "Legacy CM4 does not cover packet loss and confirms the current ABX1 candidate.",
+            ),
         )
-        valid_distinctions["performance"] += (
-            "Legacy CM4 results support the historical ASTRBS02 candidate, "
-            "not the current ABX1 candidate."
+        for surface, claim in unrelated_negations:
+            damaged = dict(documents)
+            damaged[surface] += claim
+            with self.subTest(claim=claim), self.assertRaises(CHECKER.ContractViolation):
+                CHECKER.validate_blob_documentation_contract(damaged)
+
+        accurate_but_governed = (
+            ("runbook", "Canonical promotion precedes RESULT and ACK."),
+            ("performance", "Legacy CM4 differs from the current ABX1 candidate."),
         )
-        CHECKER.validate_blob_documentation_contract(valid_distinctions)
+        for surface, claim in accurate_but_governed:
+            damaged = dict(documents)
+            damaged[surface] += claim
+            with self.subTest(claim=claim), self.assertRaises(CHECKER.ContractViolation):
+                CHECKER.validate_blob_documentation_contract(damaged)
+
+        stale_requirements = (
+            "The current selected offer is `[8, 7, 6, 5, 4, 3, 2, 1]`.",
+            "The selected handshake default/highest semantic version is 8.",
+            "Selected Blob carrier IO requires v7/v8 profile 4.",
+        )
+        for claim in stale_requirements:
+            damaged = dict(documents)
+            damaged["requirements_status"] += claim
+            with self.subTest(claim=claim), self.assertRaisesRegex(
+                CHECKER.ContractViolation, "requirements_status.*current-v8"
+            ):
+                CHECKER.validate_blob_documentation_contract(damaged)
 
     def test_blob_documentation_contract_rejects_each_capability_drift(self) -> None:
         documents = {
-            "runbook": """Blob profile negotiation: semantic v7/v8 select profile 4; semantic v9 selects profile 5.
-Profile 5 size terms: 65,536-byte canonical plaintext chunk; 66,215-byte maximum encoded canonical chunk record; 1,048,576-byte maximum ABX1 batched extent.
-Profile 5 checkpoint maximum: 134,217,728 bytes (128 MiB).
-Canonical legacy eligibility: every pre-profile-5 canonical Blob remains eligible for profile 5 after upgrade.
-Unified capacity: provisional uploads, pending network receipts, and completed canonical variants share the configured Blob depot limits.
-""",
-            "public_api": """Current Blob API capability: the Rust API, native-gRPC agent, and asterctl support bounded local publication and authenticated reads.
-Status boundary: local publication success is a durable local commit; blob-status is receiver-local durable state, not remote delivery, peer status, or convergence status.
-Download resume: post-merge work; interrupted asterctl downloads currently restart at byte zero.
-""",
-            "node_api": """Semantic v9 selects profile 5 BlobStreamV1; semantic v7/v8 retain compatibility profile 4 BlobRangesStreamV1.
-Profile 5 batches canonical 64-KiB plaintext chunks as complete ASTRBT01 records in ABX1 extents of at most 1 MiB.
-""",
-            "transports": """Semantic v9 selects profile 5 BlobStreamV1; semantic v7/v8 retain compatibility profile 4 BlobRangesStreamV1.
-Profile 5 batches canonical 64-KiB plaintext chunks as complete ASTRBT01 records in ABX1 extents of at most 1 MiB.
-""",
-            "recipes": """Semantic v9 selects profile 5 BlobStreamV1; semantic v7/v8 retain compatibility profile 4 BlobRangesStreamV1.
-Profile 5 batches canonical 64-KiB plaintext chunks as complete ASTRBT01 records in ABX1 extents of at most 1 MiB.
-""",
-            "performance": """Legacy 2026-10-20 ASTRBS02 completed-pack evidence used 1-MiB semantic segments and does not validate the current canonical-authority candidate.
-Current qualification must measure 64-KiB canonical plaintext chunks carried as ASTRBT01 records in at-most-1-MiB ABX1 extents.
-""",
+            surface: capability_block(surface)
+            for surface in DOCUMENTATION_CAPABILITIES
         }
-        documents = {
-            surface: capability_block(surface) + text
-            for surface, text in documents.items()
-        }
+        documents["performance"] += (
+            "<!-- ASTER-BLOB-LEGACY:BEGIN -->\n"
+            "Legacy CM4 results support the historical ASTRBS02 candidate, not "
+            "the current ABX1 candidate.\n"
+            "<!-- ASTER-BLOB-LEGACY:END -->\n"
+        )
         CHECKER.validate_blob_documentation_contract(documents)
 
         coexistence_mutations = (
@@ -432,21 +512,14 @@ Current qualification must measure 64-KiB canonical plaintext chunks carried as 
             ):
                 CHECKER.validate_blob_documentation_contract(damaged)
 
-        allowed = dict(documents)
-        allowed["node_api"] += (
-            "Profile 5 does not use independently authenticated 1-MiB segments."
+        historical = dict(documents)
+        historical["performance"] += (
+            "<!-- ASTER-BLOB-LEGACY:BEGIN -->\n"
+            "Legacy CM4 measurements validate only the historical ASTRBS02 "
+            "candidate and do not validate the current ABX1 candidate.\n"
+            "<!-- ASTER-BLOB-LEGACY:END -->"
         )
-        allowed["runbook"] += (
-            "Canonical promotion does not follow RESULT and ACK. "
-            "The durable receipt stores plan data but does not store the fresh "
-            "attempt nonce. Incoming transfers do not calculate their hard "
-            "deadline from exact content bytes."
-        )
-        allowed["performance"] += (
-            "The legacy CM4 measurements validate only the historical ASTRBS02 "
-            "candidate and do not validate the current ABX1 candidate."
-        )
-        CHECKER.validate_blob_documentation_contract(allowed)
+        CHECKER.validate_blob_documentation_contract(historical)
 
     def test_v1_through_v9_contract_passes(self) -> None:
         self.validate()

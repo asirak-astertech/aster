@@ -1,16 +1,29 @@
 # Aster operator runbook
 
+<!-- ASTER-BLOB-CAPABILITY:BEGIN -->
+```json
+{
+  "schema": 1,
+  "surface": "operator_guide",
+  "local_publish_waits_for_peer": false,
+  "rust_agent_asterctl_publish_read": "implemented",
+  "blob_status_scope": "receiver_local_durable_state",
+  "blob_status_reports_remote_delivery_peer_or_convergence": false,
+  "cli_download_resume": "post_merge"
+}
+```
+<!-- ASTER-BLOB-CAPABILITY:RENDERED -->
+Local Blob publication commits without waiting for a peer. Rust, the native-gRPC agent, and asterctl implement bounded Blob publication and authenticated reads. blob-status reports receiver-local durable state, not remote delivery, peer status, or convergence. CLI download resume is post-merge work; an interrupted download restarts at byte zero.
+<!-- ASTER-BLOB-CAPABILITY:END -->
+
 Use this runbook to install and operate Aster without building software or
 writing an application. Both packaged paths include `asterctl` for Event and
 Blob operations.
 
-For Blob operations, local publication and network synchronization are
-separate. Publish success is a peer-independent durable local commit.
-`blob-status` observes receiver-local canonical state; it is not remote
-delivery, peer status, or convergence status. The agent and `asterctl` support
-bounded local publication and authenticated reads today. Node-to-node profile
-5 resumes from receiver checkpoints, while interrupted CLI downloads restart
-at byte zero; download resume is post-merge work.
+For Blob operations, the machine-checked capability block above is
+authoritative for publication, status, and download behavior. Node-to-node
+profile 5 resumes from receiver checkpoints independently of the CLI output
+path.
 
 > [!IMPORTANT]
 > Aster is an evaluation-stage reference implementation, not a
@@ -218,8 +231,7 @@ mean no Blob network receipt. Peer, interest, emission-policy, depot, and
 mission changes require a restart.
 
 With semantic v9 selected, the exact interest drives the bounded profile-5
-streaming lane. Local publication remains independent of peer availability;
-the sync scheduler transfers later when the configured destination is
+streaming lane. The sync scheduler transfers when the configured destination is
 available, and an interrupted attempt resumes from receiver-authoritative
 durable progress.
 
@@ -522,8 +534,8 @@ prints `VERIFY status=pass`.
 ### Step 5: run Event and Blob checks
 
 The bundle must authorize `chat.events@mission/team/alpha` and
-`imagery.maps@mission/team/alpha`. A local publish/query needs no subscription;
-for a peer-transfer check, create the matching subscription on the receiving
+`imagery.maps@mission/team/alpha`. Work confined to one node needs no
+subscription; for a transfer check, create the matching subscription on the receiving
 node before publication and allow authenticated contact after creation. Publish
 and query an Event. Initialize the journal once in the persistent transfer
 bind mount, then retain it for later invocations:
@@ -782,7 +794,7 @@ The Debian package also installs command-specific man pages, such as
 | --- | --- | --- |
 | Static config validation | Document and referenced files satisfy static rules | Credential loading or runtime readiness |
 | `/readyz` succeeds | Local durable authority and API accept work | Peer connectivity or convergence |
-| Local publish succeeds | The local node committed the object | A peer received it |
+| Commit succeeds | The local node committed the object | Another node received it |
 | Authenticated contact increases | A mission-authenticated contact occurred | A specific Event or Blob transferred |
 | Node B query finds an Event | Node B stored that Event | Every eligible node converged |
 | Node B reads and hashes a Blob | Node B returned the requested complete Blob | Production performance or arbitrary-peer recovery |

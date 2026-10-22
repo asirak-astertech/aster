@@ -1,5 +1,30 @@
 # Production implementation requirements status
 
+<!-- ASTER-BLOB-CAPABILITY:BEGIN -->
+```json
+{
+  "schema": 1,
+  "surface": "requirements_status",
+  "default_semantic_offer": [
+    9,
+    8,
+    7,
+    6,
+    5,
+    4,
+    3,
+    2,
+    1
+  ],
+  "semantic_v7_v8_profile": "4:BlobRangesStreamV1",
+  "semantic_v9_profile": "5:BlobStreamV1",
+  "current_blob_network": "semantic_v9_profile5_with_v7_v8_compatibility"
+}
+```
+<!-- ASTER-BLOB-CAPABILITY:RENDERED -->
+The current default semantic offer is [9, 8, 7, 6, 5, 4, 3, 2, 1]. Semantic v9 selects profile 5 BlobStreamV1; semantic v7/v8 retain compatibility profile 4 BlobRangesStreamV1.
+<!-- ASTER-BLOB-CAPABILITY:END -->
+
 - Status date: 2026-10-08
 - Requirements authority: [`data-mesh-requirements.md`](../../data-mesh-requirements.md)
 - Requirements SHA-256: `e88bcc6c717a5175a460205fdc084aaa2e1f020a142a84087f9881677da02987`
@@ -196,11 +221,12 @@ mission authentication, and neither is source or control authorization:
    and activate from a durable contiguous prefix before the Event lane opens.
 4. The unchanged `aster-core` source-envelope provider authenticates each
    Event, State, Record, or Blob publisher and protected header. State and
-   Record enter the semantic-v4-v8 class- and direction-separated mutable
-   lanes. Blob carrier transfer requires semantic v7/v8 profile 4: v7 is
-   durable-only and v8 also admits authenticated finite custody. V5/v6 retain
-   only historical Blob frame allocations and fail before carrier IO. Content
-   authorization remains separate from route authorization.
+   Record enter the semantic-v4-v9 class- and direction-separated mutable
+   lanes. Blob carrier transfer selects profile 5 at semantic v9; semantic
+   v7/v8 retains compatibility profile 4, where v7 is durable-only and v8 also
+   admits authenticated finite custody. V5/v6 retain only historical Blob
+   frame allocations and fail before carrier IO. Content authorization remains
+   separate from route authorization.
 5. Semantic v6 adds one selected Event bridge lane after control authorization.
    Both peers must enable it. Each offer is filtered against the authenticated
    peer's route-grant commitments, and the receiver freshly verifies the exact
@@ -222,7 +248,7 @@ evidence statuses below do not move.
 | `aster-redb-store` | One mission-bound transaction authority for ordered control/policy, content-verified Event/State/Record/Blob publication, the shared causal frontier, Event/State/Record delivery ledgers, the tagged exact-publication/retirement Blob delivery ledger, Event custody, class-specific operations/cursors, guarded Record resolution, route-only Event cache, Blob depot markers, exact pending Blob source plans, peer-neutral carrier prefixes, semantic-v8 finite custody, and bounded exact-manifest Blob reclamation. An additive open path binds one exact mission/profile/generation and rejects mismatch, rollback, or implicit advance. It grants ordinary Blob visibility only after exact depot, fresh full-content, fresh current-lineage, and lifecycle completion agree atomically. | Authenticating the caller-supplied profile generation, snapshot/backup-resistant rollback, deriving identity from unverified bytes, route-only Blob relay/custody, executing application merge code, State/Record TTL or GC, Blob subscription/status administration and FFI lifecycle controls, complete physical allocation/sanitization, automatic revoke-plus-rekey, or a second authority |
 | `aster-negentropy` | Sole bounded set-difference mechanism over class-specific exact Event, State, Record, and Blob source transfer identities, with timestamp zero | Object transfer, Blob carrier-prefix ownership, semantic identity, policy, or durable contact progress |
 | `aster-iroh` | Direct endpoint lifecycle, exact carrier authentication, rostered allowlist admission, unrostered carrier acceptance only into the higher-layer mission handshake, bounded exchange, opt-in exact carrier ALPN selection and TLS-exporter channel binding, an opt-in singleton controlled HTTPS relay with explicit WebPKI or replacement DER-root trust and observation-only path telemetry, and default-off short-lived nearby lookup or sanitized locator browsing on the default IPv4 multicast interface or an explicit sorted, deduplicated bounded interface set | Mission identity, item/source authorization, production/hosted discovery or public/default relay fallback, port mapping, hostile-bounded upstream discovery state, lifetime IP pinning, representative or physical NAT acceptance, or physical-path proof |
-| `aster-node` | Sole stock composition root for mission-before-inventory/control-before-data; exact rostered carrier/mission checks or bounded authority-authenticated automatic LAN admission; exact control/Event/State/Record transfer; semantic-v3-v8 Event custody; semantic-v4-v8 State/Record lanes; semantic-v7/v8 profile-4 direct content-capable Blob source-before-carrier transfer with v7 durable-only and v8 authenticated finite custody; semantic-v6-v8 static selected Event bridge negotiation, peer-route filtering, bounded rotation, durable receiver outcomes, and restart promotion; semantic-v7/v8 negotiated receipt-free Event pages; constrained emission with ReceiveOnly zero Blob; caller-provided protected live `NodeConfig`; actor-owned live Event/State/Record/Blob and privileged control handles; durable Event delivery, retained-bounded State positive-current-version, Record whole-key active-head, and tagged exact-publication/retirement Blob delivery with local State/Record/Blob delivery-ledger status and local durable Blob transfer progress; public Rust durable/finite Blob publication with exact original-TTL echoes and bounded lifecycle checks; capacity-one joined Blob worker with bounded regular-file publication and zeroize-on-drop plaintext pages; exclusive stopped Event/State/Record/Blob/control facades; local zeroization; receipts and CLI. Its mission module additionally exposes an owned, cancellation-safe two-node profile-`0x0002` Iroh authorization/raw-exchange path. | Supported bridge administration or dynamic hierarchy lifecycle, stock runtime/CLI profile selection, production or hostile-LAN discovery qualification, production SecretStore or protected stock CLI/bindings, cross-process admin IPC, automatic revoke-plus-rekey, global convergence claims, State materialized-view or synthetic-withdrawal delivery, dynamic `NodeConfig` interest mutation through State/Record/Blob application subscriptions, State/Record/Blob peer/contact/convergence status, route-only Blob relay/custody, State/Record TTL/GC, Blob subscription agent/CLI and FFI lifecycle controls, broader State/Record partitions/relays, physical RF silence, automatic merge, generalized policy, coordinated provider destruction, platform-complete zeroization, or release authorization |
+| `aster-node` | Sole stock composition root for mission-before-inventory/control-before-data; exact rostered carrier/mission checks or bounded authority-authenticated automatic LAN admission; exact control/Event/State/Record transfer; semantic-v3-v9 Event custody; semantic-v4-v9 State/Record lanes; semantic-v9 profile-5 canonical Blob streaming plus semantic-v7/v8 profile-4 compatibility with v7 durable-only and v8 authenticated finite custody; semantic-v6-v9 static selected Event bridge negotiation, peer-route filtering, bounded rotation, durable receiver outcomes, and restart promotion; semantic-v7-v9 negotiated receipt-free Event pages; constrained emission with ReceiveOnly zero Blob; caller-provided protected live `NodeConfig`; actor-owned live Event/State/Record/Blob and privileged control handles; durable Event delivery, retained-bounded State positive-current-version, Record whole-key active-head, and tagged exact-publication/retirement Blob delivery with local State/Record/Blob delivery-ledger status and local durable Blob transfer progress; public Rust durable/finite Blob publication with exact original-TTL echoes and bounded lifecycle checks; bounded joined Blob workers with zeroize-on-drop plaintext pages; exclusive stopped Event/State/Record/Blob/control facades; local zeroization; receipts and CLI. Its mission module additionally exposes an owned, cancellation-safe two-node profile-`0x0002` Iroh authorization/raw-exchange path. | Supported bridge administration or dynamic hierarchy lifecycle, stock runtime/CLI profile selection, production or hostile-LAN discovery qualification, production SecretStore or protected stock CLI/bindings, cross-process admin IPC, automatic revoke-plus-rekey, global convergence claims, State materialized-view or synthetic-withdrawal delivery, dynamic `NodeConfig` interest mutation through State/Record/Blob application subscriptions, State/Record/Blob peer/contact/convergence status, route-only Blob relay/custody, State/Record TTL/GC, Blob subscription agent/CLI and FFI lifecycle controls, broader State/Record partitions/relays, physical RF silence, automatic merge, generalized policy, coordinated provider destruction, platform-complete zeroization, or release authorization |
 | `aster-core` | Profile-`0x0001` mission/control/source security and recipient-filtered rekey planning; additive profile-`0x0002` provisioned singleton policy, P-256 semantic-v1 Event/control forms, four-flight exporter-bound session, and exact-magic facade; provider-neutral bounded provisioning protection plus operation-bound opaque SecretStore install/load/destroy contracts | A production SecretStore/protection backend, stock runtime profile selection, profile-`0x0002` State/Record/Blob/batch/bridge/rekey, hardware/platform custody policy, operational recovery or physical-erasure assurance; the core remains authoritative migration source and is not deleted while replacements lack equivalent tests |
 
 Each control transfer ID is the exact envelope digest authenticated against its
@@ -234,17 +260,17 @@ class-specific exact Event, State, Record, and Blob source transfer IDs; redb
 maintains disjoint semantic
 indexes plus one authenticated publisher-dot and causal-frontier authority
 across Event, State, Record, and Blob. Canonical strict kind-2 Blob carrier IDs
-retain their historical v5 allocation but enter current carrier IO only through
-the v7/v8 profile-4 stream.
+retain their historical v5 allocation; current semantic-v9 carrier IO uses
+profile 5, while v7/v8 compatibility uses profile 4.
 
-The selected handshake default/highest semantic version is 8 with offer
-`[8, 7, 6, 5, 4, 3, 2, 1]`. Event remains compatible across all eight values;
-State/Record mechanics run in v4-v8, the static selected Event bridge lane runs
-in v6-v8, and selected Blob carrier IO requires v7/v8 profile 4. V7 is
-durable-only; v8 adds authenticated finite custody. V5/v6 carrier attempts fail
-before IO. Stable wire/profile, ABI,
+The selected handshake default/highest semantic version is 9 with offer
+`[9, 8, 7, 6, 5, 4, 3, 2, 1]`. Event remains compatible across all nine values;
+State/Record mechanics run in v4-v9, the static selected Event bridge lane runs
+in v6-v9, and Blob carrier IO selects profile 5 at v9 or compatibility profile
+4 at v7/v8. V7 is durable-only; v8 adds authenticated finite custody. V5/v6
+carrier attempts fail before IO. Stable wire/profile, ABI,
 handshake framing, and source-object formats remain version 1. Current-code
-v4-v8 automation does not alter any retained v1-v3 receipt.
+v4-v9 automation does not alter any retained v1-v3 receipt.
 
 The selected node's normal dependency graph contains neither SQLite nor
 `rusqlite`. The old caller-ID opaque `put` path remains isolated for compatibility
@@ -1106,15 +1132,17 @@ independent interoperability, or release credit is claimed.
 
 ### Selected Blob network slice
 
-The current selected offer is `[8, 7, 6, 5, 4, 3, 2, 1]`. Semantic v5
+The current selected offer is `[9, 8, 7, 6, 5, 4, 3, 2, 1]`. Semantic v5
 allocated Blob class `3` source and carrier frames, and v6 inherited them, but
-their carrier dialogue is historical: current carrier IO requires semantic
-v7/v8 profile 4 and v5/v6 attempts fail before IO. V7 is durable-only; v8 adds
-authenticated finite custody. Stable wire/ABI version 1, session framing,
+their carrier dialogue is historical: current carrier IO selects semantic-v9
+profile 5 or v7/v8 compatibility profile 4, and v5/v6 attempts fail before IO.
+V7 is durable-only; v8 adds authenticated finite custody. Stable wire/ABI
+version 1, session framing,
 `ASTRENV2`/`ASTRENV3`, manifests, `ASTRBT01`, typed ObjectIDs, and cryptographic
 suite remain unchanged.
 
-The selected v7/v8 path is direct between content-capable peers. Each exact
+The selected v9/profile-5 and v7/v8/profile-4 paths are direct between
+content-capable peers. Each exact
 topic/scope/epoch interest carries an opaque 32-byte provider proof bound to
 mission authority, authenticated claimant NodeID, and the current content
 grant. Inventory, source, and every range send recheck that proof, current route

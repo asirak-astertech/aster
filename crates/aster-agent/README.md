@@ -1,5 +1,21 @@
 ## Checked Rust API examples
 
+<!-- ASTER-BLOB-CAPABILITY:BEGIN -->
+```json
+{
+  "schema": 1,
+  "surface": "agent_readme",
+  "local_publish_waits_for_peer": false,
+  "rust_agent_asterctl_publish_read": "implemented",
+  "blob_status_scope": "receiver_local_durable_state",
+  "blob_status_reports_remote_delivery_peer_or_convergence": false,
+  "cli_download_resume": "post_merge"
+}
+```
+<!-- ASTER-BLOB-CAPABILITY:RENDERED -->
+Local Blob publication commits without waiting for a peer. Rust, the native-gRPC agent, and asterctl implement bounded Blob publication and authenticated reads. blob-status reports receiver-local durable state, not remote delivery, peer status, or convergence. CLI download resume is post-merge work; an interrupted download restarts at byte zero.
+<!-- ASTER-BLOB-CAPABILITY:END -->
+
 The Debian/package binary statically selects the systemd credential provider
 and configuration schema v1. The separate Docker binary is built by
 `aster-compose-credentials`, is also named `aster-agent`, and statically selects
@@ -89,12 +105,9 @@ two commands. The plaintext listener remains loopback-only, and every command
 requires exactly one bearer-token source. Prefer a protected token file rather
 than a literal token in shell history:
 
-This is a current capability: the native-gRPC agent and `asterctl` support
-bounded local publication and authenticated reads. Publication commits to the
-local canonical Blob authority without waiting for a peer. The agent does not
-expose peer-delivery or convergence status, and interrupted CLI reads restart
-at byte zero. Node-to-node profile-5 receipt resume is separate from download
-resume; download resume is post-merge work.
+The machine-checked capability block above is authoritative for publication,
+status, and download behavior. Node-to-node profile-5 receipt resume remains a
+separate protocol mechanism.
 
 ```sh
 TOKEN_FILE=/run/aster/client.token
@@ -182,11 +195,9 @@ redirect either side. On other supported Unix platforms the existing Event and
 status service still starts, while Blob publish fails with a fixed unsupported
 response before consuming stream bytes.
 
-This agent surface provides Blob publish, receiver-local publication
-status/wait, capacity observation, and read. Status exposes only durable
-lifecycle facts and does not report peer convergence, route selection, or
-carrier details. Blob subscription, poll, acknowledgement, peer/convergence
-status, and Blob FFI lifetime fields remain outside this surface.
+This agent surface also exposes capacity observation. Blob subscription, poll,
+acknowledgement, network-wide visibility, and Blob FFI lifetime fields remain
+outside this surface.
 
 The legacy binary flag `--blob-interest TOPIC@SCOPE` is repeatable but exists
 only for development/migration mode. Customer service deployments use strict

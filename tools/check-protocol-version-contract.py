@@ -146,6 +146,14 @@ def require_once(text: str, declaration: str, label: str) -> None:
         fail(f"{label} declaration must occur exactly once; found {count}")
 
 
+BLOB_PUBLIC_API_FIELDS = {
+    "local_publish_waits_for_peer": False,
+    "rust_agent_asterctl_publish_read": "implemented",
+    "blob_status_scope": "receiver_local_durable_state",
+    "blob_status_reports_remote_delivery_peer_or_convergence": False,
+    "cli_download_resume": "post_merge",
+}
+
 BLOB_DOCUMENTATION_CAPABILITIES = {
     surface: {
         "schema": 1,
@@ -183,15 +191,6 @@ BLOB_DOCUMENTATION_CAPABILITIES.update(
             "pre_profile5_canonical_blob_profile5_eligible": True,
             "capacity_authority": "configured_blob_depot_limits",
         },
-        "public_api": {
-            "schema": 1,
-            "surface": "public_api",
-            "local_publish_waits_for_peer": False,
-            "rust_agent_asterctl_publish_read": "implemented",
-            "blob_status_scope": "receiver_local_durable_state",
-            "blob_status_reports_remote_delivery_peer_or_convergence": False,
-            "cli_download_resume": "post_merge",
-        },
         "performance": {
             "schema": 1,
             "surface": "performance",
@@ -202,55 +201,159 @@ BLOB_DOCUMENTATION_CAPABILITIES.update(
             "current_extent": "ABX1, at most 1048576 bytes",
             "current_cm4_qualification": "pending_task_13",
         },
+        "requirements_status": {
+            "schema": 1,
+            "surface": "requirements_status",
+            "default_semantic_offer": [9, 8, 7, 6, 5, 4, 3, 2, 1],
+            "semantic_v7_v8_profile": "4:BlobRangesStreamV1",
+            "semantic_v9_profile": "5:BlobStreamV1",
+            "current_blob_network": "semantic_v9_profile5_with_v7_v8_compatibility",
+        },
     }
 )
+for _surface in (
+    "readme",
+    "agent_readme",
+    "asterctl_readme",
+    "selected_blob_api",
+    "operator_guide",
+    "capability_roadmap",
+):
+    BLOB_DOCUMENTATION_CAPABILITIES[_surface] = {
+        "schema": 1,
+        "surface": _surface,
+        **BLOB_PUBLIC_API_FIELDS,
+    }
 
 _CAPABILITY_BLOCK = re.compile(
     r"<!-- ASTER-BLOB-CAPABILITY:BEGIN -->\s*"
     r"```json\s*(.*?)\s*```\s*"
+    r"<!-- ASTER-BLOB-CAPABILITY:RENDERED -->\s*"
+    r"(.*?)\s*"
     r"<!-- ASTER-BLOB-CAPABILITY:END -->",
     re.DOTALL,
 )
 
+_JSON_FENCE = re.compile(r"```json\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
+_CODE_FENCE = re.compile(r"```.*?```", re.DOTALL)
+_CAPABILITY_MARKER = re.compile(r"ASTER-BLOB-CAPABILITY:(?:BEGIN|RENDERED|END)", re.IGNORECASE)
+_LEGACY_BLOCK = re.compile(
+    r"<!-- ASTER-BLOB-LEGACY:BEGIN -->.*?<!-- ASTER-BLOB-LEGACY:END -->",
+    re.DOTALL,
+)
 
-def _documentation_clauses(text: str) -> list[str]:
-    """Split prose at semantic clause boundaries before evaluating anchors."""
-    return [
-        " ".join(clause.lower().replace("-", " ").split())
-        for clause in re.split(
-            r"(?<=[.!?])\s+|;\s*|,\s*(?=(?:while|whereas|rather than|but)\b)",
-            text,
-            flags=re.IGNORECASE,
+
+def render_blob_documentation_capability(surface: str) -> str:
+    """Render the sole human-readable current claim from the typed record."""
+    value = BLOB_DOCUMENTATION_CAPABILITIES[surface]
+    if surface in {"node_api", "transports", "recipes"}:
+        return (
+            "Semantic v7/v8 selects profile 4 BlobRangesStreamV1; semantic v9 "
+            "selects profile 5 BlobStreamV1. Profile 5 maps 65,536-byte canonical "
+            "plaintext chunks into complete ASTRBT01 records of at most 66,215 "
+            "bytes and batches them in ABX1 extents of at most 1,048,576 bytes."
         )
-        if clause.strip()
+    if surface == "runbook":
+        return (
+            "The receiver verifies authenticated FINISH and content, applies the "
+            "canonical promotion, sends RESULT, receives ACK, and then removes the "
+            "durable receipt. AVAILABLE may precede settlement cleanup. The receipt "
+            "is keyed by receiving mission authority and canonical source and does "
+            "not persist an attempt nonce. The sender hard deadline uses exact "
+            "canonical wire length; before authenticated OPEN, the receiver uses the "
+            "profile wire ceiling. Authenticated progress times out after 120 seconds. "
+            "The 65,536-byte plaintext chunk, 66,215-byte encoded-record ceiling, "
+            "1,048,576-byte extent ceiling, and 134,217,728-byte checkpoint ceiling "
+            "are distinct. Pre-profile-5 canonical Blobs remain profile-5 eligible. "
+            "Provisional, pending, and completed bytes share configured Blob depot limits."
+        )
+    if surface == "performance":
+        return (
+            "The 2026-10-20 ASTRBS02 measurements used 1-MiB semantic segments and "
+            "do not qualify the current candidate. Current qualification must measure "
+            "65,536-byte canonical plaintext chunks, ASTRBT01 records, and ABX1 extents "
+            "of at most 1,048,576 bytes; three-CM4 qualification remains Task 13 work."
+        )
+    if surface == "requirements_status":
+        return (
+            "The current default semantic offer is [9, 8, 7, 6, 5, 4, 3, 2, 1]. "
+            "Semantic v9 selects profile 5 BlobStreamV1; semantic v7/v8 retain "
+            "compatibility profile 4 BlobRangesStreamV1."
+        )
+    if all(value.get(key) == expected for key, expected in BLOB_PUBLIC_API_FIELDS.items()):
+        return (
+            "Local Blob publication commits without waiting for a peer. Rust, the "
+            "native-gRPC agent, and asterctl implement bounded Blob publication and "
+            "authenticated reads. blob-status reports receiver-local durable state, "
+            "not remote delivery, peer status, or convergence. CLI download resume is "
+            "post-merge work; an interrupted download restarts at byte zero."
+        )
+    raise AssertionError(f"no Blob capability renderer for {surface}")
+
+
+def blob_documentation_capability_block(surface: str) -> str:
+    payload = json.dumps(BLOB_DOCUMENTATION_CAPABILITIES[surface], indent=2)
+    return (
+        "<!-- ASTER-BLOB-CAPABILITY:BEGIN -->\n"
+        "```json\n"
+        f"{payload}\n"
+        "```\n"
+        "<!-- ASTER-BLOB-CAPABILITY:RENDERED -->\n"
+        f"{render_blob_documentation_capability(surface)}\n"
+        "<!-- ASTER-BLOB-CAPABILITY:END -->"
+    )
+
+
+def _documentation_sentences(text: str) -> list[set[str]]:
+    """Return normalized topic tokens; relations and negation are not interpreted."""
+    text = _CODE_FENCE.sub("", text)
+    return [
+        set(
+            re.findall(
+                r"[a-z0-9]+",
+                re.sub(r"\bblob[ -]status\b", "blobstatus", sentence.lower()).replace("-", " "),
+            )
+        )
+        for sentence in re.split(r"(?<=[.!?])\s+|\n{2,}|\n(?=\|)", text)
+        if sentence.strip()
     ]
 
 
-def _is_explicitly_denied(clause: str, anchors: tuple[str, ...]) -> bool:
-    """Return true only when negation is attached to the governed object."""
-    words = re.findall(r"[a-z0-9]+", clause)
-    anchor_positions = [
-        index
-        for index, word in enumerate(words)
-        if any(word.startswith(anchor) for anchor in anchors)
-    ]
-    for index, word in enumerate(words):
-        if word not in {"not", "no", "never", "without"}:
+def _contains_any(words: set[str], prefixes: tuple[str, ...]) -> bool:
+    return any(any(word.startswith(prefix) for prefix in prefixes) for word in words)
+
+
+def _strip_legacy_blocks(surface: str, text: str) -> str:
+    begins = text.count("<!-- ASTER-BLOB-LEGACY:BEGIN -->")
+    ends = text.count("<!-- ASTER-BLOB-LEGACY:END -->")
+    matches = list(_LEGACY_BLOCK.finditer(text))
+    if begins != ends or begins != len(matches):
+        fail(f"Blob documentation {surface} has malformed legacy delimiters")
+    return _LEGACY_BLOCK.sub("", text)
+
+
+def _reject_capability_shaped_json(surface: str, text: str) -> None:
+    governed_keys = {
+        key
+        for value in BLOB_DOCUMENTATION_CAPABILITIES.values()
+        for key in value
+        if key not in {"schema", "surface"}
+    }
+    for match in _JSON_FENCE.finditer(text):
+        try:
+            value = json.loads(match.group(1))
+        except json.JSONDecodeError:
             continue
-        if index + 1 < len(words) and words[index + 1] == "only":
-            continue
-        if any(abs(index - anchor) <= 8 for anchor in anchor_positions):
-            return True
-    return False
+        if isinstance(value, dict) and governed_keys.intersection(value):
+            fail(f"Blob documentation {surface} has an extra capability-shaped JSON block")
 
 
 def _unstructured_capability_text(surface: str, text: str) -> str:
     if surface == "node_api":
         text = re.sub(r"(?m)^//! ?", "", text)
-    begins = text.count("<!-- ASTER-BLOB-CAPABILITY:BEGIN -->")
-    ends = text.count("<!-- ASTER-BLOB-CAPABILITY:END -->")
+    markers = list(_CAPABILITY_MARKER.finditer(text))
     matches = list(_CAPABILITY_BLOCK.finditer(text))
-    if begins != 1 or ends != 1 or len(matches) != 1:
+    if len(markers) != 3 or len(matches) != 1:
         fail(
             f"Blob documentation {surface} must contain exactly one structured capability block"
         )
@@ -261,7 +364,13 @@ def _unstructured_capability_text(surface: str, text: str) -> str:
     expected = BLOB_DOCUMENTATION_CAPABILITIES[surface]
     if actual != expected:
         fail(f"Blob documentation {surface} capability fields differ from the contract")
-    return text[: matches[0].start()] + text[matches[0].end() :]
+    rendered = " ".join(matches[0].group(2).split())
+    expected_rendered = " ".join(render_blob_documentation_capability(surface).split())
+    if rendered != expected_rendered:
+        fail(f"Blob documentation {surface} rendered capability differs from the contract")
+    remainder = text[: matches[0].start()] + text[matches[0].end() :]
+    _reject_capability_shaped_json(surface, remainder)
+    return _strip_legacy_blocks(surface, remainder)
 
 
 def validate_blob_documentation_contract(documents: dict[str, str]) -> None:
@@ -274,64 +383,71 @@ def validate_blob_documentation_contract(documents: dict[str, str]) -> None:
     }
 
     for surface in ("node_api", "transports", "recipes"):
-        for clause in _documentation_clauses(prose[surface]):
-            has_one_mib_segment = bool(
-                re.search(r"\b1\s*mib\b", clause)
-                and re.search(r"\bsegments?\b", clause)
-            )
-            has_authentication = bool(re.search(r"\bauthenticat\w*\b", clause))
+        for words in _documentation_sentences(prose[surface]):
             if (
-                has_one_mib_segment
-                and has_authentication
-                and not _is_explicitly_denied(
-                    clause, ("segment", "authenticat")
-                )
+                {"1", "mib"} <= words
+                and _contains_any(words, ("segment",))
+                and _contains_any(words, ("authenticat", "tag"))
             ):
                 fail(f"Blob documentation {surface} contradiction is present")
 
-    for clause in _documentation_clauses(prose["runbook"]):
-        words = re.findall(r"[a-z]+", clause)
-        word_set = set(words)
-        settlement_denied = _is_explicitly_denied(
-            clause, ("promotion", "result", "ack")
-        )
-        if {"promotion", "result", "ack"} <= word_set and not settlement_denied:
-            try:
-                correct_before = (
-                    words.index("promotion")
-                    < words.index("before")
-                    < min(words.index("result"), words.index("ack"))
-                )
-            except ValueError:
-                correct_before = False
-            if not correct_before:
+    for words in _documentation_sentences(prose["runbook"]):
+        if "promotion" in words and bool(words & {"result", "ack"}):
                 fail("Blob documentation receiver settlement contradiction is present")
-        receipt_denied = _is_explicitly_denied(
-            clause, ("receipt", "attempt", "nonce")
-        )
-        if {"receipt", "attempt", "nonce"} <= word_set and not receipt_denied:
+        if {"receipt", "attempt", "nonce"} <= words:
             fail("Blob documentation receipt attempt contradiction is present")
-        incoming_role = bool(word_set & {"receiver", "receiving", "incoming"})
-        exact_size = "exact" in word_set and bool(
-            word_set & {"content", "wire", "bytes", "length"}
-        )
-        deadline = "deadline" in word_set
-        deadline_denied = _is_explicitly_denied(
-            clause, ("receiver", "receiving", "incoming", "deadline")
-        )
-        if incoming_role and exact_size and deadline and not deadline_denied:
+        if (
+            bool(words & {"receiver", "receiving", "incoming"})
+            and "exact" in words
+            and "deadline" in words
+        ):
             fail("Blob documentation receiver timeout contradiction is present")
 
-    for clause in _documentation_clauses(prose["performance"]):
-        words = set(re.findall(r"[a-z0-9]+", clause))
-        historical = bool(words & {"legacy", "cm4", "2026"})
-        current = "current" in words
-        profile = bool(words & {"abx1", "batching", "candidate"})
-        current_denied = _is_explicitly_denied(
-            clause, ("current", "abx1", "batching", "candidate")
-        )
-        if historical and current and profile and not current_denied:
+    for words in _documentation_sentences(prose["performance"]):
+        if (
+            bool(words & {"legacy", "cm4", "2026"})
+            and "current" in words
+            and bool(words & {"abx1", "batching", "candidate"})
+        ):
             fail("Blob documentation legacy performance contradiction is present")
+
+    public_surfaces = (
+        "readme",
+        "agent_readme",
+        "asterctl_readme",
+        "selected_blob_api",
+        "operator_guide",
+        "capability_roadmap",
+    )
+    for surface in public_surfaces:
+        for words in _documentation_sentences(prose[surface]):
+            governed = (
+                (
+                    {"local", "peer"} <= words
+                    and not bool(words & {"event", "state", "record"})
+                    and _contains_any(words, ("publish", "publicat"))
+                )
+                or ("blobstatus" in words and bool(words & {"remote", "peer", "convergence"}))
+                or ({"cli", "download", "resume"} <= words)
+                or (
+                    {"blob", "rust", "agent", "asterctl"} <= words
+                    and _contains_any(words, ("publish", "publicat", "read"))
+                )
+            )
+            if governed:
+                fail(f"Blob documentation {surface} governed claim is outside its capability block")
+
+    stale_current_requirements = (
+        "current selected offer is `[8, 7, 6, 5, 4, 3, 2, 1]`",
+        "selected handshake default/highest semantic version is 8",
+        "selected Blob carrier IO requires v7/v8 profile 4",
+        "Blob carrier transfer requires semantic v7/v8 profile 4",
+        "enter current carrier IO only through the v7/v8 profile-4 stream",
+    )
+    requirements = prose["requirements_status"]
+    for stale in stale_current_requirements:
+        if stale.lower() in requirements.lower():
+            fail("Blob documentation requirements_status retains stale current-v8 wording")
 
 
 def parse_numeric_declaration(text: str, label: str) -> tuple[int, ...]:
@@ -937,22 +1053,28 @@ def main() -> int:
                 "runbook": (
                     ROOT / "docs/validation/blob-streaming-engineering-runbook.md"
                 ).read_text(),
-                "public_api": "\n".join(
-                    (ROOT / path).read_text()
-                    for path in (
-                        "README.md",
-                        "crates/aster-agent/README.md",
-                        "crates/asterctl/README.md",
-                        "docs/quickstart/selected-blob-api.md",
-                        "docs/operator-guide.md",
-                        "docs/validation/capability-roadmap.md",
-                    )
-                ),
+                "readme": (ROOT / "README.md").read_text(),
+                "agent_readme": (
+                    ROOT / "crates/aster-agent/README.md"
+                ).read_text(),
+                "asterctl_readme": (
+                    ROOT / "crates/asterctl/README.md"
+                ).read_text(),
+                "selected_blob_api": (
+                    ROOT / "docs/quickstart/selected-blob-api.md"
+                ).read_text(),
+                "operator_guide": (ROOT / "docs/operator-guide.md").read_text(),
+                "capability_roadmap": (
+                    ROOT / "docs/validation/capability-roadmap.md"
+                ).read_text(),
                 "node_api": (ROOT / "crates/aster-node/src/lib.rs").read_text(),
                 "transports": (ROOT / "docs/transports.md").read_text(),
                 "recipes": (ROOT / "docs/application-recipes.md").read_text(),
                 "performance": (
                     ROOT / "docs/validation/blob-streaming-performance.md"
+                ).read_text(),
+                "requirements_status": (
+                    ROOT / "docs/validation/requirements-status.md"
                 ).read_text(),
             }
         )

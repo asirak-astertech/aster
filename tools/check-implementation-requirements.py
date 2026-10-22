@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import json
 import re
 import subprocess
 import sys
@@ -56,15 +57,41 @@ VALID_SELECTED_STATES = frozenset(
 
 def validate_blob_capability_documentation(text: str) -> None:
     """Keep current Blob claims separate from explicitly open capabilities."""
-    normalized = " ".join(text.split())
+    block = re.compile(
+        r"<!-- ASTER-BLOB-CAPABILITY:BEGIN -->\s*```json\s*(.*?)\s*```\s*"
+        r"<!-- ASTER-BLOB-CAPABILITY:RENDERED -->\s*(.*?)\s*"
+        r"<!-- ASTER-BLOB-CAPABILITY:END -->",
+        re.DOTALL,
+    )
+    matches = list(block.finditer(text))
+    if len(matches) != 1:
+        raise ValueError("Blob capability documentation typed capability declaration is missing")
+    expected = {
+        "schema": 1,
+        "surface": "capability_roadmap",
+        "local_publish_waits_for_peer": False,
+        "rust_agent_asterctl_publish_read": "implemented",
+        "blob_status_scope": "receiver_local_durable_state",
+        "blob_status_reports_remote_delivery_peer_or_convergence": False,
+        "cli_download_resume": "post_merge",
+    }
+    try:
+        actual = json.loads(matches[0].group(1))
+    except json.JSONDecodeError as error:
+        raise ValueError("Blob capability documentation typed capability is malformed") from error
+    if actual != expected:
+        raise ValueError("Blob capability documentation typed capability differs")
+    rendered = (
+        "Local Blob publication commits without waiting for a peer. Rust, the "
+        "native-gRPC agent, and asterctl implement bounded Blob publication and "
+        "authenticated reads. blob-status reports receiver-local durable state, "
+        "not remote delivery, peer status, or convergence. CLI download resume is "
+        "post-merge work; an interrupted download restarts at byte zero."
+    )
+    if " ".join(matches[0].group(2).split()) != " ".join(rendered.split()):
+        raise ValueError("Blob capability documentation rendered capability differs")
+    normalized = " ".join((text[: matches[0].start()] + text[matches[0].end() :]).split())
     requirements = (
-        (
-            "agent/CLI Blob capability",
-            "native-gRPC agent and asterctl bounded publication and authenticated read are implemented",
-        ),
-        ("peer-independent publication", "Local publication is peer-independent"),
-        ("peer/convergence status", "peer delivery and convergence status remain open"),
-        ("download resume", "Download resume remains post-merge work"),
         ("BLE boundary", "BLE is not implemented"),
         (
             "CM4 evidence boundary",

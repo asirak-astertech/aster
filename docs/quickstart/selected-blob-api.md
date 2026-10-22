@@ -1,5 +1,21 @@
 # Selected Blob API quickstart
 
+<!-- ASTER-BLOB-CAPABILITY:BEGIN -->
+```json
+{
+  "schema": 1,
+  "surface": "selected_blob_api",
+  "local_publish_waits_for_peer": false,
+  "rust_agent_asterctl_publish_read": "implemented",
+  "blob_status_scope": "receiver_local_durable_state",
+  "blob_status_reports_remote_delivery_peer_or_convergence": false,
+  "cli_download_resume": "post_merge"
+}
+```
+<!-- ASTER-BLOB-CAPABILITY:RENDERED -->
+Local Blob publication commits without waiting for a peer. Rust, the native-gRPC agent, and asterctl implement bounded Blob publication and authenticated reads. blob-status reports receiver-local durable state, not remote delivery, peer status, or convergence. CLI download resume is post-merge work; an interrupted download restarts at byte zero.
+<!-- ASTER-BLOB-CAPABILITY:END -->
+
 This is the shortest path to Aster's **selected live Blob application surface**,
 its durable metadata-delivery queue, its exclusive stopped streaming facade,
 and the semantic-v9/profile-5 streaming boundary for large Blob transfer.
@@ -13,9 +29,9 @@ drop; each delivery is metadata only and carries no Blob plaintext.
 
 The live surface deliberately keeps application delivery separate from network
 replication. A Blob subscription is durable local intent, not a route/content
-grant or a dynamic network interest. The surface has no Blob peer or convergence
-status; `delivery_status` reports local selector/delivery-ledger counts, while
-`transfer_status` reports audited local durable storage and receive progress.
+grant or a dynamic network interest. `delivery_status` reports local
+selector/delivery-ledger counts, while `transfer_status` reports audited local
+durable storage and receive progress.
 The exclusive `SelectedBlobNode` remains available when no runtime owns the same
 store and provides the same delivery lifecycle plus synchronous seekable-source
 publication and streaming `read_into`. Semantic v9 selects `BlobStreamV1`:
@@ -179,13 +195,8 @@ plaintext is written only to the requested output and is never printed.
 Run `asterctl --token-file "$TOKEN_FILE" --json status` on both nodes before a
 large transfer. `blobCapacity` is an observed, non-reserving snapshot: it does
 not hold space for a later attempt and does not include filesystem, database,
-journal, temporary, or operational reserve. `blob-status` is likewise local:
-run it on the intended receiver to wait for `AVAILABLE`; it does not coordinate
-publication, prove peer convergence, or expose an IP/Iroh/BLE transport.
-
-Download resume is post-merge work. An interrupted `asterctl blob-read`
-currently restarts at byte zero; this does not affect receiver-authoritative
-node-to-node profile-5 resume.
+journal, temporary, or operational reserve. Run `blob-status` on the intended
+receiver to wait for `AVAILABLE`; it is an observation operation.
 
 The RPC and CLI use checked `u64` lengths and bounded 512-KiB application
 frames/pages. The resumable stream protocol has an explicit 8-GiB per-object
@@ -224,13 +235,12 @@ boundary. Keep the publish source contents and length unchanged until command
 exit; detectable size changes have an unknown publication outcome, while
 same-length in-place mutation is outside the command contract.
 
-The agent and CLI provide Blob publish, receiver-local publication status/wait,
-capacity observation, and read. They do not provide Blob subscription, poll,
-acknowledgement, peer/convergence status, or FFI lifetime controls. The Rust
-subscription API below remains a separate application surface.
+The agent also provides capacity observation. Blob subscription, poll,
+acknowledgement, network-wide visibility, and FFI lifetime controls remain
+outside that surface. The Rust subscription API below remains separate.
 
-For 800-MiB through 1-GiB engineering runs, including local-publication versus
-peer-transfer lifecycle, exact WLAN binding, checkpoint/credit semantics,
+For 800-MiB through 1-GiB engineering runs, including upload and synchronization
+lifecycle, exact WLAN binding, checkpoint/credit semantics,
 pipeline receipt fields, capacity checks, raw baselines, and the ARM64
 canonical ABX1/profile-5 transport example, use the
 [Blob streaming engineering runbook](../validation/blob-streaming-engineering-runbook.md).
@@ -516,16 +526,15 @@ lexicographically greatest carrier ID, not the last manifest record.
 Normal and `AtLeast` run eligible v7/v8 profile-4 Blob work because `AtLeast`
 filters Event only.
 `ReceiveOnly` advertises, requests, stages, promotes, and counts zero Blob work.
-The live handle does not change those contact rules and reports no Blob peer or
-convergence status. On a host with a supported custody clock, the Rust
+The live handle does not change those contact rules. On a host with a supported custody clock, the Rust
 `publish_with_options` surface activates local finite Blob publication and
-expiry. Finite transfer between peers remains restricted to semantic v8 with
-profile 4; v7 transfers durable Blob work only. Bounded strictly-lower-priority
-pressure recovery remains internal.
+expiry. Semantic v9/profile 5 carries eligible durable or finite publications;
+on compatibility profile 4, v8 permits finite custody while v7 remains
+durable-only. Bounded strictly-lower-priority pressure recovery remains internal.
 Route-only Blob relay/custody, a metadata-independent whole-byte identity, and
 Blob TTL fields in the FFI surface are not implemented. The selected Linux
-local-agent and `asterctl` path exposes Blob publish/read TTL, but not the Rust
-Blob subscription or transfer-status operations.
+local-agent path exposes TTL controls but not application subscriptions or
+transfer-status operations.
 
 `publish` requires a seekable source because it makes two bounded passes. The
 first computes the whole-content and per-chunk digests with one bounded,

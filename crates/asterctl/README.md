@@ -1,5 +1,21 @@
 # asterctl
 
+<!-- ASTER-BLOB-CAPABILITY:BEGIN -->
+```json
+{
+  "schema": 1,
+  "surface": "asterctl_readme",
+  "local_publish_waits_for_peer": false,
+  "rust_agent_asterctl_publish_read": "implemented",
+  "blob_status_scope": "receiver_local_durable_state",
+  "blob_status_reports_remote_delivery_peer_or_convergence": false,
+  "cli_download_resume": "post_merge"
+}
+```
+<!-- ASTER-BLOB-CAPABILITY:RENDERED -->
+Local Blob publication commits without waiting for a peer. Rust, the native-gRPC agent, and asterctl implement bounded Blob publication and authenticated reads. blob-status reports receiver-local durable state, not remote delivery, peer status, or convergence. CLI download resume is post-merge work; an interrupted download restarts at byte zero.
+<!-- ASTER-BLOB-CAPABILITY:END -->
+
 Clean Room — Privileged
 
 `asterctl` is a command-line utility for introspecting and controlling Aster
@@ -97,13 +113,9 @@ timeout.
 
 ## Publish and read Blobs
 
-The native-gRPC agent and `asterctl` provide current bounded Blob publication
-and authenticated-read capability. A successful publish is a peer-independent
-durable commit to the local canonical Blob authority. `blob-status` reports
-receiver-local durable state only; it does not report remote delivery, peer
-status, or convergence status. Node-to-node profile-5 transfer resumes from a
-receiver checkpoint, but interrupted `blob-read` output currently restarts at
-byte zero. Download resume is post-merge work.
+The machine-checked capability block above is authoritative for publication,
+status, and download behavior. Node-to-node profile-5 transfer resumes from a
+receiver checkpoint independently of the CLI output path.
 
 ```sh
 asterctl --token-file ./client.token --json blob-publish \
@@ -165,9 +177,8 @@ at byte zero; local-upload and peer-transfer resumes remain receiver-checkpointe
 Both text formats use exactly `TTL: durable` or `TTL: MILLISECONDS ms`. Finite
 JSON includes `"ttlMs": "MILLISECONDS"`; durable JSON omits `ttlMs`.
 `blob-publish --json` also includes `publicationId` and `operation_key`. Use
-that publication identity with `blob-status` on the node whose local durable
-state is being inspected; `--wait` does not coordinate publication or imply
-peer convergence. A retry after an earlier
+that publication identity with `blob-status` on the node whose durable state
+is being inspected; `--wait` is an observation operation. A retry after an earlier
 commit returns `inserted: false`; a retry after a request that did not commit
 may return `inserted: true`. A retained publication that has expired or been
 retired is reported as expired/retired, while reuse of a key after its retained

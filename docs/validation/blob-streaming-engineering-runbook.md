@@ -37,6 +37,8 @@ checked:
   "capacity_authority": "configured_blob_depot_limits"
 }
 ```
+<!-- ASTER-BLOB-CAPABILITY:RENDERED -->
+The receiver verifies authenticated FINISH and content, applies the canonical promotion, sends RESULT, receives ACK, and then removes the durable receipt. AVAILABLE may precede settlement cleanup. The receipt is keyed by receiving mission authority and canonical source and does not persist an attempt nonce. The sender hard deadline uses exact canonical wire length; before authenticated OPEN, the receiver uses the profile wire ceiling. Authenticated progress times out after 120 seconds. The 65,536-byte plaintext chunk, 66,215-byte encoded-record ceiling, 1,048,576-byte extent ceiling, and 134,217,728-byte checkpoint ceiling are distinct. Pre-profile-5 canonical Blobs remain profile-5 eligible. Provisional, pending, and completed bytes share configured Blob depot limits.
 <!-- ASTER-BLOB-CAPABILITY:END -->
 
 ## Understand the selected profile
@@ -120,17 +122,9 @@ authority: only promotion of the canonical manifest plus ASTRBT01 carriers
 creates the Blob publication. Check both state and depot filesystems and leave
 operational reserve; an observed capacity snapshot is not a reservation.
 
-Profile-5 transfer has asymmetric hard-deadline inputs. Authenticated progress
-provides the shorter stall bound.
-
-Specifically:
-
-- two minutes without authenticated progress is a retryable idle stall;
-- the sender hard deadline is `ceil(exact_wire_bytes / 128 KiB/s) + 20
-  minutes`; and
-- the receiver initially computes that formula from the full
-  8,679,596,592-byte profile wire ceiling because PLAN discloses no content
-  size and transport admission occurs before authenticated OPEN.
+Profile-5 transfer has separate authenticated-progress and absolute attempt
+bounds. Their exact current inputs and values are generated from the typed
+capability record at the top of this runbook.
 
 The legacy ten-minute attempt constant is not the normal-success deadline for
 profile 5. CLI/agent RPC deadlines are a separate local application concern;

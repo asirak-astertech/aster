@@ -72,6 +72,8 @@ selected Blob profile and map-unit contract is machine checked:
   "extent": "ABX1, at most 1048576 bytes"
 }
 ```
+<!-- ASTER-BLOB-CAPABILITY:RENDERED -->
+Semantic v7/v8 selects profile 4 BlobRangesStreamV1; semantic v9 selects profile 5 BlobStreamV1. Profile 5 maps 65,536-byte canonical plaintext chunks into complete ASTRBT01 records of at most 66,215 bytes and batches them in ABX1 extents of at most 1,048,576 bytes.
 <!-- ASTER-BLOB-CAPABILITY:END -->
 
 Profile 5 uses receiver-authoritative resume. Profile 4 remains the

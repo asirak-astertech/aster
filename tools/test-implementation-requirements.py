@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 import unittest
 
@@ -20,18 +21,28 @@ SPEC.loader.exec_module(CHECKER)
 
 class BlobCapabilityDocumentationTests(unittest.TestCase):
     def test_current_capability_boundary_is_required(self) -> None:
-        text = """Current Blob capability: native-gRPC agent and asterctl bounded publication and authenticated read are implemented.
-Local publication is peer-independent and completes at the local durable commit.
-blob-status reports local durable publication state; peer delivery and convergence status remain open.
-Node-to-node receiver-checkpoint resume is implemented. Download resume remains post-merge work and asterctl restarts at byte zero.
+        payload = {
+            "schema": 1,
+            "surface": "capability_roadmap",
+            "local_publish_waits_for_peer": False,
+            "rust_agent_asterctl_publish_read": "implemented",
+            "blob_status_scope": "receiver_local_durable_state",
+            "blob_status_reports_remote_delivery_peer_or_convergence": False,
+            "cli_download_resume": "post_merge",
+        }
+        text = f"""<!-- ASTER-BLOB-CAPABILITY:BEGIN -->
+```json
+{json.dumps(payload, indent=2)}
+```
+<!-- ASTER-BLOB-CAPABILITY:RENDERED -->
+Local Blob publication commits without waiting for a peer. Rust, the native-gRPC agent, and asterctl implement bounded Blob publication and authenticated reads. blob-status reports receiver-local durable state, not remote delivery, peer status, or convergence. CLI download resume is post-merge work; an interrupted download restarts at byte zero.
+<!-- ASTER-BLOB-CAPABILITY:END -->
 BLE is not implemented. Three-CM4 validation of this candidate has not yet run.
 """
         CHECKER.validate_blob_capability_documentation(text)
         mutations = (
-            ("agent/CLI Blob capability", "are implemented", "are planned"),
-            ("peer-independent publication", "peer-independent", "peer-coordinated"),
-            ("peer/convergence status", "remain open", "are implemented"),
-            ("download resume", "post-merge work", "implemented"),
+            ("typed capability", '"cli_download_resume": "post_merge"', '"cli_download_resume": "implemented"'),
+            ("rendered capability", "commits without waiting", "waits before committing"),
             ("BLE boundary", "BLE is not implemented", "BLE is implemented"),
             ("CM4 evidence boundary", "has not yet run", "passed"),
         )

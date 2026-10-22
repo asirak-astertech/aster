@@ -119,6 +119,8 @@ cargo test --release -p aster-node composite_profile5_records_process_256_mib_in
   "current_cm4_qualification": "pending_task_13"
 }
 ```
+<!-- ASTER-BLOB-CAPABILITY:RENDERED -->
+The 2026-10-20 ASTRBS02 measurements used 1-MiB semantic segments and do not qualify the current candidate. Current qualification must measure 65,536-byte canonical plaintext chunks, ASTRBT01 records, and ABX1 extents of at most 1,048,576 bytes; three-CM4 qualification remains Task 13 work.
 <!-- ASTER-BLOB-CAPABILITY:END -->
 
 The remediated profile uses the existing 64-KiB canonical plaintext chunk and
@@ -132,6 +134,7 @@ in-flight bytes, checkpoint cost, retransmitted bytes, resume amplification,
 and behavior under loss and constrained MTU. No result below supports the
 current batching choice.
 
+<!-- ASTER-BLOB-LEGACY:BEGIN -->
 ## Legacy evidence — 2026-10-20 CM4 completed-pack requalification
 
 Legacy 2026-10-20 ASTRBS02 completed-pack evidence used 1-MiB semantic segments
@@ -170,3 +173,4 @@ passed the 80% floor. Receiver occupancy remained bounded at four items and
 
 This legacy requalification supported only the measured ASTRBS02 completed-pack
 candidate. It supplies no evidence for later candidates.
+<!-- ASTER-BLOB-LEGACY:END -->
