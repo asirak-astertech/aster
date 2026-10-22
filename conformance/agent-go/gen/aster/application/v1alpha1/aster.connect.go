@@ -62,6 +62,9 @@ const (
 	// AsterApplicationServiceCreateEventSubscriptionProcedure is the fully-qualified name of the
 	// AsterApplicationService's CreateEventSubscription RPC.
 	AsterApplicationServiceCreateEventSubscriptionProcedure = "/aster.application.v1alpha1.AsterApplicationService/CreateEventSubscription"
+	// AsterApplicationServiceGetEventClientStatusProcedure is the fully-qualified name of the
+	// AsterApplicationService's GetEventClientStatus RPC.
+	AsterApplicationServiceGetEventClientStatusProcedure = "/aster.application.v1alpha1.AsterApplicationService/GetEventClientStatus"
 	// AsterApplicationServiceListEventSubscriptionsProcedure is the fully-qualified name of the
 	// AsterApplicationService's ListEventSubscriptions RPC.
 	AsterApplicationServiceListEventSubscriptionsProcedure = "/aster.application.v1alpha1.AsterApplicationService/ListEventSubscriptions"
@@ -111,6 +114,8 @@ type AsterApplicationServiceClient interface {
 	QueryEvents(context.Context, *connect.Request[QueryEventsRequest]) (*connect.Response[QueryEventsResponse], error)
 	// CreateEventSubscription creates or replays a durable receive selector.
 	CreateEventSubscription(context.Context, *connect.Request[CreateEventSubscriptionRequest]) (*connect.Response[CreateEventSubscriptionResponse], error)
+	// Observe this client without reclaiming its session; fenced callers remain read-only.
+	GetEventClientStatus(context.Context, *connect.Request[GetEventClientStatusRequest]) (*connect.Response[GetEventClientStatusResponse], error)
 	// ListEventSubscriptions returns all local Consume subscriptions, ordered by raw ID.
 	ListEventSubscriptions(context.Context, *connect.Request[ListEventSubscriptionsRequest]) (*connect.Response[ListEventSubscriptionsResponse], error)
 	// PollEvents returns one bounded page of at-least-once deliveries.
@@ -202,6 +207,12 @@ func NewAsterApplicationServiceClient(httpClient connect.HTTPClient, baseURL str
 			connect.WithSchema(asterApplicationServiceMethods.ByName("CreateEventSubscription")),
 			connect.WithClientOptions(opts...),
 		),
+		getEventClientStatus: connect.NewClient[GetEventClientStatusRequest, GetEventClientStatusResponse](
+			httpClient,
+			baseURL+AsterApplicationServiceGetEventClientStatusProcedure,
+			connect.WithSchema(asterApplicationServiceMethods.ByName("GetEventClientStatus")),
+			connect.WithClientOptions(opts...),
+		),
 		listEventSubscriptions: connect.NewClient[ListEventSubscriptionsRequest, ListEventSubscriptionsResponse](
 			httpClient,
 			baseURL+AsterApplicationServiceListEventSubscriptionsProcedure,
@@ -265,6 +276,7 @@ type asterApplicationServiceClient struct {
 	acknowledgeEventPublicationResult *connect.Client[AcknowledgeEventPublicationResultRequest, AcknowledgeEventPublicationResultResponse]
 	queryEvents                       *connect.Client[QueryEventsRequest, QueryEventsResponse]
 	createEventSubscription           *connect.Client[CreateEventSubscriptionRequest, CreateEventSubscriptionResponse]
+	getEventClientStatus              *connect.Client[GetEventClientStatusRequest, GetEventClientStatusResponse]
 	listEventSubscriptions            *connect.Client[ListEventSubscriptionsRequest, ListEventSubscriptionsResponse]
 	pollEvents                        *connect.Client[PollEventsRequest, PollEventsResponse]
 	streamEvents                      *connect.Client[StreamEventsRequest, StreamEventsResponse]
@@ -333,6 +345,12 @@ func (c *asterApplicationServiceClient) CreateEventSubscription(ctx context.Cont
 	return c.createEventSubscription.CallUnary(ctx, req)
 }
 
+// GetEventClientStatus calls
+// aster.application.v1alpha1.AsterApplicationService.GetEventClientStatus.
+func (c *asterApplicationServiceClient) GetEventClientStatus(ctx context.Context, req *connect.Request[GetEventClientStatusRequest]) (*connect.Response[GetEventClientStatusResponse], error) {
+	return c.getEventClientStatus.CallUnary(ctx, req)
+}
+
 // ListEventSubscriptions calls
 // aster.application.v1alpha1.AsterApplicationService.ListEventSubscriptions.
 func (c *asterApplicationServiceClient) ListEventSubscriptions(ctx context.Context, req *connect.Request[ListEventSubscriptionsRequest]) (*connect.Response[ListEventSubscriptionsResponse], error) {
@@ -398,6 +416,8 @@ type AsterApplicationServiceHandler interface {
 	QueryEvents(context.Context, *connect.Request[QueryEventsRequest]) (*connect.Response[QueryEventsResponse], error)
 	// CreateEventSubscription creates or replays a durable receive selector.
 	CreateEventSubscription(context.Context, *connect.Request[CreateEventSubscriptionRequest]) (*connect.Response[CreateEventSubscriptionResponse], error)
+	// Observe this client without reclaiming its session; fenced callers remain read-only.
+	GetEventClientStatus(context.Context, *connect.Request[GetEventClientStatusRequest]) (*connect.Response[GetEventClientStatusResponse], error)
 	// ListEventSubscriptions returns all local Consume subscriptions, ordered by raw ID.
 	ListEventSubscriptions(context.Context, *connect.Request[ListEventSubscriptionsRequest]) (*connect.Response[ListEventSubscriptionsResponse], error)
 	// PollEvents returns one bounded page of at-least-once deliveries.
@@ -484,6 +504,12 @@ func NewAsterApplicationServiceHandler(svc AsterApplicationServiceHandler, opts 
 		connect.WithSchema(asterApplicationServiceMethods.ByName("CreateEventSubscription")),
 		connect.WithHandlerOptions(opts...),
 	)
+	asterApplicationServiceGetEventClientStatusHandler := connect.NewUnaryHandler(
+		AsterApplicationServiceGetEventClientStatusProcedure,
+		svc.GetEventClientStatus,
+		connect.WithSchema(asterApplicationServiceMethods.ByName("GetEventClientStatus")),
+		connect.WithHandlerOptions(opts...),
+	)
 	asterApplicationServiceListEventSubscriptionsHandler := connect.NewUnaryHandler(
 		AsterApplicationServiceListEventSubscriptionsProcedure,
 		svc.ListEventSubscriptions,
@@ -554,6 +580,8 @@ func NewAsterApplicationServiceHandler(svc AsterApplicationServiceHandler, opts 
 			asterApplicationServiceQueryEventsHandler.ServeHTTP(w, r)
 		case AsterApplicationServiceCreateEventSubscriptionProcedure:
 			asterApplicationServiceCreateEventSubscriptionHandler.ServeHTTP(w, r)
+		case AsterApplicationServiceGetEventClientStatusProcedure:
+			asterApplicationServiceGetEventClientStatusHandler.ServeHTTP(w, r)
 		case AsterApplicationServiceListEventSubscriptionsProcedure:
 			asterApplicationServiceListEventSubscriptionsHandler.ServeHTTP(w, r)
 		case AsterApplicationServicePollEventsProcedure:
@@ -617,6 +645,10 @@ func (UnimplementedAsterApplicationServiceHandler) QueryEvents(context.Context, 
 
 func (UnimplementedAsterApplicationServiceHandler) CreateEventSubscription(context.Context, *connect.Request[CreateEventSubscriptionRequest]) (*connect.Response[CreateEventSubscriptionResponse], error) {
 	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("aster.application.v1alpha1.AsterApplicationService.CreateEventSubscription is not implemented"))
+}
+
+func (UnimplementedAsterApplicationServiceHandler) GetEventClientStatus(context.Context, *connect.Request[GetEventClientStatusRequest]) (*connect.Response[GetEventClientStatusResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("aster.application.v1alpha1.AsterApplicationService.GetEventClientStatus is not implemented"))
 }
 
 func (UnimplementedAsterApplicationServiceHandler) ListEventSubscriptions(context.Context, *connect.Request[ListEventSubscriptionsRequest]) (*connect.Response[ListEventSubscriptionsResponse], error) {

@@ -1002,6 +1002,8 @@ fn query_evidence(exact_match: bool, count: usize, has_more: bool) -> serde_json
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SubscribeInput {
+    client_id_hex: String,
+    journal_path: String,
     operation_key_hex: String,
     topic: String,
     scope: String,
@@ -1009,8 +1011,18 @@ struct SubscribeInput {
 
 async fn client_subscribe(client: &Client) -> Result<(), FixtureError> {
     let input: SubscribeInput = read_client_input()?;
+    let sdk = aster_agent::sdk::NumberedEventSdk::open(
+        client.clone(),
+        &input.journal_path,
+        &decode_hex(&input.client_id_hex)?,
+    )
+    .map_err(|_| FixtureError::Local)?;
+    sdk.recover().await.map_err(|_| FixtureError::Local)?;
+    let owner = sdk.client_context().map_err(|_| FixtureError::Local)?;
+
     let response = client
         .create_event_subscription(api::CreateEventSubscriptionRequest {
+            client: owner.into(),
             operation_key: decode_hex(&input.operation_key_hex)?,
             topic: input.topic,
             scope: input.scope,
@@ -1029,6 +1041,8 @@ async fn client_subscribe(client: &Client) -> Result<(), FixtureError> {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PollInput {
+    client_id_hex: String,
+    journal_path: String,
     subscription_id_hex: String,
     delivery_limit: u32,
     scan_limit: u32,
@@ -1036,8 +1050,18 @@ struct PollInput {
 
 async fn client_poll(client: &Client) -> Result<(), FixtureError> {
     let input: PollInput = read_client_input()?;
+    let sdk = aster_agent::sdk::NumberedEventSdk::open(
+        client.clone(),
+        &input.journal_path,
+        &decode_hex(&input.client_id_hex)?,
+    )
+    .map_err(|_| FixtureError::Local)?;
+    sdk.recover().await.map_err(|_| FixtureError::Local)?;
+    let owner = sdk.client_context().map_err(|_| FixtureError::Local)?;
+
     let response = client
         .poll_events(api::PollEventsRequest {
+            client: owner.into(),
             subscription_id: decode_hex(&input.subscription_id_hex)?,
             delivery_limit: input.delivery_limit,
             scan_limit: input.scan_limit,
@@ -1066,6 +1090,8 @@ async fn client_poll(client: &Client) -> Result<(), FixtureError> {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StreamInput {
+    client_id_hex: String,
+    journal_path: String,
     subscription_id_hex: String,
     delivery_limit: u32,
     scan_limit: u32,
@@ -1078,11 +1104,21 @@ struct StreamInput {
 
 async fn client_stream(client: &Client) -> Result<(), FixtureError> {
     let input: StreamInput = read_client_input()?;
+    let sdk = aster_agent::sdk::NumberedEventSdk::open(
+        client.clone(),
+        &input.journal_path,
+        &decode_hex(&input.client_id_hex)?,
+    )
+    .map_err(|_| FixtureError::Local)?;
+    sdk.recover().await.map_err(|_| FixtureError::Local)?;
+    let owner = sdk.client_context().map_err(|_| FixtureError::Local)?;
+
     if input.count == 0 || input.count > 32 {
         return Err(FixtureError::Local);
     }
     let mut stream = client
         .stream_events(api::StreamEventsRequest {
+            client: owner.into(),
             subscription_id: decode_hex(&input.subscription_id_hex)?,
             delivery_limit: input.delivery_limit,
             scan_limit: input.scan_limit,
@@ -1127,14 +1163,26 @@ async fn client_stream(client: &Client) -> Result<(), FixtureError> {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AckInput {
+    client_id_hex: String,
+    journal_path: String,
     subscription_id_hex: String,
     event_id_hex: String,
 }
 
 async fn client_ack(client: &Client) -> Result<(), FixtureError> {
     let input: AckInput = read_client_input()?;
+    let sdk = aster_agent::sdk::NumberedEventSdk::open(
+        client.clone(),
+        &input.journal_path,
+        &decode_hex(&input.client_id_hex)?,
+    )
+    .map_err(|_| FixtureError::Local)?;
+    sdk.recover().await.map_err(|_| FixtureError::Local)?;
+    let owner = sdk.client_context().map_err(|_| FixtureError::Local)?;
+
     let response = client
         .acknowledge_event(api::AcknowledgeEventRequest {
+            client: owner.into(),
             subscription_id: decode_hex(&input.subscription_id_hex)?,
             event_id: decode_hex(&input.event_id_hex)?,
             ..Default::default()
