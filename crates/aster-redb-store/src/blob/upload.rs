@@ -1574,6 +1574,39 @@ mod tests {
         Some(rows)
     }
 
+    fn upload_pack_root_snapshot(root: &TestRoot) -> Option<Vec<(String, Option<Vec<u8>>)>> {
+        let path = root.0.join("blob-depot-v1").join("stream-packs-v2");
+        if !path.exists() {
+            return None;
+        }
+        let mut rows = fs::read_dir(path)
+            .expect("read upload pack root")
+            .map(|entry| {
+                let entry = entry.expect("upload pack root entry");
+                let name = entry
+                    .file_name()
+                    .into_string()
+                    .expect("UTF-8 pack root artifact name");
+                let bytes = entry
+                    .file_type()
+                    .expect("pack root artifact type")
+                    .is_file()
+                    .then(|| fs::read(entry.path()).expect("read pack root artifact"));
+                (name, bytes)
+            })
+            .collect::<Vec<_>>();
+        rows.sort_by(|left, right| left.0.cmp(&right.0));
+        Some(rows)
+    }
+
+    fn cleanup_marker_count(snapshot: &Option<Vec<(String, Option<Vec<u8>>)>>) -> usize {
+        snapshot.as_ref().map_or(0, |rows| {
+            rows.iter()
+                .filter(|(name, _)| name.starts_with(".aster-upload-cleanup-"))
+                .count()
+        })
+    }
+
     #[test]
     fn upload_pack_audit_is_bidirectional_exact_and_non_mutating() {
         for damage in [
@@ -1997,6 +2030,15 @@ mod tests {
         );
         let authority = fixture.publisher.mission_authority_id();
         drop(fixture.store);
+        let cleanup_gap = upload_pack_root_snapshot(&fixture.root);
+        assert_eq!(cleanup_marker_count(&cleanup_gap), 1);
+        Store::inspect_existing(fixture.root.database())
+            .expect("read-only open accepts completed cleanup gap");
+        assert_eq!(
+            upload_pack_root_snapshot(&fixture.root),
+            cleanup_gap,
+            "read-only open must not remove the completion marker"
+        );
         let reopened = Store::open_with_limits_and_blob_depot_limits_for_mission(
             fixture.root.database(),
             StoreLimits::default(),
@@ -2010,6 +2052,23 @@ mod tests {
                 .expect("read converged completion")
                 .is_none(),
             "canonical authority remains while provisional charge is released"
+        );
+        assert_eq!(
+            cleanup_marker_count(&upload_pack_root_snapshot(&fixture.root)),
+            0,
+            "writable recovery must reclaim the completion marker without retry"
+        );
+        drop(reopened);
+        Store::open_with_limits_and_blob_depot_limits_for_mission(
+            fixture.root.database(),
+            StoreLimits::default(),
+            BlobDepotLimits::new(exact_bytes, 1, 1).expect("repeat-open limits"),
+            authority,
+        )
+        .expect("repeated completion recovery is idempotent");
+        assert_eq!(
+            cleanup_marker_count(&upload_pack_root_snapshot(&fixture.root)),
+            0
         );
     }
 
@@ -2150,6 +2209,15 @@ mod tests {
 
         let authority = fixture.publisher.mission_authority_id();
         drop(fixture.store);
+        let cleanup_gap = upload_pack_root_snapshot(&fixture.root);
+        assert_eq!(cleanup_marker_count(&cleanup_gap), 1);
+        Store::inspect_existing(fixture.root.database())
+            .expect("read-only open accepts aborted cleanup gap");
+        assert_eq!(
+            upload_pack_root_snapshot(&fixture.root),
+            cleanup_gap,
+            "read-only open must not remove the abort marker"
+        );
         let reopened = Store::open_for_mission(fixture.root.database(), authority)
             .expect("cleanup marker converges aborted upload on reopen");
         assert!(
@@ -2157,6 +2225,11 @@ mod tests {
                 .resume_blob_upload(&request.owner)
                 .expect("read converged abort")
                 .is_none()
+        );
+        assert_eq!(
+            cleanup_marker_count(&upload_pack_root_snapshot(&fixture.root)),
+            0,
+            "writable recovery must reclaim the abort marker before retry"
         );
         let (retry, initial) = reopened
             .reserve_blob_upload_with_policy(&policy, &request)
@@ -2166,6 +2239,70 @@ mod tests {
         let root = PinnedBlobPackRoot::open(&reopened).expect("retry pack root");
         BlobPackWriter::open_projected_upload_pinned(&root, &retry.pack_identity(), None)
             .expect("retry has exactly one usable initial pack");
+    }
+
+    #[test]
+    fn upload_row_absent_cleanup_marker_is_reclaimed_by_writable_open() {
+        let fixture = fixture("orphan-cleanup-marker", 0x3b, BlobDepotLimits::DEFAULT);
+        let request = request(&fixture, b"orphan-cleanup-marker", 1_024);
+        let policy = fixture.store.control_policy_snapshot().expect("policy");
+        let (reservation, _) = fixture
+            .store
+            .reserve_blob_upload_with_policy(&policy, &request)
+            .expect("reserve upload");
+        assert!(
+            fixture
+                .store
+                .abort_blob_upload(&reservation)
+                .expect("remove upload row and pack")
+        );
+        let root = PinnedBlobPackRoot::open(&fixture.store).expect("pack root");
+        super::super::pack::stage_upload_pack_cleanup(&root, &reservation.pack_identity())
+            .expect("stage pre-existing row-absent cleanup marker");
+        drop(root);
+        let authority = fixture.publisher.mission_authority_id();
+        drop(fixture.store);
+        let before = upload_pack_root_snapshot(&fixture.root);
+        assert_eq!(cleanup_marker_count(&before), 1);
+        Store::inspect_existing(fixture.root.database())
+            .expect("read-only open accepts row-absent cleanup marker");
+        assert_eq!(upload_pack_root_snapshot(&fixture.root), before);
+        drop(
+            Store::open_for_mission(fixture.root.database(), authority)
+                .expect("writable open reclaims row-absent cleanup marker"),
+        );
+        assert_eq!(
+            cleanup_marker_count(&upload_pack_root_snapshot(&fixture.root)),
+            0
+        );
+        drop(
+            Store::open_for_mission(fixture.root.database(), authority)
+                .expect("repeated cleanup marker recovery is idempotent"),
+        );
+        assert_eq!(
+            cleanup_marker_count(&upload_pack_root_snapshot(&fixture.root)),
+            0
+        );
+    }
+
+    #[test]
+    fn upload_malformed_cleanup_marker_still_fails_closed_without_mutation() {
+        let fixture = fixture("malformed-cleanup-marker", 0x3c, BlobDepotLimits::DEFAULT);
+        let root = PinnedBlobPackRoot::open(&fixture.store).expect("pack root");
+        drop(root);
+        let pack_root = fixture.root.0.join("blob-depot-v1").join("stream-packs-v2");
+        fs::write(
+            pack_root.join(format!(".aster-upload-cleanup-{}", "00".repeat(32))),
+            [0x5a; 80],
+        )
+        .expect("write malformed cleanup marker");
+        let authority = fixture.publisher.mission_authority_id();
+        drop(fixture.store);
+        let before = upload_pack_root_snapshot(&fixture.root);
+        assert!(Store::inspect_existing(fixture.root.database()).is_err());
+        assert_eq!(upload_pack_root_snapshot(&fixture.root), before);
+        assert!(Store::open_for_mission(fixture.root.database(), authority).is_err());
+        assert_eq!(upload_pack_root_snapshot(&fixture.root), before);
     }
 
     #[test]

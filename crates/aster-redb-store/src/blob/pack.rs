@@ -678,6 +678,51 @@ pub(super) fn audit_upload_packs_read(
     audit_upload_packs(depot_root, expected, false).map(|_| ())
 }
 
+/// Reclaims cleanup tombstones only after the transaction which removed their
+/// upload rows has committed. The caller holds a fresh database writer while
+/// this runs, so a new reservation cannot make a row present between the
+/// absence check and physical marker removal.
+pub(super) fn reclaim_row_absent_cleanup_markers(
+    depot_root: &OwnedDirectory,
+    expected: &[ExpectedBlobUploadPack],
+) -> Result<(), StoreError> {
+    let Some(pack_root) = depot_root.open_child_directory_if_present(PACK_DIRECTORY)? else {
+        return Ok(());
+    };
+    for name in pack_root
+        .entry_names()?
+        .into_iter()
+        .filter(|name| name.starts_with(UPLOAD_CLEANUP_PREFIX))
+    {
+        let marker = pack_root
+            .read_private_file_if_present(&name, 80)?
+            .ok_or_else(|| {
+                blob_error(BlobStoreError::DepotIntegrity(
+                    "Blob upload cleanup marker disappeared during reclaim",
+                ))
+            })?;
+        let identity = decode_cleanup_marker(&marker).map_err(pack_marker_store_error)?;
+        if name != cleanup_marker_name(identity) {
+            return Err(blob_error(BlobStoreError::DepotIntegrity(
+                "Blob upload cleanup marker identity is inconsistent",
+            )));
+        }
+        match expected
+            .iter()
+            .find(|expected| expected.identity.upload_id == identity.upload_id)
+        {
+            Some(expected) if expected.identity == identity => continue,
+            Some(_) => {
+                return Err(blob_error(BlobStoreError::DepotIntegrity(
+                    "Blob upload cleanup marker differs from durable upload identity",
+                )));
+            }
+            None => pack_root.remove_if_exists(&name, false)?,
+        }
+    }
+    Ok(())
+}
+
 enum BlobPackRoot {
     Path(PathBuf),
     Pinned(OwnedDirectory, Arc<()>),

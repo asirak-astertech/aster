@@ -6377,6 +6377,23 @@ impl Store {
             physical.commit()?;
         }
 
+        // Cleanup markers must outlive the transaction that removes their
+        // upload rows. Reclaim them only from a fresh writer after that row
+        // absence is durable; the writer lock prevents a concurrent retry
+        // from creating a row while its marker is being removed.
+        if let Some(authority) = mission_authority {
+            let cleanup = database.begin_write()?;
+            enforce_live_write(&cleanup)?;
+            check_expected_mission_binding(&cleanup, authority)?;
+            blob::depot::reclaim_upload_cleanup_markers_after_commit(
+                &cleanup,
+                &path,
+                backing_identity,
+                blob_depot_owner_token,
+            )?;
+            cleanup.commit()?;
+        }
+
         Ok(Self {
             database,
             path,

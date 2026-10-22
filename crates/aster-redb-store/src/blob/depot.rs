@@ -3164,6 +3164,32 @@ pub(crate) fn recover_upload_pack_transitions_write(
     super::upload::finish_upload_cleanups_write(write, &completed)
 }
 
+pub(crate) fn reclaim_upload_cleanup_markers_after_commit(
+    write: &redb::WriteTransaction,
+    store_path: &Path,
+    backing_identity: StoreBackingIdentity,
+    owner_token: [u8; 32],
+) -> Result<(), StoreError> {
+    if !write
+        .list_tables()?
+        .any(|table| table.name() == super::BLOB_UPLOADS.name())
+    {
+        return Ok(());
+    }
+    let expected = super::upload::upload_pack_expectations_write(write)?;
+    let Some(root) = OwnedDirectory::open_root_if_present(store_path)? else {
+        return if expected.is_empty() {
+            Ok(())
+        } else {
+            Err(blob_error(BlobStoreError::DepotIntegrity(
+                "durable Blob upload depot root is missing",
+            )))
+        };
+    };
+    root.require_store_binding(store_path, backing_identity, owner_token)?;
+    super::pack::reclaim_row_absent_cleanup_markers(&root, &expected)
+}
+
 pub(crate) fn audit_depot_read(
     read: &redb::ReadTransaction,
     store_path: &Path,
