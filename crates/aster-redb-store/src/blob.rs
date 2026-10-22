@@ -7565,6 +7565,8 @@ impl Store {
         eligibility: BlobContactEligibility,
         observe_profile5: bool,
     ) -> Result<ApplyOutcome, StoreError> {
+        #[cfg(not(any(test, feature = "test-utils")))]
+        let _ = observe_profile5;
         self.require_live()?;
         let authority = self.require_bound_mission()?;
         let source = BlobTransferId::new(plan.source_envelope().into_bytes());

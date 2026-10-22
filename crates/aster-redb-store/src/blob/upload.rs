@@ -2184,8 +2184,13 @@ mod tests {
         // file header + 16-byte AEAD tag.
         let plaintext = vec![0x71; 1_024];
         let canonical_bytes = 1_024 + 153 + 16;
-        let staging_bytes =
-            64 * 1_024 + 1_024 + BLOB_STREAM_SEGMENT_ENCODED_OVERHEAD_BYTES as u64 + 4;
+        let pack_bytes = super::super::pack::reserved_upload_pack_bytes(plaintext.len() as u64)
+            .expect("pack reservation");
+        let digest_sidecar_bytes =
+            super::super::pack::upload_digest_reserved_bytes(plaintext.len() as u64)
+                .expect("digest sidecar reservation");
+        assert_eq!(digest_sidecar_bytes, 118);
+        let staging_bytes = pack_bytes + digest_sidecar_bytes;
         let exact_bytes = staging_bytes + canonical_bytes;
         let mut fixture = fixture(
             "promotion",
