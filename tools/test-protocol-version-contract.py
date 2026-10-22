@@ -119,10 +119,26 @@ Profile 5 size terms: 65,536-byte canonical plaintext chunk; 66,215-byte maximum
 Profile 5 checkpoint maximum: 134,217,728 bytes (128 MiB).
 Canonical legacy eligibility: every pre-profile-5 canonical Blob remains eligible for profile 5 after upgrade.
 Unified capacity: provisional uploads, pending network receipts, and completed canonical variants share the configured Blob depot limits.
+Receiver settlement order: authenticated FINISH and content verification -> canonical apply/promotion -> RESULT -> ACK -> receipt cleanup.
+Canonical status may report AVAILABLE while RESULT/ACK settlement or receipt cleanup is still pending.
+The durable receipt is keyed by receiving mission authority and canonical source and binds the verified plan, depot/store authority, and durable checkpoint; it does not persist the fresh attempt nonce.
+Timeout asymmetry: the sender derives its hard deadline from the exact canonical wire length; the receiver opens before authenticated OPEN using the full profile wire ceiling. The two-minute authenticated-progress timeout is the shorter stall bound.
 """,
             "public_api": """Current Blob API capability: the Rust API, native-gRPC agent, and asterctl support bounded local publication and authenticated reads.
 Status boundary: local publication success is a durable local commit; blob-status is receiver-local durable state, not remote delivery, peer status, or convergence status.
 Download resume: post-merge work; interrupted asterctl downloads currently restart at byte zero.
+""",
+            "node_api": """Semantic v9 selects profile 5 BlobStreamV1; semantic v7/v8 retain compatibility profile 4 BlobRangesStreamV1.
+Profile 5 batches canonical 64-KiB plaintext chunks as complete ASTRBT01 records in ABX1 extents of at most 1 MiB.
+""",
+            "transports": """Semantic v9 selects profile 5 BlobStreamV1; semantic v7/v8 retain compatibility profile 4 BlobRangesStreamV1.
+Profile 5 batches canonical 64-KiB plaintext chunks as complete ASTRBT01 records in ABX1 extents of at most 1 MiB.
+""",
+            "recipes": """Semantic v9 selects profile 5 BlobStreamV1; semantic v7/v8 retain compatibility profile 4 BlobRangesStreamV1.
+Profile 5 batches canonical 64-KiB plaintext chunks as complete ASTRBT01 records in ABX1 extents of at most 1 MiB.
+""",
+            "performance": """Legacy 2026-10-20 ASTRBS02 completed-pack evidence used 1-MiB semantic segments and does not validate the current canonical-authority candidate.
+Current qualification must measure 64-KiB canonical plaintext chunks carried as ASTRBT01 records in at-most-1-MiB ABX1 extents.
 """,
         }
         CHECKER.validate_blob_documentation_contract(documents)
@@ -135,6 +151,10 @@ Download resume: post-merge work; interrupted asterctl downloads currently resta
             ("agent and CLI capability", "native-gRPC agent, and asterctl support", "native-gRPC agent may eventually support"),
             ("local versus convergence status", "not remote delivery, peer status, or convergence status", "reports remote delivery and convergence status"),
             ("download resume boundary", "post-merge work", "current capability"),
+            ("receiver settlement order", "canonical apply/promotion -> RESULT -> ACK -> receipt cleanup", "RESULT -> ACK -> canonical apply/promotion -> receipt cleanup"),
+            ("canonical-first status timing", "may report AVAILABLE while RESULT/ACK settlement", "reports AVAILABLE only after RESULT/ACK settlement"),
+            ("receipt has no attempt binding", "does not persist the fresh attempt nonce", "persists the fresh attempt nonce"),
+            ("timeout asymmetry", "receiver opens before authenticated OPEN using the full profile wire ceiling", "receiver uses the exact canonical wire length"),
         )
         for label, old, new in mutations:
             damaged = dict(documents)
@@ -144,6 +164,25 @@ Download resume: post-merge work; interrupted asterctl downloads currently resta
                 CHECKER.ContractViolation, label
             ):
                 CHECKER.validate_blob_documentation_contract(damaged)
+
+        for surface in ("node_api", "transports", "recipes"):
+            damaged = dict(documents)
+            damaged[surface] = damaged[surface].replace(
+                "canonical 64-KiB plaintext chunks as complete ASTRBT01 records",
+                "independently authenticated 1-MiB segments",
+            )
+            with self.subTest(surface=surface), self.assertRaisesRegex(
+                CHECKER.ContractViolation, surface
+            ):
+                CHECKER.validate_blob_documentation_contract(damaged)
+
+        damaged = dict(documents)
+        damaged["performance"] = damaged["performance"].replace(
+            "Legacy 2026-10-20 ASTRBS02 completed-pack evidence used 1-MiB semantic segments",
+            "The current ABX1 profile used 64-KiB canonical chunks",
+        )
+        with self.assertRaisesRegex(CHECKER.ContractViolation, "legacy performance"):
+            CHECKER.validate_blob_documentation_contract(damaged)
 
     def test_v1_through_v9_contract_passes(self) -> None:
         self.validate()

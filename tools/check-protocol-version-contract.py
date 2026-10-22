@@ -177,6 +177,58 @@ def validate_blob_documentation_contract(documents: dict[str, str]) -> None:
         if " ".join(statement.split()) not in combined:
             fail(f"Blob documentation {label} declaration is missing")
 
+    def require_document(key: str, label: str, statement: str) -> None:
+        normalized = " ".join(documents.get(key, "").replace("//!", "").split())
+        if " ".join(statement.split()) not in normalized:
+            fail(f"Blob documentation {label} declaration is missing from {key}")
+
+    for label, statement in (
+        (
+            "receiver settlement order",
+            "authenticated FINISH and content verification -> canonical apply/promotion -> RESULT -> ACK -> receipt cleanup",
+        ),
+        (
+            "canonical-first status timing",
+            "may report AVAILABLE while RESULT/ACK settlement or receipt cleanup is still pending",
+        ),
+        (
+            "receipt has no attempt binding",
+            "does not persist the fresh attempt nonce",
+        ),
+        (
+            "timeout asymmetry",
+            "the sender derives its hard deadline from the exact canonical wire length; the receiver opens before authenticated OPEN using the full profile wire ceiling",
+        ),
+        (
+            "timeout asymmetry",
+            "The two-minute authenticated-progress timeout is the shorter stall bound",
+        ),
+    ):
+        require_document("runbook", label, statement)
+
+    profile_statement = (
+        "Semantic v9 selects profile 5 BlobStreamV1; semantic v7/v8 retain "
+        "compatibility profile 4 BlobRangesStreamV1"
+    )
+    chunk_statement = (
+        "Profile 5 batches canonical 64-KiB plaintext chunks as complete "
+        "ASTRBT01 records in ABX1 extents of at most 1 MiB"
+    )
+    for surface in ("node_api", "transports", "recipes"):
+        require_document(surface, surface, profile_statement)
+        require_document(surface, surface, chunk_statement)
+
+    require_document(
+        "performance",
+        "legacy performance",
+        "Legacy 2026-10-20 ASTRBS02 completed-pack evidence used 1-MiB semantic segments",
+    )
+    require_document(
+        "performance",
+        "current performance qualification",
+        "Current qualification must measure 64-KiB canonical plaintext chunks carried as ASTRBT01 records in at-most-1-MiB ABX1 extents",
+    )
+
 
 def parse_numeric_declaration(text: str, label: str) -> tuple[int, ...]:
     match = re.search(rf"^{re.escape(label)}:\s*([^\n]+)$", text, re.MULTILINE)
@@ -792,6 +844,12 @@ def main() -> int:
                         "docs/validation/capability-roadmap.md",
                     )
                 ),
+                "node_api": (ROOT / "crates/aster-node/src/lib.rs").read_text(),
+                "transports": (ROOT / "docs/transports.md").read_text(),
+                "recipes": (ROOT / "docs/application-recipes.md").read_text(),
+                "performance": (
+                    ROOT / "docs/validation/blob-streaming-performance.md"
+                ).read_text(),
             }
         )
     except (ContractViolation, OSError) as error:

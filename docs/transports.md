@@ -58,10 +58,12 @@ configured network receive interest. The runtime also
 exposes a cloneable live Blob handle: publish accepts an already-open regular
 file at cursor zero, bounded to 64 MiB and 1,024 canonical 64-KiB chunks, and a
 live read returns at most 64 KiB of plaintext per zeroize-on-drop page. Semantic
-v9/profile 5 adds bounded, checkpointed streaming of canonical independently
-authenticated 1-MiB segments with receiver-authoritative resume. Semantic
-v7/v8 profile 4 remains the compatibility path for peer-neutral contiguous
-carrier ranges of at most 16 KiB; v7 is durable-only, while v8 also implements
+v9 selects profile 5 BlobStreamV1; semantic v7/v8 retain compatibility profile
+4 BlobRangesStreamV1. Profile 5 batches canonical 64-KiB plaintext chunks as
+complete ASTRBT01 records in ABX1 extents of at most 1 MiB, with
+receiver-authoritative resume. Profile 4 remains the compatibility path for
+peer-neutral contiguous carrier ranges of at most 16 KiB; v7 is durable-only,
+while v8 also implements
 authenticated finite-TTL custody and bounded lower-priority pressure recovery
 internally. The broader
 semantic implementation remains the migration source for behavior that has not

@@ -190,11 +190,13 @@ node-to-node profile-5 resume.
 The RPC and CLI use checked `u64` lengths and bounded 512-KiB application
 frames/pages. The resumable stream protocol has an explicit 8-GiB per-object
 ceiling, 1-MiB DATA/SOURCE record bounds, and a 128-MiB checkpoint maximum.
-Node-to-node profile-5 attempts use a two-minute authenticated-progress idle
-timeout and a size-derived hard deadline of `ceil(bytes / 128 KiB/s) + 20
-minutes`; the legacy ten-minute bound is not a normal-success timeout. CLI and
-agent RPC deadlines are separate local application bounds. A timed-out local
-upload is retried with the same operation key; peer transfer resumes from the
+Node-to-node profile-5 attempts use a two-minute authenticated-progress timeout
+as their shorter stall bound. The sender derives its hard deadline from exact
+canonical wire bytes. The receiver opens before authenticated OPEN, while PLAN
+still hides content size, and initially derives its hard deadline from the full
+profile wire ceiling. The legacy ten-minute bound is not a normal-success
+timeout. CLI and agent RPC deadlines are separate local application bounds. A
+timed-out local upload is retried with the same operation key; peer transfer resumes from the
 receiver's last durable checkpoint, including after an adapter change.
 Publish/read progress is written only to stderr. `--progress auto` displays it
 on a terminal, `always` emits newline records, and `never` disables it. A

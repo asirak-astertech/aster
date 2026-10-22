@@ -52,16 +52,20 @@ content must never be converted into that EOF.
 
 Local publish succeeds after the local durable commit and does not wait for a
 peer. Synchronization starts when an eligible destination becomes available or
-requests the content. Receiver promotion occurs only after authenticated
-canonical records, terminal-root verification, RESULT, and ACK settlement.
+requests the content. Receiver settlement order: authenticated FINISH and
+content verification -> canonical apply/promotion -> RESULT -> ACK -> receipt
+cleanup. Canonical status may report AVAILABLE while RESULT/ACK settlement or
+receipt cleanup is still pending.
 
 Every attempt is gated independently by authenticated peer identity, current
 Blob interest, route authorization, content proof, and nonrevocation. Status is
 canonical-first: `blob-status` reports receiver-local durable publication
-state, not carrier connectivity or source-side intent. Resume uses the
-receiver's durable receipt (publication/attempt binding, canonical offset,
-checkpoint generation, and commitment). A later selected adapter therefore
-resumes the same publication without translating durable state.
+state, not carrier connectivity or source-side intent. The durable receipt is
+keyed by receiving mission authority and canonical source and binds the
+verified plan, depot/store authority, and durable checkpoint; it does not
+persist the fresh attempt nonce. Its checkpoint includes generation, chunk
+index, plaintext offset, pack offset, and wire offset. A later selected adapter
+therefore resumes the same publication without translating durable state.
 
 The current adapter is Iroh QUIC. The adapter interface is carrier-independent
 and retains the bindings needed by a reliable ordered full-duplex non-IP
@@ -85,10 +89,19 @@ authority: only promotion of the canonical manifest plus ASTRBT01 carriers
 creates the Blob publication. Check both state and depot filesystems and leave
 operational reserve; an observed capacity snapshot is not a reservation.
 
-Profile-5 transfer has two different liveness bounds:
+Profile-5 transfer has asymmetric hard-deadline inputs. Timeout asymmetry: the
+sender derives its hard deadline from the exact canonical wire length; the
+receiver opens before authenticated OPEN using the full profile wire ceiling.
+The two-minute authenticated-progress timeout is the shorter stall bound.
 
-- two minutes without authenticated progress is a retryable idle stall; and
-- the hard attempt deadline is `ceil(bytes / 128 KiB/s) + 20 minutes`.
+Specifically:
+
+- two minutes without authenticated progress is a retryable idle stall;
+- the sender hard deadline is `ceil(exact_wire_bytes / 128 KiB/s) + 20
+  minutes`; and
+- the receiver initially computes that formula from the full
+  8,679,596,592-byte profile wire ceiling because PLAN discloses no content
+  size and transport admission occurs before authenticated OPEN.
 
 The legacy ten-minute attempt constant is not the normal-success deadline for
 profile 5. CLI/agent RPC deadlines are a separate local application concern;

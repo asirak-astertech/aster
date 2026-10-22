@@ -111,29 +111,31 @@ an encoded canonical chunk record of at most 66,215 bytes. `ABX1` batches whole
 records into an extent of at most 1 MiB. The extent target is transfer policy,
 not the canonical plaintext chunk size and not a second Blob identity format.
 
-Before changing batching policy, run the same warmed CM4 workload with smaller
-extent targets. Retain end-to-end throughput and latency, CPU, peak RSS and
+Current qualification must measure 64-KiB canonical plaintext chunks carried
+as ASTRBT01 records in at-most-1-MiB ABX1 extents. Task 13 must establish the
+current candidate's end-to-end throughput and latency, CPU, peak RSS and
 in-flight bytes, checkpoint cost, retransmitted bytes, resume amplification,
-and behavior under loss and constrained MTU. A peer may negotiate a smaller
-extent without changing canonical Blob identity.
+and behavior under loss and constrained MTU. No result below supports the
+current batching choice.
 
-## 2026-10-20 CM4 checkpoint and sender-copy requalification
+## Legacy evidence — 2026-10-20 CM4 completed-pack requalification
 
-The completed-pack sender now writes the small protected record prefix and the
-owned canonical pack body as one carrier frame without first copying the body
-into a second payload-sized allocation. The receiver's absolute-credit window
-also rounds up to a whole canonical extent. That rule fixes the deadlock where
-an exact byte window admitted too few slightly-over-1-MiB pack records to reach
-the next checkpoint.
+Legacy 2026-10-20 ASTRBS02 completed-pack evidence used 1-MiB semantic segments
+and does not validate the current canonical-authority candidate. This entire
+dated section retains the measured candidate's original terminology and claim
+boundary.
 
-The checkpoint batch is a durability/performance policy, independent of the
-64-KiB canonical chunk and 1-MiB maximum batched extent. A receiver may
-negotiate a smaller batch;
-the profile-5 implementation caps the current batch at 128 MiB. Larger batches
-reduce synchronization and reverse-control overhead but increase the maximum
-uncheckpointed suffix that an interrupted attempt may replay. The attempt's
-control allocation therefore uses the bounded worst case of one checkpoint per
-admitted extent rather than assuming that every peer selects the maximum batch.
+The legacy ASTRBS02 completed-pack sender wrote the small protected record
+prefix and the owned 1-MiB semantic pack body as one carrier frame without
+first copying the body into a second payload-sized allocation. Its receiver's
+absolute-credit window rounded up to a whole pack record. That rule fixed the
+legacy deadlock where an exact byte window admitted too few slightly-over-1-MiB
+pack records to reach the next checkpoint.
+
+In that candidate, checkpoint batching was independent of its 1-MiB
+authenticated semantic segment. Larger batches reduced synchronization and
+reverse-control overhead but increased the maximum uncheckpointed suffix that
+an interrupted attempt could replay.
 
 Successive 256-MiB CM4 runs on `rpi4-2 -> rpi4-1` showed:
 
@@ -143,18 +145,15 @@ Successive 256-MiB CM4 runs on `rpi4-2 -> rpi4-1` showed:
 | 64-MiB batch and split-frame sender | 4 | 7.376 | 9.400 retained sample | 78.5% |
 | 128-MiB batch and split-frame sender | 2 | 8.317 | 9.561 | 87.0% |
 
-These are integrated candidate measurements, not an isolated single-variable
-benchmark; they support the selected combination but do not attribute all gain
-to checkpoint cadence. The exact 1-GiB confirmation transferred 1,073,879,040
+These are integrated legacy-candidate measurements, not an isolated
+single-variable benchmark; they do not attribute all gain to checkpoint
+cadence. The exact 1-GiB confirmation transferred 1,073,879,040
 wire bytes in 126.445 seconds at 8.099 MiB/s, with eight checkpoints and
 matching terminal roots. The immediately adjacent 1-GiB raw TCP run sustained
 9.344 MiB/s, so the integrated path achieved 86.7% of available throughput and
 passed the 80% floor. Receiver occupancy remained bounded at four items and
 4,194,840 bytes.
 
-This historical requalification does not prove that the 1-MiB extent target is
-optimal. It shows that changing the canonical 64-KiB chunk was not required to
-remove the observed transport gap: the retained batching policy exceeded the
-acceptance floor after credit, durability cadence, and sender ownership were
-corrected. These measurements predate the current canonical-authority
-remediation and are not validation of this candidate.
+This legacy requalification supported only the measured ASTRBS02 completed-pack
+candidate. The current profile-5 canonical-authority pipeline has different
+64-KiB/ASTRBT01/ABX1 map and extent units and requires new CM4 evidence.

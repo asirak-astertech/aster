@@ -19,9 +19,13 @@
 //! zeroize-on-drop plaintext pages. The corresponding stopped facades retain
 //! exclusive maintenance/application access and streaming Blob I/O. State and
 //! Record additionally use class-specific, explicitly interested reconciliation
-//! lanes. Blob transfer is selected only for semantic v7/v8 profile 4: v7 is
-//! durable-only and v8 adds authenticated finite custody. Semantic v5/v6 Blob
-//! intent fails instead of falling back to a historical carrier path.
+//! lanes. Semantic v9 selects profile 5 BlobStreamV1; semantic v7/v8 retain
+//! compatibility profile 4 BlobRangesStreamV1. Profile 5 batches canonical
+//! 64-KiB plaintext chunks as complete ASTRBT01 records in ABX1 extents of at
+//! most 1 MiB, with receiver-authoritative checkpoints; profile 4 keeps its
+//! historical bounds, v7 is durable-only, and v8 adds authenticated finite
+//! custody. Semantic v5/v6 Blob intent fails instead of falling back to a
+//! historical carrier path.
 //! Shutdown and zeroization close live application
 //! admission before releasing the actor's store authority, so retained handles
 //! fail closed with [`application::ApplicationErrorKind::StateUnavailable`].
@@ -43,9 +47,9 @@ pub mod mission;
 pub mod publication_journal;
 mod runtime;
 pub mod stream_pipeline;
-#[allow(dead_code)] // Activated by the profile-5 runtime driver in Task 7.
+#[allow(dead_code)] // Includes validation-only profile-5 codec and state helpers.
 mod stream_transfer;
-#[allow(dead_code)] // Activated by the profile-5 runtime driver in Task 7.
+#[allow(dead_code)] // Includes adapter probes used only by focused validation.
 mod stream_transport;
 #[doc(hidden)]
 pub mod stream_validation;

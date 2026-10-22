@@ -88,10 +88,12 @@ client deadline. The agent may enforce a shorter deadline: the current
 `aster-agent` caps each RPC at 15 minutes, even when the client requests more.
 Query applies a fresh deadline to each page request, not to the whole query.
 The RPC timeout does not limit time spent entering a payload on stdin.
-It is also independent of the node-to-node profile-5 attempt: that protocol
-uses a two-minute authenticated-progress idle timeout and a size-derived hard
-deadline of `ceil(bytes / 128 KiB/s) + 20 minutes`, not a ten-minute
-normal-success timeout.
+It is also independent of the node-to-node profile-5 attempt. The two-minute
+authenticated-progress timeout is the shorter stall bound. The sender derives
+its hard deadline from exact canonical wire bytes; the receiver opens before
+authenticated OPEN and initially derives its hard deadline from the full
+profile wire ceiling. The legacy ten-minute constant is not a normal-success
+timeout.
 
 ## Publish and read Blobs
 

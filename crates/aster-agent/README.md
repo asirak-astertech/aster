@@ -151,8 +151,11 @@ The exact maxima are 65,536 plaintext bytes, 66,215 encoded-record bytes,
 1,048,576 batched-extent bytes, and 134,217,728 checkpoint bytes. Provisional
 uploads, pending receipts, and completed variants all use the configured
 canonical Blob depot limits; there is no independent stream pool.
-Its two-minute progress timeout and size-derived hard deadline (`ceil(bytes /
-128 KiB/s) + 20 minutes`) are independent of this agent's local RPC deadline.
+Its two-minute authenticated-progress timeout is the shorter stall bound. The
+sender derives the hard deadline from exact canonical wire bytes; because PLAN
+does not disclose size, the receiver opens transport before authenticated OPEN
+and derives its initial hard deadline from the full profile wire ceiling. Those
+network bounds are independent of this agent's local RPC deadline.
 Blob RPCs currently default to 15 minutes; other RPCs retain the 10-second
 default, and the server caps an explicitly requested RPC deadline at 15
 minutes. These are current implementation limits, not compatibility
