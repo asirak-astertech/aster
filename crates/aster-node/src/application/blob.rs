@@ -6619,106 +6619,6 @@ pub(crate) mod tests {
         (opened.token, request)
     }
 
-    fn install_legacy_stream_publication(node: &mut SelectedBlobNode, bytes: &[u8]) -> BlobId {
-        let operation = BlobOperationKey::new(b"blob/legacy-read-authority".to_vec())
-            .expect("legacy operation");
-        let stream_id = BlobPublicationStreamId::from_bytes([0x6d; 32]).expect("legacy stream id");
-        let open = aster_mesh::BlobStreamOpen::new(
-            stream_id,
-            node.identity(),
-            operation.as_bytes().to_vec(),
-            node.mission_authority(),
-            1,
-            aster_mesh::VersionVector::default(),
-            blob_topic(),
-            blob_scope(),
-            CoreBlobMetadata::new(Some("application/octet-stream".into()), Vec::new())
-                .expect("legacy metadata"),
-            Priority::Priority,
-            None,
-            None,
-            bytes.len() as u64,
-            1,
-            1,
-            node.verifier
-                .blob_stream_authorization_digest(&blob_scope(), 1)
-                .expect("legacy authorization digest"),
-            [0x7d; 32],
-        )
-        .expect("legacy stream open");
-        let authenticated_open = node
-            .verifier
-            .seal_blob_stream_open(&open)
-            .and_then(|sealed| node.verifier.verify_blob_stream_open(&sealed))
-            .expect("authenticate legacy stream open");
-        let policy = node
-            .current_policy("legacy stream fixture")
-            .expect("policy");
-        let (reservation, initial) = node
-            .store
-            .reserve_blob_stream_with_policy(
-                &policy,
-                aster_redb_store::BlobStreamReservationRequest {
-                    operation: &operation,
-                    source: aster_redb_store::BlobStreamSource::LocalApplication,
-                },
-                &authenticated_open,
-            )
-            .expect("reserve legacy stream");
-        let root = PinnedBlobPackRoot::open(&node.store).expect("legacy pack root");
-        let mut writer = BlobPackWriter::create_pinned(&root, authenticated_open.open())
-            .expect("legacy pack writer");
-        let sealer = node
-            .verifier
-            .blob_stream_segment_sealer(&authenticated_open)
-            .expect("legacy segment sealer");
-        let (segment, leaves) = sealer
-            .seal(
-                aster_mesh::BlobStreamPlainPartition::new(
-                    *stream_id.as_bytes(),
-                    authenticated_open.open().digest(),
-                    1,
-                    0,
-                    0,
-                    bytes.len() as u64,
-                    bytes.to_vec(),
-                )
-                .expect("legacy plaintext partition"),
-            )
-            .expect("seal legacy segment");
-        writer
-            .append(&segment, leaves)
-            .expect("append legacy segment");
-        let checkpoint = writer.checkpoint().expect("checkpoint legacy pack");
-        node.store
-            .checkpoint_blob_stream(&policy, &reservation, initial, checkpoint.clone())
-            .expect("project legacy checkpoint");
-        let roots = aster_mesh::BlobStreamFrontier::restore(checkpoint.frontier().clone())
-            .and_then(|frontier| frontier.finish(bytes.len() as u64))
-            .expect("legacy roots");
-        let commitment = aster_mesh::BlobStreamFinalCommitment::new(
-            &authenticated_open,
-            roots.0,
-            roots.1,
-            1,
-            None,
-        )
-        .expect("legacy final commitment");
-        let verified = node
-            .verifier
-            .seal_blob_stream_commitment(&commitment)
-            .and_then(|sealed| {
-                node.verifier
-                    .verify_blob_stream_commitment(&authenticated_open, &sealed)
-            })
-            .expect("authenticate legacy commitment");
-        let promoted = node
-            .store
-            .promote_blob_stream_with_policy(&policy, &reservation, &verified)
-            .expect("promote legacy publication");
-        BlobId::from_core(promoted.blob_id())
-    }
-
     fn finish_stream_read_fixture(
         node: &mut SelectedBlobNode,
         operation: &[u8],
@@ -6761,31 +6661,6 @@ pub(crate) mod tests {
             offset,
             max_bytes: 31,
         })
-    }
-
-    #[test]
-    #[ignore = "removed split-stream fixture; replace with canonical v9 authority in Task 11/12"]
-    fn legacy_stream_publication_is_not_a_plaintext_read_authority() {
-        // Break caught: the retired stream-publication namespace must never
-        // bypass the canonical BlobReadPlan authority used by every page.
-        let root = TestRoot::new("legacy-read-authority");
-        let mut node = selected_node(&root);
-        let id = install_legacy_stream_publication(&mut node, &payload(97));
-
-        let error = node
-            .read_page(BlobReadPageRequest {
-                blob: BlobReadRequest {
-                    id,
-                    topic: blob_topic(),
-                    scope: blob_scope(),
-                },
-                offset: 0,
-                max_bytes: 32,
-            })
-            .expect_err("legacy publication cannot supply plaintext");
-
-        assert_eq!(error.kind(), ApplicationErrorKind::NotFound);
-        assert_eq!(error.operation(), "blob read page");
     }
 
     #[test]

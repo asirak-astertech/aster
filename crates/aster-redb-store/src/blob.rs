@@ -47,11 +47,7 @@ use super::*;
 
 pub use depot::{AuthenticatedBlobReadDepot, BlobDepot, BlobDepotCompletion};
 pub use lease::{BlobLeaseLimitError, BlobLeaseLimits};
-pub use stream::{
-    BlobProfile5Receipt, BlobStreamConflictEvidence, BlobStreamInspection, BlobStreamPromotion,
-    BlobStreamPublication, BlobStreamReservation, BlobStreamReservationRequest, BlobStreamResume,
-    BlobStreamSource,
-};
+pub use stream::{BlobProfile5Receipt, BlobStreamResume};
 pub use upload::{BlobUploadCheckpoint, BlobUploadRequest, BlobUploadReservation};
 
 pub(crate) const BLOB_PUBLICATIONS: TableDefinition<&[u8], &[u8]> =
@@ -10395,10 +10391,10 @@ fn variant_has_valid_reference_write(
     let evidence = {
         let references = write.open_table(lifecycle::BLOB_VARIANT_REFERENCES)?;
         let Some((key, value)) = references.range(start..)?.next().transpose()? else {
-            return stream::variant_has_publication_write(write, variant);
+            return Ok(false);
         };
         if !key.value().starts_with(start) {
-            return stream::variant_has_publication_write(write, variant);
+            return Ok(false);
         }
         MaintenanceReferenceEvidence {
             key: key.value().to_vec(),
@@ -15599,6 +15595,57 @@ pub(crate) fn blob_schema_present_write(
         .map(|field| metadata.get(*field).map(|value| value.is_some()))
         .collect::<Result<Vec<_>, _>>()?;
     drop(metadata);
+    if stream_present != 0 && stream_present != stream_tables.len() {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "mission-scoped Blob schema group is incomplete",
+        )));
+    }
+    let stream_complete_empty = if stream_present == stream_tables.len() {
+        let empty = write.open_table(BLOB_STREAM_RESERVATIONS)?.len()? == 0
+            && write.open_table(BLOB_STREAM_OPERATIONS)?.len()? == 0
+            && write.open_table(BLOB_STREAM_PUBLICATIONS)?.len()? == 0
+            && write.open_table(BLOB_STREAM_CONFLICTS)?.len()? == 0
+            && write.open_table(BLOB_STREAM_VARIANTS)?.len()? == 0
+            && write.open_table(BLOB_STREAM_RETIREMENTS)?.len()? == 0;
+        if !empty {
+            return Err(blob_error(
+                BlobStoreError::UnsupportedExperimentalBlobStreamSchema,
+            ));
+        }
+        true
+    } else {
+        false
+    };
+    if legacy_present == 0
+        && network_present == 0
+        && !upload_present
+        && global_present.iter().all(|present| !present)
+        && stream_complete_empty
+    {
+        lifecycle::require_blob_lifecycle_absent_write(write)?;
+        deletion::require_blob_deletion_absent_write(write)?;
+        for table in [
+            BLOB_STREAM_RESERVATIONS,
+            BLOB_STREAM_OPERATIONS,
+            BLOB_STREAM_PUBLICATIONS,
+            BLOB_STREAM_CONFLICTS,
+            BLOB_STREAM_VARIANTS,
+            BLOB_STREAM_RETIREMENTS,
+        ] {
+            if !write.delete_table(table)? {
+                return Err(blob_error(BlobStoreError::SchemaInvariant(
+                    "experimental Blob stream schema changed during migration",
+                )));
+            }
+        }
+        #[cfg(test)]
+        if TEST_BLOB_SCHEMA_MIGRATION_FAULT.get() == 1 {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "injected Blob schema cleanup abort",
+            )));
+        }
+        return Ok(false);
+    }
     if legacy_present == 0
         && network_present == 0
         && stream_present == 0
@@ -15612,25 +15659,13 @@ pub(crate) fn blob_schema_present_write(
     if legacy_present != legacy.len()
         || !(network_present == 0 || network_predecessor || network_current)
         || !extension_group_supported
-        || !(stream_present == 0 || stream_present == stream_tables.len())
         || global_present.iter().any(|present| !present)
     {
         return Err(blob_error(BlobStoreError::SchemaInvariant(
             "mission-scoped Blob schema group is incomplete",
         )));
     }
-    if stream_present == stream_tables.len() {
-        if write.open_table(BLOB_STREAM_RESERVATIONS)?.len()? != 0
-            || write.open_table(BLOB_STREAM_OPERATIONS)?.len()? != 0
-            || write.open_table(BLOB_STREAM_PUBLICATIONS)?.len()? != 0
-            || write.open_table(BLOB_STREAM_CONFLICTS)?.len()? != 0
-            || write.open_table(BLOB_STREAM_VARIANTS)?.len()? != 0
-            || write.open_table(BLOB_STREAM_RETIREMENTS)?.len()? != 0
-        {
-            return Err(blob_error(
-                BlobStoreError::UnsupportedExperimentalBlobStreamSchema,
-            ));
-        }
+    if stream_complete_empty {
         for table in [
             BLOB_STREAM_RESERVATIONS,
             BLOB_STREAM_OPERATIONS,
@@ -16508,8 +16543,30 @@ pub(crate) fn inspect_blob_tables_read(
             )));
         }
     };
+    if stream_present != 0 && stream_present != stream_tables.len() {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "mission-scoped Blob schema group is incomplete",
+        )));
+    }
+    let stream_complete_empty = if stream_present == stream_tables.len() {
+        let empty = read.open_table(BLOB_STREAM_RESERVATIONS)?.len()? == 0
+            && read.open_table(BLOB_STREAM_OPERATIONS)?.len()? == 0
+            && read.open_table(BLOB_STREAM_PUBLICATIONS)?.len()? == 0
+            && read.open_table(BLOB_STREAM_CONFLICTS)?.len()? == 0
+            && read.open_table(BLOB_STREAM_VARIANTS)?.len()? == 0
+            && read.open_table(BLOB_STREAM_RETIREMENTS)?.len()? == 0;
+        if !empty {
+            return Err(blob_error(
+                BlobStoreError::UnsupportedExperimentalBlobStreamSchema,
+            ));
+        }
+        true
+    } else {
+        false
+    };
     if legacy_present == 0
         && network_present == 0
+        && (stream_present == 0 || stream_complete_empty)
         && !upload_present
         && global_present.iter().all(|present| !present)
     {
@@ -16521,25 +16578,12 @@ pub(crate) fn inspect_blob_tables_read(
         || !(network_present == 0 || network_predecessor || network_current)
         || !extension_group_supported
         || global_present.iter().any(|present| !present)
-        || !(stream_present == 0 || stream_present == stream_tables.len())
     {
         return Err(blob_error(BlobStoreError::SchemaInvariant(
             "mission-scoped Blob schema group is incomplete",
         )));
     }
     drop(metadata);
-    if stream_present == stream_tables.len()
-        && (read.open_table(BLOB_STREAM_RESERVATIONS)?.len()? != 0
-            || read.open_table(BLOB_STREAM_OPERATIONS)?.len()? != 0
-            || read.open_table(BLOB_STREAM_PUBLICATIONS)?.len()? != 0
-            || read.open_table(BLOB_STREAM_CONFLICTS)?.len()? != 0
-            || read.open_table(BLOB_STREAM_VARIANTS)?.len()? != 0
-            || read.open_table(BLOB_STREAM_RETIREMENTS)?.len()? != 0)
-    {
-        return Err(blob_error(
-            BlobStoreError::UnsupportedExperimentalBlobStreamSchema,
-        ));
-    }
     if upload_present {
         upload::audit_blob_uploads_read(read)?;
     }
@@ -30987,6 +31031,150 @@ mod tests {
         let before = blob_table_name_set(&root.database);
         Store::inspect_existing(&root.database).expect("read-only audit accepts empty predecessor");
         assert_eq!(blob_table_name_set(&root.database), before);
+    }
+
+    fn stream_only_schema_fixture(path: &Path, count: usize, populated: bool) {
+        let database = Database::create(path).expect("create stream-only database");
+        let write = database.begin_write().expect("stream-only schema write");
+        let _ = write.open_table(METADATA).expect("metadata table");
+        for (index, definition) in [
+            BLOB_STREAM_RESERVATIONS,
+            BLOB_STREAM_OPERATIONS,
+            BLOB_STREAM_PUBLICATIONS,
+            BLOB_STREAM_CONFLICTS,
+            BLOB_STREAM_VARIANTS,
+            BLOB_STREAM_RETIREMENTS,
+        ]
+        .into_iter()
+        .take(count)
+        .enumerate()
+        {
+            let mut table = write.open_table(definition).expect("stream table");
+            if populated && index == 0 {
+                table
+                    .insert([0x31; 32].as_slice(), [0x41; 3].as_slice())
+                    .expect("experimental stream row");
+            }
+        }
+        write.commit().expect("commit stream-only schema");
+    }
+
+    fn stream_only_snapshot(path: &Path) -> (BTreeSet<String>, Vec<Vec<(Vec<u8>, Vec<u8>)>>) {
+        let database = redb::Builder::new()
+            .open_read_only(path)
+            .expect("open stream-only snapshot");
+        let read = database.begin_read().expect("read stream-only snapshot");
+        let names = read
+            .list_tables()
+            .expect("stream-only table names")
+            .map(|table| table.name().to_owned())
+            .collect();
+        let rows = [
+            BLOB_STREAM_RESERVATIONS,
+            BLOB_STREAM_OPERATIONS,
+            BLOB_STREAM_PUBLICATIONS,
+            BLOB_STREAM_CONFLICTS,
+            BLOB_STREAM_VARIANTS,
+            BLOB_STREAM_RETIREMENTS,
+        ]
+        .into_iter()
+        .filter_map(|definition| {
+            read.open_table(definition).ok().map(|table| {
+                table
+                    .iter()
+                    .expect("stream-only rows")
+                    .map(|row| {
+                        let (key, value) = row.expect("stream-only row");
+                        (key.value().to_vec(), value.value().to_vec())
+                    })
+                    .collect()
+            })
+        })
+        .collect();
+        (names, rows)
+    }
+
+    #[test]
+    fn stream_only_experimental_schema_is_classified_before_whole_absent() {
+        for (label, count, populated, unsupported) in [
+            ("partial", 1, false, false),
+            ("complete-nonempty", 6, true, true),
+        ] {
+            let root = BlobTestRoot::new(&format!("stream-only-{label}"));
+            stream_only_schema_fixture(&root.database, count, populated);
+            let before = stream_only_snapshot(&root.database);
+            {
+                let database = redb::Builder::new()
+                    .open_read_only(&root.database)
+                    .expect("read-only stream-only database");
+                let error = match inspect_blob_tables_read(&database.begin_read().unwrap()) {
+                    Ok(_) => panic!("read-only stream-only schema must fail closed"),
+                    Err(error) => error,
+                };
+                assert_eq!(
+                    matches!(
+                        error,
+                        StoreError::Blob(BlobStoreError::UnsupportedExperimentalBlobStreamSchema)
+                    ),
+                    unsupported
+                );
+            }
+            assert_eq!(stream_only_snapshot(&root.database), before);
+            {
+                let database = Database::open(&root.database).expect("writable stream-only db");
+                let write = database.begin_write().expect("stream-only audit write");
+                let error = blob_schema_present_write(&write)
+                    .expect_err("writable stream-only schema rejection");
+                assert_eq!(
+                    matches!(
+                        error,
+                        StoreError::Blob(BlobStoreError::UnsupportedExperimentalBlobStreamSchema)
+                    ),
+                    unsupported
+                );
+            }
+            assert_eq!(stream_only_snapshot(&root.database), before);
+        }
+
+        let root = BlobTestRoot::new("stream-only-complete-empty");
+        stream_only_schema_fixture(&root.database, 6, false);
+        let before = stream_only_snapshot(&root.database);
+        {
+            let database = redb::Builder::new()
+                .open_read_only(&root.database)
+                .expect("read-only complete-empty stream database");
+            assert_eq!(
+                inspect_blob_tables_read(&database.begin_read().unwrap())
+                    .expect("read-only complete-empty predecessor")
+                    .stats,
+                BlobStoreStats::default()
+            );
+        }
+        assert_eq!(stream_only_snapshot(&root.database), before);
+        {
+            let database = Database::open(&root.database).expect("faulted complete-empty db");
+            let write = database
+                .begin_write()
+                .expect("faulted complete-empty migration");
+            TEST_BLOB_SCHEMA_MIGRATION_FAULT.set(1);
+            assert_blob_schema_invariant(
+                &blob_schema_present_write(&write).expect_err("injected stream-only cleanup"),
+            );
+            TEST_BLOB_SCHEMA_MIGRATION_FAULT.set(0);
+        }
+        assert_eq!(stream_only_snapshot(&root.database), before);
+        {
+            let database = Database::open(&root.database).expect("writable complete-empty db");
+            let write = database.begin_write().expect("complete-empty migration");
+            assert!(!blob_schema_present_write(&write).expect("remove empty split group"));
+            write.commit().expect("commit split cleanup");
+        }
+        let after = blob_table_name_set(&root.database);
+        assert!(
+            stream_blob_table_names()
+                .iter()
+                .all(|name| !after.contains(*name))
+        );
     }
 
     #[test]

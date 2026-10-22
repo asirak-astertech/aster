@@ -25,7 +25,7 @@ const PACK_VERSION: u16 = 2;
 const PACK_FILE: &str = "segments.pack";
 const CHECKPOINT_ZERO: &str = "checkpoint.0";
 const CHECKPOINT_ONE: &str = "checkpoint.1";
-const PACK_HEADER_LEN: u64 = 8 + 2 + 32 + 32 + 8;
+pub(super) const PACK_HEADER_LEN: u64 = 8 + 2 + 32 + 32 + 8;
 const MAX_RECORD_BYTES: usize = 2 * 1024 * 1024;
 const PACK_FIXED_RESERVATION_BYTES: u64 = 64 * 1024;
 const UPLOAD_MARKER: &str = ".aster-upload-v1";
@@ -129,6 +129,13 @@ impl PinnedBlobPackRoot {
             directory: open_blob_pack_root(store)?,
             authority: Arc::clone(&store.blob_completion_authority),
         })
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_upload_path(&self, identity: &BlobPackIdentity) -> PathBuf {
+        self.directory
+            .path()
+            .join(hex32(identity.upload_id.as_bytes()))
     }
 
     fn stream_id(
@@ -270,20 +277,137 @@ fn pack_marker_store_error(error: BlobPackError) -> StoreError {
     }
 }
 
+#[derive(Clone, Debug)]
+pub(super) struct ExpectedBlobUploadPack {
+    pub(super) identity: BlobPackIdentity,
+    pub(super) checkpoint: Option<BlobPackCheckpoint>,
+}
+
+fn audit_expected_upload_pack(
+    directory: &OwnedDirectory,
+    expected: &ExpectedBlobUploadPack,
+) -> Result<(), StoreError> {
+    let mut data = directory
+        .open_private_read_file_if_present(PACK_FILE)?
+        .ok_or_else(|| {
+            blob_error(BlobStoreError::DepotIntegrity(
+                "Blob upload pack data is unavailable",
+            ))
+        })?;
+    validate_header(&mut data, expected.identity).map_err(pack_marker_store_error)?;
+    let data_len = data
+        .metadata()
+        .map_err(BlobStoreError::Io)
+        .map_err(blob_error)?
+        .len();
+    let mut checkpoints = Vec::new();
+    for name in [CHECKPOINT_ZERO, CHECKPOINT_ONE] {
+        let Some(bytes) = directory.read_private_file_if_present(name, 16 * 1024)? else {
+            continue;
+        };
+        let Ok(checkpoint) = BlobPackCheckpoint::decode(&bytes) else {
+            continue;
+        };
+        if checkpoint.open_digest == expected.identity.request_digest
+            && checkpoint.stream_id == expected.identity.upload_id
+            && checkpoint.total_len == expected.identity.total_len
+            && checkpoint.pack_len <= data_len
+        {
+            checkpoints.push(checkpoint);
+        }
+    }
+    let projected = match expected.checkpoint.as_ref() {
+        Some(projected) => checkpoints.iter().find(|candidate| *candidate == projected),
+        None => checkpoints.iter().find(|candidate| {
+            candidate.next_index() == 0
+                && candidate.plaintext_offset() == 0
+                && candidate.pack_len() == PACK_HEADER_LEN
+        }),
+    }
+    .ok_or_else(|| {
+        blob_error(BlobStoreError::DepotIntegrity(
+            "store-projected Blob upload checkpoint is unavailable",
+        ))
+    })?;
+    if data_len != projected.pack_len() {
+        return Err(blob_error(BlobStoreError::DepotIntegrity(
+            "Blob upload pack data boundary differs from its durable checkpoint",
+        )));
+    }
+    data.seek(SeekFrom::Start(PACK_HEADER_LEN))
+        .map_err(BlobStoreError::Io)
+        .map_err(blob_error)?;
+    let mut index = 0_u64;
+    let mut plaintext_offset = 0_u64;
+    while index < projected.next_index() {
+        let mut length = [0; 4];
+        data.read_exact(&mut length)
+            .map_err(BlobStoreError::Io)
+            .map_err(blob_error)?;
+        let length = u32::from_be_bytes(length) as usize;
+        if length == 0 || length > MAX_RECORD_BYTES {
+            return Err(blob_error(BlobStoreError::DepotIntegrity(
+                "Blob upload pack contains an invalid record length",
+            )));
+        }
+        let mut encoded = vec![0; length];
+        data.read_exact(&mut encoded)
+            .map_err(BlobStoreError::Io)
+            .map_err(blob_error)?;
+        let header = EncryptedBlobStreamSegment::inspect_encoded(&encoded).map_err(|_| {
+            blob_error(BlobStoreError::DepotIntegrity(
+                "Blob upload pack contains an invalid segment",
+            ))
+        })?;
+        if header.index() != index
+            || header.stream_id() != expected.identity.upload_id.as_bytes()
+            || header.open_digest() != &expected.identity.request_digest
+            || header.offset() != plaintext_offset
+            || header.total_len() != expected.identity.total_len
+        {
+            return Err(blob_error(BlobStoreError::DepotIntegrity(
+                "Blob upload pack segment differs from its durable checkpoint",
+            )));
+        }
+        plaintext_offset = plaintext_offset
+            .checked_add(u64::from(header.plaintext_len()))
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+        index += 1;
+    }
+    if plaintext_offset != projected.plaintext_offset()
+        || data
+            .stream_position()
+            .map_err(BlobStoreError::Io)
+            .map_err(blob_error)?
+            != data_len
+    {
+        return Err(blob_error(BlobStoreError::DepotIntegrity(
+            "Blob upload pack record boundary differs from its durable checkpoint",
+        )));
+    }
+    Ok(())
+}
+
 fn audit_upload_packs(
     depot_root: &OwnedDirectory,
-    expected: &[BlobPackIdentity],
-    reclaim_orphans: bool,
+    expected: &[ExpectedBlobUploadPack],
 ) -> Result<(), StoreError> {
     let Some(pack_root) = depot_root.open_child_directory_if_present(PACK_DIRECTORY)? else {
-        return Ok(());
+        return if expected.is_empty() {
+            Ok(())
+        } else {
+            Err(blob_error(BlobStoreError::DepotIntegrity(
+                "durable Blob upload pack root is missing",
+            )))
+        };
     };
+    let mut seen = std::collections::BTreeSet::new();
     for name in pack_root.entry_names()? {
         let directory = pack_root.open_child_directory(&name, false)?;
         let Some(marker) = directory.read_private_file_if_present(UPLOAD_MARKER, 80)? else {
-            // Legacy stream packs are transitional and intentionally outside
-            // provisional-upload authority in this task.
-            continue;
+            return Err(blob_error(BlobStoreError::DepotIntegrity(
+                "Blob upload pack marker is missing",
+            )));
         };
         let identity = decode_upload_marker(&marker).map_err(pack_marker_store_error)?;
         if name != hex32(identity.upload_id.as_bytes()) {
@@ -291,32 +415,44 @@ fn audit_upload_packs(
                 "Blob upload pack directory differs from its marker",
             )));
         }
-        if expected.contains(&identity) {
-            continue;
-        }
-        drop(directory);
-        if !reclaim_orphans {
+        let expected_pack = expected
+            .iter()
+            .find(|expected| expected.identity == identity)
+            .ok_or_else(|| {
+                blob_error(BlobStoreError::DepotIntegrity(
+                    "unexpected Blob upload pack has no durable authority",
+                ))
+            })?;
+        if !seen.insert(*identity.upload_id.as_bytes()) {
             return Err(blob_error(BlobStoreError::DepotIntegrity(
-                "orphaned Blob upload pack remains after charge release",
+                "duplicate Blob upload pack identity",
             )));
         }
-        remove_upload_pack_directory(&pack_root, &identity)?;
+        audit_expected_upload_pack(&directory, expected_pack)?;
+    }
+    if expected
+        .iter()
+        .any(|expected| !seen.contains(expected.identity.upload_id.as_bytes()))
+    {
+        return Err(blob_error(BlobStoreError::DepotIntegrity(
+            "durable Blob upload pack is missing",
+        )));
     }
     Ok(())
 }
 
 pub(super) fn audit_upload_packs_write(
     depot_root: &OwnedDirectory,
-    expected: &[BlobPackIdentity],
+    expected: &[ExpectedBlobUploadPack],
 ) -> Result<(), StoreError> {
-    audit_upload_packs(depot_root, expected, true)
+    audit_upload_packs(depot_root, expected)
 }
 
 pub(super) fn audit_upload_packs_read(
     depot_root: &OwnedDirectory,
-    expected: &[BlobPackIdentity],
+    expected: &[ExpectedBlobUploadPack],
 ) -> Result<(), StoreError> {
-    audit_upload_packs(depot_root, expected, false)
+    audit_upload_packs(depot_root, expected)
 }
 
 enum BlobPackRoot {

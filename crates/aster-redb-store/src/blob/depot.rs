@@ -3091,7 +3091,7 @@ pub(crate) fn audit_depot_write(
     let owner_binding =
         require_depot_owner_binding_write(write, store_path, backing_identity, owner_token)?;
     let deletion = super::deletion::audit_blob_deletion_write(write, Some(owner_binding))?;
-    let upload_packs = super::upload::upload_pack_identities_write(write)?;
+    let upload_packs = super::upload::upload_pack_expectations_write(write)?;
     if expected == BlobStoreStats::default() {
         if let Some(root) = OwnedDirectory::open_root_if_present(store_path)? {
             match root.read_owner_marker()? {
@@ -3106,6 +3106,10 @@ pub(crate) fn audit_depot_write(
                     )));
                 }
             }
+        } else if !upload_packs.is_empty() {
+            return Err(blob_error(BlobStoreError::DepotIntegrity(
+                "durable Blob upload depot root is missing",
+            )));
         }
         return Ok(());
     }
@@ -3134,9 +3138,9 @@ pub(crate) fn audit_depot_read(
     let owner_binding =
         require_depot_owner_binding_read(read, store_path, backing_identity, owner_token)?;
     let deletion = super::deletion::inspect_blob_deletion_read(read, Some(owner_binding))?;
-    let upload_packs = super::upload::upload_pack_identities_read(read)?;
+    let upload_packs = super::upload::upload_pack_expectations_read(read)?;
     let Some(root) = OwnedDirectory::open_root_if_present(store_path)? else {
-        if expected.variants == 0 {
+        if expected.variants == 0 && upload_packs.is_empty() {
             return Ok(());
         }
         return Err(blob_error(BlobStoreError::DepotIntegrity(
@@ -7049,6 +7053,55 @@ impl OwnedDirectory {
                 )));
             }
             Ok(Some(file))
+        }
+    }
+
+    pub(super) fn open_private_read_file_if_present(
+        &self,
+        name: &str,
+    ) -> Result<Option<File>, StoreError> {
+        require_relative_leaf_name(name)?;
+        #[cfg(unix)]
+        {
+            let descriptor = match rustix::fs::openat(
+                &self.file,
+                name,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            ) {
+                Ok(descriptor) => descriptor,
+                Err(error) if error == rustix::io::Errno::NOENT => return Ok(None),
+                Err(error)
+                    if error == rustix::io::Errno::LOOP
+                        || error == rustix::io::Errno::ISDIR
+                        || error == rustix::io::Errno::NOTDIR =>
+                {
+                    return Err(blob_error(BlobStoreError::DepotIntegrity(
+                        "Blob pack file was replaced by another filesystem type",
+                    )));
+                }
+                Err(error) => return Err(blob_error(BlobStoreError::Io(error.into()))),
+            };
+            let file = File::from(descriptor);
+            validate_private_pack_file(&file)?;
+            Ok(Some(file))
+        }
+        #[cfg(not(unix))]
+        {
+            match File::open(self.path.join(name)) {
+                Ok(file) => {
+                    if !file.metadata()?.is_file() {
+                        return Err(blob_error(BlobStoreError::DepotIntegrity(
+                            "Blob pack file is not regular",
+                        )));
+                    }
+                    Ok(Some(file))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(blob_error(BlobStoreError::Io(error))),
+            }
         }
     }
 

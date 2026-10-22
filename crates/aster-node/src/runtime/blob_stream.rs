@@ -44,14 +44,10 @@ use crate::{
     },
 };
 #[cfg(test)]
-use aster_mesh::{
-    BlobStreamOpen, BlobStreamSegmentOpener, NodeId, VerifiedBlobStreamFinalCommitment,
-    VerifiedBlobStreamOpen,
-};
+use aster_mesh::{BlobStreamOpen, BlobStreamSegmentOpener};
 #[cfg(test)]
-use aster_redb_store::{
-    BlobOperationKey, BlobStreamReservation, BlobStreamReservationRequest, BlobStreamSource,
-    pack::{BlobPackCheckpoint, BlobPackReader, BlobPackWriter, PinnedBlobPackRoot},
+use aster_redb_store::pack::{
+    BlobPackCheckpoint, BlobPackReader, BlobPackWriter, PinnedBlobPackRoot,
 };
 #[cfg(test)]
 use std::path::Path;
@@ -388,61 +384,6 @@ pub struct BlobNetworkReport {
     pub roots: ([u8; 32], [u8; 32]),
     pub checkpoints: u64,
     pub pipeline: Option<PipelineReport>,
-}
-
-#[cfg(test)]
-pub type BlobCommitmentVerifier = Arc<
-    dyn Fn(&VerifiedBlobStreamOpen, &[u8]) -> Result<VerifiedBlobStreamFinalCommitment, String>
-        + Send
-        + Sync,
->;
-
-#[cfg(test)]
-pub struct BlobReceiveStoreSession {
-    store: Arc<Store>,
-    policy: ControlPolicySnapshot,
-    open: VerifiedBlobStreamOpen,
-    authenticated_open: Vec<u8>,
-    operation: BlobOperationKey,
-    source: BlobStreamSource,
-    verify_commitment: BlobCommitmentVerifier,
-}
-
-#[cfg(test)]
-impl BlobReceiveStoreSession {
-    pub fn new(
-        store: Arc<Store>,
-        policy: ControlPolicySnapshot,
-        open: VerifiedBlobStreamOpen,
-        authenticated_open: Vec<u8>,
-        peer: NodeId,
-        verify_commitment: BlobCommitmentVerifier,
-    ) -> Result<Self, BlobNetworkError> {
-        let operation = BlobOperationKey::new(open.open().operation_key().to_vec())
-            .map_err(|error| failure("stream operation", error))?;
-        Ok(Self {
-            store,
-            policy,
-            open,
-            authenticated_open,
-            operation,
-            source: BlobStreamSource::AuthenticatedPeer(peer),
-            verify_commitment,
-        })
-    }
-
-    fn reserve(&self) -> Result<(BlobStreamReservation, BlobStreamResume), BlobNetworkError> {
-        self.store
-            .reserve_blob_stream_with_policy(
-                &self.policy,
-                BlobStreamReservationRequest {
-                    operation: &self.operation,
-                    source: self.source,
-                },
-                &self.open,
-            )
-            .map_err(|error| lifecycle_failure("reserve stream", error))
-    }
 }
 
 fn failure(context: impl Into<String>, error: impl std::fmt::Display) -> BlobNetworkError {
@@ -2163,83 +2104,12 @@ pub(crate) async fn receive_completed_pack(
         PackAccess::Path(root),
         wire_len,
         limits,
-        None,
-        None,
         StreamDirection::ToSessionResponder,
         &mut codec,
     )
     .await
 }
 
-#[cfg(test)]
-pub(crate) async fn receive_completed_pack_with_store(
-    connection: Connection,
-    session: BlobReceiveStoreSession,
-    opener: BlobStreamSegmentOpener,
-    root: &Path,
-    wire_len: u64,
-    limits: PipelineLimits,
-) -> Result<BlobNetworkReport, BlobNetworkError> {
-    let open = session.open.open().clone();
-    let mut codec = PlainBlobRecordCodec;
-    let transport = select_stream_transport(connection)?;
-    receive_completed_pack_inner(
-        transport.as_ref(),
-        &open,
-        opener,
-        PackAccess::Path(root),
-        wire_len,
-        limits,
-        Some(session),
-        None,
-        StreamDirection::ToSessionResponder,
-        &mut codec,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-#[allow(dead_code)] // Task 5 supplies profile-5 source acceptance before this receiver.
-#[cfg(test)]
-pub(crate) async fn receive_completed_pack_with_store_protected(
-    connection: Connection,
-    mission: &mut MissionSession,
-    profile_digest: [u8; 32],
-    direction: EventDirection,
-    attempt_nonce: [u8; 32],
-    session: BlobReceiveStoreSession,
-    opener: BlobStreamSegmentOpener,
-    root: &PinnedBlobPackRoot,
-    wire_len: u64,
-    limits: PipelineLimits,
-) -> Result<BlobNetworkReport, BlobNetworkError> {
-    let open = session.open.open().clone();
-    let mut codec = MissionBlobRecordCodec {
-        mission,
-        profile_digest,
-        direction,
-        attempt_nonce,
-    };
-    let transport = select_stream_transport(connection)?;
-    receive_completed_pack_inner(
-        transport.as_ref(),
-        &open,
-        opener,
-        PackAccess::Pinned(root),
-        wire_len,
-        limits,
-        Some(session),
-        Some(attempt_nonce),
-        match direction {
-            EventDirection::ToSessionInitiator => StreamDirection::ToSessionInitiator,
-            EventDirection::ToSessionResponder => StreamDirection::ToSessionResponder,
-        },
-        &mut codec,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
 #[cfg(test)]
 async fn receive_completed_pack_inner(
     transport: &dyn StreamTransportAdapter,
@@ -2248,8 +2118,6 @@ async fn receive_completed_pack_inner(
     root: PackAccess<'_>,
     wire_len: u64,
     limits: PipelineLimits,
-    store_session: Option<BlobReceiveStoreSession>,
-    planned_nonce: Option<[u8; 32]>,
     direction: StreamDirection,
     codec: &mut dyn BlobRecordCodec,
 ) -> Result<BlobNetworkReport, BlobNetworkError> {
@@ -2273,30 +2141,19 @@ async fn receive_completed_pack_inner(
     let StreamFrame::Open(transfer_open) = codec.decode(&frame)? else {
         return Err("first data frame was not open".into());
     };
-    let authenticated_source =
-        receive_authenticated_source(attempt.as_ref(), codec, &transfer_open).await?;
+    receive_authenticated_source(attempt.as_ref(), codec, &transfer_open).await?;
     if transfer_open.class != StreamClass::Blob
         || transfer_open.direction != direction
         || transfer_open.total_len != wire_len
         || transfer_open.session_transcript != open.digest()
         || transfer_open.publication_id != *open.stream_id().as_bytes()
-        || store_session
-            .as_ref()
-            .is_some_and(|session| session.authenticated_open != authenticated_source)
-        || planned_nonce.is_some_and(|nonce| nonce != transfer_open.attempt_nonce)
     {
         return Err(authentication_failure(
             "validate transport open",
             "open differs from authenticated Blob open",
         ));
     }
-    let mut store_state = store_session
-        .as_ref()
-        .map(BlobReceiveStoreSession::reserve)
-        .transpose()?;
-    let resume = store_state
-        .as_ref()
-        .map_or_else(BlobStreamResume::default, |(_, resume)| *resume);
+    let resume = BlobStreamResume::default();
     let durable_wire = resume.durable_wire_offset();
     let resumed_from = durable_wire;
     let mut writer = root.projected_writer(open, resume)?;
@@ -2417,19 +2274,6 @@ async fn receive_completed_pack_inner(
                         "verification pipeline closed before checkpoint",
                     )
                 })?;
-                if let (Some(session), Some((reservation, resume))) =
-                    (store_session.as_ref(), store_state.as_mut())
-                {
-                    *resume = session
-                        .store
-                        .checkpoint_blob_stream(
-                            &session.policy,
-                            reservation,
-                            *resume,
-                            progress.checkpoint.clone(),
-                        )
-                        .map_err(|error| durability_failure("project durable checkpoint", error))?;
-                }
                 send_durable_checkpoint(
                     &attempt,
                     &mut state,
@@ -2461,30 +2305,13 @@ async fn receive_completed_pack_inner(
     let StreamFrame::Finish(finish) = codec.decode(&finish)? else {
         return Err("terminal data frame was not finish".into());
     };
-    let semantic_commitment = finish.semantic_commitment.clone();
     let StreamAction::Promote = state
         .finish(finish)
         .map_err(|error| failure("finish receiver state", error))?
     else {
         return Err("receiver did not reach promotion".into());
     };
-    let result_code = if let (Some(session), Some((reservation, _))) =
-        (store_session.as_ref(), store_state.as_ref())
-    {
-        let commitment = (session.verify_commitment)(&session.open, &semantic_commitment)
-            .map_err(|error| verification_failure("verify final commitment", error))?;
-        let promotion = session
-            .store
-            .promote_blob_stream_with_policy(&session.policy, reservation, &commitment)
-            .map_err(|error| lifecycle_failure("promote stream", error))?;
-        if promotion.duplicate() {
-            StreamResultCode::AlreadyPresent
-        } else {
-            StreamResultCode::Promoted
-        }
-    } else {
-        StreamResultCode::Promoted
-    };
+    let result_code = StreamResultCode::Promoted;
     let digest = result_digest(open, roots);
     let StreamAction::Send(result) = state
         .promoted(result_code, digest)
@@ -2545,10 +2372,10 @@ pub(crate) mod tests {
     };
     use aster_iroh::{CarrierSecurityProfile, Endpoint, EndpointConfig, ExpectedPeer, SecretKey};
     use aster_mesh::{
-        BLOB_STREAM_SEGMENT_BYTES, BlobMetadata, BlobPublicationStreamId,
-        BlobStreamFinalCommitment, BlobStreamOpen, BlobStreamSegmentOpener,
-        BlobStreamSegmentSealer, Priority, ProvisioningAccess, ProvisioningBundle,
-        ReferenceEnvelopeSealer, ReferenceProvisioner, Scope, Topic, VersionVector,
+        BLOB_STREAM_SEGMENT_BYTES, BlobMetadata, BlobPublicationStreamId, BlobStreamOpen,
+        BlobStreamSegmentOpener, BlobStreamSegmentSealer, Priority, ProvisioningAccess,
+        ProvisioningBundle, ReferenceEnvelopeSealer, ReferenceProvisioner, Scope, Topic,
+        VersionVector,
     };
     use std::{
         collections::BTreeSet,
@@ -3627,8 +3454,6 @@ pub(crate) mod tests {
             PackAccess::Path(&receiver_root.0),
             wire_len,
             limits,
-            None,
-            None,
             StreamDirection::ToSessionResponder,
             &mut receiver_codec,
         );
@@ -3708,8 +3533,6 @@ pub(crate) mod tests {
             PackAccess::Path(&receiver_root.0),
             wire_len,
             limits,
-            None,
-            None,
             StreamDirection::ToSessionResponder,
             &mut receiver_codec,
         );
@@ -3861,210 +3684,6 @@ pub(crate) mod tests {
                 .completed_items(),
             published.segment_count
         );
-        client.close().await;
-        server.close().await;
-    }
-
-    #[tokio::test]
-    #[ignore = "removed split-stream fixture; replace with canonical v9 authority in Task 11/12"]
-    async fn receiver_projects_pack_checkpoints_and_promotes_through_store() {
-        let source_root = TempRoot::new("store-source");
-        let receiver_root = TempRoot::new("store-receiver");
-        let total_len = 2 * BLOB_STREAM_SEGMENT_BYTES + 17;
-        let topic = Topic::new("imagery").unwrap();
-        let scope = Scope::new("mission/alpha").unwrap();
-        let access =
-            ProvisioningAccess::member(scope.clone(), vec![1], vec![topic.clone()]).unwrap();
-        let mut provisioner = ReferenceProvisioner::from_seed([0x84; 32]).unwrap();
-        let provider = Arc::new(
-            ReferenceEnvelopeSealer::open(
-                provisioner.issue_control_authority(1, &[access]).unwrap(),
-            )
-            .unwrap(),
-        );
-        let open = BlobStreamOpen::new(
-            BlobPublicationStreamId::from_bytes([0x85; 32]).unwrap(),
-            provider.identity(),
-            b"network-store-session".to_vec(),
-            provider.mission_authority_id(),
-            1,
-            VersionVector::default(),
-            topic,
-            scope.clone(),
-            BlobMetadata::new(Some("application/octet-stream".into()), Vec::new()).unwrap(),
-            Priority::Immediate,
-            None,
-            None,
-            total_len as u64,
-            1,
-            1,
-            provider
-                .blob_stream_authorization_digest(&scope, 1)
-                .unwrap(),
-            [0x86; 32],
-        )
-        .unwrap();
-        let signed_open = provider.seal_blob_stream_open(&open).unwrap();
-        let verified_open = provider.verify_blob_stream_open(&signed_open).unwrap();
-        let limits = PipelineLimits::new(2, 4, 5 * 1024 * 1024, 4).unwrap();
-        let published = publish_blob_stream(
-            std::io::Cursor::new(vec![0x5d; total_len]),
-            verified_open.open(),
-            provider.blob_stream_segment_sealer(&verified_open).unwrap(),
-            &source_root.0,
-            limits,
-        )
-        .await
-        .unwrap();
-        let roots = (published.plaintext_root, published.ciphertext_root);
-        let commitment = BlobStreamFinalCommitment::new(
-            &verified_open,
-            roots.0,
-            roots.1,
-            published.segment_count,
-            None,
-        )
-        .unwrap();
-        let signed_commitment = provider.seal_blob_stream_commitment(&commitment).unwrap();
-        let wire_len = completed_pack_wire_len(&source_root.0, verified_open.open()).unwrap();
-        let store = Arc::new(
-            Store::open_for_mission(
-                receiver_root.0.join("state.redb"),
-                provider.mission_authority_id(),
-            )
-            .unwrap(),
-        );
-        let policy = store.control_policy_snapshot().unwrap();
-        let receiver_pack = receiver_root.0.join("pack");
-        let operation =
-            BlobOperationKey::new(verified_open.open().operation_key().to_vec()).unwrap();
-        let (reservation, initial) = store
-            .reserve_blob_stream_with_policy(
-                &policy,
-                BlobStreamReservationRequest {
-                    operation: &operation,
-                    source: BlobStreamSource::AuthenticatedPeer(provider.identity()),
-                },
-                &verified_open,
-            )
-            .unwrap();
-        let mut source_reader = BlobPackReader::open(&source_root.0, verified_open.open()).unwrap();
-        let first_segment = source_reader.next_segment().unwrap().unwrap();
-        let (_, first_leaves) = provider
-            .blob_stream_segment_opener(&verified_open)
-            .unwrap()
-            .open(&first_segment)
-            .unwrap();
-        let mut partial_writer =
-            BlobPackWriter::create(&receiver_pack, verified_open.open()).unwrap();
-        partial_writer.append(&first_segment, first_leaves).unwrap();
-        let partial_checkpoint = partial_writer.checkpoint().unwrap();
-        let partial_resume = store
-            .checkpoint_blob_stream(&policy, &reservation, initial, partial_checkpoint.clone())
-            .unwrap();
-        assert_eq!(partial_resume.next_segment_index(), 1);
-        assert_eq!(
-            partial_resume.durable_wire_offset(),
-            partial_checkpoint.payload_len()
-        );
-        let second_segment = source_reader.next_segment().unwrap().unwrap();
-        let (_, second_leaves) = provider
-            .blob_stream_segment_opener(&verified_open)
-            .unwrap()
-            .open(&second_segment)
-            .unwrap();
-        partial_writer
-            .append(&second_segment, second_leaves)
-            .unwrap();
-        let unprojected_checkpoint = partial_writer.checkpoint().unwrap();
-        assert!(unprojected_checkpoint.generation() > partial_resume.generation());
-        drop(partial_writer);
-        let verifier = {
-            let provider = Arc::clone(&provider);
-            Arc::new(move |open: &VerifiedBlobStreamOpen, bytes: &[u8]| {
-                provider
-                    .verify_blob_stream_commitment(open, bytes)
-                    .map_err(|error| error.to_string())
-            }) as BlobCommitmentVerifier
-        };
-        let session = BlobReceiveStoreSession::new(
-            Arc::clone(&store),
-            policy,
-            verified_open.clone(),
-            signed_open.clone(),
-            provider.identity(),
-            verifier,
-        )
-        .unwrap();
-
-        let config = EndpointConfig::direct("127.0.0.1:0".parse().unwrap());
-        let server = Endpoint::bind_with_security_profile(
-            SecretKey::generate(),
-            config,
-            CarrierSecurityProfile::IrohQuicV1,
-        )
-        .await
-        .unwrap();
-        let client = Endpoint::bind_with_security_profile(
-            SecretKey::generate(),
-            config,
-            CarrierSecurityProfile::IrohQuicV1,
-        )
-        .await
-        .unwrap();
-        let address = server
-            .bound_sockets()
-            .into_iter()
-            .find(std::net::SocketAddr::is_ipv4)
-            .unwrap();
-        let receiver = tokio::spawn({
-            let server = server.clone();
-            let allowed = BTreeSet::from([client.id()]);
-            let root = receiver_pack;
-            let opener = provider.blob_stream_segment_opener(&verified_open).unwrap();
-            async move {
-                let connection = server.accept(&allowed).await.unwrap();
-                receive_completed_pack_with_store(
-                    connection, session, opener, &root, wire_len, limits,
-                )
-                .await
-            }
-        });
-        let connection = client
-            .connect(ExpectedPeer {
-                id: server.id(),
-                address,
-            })
-            .await
-            .unwrap();
-        let sent = send_completed_pack(
-            connection,
-            verified_open.open(),
-            signed_open,
-            &source_root.0,
-            roots,
-            signed_commitment,
-        )
-        .await
-        .unwrap();
-        let received = receiver.await.unwrap().unwrap();
-
-        assert_eq!(sent.roots, roots);
-        assert_eq!(received.roots, roots);
-        assert_eq!(sent.resumed_from, partial_resume.durable_wire_offset());
-        assert_eq!(received.resumed_from, partial_resume.durable_wire_offset());
-        assert_eq!(
-            sent.attempt_bytes,
-            wire_len - partial_resume.durable_wire_offset()
-        );
-        assert_eq!(received.attempt_bytes, sent.attempt_bytes);
-        assert_eq!(
-            received.pipeline.as_ref().unwrap().completed_items(),
-            published.segment_count - 1
-        );
-        let publications = store.blob_stream_publications_with_policy(&policy).unwrap();
-        assert_eq!(publications.len(), 1);
-        assert_eq!(publications[0].blob_id(), commitment.blob_id());
         client.close().await;
         server.close().await;
     }
