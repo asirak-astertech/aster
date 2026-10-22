@@ -169,6 +169,10 @@ impl PartialEq for BlobPackVariant {
 impl Eq for BlobPackVariant {}
 
 impl BlobPackVariant {
+    pub const fn variant_id(&self) -> BlobVariantId {
+        self.variant_id
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         route_lineage: SourceRouteLineage,

@@ -205,6 +205,37 @@ impl BlobCustodyClaimV2 {
         if source_len == 0 || ttl_ms == 0 {
             return Err(BlobCustodyError::InvalidClaim);
         }
+        Self::from_authenticated_profile5_source(
+            authority,
+            source_transfer_id,
+            source_len,
+            source.item_id(),
+            source.blob_id(),
+            source.priority(),
+            ttl_ms,
+            prior_cumulative_age_ms,
+            sender_sample,
+        )
+    }
+
+    /// Constructs a custody claim for the native Profile-5 source grammar.
+    /// The caller must hold the unforgeable session authority and must have
+    /// already authenticated the signed stream open and retained pack source.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_authenticated_profile5_source(
+        authority: AuthenticatedBlobCustodySendContextV2,
+        source_transfer_id: BlobCustodyTransferId,
+        source_len: u64,
+        publication_id: [u8; 32],
+        blob_id: BlobId,
+        priority: Priority,
+        ttl_ms: u64,
+        prior_cumulative_age_ms: u64,
+        sender_sample: CustodySample,
+    ) -> Result<Self, BlobCustodyError> {
+        if source_len == 0 || publication_id == [0; 32] || ttl_ms == 0 {
+            return Err(BlobCustodyError::InvalidClaim);
+        }
         let hop_delta_ms = authority.finalization_charge_ms;
         let forwarding_age_ms = prior_cumulative_age_ms
             .checked_add(hop_delta_ms)
@@ -215,9 +246,9 @@ impl BlobCustodyClaimV2 {
             direction: authority.context.direction,
             source_transfer_id,
             source_len,
-            publication_id: source.item_id(),
-            blob_id: source.blob_id(),
-            priority: source.priority(),
+            publication_id,
+            blob_id,
+            priority,
             ttl_ms,
             prior_cumulative_age_ms,
             sender_sample,
@@ -241,6 +272,34 @@ impl BlobCustodyClaimV2 {
             .map_err(|_| BlobCustodyError::ContextMismatch)?;
         let expected_len =
             u64::try_from(exact_source_bytes.len()).map_err(|_| BlobCustodyError::InvalidClaim)?;
+        self.verify_authenticated_profile5_source(
+            contact,
+            exchange_id,
+            source_transfer_id,
+            expected_len,
+            source.item_id(),
+            source.blob_id(),
+            source.priority(),
+            source.ttl_ms().ok_or(BlobCustodyError::InvalidClaim)?,
+            minimum_cumulative_age_ms,
+        )
+    }
+
+    /// Verifies custody against identities derived from a signed native
+    /// Profile-5 open and final commitment.
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_authenticated_profile5_source(
+        &self,
+        contact: AuthenticatedBlobCustodyContactV2,
+        exchange_id: u64,
+        source_transfer_id: BlobCustodyTransferId,
+        source_len: u64,
+        publication_id: [u8; 32],
+        blob_id: BlobId,
+        priority: Priority,
+        ttl_ms: u64,
+        minimum_cumulative_age_ms: u64,
+    ) -> Result<VerifiedBlobCustodyClaimV2, BlobCustodyError> {
         if contact.context.semantic_version != SEMANTIC_VERSION
             || contact.context.profile != PROFILE_ID
             || contact.context.lane != BLOB_LANE_ID
@@ -249,12 +308,14 @@ impl BlobCustodyClaimV2 {
             || self.direction != contact.context.direction
             || self.exchange_id != exchange_id
             || self.source_transfer_id != source_transfer_id
-            || source_transfer_id.as_bytes() != &source.envelope_id()
-            || self.source_len != expected_len
-            || self.publication_id != source.item_id()
-            || self.blob_id != source.blob_id()
-            || self.priority != source.priority()
-            || Some(self.ttl_ms) != source.ttl_ms()
+            || source_len == 0
+            || publication_id == [0; 32]
+            || ttl_ms == 0
+            || self.source_len != source_len
+            || self.publication_id != publication_id
+            || self.blob_id != blob_id
+            || self.priority != priority
+            || self.ttl_ms != ttl_ms
             || self.forwarding_age_ms < minimum_cumulative_age_ms
         {
             return Err(BlobCustodyError::ContextMismatch);
@@ -491,6 +552,61 @@ mod tests {
         assert_eq!(claim.encode(), encoded);
         assert_eq!(claim.forwarding_age_ms(), 0);
         assert_eq!(claim.source_len(), 1);
+    }
+
+    #[test]
+    fn native_profile5_custody_binds_derived_source_identities() {
+        let transcript = [0x11; 32];
+        let nonce = [0x22; 32];
+        let context = ApplicationRecordContext::new_v9_blob(
+            [0x33; 32],
+            BlobCustodyDirectionV1::ToSessionResponder,
+            nonce,
+            0,
+        )
+        .unwrap();
+        let authority = AuthenticatedBlobCustodySendContextV2::from_authenticated_record(
+            transcript, 1, context, 7,
+        );
+        let transfer = BlobCustodyTransferId::from_exact_hash([0x44; 32]);
+        let publication = [0x55; 32];
+        let blob = BlobId::from_bytes([0x66; 32]);
+        let claim = BlobCustodyClaimV2::from_authenticated_profile5_source(
+            authority,
+            transfer,
+            4096,
+            publication,
+            blob,
+            Priority::Immediate,
+            60_000,
+            11,
+            CustodySample {
+                clock_id: [0x77; 16],
+                tick_ms: 23,
+            },
+        )
+        .unwrap();
+        let contact = AuthenticatedBlobCustodyContactV2::from_opened_record(
+            transcript,
+            context,
+            claim.digest(),
+        );
+        let verified = claim
+            .verify_authenticated_profile5_source(
+                contact,
+                1,
+                transfer,
+                4096,
+                publication,
+                blob,
+                Priority::Immediate,
+                60_000,
+                11,
+            )
+            .unwrap();
+        assert_eq!(verified.forwarding_age_ms(), 18);
+        assert_eq!(verified.publication_id(), publication);
+        assert_eq!(verified.source_transfer_id(), transfer);
     }
 
     #[test]

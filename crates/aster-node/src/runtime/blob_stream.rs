@@ -25,16 +25,17 @@ use crate::{
 };
 use aster_iroh::Connection;
 use aster_mesh::{
-    BlobContentVerification, BlobCustodyTransferId, BlobStreamFinalCommitment, BlobStreamOpen,
-    ContentVerifiedBlobEnvelope, ReferenceEnvelopeSealer, VerifiedBlobStreamOpen,
-    VerifiedBlobTransferPlan, profile5_canonical_wire_shape,
+    AuthenticatedBlobCustodyContactV2, BlobContentVerification, BlobCustodyClaimV2,
+    BlobCustodyTransferId, BlobStreamFinalCommitment, BlobStreamOpen, ContentVerifiedBlobEnvelope,
+    ReferenceEnvelopeSealer, VerifiedBlobStreamOpen, VerifiedBlobTransferPlan,
+    profile5_canonical_wire_shape,
 };
 use aster_redb_store::pack::{BlobPackWriter, PinnedBlobPackRoot};
 use aster_redb_store::{
     ApplyOutcome, BlobDepotCompletion, BlobOperationKey, BlobOperationOwner, BlobSourceProjection,
     BlobSourceRetention, BlobSourceStageOutcome, BlobStreamResume, BlobTransferId,
     BlobUploadCheckpoint, BlobUploadReservation, BlobVariantId, ControlPolicySnapshot, Store,
-    StoredBlob, profile5_pack_identities,
+    StoredBlob, profile5_pack_identities, profile5_pack_source_record_len,
 };
 use sha2::{Digest, Sha256};
 use std::{collections::VecDeque, future::Future, sync::Arc};
@@ -1697,7 +1698,22 @@ fn require_native_profile5_send_source(
     let mut authorized = false;
     store
         .visit_retained_blob_sources(Some(policy), |retained| {
-            if retained.source == source.projection
+            let current = &retained.source;
+            let selected = &source.projection;
+            if current.transfer_id == selected.transfer_id
+                && current.semantic_id == selected.semantic_id
+                && current.publisher == selected.publisher
+                && current.topic == selected.topic
+                && current.scope == selected.scope
+                && current.epoch == selected.epoch
+                && current.sealed_len == selected.sealed_len
+                && current.route_lineage == selected.route_lineage
+                && current.physical_lineage == selected.physical_lineage
+                && current.manifest_digest == selected.manifest_digest
+                && current.blob_id == selected.blob_id
+                && current.total_len == selected.total_len
+                && current.chunk_size == selected.chunk_size
+                && current.chunk_count == selected.chunk_count
                 && retained.retention == source.retention
                 && retained.source.transfer_id == source.stored.transfer_id
                 && matches!(
@@ -1753,12 +1769,6 @@ async fn send_native_profile5_pack(
     direction: EventDirection,
     attempt_nonce: [u8; 32],
 ) -> Result<BlobNetworkReport, BlobNetworkError> {
-    if source.open.open().ttl_ms().is_some() {
-        return Err(lifecycle_failure(
-            "send native Profile-5 pack",
-            "finite-lifetime native pack transfer requires imported custody authority",
-        ));
-    }
     let open_value = source.open.open();
     let expected_wire = blob_pack_wire_len(open_value.total_len())
         .map_err(|error| failure("calculate native Profile-5 wire length", error))?;
@@ -1798,6 +1808,85 @@ async fn send_native_profile5_pack(
     )
     .await?;
     let mut cancellation = SenderDataCancellation::new(Arc::clone(&attempt));
+    let finite_custody = if open_value.ttl_ms().is_some() {
+        let exact_len = u64::try_from(source.stored.sealed.len())
+            .map_err(|_| "finite native Profile-5 source length overflows")?;
+        let charge = super::custody_finalization_charge_ms(exact_len)
+            .map_err(|error| lifecycle_failure("bound native Profile-5 custody age", error))?;
+        let context = session
+            .mint_blob_custody_send_context_v2(direction, 1, attempt_nonce, charge)
+            .map_err(|error| {
+                authentication_failure("authorize native Profile-5 custody record", error)
+            })?;
+        let sample = super::contact_custody_sample()
+            .map_err(|error| lifecycle_failure("sample native Profile-5 custody clock", error))?
+            .ok_or_else(|| {
+                lifecycle_failure("sample native Profile-5 custody clock", "clock unavailable")
+            })?;
+        let current = store
+            .blob_source_projection(source.stored.transfer_id)
+            .map_err(|error| lifecycle_failure("refresh finite native Profile-5 source", error))?
+            .ok_or_else(|| {
+                lifecycle_failure(
+                    "refresh finite native Profile-5 source",
+                    "publication is no longer visible",
+                )
+            })?;
+        let pack = store
+            .open_profile5_pack_transfer_read(source.stored.variant_id)
+            .map_err(|error| durability_failure("open finite native Profile-5 pack", error))?;
+        let authorization = store
+            .authorize_finite_profile5_pack_send_v2_with_policy(
+                policy,
+                &source.stored,
+                &current.source,
+                current.retention,
+                &source.open,
+                &pack,
+                context,
+                sample,
+            )
+            .map_err(|error| lifecycle_failure("authorize finite native Profile-5 source", error))?
+            .ok_or_else(|| {
+                lifecycle_failure("authorize finite native Profile-5 source", "source expired")
+            })?;
+        let (claim, prepared) = authorization.into_profile5_claim().map_err(|error| {
+            authentication_failure("construct native Profile-5 custody claim", error)
+        })?;
+        let custody_digest = claim.digest();
+        let custody_frame = session
+            .seal_blob_custody_frame_v2(profile_digest, direction, attempt_nonce, &claim)
+            .map_err(|error| {
+                authentication_failure("seal native Profile-5 custody claim", error)
+            })?;
+        let final_sample = super::contact_custody_sample()
+            .map_err(|error| lifecycle_failure("finalize native Profile-5 custody clock", error))?
+            .ok_or_else(|| {
+                lifecycle_failure(
+                    "finalize native Profile-5 custody clock",
+                    "clock unavailable",
+                )
+            })?;
+        if !store
+            .finalize_finite_profile5_pack_send_with_policy(
+                policy,
+                prepared,
+                &source.stored,
+                &source.open,
+                &pack,
+                final_sample,
+            )
+            .map_err(|error| lifecycle_failure("finalize finite native Profile-5 source", error))?
+        {
+            return Err(lifecycle_failure(
+                "finalize finite native Profile-5 source",
+                "source expired or changed before custody emission",
+            ));
+        }
+        Some((custody_frame, custody_digest))
+    } else {
+        None
+    };
     let stream_direction = match direction {
         EventDirection::ToSessionInitiator => StreamDirection::ToSessionInitiator,
         EventDirection::ToSessionResponder => StreamDirection::ToSessionResponder,
@@ -1814,7 +1903,7 @@ async fn send_native_profile5_pack(
         total_len: source.wire_len,
         attempt_nonce,
         checkpoint_generation: 0,
-        custody_digest: None,
+        custody_digest: finite_custody.as_ref().map(|(_, digest)| *digest),
         source_len: u32::try_from(source.open.authenticated_bytes().len()).map_err(|_| {
             BlobNetworkError::new(
                 BlobNetworkStage::Framing,
@@ -1830,6 +1919,13 @@ async fn send_native_profile5_pack(
         direction,
         attempt_nonce,
     };
+    if let Some((custody_frame, _)) = finite_custody {
+        await_authenticated_progress(
+            "send native Profile-5 custody authority",
+            attempt.send_data(&custody_frame),
+        )
+        .await?;
+    }
     await_authenticated_progress(
         "send native Profile-5 open",
         attempt.send_data(&codec.encode(StreamFrame::Open(transfer_open.clone()))?),
@@ -2269,12 +2365,13 @@ async fn receive_native_profile5_pack(
     transfer_open: StreamOpenV1,
     verified_open: VerifiedBlobStreamOpen,
     offer: &BlobStreamSourceOfferV1,
+    mut opened_custody: Option<(BlobCustodyClaimV2, AuthenticatedBlobCustodyContactV2)>,
 ) -> Result<BlobNetworkReport, BlobNetworkError> {
     let open = verified_open.open();
     let wire_len = blob_pack_wire_len(open.total_len())
         .map_err(|error| failure("calculate received Profile-5 pack length", error))?;
-    if offer.finite
-        || open.ttl_ms().is_some()
+    if (offer.finite != open.ttl_ms().is_some())
+        || (offer.finite != opened_custody.is_some())
         || open.publisher() == [0; 32]
         || open.topic() != &offer.topic
         || open.scope() != &offer.scope
@@ -2291,6 +2388,66 @@ async fn receive_native_profile5_pack(
     if let Some((blob, pack)) =
         existing_native_profile5_pack(&store, policy, &verified_open, &transfer_open)?
     {
+        if let Some((claim, authority)) = opened_custody.take() {
+            let ttl_ms = open.ttl_ms().ok_or_else(|| {
+                authentication_failure(
+                    "verify existing native Profile-5 custody claim",
+                    "durable source carried finite custody authority",
+                )
+            })?;
+            let verified = claim
+                .verify_authenticated_profile5_source(
+                    authority,
+                    1,
+                    BlobCustodyTransferId::from_exact_hash(*blob.transfer_id.as_bytes()),
+                    profile5_pack_source_record_len(
+                        pack.authenticated_open().len(),
+                        pack.authenticated_commitment().len(),
+                    )
+                    .map_err(|error| {
+                        authentication_failure(
+                            "verify existing native Profile-5 custody claim",
+                            error,
+                        )
+                    })?,
+                    *blob.semantic_id.as_bytes(),
+                    pack.commitment().blob_id(),
+                    open.priority(),
+                    ttl_ms,
+                    claim.prior_cumulative_age_ms(),
+                )
+                .map_err(|error| {
+                    authentication_failure("verify existing native Profile-5 custody claim", error)
+                })?;
+            if transfer_open.custody_digest != Some(verified.digest()) {
+                return Err(authentication_failure(
+                    "bind existing native Profile-5 custody claim",
+                    "OPEN custody digest differs from authenticated claim",
+                ));
+            }
+            let receiver_sample = super::contact_custody_sample()
+                .map_err(|error| {
+                    lifecycle_failure("sample existing native receiver custody clock", error)
+                })?
+                .ok_or_else(|| {
+                    lifecycle_failure(
+                        "sample existing native receiver custody clock",
+                        "clock unavailable",
+                    )
+                })?;
+            store
+                .admit_existing_finite_profile5_pack_with_policy(
+                    policy,
+                    &blob,
+                    &verified_open,
+                    &pack,
+                    verified,
+                    receiver_sample,
+                )
+                .map_err(|error| {
+                    lifecycle_failure("refresh existing native Profile-5 custody", error)
+                })?;
+        }
         return settle_existing_native_profile5_pack(
             attempt,
             codec,
@@ -2602,6 +2759,49 @@ async fn receive_native_profile5_pack(
             "transport OPEN differs from signed Profile-5 source",
         ));
     }
+    let imported_custody = if let Some((claim, authority)) = opened_custody {
+        let ttl_ms = open.ttl_ms().ok_or_else(|| {
+            authentication_failure(
+                "verify native Profile-5 custody claim",
+                "durable source carried finite custody authority",
+            )
+        })?;
+        let verified = claim
+            .verify_authenticated_profile5_source(
+                authority,
+                1,
+                BlobCustodyTransferId::from_exact_hash(*expected_transfer.as_bytes()),
+                profile5_pack_source_record_len(
+                    verified_open.authenticated_bytes().len(),
+                    finish.semantic_commitment.len(),
+                )
+                .map_err(|error| {
+                    authentication_failure("verify native Profile-5 custody claim", error)
+                })?,
+                *expected_semantic.as_bytes(),
+                commitment.blob_id(),
+                open.priority(),
+                ttl_ms,
+                claim.prior_cumulative_age_ms(),
+            )
+            .map_err(|error| {
+                authentication_failure("verify native Profile-5 custody claim", error)
+            })?;
+        if transfer_open.custody_digest != Some(verified.digest()) {
+            return Err(authentication_failure(
+                "bind native Profile-5 custody claim",
+                "OPEN custody digest differs from authenticated claim",
+            ));
+        }
+        let receiver_sample = super::contact_custody_sample()
+            .map_err(|error| lifecycle_failure("sample native receiver custody clock", error))?
+            .ok_or_else(|| {
+                lifecycle_failure("sample native receiver custody clock", "clock unavailable")
+            })?;
+        Some((verified, receiver_sample))
+    } else {
+        None
+    };
     let StreamAction::Promote = state
         .finish(finish)
         .map_err(|error| settlement_failure("finish native Profile-5 receiver", error))?
@@ -2640,12 +2840,22 @@ async fn receive_native_profile5_pack(
             &verified_commitment,
             lineage,
         )?;
-        finish_store.commit_profile5_upload_once_with_policy(
-            &finish_policy,
-            &finish_reservation,
-            &projected,
-            None,
-        )
+        match imported_custody {
+            Some((verified, receiver_sample)) => finish_store
+                .commit_received_profile5_upload_once_with_policy(
+                    &finish_policy,
+                    &finish_reservation,
+                    &projected,
+                    verified,
+                    receiver_sample,
+                ),
+            None => finish_store.commit_profile5_upload_once_with_policy(
+                &finish_policy,
+                &finish_reservation,
+                &projected,
+                None,
+            ),
+        }
     })
     .await
     .map_err(|error| failure("join native Profile-5 promotion", error))?
@@ -3233,6 +3443,7 @@ pub(crate) async fn receive_canonical_blob_profile5(
                 open,
                 native_open,
                 offer,
+                opened_custody,
             ))
             .await;
         }

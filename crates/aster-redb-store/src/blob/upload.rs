@@ -17,8 +17,8 @@ use crate::{
 };
 use aster_mesh::{
     BlobManifest, BlobMetadata, BlobPublicationStreamId, BlobStreamFinalCommitment,
-    BlobStreamLineage, BlobStreamOpen, NodeId, VerifiedBlobStreamFinalCommitment,
-    VerifiedBlobStreamOpen, local_blob_publication_stream_id,
+    BlobStreamLineage, BlobStreamOpen, NodeId, VerifiedBlobCustodyClaimV2,
+    VerifiedBlobStreamFinalCommitment, VerifiedBlobStreamOpen, local_blob_publication_stream_id,
 };
 use redb::{Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableHandle};
 use sha2::{Digest, Sha256};
@@ -66,6 +66,11 @@ const PROFILE5_UPLOAD_VERSION: u8 = 3;
 const UPLOAD_ID_DOMAIN: &[u8] = b"aster/blob-upload-id/v1\0";
 const UPLOAD_REQUEST_DOMAIN: &[u8] = b"aster/blob-upload-request/v1\0";
 const MAX_UPLOADS: u64 = super::MAX_BLOB_OPERATIONS;
+
+enum Profile5PromotionLifetime {
+    Local(Option<aster_mesh::CustodySample>),
+    Network(super::VerifiedFiniteBlobAdmission),
+}
 
 fn profile5_upload_capacity(total_len: u64) -> Result<BlobUploadCapacity, StoreError> {
     let segments = total_len
@@ -1941,12 +1946,54 @@ impl Store {
         expected: &BlobUploadCheckpoint,
         precommit_sample: Option<aster_mesh::CustodySample>,
     ) -> Result<super::BlobOnceOutcome, StoreError> {
+        self.commit_profile5_upload_once_with_lifetime(
+            policy,
+            reservation,
+            expected,
+            Profile5PromotionLifetime::Local(precommit_sample),
+        )
+    }
+
+    /// Promotes a received finite native pack using only authenticated v9
+    /// custody authority and a receiver-local monotonic clock sample.
+    #[doc(hidden)]
+    pub fn commit_received_profile5_upload_once_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        reservation: &BlobUploadReservation,
+        expected: &BlobUploadCheckpoint,
+        verified: VerifiedBlobCustodyClaimV2,
+        receiver_sample: aster_mesh::CustodySample,
+    ) -> Result<super::BlobOnceOutcome, StoreError> {
+        self.commit_profile5_upload_once_with_lifetime(
+            policy,
+            reservation,
+            expected,
+            Profile5PromotionLifetime::Network(
+                super::VerifiedFiniteBlobAdmission::from_verified_v2(verified, receiver_sample),
+            ),
+        )
+    }
+
+    fn commit_profile5_upload_once_with_lifetime(
+        &self,
+        policy: &ControlPolicySnapshot,
+        reservation: &BlobUploadReservation,
+        expected: &BlobUploadCheckpoint,
+        lifetime_authority: Profile5PromotionLifetime,
+    ) -> Result<super::BlobOnceOutcome, StoreError> {
         self.require_live()?;
         let authority = self.require_bound_mission()?;
         let owner_key = validate_reservation_capability(self, reservation)?;
-        if reservation.control_policy != *policy
-            || reservation.request.ttl_ms.is_some() != precommit_sample.is_some()
-        {
+        let lifetime_shape_matches = match &lifetime_authority {
+            Profile5PromotionLifetime::Local(precommit_sample) => {
+                reservation.request.ttl_ms.is_some() == precommit_sample.is_some()
+            }
+            Profile5PromotionLifetime::Network(admission) => {
+                reservation.request.ttl_ms == Some(admission.ttl_ms)
+            }
+        };
+        if reservation.control_policy != *policy || !lifetime_shape_matches {
             return Err(blob_error(BlobStoreError::ReservationChanged));
         }
         let completion = expected
@@ -2040,18 +2087,62 @@ impl Store {
         {
             return Err(blob_error(BlobStoreError::CompletionMismatch));
         }
-        let lifetime = match profile5.open.ttl_ms() {
-            None => super::BlobLifetime::Durable,
-            Some(ttl_ms) => super::BlobLifetime::Finite {
-                ttl_ms,
-                age: super::custody::LowerBoundAgeCheckpoint {
-                    cumulative_age_ms: 0,
-                    checkpoint: None,
-                    continuity_generation: 0,
-                    continuity_lost: true,
-                },
-                provenance: super::BlobFiniteProvenance::Local,
-            },
+        let (lifetime, local_samples) = match lifetime_authority {
+            Profile5PromotionLifetime::Local(precommit_sample) => {
+                let lifetime = match profile5.open.ttl_ms() {
+                    None => super::BlobLifetime::Durable,
+                    Some(ttl_ms) => super::BlobLifetime::Finite {
+                        ttl_ms,
+                        age: super::custody::LowerBoundAgeCheckpoint {
+                            cumulative_age_ms: 0,
+                            checkpoint: None,
+                            continuity_generation: 0,
+                            continuity_lost: true,
+                        },
+                        provenance: super::BlobFiniteProvenance::Local,
+                    },
+                };
+                (
+                    lifetime,
+                    profile5.open.initial_custody().zip(precommit_sample),
+                )
+            }
+            Profile5PromotionLifetime::Network(admission) => {
+                let source = pack.source_record()?;
+                let (transfer_id, semantic_id, _) = super::profile5_pack_identities(
+                    &profile5.open,
+                    &profile5.authenticated,
+                    pack.commitment(),
+                    pack.authenticated_commitment(),
+                )?;
+                if admission.source_transfer_id != *transfer_id.as_bytes()
+                    || admission.source_len
+                        != u64::try_from(source.len())
+                            .map_err(|_| StoreError::PayloadByteAccountingOverflow)?
+                    || admission.publication_id != *semantic_id.as_bytes()
+                    || admission.blob_id != completion.commitment().blob_id()
+                    || admission.priority != profile5.open.priority()
+                    || profile5.open.ttl_ms() != Some(admission.ttl_ms)
+                    || admission.forwarding_age_ms >= admission.ttl_ms
+                {
+                    return Err(blob_error(BlobStoreError::PendingSourceConflict));
+                }
+                let continuity =
+                    super::custody::observe_continuity_write(&write, admission.receiver_sample)?;
+                (
+                    super::BlobLifetime::Finite {
+                        ttl_ms: admission.ttl_ms,
+                        age: super::custody::LowerBoundAgeCheckpoint {
+                            cumulative_age_ms: admission.forwarding_age_ms,
+                            checkpoint: Some(continuity.sample()),
+                            continuity_generation: continuity.generation(),
+                            continuity_lost: false,
+                        },
+                        provenance: admission.provenance,
+                    },
+                    None,
+                )
+            }
         };
         let prepared = super::PreparedBlobPublication::from_profile5_pack(&pack, lifetime)?;
         let intent = super::BlobPublicationIntent::new_with_ttl(
@@ -2072,7 +2163,7 @@ impl Store {
             &request,
             &blob_reservation,
             prepared,
-            profile5.open.initial_custody().zip(precommit_sample),
+            local_samples,
             true,
         )
     }

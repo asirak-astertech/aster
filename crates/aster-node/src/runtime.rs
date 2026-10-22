@@ -48664,7 +48664,12 @@ mod tests {
         scope: &Scope,
         epoch: u64,
         plaintext: &[u8],
+        ttl_ms: Option<u64>,
     ) -> BlobTransferId {
+        let initial_custody = ttl_ms.map(|_| CustodySample {
+            clock_id: [0xd1; 16],
+            tick_ms: 10,
+        });
         let policy = store
             .control_policy_snapshot()
             .expect("native Profile-5 source policy");
@@ -48677,7 +48682,7 @@ mod tests {
             topic: topic.clone(),
             scope: scope.clone(),
             priority: Priority::Routine,
-            ttl_ms: None,
+            ttl_ms,
             media_type: Some("application/octet-stream".into()),
             schema_id: Vec::new(),
             total_len: plaintext.len() as u64,
@@ -48688,42 +48693,48 @@ mod tests {
             .expect("native Profile-5 source authorization");
         let mission = sealer.mission_authority_id();
         let (reservation, checkpoint, open) = store
-            .reserve_profile5_upload_with_policy(&policy, &request, None, |semantic, existing| {
-                assert!(existing.is_none(), "native test publication is new");
-                let open = aster_mesh::BlobStreamOpen::new(
-                    aster_mesh::local_blob_publication_stream_id(
+            .reserve_profile5_upload_with_policy(
+                &policy,
+                &request,
+                initial_custody,
+                |semantic, existing| {
+                    assert!(existing.is_none(), "native test publication is new");
+                    let open = aster_mesh::BlobStreamOpen::new(
+                        aster_mesh::local_blob_publication_stream_id(
+                            request.owner.publisher,
+                            request.owner.operation.as_bytes(),
+                        ),
                         request.owner.publisher,
-                        request.owner.operation.as_bytes(),
-                    ),
-                    request.owner.publisher,
-                    request.owner.operation.as_bytes().to_vec(),
-                    mission,
-                    semantic.counter(),
-                    semantic.context().clone(),
-                    request.topic.clone(),
-                    request.scope.clone(),
-                    aster_mesh::BlobMetadata::new(request.media_type.clone(), Vec::new())
-                        .expect("native Profile-5 metadata"),
-                    request.priority,
-                    None,
-                    None,
-                    request.total_len,
-                    epoch,
-                    policy_revision,
-                    authorization_digest,
-                    [0x4d; 32],
-                )
-                .expect("native Profile-5 open");
-                let authenticated = sealer.seal_blob_stream_open(&open).map_err(|error| {
-                    StoreError::Blob(BlobStoreError::Verification(error.to_string()))
-                })?;
-                let verified = sealer
-                    .verify_blob_stream_open(&authenticated)
-                    .map_err(|error| {
+                        request.owner.operation.as_bytes().to_vec(),
+                        mission,
+                        semantic.counter(),
+                        semantic.context().clone(),
+                        request.topic.clone(),
+                        request.scope.clone(),
+                        aster_mesh::BlobMetadata::new(request.media_type.clone(), Vec::new())
+                            .expect("native Profile-5 metadata"),
+                        request.priority,
+                        ttl_ms,
+                        initial_custody,
+                        request.total_len,
+                        epoch,
+                        policy_revision,
+                        authorization_digest,
+                        [0x4d; 32],
+                    )
+                    .expect("native Profile-5 open");
+                    let authenticated = sealer.seal_blob_stream_open(&open).map_err(|error| {
                         StoreError::Blob(BlobStoreError::Verification(error.to_string()))
                     })?;
-                Ok((verified, authenticated))
-            })
+                    let verified =
+                        sealer
+                            .verify_blob_stream_open(&authenticated)
+                            .map_err(|error| {
+                                StoreError::Blob(BlobStoreError::Verification(error.to_string()))
+                            })?;
+                    Ok((verified, authenticated))
+                },
+            )
             .expect("reserve native Profile-5 upload");
         let root = aster_redb_store::pack::PinnedBlobPackRoot::open(store)
             .expect("native Profile-5 pack root");
@@ -48768,7 +48779,10 @@ mod tests {
             plaintext_root,
             ciphertext_root,
             writer.next_index(),
-            None,
+            initial_custody.map(|sample| CustodySample {
+                clock_id: sample.clock_id,
+                tick_ms: sample.tick_ms + 10,
+            }),
         )
         .expect("native Profile-5 commitment");
         let authenticated_commitment = sealer
@@ -48802,7 +48816,15 @@ mod tests {
             )
             .expect("install native Profile-5 completion");
         store
-            .commit_profile5_upload_once_with_policy(&policy, &reservation, &checkpoint, None)
+            .commit_profile5_upload_once_with_policy(
+                &policy,
+                &reservation,
+                &checkpoint,
+                initial_custody.map(|sample| CustodySample {
+                    clock_id: sample.clock_id,
+                    tick_ms: sample.tick_ms + 20,
+                }),
+            )
             .expect("promote native Profile-5 publication")
             .blob()
             .transfer_id
@@ -52878,9 +52900,25 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn lifecycle_native_profile5_pack_crosses_without_legacy_repack() {
+        assert_lifecycle_native_profile5_pack_crosses_without_legacy_repack(None).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn finite_lifecycle_native_profile5_pack_crosses_with_custody() {
+        assert_lifecycle_native_profile5_pack_crosses_without_legacy_repack(Some(600_000)).await;
+    }
+
+    async fn assert_lifecycle_native_profile5_pack_crosses_without_legacy_repack(
+        ttl_ms: Option<u64>,
+    ) {
         let services = control_test_services([0xe1; 32]);
-        let source_state = root("native-profile5-pack-source");
-        let target_state = root("native-profile5-pack-target");
+        let suffix = if ttl_ms.is_some() {
+            "finite"
+        } else {
+            "durable"
+        };
+        let source_state = root(&format!("native-profile5-pack-source-{suffix}"));
+        let target_state = root(&format!("native-profile5-pack-target-{suffix}"));
         fs::create_dir_all(&source_state).expect("native source state");
         fs::create_dir_all(&target_state).expect("native target state");
         let authority = services.member.mission_authority_id();
@@ -52903,6 +52941,7 @@ mod tests {
             &services.scope,
             1,
             &plaintext,
+            ttl_ms,
         );
         let retained = source_store
             .blob_source_projection(publication)
@@ -52926,7 +52965,7 @@ mod tests {
             .expect("verify native source commitment");
         let source = blob_stream::CanonicalBlobSendSource::new_native(
             stored,
-            retained.source,
+            retained.source.clone(),
             retained.retention,
             verified_open,
             &source_session,
@@ -52945,7 +52984,7 @@ mod tests {
             source_len: u32::try_from(source.authenticated_open().len())
                 .expect("native source length"),
             source_digest: Sha256::digest(source.authenticated_open()).into(),
-            finite: false,
+            finite: ttl_ms.is_some(),
         };
         let initiator_bytes = services
             .member
@@ -52968,34 +53007,75 @@ mod tests {
         let target_policy = target_store
             .control_policy_snapshot()
             .expect("native target policy");
+        let mut policy_visible = Vec::new();
+        source_store
+            .visit_retained_blob_sources(Some(&source_policy), |retained| {
+                policy_visible.push(retained.clone());
+            })
+            .expect("enumerate policy-visible native sources");
+        assert!(
+            policy_visible
+                .iter()
+                .any(|candidate| candidate == &retained),
+            "native source must be policy-visible before transfer: expected={retained:?}, actual={policy_visible:?}"
+        );
         let mut target_verifier = open_test_sealer(&services.other);
         let target_cache = AuthenticatedEventRouteCache::empty(&target_verifier);
         let direction = EventDirection::ToSessionResponder;
         let nonce = [0xe2; 32];
-        let sender_future = blob_stream::send_canonical_blob_profile5(
-            &adapter,
-            Arc::clone(&source_store),
-            &source_policy,
-            &source,
-            &mut sender_session,
-            profile_digest,
-            direction,
-            nonce,
+        let source_live = Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal));
+        let source_guard = ContactEmissionGuard {
+            captured: source_live.snapshot().expect("source emission snapshot"),
+            live: source_live,
+            custody_clock: NodeCustodyClock::injected([0xd1; 16], 100, 0),
+        };
+        let target_live = Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal));
+        let target_guard = ContactEmissionGuard {
+            captured: target_live.snapshot().expect("target emission snapshot"),
+            live: target_live,
+            custody_clock: NodeCustodyClock::injected([0xe5; 16], 10_000, 0),
+        };
+        let sender_future = CONTACT_EMISSION_GUARD.scope(
+            source_guard,
+            blob_stream::send_canonical_blob_profile5(
+                &adapter,
+                Arc::clone(&source_store),
+                &source_policy,
+                &source,
+                &mut sender_session,
+                profile_digest,
+                direction,
+                nonce,
+            ),
         );
-        let receiver_future = blob_stream::receive_canonical_blob_profile5(
-            &adapter,
-            Arc::clone(&target_store),
-            &target_cache,
-            &target_policy,
-            &mut target_verifier,
-            &mut receiver_session,
-            profile_digest,
-            direction,
-            nonce,
-            &offer,
+        let receiver_future = CONTACT_EMISSION_GUARD.scope(
+            target_guard,
+            blob_stream::receive_canonical_blob_profile5(
+                &adapter,
+                Arc::clone(&target_store),
+                &target_cache,
+                &target_policy,
+                &mut target_verifier,
+                &mut receiver_session,
+                profile_digest,
+                direction,
+                nonce,
+                &offer,
+            ),
         );
+        let mut sender_future = Box::pin(sender_future);
+        let mut receiver_future = Box::pin(receiver_future);
         let (sent, received) = tokio::time::timeout(std::time::Duration::from_secs(15), async {
-            tokio::join!(Box::pin(sender_future), Box::pin(receiver_future))
+            tokio::select! {
+                sent = &mut sender_future => match sent {
+                    Ok(sent) => (Ok(sent), receiver_future.await),
+                    Err(error) => panic!("native Profile-5 sender failed before peer completion: {error:?}"),
+                },
+                received = &mut receiver_future => match received {
+                    Ok(received) => (sender_future.await, Ok(received)),
+                    Err(error) => panic!("native Profile-5 receiver failed before peer completion: {error:?}"),
+                },
+            }
         })
         .await
         .expect("native Profile-5 crossing remains bounded");
@@ -53010,30 +53090,52 @@ mod tests {
         let (mut retry_sender_session, mut retry_receiver_session, retry_profile_digest) =
             blob_stream::tests::mission_pair_from_bundles(&initiator_bytes, &responder_bytes);
         let retry_nonce = [0xe3; 32];
+        let retry_source_live = Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal));
+        let retry_source_guard = ContactEmissionGuard {
+            captured: retry_source_live
+                .snapshot()
+                .expect("retry source emission snapshot"),
+            live: retry_source_live,
+            custody_clock: NodeCustodyClock::injected([0xd1; 16], 200, 0),
+        };
+        let retry_target_live = Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal));
+        let retry_target_guard = ContactEmissionGuard {
+            captured: retry_target_live
+                .snapshot()
+                .expect("retry target emission snapshot"),
+            live: retry_target_live,
+            custody_clock: NodeCustodyClock::injected([0xe5; 16], 20_000, 0),
+        };
         let (retry_sent, retry_received) =
             tokio::time::timeout(std::time::Duration::from_secs(15), async {
                 tokio::join!(
-                    Box::pin(blob_stream::send_canonical_blob_profile5(
-                        &retry_adapter,
-                        Arc::clone(&source_store),
-                        &source_policy,
-                        &source,
-                        &mut retry_sender_session,
-                        retry_profile_digest,
-                        direction,
-                        retry_nonce,
+                    Box::pin(CONTACT_EMISSION_GUARD.scope(
+                        retry_source_guard,
+                        blob_stream::send_canonical_blob_profile5(
+                            &retry_adapter,
+                            Arc::clone(&source_store),
+                            &source_policy,
+                            &source,
+                            &mut retry_sender_session,
+                            retry_profile_digest,
+                            direction,
+                            retry_nonce,
+                        ),
                     )),
-                    Box::pin(blob_stream::receive_canonical_blob_profile5(
-                        &retry_adapter,
-                        Arc::clone(&target_store),
-                        &target_cache,
-                        &target_policy,
-                        &mut target_verifier,
-                        &mut retry_receiver_session,
-                        retry_profile_digest,
-                        direction,
-                        retry_nonce,
-                        &offer,
+                    Box::pin(CONTACT_EMISSION_GUARD.scope(
+                        retry_target_guard,
+                        blob_stream::receive_canonical_blob_profile5(
+                            &retry_adapter,
+                            Arc::clone(&target_store),
+                            &target_cache,
+                            &target_policy,
+                            &mut target_verifier,
+                            &mut retry_receiver_session,
+                            retry_profile_digest,
+                            direction,
+                            retry_nonce,
+                            &offer,
+                        ),
                     ))
                 )
             })
@@ -53099,6 +53201,22 @@ mod tests {
             restored.extend_from_slice(&bytes);
         }
         assert_eq!(restored, plaintext);
+        drop(target_pack);
+        drop(target_records);
+        drop(target_store);
+        let reopened_target = Store::open_for_mission(target_state.join(STORE_FILE), authority)
+            .expect("reopen native target store");
+        let restarted = reopened_target
+            .get_blob(publication)
+            .expect("restart native target lookup")
+            .expect("native target publication survives restart");
+        let restarted_pack = reopened_target
+            .open_profile5_pack_transfer_read(restarted.variant_id)
+            .expect("native target pack survives restart");
+        assert_eq!(
+            restarted_pack.authenticated_open(),
+            source.authenticated_open()
+        );
     }
 
     async fn assert_completed_canonical_blob_crossing(

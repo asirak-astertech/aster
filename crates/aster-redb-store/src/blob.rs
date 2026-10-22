@@ -41,7 +41,8 @@ use aster_mesh::{
     MAX_BLOB_CHUNK_SIZE, MAX_BLOB_CHUNKS, MAX_BLOB_MANIFEST_BYTES, MAX_BLOB_MEDIA_TYPE_BYTES,
     MAX_BLOB_SCHEMA_ID_BYTES, SELECTED_BLOB_CHUNK_SIZE as CORE_SELECTED_BLOB_CHUNK_SIZE,
     VerifiedBlobContentCompletion, VerifiedBlobCustodyClaimV1, VerifiedBlobCustodyClaimV2,
-    VerifiedBlobTransferObject, VerifiedBlobTransferPlan, local_blob_publication_stream_id,
+    VerifiedBlobStreamOpen, VerifiedBlobTransferObject, VerifiedBlobTransferPlan,
+    local_blob_publication_stream_id,
 };
 use redb::{ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle};
 
@@ -1143,6 +1144,22 @@ pub fn profile5_pack_identities(
     ))
 }
 
+/// Exact authenticated source-record length bound by the native Profile-5
+/// transfer identity and custody claim.
+pub fn profile5_pack_source_record_len(
+    authenticated_open_len: usize,
+    authenticated_commitment_len: usize,
+) -> Result<u64, StoreError> {
+    let len = 8_usize
+        .checked_add(2)
+        .and_then(|len| len.checked_add(4))
+        .and_then(|len| len.checked_add(authenticated_open_len))
+        .and_then(|len| len.checked_add(4))
+        .and_then(|len| len.checked_add(authenticated_commitment_len))
+        .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+    u64::try_from(len).map_err(|_| StoreError::PayloadByteAccountingOverflow)
+}
+
 pub(crate) fn blob_variant_id(
     blob_id: BlobId,
     content_group: &[u8; 32],
@@ -2028,6 +2045,58 @@ impl VerifiedBlobCustodySendV2 {
             source_transfer_id,
             source,
             exact_source_bytes,
+            prior_cumulative_age_ms,
+            sender_sample,
+        )?;
+        if claim.source_len() != source_len
+            || claim.publication_id() != publication_id
+            || claim.blob_id() != blob_id
+            || claim.priority() != priority
+            || claim.ttl_ms() != ttl_ms
+            || claim.forwarding_age_ms() != authenticated_age_ms
+        {
+            return Err(BlobCustodyError::ContextMismatch);
+        }
+        Ok((
+            claim,
+            PreparedBlobCustodySend {
+                context,
+                checkpoint_sample: sender_sample,
+                authenticated_age_ms,
+                projection,
+                retention,
+            },
+        ))
+    }
+
+    /// Consumes Store-authenticated native Profile-5 source authority without
+    /// reconstructing the legacy manifest envelope grammar.
+    pub fn into_profile5_claim(
+        self,
+    ) -> Result<(aster_mesh::BlobCustodyClaimV2, PreparedBlobCustodySend), BlobCustodyError> {
+        let VerifiedBlobCustodySendV2 { authority, inner } = self;
+        let VerifiedBlobCustodySend {
+            context,
+            source_transfer_id,
+            source_len,
+            publication_id,
+            blob_id,
+            priority,
+            ttl_ms,
+            prior_cumulative_age_ms,
+            sender_sample,
+            authenticated_age_ms,
+            projection,
+            retention,
+        } = inner;
+        let claim = aster_mesh::BlobCustodyClaimV2::from_authenticated_profile5_source(
+            authority,
+            source_transfer_id,
+            source_len,
+            publication_id,
+            blob_id,
+            priority,
+            ttl_ms,
             prior_cumulative_age_ms,
             sender_sample,
         )?;
@@ -5341,7 +5410,7 @@ impl Store {
             policy,
             projection,
             retention,
-            blob,
+            Some(blob),
             sealed,
             context.into(),
             sender_sample,
@@ -5365,7 +5434,7 @@ impl Store {
             policy,
             projection,
             retention,
-            blob,
+            Some(blob),
             sealed,
             fields,
             sender_sample,
@@ -5378,13 +5447,190 @@ impl Store {
         })
     }
 
+    /// Authorizes finite custody for a lifecycle-owned native Profile-5 pack.
+    /// The pack session is a nonconstructible Store capability; the signed
+    /// open and commitment must already have been authenticated by the caller.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn authorize_finite_profile5_pack_send_v2_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        stored: &StoredBlob,
+        projection: &BlobSourceProjection,
+        retention: BlobSourceRetention,
+        open: &VerifiedBlobStreamOpen,
+        pack: &Profile5PackReadSession,
+        context: AuthenticatedBlobCustodySendContextV2,
+        sender_sample: aster_mesh::CustodySample,
+    ) -> Result<Option<VerifiedBlobCustodySendV2>, StoreError> {
+        let (transfer_id, semantic_id, variant_id) = profile5_pack_identities(
+            open.open(),
+            open.authenticated_bytes(),
+            pack.commitment(),
+            pack.authenticated_commitment(),
+        )?;
+        let sealed_len = u64::try_from(stored.sealed.len())
+            .map_err(|_| StoreError::PayloadByteAccountingOverflow)?;
+        if pack.open() != open.open()
+            || pack.authenticated_open() != open.authenticated_bytes()
+            || stored.transfer_id != transfer_id
+            || stored.semantic_id != semantic_id
+            || stored.variant_id != variant_id
+            || projection.transfer_id != transfer_id
+            || projection.semantic_id != semantic_id
+            || projection.publisher != open.open().publisher()
+            || projection.topic != *open.open().topic()
+            || projection.scope != *open.open().scope()
+            || projection.epoch != open.open().content_epoch()
+            || projection.route_lineage != *pack.route_lineage()
+            || projection.physical_lineage != *pack.physical_lineage()
+            || projection.blob_id != pack.commitment().blob_id()
+            || projection.total_len != open.open().total_len()
+            || projection.chunk_size != aster_mesh::BLOB_STREAM_SEGMENT_BYTES as u32
+            || projection.chunk_count != pack.commitment().segment_count()
+            || sealed_len != projection.sealed_len
+            || Sha256::digest(&stored.sealed).as_slice() != transfer_id.as_bytes()
+        {
+            return Err(blob_error(BlobStoreError::PendingSourceConflict));
+        }
+        let fields = BlobCustodySendContextFields::from(&context);
+        self.authorize_finite_blob_send_fields(
+            policy,
+            projection,
+            retention,
+            None,
+            &stored.sealed,
+            fields,
+            sender_sample,
+        )
+        .map(|authorized| {
+            authorized.map(|inner| VerifiedBlobCustodySendV2 {
+                authority: context,
+                inner,
+            })
+        })
+    }
+
+    /// Imports a freshly authenticated custody lower bound for an exact
+    /// already-promoted native Profile-5 pack. This is the zero-DATA retry
+    /// counterpart of receiver-side finite pack promotion.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn admit_existing_finite_profile5_pack_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        stored: &StoredBlob,
+        open: &VerifiedBlobStreamOpen,
+        pack: &Profile5PackReadSession,
+        verified: VerifiedBlobCustodyClaimV2,
+        receiver_sample: aster_mesh::CustodySample,
+    ) -> Result<(), StoreError> {
+        self.require_live()?;
+        let authority = self.require_bound_mission()?;
+        let admission = VerifiedFiniteBlobAdmission::from_verified_v2(verified, receiver_sample);
+        let (transfer_id, semantic_id, variant_id) = profile5_pack_identities(
+            open.open(),
+            open.authenticated_bytes(),
+            pack.commitment(),
+            pack.authenticated_commitment(),
+        )?;
+        let source_len = profile5_pack_source_record_len(
+            pack.authenticated_open().len(),
+            pack.authenticated_commitment().len(),
+        )?;
+        if pack.open() != open.open()
+            || pack.authenticated_open() != open.authenticated_bytes()
+            || stored.transfer_id != transfer_id
+            || stored.semantic_id != semantic_id
+            || stored.variant_id != variant_id
+            || admission.source_transfer_id != *transfer_id.as_bytes()
+            || admission.source_len != source_len
+            || admission.publication_id != *semantic_id.as_bytes()
+            || admission.blob_id != pack.commitment().blob_id()
+            || admission.priority != open.open().priority()
+            || open.open().ttl_ms() != Some(admission.ttl_ms)
+            || admission.forwarding_age_ms >= admission.ttl_ms
+        {
+            return Err(blob_error(BlobStoreError::PendingSourceConflict));
+        }
+
+        let write = self.database.begin_write()?;
+        enforce_live_write(&write)?;
+        require_control_policy_write(&write, authority, policy)?;
+        synchronize_blob_policy_generation_write(&write)?;
+        let continuity = custody::observe_continuity_write(&write, admission.receiver_sample)?;
+        let encoded = write
+            .open_table(BLOB_PUBLICATIONS)?
+            .get(transfer_id.as_bytes().as_slice())?
+            .map(|value| value.value().to_vec())
+            .ok_or_else(|| blob_error(BlobStoreError::PendingSourceMissing))?;
+        if lifecycle::publication_record_is_retired(&encoded).map_err(blob_error)? {
+            return Err(blob_error(BlobStoreError::ExpiredOrRetired));
+        }
+        let mut metadata = decode_blob_metadata(&encoded)?;
+        if metadata.transfer_id != transfer_id
+            || metadata.semantic_id != semantic_id
+            || metadata.variant_id != variant_id
+            || metadata.blob_id != admission.blob_id
+            || metadata.header.priority != admission.priority
+            || metadata.header.ttl_ms != Some(admission.ttl_ms)
+            || metadata.route_lineage != Some(*pack.route_lineage())
+            || metadata.physical_lineage != Some(*pack.physical_lineage())
+        {
+            return Err(blob_error(BlobStoreError::PendingSourceConflict));
+        }
+        enforce_blob_policy_write(&write, authority, policy, &metadata.header)?;
+        let incoming = BlobLifetime::Finite {
+            ttl_ms: admission.ttl_ms,
+            age: custody::LowerBoundAgeCheckpoint {
+                cumulative_age_ms: admission.forwarding_age_ms,
+                checkpoint: Some(continuity.sample()),
+                continuity_generation: continuity.generation(),
+                continuity_lost: false,
+            },
+            provenance: admission.provenance,
+        };
+        let merged = lifecycle::project_lifetime_for_policy_write(
+            &write,
+            merge_blob_lifetime(
+                metadata.lifetime,
+                incoming,
+                Some(custody::LowerBoundContinuity {
+                    generation: continuity.generation(),
+                    sample: continuity.sample(),
+                }),
+                Some(admission.receiver_sample),
+            )?,
+        )?;
+        require_blob_lifetime_visible_write(&write, merged)?;
+        if merged != metadata.lifetime {
+            lifecycle::replace_policy_ttl_deadline_write(
+                &write,
+                transfer_id,
+                lifecycle::TtlDeadlineKind::LivePublication,
+                Some(metadata.lifetime),
+                Some(merged),
+                self.blob_lifecycle_limits,
+            )?;
+            metadata.lifetime = merged;
+            let payload = encode_blob_metadata(metadata)?;
+            let replacement = lifecycle::replace_live_publication_payload(&encoded, &payload)?;
+            write
+                .open_table(BLOB_PUBLICATIONS)?
+                .insert(transfer_id.as_bytes().as_slice(), replacement.as_slice())?;
+            pressure::rekey_publication_lifetime_write(&write, transfer_id)?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn authorize_finite_blob_send_fields(
         &self,
         policy: &ControlPolicySnapshot,
         projection: &BlobSourceProjection,
         retention: BlobSourceRetention,
-        blob: &ContentVerifiedBlobEnvelope,
+        blob: Option<&ContentVerifiedBlobEnvelope>,
         sealed: &[u8],
         context: BlobCustodySendContextFields,
         sender_sample: aster_mesh::CustodySample,
@@ -5398,9 +5644,13 @@ impl Store {
         {
             return Err(blob_error(BlobStoreError::PendingSourceConflict));
         }
-        blob.verify_exact_sealed(sealed)
-            .map_err(|error| blob_error(BlobStoreError::Verification(error.to_string())))?;
-        let transfer = BlobTransferId::new(blob.envelope_id());
+        let transfer = if let Some(blob) = blob {
+            blob.verify_exact_sealed(sealed)
+                .map_err(|error| blob_error(BlobStoreError::Verification(error.to_string())))?;
+            BlobTransferId::new(blob.envelope_id())
+        } else {
+            BlobTransferId::new(Sha256::digest(sealed).into())
+        };
         if projection.transfer_id != transfer
             || BlobTransferId::new(Sha256::digest(sealed).into()) != transfer
         {
@@ -5509,8 +5759,10 @@ impl Store {
         let sealed_len =
             u64::try_from(sealed.len()).map_err(|_| StoreError::PayloadByteAccountingOverflow)?;
         let stored_projection = blob_source_projection(&metadata, sealed_len, shape)?;
-        let verified_projection =
-            verified_blob_source_projection(blob, sealed_len, metadata.lifetime)?;
+        let verified_projection = match blob {
+            Some(blob) => verified_blob_source_projection(blob, sealed_len, metadata.lifetime)?,
+            None => stored_projection.clone(),
+        };
         if stored_projection != *projection || verified_projection != *projection {
             return Ok(None);
         }
@@ -5571,8 +5823,10 @@ impl Store {
             return Ok(None);
         };
         let checkpointed_projection = blob_source_projection(&metadata, sealed_len, shape)?;
-        let checkpointed_verified =
-            verified_blob_source_projection(blob, sealed_len, metadata.lifetime)?;
+        let checkpointed_verified = match blob {
+            Some(blob) => verified_blob_source_projection(blob, sealed_len, metadata.lifetime)?,
+            None => checkpointed_projection.clone(),
+        };
         if checkpointed_projection != checkpointed_verified {
             return Err(blob_error(BlobStoreError::PendingSourceConflict));
         }
@@ -5589,11 +5843,11 @@ impl Store {
         }
         let send = VerifiedBlobCustodySend {
             context,
-            source_transfer_id: BlobCustodyTransferId::from_exact_hash(blob.envelope_id()),
+            source_transfer_id: BlobCustodyTransferId::from_exact_hash(*transfer.as_bytes()),
             source_len: sealed_len,
-            publication_id: blob.item_id(),
-            blob_id: blob.blob_id(),
-            priority: blob.priority(),
+            publication_id: *projection.semantic_id.as_bytes(),
+            blob_id: projection.blob_id,
+            priority: metadata.header.priority,
             ttl_ms,
             prior_cumulative_age_ms: age_ms,
             sender_sample: continuity.sample(),
@@ -5636,8 +5890,68 @@ impl Store {
             policy,
             &projection,
             retention,
-            blob,
+            Some(blob),
             sealed,
+            context,
+            final_sample,
+        )?
+        else {
+            return Ok(false);
+        };
+        Ok(
+            rechecked.sender_sample.clock_id == checkpoint_sample.clock_id
+                && rechecked.sender_sample.tick_ms >= checkpoint_sample.tick_ms
+                && rechecked.prior_cumulative_age_ms <= authenticated_age_ms,
+        )
+    }
+
+    /// Rechecks a native Profile-5 finite source immediately before emitting
+    /// its custody record.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn finalize_finite_profile5_pack_send_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        prepared: PreparedBlobCustodySend,
+        stored: &StoredBlob,
+        open: &VerifiedBlobStreamOpen,
+        pack: &Profile5PackReadSession,
+        final_sample: aster_mesh::CustodySample,
+    ) -> Result<bool, StoreError> {
+        let PreparedBlobCustodySend {
+            context,
+            checkpoint_sample,
+            authenticated_age_ms,
+            projection,
+            retention,
+        } = prepared;
+        if final_sample.clock_id != checkpoint_sample.clock_id
+            || final_sample.tick_ms < checkpoint_sample.tick_ms
+        {
+            return Ok(false);
+        }
+        let (transfer_id, semantic_id, variant_id) = profile5_pack_identities(
+            open.open(),
+            open.authenticated_bytes(),
+            pack.commitment(),
+            pack.authenticated_commitment(),
+        )?;
+        if pack.open() != open.open()
+            || pack.authenticated_open() != open.authenticated_bytes()
+            || stored.transfer_id != transfer_id
+            || stored.semantic_id != semantic_id
+            || stored.variant_id != variant_id
+            || projection.transfer_id != transfer_id
+            || projection.semantic_id != semantic_id
+        {
+            return Ok(false);
+        }
+        let Some(rechecked) = self.authorize_finite_blob_send_fields(
+            policy,
+            &projection,
+            retention,
+            None,
+            &stored.sealed,
             context,
             final_sample,
         )?
@@ -5670,7 +5984,7 @@ impl Store {
             policy,
             projection,
             retention,
-            blob,
+            Some(blob),
             sealed,
             BlobCustodySendContextFields {
                 semantic_version: 8,
