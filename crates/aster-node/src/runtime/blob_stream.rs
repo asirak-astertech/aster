@@ -189,6 +189,8 @@ struct SenderByteOwnership {
     extent_body_zeroize_observer: Option<Arc<std::sync::atomic::AtomicUsize>>,
     #[cfg(test)]
     prefix_header_zeroize_observer: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    #[cfg(test)]
+    encoded_header_creation_observer: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 impl SenderByteOwnership {
@@ -221,6 +223,10 @@ impl SenderByteOwnership {
             prefix_header_zeroize_observer: observers
                 .as_ref()
                 .map(|observers| Arc::clone(&observers.prefix_header_zeroizations)),
+            #[cfg(test)]
+            encoded_header_creation_observer: observers
+                .as_ref()
+                .map(|observers| Arc::clone(&observers.encoded_header_creations)),
         }
     }
 
@@ -269,6 +275,7 @@ impl SenderByteOwnership {
 #[derive(Clone, Copy)]
 enum SenderBufferClass {
     ExtentBody,
+    EncodedHeader,
     PrefixHeader,
 }
 
@@ -284,8 +291,16 @@ impl ZeroizingSenderBuffer {
         #[cfg(test)]
         let zeroize_observer = match class {
             SenderBufferClass::ExtentBody => ownership.extent_body_zeroize_observer.clone(),
-            SenderBufferClass::PrefixHeader => ownership.prefix_header_zeroize_observer.clone(),
+            SenderBufferClass::EncodedHeader | SenderBufferClass::PrefixHeader => {
+                ownership.prefix_header_zeroize_observer.clone()
+            }
         };
+        #[cfg(test)]
+        if matches!(class, SenderBufferClass::EncodedHeader)
+            && let Some(observer) = &ownership.encoded_header_creation_observer
+        {
+            observer.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         #[cfg(not(test))]
         let _ = class;
         Self {
@@ -906,7 +921,7 @@ impl MissionBlobRecordCodec<'_> {
                 )
             })?;
         let encoded_header =
-            ZeroizingSenderBuffer::new(encoded_header, ownership, SenderBufferClass::PrefixHeader);
+            ZeroizingSenderBuffer::new(encoded_header, ownership, SenderBufferClass::EncodedHeader);
         #[cfg(test)]
         if inject_auth_failure {
             return Err(BlobNetworkError::with_source(
@@ -3698,6 +3713,7 @@ pub(crate) mod tests {
     struct MemorySenderAttempt {
         data: mpsc::UnboundedSender<Option<Vec<u8>>>,
         control: tokio::sync::Mutex<mpsc::UnboundedReceiver<Option<Vec<u8>>>>,
+        pending_data_send_entered: Option<Arc<tokio::sync::Semaphore>>,
     }
 
     struct SmallMtuSenderAttempt {
@@ -3759,6 +3775,10 @@ pub(crate) mod tests {
             body: &'a [u8],
         ) -> AdapterFuture<'a, ()> {
             Box::pin(async move {
+                if let Some(entered) = &self.pending_data_send_entered {
+                    entered.add_permits(1);
+                    std::future::pending::<()>().await;
+                }
                 let mut frame = Vec::with_capacity(prefix.len() + body.len());
                 frame.extend_from_slice(prefix);
                 frame.extend_from_slice(body);
@@ -3825,6 +3845,25 @@ pub(crate) mod tests {
         receiver: Arc<MemoryReceiverAttempt>,
     }
 
+    pub(crate) struct PendingDataSendControl {
+        entered: Arc<tokio::sync::Semaphore>,
+        data: mpsc::UnboundedSender<Option<Vec<u8>>>,
+    }
+
+    impl PendingDataSendControl {
+        pub(crate) async fn wait_entered(&self) {
+            self.entered
+                .acquire()
+                .await
+                .expect("pending DATA sender remains open")
+                .forget();
+        }
+
+        pub(crate) fn close_data(&self) {
+            let _ = self.data.send(None);
+        }
+    }
+
     impl MemoryTransportAdapter {
         pub(crate) fn new() -> Self {
             Self::with_receive_failure(None)
@@ -3837,6 +3876,7 @@ pub(crate) mod tests {
                 sender: Arc::new(MemorySenderAttempt {
                     data: data_send,
                     control: tokio::sync::Mutex::new(control_receive),
+                    pending_data_send_entered: None,
                 }),
                 receiver: Arc::new(MemoryReceiverAttempt {
                     data: tokio::sync::Mutex::new(data_receive),
@@ -3845,6 +3885,32 @@ pub(crate) mod tests {
                     receives: std::sync::atomic::AtomicUsize::new(0),
                 }),
             }
+        }
+
+        pub(crate) fn with_pending_data_send() -> (Self, PendingDataSendControl) {
+            let (data_send, data_receive) = mpsc::unbounded_channel();
+            let (control_send, control_receive) = mpsc::unbounded_channel();
+            let entered = Arc::new(tokio::sync::Semaphore::new(0));
+            let control = PendingDataSendControl {
+                entered: Arc::clone(&entered),
+                data: data_send.clone(),
+            };
+            (
+                Self {
+                    sender: Arc::new(MemorySenderAttempt {
+                        data: data_send,
+                        control: tokio::sync::Mutex::new(control_receive),
+                        pending_data_send_entered: Some(entered),
+                    }),
+                    receiver: Arc::new(MemoryReceiverAttempt {
+                        data: tokio::sync::Mutex::new(data_receive),
+                        control: control_send,
+                        fail_after_receives: None,
+                        receives: std::sync::atomic::AtomicUsize::new(0),
+                    }),
+                },
+                control,
+            )
         }
     }
 

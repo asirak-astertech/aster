@@ -52280,6 +52280,7 @@ mod tests {
         carrier_zeroizations: usize,
         extent_body_zeroizations: usize,
         prefix_header_zeroizations: usize,
+        encoded_header_creations: usize,
         actual_peak_live_bytes: usize,
     }
 
@@ -52295,6 +52296,7 @@ mod tests {
         sender_carrier_zeroizations: u64,
         sender_extent_body_zeroizations: u64,
         sender_prefix_header_zeroizations: u64,
+        sender_encoded_header_creations: u64,
         sender_actual_peak_live_bytes: u64,
         store: aster_redb_store::Profile5BatchTestCounts,
     }
@@ -52324,6 +52326,7 @@ mod tests {
                 sender_extent_body_zeroizations: sender_ownership.extent_body_zeroizations as u64,
                 sender_prefix_header_zeroizations: sender_ownership.prefix_header_zeroizations
                     as u64,
+                sender_encoded_header_creations: sender_ownership.encoded_header_creations as u64,
                 sender_actual_peak_live_bytes: sender_ownership.actual_peak_live_bytes as u64,
                 store,
             }
@@ -52405,6 +52408,7 @@ mod tests {
                     "\"store\":{{\"carrier_reads\":{}}},",
                     "\"ownership\":{{\"carrier_zeroizations\":{},",
                     "\"extent_body_zeroizations\":{},\"prefix_header_zeroizations\":{},",
+                    "\"encoded_header_creations\":{},",
                     "\"actual_peak_live_bytes\":{},\"live_bytes_after_join\":0}},",
                     "\"pipeline\":{{\"accepted_items\":{},\"completed_items\":{},",
                     "\"workers\":{},\"peak_in_flight_items\":{},",
@@ -52420,6 +52424,7 @@ mod tests {
                 self.sender_carrier_zeroizations,
                 self.sender_extent_body_zeroizations,
                 self.sender_prefix_header_zeroizations,
+                self.sender_encoded_header_creations,
                 self.sender_actual_peak_live_bytes,
                 self.sender_pipeline.accepted_items(),
                 self.sender_pipeline.completed_items(),
@@ -52478,6 +52483,11 @@ mod tests {
             ("sender-extent-failure", multi_extent.as_slice(), false),
             ("sender-auth-failure", multi_extent.as_slice(), false),
             ("sender-transport-failure", multi_extent.as_slice(), false),
+            (
+                "sender-cancelled-send",
+                sustained_pipeline.as_slice(),
+                false,
+            ),
             ("empty", b"".as_slice(), false),
             (
                 "finite",
@@ -52617,18 +52627,34 @@ mod tests {
                 .expect("encode canonical v9 responder bundle");
             let (mut sender_session, mut receiver_session, profile_digest) =
                 blob_stream::tests::mission_pair_from_bundles(&initiator_bytes, &responder_bytes);
-            let adapter: Box<dyn crate::stream_transport::StreamTransportAdapter> = if label
-                == "nonempty"
-            {
+            let (adapter, pending_data_send): (
+                Box<dyn crate::stream_transport::StreamTransportAdapter>,
+                Option<blob_stream::tests::PendingDataSendControl>,
+            ) = if label == "nonempty" {
                 // Persist the first of multiple canonical extents, then lose
                 // the connection before the second extent is received.
-                Box::new(blob_stream::tests::SmallMtuTransportAdapter::with_receive_failure(3))
+                (
+                    Box::new(blob_stream::tests::SmallMtuTransportAdapter::with_receive_failure(3)),
+                    None,
+                )
             } else if label == "empty" {
                 // OPEN and empty SOURCE staging succeed; disconnect before
                 // FINISH so the exact (0, 0) pending receipt must reopen.
-                Box::new(blob_stream::tests::MemoryTransportAdapter::with_receive_failure(Some(2)))
+                (
+                    Box::new(
+                        blob_stream::tests::MemoryTransportAdapter::with_receive_failure(Some(2)),
+                    ),
+                    None,
+                )
+            } else if label == "sender-cancelled-send" {
+                let (adapter, control) =
+                    blob_stream::tests::MemoryTransportAdapter::with_pending_data_send();
+                (Box::new(adapter), Some(control))
             } else {
-                Box::new(blob_stream::tests::MemoryTransportAdapter::new())
+                (
+                    Box::new(blob_stream::tests::MemoryTransportAdapter::new()),
+                    None,
+                )
             };
             let source_policy = source_store
                 .control_policy_snapshot()
@@ -52731,35 +52757,99 @@ mod tests {
             };
 
             let transfer_started = std::time::Instant::now();
-            let (first_sender, first_receiver) = tokio::join!(
-                CONTACT_EMISSION_GUARD.scope(
-                    source_guard,
-                    blob_stream::send_canonical_blob_profile5(
-                        adapter.as_ref(),
-                        Arc::clone(&source_store),
-                        &source_policy,
-                        &source,
-                        &mut sender_session,
-                        profile_digest,
-                        direction,
-                        attempt_nonce,
-                    ),
-                ),
-                CONTACT_EMISSION_GUARD.scope(
-                    target_guard,
-                    blob_stream::receive_canonical_blob_profile5(
-                        adapter.as_ref(),
-                        Arc::clone(&target_store),
-                        &target_policy,
-                        &mut target_verifier,
-                        &mut receiver_session,
-                        profile_digest,
-                        direction,
-                        attempt_nonce,
-                        &offer,
-                    ),
+            let data_header_encodings_before =
+                crate::stream_transfer::test_data_header_encoding_count();
+            let sender_future = CONTACT_EMISSION_GUARD.scope(
+                source_guard,
+                blob_stream::send_canonical_blob_profile5(
+                    adapter.as_ref(),
+                    Arc::clone(&source_store),
+                    &source_policy,
+                    &source,
+                    &mut sender_session,
+                    profile_digest,
+                    direction,
+                    attempt_nonce,
                 ),
             );
+            let receiver_future = CONTACT_EMISSION_GUARD.scope(
+                target_guard,
+                blob_stream::receive_canonical_blob_profile5(
+                    adapter.as_ref(),
+                    Arc::clone(&target_store),
+                    &target_policy,
+                    &mut target_verifier,
+                    &mut receiver_session,
+                    profile_digest,
+                    direction,
+                    attempt_nonce,
+                    &offer,
+                ),
+            );
+            if let Some(control) = pending_data_send {
+                let mut sender_future = Box::pin(sender_future);
+                let mut receiver_future = Box::pin(receiver_future);
+                tokio::select! {
+                    () = control.wait_entered() => {}
+                    result = &mut sender_future => panic!("sender completed before pending DATA cancellation: {result:?}"),
+                    result = &mut receiver_future => panic!("receiver completed before pending DATA cancellation: {result:?}"),
+                }
+                let first_extent_end = wire_shape.checkpoints()[1].next_chunk_index as usize;
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+                while sender_pipeline_probe.prepared_sender_carriers() <= first_extent_end
+                    && tokio::time::Instant::now() < deadline
+                {
+                    tokio::task::yield_now().await;
+                }
+                assert!(
+                    sender_pipeline_probe.prepared_sender_carriers() > first_extent_end,
+                    "production cancellation fixture must retain prepared carrier N+1 while send_data_parts is pending"
+                );
+                drop(sender_future);
+                control.close_data();
+                let receiver_result =
+                    tokio::time::timeout(std::time::Duration::from_secs(10), &mut receiver_future)
+                        .await
+                        .expect("receiver observes EOF after cancelled pending DATA send");
+                assert!(receiver_result.is_err());
+                assert!(
+                    target_store
+                        .get_blob(publication)
+                        .expect("cancelled sender target lookup")
+                        .is_none(),
+                    "cancelled pending DATA must never promote a Blob"
+                );
+                assert!(sender_pipeline_probe.mapped_ciphertext_zeroizations() > 0);
+                assert!(sender_pipeline_probe.sender_extent_body_zeroizations() > 0);
+                assert_eq!(sender_pipeline_probe.sender_prefix_header_zeroizations(), 3);
+                assert_eq!(sender_pipeline_probe.sender_encoded_header_creations(), 1);
+                assert_eq!(
+                    crate::stream_transfer::test_data_header_encoding_count()
+                        - data_header_encodings_before,
+                    sender_pipeline_probe.sender_encoded_header_creations(),
+                    "production cancellation creates no uncharged duplicate DATA header"
+                );
+                assert_eq!(sender_pipeline_probe.sender_live_bytes(), 0);
+                assert!(sender_pipeline_probe.cleanup_observed());
+                assert!(sender_pipeline_probe.cancellation_signalled());
+                assert!(sender_pipeline_probe.channels_closed());
+                assert_eq!(sender_pipeline_probe.active_workers(), 0);
+                assert_eq!(
+                    sender_pipeline_probe.worker_exits(),
+                    sender_pipeline_probe.joined_workers()
+                );
+                assert_eq!(sender_pipeline_probe.available_item_permits(), 128);
+                assert_eq!(
+                    sender_pipeline_probe.available_byte_permits(),
+                    4 * aster_mesh::PROFILE5_CANONICAL_EXTENT_BYTES as usize
+                );
+                drop(receiver_future);
+                drop((source_store, target_store));
+                fs::remove_dir_all(source_state).expect("cancelled sender source cleanup");
+                fs::remove_dir_all(target_state).expect("cancelled sender target cleanup");
+                continue;
+            }
+            let (first_sender, first_receiver) = tokio::join!(sender_future, receiver_future);
             let transfer_wall_time = transfer_started.elapsed();
             if let Some(barrier) = sender_send_barrier {
                 barrier.await.expect("sender send barrier task");
@@ -52893,8 +52983,20 @@ mod tests {
                     assert!(sender_pipeline_probe.sender_extent_body_zeroizations() > 0);
                 }
                 if matches!(label, "sender-auth-failure" | "sender-transport-failure") {
-                    assert!(sender_pipeline_probe.sender_prefix_header_zeroizations() > 0);
+                    assert_eq!(sender_pipeline_probe.sender_encoded_header_creations(), 1);
+                    assert_eq!(
+                        sender_pipeline_probe.sender_prefix_header_zeroizations(),
+                        if label == "sender-auth-failure" { 1 } else { 3 }
+                    );
+                } else {
+                    assert_eq!(sender_pipeline_probe.sender_encoded_header_creations(), 0);
                 }
+                assert_eq!(
+                    crate::stream_transfer::test_data_header_encoding_count()
+                        - data_header_encodings_before,
+                    sender_pipeline_probe.sender_encoded_header_creations(),
+                    "fault path creates no uncharged duplicate DATA header"
+                );
                 drop((source_store, target_store));
                 fs::remove_dir_all(source_state).expect("sender-failure source cleanup");
                 fs::remove_dir_all(target_state).expect("sender-failure target cleanup");
@@ -53256,7 +53358,21 @@ mod tests {
                     "reported ownership peak must equal the actual-live-byte observer"
                 );
                 assert!(sender_pipeline_probe.sender_extent_body_zeroizations() > 0);
-                assert!(sender_pipeline_probe.sender_prefix_header_zeroizations() > 0);
+                assert_eq!(
+                    sender_pipeline_probe.sender_prefix_header_zeroizations(),
+                    3 * wire_shape.checkpoints().len().saturating_sub(1)
+                );
+                assert_eq!(
+                    sender_pipeline_probe.sender_encoded_header_creations(),
+                    wire_shape.checkpoints().len().saturating_sub(1),
+                    "each emitted DATA extent creates its encoded header exactly once"
+                );
+                assert_eq!(
+                    crate::stream_transfer::test_data_header_encoding_count()
+                        - data_header_encodings_before,
+                    sender_pipeline_probe.sender_encoded_header_creations(),
+                    "successful production path creates each DATA header only in charged ownership"
+                );
                 assert!(sender_pipeline_probe.peak_active_workers() > 1);
                 assert!(sender_pipeline_probe.cleanup_observed());
                 assert!(sender_pipeline_probe.cancellation_signalled());
@@ -53331,6 +53447,8 @@ mod tests {
                             .sender_extent_body_zeroizations(),
                         prefix_header_zeroizations: sender_pipeline_probe
                             .sender_prefix_header_zeroizations(),
+                        encoded_header_creations: sender_pipeline_probe
+                            .sender_encoded_header_creations(),
                         actual_peak_live_bytes: sender_pipeline_probe.sender_peak_live_bytes(),
                     },
                     batch_counts,
@@ -53689,6 +53807,12 @@ mod tests {
         );
         assert!(
             sender["ownership"]["prefix_header_zeroizations"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert!(
+            sender["ownership"]["encoded_header_creations"]
                 .as_u64()
                 .unwrap()
                 > 0

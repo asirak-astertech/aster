@@ -870,13 +870,20 @@ impl StreamFrame {
 }
 
 impl StreamDataHeaderV1 {
-    pub(crate) fn encode_for_context(self, v: u16, p: u16) -> Result<Vec<u8>, StreamError> {
+    fn validate_for_context(&self, v: u16, p: u16) -> Result<(), StreamError> {
         context(v, p)?;
         nonce(&self.attempt_nonce)?;
         extent(self.extent_len)?;
         self.offset
             .checked_add(self.extent_len.into())
             .ok_or_else(|| StreamError::invalid("offset overflow"))?;
+        Ok(())
+    }
+
+    pub(crate) fn encode_for_context(self, v: u16, p: u16) -> Result<Vec<u8>, StreamError> {
+        self.validate_for_context(v, p)?;
+        #[cfg(test)]
+        DATA_HEADER_ENCODING_COUNT.with(|count| count.set(count.get() + 1));
         let mut output = Vec::with_capacity(STREAM_DATA_FIXED_BYTES);
         output.extend_from_slice(MAGIC);
         output.push(0xd8);
@@ -927,6 +934,16 @@ impl StreamDataHeaderV1 {
     }
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static DATA_HEADER_ENCODING_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn test_data_header_encoding_count() -> usize {
+    DATA_HEADER_ENCODING_COUNT.with(std::cell::Cell::get)
+}
+
 impl StreamDataV1 {
     pub(crate) fn into_header_and_body(
         mut self,
@@ -945,7 +962,7 @@ impl StreamDataV1 {
             offset: self.offset,
             extent_len,
         };
-        if let Err(error) = header.encode_for_context(9, 5) {
+        if let Err(error) = header.validate_for_context(9, 5) {
             self.bytes.zeroize();
             return Err(error);
         }

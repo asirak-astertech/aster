@@ -139,6 +139,7 @@ struct PipelineTestProbeInner {
     mapped_ciphertext_zeroizations: Arc<std::sync::atomic::AtomicUsize>,
     sender_extent_body_zeroizations: Arc<std::sync::atomic::AtomicUsize>,
     sender_prefix_header_zeroizations: Arc<std::sync::atomic::AtomicUsize>,
+    sender_encoded_header_creations: Arc<std::sync::atomic::AtomicUsize>,
     sender_live_bytes: Arc<std::sync::atomic::AtomicUsize>,
     sender_peak_live_bytes: Arc<std::sync::atomic::AtomicUsize>,
     prepared_sender_carriers: std::sync::atomic::AtomicUsize,
@@ -158,6 +159,7 @@ pub(crate) struct PipelineTestProbe(Arc<PipelineTestProbeInner>);
 pub(crate) struct SenderOwnershipObservers {
     pub(crate) extent_body_zeroizations: Arc<std::sync::atomic::AtomicUsize>,
     pub(crate) prefix_header_zeroizations: Arc<std::sync::atomic::AtomicUsize>,
+    pub(crate) encoded_header_creations: Arc<std::sync::atomic::AtomicUsize>,
     pub(crate) live_bytes: Arc<std::sync::atomic::AtomicUsize>,
     pub(crate) peak_live_bytes: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -203,6 +205,7 @@ impl PipelineTestProbe {
         Self::for_job(job).map(|probe| SenderOwnershipObservers {
             extent_body_zeroizations: Arc::clone(&probe.0.sender_extent_body_zeroizations),
             prefix_header_zeroizations: Arc::clone(&probe.0.sender_prefix_header_zeroizations),
+            encoded_header_creations: Arc::clone(&probe.0.sender_encoded_header_creations),
             live_bytes: Arc::clone(&probe.0.sender_live_bytes),
             peak_live_bytes: Arc::clone(&probe.0.sender_peak_live_bytes),
         })
@@ -216,6 +219,11 @@ impl PipelineTestProbe {
     pub(crate) fn sender_prefix_header_zeroizations(&self) -> usize {
         self.0
             .sender_prefix_header_zeroizations
+            .load(Ordering::SeqCst)
+    }
+    pub(crate) fn sender_encoded_header_creations(&self) -> usize {
+        self.0
+            .sender_encoded_header_creations
             .load(Ordering::SeqCst)
     }
     pub(crate) fn sender_live_bytes(&self) -> usize {
