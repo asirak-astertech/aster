@@ -980,7 +980,7 @@ impl<'a> BlobDepot<'a> {
         #[cfg(any(test, feature = "test-utils"))]
         self.store
             .profile5_batch_test_counters
-            .redb_write_begins
+            .extent_write_begins
             .fetch_add(1, Ordering::Relaxed);
         write.set_durability(redb::Durability::Immediate)?;
         enforce_live_write(&write)?;
@@ -1088,7 +1088,7 @@ impl<'a> BlobDepot<'a> {
         #[cfg(any(test, feature = "test-utils"))]
         self.store
             .profile5_batch_test_counters
-            .redb_write_commits
+            .extent_write_commits
             .fetch_add(1, Ordering::Relaxed);
         Ok(progress)
     }
@@ -1799,7 +1799,7 @@ impl<'a> BlobDepot<'a> {
         if observe_profile5 {
             self.store
                 .profile5_batch_test_counters
-                .redb_write_begins
+                .fallback_activation_write_begins
                 .fetch_add(1, Ordering::Relaxed);
         }
         enforce_live_write(&write)?;
@@ -1916,7 +1916,7 @@ impl<'a> BlobDepot<'a> {
         if observe_profile5 {
             self.store
                 .profile5_batch_test_counters
-                .redb_write_commits
+                .fallback_activation_write_commits
                 .fetch_add(1, Ordering::Relaxed);
         }
         if observe_profile5 {

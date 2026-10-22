@@ -52328,7 +52328,13 @@ mod tests {
                     "\"peak_in_flight_bytes\":{},\"peak_reorder_items\":{},",
                     "\"stages\":{{\"admission\":{},\"map\":{},\"reorder\":{},\"sink\":{}}}}},",
                     "\"store\":{{\"durable_batches\":{},\"installed_carriers\":{},",
-                    "\"redb_write_begins\":{},\"redb_write_commits\":{},",
+                    "\"total_write_begins\":{},\"total_write_commits\":{},",
+                    "\"source_stage_write_begins\":{},\"source_stage_write_commits\":{},",
+                    "\"receipt_reservation_write_begins\":{},\"receipt_reservation_write_commits\":{},",
+                    "\"extent_write_begins\":{},\"extent_write_commits\":{},",
+                    "\"promotion_write_begins\":{},\"promotion_write_commits\":{},",
+                    "\"receipt_cleanup_write_begins\":{},\"receipt_cleanup_write_commits\":{},",
+                    "\"fallback_activation_write_begins\":{},\"fallback_activation_write_commits\":{},",
                     "\"temp_file_syncs\":{},\"parent_directory_syncs\":{}}}}}"
                 ),
                 self.payload_bytes,
@@ -52347,8 +52353,20 @@ mod tests {
                 self.stage_line(crate::stream_pipeline::PipelineStage::Sink),
                 self.store.durable_batches,
                 self.store.installed_carriers,
-                self.store.redb_write_begins,
-                self.store.redb_write_commits,
+                self.store.total_write_begins,
+                self.store.total_write_commits,
+                self.store.source_stage_write_begins,
+                self.store.source_stage_write_commits,
+                self.store.receipt_reservation_write_begins,
+                self.store.receipt_reservation_write_commits,
+                self.store.extent_write_begins,
+                self.store.extent_write_commits,
+                self.store.promotion_write_begins,
+                self.store.promotion_write_commits,
+                self.store.receipt_cleanup_write_begins,
+                self.store.receipt_cleanup_write_commits,
+                self.store.fallback_activation_write_begins,
+                self.store.fallback_activation_write_commits,
                 self.store.temp_file_syncs,
                 self.store.parent_directory_syncs,
             )
@@ -52645,6 +52663,25 @@ mod tests {
                 assert_eq!(
                     pipeline_probe.worker_exits(),
                     pipeline_probe.joined_workers()
+                );
+                let failed_counts = target_store.profile5_batch_test_counts();
+                assert_eq!(
+                    (
+                        failed_counts.total_write_begins,
+                        failed_counts.total_write_commits,
+                        failed_counts.source_stage_write_begins,
+                        failed_counts.source_stage_write_commits,
+                        failed_counts.receipt_reservation_write_begins,
+                        failed_counts.receipt_reservation_write_commits,
+                        failed_counts.extent_write_begins,
+                        failed_counts.extent_write_commits,
+                        failed_counts.promotion_write_begins,
+                        failed_counts.promotion_write_commits,
+                        failed_counts.receipt_cleanup_write_begins,
+                        failed_counts.receipt_cleanup_write_commits,
+                    ),
+                    (2, 2, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0),
+                    "sink failure stops after stage/reservation and before extent metadata, promotion, or cleanup writes"
                 );
                 drop((source_store, target_store));
                 fs::remove_dir_all(source_state).expect("sink-failure source cleanup");
@@ -53008,14 +53045,36 @@ mod tests {
                 );
                 assert!(batch_counts.durable_batches < batch_counts.installed_carriers);
                 assert_eq!(
-                    batch_counts.redb_write_begins,
-                    batch_counts.durable_batches + 1,
-                    "extent transactions plus one source-stage import activation are observed at their actual begin sites"
+                    batch_counts.total_write_begins,
+                    batch_counts.durable_batches + 4,
+                    "full receiver interval includes stage, reservation, extents, promotion, and cleanup"
                 );
                 assert_eq!(
-                    batch_counts.redb_write_commits,
-                    batch_counts.durable_batches + 1,
-                    "extent transactions plus one source-stage import activation commit successfully"
+                    batch_counts.total_write_commits,
+                    batch_counts.durable_batches + 4,
+                    "every clean receiver write transaction commits"
+                );
+                assert_eq!(
+                    (
+                        batch_counts.source_stage_write_begins,
+                        batch_counts.source_stage_write_commits,
+                        batch_counts.receipt_reservation_write_begins,
+                        batch_counts.receipt_reservation_write_commits,
+                        batch_counts.promotion_write_begins,
+                        batch_counts.promotion_write_commits,
+                        batch_counts.receipt_cleanup_write_begins,
+                        batch_counts.receipt_cleanup_write_commits,
+                        batch_counts.fallback_activation_write_begins,
+                        batch_counts.fallback_activation_write_commits,
+                    ),
+                    (1, 1, 1, 1, 1, 1, 1, 1, 0, 0),
+                );
+                assert_eq!(
+                    (
+                        batch_counts.extent_write_begins,
+                        batch_counts.extent_write_commits,
+                    ),
+                    (batch_counts.durable_batches, batch_counts.durable_batches),
                 );
                 assert_eq!(
                     batch_counts.temp_file_syncs, batch_counts.installed_carriers,

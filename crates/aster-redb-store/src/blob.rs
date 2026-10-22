@@ -55,8 +55,20 @@ pub use upload::{BlobUploadCheckpoint, BlobUploadRequest, BlobUploadReservation}
 pub struct Profile5BatchTestCounts {
     pub durable_batches: u64,
     pub installed_carriers: u64,
-    pub redb_write_begins: u64,
-    pub redb_write_commits: u64,
+    pub total_write_begins: u64,
+    pub total_write_commits: u64,
+    pub source_stage_write_begins: u64,
+    pub source_stage_write_commits: u64,
+    pub receipt_reservation_write_begins: u64,
+    pub receipt_reservation_write_commits: u64,
+    pub extent_write_begins: u64,
+    pub extent_write_commits: u64,
+    pub promotion_write_begins: u64,
+    pub promotion_write_commits: u64,
+    pub receipt_cleanup_write_begins: u64,
+    pub receipt_cleanup_write_commits: u64,
+    pub fallback_activation_write_begins: u64,
+    pub fallback_activation_write_commits: u64,
     pub temp_file_syncs: u64,
     pub parent_directory_syncs: u64,
 }
@@ -4513,7 +4525,7 @@ impl Store {
         #[cfg(any(test, feature = "test-utils"))]
         if observe_profile5 {
             self.profile5_batch_test_counters
-                .redb_write_begins
+                .source_stage_write_begins
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         enforce_live_write(&write)?;
@@ -4691,7 +4703,7 @@ impl Store {
             #[cfg(any(test, feature = "test-utils"))]
             if observe_profile5 {
                 self.profile5_batch_test_counters
-                    .redb_write_commits
+                    .source_stage_write_commits
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             return Ok(BlobSourceStageOutcome::Duplicate);
@@ -4880,7 +4892,7 @@ impl Store {
         #[cfg(any(test, feature = "test-utils"))]
         if observe_profile5 {
             self.profile5_batch_test_counters
-                .redb_write_commits
+                .source_stage_write_commits
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         Ok(if existing.is_some() {
@@ -6807,7 +6819,7 @@ impl Store {
     #[cfg(any(test, feature = "test-utils"))]
     #[doc(hidden)]
     pub fn profile5_batch_test_counts(&self) -> Profile5BatchTestCounts {
-        Profile5BatchTestCounts {
+        let mut counts = Profile5BatchTestCounts {
             durable_batches: self
                 .profile5_batch_test_counters
                 .durable_batches
@@ -6816,13 +6828,53 @@ impl Store {
                 .profile5_batch_test_counters
                 .installed_carriers
                 .load(std::sync::atomic::Ordering::Relaxed),
-            redb_write_begins: self
+            source_stage_write_begins: self
                 .profile5_batch_test_counters
-                .redb_write_begins
+                .source_stage_write_begins
                 .load(std::sync::atomic::Ordering::Relaxed),
-            redb_write_commits: self
+            source_stage_write_commits: self
                 .profile5_batch_test_counters
-                .redb_write_commits
+                .source_stage_write_commits
+                .load(std::sync::atomic::Ordering::Relaxed),
+            receipt_reservation_write_begins: self
+                .profile5_batch_test_counters
+                .receipt_reservation_write_begins
+                .load(std::sync::atomic::Ordering::Relaxed),
+            receipt_reservation_write_commits: self
+                .profile5_batch_test_counters
+                .receipt_reservation_write_commits
+                .load(std::sync::atomic::Ordering::Relaxed),
+            extent_write_begins: self
+                .profile5_batch_test_counters
+                .extent_write_begins
+                .load(std::sync::atomic::Ordering::Relaxed),
+            extent_write_commits: self
+                .profile5_batch_test_counters
+                .extent_write_commits
+                .load(std::sync::atomic::Ordering::Relaxed),
+            promotion_write_begins: self
+                .profile5_batch_test_counters
+                .promotion_write_begins
+                .load(std::sync::atomic::Ordering::Relaxed),
+            promotion_write_commits: self
+                .profile5_batch_test_counters
+                .promotion_write_commits
+                .load(std::sync::atomic::Ordering::Relaxed),
+            receipt_cleanup_write_begins: self
+                .profile5_batch_test_counters
+                .receipt_cleanup_write_begins
+                .load(std::sync::atomic::Ordering::Relaxed),
+            receipt_cleanup_write_commits: self
+                .profile5_batch_test_counters
+                .receipt_cleanup_write_commits
+                .load(std::sync::atomic::Ordering::Relaxed),
+            fallback_activation_write_begins: self
+                .profile5_batch_test_counters
+                .fallback_activation_write_begins
+                .load(std::sync::atomic::Ordering::Relaxed),
+            fallback_activation_write_commits: self
+                .profile5_batch_test_counters
+                .fallback_activation_write_commits
                 .load(std::sync::atomic::Ordering::Relaxed),
             temp_file_syncs: self
                 .profile5_batch_test_counters
@@ -6832,7 +6884,21 @@ impl Store {
                 .profile5_batch_test_counters
                 .parent_directory_syncs
                 .load(std::sync::atomic::Ordering::Relaxed),
-        }
+            ..Profile5BatchTestCounts::default()
+        };
+        counts.total_write_begins = counts.source_stage_write_begins
+            + counts.receipt_reservation_write_begins
+            + counts.extent_write_begins
+            + counts.promotion_write_begins
+            + counts.receipt_cleanup_write_begins
+            + counts.fallback_activation_write_begins;
+        counts.total_write_commits = counts.source_stage_write_commits
+            + counts.receipt_reservation_write_commits
+            + counts.extent_write_commits
+            + counts.promotion_write_commits
+            + counts.receipt_cleanup_write_commits
+            + counts.fallback_activation_write_commits;
+        counts
     }
 
     #[cfg(any(test, feature = "test-utils"))]
@@ -7382,6 +7448,27 @@ impl Store {
             depot_completion,
             content_completion,
             BlobContactEligibility::CustodyV1,
+            false,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn apply_verified_profile5_blob_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        plan: &VerifiedBlobTransferPlan,
+        lineage: &CurrentBlobLineage,
+        depot_completion: &BlobDepotCompletion,
+        content_completion: &VerifiedBlobContentCompletion,
+    ) -> Result<ApplyOutcome, StoreError> {
+        self.apply_verified_blob_with_eligibility(
+            policy,
+            plan,
+            lineage,
+            depot_completion,
+            content_completion,
+            BlobContactEligibility::CustodyV1,
+            true,
         )
     }
 
@@ -7401,6 +7488,7 @@ impl Store {
             depot_completion,
             content_completion,
             BlobContactEligibility::DurableOnly,
+            false,
         )
     }
 
@@ -7413,6 +7501,7 @@ impl Store {
         depot_completion: &BlobDepotCompletion,
         content_completion: &VerifiedBlobContentCompletion,
         eligibility: BlobContactEligibility,
+        observe_profile5: bool,
     ) -> Result<ApplyOutcome, StoreError> {
         self.require_live()?;
         let authority = self.require_bound_mission()?;
@@ -7498,6 +7587,12 @@ impl Store {
         depot::verify_completion(self, depot_completion)?;
 
         let write = self.database.begin_write()?;
+        #[cfg(any(test, feature = "test-utils"))]
+        if observe_profile5 {
+            self.profile5_batch_test_counters
+                .promotion_write_begins
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         enforce_live_write(&write)?;
         let staging = blob_network_staging_usage_write(&write, authority)?;
         let owner_binding = depot::require_depot_owner_binding_write(
@@ -7672,6 +7767,12 @@ impl Store {
             )?;
             pressure::promote_pending_source_write(&write, source, metadata.variant_id)?;
             write.commit()?;
+            #[cfg(any(test, feature = "test-utils"))]
+            if observe_profile5 {
+                self.profile5_batch_test_counters
+                    .promotion_write_commits
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             return Ok(ApplyOutcome::Duplicate {
                 acceptance_marker: accepted.acceptance_marker,
             });
@@ -7856,6 +7957,12 @@ impl Store {
         )?;
         pressure::promote_pending_source_write(&write, source, metadata.variant_id)?;
         write.commit()?;
+        #[cfg(any(test, feature = "test-utils"))]
+        if observe_profile5 {
+            self.profile5_batch_test_counters
+                .promotion_write_commits
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         Ok(ApplyOutcome::Inserted {
             acceptance_marker: marker,
         })
@@ -20523,10 +20630,17 @@ mod tests {
                     Profile5BatchTestCounts {
                         durable_batches: 0,
                         installed_carriers: 0,
-                        redb_write_begins: 2,
-                        redb_write_commits: 1,
+                        total_write_begins: 3,
+                        total_write_commits: 2,
+                        source_stage_write_begins: 1,
+                        source_stage_write_commits: 1,
+                        receipt_reservation_write_begins: 1,
+                        receipt_reservation_write_commits: 1,
+                        extent_write_begins: 1,
+                        extent_write_commits: 0,
                         temp_file_syncs: 1,
                         parent_directory_syncs: 2,
+                        ..Profile5BatchTestCounts::default()
                     },
                     "policy rejection observes activation, file syncs, and the failed extent transaction at their actual sites"
                 );
@@ -20567,8 +20681,14 @@ mod tests {
             let policy_prefix = u64::from(label == "temp-synced");
             assert_eq!(interrupted_counts.durable_batches, 0);
             assert_eq!(interrupted_counts.installed_carriers, 0);
-            assert_eq!(interrupted_counts.redb_write_begins, 1 + policy_prefix);
-            assert_eq!(interrupted_counts.redb_write_commits, 1);
+            assert_eq!(interrupted_counts.total_write_begins, 2 + policy_prefix);
+            assert_eq!(interrupted_counts.total_write_commits, 2);
+            assert_eq!(interrupted_counts.source_stage_write_begins, 1);
+            assert_eq!(interrupted_counts.source_stage_write_commits, 1);
+            assert_eq!(interrupted_counts.receipt_reservation_write_begins, 1);
+            assert_eq!(interrupted_counts.receipt_reservation_write_commits, 1);
+            assert_eq!(interrupted_counts.extent_write_begins, policy_prefix);
+            assert_eq!(interrupted_counts.extent_write_commits, 0);
             assert_eq!(interrupted_counts.temp_file_syncs, 1 + policy_prefix);
             assert_eq!(
                 interrupted_counts.parent_directory_syncs,
@@ -20662,7 +20782,8 @@ mod tests {
         assert_eq!(
             target.profile5_batch_test_counts(),
             Profile5BatchTestCounts {
-                redb_write_begins: 1,
+                total_write_begins: 1,
+                source_stage_write_begins: 1,
                 ..Profile5BatchTestCounts::default()
             },
             "capacity must reject inside source staging before commit, receipt, file sync, or final extent transaction"

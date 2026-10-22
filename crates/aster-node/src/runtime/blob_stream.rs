@@ -1895,7 +1895,7 @@ pub(crate) async fn receive_canonical_blob_profile5(
                 authentication_failure("recheck canonical promotion lineage", error)
             })?;
         match store
-            .apply_verified_blob_with_policy(
+            .apply_verified_profile5_blob_with_policy(
                 policy,
                 &plan,
                 &lineage,

@@ -550,6 +550,10 @@ impl Store {
             max_wire_len: profile5_max_wire_len(plan)?,
         };
         let mut write = self.database.begin_write()?;
+        #[cfg(any(test, feature = "test-utils"))]
+        self.profile5_batch_test_counters
+            .receipt_reservation_write_begins
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         write.set_durability(Durability::Immediate)?;
         enforce_live_write(&write)?;
         synchronize_blob_policy_generation_write(&write)?;
@@ -607,6 +611,10 @@ impl Store {
         receipts.insert(key.as_slice(), record.encode().as_slice())?;
         drop(receipts);
         write.commit()?;
+        #[cfg(any(test, feature = "test-utils"))]
+        self.profile5_batch_test_counters
+            .receipt_reservation_write_commits
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok((receipt, progress))
     }
 
@@ -784,6 +792,10 @@ impl Store {
         }
         let key = profile5_receipt_key(authority, receipt.source);
         let mut write = self.database.begin_write()?;
+        #[cfg(any(test, feature = "test-utils"))]
+        self.profile5_batch_test_counters
+            .receipt_cleanup_write_begins
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         write.set_durability(Durability::Immediate)?;
         enforce_live_write(&write)?;
         let existing = write
@@ -800,6 +812,10 @@ impl Store {
             .open_table(BLOB_PROFILE5_RECEIPTS)?
             .remove(key.as_slice())?;
         write.commit()?;
+        #[cfg(any(test, feature = "test-utils"))]
+        self.profile5_batch_test_counters
+            .receipt_cleanup_write_commits
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(true)
     }
 }
