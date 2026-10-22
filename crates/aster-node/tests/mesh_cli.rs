@@ -2990,8 +2990,10 @@ fn public_binary_relay_secrecy_and_consumer_ack_survive_reopen() {
                     .unwrap();
             let client_id =
                 aster_redb_store::EventClientId::new(b"compact-selector-owner".to_vec()).unwrap();
+            let mut claim_nonce = [0; 32];
+            getrandom::fill(&mut claim_nonce).unwrap();
             let recovery = store
-                .begin_event_publication_session(&client_id, 0, &[0x71; 32])
+                .begin_event_publication_session(&client_id, 0, &claim_nonce)
                 .unwrap();
             store
                 .complete_event_publication_recovery(
