@@ -2412,6 +2412,30 @@ pub struct MissionSession {
     peer: MissionPeerBinding,
 }
 
+#[cfg(feature = "fuzzing")]
+pub(crate) fn fuzz_mission_pair() -> (MissionSession, MissionSession, [u8; 32]) {
+    let (initiator, responder, digest) = aster_mesh::fuzz_reference_v9_session_pair();
+    let initiator_peer = MissionPeerBinding::new(
+        SecretKey::from_bytes(&[0x71; 32]).public(),
+        initiator.peer_identity(),
+    );
+    let responder_peer = MissionPeerBinding::new(
+        SecretKey::from_bytes(&[0x72; 32]).public(),
+        responder.peer_identity(),
+    );
+    (
+        MissionSession {
+            inner: initiator,
+            peer: initiator_peer,
+        },
+        MissionSession {
+            inner: responder,
+            peer: responder_peer,
+        },
+        digest,
+    )
+}
+
 impl MissionSession {
     fn blob_direction(direction: crate::frame::EventDirection) -> BlobCustodyDirectionV1 {
         match direction {

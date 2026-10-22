@@ -704,6 +704,44 @@ impl BlobRecordCodec for MissionBlobRecordCodec<'_> {
     }
 }
 
+#[cfg(all(feature = "fuzzing", test))]
+pub(crate) fn fuzz_protect_profile5_data_extent(
+    extent: Vec<u8>,
+) -> Result<Vec<u8>, BlobNetworkError> {
+    let (mut sender, _receiver, profile_digest) = crate::mission::fuzz_mission_pair();
+    MissionBlobRecordCodec {
+        mission: &mut sender,
+        profile_digest,
+        direction: EventDirection::ToSessionResponder,
+        attempt_nonce: [0x22; 32],
+    }
+    .encode(StreamFrame::Data(crate::stream_transfer::StreamDataV1 {
+        transfer_id: [0x11; 32],
+        attempt_nonce: [0x22; 32],
+        sequence: 0,
+        offset: 0,
+        bytes: extent,
+    }))
+}
+
+#[cfg(feature = "fuzzing")]
+pub(crate) fn fuzz_open_profile5_data_extent(
+    bytes: &[u8],
+) -> Result<crate::stream_transfer::StreamDataV1, BlobNetworkError> {
+    let (_sender, mut receiver, profile_digest) = crate::mission::fuzz_mission_pair();
+    let frame = MissionBlobRecordCodec {
+        mission: &mut receiver,
+        profile_digest,
+        direction: EventDirection::ToSessionResponder,
+        attempt_nonce: [0x22; 32],
+    }
+    .decode(bytes)?;
+    let StreamFrame::Data(data) = frame else {
+        return Err("fuzz fixture did not open as profile-5 DATA".into());
+    };
+    Ok(data)
+}
+
 async fn send_authenticated_source(
     attempt: &dyn StreamAttempt,
     codec: &mut dyn BlobRecordCodec,
@@ -1373,9 +1411,7 @@ pub(crate) async fn receive_canonical_blob_profile5(
     // The PLAN intentionally discloses no content size. Bound the transport by
     // the selected profile ceiling until authenticated OPEN supplies the exact
     // attempt size.
-    let profile_ceiling = (8u64 * 1024 * 1024 * 1024)
-        .checked_add(512 * 1024 * 1024)
-        .ok_or("profile-5 ceiling overflow")?;
+    let profile_ceiling = aster_mesh::PROFILE5_MAX_CANONICAL_WIRE_BYTES;
     let (max_data_bytes, max_control_bytes) =
         profile5_attempt_bounds(profile_ceiling).map_err(|error| {
             BlobNetworkError::new(BlobNetworkStage::Framing, "bound receive attempt", error)
@@ -2838,6 +2874,38 @@ pub(crate) mod tests {
             attempt_nonce: nonce,
         };
         assert_eq!(receiver_codec.decode(&encoded).unwrap(), frame);
+    }
+
+    #[cfg(feature = "fuzzing")]
+    #[test]
+    fn deterministic_profile5_fuzz_header_fixture_matches_production_codec() {
+        for (seed, fixture) in [
+            (
+                include_bytes!(
+                    "../../../../fuzz/corpus/stream_transfer_decode/profile5-composite-valid.bin"
+                )
+                .as_slice(),
+                include_bytes!("../../../../conformance/profile5-protected-data-header.bin")
+                    .as_slice(),
+            ),
+            (
+                include_bytes!(
+                    "../../../../fuzz/corpus/stream_transfer_decode/profile5-composite-maximum.bin"
+                )
+                .as_slice(),
+                include_bytes!(
+                    "../../../../conformance/profile5-protected-data-header-maximum.bin"
+                )
+                .as_slice(),
+            ),
+        ] {
+            let (_, extent) = crate::stream_transfer::split_composite_data_record(seed).unwrap();
+            let protected = super::fuzz_protect_profile5_data_extent(extent.to_vec()).unwrap();
+            let (header, _) =
+                crate::stream_transfer::split_composite_data_record(&protected).unwrap();
+            assert!(header.starts_with(b"ASTRFR01"));
+            assert_eq!(header, fixture);
+        }
     }
 
     #[test]

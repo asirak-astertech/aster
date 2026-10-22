@@ -450,6 +450,15 @@ fn validate_semantic_commitment_with_max(
 fn validate_authenticated_open(bytes: &[u8]) -> Result<(), StreamError> {
     validate_authenticated_open_with_max(bytes, MAX_STREAM_AUTHENTICATED_OPEN_BYTES)
 }
+fn validate_profile5_wire_len(bytes: u64) -> Result<(), StreamError> {
+    if bytes <= aster_mesh::PROFILE5_MAX_CANONICAL_WIRE_BYTES {
+        Ok(())
+    } else {
+        Err(StreamError::invalid(
+            "canonical ABX1 wire length exceeds profile 5",
+        ))
+    }
+}
 fn validate_authenticated_open_with_max(bytes: &[u8], max_bytes: usize) -> Result<(), StreamError> {
     if max_bytes == 0 || bytes.is_empty() || bytes.len() > max_bytes {
         Err(StreamError::invalid(
@@ -498,6 +507,7 @@ impl StreamFrame {
         match self {
             Self::Open(x) => {
                 nonce(&x.attempt_nonce)?;
+                validate_profile5_wire_len(x.total_len)?;
                 if x.source_len == 0
                     || usize::try_from(x.source_len)
                         .ok()
@@ -656,6 +666,7 @@ impl StreamFrame {
                 let publication_id = r.array()?;
                 let variant_id = r.array()?;
                 let total_len = r.u64()?;
+                validate_profile5_wire_len(total_len)?;
                 let attempt_nonce = r.array()?;
                 nonce(&attempt_nonce)?;
                 let checkpoint_generation = r.u64()?;
@@ -1401,28 +1412,168 @@ impl<'a> Reader<'a> {
 }
 
 #[cfg(feature = "fuzzing")]
-fn decode_fuzz_transcript(input: &[u8]) -> Option<Vec<StreamFrame>> {
-    if !input.starts_with(b"AST1") || input.len() < 5 {
+fn decode_fuzz_transcript(input: &[u8]) -> Option<(bool, Vec<StreamFrame>)> {
+    if !input.starts_with(b"AST1") || input.len() < 6 || input[4] > 1 {
         return None;
     }
-    let count = usize::from(input[4]);
+    let expected_accept = input[4] == 1;
+    let count = usize::from(input[5]);
     if count == 0 || count > 16 {
         return None;
     }
-    let mut reader = Reader::new(&input[5..]);
+    let mut reader = Reader::new(&input[6..]);
     let mut frames = Vec::with_capacity(count);
     for _ in 0..count {
         let len = usize::try_from(reader.u32().ok()?).ok()?;
         frames.push(StreamFrame::decode_for_context(9, 5, reader.take(len).ok()?).ok()?);
     }
     reader.finish().ok()?;
-    Some(frames)
+    Some((expected_accept, frames))
 }
 
 #[cfg(feature = "fuzzing")]
-fn drive_fuzz_transcript(frames: &[StreamFrame]) {
+fn model_fuzz_transcript(frames: &[StreamFrame]) -> bool {
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    enum Phase {
+        Source,
+        Data,
+        Finished,
+        Result,
+        Terminal,
+    }
+
     let Some(StreamFrame::Open(open)) = frames.first() else {
-        return;
+        return false;
+    };
+    let mut phase = Phase::Source;
+    let mut source_sequence = 0_u64;
+    let mut data_sequence = 0_u64;
+    let mut control_sequence = 0_u64;
+    let mut received = 0_u64;
+    let mut durable = 0_u64;
+    let mut generation = open.checkpoint_generation;
+    let mut limit = open.total_len;
+    let max_extent = MAX_STREAM_EXTENT_BYTES as u32;
+    let mut result: Option<StreamResultV1> = None;
+    let mut expected_ack: Option<StreamResultAckV1> = None;
+
+    let bound =
+        |id: &[u8; 32], nonce: &[u8; 32]| id == &open.transfer_id && nonce == &open.attempt_nonce;
+    for frame in &frames[1..] {
+        match frame {
+            StreamFrame::Open(_) => return false,
+            StreamFrame::Source(value) if phase == Phase::Source => {
+                if !bound(&value.transfer_id, &value.attempt_nonce)
+                    || value.sequence != source_sequence
+                {
+                    return false;
+                }
+                source_sequence += 1;
+            }
+            StreamFrame::Accept(value) if phase == Phase::Source => {
+                if !bound(&value.transfer_id, &value.attempt_nonce)
+                    || value.sequence != 0
+                    || value.durable_offset != 0
+                    || value.checkpoint_generation != generation
+                    || value.absolute_receive_limit != limit
+                    || value.max_extent_bytes != max_extent
+                    || value.checkpoint_batch_bytes == 0
+                    || value.checkpoint_batch_bytes > MAX_STREAM_CHECKPOINT_BATCH_BYTES
+                {
+                    return false;
+                }
+                control_sequence = 1;
+                phase = Phase::Data;
+            }
+            StreamFrame::Data(value) if phase == Phase::Data => {
+                let Ok(length) = u32::try_from(value.bytes.len()) else {
+                    return false;
+                };
+                let Some(end) = value.offset.checked_add(u64::from(length)) else {
+                    return false;
+                };
+                if !bound(&value.transfer_id, &value.attempt_nonce)
+                    || value.sequence != data_sequence
+                    || value.offset != received
+                    || length == 0
+                    || length > max_extent
+                    || end > limit
+                    || end > open.total_len
+                {
+                    return false;
+                }
+                data_sequence += 1;
+                received = end;
+            }
+            StreamFrame::Checkpoint(value) if phase == Phase::Data => {
+                if !bound(&value.transfer_id, &value.attempt_nonce)
+                    || value.sequence != control_sequence
+                    || value.durable_offset < durable
+                    || value.durable_offset > received
+                    || value.checkpoint_generation < generation
+                    || ((value.durable_offset == durable)
+                        != (value.checkpoint_generation == generation))
+                    || value.absolute_receive_limit < limit
+                    || value.absolute_receive_limit > open.total_len
+                {
+                    return false;
+                }
+                control_sequence += 1;
+                durable = value.durable_offset;
+                generation = value.checkpoint_generation;
+                limit = value.absolute_receive_limit;
+            }
+            StreamFrame::Finish(value) if phase == Phase::Data => {
+                if !bound(&value.transfer_id, &value.attempt_nonce)
+                    || value.sequence != data_sequence
+                    || value.final_offset != open.total_len
+                    || received != open.total_len
+                    || durable != open.total_len
+                    || validate_semantic_commitment(&value.semantic_commitment).is_err()
+                {
+                    return false;
+                }
+                data_sequence += 1;
+                phase = Phase::Finished;
+            }
+            StreamFrame::Result(value) if phase == Phase::Finished => {
+                if !bound(&value.transfer_id, &value.attempt_nonce)
+                    || value.sequence != control_sequence
+                    || value.final_offset != open.total_len
+                {
+                    return false;
+                }
+                control_sequence += 1;
+                expected_ack = Some(StreamResultAckV1 {
+                    transfer_id: open.transfer_id,
+                    attempt_nonce: open.attempt_nonce,
+                    sequence: data_sequence,
+                    result_digest: value.result_digest,
+                });
+                result = Some(value.clone());
+                phase = Phase::Result;
+            }
+            StreamFrame::Result(value) if matches!(phase, Phase::Result | Phase::Terminal) => {
+                if result.as_ref() != Some(value) {
+                    return false;
+                }
+            }
+            StreamFrame::ResultAck(value) if matches!(phase, Phase::Result | Phase::Terminal) => {
+                if expected_ack.as_ref() != Some(value) {
+                    return false;
+                }
+                phase = Phase::Terminal;
+            }
+            _ => return false,
+        }
+    }
+    phase == Phase::Terminal
+}
+
+#[cfg(feature = "fuzzing")]
+fn drive_fuzz_transcript(frames: &[StreamFrame]) -> bool {
+    let Some(StreamFrame::Open(open)) = frames.first() else {
+        return false;
     };
     let receive_limit = open.total_len;
     let Ok(mut receiver) = StreamReceiverState::new(
@@ -1432,62 +1583,137 @@ fn drive_fuzz_transcript(frames: &[StreamFrame]) {
         receive_limit,
         MAX_STREAM_EXTENT_BYTES as u32,
     ) else {
-        return;
+        return false;
     };
     let mut sender = StreamSenderState::new(open.transfer_id, open.attempt_nonce, open.total_len);
+    let mut source_sequence = 0;
+    let mut pending_ack = None;
+    let mut terminal_code = None;
+    let mut terminal = false;
     for frame in &frames[1..] {
         match frame {
-            StreamFrame::Open(_) | StreamFrame::Source(_) => {}
+            StreamFrame::Open(_) => return false,
+            StreamFrame::Source(value) => {
+                if value.transfer_id != open.transfer_id
+                    || value.attempt_nonce != open.attempt_nonce
+                    || value.sequence != source_sequence
+                {
+                    return false;
+                }
+                source_sequence += 1;
+            }
             StreamFrame::Accept(value) => {
-                let _ = receiver.accept(value.checkpoint_batch_bytes);
-                let _ = sender.accept(value.clone());
+                let Ok(StreamAction::Send(StreamFrame::Accept(generated))) =
+                    receiver.accept(value.checkpoint_batch_bytes)
+                else {
+                    return false;
+                };
+                if generated != *value || sender.accept(value.clone()).is_err() {
+                    return false;
+                }
             }
             StreamFrame::Data(value) => {
-                let _ = sender.send_extent(value.bytes.clone());
-                let _ = receiver.data(value);
+                let Ok(StreamExtentAction::Send(generated)) =
+                    sender.send_extent(value.bytes.clone())
+                else {
+                    return false;
+                };
+                if generated != *value
+                    || !matches!(receiver.data(value), Ok(StreamAction::Persist { .. }))
+                {
+                    return false;
+                }
             }
             StreamFrame::Checkpoint(value) => {
-                let _ = receiver.persisted(
-                    value.durable_offset,
-                    value.checkpoint_generation,
-                    value.absolute_receive_limit,
-                );
-                let _ = sender.checkpoint(value.clone());
+                let Ok(StreamAction::Send(StreamFrame::Checkpoint(generated))) = receiver
+                    .persisted(
+                        value.durable_offset,
+                        value.checkpoint_generation,
+                        value.absolute_receive_limit,
+                    )
+                else {
+                    return false;
+                };
+                if generated != *value || sender.checkpoint(value.clone()).is_err() {
+                    return false;
+                }
             }
             StreamFrame::Finish(value) => {
-                let _ = sender.finish(value.semantic_commitment.clone());
-                let _ = receiver.finish(value.clone());
+                let Ok(StreamAction::Send(StreamFrame::Finish(generated))) =
+                    sender.finish(value.semantic_commitment.clone())
+                else {
+                    return false;
+                };
+                if generated != *value
+                    || receiver.finish(value.clone()) != Ok(StreamAction::Promote)
+                {
+                    return false;
+                }
             }
             StreamFrame::Result(value) => {
-                let _ = receiver.promoted(value.code, value.result_digest);
-                let _ = sender.result(value.clone());
+                let Ok(StreamAction::Send(StreamFrame::Result(generated))) =
+                    receiver.promoted(value.code, value.result_digest)
+                else {
+                    return false;
+                };
+                let Ok((StreamAction::Send(StreamFrame::ResultAck(ack)), generated_terminal)) =
+                    sender.result(value.clone())
+                else {
+                    return false;
+                };
+                if generated != *value || generated_terminal != StreamAction::Terminal(value.code) {
+                    return false;
+                }
+                terminal_code = Some(value.code);
+                pending_ack = Some(ack);
             }
             StreamFrame::ResultAck(value) => {
-                let _ = receiver.result_ack(value.clone(), StreamResultCode::Promoted);
+                if pending_ack.as_ref() != Some(value)
+                    || receiver.result_ack(
+                        value.clone(),
+                        terminal_code.unwrap_or(StreamResultCode::IntegrityFailure),
+                    ) != Ok(StreamAction::Terminal(
+                        terminal_code.unwrap_or(StreamResultCode::IntegrityFailure),
+                    ))
+                {
+                    return false;
+                }
+                terminal = true;
             }
         }
     }
+    terminal
 }
 
 #[cfg(feature = "fuzzing")]
 pub(crate) fn fuzz_decode(input: &[u8]) {
     if input.starts_with(b"AST1") {
-        if let Some(frames) = decode_fuzz_transcript(input) {
-            drive_fuzz_transcript(&frames);
+        if let Some((_seed_expectation, frames)) = decode_fuzz_transcript(input) {
+            assert_eq!(
+                drive_fuzz_transcript(&frames),
+                model_fuzz_transcript(&frames)
+            );
         }
         return;
     }
-    if let Ok((protected_header, body)) = split_composite_data_record(input) {
-        if let Ok(header) = StreamDataHeaderV1::decode_for_context(9, 5, protected_header) {
-            let _ = header.decode_body(body);
-        }
-        if let Ok(extent) = CanonicalBlobExtentV1::decode(body) {
+    if input.starts_with(COMPOSITE_DATA_MAGIC) {
+        if let Ok(data) = crate::runtime::blob_stream::fuzz_open_profile5_data_extent(input)
+            && let Ok(extent) = CanonicalBlobExtentV1::decode(&data.bytes)
+        {
+            let body = data.bytes.as_slice();
+            let expected_ciphertext = (0_u8..17).collect::<Vec<_>>();
             for carrier in &extent.carriers {
-                let _ = aster_mesh::fuzz_inspect_blob_transfer_object(carrier);
-                if !carrier.is_empty() {
+                if aster_mesh::fuzz_verify_profile5_carrier(carrier, &expected_ciphertext) {
+                    assert!(aster_mesh::fuzz_verify_profile5_carrier(
+                        carrier,
+                        &expected_ciphertext
+                    ));
                     let mut malformed = carrier.clone();
                     malformed[carrier.len() - 1] ^= 1;
-                    let _ = aster_mesh::fuzz_inspect_blob_transfer_object(&malformed);
+                    assert!(!aster_mesh::fuzz_verify_profile5_carrier(
+                        &malformed,
+                        &expected_ciphertext
+                    ));
                 }
             }
             let encoded = extent
@@ -1501,6 +1727,7 @@ pub(crate) fn fuzz_decode(input: &[u8]) {
             trailing.push(0);
             assert!(CanonicalBlobExtentV1::decode(&trailing).is_err());
         }
+        return;
     }
     let Ok(decoded) = StreamFrame::decode_for_context(9, 5, input) else {
         return;
@@ -1975,7 +2202,7 @@ mod stream_frame_codec {
     }
 
     #[test]
-    fn production_composite_seeds_reach_canonical_carrier_inspection() {
+    fn production_composite_seeds_are_structurally_bounded() {
         assert_eq!(MAX_COMPOSITE_STREAM_DATA_BYTES, 1_050_632);
         for bytes in [
             include_bytes!(
@@ -1989,15 +2216,62 @@ mod stream_frame_codec {
         ] {
             assert!(bytes.len() <= MAX_COMPOSITE_STREAM_DATA_BYTES);
             let (header, body) = split_composite_data_record(bytes).expect("ASD1 seed");
-            let header = StreamDataHeaderV1::decode_for_context(9, 5, header).expect("DATA header");
-            header.decode_body(body).expect("DATA body");
+            assert!(header.starts_with(b"ASTRFR01"));
             let extent = CanonicalBlobExtentV1::decode(body).expect("ABX1 extent");
-            assert!(
-                extent
-                    .carriers
-                    .iter()
-                    .all(|carrier| { aster_mesh::fuzz_inspect_blob_transfer_object(carrier) })
-            );
+            assert!(!extent.carriers.is_empty());
+        }
+    }
+
+    #[cfg(feature = "fuzzing")]
+    #[test]
+    fn production_composite_seed_opens_and_authenticates_through_runtime_codec() {
+        let bytes = include_bytes!(
+            "../../../fuzz/corpus/stream_transfer_decode/profile5-composite-valid.bin"
+        );
+        let data = crate::runtime::blob_stream::fuzz_open_profile5_data_extent(bytes)
+            .expect("production MissionBlobRecordCodec opens seed");
+        let extent = CanonicalBlobExtentV1::decode(&data.bytes).expect("ABX1 extent");
+        let expected_ciphertext = (0_u8..17).collect::<Vec<_>>();
+        assert_eq!(extent.carriers.len(), 1);
+        assert!(aster_mesh::fuzz_verify_profile5_carrier(
+            &extent.carriers[0],
+            &expected_ciphertext,
+        ));
+        let mut malformed = extent.carriers[0].clone();
+        *malformed.last_mut().expect("carrier ciphertext") ^= 1;
+        assert!(!aster_mesh::fuzz_verify_profile5_carrier(
+            &malformed,
+            &expected_ciphertext,
+        ));
+    }
+
+    #[cfg(feature = "fuzzing")]
+    #[test]
+    fn transcript_seed_expectations_match_model_and_production_states() {
+        let seeds: [&[u8]; 6] = [
+            include_bytes!(
+                "../../../fuzz/corpus/stream_transfer_decode/profile5-transcript-empty.bin"
+            ),
+            include_bytes!(
+                "../../../fuzz/corpus/stream_transfer_decode/profile5-transcript-nonempty.bin"
+            ),
+            include_bytes!(
+                "../../../fuzz/corpus/stream_transfer_decode/profile5-transcript-reject-binding.bin"
+            ),
+            include_bytes!(
+                "../../../fuzz/corpus/stream_transfer_decode/profile5-transcript-reject-rollback.bin"
+            ),
+            include_bytes!(
+                "../../../fuzz/corpus/stream_transfer_decode/profile5-transcript-reject-replay.bin"
+            ),
+            include_bytes!(
+                "../../../fuzz/corpus/stream_transfer_decode/profile5-transcript-reject-terminal-change.bin"
+            ),
+        ];
+        for seed in seeds {
+            let (expected, frames) = decode_fuzz_transcript(seed).expect("decode transcript seed");
+            assert_eq!(model_fuzz_transcript(&frames), expected);
+            assert_eq!(drive_fuzz_transcript(&frames), expected);
         }
     }
     #[test]

@@ -4242,6 +4242,45 @@ pub fn inspect_blob_transfer_object(bytes: &[u8]) -> Result<BlobTransferObject, 
     })
 }
 
+/// Fuzz-only one-chunk source/manifest oracle that enters the same route- and
+/// record-bound carrier authentication path as the production receiver.
+#[cfg(feature = "fuzzing")]
+pub(crate) fn fuzz_verify_profile5_carrier(
+    bytes: &[u8],
+    expected_ciphertext: &[u8],
+) -> Result<(), BlobError> {
+    let ciphertext_sha256 = sha256(expected_ciphertext);
+    let ciphertext_len =
+        u32::try_from(expected_ciphertext.len()).map_err(|_| BlobError::LengthOverflow)?;
+    let plaintext_len = ciphertext_len
+        .checked_sub(GCM_TAG_LEN as u32)
+        .ok_or(BlobError::InvalidManifest)?;
+    let record =
+        BlobChunkRecord::from_parts([0x30; 32], ciphertext_sha256, plaintext_len, ciphertext_len)?;
+    let blob_id = BlobId::from_bytes([0x20; 32]);
+    let tree = BlobRouteTree::build(blob_id, vec![record])?;
+    let commitment = tree.commitment()?;
+    let route = AuthenticatedBlobRoute::new(EnvelopeId::from_bytes([0x10; 32]), commitment);
+    let proof = tree.proof(0)?;
+    let object_id = transfer_object_id(
+        route.source_envelope,
+        blob_id,
+        0,
+        ciphertext_sha256,
+        ciphertext_len,
+        &proof,
+    );
+    let inspected = authenticate_blob_transfer_object_for_route(object_id, bytes, route)?;
+    if inspected.index != 0
+        || inspected.ciphertext_sha256 != ciphertext_sha256
+        || inspected.ciphertext_len != ciphertext_len
+        || inspected.ciphertext != expected_ciphertext
+    {
+        return Err(BlobError::AuthenticationFailed);
+    }
+    Ok(())
+}
+
 fn read_exact_chunk<R: Read>(
     source: &mut R,
     buffer: &mut Vec<u8>,

@@ -12,7 +12,7 @@ use super::{
     MlKemDecapsulationKey, MlKemEncapsulationKey, MlKemKey, MlKemKeyExport, P256SecretKey,
     P256SigningKey, ResponderHandshake, ResponderHandshakePrepared, RustCryptoProvider,
     RustCryptoSigningKey, SealedBatchItem, SealedSourceBatch, Secret32, SecureChannel,
-    SequencedCiphertext, ServerFinished, ServerHello, ZeroizeKey, client_hello_hash,
+    SequencedCiphertext, ServerFinished, ServerHello, SessionKeys, ZeroizeKey, client_hello_hash,
 };
 use crate::batch;
 use crate::blob::{
@@ -4988,6 +4988,83 @@ pub struct ReferenceAuthenticatedSession {
     role: SessionRole,
     channel: SecureChannel,
     transfer_profiles: TransferProfileNegotiationState,
+}
+
+/// Deterministic v9 authenticated sessions for corpus generation and fuzzing.
+/// This constructor is absent from ordinary production builds.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_reference_v9_session_pair() -> (
+    ReferenceAuthenticatedSession,
+    ReferenceAuthenticatedSession,
+    [u8; 32],
+) {
+    fn provider(prefix: [u8; 4]) -> RustCryptoProvider<SysRng> {
+        RustCryptoProvider {
+            rng: SysRng,
+            nonce_prefix: prefix,
+            nonce_counter: 1,
+            nonce_start: 1,
+            nonce_exhausted: false,
+        }
+    }
+    fn profiles() -> (TransferProfileNegotiationState, [u8; 32]) {
+        let offer = TransferProfileOfferV1::for_semantic_version(SEMANTIC_PROTOCOL_V9)
+            .expect("fixed v9 fuzz offer");
+        let negotiated =
+            negotiate_transfer_profiles_for_semantic_version(SEMANTIC_PROTOCOL_V9, &offer, &offer)
+                .expect("fixed v9 fuzz negotiation");
+        let digest = transfer_profile_digest(&offer, &offer, &negotiated);
+        (
+            TransferProfileNegotiationState {
+                local_offer: Some(offer.clone()),
+                authenticated_peer_offer: Some(offer),
+                authenticated: Some(AuthenticatedTransferProfiles { negotiated, digest }),
+            },
+            digest,
+        )
+    }
+    let session_id = [0x31; 32];
+    let (initiator_profiles, digest) = profiles();
+    let (responder_profiles, responder_digest) = profiles();
+    debug_assert_eq!(digest, responder_digest);
+    let initiator_keys = SessionKeys {
+        transmit: Secret32::new([0x41; 32]),
+        receive: Secret32::new([0x42; 32]),
+        transcript_hash: session_id,
+        selected_version: SEMANTIC_PROTOCOL_V9,
+        selected_suite: super::HYBRID_SUITE_ID,
+    };
+    let responder_keys = SessionKeys {
+        transmit: Secret32::new([0x42; 32]),
+        receive: Secret32::new([0x41; 32]),
+        transcript_hash: session_id,
+        selected_version: SEMANTIC_PROTOCOL_V9,
+        selected_suite: super::HYBRID_SUITE_ID,
+    };
+    (
+        ReferenceAuthenticatedSession {
+            provider: provider([0x51; 4]),
+            peer_identity: [0x61; 32],
+            peer_route_grant_commitments: Vec::new(),
+            semantic_version: SEMANTIC_PROTOCOL_V9,
+            session_id,
+            role: SessionRole::Initiator,
+            channel: initiator_keys.into_channel(),
+            transfer_profiles: initiator_profiles,
+        },
+        ReferenceAuthenticatedSession {
+            provider: provider([0x52; 4]),
+            peer_identity: [0x62; 32],
+            peer_route_grant_commitments: Vec::new(),
+            semantic_version: SEMANTIC_PROTOCOL_V9,
+            session_id,
+            role: SessionRole::Responder,
+            channel: responder_keys.into_channel(),
+            transfer_profiles: responder_profiles,
+        },
+        digest,
+    )
 }
 
 impl fmt::Debug for ReferenceAuthenticatedSession {

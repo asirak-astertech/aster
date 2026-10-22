@@ -1041,6 +1041,10 @@ Blob profile registry: semantic v7/v8 select profile 4; semantic v9 selects prof
 Profile 4 limits: 67,108,864 object bytes; 1,024 canonical chunks; 1,048,576 authenticated-source bytes.
 Profile 5 limits: 8,589,934,592 object bytes; 131,072 canonical chunks; 16,777,216 authenticated-source bytes.
 Profile 5 size classes: 65,536 plaintext chunk bytes; 66,215 encrypted carrier bytes; 1,048,576 ABX1 extent bytes; 134,217,728 checkpoint bytes; 2,097,152 Iroh frame bytes.
+`StreamOpenV1.total_len` is the canonical ABX1 wire length, not the plaintext
+object length. Its exact maximum for the profile-5 maximum shape is
+8,679,596,592 bytes; the 8-GiB plaintext bound remains on the manifest/source
+object fields.
 
 Both peers compute the same highest common profile independently for each lane
 and bind the complete canonical offers plus intersections into

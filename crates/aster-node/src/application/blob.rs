@@ -923,8 +923,9 @@ fn blob_transfer_phase(
 /// [`SelectedBlobHandle::publish`], the owned regular file must have its cursor
 /// positioned at exactly zero. Exact-operation retry remains available only
 /// while the publisher and Store are authorized and not zeroized. A failed
-/// publication may leave bounded, quota-charged unfinished or
-/// completed-but-unpublished depot staging with no semantic/operation row.
+/// publication may leave bounded, quota-charged unfinished or completed
+/// provisional upload staging with no semantic/operation row. That staging is
+/// not a second publication authority; only canonical publication commits it.
 /// Exact already-unreferenced variants are eligible for manifest-authorized,
 /// bounded background reclamation and remain fully charged until deletion
 /// finalizes. Capacity admission may run one cursor-neutral bounded reclamation
@@ -1170,12 +1171,14 @@ impl SelectedBlobHandle {
     /// commit; retry the exact `operation_key` to recover the authoritative
     /// result only while that publisher and Store remain authorized and have
     /// not been zeroized. A failed or concurrently mutated source can leave
-    /// bounded, quota-charged unfinished or completed-but-unpublished depot
-    /// staging without a semantic or operation row. Bounded maintenance can
-    /// reclaim that exact already-unreferenced staging, but it remains charged
-    /// through finalization and provides no live-retirement or pressure-eviction
-    /// guarantee. An authorized publisher can therefore exhaust the default
-    /// 512-MiB depot with roughly eight maximum-size Blobs before cleanup, and
+    /// bounded, quota-charged unfinished or completed provisional upload
+    /// staging without a semantic or operation row. This is not a second
+    /// publication authority; only canonical publication commits it. Bounded
+    /// maintenance can reclaim that exact already-unreferenced staging, but it
+    /// remains charged through finalization and provides no live-retirement or
+    /// pressure-eviction guarantee. An authorized publisher can therefore
+    /// exhaust the default 512-MiB depot with roughly eight maximum-size Blobs
+    /// before cleanup, and
     /// before separately bounded carrier-prefix staging.
     /// Admitted file syscalls run on the joined blocking worker, so a hostile or
     /// delayed FUSE/NFS/other filesystem can delay rekey, shutdown, and

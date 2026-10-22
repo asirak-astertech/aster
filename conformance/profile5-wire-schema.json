@@ -65,7 +65,7 @@
         ],
         [
           "total_len",
-          "u64<=8589934592"
+          "u64-canonical-abx1-wire<=8679596592"
         ],
         [
           "attempt_nonce",
@@ -288,7 +288,7 @@
       ],
       [
         "protected_header",
-        "bytes[protected_header_len],protected-DATA-header"
+        "bytes[protected_header_len],protected-ASTRFR01-DATA-header"
       ],
       [
         "abx1_extent",

@@ -8,7 +8,7 @@ license.workspace = true
 publish = false
 
 [features]
-fuzzing = []
+fuzzing = ["aster-mesh/fuzzing"]
 nearby-discovery = ["aster-iroh/nearby-discovery"]
 
 [lib]

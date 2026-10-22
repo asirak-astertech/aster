@@ -150,3 +150,67 @@ Focused verification:
 - `cargo fmt --all -- --check` and `git diff --check` — PASS.
 
 No full suite, push, deployment, or device validation was run.
+
+## Review remediation round 2
+
+The two Important findings and Minor terminology finding in
+`task-9-rereview-1.md` are addressed.
+
+- `StreamOpenV1.total_len` is now explicitly the canonical ABX1 wire length.
+  Encoder admission, decoder admission, the receiver ceiling, structured
+  schema, protocol prose, checker, oracle, and vectors use the derived exact
+  maximum of 8,679,596,592 bytes. The derivation uses the executable 66,215-byte
+  carrier maximum, 15 maximum carriers per 1-MiB ABX1 extent, 131,072 chunks,
+  and one 16-byte ABX1 header per extent. A focused maximum-shape proof reaches
+  the same terminal wire offset; maximum + 1 is rejected. The separate 8-GiB
+  plaintext object limit remains on manifest/source fields.
+- The standalone checker now binds every record tag, ordered field and
+  width/type/bound to both Rust encoder and decoder tokens plus executable
+  validators. It also binds every nested attempt field, ABX1 magic/index/count/
+  carrier length and aggregate limits, ASD1 magic/header length/protected
+  header/extent and aggregate limits, enums/result codes, and both exact flows.
+  Mutation tests cover each of these elements, representative decoder offsets,
+  executable bound drift, the prior incorrect 8-GiB OPEN bound, and independent
+  oracle/vector drift.
+- Both ASD1 seeds now contain stable authenticated `ASTRFR01` headers produced
+  by a fixed production reference mission/session codec fixture. The fuzz path
+  opens those headers through `MissionBlobRecordCodec` and
+  `open_v9_blob_data_header` before decoding ABX1. It then calls the production
+  route/manifest-bound canonical carrier inspector, proves the valid
+  `ASTRBT01` carrier is accepted, and proves an authenticated-byte mutation is
+  rejected. The maximum-boundary seed uses the same production path.
+- The transcript harness has an independent small phase/state model for
+  attempt binding, source/data/control sequences, offsets, cumulative credit,
+  checkpoint-generation monotonicity, durable completion, terminal replay,
+  terminal change, and ACK binding. Every decoded input is driven through the
+  production sender/receiver states and its result is compared with the model.
+  Checked-in seeds prove accepted empty/nonempty and rejected binding,
+  rollback, DATA replay, and terminal-change branches. An initial direct fuzz
+  run exposed and reproduced a mutable seed-label false oracle; replacing that
+  label assertion with the independent input-derived model eliminated the
+  harness defect.
+- Public API and engineering runbook language now calls the residual bytes
+  completed provisional upload staging and states that only canonical
+  publication is authoritative.
+
+Focused verification:
+
+- `python3 conformance/blob_stream_oracle.py` — PASS.
+- `python3 tools/check-protocol-version-contract.py` — PASS; semantic versions
+  1 through 9 align.
+- `python3 tools/test-protocol-version-contract.py` — PASS, 29 tests.
+- `python3 tools/test-run-fuzz-smoke.py` — PASS, 3 tests.
+- `cargo test -p aster-core maximum_wire_bound_is_derived_from_executable_carrier_partitioning -- --nocapture`
+  — PASS, 1 test.
+- `cargo test -p aster-node --features fuzzing stream_transfer -- --nocapture`
+  — PASS, 29 passed, 1 explicit 1-GiB performance test ignored.
+- `cargo test --manifest-path fuzz/Cargo.toml --lib` — PASS, 3 tests.
+- Direct `stream_transfer_decode` campaign with
+  `-runs=10000 -max_len=1052672 -seed=2026102202` — PASS, 10,000 runs, 5,000
+  executions/second, peak RSS 412 MiB.
+- Fresh-copy replay loaded all 17 checked-in seeds, including both production
+  ASD1 composites and all six accepted/rejected transcripts, and completed 100
+  mutation runs with maximum input 1,048,725 bytes — PASS.
+- `cargo fmt --all -- --check` and `git diff --check` — PASS.
+
+No full suite, push, deployment, or device validation was run.

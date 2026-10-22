@@ -156,8 +156,10 @@ pub use blob::{
 };
 /// Fuzz-harness bridge to the production canonical carrier inspector.
 #[doc(hidden)]
-pub fn fuzz_inspect_blob_transfer_object(bytes: &[u8]) -> bool {
-    blob::inspect_blob_transfer_object(bytes).is_ok()
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_verify_profile5_carrier(bytes: &[u8], expected_ciphertext: &[u8]) -> bool {
+    blob::fuzz_verify_profile5_carrier(bytes, expected_ciphertext).is_ok()
 }
 #[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
 pub use blob_custody::{
@@ -180,10 +182,10 @@ pub use blob_stream::{
     BlobUploadSegmentOpener, BlobUploadSegmentSealer, EncryptedBlobStreamSegment,
     EncryptedBlobStreamSegmentHeader, MAX_BLOB_STREAM_BYTES,
     PROFILE5_CANONICAL_CARRIER_PREFIX_BYTES, PROFILE5_CANONICAL_EXTENT_BYTES,
-    PROFILE5_CANONICAL_EXTENT_HEADER_BYTES, Profile5CanonicalCheckpoint,
-    Profile5CanonicalWireShape, VerifiedBlobStreamFinalCommitment, VerifiedBlobStreamOpen,
-    local_blob_publication_stream_id, profile5_canonical_wire_shape,
-    profile5_canonical_wire_shape_from_lengths,
+    PROFILE5_CANONICAL_EXTENT_HEADER_BYTES, PROFILE5_MAX_CANONICAL_WIRE_BYTES,
+    PROFILE5_MAX_CARRIERS_PER_EXTENT, Profile5CanonicalCheckpoint, Profile5CanonicalWireShape,
+    VerifiedBlobStreamFinalCommitment, VerifiedBlobStreamOpen, local_blob_publication_stream_id,
+    profile5_canonical_wire_shape, profile5_canonical_wire_shape_from_lengths,
 };
 #[cfg(feature = "reference-session")]
 pub use bridge_adapter::{
@@ -192,6 +194,9 @@ pub use bridge_adapter::{
     SelectedEventBridgeAdapter, VerifiedSelectedBridgeAuthorization,
     VerifiedSelectedBridgeEnrollment, VerifiedSelectedBridgeEventRoute,
 };
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub use crypto::fuzz_reference_v9_session_pair;
 #[cfg(all(feature = "sqlite-store", feature = "adapter-sdk"))]
 pub use crypto::{
     ApplicationProtection, AuthenticatedChannelBinding, CLASSICAL_SECURITY_PROFILE_ID,

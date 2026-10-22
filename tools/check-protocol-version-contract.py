@@ -60,6 +60,8 @@ PROFILE5_LIMIT_NAMES = (
     "MAX_BLOB_CHUNK_SIZE",
     "MAX_BLOB_TRANSFER_OBJECT_BYTES",
     "PROFILE5_CANONICAL_EXTENT_BYTES",
+    "PROFILE5_MAX_CARRIERS_PER_EXTENT",
+    "PROFILE5_MAX_CANONICAL_WIRE_BYTES",
     "MAX_STREAM_CHECKPOINT_BATCH_BYTES",
     "DEFAULT_MAX_EXCHANGE_BYTES",
 )
@@ -81,7 +83,7 @@ PROFILE5_RECORDS = {
     "ACK": (0xDC, ["attempt", "result_digest"]),
 }
 PROFILE5_FIELDS = {
-    "OPEN": [["class", "u8-enum:1"], ["direction", "u8-enum:1,2"], ["semantic_version", "u16=9"], ["profile_id", "u16=5"], ["session_transcript", "bytes32"], ["exchange_id", "u64"], ["transfer_id", "bytes32"], ["source_transfer_id", "bytes32"], ["publication_id", "bytes32"], ["variant_id", "bytes32"], ["total_len", "u64<=8589934592"], ["attempt_nonce", "bytes32-nonzero"], ["checkpoint_generation", "u64"], ["custody_present", "u8-enum:0,1"], ["custody_digest", "bytes32-if-present"], ["source_len", "u32:1..16777216"], ["source_digest", "bytes32"]],
+    "OPEN": [["class", "u8-enum:1"], ["direction", "u8-enum:1,2"], ["semantic_version", "u16=9"], ["profile_id", "u16=5"], ["session_transcript", "bytes32"], ["exchange_id", "u64"], ["transfer_id", "bytes32"], ["source_transfer_id", "bytes32"], ["publication_id", "bytes32"], ["variant_id", "bytes32"], ["total_len", "u64-canonical-abx1-wire<=8679596592"], ["attempt_nonce", "bytes32-nonzero"], ["checkpoint_generation", "u64"], ["custody_present", "u8-enum:0,1"], ["custody_digest", "bytes32-if-present"], ["source_len", "u32:1..16777216"], ["source_digest", "bytes32"]],
     "SOURCE": [["attempt", "attempt_fields"], ["source_offset", "u32"], ["source_total_len", "u32:1..16777216"], ["source_chunk_len", "u32:1..1048576"], ["source_chunk", "bytes[source_chunk_len]"]],
     "ACCEPT": [["attempt", "attempt_fields"], ["durable_offset", "u64"], ["checkpoint_generation", "u64"], ["absolute_receive_limit", "u64>=durable_offset"], ["max_extent_bytes", "u32:1..1048576"], ["checkpoint_batch_bytes", "u32:1..134217728"]],
     "DATA": [["attempt", "attempt_fields"], ["offset", "u64"], ["extent_len", "u32:1..1048576"], ["abx1_extent", "bytes[extent_len]"]],
@@ -99,6 +101,23 @@ PROFILE5_RUST_ORDER = {
     "FINISH": ["o.push(0xda)", "put_attempt", "x.final_offset", "x.semantic_commitment.len()", "o.extend(&x.semantic_commitment)"],
     "RESULT": ["o.push(0xdb)", "put_attempt", "x.final_offset", "x.code as u8", "x.result_digest"],
     "ACK": ["o.push(0xdc)", "put_attempt", "x.result_digest"],
+}
+PROFILE5_ATTEMPT_FIELDS = [["transfer_id", "bytes32"], ["attempt_nonce", "bytes32-nonzero"], ["sequence", "u64"]]
+PROFILE5_ABX1_FIELDS = [["first_chunk_index", "u64"], ["carrier_count", "u32:1..131072"], ["carriers", "repeat carrier_count"], ["carrier_len", "u32:1..66215"], ["carrier", "bytes[carrier_len],valid-ASTRBT01"]]
+PROFILE5_COMPOSITE_FIELDS = [["protected_header_len", "u32:1..2048"], ["protected_header", "bytes[protected_header_len],protected-ASTRFR01-DATA-header"], ["abx1_extent", "bytes[extent_len]"]]
+PROFILE5_FLOWS = {
+    "nonempty": ["PLAN", "OPEN", "SOURCE", "ACCEPT", "DATA", "CHECKPOINT", "FINISH", "RESULT", "ACK"],
+    "empty": ["PLAN", "OPEN", "SOURCE", "ACCEPT", "FINISH", "RESULT", "ACK"],
+}
+PROFILE5_RUST_DECODE_ORDER = {
+    "OPEN": ["StreamClass::decode(r.u8()?)", "StreamDirection::decode(r.u8()?)", "r.u16() != Ok(9)", "r.u16() != Ok(5)", "let session_transcript = r.array()?", "let exchange_id = r.u64()?", "let transfer_id = r.array()?", "let source_transfer_id = r.array()?", "let publication_id = r.array()?", "let variant_id = r.array()?", "let total_len = r.u64()?", "validate_profile5_wire_len(total_len)?", "let attempt_nonce = r.array()?", "let checkpoint_generation = r.u64()?", "let custody_digest = match r.u8()?", "let source_len = r.u32()?", "let source_digest = r.array()?"],
+    "SOURCE": ["let (transfer_id, attempt_nonce, sequence) = r.attempt()?", "let offset = r.u32()?", "let total_len = r.u32()?", "let chunk_len = usize::try_from(r.u32()?)", "bytes: r.take(chunk_len)?.to_vec()"],
+    "ACCEPT": ["let (transfer_id, attempt_nonce, sequence) = r.attempt()?", "durable_offset: r.u64()?", "checkpoint_generation: r.u64()?", "absolute_receive_limit: r.u64()?", "max_extent_bytes: r.u32()?", "checkpoint_batch_bytes: r.u32()?"],
+    "DATA": ["let (transfer_id, attempt_nonce, sequence) = r.attempt()?", "let offset = r.u64()?", "let extent_len = r.u32()?", "extent(extent_len)?"],
+    "CHECKPOINT": ["let (transfer_id, attempt_nonce, sequence) = r.attempt()?", "durable_offset: r.u64()?", "checkpoint_generation: r.u64()?", "absolute_receive_limit: r.u64()?"],
+    "FINISH": ["let (transfer_id, attempt_nonce, sequence) = r.attempt()?", "let final_offset = r.u64()?", "let commitment_len = usize::try_from(r.u32()?)", "semantic_commitment: r.take(commitment_len)?.to_vec()"],
+    "RESULT": ["let (transfer_id, attempt_nonce, sequence) = r.attempt()?", "final_offset: r.u64()?", "code: StreamResultCode::decode(r.u8()?)?", "result_digest: r.array()?"],
+    "ACK": ["let (transfer_id, attempt_nonce, sequence) = r.attempt()?", "result_digest: r.array()?"],
 }
 
 
@@ -347,6 +366,7 @@ def rust_numeric_constants(*sources: str) -> dict[str, int]:
         expression = re.sub(r"(?<=\d)(?:u|i)(?:8|16|32|64|128|size)\b", "", expression)
         for dependency in sorted(set(re.findall(r"\b[A-Z][A-Z0-9_]*\b", expression)), key=len, reverse=True):
             expression = re.sub(rf"\b{dependency}\b", str(resolve(dependency, stack + (name,))), expression)
+        expression = re.sub(r"\s+", " ", expression).strip()
         try:
             node = ast.parse(expression, mode="eval")
         except SyntaxError as error:
@@ -382,6 +402,7 @@ def validate_executable_profile_contract(
     core_blob_stream: str,
     stream_transfer: str,
     iroh: str,
+    blob_runtime: str,
 ) -> None:
     values = rust_numeric_constants(application_blob, core_blob, core_blob_stream, stream_transfer, iroh)
     expected = {
@@ -391,6 +412,8 @@ def validate_executable_profile_contract(
         "MAX_BLOB_CHUNK_SIZE": 65_536,
         "MAX_BLOB_TRANSFER_OBJECT_BYTES": 66_215,
         "PROFILE5_CANONICAL_EXTENT_BYTES": 1_048_576,
+        "PROFILE5_MAX_CARRIERS_PER_EXTENT": 15,
+        "PROFILE5_MAX_CANONICAL_WIRE_BYTES": 8_679_596_592,
         "MAX_STREAM_CHECKPOINT_BATCH_BYTES": 134_217_728,
         "DEFAULT_MAX_EXCHANGE_BYTES": 2_097_152,
     }
@@ -416,10 +439,19 @@ def validate_executable_profile_contract(
         fail("production extent admission and attempt bounds must use canonical ABX1 limits")
     if "MAX_STREAM_EXTENT_BYTES: usize = PROFILE5_EXTENT_BYTES" in stream_transfer:
         fail("retired ASTRBS02 extent aliases production admission")
+    if "let profile_ceiling = aster_mesh::PROFILE5_MAX_CANONICAL_WIRE_BYTES;" not in blob_runtime:
+        fail("profile 5 receiver ceiling must use the exact canonical maximum wire shape")
 
 
 def validate_profile5_schema(schema: dict, stream_transfer: str) -> None:
-    if schema.get("format") != "aster-profile5-fixed-binary-v1" or schema.get("magic") != "41534d01":
+    compact_stream = re.sub(r"\s+", " ", stream_transfer)
+    if (
+        schema.get("format") != "aster-profile5-fixed-binary-v1"
+        or schema.get("magic") != "41534d01"
+        or schema.get("semantic_version") != 9
+        or schema.get("profile_id") != 5
+        or schema.get("byte_order") != "big-endian"
+    ):
         fail("profile 5 schema identity differs")
     records = schema.get("records")
     if not isinstance(records, list) or len(records) != len(PROFILE5_RECORDS):
@@ -438,25 +470,92 @@ def validate_profile5_schema(schema: dict, stream_transfer: str) -> None:
         if start < 0:
             fail(f"executable profile 5 encoder lacks {name}")
         end = stream_transfer.find("\n            Self::", start + len(marker))
-        arm = stream_transfer[start:end if end >= 0 else None]
+        arm = re.sub(r"\s+", " ", stream_transfer[start:end if end >= 0 else None])
         if f"o.push(0x{tag:02x})" not in arm:
             fail(f"executable profile 5 {name} tag differs")
         cursor = -1
         for token in PROFILE5_RUST_ORDER[name]:
+            token = re.sub(r"\s+", " ", token)
             position = arm.find(token, cursor + 1)
             if position < 0:
                 fail(f"executable profile 5 {name} field order differs at {token}")
             cursor = position
+        if name == "DATA":
+            decoder_start = stream_transfer.find("impl StreamDataHeaderV1")
+            decoder_end = stream_transfer.find("impl StreamDataV1", decoder_start)
+        else:
+            decoder = stream_transfer.find("pub(crate) fn decode_for_context", encoder)
+            tag_marker = f"0x{tag:02x} =>"
+            decoder_start = stream_transfer.find(tag_marker, decoder)
+            decoder_end = stream_transfer.find("\n            0x", decoder_start + len(tag_marker))
+        if decoder_start < 0:
+            fail(f"executable profile 5 decoder lacks {name}")
+        decoder_arm = re.sub(
+            r"\s+", " ", stream_transfer[decoder_start:decoder_end if decoder_end >= 0 else None]
+        )
+        cursor = -1
+        for token in PROFILE5_RUST_DECODE_ORDER[name]:
+            token = re.sub(r"\s+", " ", token)
+            position = decoder_arm.find(token, cursor + 1)
+            if position < 0:
+                fail(f"executable profile 5 {name} decoder field order differs at {token}")
+            cursor = position
+    if schema.get("attempt_fields") != PROFILE5_ATTEMPT_FIELDS:
+        fail("profile 5 nested attempt tuple differs")
+    for start_marker, end_marker, tokens in (
+        ("fn put_attempt", "impl StreamFrame", ["o.extend_from_slice(id)", "o.extend_from_slice(n)", "s.to_be_bytes()"]),
+        ("fn attempt(&mut self)", "fn finish(self)", ["let id = self.array()?", "let n = self.array()?", "nonce(&n)?", "Ok((id, n, self.u64()?))"]),
+    ):
+        start = compact_stream.find(start_marker)
+        end = compact_stream.find(end_marker, start)
+        cursor = start
+        if start < 0 or end < 0:
+            fail("executable profile 5 nested attempt tuple differs")
+        for token in tokens:
+            position = compact_stream.find(token, cursor, end)
+            if position < 0:
+                fail("executable profile 5 nested attempt tuple differs")
+            cursor = position
     abx1 = schema.get("abx1", {})
     if abx1.get("magic") != "41425831" or abx1.get("max_encoded_bytes") != 1_048_576:
         fail("profile 5 ABX1 schema differs")
-    if [field[0] for field in abx1.get("fields", [])] != ["first_chunk_index", "carrier_count", "carriers", "carrier_len", "carrier"]:
-        fail("profile 5 ABX1 carrier_len or field order differs")
+    if abx1.get("fields") != PROFILE5_ABX1_FIELDS:
+        fail("profile 5 ABX1 fields or bounds differ")
+    for fragment in (
+        'CANONICAL_BLOB_EXTENT_MAGIC: &[u8; 4] = b"ABX1"',
+        ".checked_add(self.carriers.len() as u64)",
+        "end > aster_mesh::MAX_BLOB_CHUNKS",
+        "carrier.len() > PROFILE5_CANONICAL_CARRIER_RECORD_BYTES",
+        "encoded_len > PROFILE5_CANONICAL_EXTENT_BYTES",
+        "u32::try_from(self.carriers.len())", "u32::try_from(carrier.len())",
+        "bytes.len() > PROFILE5_CANONICAL_EXTENT_BYTES",
+        "&bytes[..4] != CANONICAL_BLOB_EXTENT_MAGIC", "bytes[4..12]",
+        "bytes[12..16]", "if count == 0", "length == 0",
+        "length > PROFILE5_CANONICAL_CARRIER_RECORD_BYTES", "offset != bytes.len()",
+    ):
+        if fragment not in compact_stream:
+            fail(f"executable profile 5 ABX1 validator differs at {fragment}")
     composite = schema.get("composite", {})
     if composite.get("magic") != "41534431" or composite.get("max_encoded_bytes") != 1_050_632:
         fail("profile 5 ASD1 composite schema differs")
-    if schema.get("flow", {}).get("empty") != ["PLAN", "OPEN", "SOURCE", "ACCEPT", "FINISH", "RESULT", "ACK"]:
-        fail("profile 5 empty flow differs")
+    if composite.get("fields") != PROFILE5_COMPOSITE_FIELDS:
+        fail("profile 5 ASD1 fields or bounds differ")
+    for fragment in (
+        'COMPOSITE_DATA_MAGIC: &[u8; 4] = b"ASD1"',
+        "protected_header.len() > MAX_PROTECTED_STREAM_DATA_HEADER_BYTES",
+        "u32::try_from(protected_header.len())", "output.extend_from_slice(protected_header)",
+        "&bytes[..4] != COMPOSITE_DATA_MAGIC", "bytes[4..8]", "protected_len == 0",
+        "protected_len > MAX_PROTECTED_STREAM_DATA_HEADER_BYTES", "&bytes[8..body_offset]",
+        "&bytes[body_offset..]",
+    ):
+        if fragment not in compact_stream:
+            fail(f"executable profile 5 ASD1 validator differs at {fragment}")
+    if schema.get("flow") != PROFILE5_FLOWS:
+        fail("profile 5 empty or nonempty flow differs")
+    if stream_transfer.count("validate_profile5_wire_len(x.total_len)?") != 1 or stream_transfer.count("validate_profile5_wire_len(total_len)?") != 1:
+        fail("profile 5 OPEN encoder/decoder wire bound differs")
+    if "bytes <= aster_mesh::PROFILE5_MAX_CANONICAL_WIRE_BYTES" not in stream_transfer:
+        fail("profile 5 OPEN canonical wire bound differs")
     result = next(record for record in records if record["name"] == "RESULT")
     if dict(result["fields"])["result_code"] != "u8-enum:1,2,3,4,5,6":
         fail("profile 5 result-code enum differs")
@@ -495,6 +594,7 @@ def main() -> int:
             (ROOT / "crates/aster-core/src/blob_stream.rs").read_text(),
             (ROOT / "crates/aster-node/src/stream_transfer.rs").read_text(),
             (ROOT / "crates/aster-iroh/src/lib.rs").read_text(),
+            (ROOT / "crates/aster-node/src/runtime/blob_stream.rs").read_text(),
         )
         validate_profile5_schema(
             json.loads((ROOT / "conformance/profile5-wire-schema.json").read_text()),

@@ -339,6 +339,10 @@ class ProtocolVersionContractTests(unittest.TestCase):
         schema = json.loads((root / "conformance/profile5-wire-schema.json").read_text())
         rust = (root / "crates/aster-node/src/stream_transfer.rs").read_text()
         mutations = []
+        for key, value in (("semantic_version", 8), ("profile_id", 4), ("byte_order", "little-endian")):
+            changed = copy.deepcopy(schema)
+            changed[key] = value
+            mutations.append((key, changed))
         for index, record in enumerate(schema["records"]):
             changed = copy.deepcopy(schema)
             changed["records"][index]["tag"] ^= 1
@@ -357,9 +361,93 @@ class ProtocolVersionContractTests(unittest.TestCase):
         changed = copy.deepcopy(schema)
         next(record for record in changed["records"] if record["name"] == "RESULT")["fields"][-2][1] = "u8-enum:1,2"
         mutations.append(("result code", changed))
+        changed = copy.deepcopy(schema)
+        next(record for record in changed["records"] if record["name"] == "OPEN")["fields"][10][1] = "u64<=8589934592"
+        mutations.append(("OPEN plaintext instead of canonical wire bound", changed))
+        for section in ("attempt_fields",):
+            changed = copy.deepcopy(schema)
+            changed[section] = list(reversed(changed[section]))
+            mutations.append((f"{section} order", changed))
+            for index, field in enumerate(schema[section]):
+                changed = copy.deepcopy(schema)
+                changed[section][index][1] = "u8"
+                mutations.append((f"{section} {field[0]} width/bound", changed))
+        for section in ("abx1", "composite"):
+            changed = copy.deepcopy(schema)
+            changed[section]["magic"] = "00000000"
+            mutations.append((f"{section} magic", changed))
+            changed = copy.deepcopy(schema)
+            changed[section]["fields"] = list(reversed(changed[section]["fields"]))
+            mutations.append((f"{section} field order", changed))
+            for index, field in enumerate(schema[section]["fields"]):
+                changed = copy.deepcopy(schema)
+                changed[section]["fields"][index][1] = "u8"
+                mutations.append((f"{section} {field[0]} width/bound", changed))
+        for flow in ("empty", "nonempty"):
+            changed = copy.deepcopy(schema)
+            changed["flow"][flow] = list(reversed(changed["flow"][flow]))
+            mutations.append((f"{flow} flow", changed))
         for name, changed in mutations:
             with self.subTest(name=name), self.assertRaises(CHECKER.ContractViolation):
                 CHECKER.validate_profile5_schema(changed, rust)
+
+    def test_profile_five_decoder_and_validator_drift_fail(self) -> None:
+        root = CHECKER_PATH.parents[1]
+        schema = json.loads((root / "conformance/profile5-wire-schema.json").read_text())
+        rust = (root / "crates/aster-node/src/stream_transfer.rs").read_text()
+        mutations = {
+            "OPEN decoder width": rust.replace("let total_len = r.u64()?;", "let total_len = r.u32()?;", 1),
+            "attempt decoder order": rust.replace(
+                "let id = self.array()?;\n        let n = self.array()?;",
+                "let n = self.array()?;\n        let id = self.array()?;",
+                1,
+            ),
+            "OPEN executable wire bound": rust.replace(
+                "bytes <= aster_mesh::PROFILE5_MAX_CANONICAL_WIRE_BYTES",
+                "bytes <= aster_mesh::MAX_BLOB_CHUNKS",
+                1,
+            ),
+            "ABX1 carrier bound": rust.replace(
+                "length > PROFILE5_CANONICAL_CARRIER_RECORD_BYTES",
+                "length > PROFILE5_CANONICAL_EXTENT_BYTES",
+            ),
+            "ASD1 protected-header bound": rust.replace(
+                "protected_len > MAX_PROTECTED_STREAM_DATA_HEADER_BYTES",
+                "protected_len > MAX_STREAM_EXTENT_BYTES",
+            ),
+        }
+        for name, changed in mutations.items():
+            with self.subTest(name=name), self.assertRaises(CHECKER.ContractViolation):
+                CHECKER.validate_profile5_schema(schema, changed)
+
+    def test_profile_five_executable_wire_ceiling_drift_fails(self) -> None:
+        root = CHECKER_PATH.parents[1]
+        paths = [
+            "crates/aster-core/src/transfer_profile.rs",
+            "crates/aster-node/src/application/blob.rs",
+            "crates/aster-core/src/blob.rs",
+            "crates/aster-core/src/blob_stream.rs",
+            "crates/aster-node/src/stream_transfer.rs",
+            "crates/aster-iroh/src/lib.rs",
+            "crates/aster-node/src/runtime/blob_stream.rs",
+        ]
+        sources = [(root / path).read_text() for path in paths]
+        damaged = list(sources)
+        damaged[3] = damaged[3].replace(
+            "pub const PROFILE5_MAX_CANONICAL_WIRE_BYTES: u64 = MAX_BLOB_CHUNKS",
+            "pub const PROFILE5_MAX_CANONICAL_WIRE_BYTES: u64 = 8_589_934_592 + 0 * MAX_BLOB_CHUNKS",
+            1,
+        )
+        with self.assertRaisesRegex(CHECKER.ContractViolation, "executable profile 5 limits"):
+            CHECKER.validate_executable_profile_contract(*damaged)
+        damaged = list(sources)
+        damaged[6] = damaged[6].replace(
+            "let profile_ceiling = aster_mesh::PROFILE5_MAX_CANONICAL_WIRE_BYTES;",
+            "let profile_ceiling = 8u64 * 1024 * 1024 * 1024;",
+            1,
+        )
+        with self.assertRaisesRegex(CHECKER.ContractViolation, "receiver ceiling"):
+            CHECKER.validate_executable_profile_contract(*damaged)
 
     def test_every_profile_five_fuzz_seed_is_an_actual_decodable_record(self) -> None:
         seed_root = CHECKER_PATH.parents[1] / "fuzz/corpus/stream_transfer_decode"
@@ -373,17 +461,16 @@ class ProtocolVersionContractTests(unittest.TestCase):
                 wire = bytes.fromhex(payload[4:].strip().decode("ascii"))
                 observed.add(ORACLE.decode_stream_record(wire))
             elif payload.startswith(b"ASD1"):
-                self.assertTrue(payload.startswith(b"ASD1"), seed)
                 protected_len = int.from_bytes(payload[4:8], "big")
-                self.assertEqual(
-                    ORACLE.decode_stream_record(payload[8:8 + protected_len] + payload[8 + protected_len:]),
-                    0xd8,
-                )
+                self.assertTrue(payload[8:8 + protected_len].startswith(b"ASTRFR01"))
+                self.assertTrue(payload[8 + protected_len:].startswith(b"ABX1"))
                 self.assertLessEqual(len(payload), 1_050_632)
             else:
                 self.assertTrue(payload.startswith(b"AST1"), seed)
-                count = payload[4]
-                offset = 5
+                self.assertIn(payload[4], (0, 1))
+                accepted = payload[4] == 1
+                count = payload[5]
+                offset = 6
                 tags = []
                 for _ in range(count):
                     length = int.from_bytes(payload[offset:offset + 4], "big")
@@ -391,12 +478,11 @@ class ProtocolVersionContractTests(unittest.TestCase):
                     tags.append(ORACLE.decode_stream_record(payload[offset:offset + length]))
                     offset += length
                 self.assertEqual(offset, len(payload))
-                transcripts.add(tuple(tags))
+                transcripts.add((accepted, tuple(tags)))
         self.assertEqual(observed, set(range(0xd6, 0xde)))
-        self.assertEqual(transcripts, {
-            (0xd6, 0xdd, 0xd7, 0xd8, 0xd9, 0xda, 0xdb, 0xdc),
-            (0xd6, 0xdd, 0xd7, 0xda, 0xdb, 0xdc),
-        })
+        self.assertIn((True, (0xd6, 0xdd, 0xd7, 0xd8, 0xd9, 0xda, 0xdb, 0xdc)), transcripts)
+        self.assertIn((True, (0xd6, 0xdd, 0xd7, 0xda, 0xdb, 0xdc)), transcripts)
+        self.assertEqual(sum(not accepted for accepted, _ in transcripts), 4)
 
     def test_profile_five_oracle_and_vector_drift_fail(self) -> None:
         root = CHECKER_PATH.parents[1]

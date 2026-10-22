@@ -17,6 +17,18 @@ MAX_SOURCE_CHUNK = 1024 * 1024
 MAX_AUTHENTICATED_SOURCE = 16 * 1024 * 1024
 MAX_EXTENT = 1024 * 1024
 MAX_CHECKPOINT = 128 * 1024 * 1024
+MAX_CANONICAL_WIRE = 8_679_596_592
+PROTECTED_HEADER_SHA256 = {
+    'profile5-protected-data-header.bin': 'f0c3586ff8d3402074e1c2a216a01762e6b52c9e0cc41bd7e55a2c13477b6ba6',
+    'profile5-protected-data-header-maximum.bin': '7d38327dc1cf38d65251bd99a3a10aaec6d6d905f503fb93cd950df9e0f6e6ea',
+}
+
+
+def protected_header(name):
+    value = (ROOT / name).read_bytes()
+    assert value.startswith(b'ASTRFR01') and len(value) <= 2048
+    assert hashlib.sha256(value).hexdigest() == PROTECTED_HEADER_SHA256[name]
+    return value
 
 
 def u16(n):
@@ -173,7 +185,9 @@ def decode_stream_record(wire):
     if tag == 0xd6:
         if len(body) not in (259, 291) or body[0:2].tobytes() != b'\x01\x02':
             raise ValueError('open length/class/direction')
-        if struct.unpack('>HH', body[2:6]) != (9, 5) or not any(body[182:214]):
+        if (struct.unpack('>HH', body[2:6]) != (9, 5)
+                or struct.unpack('>Q', body[174:182])[0] > MAX_CANONICAL_WIRE
+                or not any(body[182:214])):
             raise ValueError('open context/nonce')
         custody = body[222]
         source_offset = 223 + (32 if custody == 1 else 0)
@@ -232,10 +246,12 @@ def profile5_stream_corpus():
         ('accept', stream_accept(len(extent))), ('data-abx1', stream_data(extent)),
         ('checkpoint', stream_checkpoint(len(extent))), ('finish', stream_finish(len(extent))),
         ('result', stream_result(len(extent))), ('ack', stream_ack()),
+        ('open-max-wire', stream_open(MAX_CANONICAL_WIRE)),
     ]
     rows = [('ACCEPT', name, wire) for name, wire in accepted]
     rows.extend([
         ('REJECT', 'open-zero-attempt', accepted[0][1][:187] + b'\x00' * 32 + accepted[0][1][219:]),
+        ('REJECT', 'open-wire-overflow', stream_open(MAX_CANONICAL_WIRE + 1)),
         ('REJECT', 'data-truncated', accepted[3][1][:-1]),
         ('REJECT', 'data-trailing', accepted[3][1] + b'\x00'),
         ('REJECT', 'data-offset-overflow', accepted[3][1][:77] + struct.pack('>Q', 0xffffffffffffffff) + accepted[3][1][85:]),
@@ -255,7 +271,7 @@ def profile5_stream_corpus():
 
 def profile5_composite_corpus():
     extent = abx1_extent()
-    data_header = stream_data(extent)[:89]
+    data_header = protected_header('profile5-protected-data-header.bin')
     rows = [
         ('ACCEPT', 'abx1-data', b'ASD1' + struct.pack('>I', len(data_header)) + data_header + extent),
         ('REJECT', 'wrong-magic', b'ASD2' + struct.pack('>I', 2) + b'\xa1\xa2\xb1'),
@@ -327,9 +343,9 @@ def validate_rejected_transcript(name, frames, accepted):
         raise AssertionError(f'unknown rejected transcript: {name}')
 
 
-def fuzz_transcript_seed(frames):
+def fuzz_transcript_seed(accepted, frames):
     assert 0 < len(frames) <= 16
-    return (b'AST1' + bytes([len(frames)])
+    return (b'AST1' + bytes([1 if accepted else 0, len(frames)])
             + b''.join(struct.pack('>I', len(frame)) + frame for frame in frames))
 
 
@@ -369,23 +385,33 @@ def main():
         else:
             assert seed_path.read_bytes() == payload, f'{seed_path}: differs from oracle'
     extent = abx1_extent()
-    header = stream_data(extent)[:89]
+    header = protected_header('profile5-protected-data-header.bin')
     composite_seeds = {
         'profile5-composite-valid.bin': b'ASD1' + struct.pack('>I', len(header)) + header + extent,
     }
     maximum = maximum_abx1_extent()
-    maximum_header = stream_data(maximum)[:89]
+    maximum_header = protected_header('profile5-protected-data-header-maximum.bin')
     composite_seeds['profile5-composite-maximum.bin'] = (
         b'ASD1' + struct.pack('>I', len(maximum_header)) + maximum_header + maximum)
-    composite_seeds['profile5-transcript-nonempty.bin'] = fuzz_transcript_seed([
+    nonempty = [
         stream_open(len(extent)), stream_source(), stream_accept(len(extent)),
         stream_data(extent), stream_checkpoint(len(extent)), stream_finish(len(extent)),
         stream_result(len(extent)), stream_ack(),
-    ])
-    composite_seeds['profile5-transcript-empty.bin'] = fuzz_transcript_seed([
+    ]
+    empty = [
         stream_open(0), stream_source(), stream_accept(0), stream_finish(0, 0),
         stream_result(0, 1), stream_ack(1),
-    ])
+    ]
+    rollback = nonempty[:5] + [stream_checkpoint(len(extent), 0)]
+    binding = nonempty[:4] + [nonempty[4][:37] + bytes([0x23]) * 32 + nonempty[4][69:]]
+    replay = nonempty[:4] + [nonempty[3]] + nonempty[4:]
+    terminal_change = nonempty + [stream_result(len(extent))[:-1] + bytes([0x98])]
+    composite_seeds['profile5-transcript-nonempty.bin'] = fuzz_transcript_seed(True, nonempty)
+    composite_seeds['profile5-transcript-empty.bin'] = fuzz_transcript_seed(True, empty)
+    composite_seeds['profile5-transcript-reject-rollback.bin'] = fuzz_transcript_seed(False, rollback)
+    composite_seeds['profile5-transcript-reject-binding.bin'] = fuzz_transcript_seed(False, binding)
+    composite_seeds['profile5-transcript-reject-replay.bin'] = fuzz_transcript_seed(False, replay)
+    composite_seeds['profile5-transcript-reject-terminal-change.bin'] = fuzz_transcript_seed(False, terminal_change)
     for name, payload in composite_seeds.items():
         expected_names.add(name)
         path = stream_seed_root / name

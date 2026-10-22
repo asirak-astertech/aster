@@ -63,8 +63,10 @@ implement BLE or multi-adapter failover.
 
 The local canonical finalization pool has two workers and two queued jobs.
 That bound limits concurrent finalization, not disk consumption. Depot
-reservations, completed-but-unpublished packs, database/journal allocation,
-and finalizers may overlap. Check both state and depot filesystems and leave
+reservations, completed provisional upload staging, database/journal
+allocation, and finalizers may overlap. Staging is not a second publication
+authority: only promotion of the canonical manifest plus ASTRBT01 carriers
+creates the Blob publication. Check both state and depot filesystems and leave
 operational reserve; an observed capacity snapshot is not a reservation.
 
 Profile-5 transfer has two different liveness bounds:

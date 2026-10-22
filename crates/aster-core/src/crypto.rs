@@ -29,6 +29,8 @@ pub use profile::{
     HYBRID_SECURITY_PROFILE_ID, SecurityProfile, SecurityProfileId, VerifiedSecurityProfile,
 };
 
+#[cfg(feature = "fuzzing")]
+pub use reference::fuzz_reference_v9_session_pair;
 pub(crate) use reference::{
     PendingBatchItem, VerifiedBatchItem, VerifiedBatchProof, VerifiedBridgeAuthorization,
     VerifiedBridgeSourceRoute, VerifiedBridgeWrapper,

@@ -1,5 +1,8 @@
 use crate::{
-    blob::{BlobError, BlobId, BlobMetadata, VerifiedBlobTransferPlan},
+    blob::{
+        BlobError, BlobId, BlobMetadata, MAX_BLOB_CHUNKS, MAX_BLOB_TRANSFER_OBJECT_BYTES,
+        VerifiedBlobTransferPlan,
+    },
     custody::CustodySample,
     model::{Dot, MAX_CAUSAL_CONTEXT_ENTRIES, NodeId, Priority, Scope, Topic, VersionVector},
 };
@@ -18,6 +21,15 @@ pub const PROFILE5_CANONICAL_EXTENT_BYTES: u64 = 1024 * 1024;
 pub const PROFILE5_CANONICAL_EXTENT_HEADER_BYTES: u64 = 4 + 8 + 4;
 /// ABX1 length prefix preceding each byte-identical ASTRBT01 carrier.
 pub const PROFILE5_CANONICAL_CARRIER_PREFIX_BYTES: u64 = 4;
+/// Maximum number of maximum-sized canonical carriers fitting one ABX1 extent.
+pub const PROFILE5_MAX_CARRIERS_PER_EXTENT: u64 = (PROFILE5_CANONICAL_EXTENT_BYTES
+    - PROFILE5_CANONICAL_EXTENT_HEADER_BYTES)
+    / (PROFILE5_CANONICAL_CARRIER_PREFIX_BYTES + MAX_BLOB_TRANSFER_OBJECT_BYTES as u64);
+/// Maximum ABX1 wire length for the maximum 8-GiB/131,072-chunk manifest.
+pub const PROFILE5_MAX_CANONICAL_WIRE_BYTES: u64 = MAX_BLOB_CHUNKS
+    * (PROFILE5_CANONICAL_CARRIER_PREFIX_BYTES + MAX_BLOB_TRANSFER_OBJECT_BYTES as u64)
+    + ((MAX_BLOB_CHUNKS + PROFILE5_MAX_CARRIERS_PER_EXTENT - 1) / PROFILE5_MAX_CARRIERS_PER_EXTENT)
+        * PROFILE5_CANONICAL_EXTENT_HEADER_BYTES;
 
 /// One exact resumable boundary in the canonical semantic-v9 ABX1 stream.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -146,6 +158,26 @@ mod profile5_wire_shape_tests {
             &[Profile5CanonicalCheckpoint::default()]
         );
         assert_eq!(shape.terminal(), Profile5CanonicalCheckpoint::default());
+    }
+
+    #[test]
+    fn maximum_wire_bound_is_derived_from_executable_carrier_partitioning() {
+        assert_eq!(PROFILE5_MAX_CARRIERS_PER_EXTENT, 15);
+        assert_eq!(PROFILE5_MAX_CANONICAL_WIRE_BYTES, 8_679_596_592);
+        let lengths = vec![
+            (
+                crate::blob::MAX_BLOB_CHUNK_SIZE as u64,
+                MAX_BLOB_TRANSFER_OBJECT_BYTES as u64,
+            );
+            MAX_BLOB_CHUNKS as usize
+        ];
+        assert_eq!(
+            profile5_canonical_wire_shape_from_lengths(&lengths)
+                .expect("maximum shape")
+                .terminal()
+                .wire_offset,
+            PROFILE5_MAX_CANONICAL_WIRE_BYTES,
+        );
     }
 }
 /// Maximum plaintext length of one independently segmented Blob stream (8 GiB).
