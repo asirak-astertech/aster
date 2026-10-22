@@ -1673,6 +1673,195 @@ fn blob_finalize_cpu_budget() -> &'static BlobFinalizeCpuBudget {
     })
 }
 
+mod finalize_store {
+    use super::*;
+
+    /// One attempted call across the complete finalizer-to-Store/helper
+    /// boundary. These are orchestration operations, not nested redb calls.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(super) enum BlobFinalizeStoreOperation {
+        ReplayAuthority,
+        ReadControlHead,
+        RefreshPolicy,
+        ReserveUpload,
+        OpenPackRoot,
+        OpenUploadDepot,
+        CompletePreparedBlob,
+        CommitPublication,
+        CacheRoute,
+        CompleteUpload,
+    }
+
+    /// Non-escaping Store authority for one finalizer job.
+    ///
+    /// Deliberately has no `Deref`, `AsRef<Store>`, or raw Store getter. Every
+    /// top-level Store-backed action in `run_measured` must be named here.
+    pub(super) struct BlobFinalizeStore {
+        inner: Arc<Store>,
+        operations: AtomicU64,
+        #[cfg(test)]
+        trace: std::sync::Mutex<Vec<BlobFinalizeStoreOperation>>,
+    }
+
+    impl BlobFinalizeStore {
+        pub(super) fn new(inner: Arc<Store>) -> Self {
+            Self {
+                inner,
+                operations: AtomicU64::new(0),
+                #[cfg(test)]
+                trace: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn record(&self, operation: BlobFinalizeStoreOperation) {
+            self.operations.fetch_add(1, Ordering::Relaxed);
+            #[cfg(not(test))]
+            let _ = operation;
+            #[cfg(test)]
+            self.trace
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(operation);
+        }
+
+        pub(super) fn operation_count(&self) -> u64 {
+            self.operations.load(Ordering::Relaxed)
+        }
+
+        #[cfg(test)]
+        pub(super) fn trace(&self) -> Vec<BlobFinalizeStoreOperation> {
+            self.trace
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+
+        pub(super) fn replay_authority(
+            &self,
+            mission: &UnprotectedReferenceMission,
+        ) -> Result<ReferenceEnvelopeSealer, NodeError> {
+            self.record(BlobFinalizeStoreOperation::ReplayAuthority);
+            open_replayed_verifier(&self.inner, mission)
+        }
+
+        pub(super) fn control_head(&self) -> Result<Option<(u64, ControlTransferId)>, StoreError> {
+            self.record(BlobFinalizeStoreOperation::ReadControlHead);
+            self.inner.control_head()
+        }
+
+        pub(super) fn refresh_policy(
+            &self,
+            mission: &UnprotectedReferenceMission,
+            verifier: &mut ReferenceEnvelopeSealer,
+            verifier_head: &mut Option<(u64, ControlTransferId)>,
+        ) -> Result<Option<ControlPolicySnapshot>, NodeError> {
+            self.record(BlobFinalizeStoreOperation::RefreshPolicy);
+            refresh_application_policy(&self.inner, mission, verifier, verifier_head)
+        }
+
+        pub(super) fn reserve_upload(
+            &self,
+            policy: &ControlPolicySnapshot,
+            request: &BlobUploadRequest,
+        ) -> Result<
+            (
+                BlobUploadReservation,
+                aster_redb_store::BlobUploadCheckpoint,
+            ),
+            StoreError,
+        > {
+            self.record(BlobFinalizeStoreOperation::ReserveUpload);
+            self.inner.reserve_blob_upload_with_policy(policy, request)
+        }
+
+        pub(super) fn open_pack_root(&self) -> Result<PinnedBlobPackRoot, StoreError> {
+            self.record(BlobFinalizeStoreOperation::OpenPackRoot);
+            PinnedBlobPackRoot::open(&self.inner)
+        }
+
+        pub(super) fn open_upload_depot(
+            &self,
+            reservation: &BlobUploadReservation,
+        ) -> Result<aster_redb_store::BlobDepot<'_>, StoreError> {
+            self.record(BlobFinalizeStoreOperation::OpenUploadDepot);
+            self.inner.blob_depot_for_upload(reservation)
+        }
+
+        pub(super) fn complete_prepared_blob(
+            &self,
+            manifest: &BlobManifest,
+            manifest_digest: [u8; 32],
+        ) -> Result<BlobDepotCompletion, StoreError> {
+            self.record(BlobFinalizeStoreOperation::CompletePreparedBlob);
+            self.inner
+                .completed_prepared_local_blob(manifest, manifest_digest)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub(super) fn commit_publication<F>(
+            &self,
+            policy: &ControlPolicySnapshot,
+            request: &BlobOperationRequest<'_>,
+            ttl_ms: Option<u64>,
+            initial_sample: Option<CustodySample>,
+            precommit_sample: Option<CustodySample>,
+            completion: &BlobDepotCompletion,
+            build: F,
+        ) -> Result<aster_redb_store::BlobOnceOutcome, StoreError>
+        where
+            F: FnOnce(
+                &aster_redb_store::BlobReservation,
+            ) -> Result<(ContentVerifiedBlobEnvelope, Vec<u8>), StoreError>,
+        {
+            self.record(BlobFinalizeStoreOperation::CommitPublication);
+            self.inner.commit_prepared_local_blob_once_with_policy(
+                policy,
+                request,
+                ttl_ms,
+                initial_sample,
+                precommit_sample,
+                completion,
+                build,
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub(super) fn cache_route(
+            &self,
+            cache: &AuthenticatedEventRouteCache,
+            verifier: &ReferenceEnvelopeSealer,
+            blob: &ContentVerifiedBlobEnvelope,
+            manifest_bytes: &[u8],
+            sealed: &[u8],
+            acceptance_marker: u64,
+        ) -> Result<(), NodeError> {
+            self.record(BlobFinalizeStoreOperation::CacheRoute);
+            cache_authenticated_blob_route_claim(
+                &self.inner,
+                cache,
+                verifier,
+                blob,
+                manifest_bytes,
+                sealed,
+                acceptance_marker,
+            )
+        }
+
+        pub(super) fn complete_upload(
+            &self,
+            reservation: &BlobUploadReservation,
+            publication: aster_redb_store::BlobTransferId,
+        ) -> Result<(), StoreError> {
+            self.record(BlobFinalizeStoreOperation::CompleteUpload);
+            self.inner.complete_blob_upload(reservation, publication)
+        }
+    }
+}
+
+use finalize_store::BlobFinalizeStore;
+#[cfg(test)]
+use finalize_store::BlobFinalizeStoreOperation;
+
 pub(crate) type BlobFinalizeCompletion =
     oneshot::Receiver<Result<BlobPublishResult, ApplicationError>>;
 
@@ -1732,6 +1921,10 @@ struct BlobFinalizeMetrics {
     encrypted_bytes: u64,
     provisional_segment_reads: u64,
     depot_operations: u64,
+    /// Attempted calls through the complete private finalizer Store boundary.
+    store_boundary_operations: u64,
+    #[cfg(test)]
+    store_boundary_trace: Vec<BlobFinalizeStoreOperation>,
 }
 
 struct BlobFinalizeMappedChunk {
@@ -2153,6 +2346,7 @@ impl BlobFinalizePool {
             debug_assert!(report.encrypted_bytes >= report.plaintext_bytes_read);
             debug_assert!(report.provisional_segment_reads <= report.pipeline.completed_items());
             debug_assert!(report.depot_operations >= report.pipeline.completed_items());
+            debug_assert!((9..=10).contains(&report.store_boundary_operations));
             debug_assert!(
                 report.observed_buffer_peak_bytes >= report.observed_worker_buffer_peak_bytes
             );
@@ -2176,32 +2370,33 @@ impl Drop for BlobFinalizePool {
 }
 
 impl BlobFinalizeJob {
-    #[cfg(test)]
-    fn run(self) -> Result<BlobPublishResult, ApplicationError> {
-        self.run_measured().map(|(result, _report)| result)
-    }
-
     fn run_measured(self) -> Result<(BlobPublishResult, BlobFinalizeMetrics), ApplicationError> {
+        let BlobFinalizeJob {
+            mission,
+            store: raw_store,
+            source_route_cache,
+            custody_clock,
+            reservation,
+            cleanup_upload,
+            #[cfg(test)]
+            gate,
+        } = self;
         #[cfg(test)]
-        if let Some(gate) = &self.gate {
+        if let Some(gate) = &gate {
             gate.enter();
         }
+        let store = BlobFinalizeStore::new(raw_store);
 
         // Replay current authority inside this owned job. This deliberately
         // happens after handoff from the application actor, so preparation and
         // canonical encryption cannot stall unrelated application commands.
-        let mut verifier = open_replayed_verifier(&self.store, &self.mission)
+        let mut verifier = store
+            .replay_authority(&mission)
             .map_err(|error| application_error("blob stream finish", error))?;
-        let mut verifier_head = self
-            .store
+        let mut verifier_head = store
             .control_head()
             .map_err(|error| application_error("blob stream finish", error.into()))?;
-        let policy = match refresh_application_policy(
-            &self.store,
-            &self.mission,
-            &mut verifier,
-            &mut verifier_head,
-        ) {
+        let policy = match store.refresh_policy(&mission, &mut verifier, &mut verifier_head) {
             Ok(Some(policy)) => policy,
             Ok(None) => {
                 return Err(ApplicationError::new(
@@ -2211,13 +2406,11 @@ impl BlobFinalizeJob {
             }
             Err(error) => return Err(application_error("blob stream finish", error)),
         };
-        let request = self.reservation.request().clone();
-        let (current, checkpoint) = self
-            .store
-            .reserve_blob_upload_with_policy(&policy, &request)
+        let request = reservation.request().clone();
+        let (current, checkpoint) = store
+            .reserve_upload(&policy, &request)
             .map_err(|error| application_error("blob stream finish", error.into()))?;
-        if current != self.reservation || checkpoint.durable_plaintext_offset() != request.total_len
-        {
+        if current != reservation || checkpoint.durable_plaintext_offset() != request.total_len {
             return Err(ApplicationError::new(
                 ApplicationErrorKind::Integrity,
                 "blob stream finish",
@@ -2234,7 +2427,8 @@ impl BlobFinalizeJob {
         let opener = verifier
             .blob_upload_segment_opener(&request.scope, &request.topic, &upload)
             .map_err(|error| application_error("blob stream finish", error.into()))?;
-        let root = PinnedBlobPackRoot::open(&self.store)
+        let root = store
+            .open_pack_root()
             .map_err(|error| application_error("blob stream finish", error.into()))?;
         let metadata = CoreBlobMetadata::new(request.media_type.clone(), request.schema_id.clone())
             .map_err(|error| blob_core_error("blob stream finish", error))?;
@@ -2276,8 +2470,8 @@ impl BlobFinalizeJob {
                 &request.topic,
                 current.content_epoch(),
                 MeasuredBlobStore::new(
-                    self.store
-                        .blob_depot_for_upload(&current)
+                    store
+                        .open_upload_depot(&current)
                         .map_err(|error| application_error("blob stream finish", error.into()))?,
                     Arc::clone(&depot_operations),
                 ),
@@ -2494,9 +2688,8 @@ impl BlobFinalizeJob {
         ));
         drop(service);
         let depot_operations = depot_operations.load(Ordering::Relaxed);
-        let completion = self
-            .store
-            .completed_prepared_local_blob(&manifest, *finished.manifest_digest())
+        let completion = store
+            .complete_prepared_blob(&manifest, *finished.manifest_digest())
             .map_err(|error| application_error("blob stream finish", error.into()))?;
         let intent = BlobPublicationIntent::new_with_ttl(
             request.owner.publisher,
@@ -2510,7 +2703,7 @@ impl BlobFinalizeJob {
         let operation = BlobOperationRequest::new(&request.owner.operation, &intent);
         let sample = if request.ttl_ms.is_some() {
             Some(
-                self.custody_clock
+                custody_clock
                     .sample()
                     .map_err(|error| application_error("blob stream finish", error))?,
             )
@@ -2518,9 +2711,8 @@ impl BlobFinalizeJob {
             None
         };
         let build_publication_buffer_peak = Arc::clone(&publication_buffer_peak);
-        let outcome = self
-            .store
-            .commit_prepared_local_blob_once_with_policy(
+        let outcome = store
+            .commit_publication(
                 &policy,
                 &operation,
                 request.ttl_ms,
@@ -2582,15 +2774,13 @@ impl BlobFinalizeJob {
                 .saturating_add(metadata_owned_bytes),
             Ordering::Relaxed,
         );
-        let stored = SelectedBlobNode::verify_stored_blob_with(
-            &self.store,
-            self.mission.mission_authority_id(),
+        let stored = SelectedBlobNode::verify_stored_blob_without_completion(
+            mission.mission_authority_id(),
             &mut verifier,
             outcome.blob(),
             Some(&intent),
             current.content_epoch(),
             "blob stream finish",
-            false,
         )?;
         publication_buffer_peak.fetch_max(
             retained_manifest_bytes
@@ -2599,19 +2789,19 @@ impl BlobFinalizeJob {
                 .saturating_add(metadata_owned_bytes),
             Ordering::Relaxed,
         );
-        cache_authenticated_blob_route_claim(
-            &self.store,
-            &self.source_route_cache,
-            &verifier,
-            &stored.blob,
-            &stored.manifest_bytes,
-            &outcome.blob().sealed,
-            outcome.blob().acceptance_marker,
-        )
-        .map_err(|error| application_error("blob stream finish", error))?;
-        if self.cleanup_upload {
-            self.store
-                .complete_blob_upload(&current, outcome.blob().transfer_id)
+        store
+            .cache_route(
+                &source_route_cache,
+                &verifier,
+                &stored.blob,
+                &stored.manifest_bytes,
+                &outcome.blob().sealed,
+                outcome.blob().acceptance_marker,
+            )
+            .map_err(|error| application_error("blob stream finish", error))?;
+        if cleanup_upload {
+            store
+                .complete_upload(&current, outcome.blob().transfer_id)
                 .map_err(|error| application_error("blob stream finish", error.into()))?;
         }
         let mut result = blob_publish_result(&stored, outcome.inserted());
@@ -2624,6 +2814,9 @@ impl BlobFinalizeJob {
             .max(observed_publication_buffer_peak_bytes);
         let conservative_owned_byte_bound =
             BLOB_FINALIZE_AGGREGATE_SENSITIVE_BYTES / BLOB_FINALIZE_WORKERS;
+        let store_boundary_operations = store.operation_count();
+        #[cfg(test)]
+        let store_boundary_trace = store.trace();
         Ok((
             result,
             BlobFinalizeMetrics {
@@ -2642,6 +2835,9 @@ impl BlobFinalizeJob {
                 encrypted_bytes,
                 provisional_segment_reads,
                 depot_operations,
+                store_boundary_operations,
+                #[cfg(test)]
+                store_boundary_trace,
             },
         ))
     }
@@ -3442,12 +3638,14 @@ impl SelectedBlobNode {
     fn finish_publish_stream_without_cleanup_for_test(
         &mut self,
         token: [u8; 32],
-    ) -> Result<BlobPublishResult, ApplicationError> {
+    ) -> Result<(BlobPublishResult, Option<BlobFinalizeMetrics>), ApplicationError> {
         match self.prepare_publish_stream_finalization(token)? {
-            PreparedBlobPublishFinalization::Completed(result) => Ok(result),
+            PreparedBlobPublishFinalization::Completed(result) => Ok((result, None)),
             PreparedBlobPublishFinalization::Pending(mut job) => {
                 job.cleanup_upload = false;
-                (*job).run()
+                (*job)
+                    .run_measured()
+                    .map(|(result, measured)| (result, Some(measured)))
             }
         }
     }
@@ -5832,6 +6030,46 @@ impl SelectedBlobNode {
         operation: &'static str,
         verify_completion: bool,
     ) -> Result<VerifiedStoredBlob, ApplicationError> {
+        Self::verify_stored_blob_inner(
+            verify_completion.then_some(store),
+            mission_authority,
+            verifier,
+            stored,
+            expected,
+            current_epoch,
+            operation,
+        )
+    }
+
+    fn verify_stored_blob_without_completion(
+        mission_authority: NodeId,
+        verifier: &mut ReferenceEnvelopeSealer,
+        stored: &StoredBlob,
+        expected: Option<&BlobPublicationIntent>,
+        current_epoch: u64,
+        operation: &'static str,
+    ) -> Result<VerifiedStoredBlob, ApplicationError> {
+        Self::verify_stored_blob_inner(
+            None,
+            mission_authority,
+            verifier,
+            stored,
+            expected,
+            current_epoch,
+            operation,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn verify_stored_blob_inner(
+        completion_store: Option<&Store>,
+        mission_authority: NodeId,
+        verifier: &mut ReferenceEnvelopeSealer,
+        stored: &StoredBlob,
+        expected: Option<&BlobPublicationIntent>,
+        current_epoch: u64,
+        operation: &'static str,
+    ) -> Result<VerifiedStoredBlob, ApplicationError> {
         let route = verifier
             .verify_blob(&stored.sealed)
             .map_err(|error| application_error(operation, error.into()))?;
@@ -5903,7 +6141,7 @@ impl SelectedBlobNode {
             .map_err(|error| application_error(operation, error.into()))?;
         blob.verify_exact_manifest(&manifest_bytes)
             .map_err(|error| application_error(operation, error.into()))?;
-        if verify_completion {
+        if let Some(store) = completion_store {
             store
                 .blob_depot()
                 .and_then(|mut depot| depot.completed_blob(&blob, &manifest_bytes))
@@ -7939,6 +8177,11 @@ pub(crate) mod tests {
             bytes.len() as u64 + chunks * BLOB_FINALIZE_AEAD_TAG_BYTES as u64
         );
         assert_eq!(measured.depot_operations, 4 * chunks + 2);
+        assert_eq!(measured.store_boundary_operations, 10);
+        assert_eq!(
+            measured.store_boundary_trace,
+            expected_finalize_store_trace(true)
+        );
         let measurement = blob_finalize_measurement_json(bytes.len() as u64, &measured);
         assert_eq!(
             measurement["depot_operations"],
@@ -7948,6 +8191,10 @@ pub(crate) mod tests {
         assert!(measurement.get("store_phase_calls").is_none());
         assert!(measurement.get("store_operations").is_none());
         assert!(measurement.get("peak_owned_bytes").is_none());
+        assert_eq!(
+            measurement["store_boundary_operations"],
+            serde_json::json!(10)
+        );
         assert_eq!(
             measurement["observed_buffer_peak_bytes"],
             serde_json::json!(measured.observed_buffer_peak_bytes)
@@ -7983,6 +8230,24 @@ pub(crate) mod tests {
                     + BLOB_FINALIZE_MAX_METADATA_BYTES)
         );
         assert_eq!(BLOB_FINALIZE_CPU_BUDGET, 4);
+    }
+
+    fn expected_finalize_store_trace(cleanup: bool) -> Vec<BlobFinalizeStoreOperation> {
+        let mut expected = vec![
+            BlobFinalizeStoreOperation::ReplayAuthority,
+            BlobFinalizeStoreOperation::ReadControlHead,
+            BlobFinalizeStoreOperation::RefreshPolicy,
+            BlobFinalizeStoreOperation::ReserveUpload,
+            BlobFinalizeStoreOperation::OpenPackRoot,
+            BlobFinalizeStoreOperation::OpenUploadDepot,
+            BlobFinalizeStoreOperation::CompletePreparedBlob,
+            BlobFinalizeStoreOperation::CommitPublication,
+            BlobFinalizeStoreOperation::CacheRoute,
+        ];
+        if cleanup {
+            expected.push(BlobFinalizeStoreOperation::CompleteUpload);
+        }
+        expected
     }
 
     #[test]
@@ -8121,6 +8386,7 @@ pub(crate) mod tests {
             "encrypted_bytes": measured.encrypted_bytes,
             "provisional_segment_reads": measured.provisional_segment_reads,
             "depot_operations": measured.depot_operations,
+            "store_boundary_operations": measured.store_boundary_operations,
             "aggregate_cpu_budget": BLOB_FINALIZE_CPU_BUDGET,
             "aggregate_pipeline_accounting_bound": BLOB_FINALIZE_AGGREGATE_PIPELINE_BYTES,
             "aggregate_conservative_owned_byte_bound": BLOB_FINALIZE_AGGREGATE_SENSITIVE_BYTES,
@@ -8212,9 +8478,15 @@ pub(crate) mod tests {
                 )
                 .expect("append cleanup-gap bytes");
             }
-            let result = node
+            let (result, measured) = node
                 .finish_publish_stream_without_cleanup_for_test(opened.token)
                 .expect("commit before injected cleanup crash");
+            let measured = measured.expect("new upload has a finalization measurement");
+            assert_eq!(measured.store_boundary_operations, 9);
+            assert_eq!(
+                measured.store_boundary_trace,
+                expected_finalize_store_trace(false)
+            );
             let owner = BlobOperationOwner::new(
                 node.identity(),
                 BlobOperationKey::new(stream_request.publication.operation_key.clone())
