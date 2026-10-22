@@ -52560,6 +52560,65 @@ mod tests {
                     plaintext.len() as u64
                 );
 
+                // Canonical publication authority must be visible immediately
+                // after promotion even while the dropped-ACK receipt remains.
+                drop(target_store);
+                let publication_id = crate::application::BlobStreamPublicationId::from_bytes(
+                    *publication.as_bytes(),
+                )
+                .expect("profile-5 publication identity");
+                let promoted_status = {
+                    let mut application = SelectedBlobNode::open_unprotected_reference(
+                        &target_state,
+                        target_state.join("profile5-status.bundle"),
+                    )
+                    .expect("open application during profile-5 settlement retry");
+                    let status = application
+                        .inspect_publication(crate::application::BlobPublicationInspectionRequest {
+                            publication_id,
+                            topic: services.topic.clone(),
+                            scope: services.scope.clone(),
+                        })
+                        .expect("inspect promoted publication with residual receipt");
+                    assert_eq!(
+                        status.phase,
+                        crate::application::BlobPublicationPhase::Available
+                    );
+                    let blob_id = status.blob_id.expect("available profile-5 Blob id");
+                    let mut received_plaintext = Vec::with_capacity(plaintext.len());
+                    let mut offset = 0_u64;
+                    while offset < plaintext.len() as u64 {
+                        let page = application
+                            .read_page(crate::application::BlobReadPageRequest {
+                                blob: crate::application::BlobReadRequest {
+                                    id: blob_id,
+                                    topic: services.topic.clone(),
+                                    scope: services.scope.clone(),
+                                },
+                                offset,
+                                max_bytes: crate::application::MAX_SELECTED_BLOB_PAGE_BYTES,
+                            })
+                            .expect("read promoted profile-5 content with residual receipt");
+                        received_plaintext.extend_from_slice(page.as_bytes());
+                        offset = page.next_offset();
+                    }
+                    assert_eq!(received_plaintext.as_slice(), plaintext);
+                    status
+                };
+                assert_eq!(promoted_status.publication_id, publication_id);
+                assert_eq!(
+                    promoted_status.blob_id.map(|id| *id.as_bytes()),
+                    Some(published_blob_id)
+                );
+                target_store = Store::open_for_mission(target_state.join(STORE_FILE), authority)
+                    .expect("reopen target after promoted status inspection");
+                assert!(
+                    target_store
+                        .resume_profile5_receipt(publication)
+                        .expect("receipt remains until settlement ACK")
+                        .is_some()
+                );
+
                 let (mut retry_sender, mut retry_receiver, retry_digest) =
                     blob_stream::tests::mission_pair_from_bundles(
                         &initiator_bytes,

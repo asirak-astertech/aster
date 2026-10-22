@@ -3648,6 +3648,14 @@ pub(crate) mod tests {
             "failure preceded worker activity"
         );
         assert!(!probe.admission_open(), "pipeline admission remained open");
+        assert!(
+            probe.admission_rejected(),
+            "pipeline internal admission still accepts"
+        );
+        assert!(
+            probe.cleanup_observed(),
+            "pipeline cleanup was not observed"
+        );
         assert!(probe.cancellation_signalled(), "pipeline was not cancelled");
         assert!(probe.channels_closed(), "pipeline channels remained open");
         assert_eq!(probe.worker_exits(), 2, "not every receive worker exited");

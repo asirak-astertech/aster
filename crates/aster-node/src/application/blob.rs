@@ -4196,10 +4196,48 @@ impl SelectedBlobNode {
             });
         }
         // Incoming profile-5 publication identity is the authenticated source
-        // transfer ID. Its receiver-owned receipt is the sole durable progress
-        // authority across transport attempts; no adapter identity is stored.
+        // transfer ID. Canonical content authority wins over a residual
+        // settlement receipt; the receipt projects progress only before the
+        // publication is available. No adapter identity is stored.
         let profile5_source =
             aster_redb_store::BlobTransferId::new(*request.publication_id.as_bytes());
+        if let Some(stored) = self
+            .store
+            .get_blob(profile5_source)
+            .map_err(|error| application_error("blob publication status", error.into()))?
+        {
+            if stored.header.topic != request.topic || stored.header.scope != request.scope {
+                return Err(ApplicationError::new(
+                    ApplicationErrorKind::NotFound,
+                    "blob publication status",
+                ));
+            }
+            let epoch = self.active_epoch(&request.scope, "blob publication status")?;
+            self.require_blob_grants(
+                &request.topic,
+                &request.scope,
+                epoch,
+                "blob publication status",
+            )?;
+            let verified =
+                self.verify_stored_blob(&stored, None, epoch, "blob publication status", false)?;
+            let result = blob_publish_result(&verified, false);
+            return Ok(BlobPublicationInspection {
+                publication_id: request.publication_id,
+                phase: BlobPublicationPhase::Available,
+                plaintext_total_bytes: result.total_len,
+                durable_plaintext_bytes: result.total_len,
+                transfer_total_bytes: 0,
+                durable_transfer_bytes: 0,
+                total_units: result
+                    .total_len
+                    .div_ceil(u64::from(SELECTED_BLOB_CHUNK_SIZE)),
+                durable_units: result
+                    .total_len
+                    .div_ceil(u64::from(SELECTED_BLOB_CHUNK_SIZE)),
+                blob_id: Some(result.id),
+            });
+        }
         if let Some((receipt, progress)) = self
             .store
             .resume_profile5_receipt(profile5_source)
@@ -4251,43 +4289,6 @@ impl SelectedBlobNode {
                 total_units: receipt.total_units(),
                 durable_units: progress.next_segment_index(),
                 blob_id: None,
-            });
-        }
-        if let Some(stored) = self
-            .store
-            .get_blob(profile5_source)
-            .map_err(|error| application_error("blob publication status", error.into()))?
-        {
-            if stored.header.topic != request.topic || stored.header.scope != request.scope {
-                return Err(ApplicationError::new(
-                    ApplicationErrorKind::NotFound,
-                    "blob publication status",
-                ));
-            }
-            let epoch = self.active_epoch(&request.scope, "blob publication status")?;
-            self.require_blob_grants(
-                &request.topic,
-                &request.scope,
-                epoch,
-                "blob publication status",
-            )?;
-            let verified =
-                self.verify_stored_blob(&stored, None, epoch, "blob publication status", false)?;
-            let result = blob_publish_result(&verified, false);
-            return Ok(BlobPublicationInspection {
-                publication_id: request.publication_id,
-                phase: BlobPublicationPhase::Available,
-                plaintext_total_bytes: result.total_len,
-                durable_plaintext_bytes: result.total_len,
-                transfer_total_bytes: 0,
-                durable_transfer_bytes: 0,
-                total_units: result
-                    .total_len
-                    .div_ceil(u64::from(SELECTED_BLOB_CHUNK_SIZE)),
-                durable_units: result
-                    .total_len
-                    .div_ceil(u64::from(SELECTED_BLOB_CHUNK_SIZE)),
-                blob_id: Some(result.id),
             });
         }
         let inspection = self

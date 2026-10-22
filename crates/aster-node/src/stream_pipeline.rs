@@ -101,7 +101,9 @@ impl Drop for StreamPartition {
 #[cfg(test)]
 #[derive(Default)]
 struct PipelineTestProbeInner {
+    cleanup_observed: AtomicBool,
     admission_open: AtomicBool,
+    admission_rejected: AtomicBool,
     cancellation_signalled: AtomicBool,
     channels_closed: AtomicBool,
     worker_exits: std::sync::atomic::AtomicUsize,
@@ -129,7 +131,6 @@ static PIPELINE_TEST_PROBES: std::sync::LazyLock<
 impl PipelineTestProbe {
     pub(crate) fn install(job: StreamJobId) -> Self {
         let inner = Arc::new(PipelineTestProbeInner::default());
-        inner.admission_open.store(true, Ordering::SeqCst);
         PIPELINE_TEST_PROBES
             .lock()
             .expect("pipeline probe registry")
@@ -154,6 +155,12 @@ impl PipelineTestProbe {
     }
     pub(crate) fn admission_open(&self) -> bool {
         self.0.admission_open.load(Ordering::SeqCst)
+    }
+    pub(crate) fn admission_rejected(&self) -> bool {
+        self.0.admission_rejected.load(Ordering::SeqCst)
+    }
+    pub(crate) fn cleanup_observed(&self) -> bool {
+        self.0.cleanup_observed.load(Ordering::SeqCst)
     }
     pub(crate) fn cancellation_signalled(&self) -> bool {
         self.0.cancellation_signalled.load(Ordering::SeqCst)
@@ -442,6 +449,7 @@ pub(crate) struct FixedPartitionMapPool<T> {
     work_sender: Option<std_mpsc::SyncSender<Work>>,
     work_receiver: Arc<Mutex<std_mpsc::Receiver<Work>>>,
     result_receiver: mpsc::UnboundedReceiver<Result<Pending<T>, PipelineError>>,
+    admission_accepting: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
     workers: Vec<std::thread::JoinHandle<()>>,
     #[cfg(test)]
@@ -502,6 +510,7 @@ impl<T: Send + 'static> FixedPartitionMapPool<T> {
             return Err(PipelineError::InvalidLimits);
         }
         let map = Arc::new(map);
+        let admission_accepting = Arc::new(AtomicBool::new(true));
         let cancelled = Arc::new(AtomicBool::new(false));
         let (work_sender, work_receiver) = std_mpsc::sync_channel::<Work>(queue_capacity);
         #[cfg(test)]
@@ -612,6 +621,7 @@ impl<T: Send + 'static> FixedPartitionMapPool<T> {
             let worker = match worker {
                 Ok(worker) => worker,
                 Err(_) => {
+                    admission_accepting.store(false, Ordering::Release);
                     cancelled.store(true, Ordering::Release);
                     drop(work_sender);
                     drop(result_sender);
@@ -631,8 +641,14 @@ impl<T: Send + 'static> FixedPartitionMapPool<T> {
                     while result_receiver.try_recv().is_ok() {}
                     #[cfg(test)]
                     if let Some(probe) = &probe {
-                        probe.0.admission_open.store(false, Ordering::SeqCst);
-                        probe.0.cancellation_signalled.store(true, Ordering::SeqCst);
+                        probe.0.admission_open.store(
+                            admission_accepting.load(Ordering::Acquire),
+                            Ordering::SeqCst,
+                        );
+                        probe
+                            .0
+                            .cancellation_signalled
+                            .store(cancelled.load(Ordering::Acquire), Ordering::SeqCst);
                         let work_closed = work_receiver.lock().is_ok_and(|receiver| {
                             matches!(
                                 receiver.try_recv(),
@@ -647,6 +663,11 @@ impl<T: Send + 'static> FixedPartitionMapPool<T> {
                             .0
                             .channels_closed
                             .store(work_closed && results_closed, Ordering::SeqCst);
+                        probe.0.admission_rejected.store(
+                            !admission_accepting.load(Ordering::Acquire) && work_closed,
+                            Ordering::SeqCst,
+                        );
+                        probe.0.cleanup_observed.store(true, Ordering::SeqCst);
                     }
                     return Err(PipelineError::WorkerPanicked);
                 }
@@ -658,6 +679,7 @@ impl<T: Send + 'static> FixedPartitionMapPool<T> {
             work_sender: Some(work_sender),
             work_receiver,
             result_receiver,
+            admission_accepting,
             cancelled,
             workers,
             #[cfg(test)]
@@ -694,6 +716,9 @@ impl<T: Send + 'static> FixedPartitionMapPool<T> {
     }
 
     fn submit_work(&self, work: Work) -> Result<(), PipelineError> {
+        if !self.admission_accepting.load(Ordering::Acquire) {
+            return Err(PipelineError::WorkerPanicked);
+        }
         self.work_sender
             .as_ref()
             .ok_or(PipelineError::WorkerPanicked)?
@@ -736,6 +761,7 @@ impl<T: Send + 'static> FixedPartitionMapPool<T> {
     }
 
     pub(crate) fn shutdown(mut self) -> Result<(), PipelineError> {
+        self.admission_accepting.store(false, Ordering::Release);
         self.cancelled.store(true, Ordering::Release);
         drop(self.work_sender.take());
         let mut panicked = false;
@@ -772,11 +798,7 @@ async fn stop_workers<T: Send + 'static>(pool: FixedPartitionMapPool<T>) -> bool
 
 impl<T> Drop for FixedPartitionMapPool<T> {
     fn drop(&mut self) {
-        #[cfg(test)]
-        if let Some(probe) = &self.test_probe {
-            probe.0.admission_open.store(false, Ordering::SeqCst);
-            probe.0.cancellation_signalled.store(true, Ordering::SeqCst);
-        }
+        self.admission_accepting.store(false, Ordering::Release);
         self.cancelled.store(true, Ordering::Release);
         drop(self.work_sender.take());
         // Normal paths call shutdown. On cancellation, joining here guarantees
@@ -800,6 +822,18 @@ impl<T> Drop for FixedPartitionMapPool<T> {
         while self.result_receiver.try_recv().is_ok() {}
         #[cfg(test)]
         if let Some(probe) = &self.test_probe {
+            probe.0.admission_open.store(
+                self.admission_accepting.load(Ordering::Acquire) && self.work_sender.is_some(),
+                Ordering::SeqCst,
+            );
+            probe.0.admission_rejected.store(
+                !self.admission_accepting.load(Ordering::Acquire) && self.work_sender.is_none(),
+                Ordering::SeqCst,
+            );
+            probe
+                .0
+                .cancellation_signalled
+                .store(self.cancelled.load(Ordering::Acquire), Ordering::SeqCst);
             let work_closed = self.work_receiver.lock().is_ok_and(|receiver| {
                 matches!(
                     receiver.try_recv(),
@@ -814,6 +848,7 @@ impl<T> Drop for FixedPartitionMapPool<T> {
                 .0
                 .channels_closed
                 .store(work_closed && results_closed, Ordering::SeqCst);
+            probe.0.cleanup_observed.store(true, Ordering::SeqCst);
             if let Some(budget) = &self.test_item_budget {
                 probe
                     .0
@@ -1181,26 +1216,7 @@ where
     }
     .await;
 
-    #[cfg(test)]
-    if let Some(probe) = &test_probe {
-        probe.0.admission_open.store(false, Ordering::SeqCst);
-        if outcome.is_err() {
-            probe.0.cancellation_signalled.store(true, Ordering::SeqCst);
-        }
-    }
     let worker_panicked = stop_workers(map_pool).await;
-    #[cfg(test)]
-    if let Some(probe) = &test_probe {
-        probe.0.channels_closed.store(true, Ordering::SeqCst);
-        probe
-            .0
-            .available_item_permits
-            .store(item_budget.available_permits(), Ordering::SeqCst);
-        probe
-            .0
-            .available_byte_permits
-            .store(byte_budget.available_permits(), Ordering::SeqCst);
-    }
     if worker_panicked && outcome.is_ok() {
         Err(PipelineError::WorkerPanicked)
     } else {
@@ -1602,6 +1618,11 @@ mod tests {
         );
         assert!(!probe.admission_open(), "admission remained open");
         assert!(
+            probe.admission_rejected(),
+            "internal admission still accepts"
+        );
+        assert!(probe.cleanup_observed(), "cleanup state was not observed");
+        assert!(
             probe.cancellation_signalled(),
             "cancellation was not signalled"
         );
@@ -1641,6 +1662,8 @@ mod tests {
         );
         assert!(matches!(result, Err(PipelineError::WorkerPanicked)));
         assert!(!probe.admission_open());
+        assert!(probe.admission_rejected());
+        assert!(probe.cleanup_observed());
         assert!(probe.cancellation_signalled());
         assert!(probe.channels_closed());
         assert_eq!(probe.worker_exits(), 2);
