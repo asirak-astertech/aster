@@ -51,10 +51,13 @@ pub use stream::{BlobProfile5Receipt, BlobStreamResume};
 pub use upload::{BlobUploadCheckpoint, BlobUploadRequest, BlobUploadReservation};
 
 #[cfg(any(test, feature = "test-utils"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Profile5BatchTestCounts {
     pub durable_batches: u64,
     pub installed_carriers: u64,
+    pub redb_write_begins: u64,
+    pub redb_write_commits: u64,
+    pub file_sync_operations: u64,
 }
 
 pub(crate) const BLOB_PUBLICATIONS: TableDefinition<&[u8], &[u8]> =
@@ -6759,34 +6762,22 @@ impl Store {
 
         let mut depot = BlobDepot::open_network_mutation(self, false)?;
         depot.acquire_internal_chunk_work_lease(pending.metadata.variant_id)?;
-        CoreBlobStore::begin_blob_with_lineage(
-            &mut depot,
-            plan.manifest(),
-            plan.physical_lineage(),
-        )?;
-        for (verified, _) in carriers {
-            plan.install_verified_carrier(&mut depot, verified)
-                .map_err(|error| blob_error(BlobStoreError::Verification(error.to_string())))?;
-            #[cfg(any(test, feature = "test-utils"))]
-            self.profile5_batch_test_counters
-                .installed_carriers
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        if durable.next_segment_index() == plan.manifest().chunk_count() {
-            CoreBlobStore::finalize_blob(
-                &mut depot,
-                plan.manifest().id(),
-                *plan.manifest_digest(),
-            )?;
-        }
-        drop(depot);
-        let progress = self.checkpoint_verified_profile5_receipt_with_policy(
-            policy, receipt, expected, durable, plan,
+        let progress = depot.commit_verified_profile5_extent_batch(
+            policy, receipt, expected, durable, plan, carriers,
         )?;
         #[cfg(any(test, feature = "test-utils"))]
-        self.profile5_batch_test_counters
-            .durable_batches
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        {
+            self.profile5_batch_test_counters
+                .installed_carriers
+                .fetch_add(
+                    u64::try_from(carriers.len())
+                        .expect("profile-5 batch length is bounded by the manifest"),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            self.profile5_batch_test_counters
+                .durable_batches
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         Ok(progress)
     }
 
@@ -6802,7 +6793,36 @@ impl Store {
                 .profile5_batch_test_counters
                 .installed_carriers
                 .load(std::sync::atomic::Ordering::Relaxed),
+            redb_write_begins: self
+                .profile5_batch_test_counters
+                .redb_write_begins
+                .load(std::sync::atomic::Ordering::Relaxed),
+            redb_write_commits: self
+                .profile5_batch_test_counters
+                .redb_write_commits
+                .load(std::sync::atomic::Ordering::Relaxed),
+            file_sync_operations: self
+                .profile5_batch_test_counters
+                .file_sync_operations
+                .load(std::sync::atomic::Ordering::Relaxed),
         }
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn install_profile5_batch_precommit_gate(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<bool>,
+    ) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        *self
+            .profile5_batch_precommit_gate
+            .lock()
+            .expect("profile-5 precommit gate lock") = Some((entered_tx, release_rx));
+        (entered_rx, release_tx)
     }
 
     /// Authenticates and installs one complete exact carrier, then retires only
@@ -20337,6 +20357,261 @@ mod tests {
                 .resume_profile5_receipt(receipt.source())
                 .expect("resume profile-5 receipt"),
             Some((receipt, durable))
+        );
+    }
+
+    #[test]
+    fn profile5_extent_batch_replays_every_filesystem_commit_boundary_exactly_once() {
+        for (label, point) in [
+            ("temp-synced", depot::DepotFaultPoint::TempSynced),
+            ("renamed", depot::DepotFaultPoint::Renamed),
+            ("directory-synced", depot::DepotFaultPoint::DirectorySynced),
+        ] {
+            let source_root = BlobTestRoot::new(&format!("profile5-batch-source-{label}"));
+            let target_root = BlobTestRoot::new(&format!("profile5-batch-target-{label}"));
+            let mut services = blob_services(0xe8);
+            let plaintext = vec![0x5a; 64 * 1024];
+            let prepared = prepared_blob(&plaintext);
+            let source = Store::open_for_mission(&source_root.database, services.authority)
+                .expect("profile-5 batch source");
+            let target = Store::open_for_mission(&target_root.database, services.authority)
+                .expect("profile-5 batch target");
+            let proof = prepare_blob_proof(&source, &mut services, &prepared, &plaintext, 1);
+            let plan = proof
+                .blob
+                .transfer_plan(&proof.manifest_bytes)
+                .expect("profile-5 batch plan");
+            let mut policy = target
+                .control_policy_snapshot()
+                .expect("profile-5 target policy");
+            target
+                .stage_verified_profile5_blob_source_with_policy(
+                    &policy,
+                    &proof.blob,
+                    &proof.sealed,
+                    &plan,
+                )
+                .expect("stage profile-5 batch source");
+            let (receipt, initial) = target
+                .reserve_profile5_receipt(&policy, &plan)
+                .expect("reserve profile-5 batch receipt");
+            let built = {
+                let mut depot = source.blob_depot().expect("source batch depot");
+                CoreBlobStore::begin_blob_with_lineage(
+                    &mut depot,
+                    plan.manifest(),
+                    plan.physical_lineage(),
+                )
+                .expect("activate source batch plan");
+                plan.build_carrier(&mut depot, 0)
+                    .expect("build profile-5 batch carrier")
+            };
+            let verified = plan
+                .verify_carrier(&built.object_id().wire_bytes(), built.bytes())
+                .expect("verify profile-5 batch carrier");
+            let shape = aster_mesh::profile5_canonical_wire_shape(&plan)
+                .expect("profile-5 batch wire shape");
+            let terminal = shape.terminal();
+            let durable = BlobStreamResume::profile5(
+                1,
+                terminal.next_chunk_index,
+                terminal.plaintext_offset,
+                terminal.carrier_offset,
+                terminal.wire_offset,
+            );
+            let encoded_len = u64::try_from(built.bytes().len()).expect("carrier length");
+
+            if label == "temp-synced" {
+                let registry = services
+                    .provisioner
+                    .export_rekey_registry()
+                    .expect("profile-5 policy-race registry");
+                let (control, _) = services
+                    .publisher
+                    .seal_chained_scope_rekey_control_from_registry(
+                        &registry,
+                        0,
+                        blob_scope(),
+                        1,
+                        vec![
+                            ScopeRekeyRecipient::member(
+                                services.publisher.identity(),
+                                vec![blob_topic()],
+                            )
+                            .expect("profile-5 policy-race publisher"),
+                            ScopeRekeyRecipient::member(
+                                services.reader.identity(),
+                                vec![blob_topic()],
+                            )
+                            .expect("profile-5 policy-race reader"),
+                        ],
+                        1,
+                        None,
+                    )
+                    .expect("profile-5 policy-race control");
+                let verified_control = services
+                    .reader
+                    .verify_control(&control)
+                    .expect("verify profile-5 policy-race control");
+                let (entered, release) = target.install_profile5_batch_precommit_gate();
+                let raced = std::thread::scope(|scope| {
+                    let worker = scope.spawn(|| {
+                        target.commit_verified_profile5_batch_with_policy(
+                            &policy,
+                            &receipt,
+                            initial,
+                            durable,
+                            &plan,
+                            &[(verified.clone(), encoded_len)],
+                        )
+                    });
+                    entered
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .expect("profile-5 policy race precommit boundary");
+                    target
+                        .ingest_verified_control(&verified_control, &control)
+                        .expect("advance durable policy during profile-5 extent commit");
+                    release.send(true).expect("release policy race");
+                    worker.join().expect("policy race worker")
+                });
+                assert!(
+                    matches!(raced, Err(StoreError::ControlPolicyChanged)),
+                    "a control head advanced after file sync must abort the receipt transaction: {raced:?}"
+                );
+                assert_eq!(
+                    target
+                        .resume_profile5_receipt(receipt.source())
+                        .expect("policy-raced receipt"),
+                    Some((receipt.clone(), initial))
+                );
+                assert_eq!(
+                    target
+                        .blob_stats()
+                        .expect("policy-raced batch stats")
+                        .committed_chunks,
+                    0
+                );
+
+                policy = target
+                    .control_policy_snapshot()
+                    .expect("advanced profile-5 target policy");
+            }
+
+            depot::inject_test_fault(&target_root.path, point);
+            assert!(
+                target
+                    .commit_verified_profile5_batch_with_policy(
+                        &policy,
+                        &receipt,
+                        initial,
+                        durable,
+                        &plan,
+                        &[(verified.clone(), encoded_len)],
+                    )
+                    .is_err(),
+                "{point:?} must fail before the receipt transaction commits"
+            );
+            assert_eq!(
+                target
+                    .resume_profile5_receipt(receipt.source())
+                    .expect("interrupted profile-5 receipt"),
+                Some((receipt.clone(), initial))
+            );
+            assert_eq!(
+                target
+                    .blob_stats()
+                    .expect("interrupted batch stats")
+                    .committed_chunks,
+                0
+            );
+            drop(target);
+
+            let reopened = Store::open_for_mission(&target_root.database, services.authority)
+                .expect("reclaim profile-5 batch orphan");
+            assert_eq!(
+                reopened
+                    .commit_verified_profile5_batch_with_policy(
+                        &policy,
+                        &receipt,
+                        initial,
+                        durable,
+                        &plan,
+                        &[(verified, encoded_len)],
+                    )
+                    .expect("replay profile-5 batch"),
+                durable
+            );
+            assert_eq!(
+                reopened
+                    .resume_profile5_receipt(receipt.source())
+                    .expect("replayed profile-5 receipt"),
+                Some((receipt, durable))
+            );
+            assert_eq!(
+                reopened
+                    .blob_stats()
+                    .expect("replayed batch stats")
+                    .committed_chunks,
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn profile5_capacity_rejects_before_receipt_or_physical_write() {
+        let source_root = BlobTestRoot::new("profile5-batch-capacity-source");
+        let target_root = BlobTestRoot::new("profile5-batch-capacity-target");
+        let mut services = blob_services(0xe9);
+        let plaintext = vec![0x5a; 64 * 1024];
+        let prepared = prepared_blob(&plaintext);
+        let source = Store::open_for_mission(&source_root.database, services.authority)
+            .expect("profile-5 capacity source");
+        let target = Store::open_with_all_limits_for_mission(
+            &target_root.database,
+            StoreLimits::default(),
+            BlobDepotLimits::new(1, 1, 1).expect("one-byte profile-5 depot"),
+            EventOperationLimits::DEFAULT,
+            BlobLifecycleLimits::default(),
+            services.authority,
+        )
+        .expect("profile-5 capacity target");
+        let proof = prepare_blob_proof(&source, &mut services, &prepared, &plaintext, 1);
+        let plan = proof
+            .blob
+            .transfer_plan(&proof.manifest_bytes)
+            .expect("profile-5 capacity plan");
+        let policy = target
+            .control_policy_snapshot()
+            .expect("profile-5 capacity policy");
+        assert!(matches!(
+            target.stage_verified_profile5_blob_source_with_policy(
+                &policy,
+                &proof.blob,
+                &proof.sealed,
+                &plan,
+            ),
+            Err(StoreError::Blob(
+                BlobStoreError::DepotByteLimitExceeded { .. }
+            ))
+        ));
+        assert_eq!(
+            target
+                .resume_profile5_receipt(BlobTransferId::new(proof.blob.envelope_id()))
+                .expect("capacity-rejected receipt lookup"),
+            None,
+            "capacity failure must precede receipt authority"
+        );
+        assert_eq!(
+            target
+                .blob_stats()
+                .expect("capacity-rejected stats")
+                .committed_chunks,
+            0
+        );
+        assert_eq!(
+            target.profile5_batch_test_counts(),
+            Profile5BatchTestCounts::default(),
+            "capacity must reject before a file sync or final redb transaction"
         );
     }
 

@@ -820,6 +820,278 @@ impl CoreBlobStore for AuthenticatedBlobReadDepot<'_> {
 }
 
 impl<'a> BlobDepot<'a> {
+    fn activate_verified_plan(
+        &mut self,
+        plan: &VerifiedBlobTransferPlan,
+    ) -> Result<ActiveImport, StoreError> {
+        let variant_id = blob_variant_id(
+            plan.manifest().id(),
+            plan.manifest().content_group(),
+            plan.manifest().content_epoch(),
+        );
+        let existing = {
+            let read = self.store.database.begin_read()?;
+            load_import_read(&read, variant_id)?
+        };
+        if let Some(existing) = existing {
+            if !existing.matches_manifest(plan.manifest())
+                || existing.physical_lineage != Some(*plan.physical_lineage().binding())
+            {
+                return Err(blob_error(BlobStoreError::DepotIntegrity(
+                    "profile-5 batch import differs from authenticated plan",
+                )));
+            }
+            let active = active_from_import(&existing);
+            self.active = Some(active);
+            Ok(active)
+        } else {
+            self.begin_blob_internal(plan.manifest(), Some(plan.physical_lineage()))?;
+            self.require_active(plan.manifest().id())
+        }
+    }
+
+    pub(super) fn commit_verified_profile5_extent_batch(
+        &mut self,
+        policy: &ControlPolicySnapshot,
+        receipt: &BlobProfile5Receipt,
+        expected: BlobStreamResume,
+        durable: BlobStreamResume,
+        plan: &VerifiedBlobTransferPlan,
+        carriers: &[(VerifiedBlobTransferObject, u64)],
+    ) -> Result<BlobStreamResume, StoreError> {
+        self.store.require_live()?;
+        let authority = self.store.require_bound_mission()?;
+        let active = self.activate_verified_plan(plan)?;
+        let variant = self
+            .root
+            .open_child_directory(&hex32(active.variant_id.as_bytes()), true)?;
+
+        let read = self.store.database.begin_read()?;
+        super::deletion::require_variant_available_read(&read, active.variant_id)?;
+        let admission = depot_admission_usage_read(&read)?;
+        let mut incoming_chunks = 0u64;
+        let mut incoming_reserved = 0u64;
+        let mut prepared = Vec::with_capacity(carriers.len());
+        for (verified, _) in carriers {
+            let index = verified.index();
+            let record = verified.record();
+            self.ensure_chunk_record(active, index, record)?;
+            if usize::try_from(record.ciphertext_len()).ok() != Some(verified.ciphertext().len())
+                || <[u8; 32]>::from(Sha256::digest(verified.ciphertext()))
+                    != *record.ciphertext_sha256()
+            {
+                return Err(blob_error(BlobStoreError::DepotIntegrity(
+                    "verified profile-5 carrier differs from its record",
+                )));
+            }
+            let existing = load_chunk_read(&read, active.variant_id, index)?;
+            if let Some(existing) = existing {
+                if existing.committed == Some(record) {
+                    verify_chunk_file(
+                        &variant,
+                        &chunk_file_name(index),
+                        active,
+                        index,
+                        record,
+                        existing.committed_file_bytes,
+                    )?;
+                    prepared.push((index, record, existing.committed_file_bytes, false));
+                    continue;
+                }
+                if existing.expected.is_some_and(|value| value != record)
+                    || existing.committed.is_some()
+                {
+                    return Err(blob_error(BlobStoreError::DepotIntegrity(
+                        "profile-5 carrier conflicts with durable chunk state",
+                    )));
+                }
+            } else {
+                incoming_chunks = incoming_chunks
+                    .checked_add(1)
+                    .ok_or(StoreError::ItemCountAccountingOverflow)?;
+            }
+            let file_len = chunk_file_len(record)?;
+            if existing.and_then(|state| state.expected).is_none() {
+                incoming_reserved = incoming_reserved
+                    .checked_add(file_len)
+                    .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+            }
+            prepared.push((index, record, file_len, true));
+        }
+        if admission
+            .chunks
+            .checked_add(incoming_chunks)
+            .ok_or(StoreError::ItemCountAccountingOverflow)?
+            > self.store.blob_depot_limits.max_chunks
+        {
+            return Err(blob_error(BlobStoreError::DepotChunkLimitExceeded {
+                current: admission.chunks,
+                limit: self.store.blob_depot_limits.max_chunks,
+            }));
+        }
+        if admission
+            .reserved_bytes
+            .checked_add(incoming_reserved)
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?
+            > self.store.blob_depot_limits.max_bytes
+        {
+            return Err(blob_error(BlobStoreError::DepotByteLimitExceeded {
+                current: admission.reserved_bytes,
+                incoming: incoming_reserved,
+                limit: self.store.blob_depot_limits.max_bytes,
+            }));
+        }
+        drop(read);
+
+        for ((verified, _), (index, record, _, write_file)) in
+            carriers.iter().zip(prepared.iter().copied())
+        {
+            if write_file {
+                let name = chunk_file_name(index);
+                variant.remove_if_exists(&name, false)?;
+                let encoded = encode_chunk_file(active, index, record, verified.ciphertext())?;
+                variant.write_atomic(&name, &encoded)?;
+                #[cfg(any(test, feature = "test-utils"))]
+                self.store
+                    .profile5_batch_test_counters
+                    .file_sync_operations
+                    .fetch_add(2, Ordering::Relaxed);
+            }
+        }
+
+        #[cfg(any(test, feature = "test-utils"))]
+        if let Some((entered, release)) = self
+            .store
+            .profile5_batch_precommit_gate
+            .lock()
+            .expect("profile-5 precommit gate lock")
+            .take()
+        {
+            entered.send(()).expect("profile-5 precommit gate observer");
+            if !release.recv().expect("profile-5 precommit gate release") {
+                return Err(blob_error(BlobStoreError::SchemaInvariant(
+                    "injected profile-5 extent sink failure",
+                )));
+            }
+        }
+
+        #[cfg(any(test, feature = "test-utils"))]
+        self.store
+            .profile5_batch_test_counters
+            .redb_write_begins
+            .fetch_add(1, Ordering::Relaxed);
+        let mut write = self.store.database.begin_write()?;
+        write.set_durability(redb::Durability::Immediate)?;
+        enforce_live_write(&write)?;
+        super::deletion::require_variant_available_write(&write, active.variant_id)?;
+        let mut import = load_import_write(&write, active.variant_id)?
+            .ok_or_else(|| blob_error(BlobStoreError::DepotIntegrity("Blob import disappeared")))?;
+        if !import.matches_manifest(plan.manifest())
+            || import.physical_lineage != Some(*plan.physical_lineage().binding())
+        {
+            return Err(blob_error(BlobStoreError::DepotIntegrity(
+                "profile-5 batch import changed",
+            )));
+        }
+
+        let mut reserved_delta = 0u64;
+        let mut committed_delta = 0u64;
+        let mut committed_bytes_delta = 0u64;
+        for (index, record, file_len, write_file) in prepared {
+            if !write_file {
+                continue;
+            }
+            let key = chunk_key(active.variant_id, index);
+            let previous = write
+                .open_table(BLOB_CHUNKS)?
+                .get(key.as_slice())?
+                .map(|value| decode_chunk_state(value.value()))
+                .transpose()?
+                .unwrap_or_default();
+            if previous.expected.is_some_and(|value| value != record)
+                || previous.committed.is_some_and(|value| value != record)
+            {
+                return Err(blob_error(BlobStoreError::DepotIntegrity(
+                    "profile-5 batch chunk state changed",
+                )));
+            }
+            if previous.expected.is_none() {
+                reserved_delta = reserved_delta
+                    .checked_add(file_len)
+                    .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+            }
+            if previous.committed.is_none() {
+                committed_delta = committed_delta
+                    .checked_add(1)
+                    .ok_or(StoreError::ItemCountAccountingOverflow)?;
+                committed_bytes_delta = committed_bytes_delta
+                    .checked_add(file_len)
+                    .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+            }
+            let state = ChunkState {
+                plaintext_digest: Some(*record.plaintext_sha256()),
+                expected: Some(record),
+                committed: Some(record),
+                committed_file_bytes: file_len,
+            };
+            write
+                .open_table(BLOB_CHUNKS)?
+                .insert(key.as_slice(), encode_chunk_state(state).as_slice())?;
+        }
+        let mut metadata = write.open_table(BLOB_DEPOT_METADATA)?;
+        let reserved = metadata
+            .get(DEPOT_RESERVED_FILE_BYTES)?
+            .map_or(0, |value| value.value());
+        let committed = metadata
+            .get(DEPOT_COMMITTED_CHUNK_COUNT)?
+            .map_or(0, |value| value.value());
+        let committed_bytes = metadata
+            .get(DEPOT_COMMITTED_FILE_BYTES)?
+            .map_or(0, |value| value.value());
+        metadata.insert(
+            DEPOT_RESERVED_FILE_BYTES,
+            reserved
+                .checked_add(reserved_delta)
+                .ok_or(StoreError::PayloadByteAccountingOverflow)?,
+        )?;
+        metadata.insert(
+            DEPOT_COMMITTED_CHUNK_COUNT,
+            committed
+                .checked_add(committed_delta)
+                .ok_or(StoreError::ItemCountAccountingOverflow)?,
+        )?;
+        metadata.insert(
+            DEPOT_COMMITTED_FILE_BYTES,
+            committed_bytes
+                .checked_add(committed_bytes_delta)
+                .ok_or(StoreError::PayloadByteAccountingOverflow)?,
+        )?;
+        drop(metadata);
+        if durable.next_segment_index() == plan.manifest().chunk_count() {
+            import.finalized_manifest_digest = Some(*plan.manifest_digest());
+            write.open_table(BLOB_IMPORTS)?.insert(
+                active.variant_id.as_bytes().as_slice(),
+                encode_import(&import)?.as_slice(),
+            )?;
+        }
+        super::pressure::reconcile_variant_write(&write, active.variant_id)?;
+        let progress = self.store.checkpoint_profile5_receipt_in_write(
+            &write,
+            authority,
+            receipt,
+            expected,
+            durable,
+            Some((policy, plan)),
+        )?;
+        write.commit()?;
+        #[cfg(any(test, feature = "test-utils"))]
+        self.store
+            .profile5_batch_test_counters
+            .redb_write_commits
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(progress)
+    }
+
     pub(super) fn acquire_local_import_attempt(
         &mut self,
         staging: BlobTransferId,

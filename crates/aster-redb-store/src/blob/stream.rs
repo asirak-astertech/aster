@@ -620,17 +620,6 @@ impl Store {
         self.checkpoint_profile5_receipt_inner(receipt, expected, durable, None)
     }
 
-    pub(crate) fn checkpoint_verified_profile5_receipt_with_policy(
-        &self,
-        policy: &ControlPolicySnapshot,
-        receipt: &BlobProfile5Receipt,
-        expected: BlobStreamResume,
-        durable: BlobStreamResume,
-        plan: &VerifiedBlobTransferPlan,
-    ) -> Result<BlobStreamResume, StoreError> {
-        self.checkpoint_profile5_receipt_inner(receipt, expected, durable, Some((policy, plan)))
-    }
-
     fn checkpoint_profile5_receipt_inner(
         &self,
         receipt: &BlobProfile5Receipt,
@@ -645,10 +634,36 @@ impl Store {
         {
             return Err(blob_error(BlobStoreError::ReservationChanged));
         }
-        let key = profile5_receipt_key(authority, receipt.source);
         let mut write = self.database.begin_write()?;
         write.set_durability(Durability::Immediate)?;
         enforce_live_write(&write)?;
+        let progress = self.checkpoint_profile5_receipt_in_write(
+            &write,
+            authority,
+            receipt,
+            expected,
+            durable,
+            verified_gate,
+        )?;
+        write.commit()?;
+        Ok(progress)
+    }
+
+    pub(crate) fn checkpoint_profile5_receipt_in_write(
+        &self,
+        write: &redb::WriteTransaction,
+        authority: NodeId,
+        receipt: &BlobProfile5Receipt,
+        expected: BlobStreamResume,
+        durable: BlobStreamResume,
+        verified_gate: Option<(&ControlPolicySnapshot, &VerifiedBlobTransferPlan)>,
+    ) -> Result<BlobStreamResume, StoreError> {
+        if receipt.receiving_authority != authority
+            || receipt.store_binding != self.blob_depot_owner_binding
+        {
+            return Err(blob_error(BlobStoreError::ReservationChanged));
+        }
+        let key = profile5_receipt_key(authority, receipt.source);
         let encoded = write
             .open_table(BLOB_PROFILE5_RECEIPTS)?
             .get(key.as_slice())?
@@ -667,11 +682,11 @@ impl Store {
             let pending = pending
                 .as_ref()
                 .ok_or_else(|| blob_error(BlobStoreError::PendingSourceMissing))?;
-            synchronize_blob_policy_generation_write(&write)?;
-            super::require_blob_lifetime_visible_write(&write, pending.metadata.lifetime)?;
-            super::pressure::require_pending_source_write(&write, receipt.source, pending)?;
-            super::pressure::require_variant_write(&write, pending.metadata.variant_id)?;
-            super::enforce_blob_policy_write(&write, authority, policy, &pending.metadata.header)?;
+            synchronize_blob_policy_generation_write(write)?;
+            super::require_blob_lifetime_visible_write(write, pending.metadata.lifetime)?;
+            super::pressure::require_pending_source_write(write, receipt.source, pending)?;
+            super::pressure::require_variant_write(write, pending.metadata.variant_id)?;
+            super::enforce_blob_policy_write(write, authority, policy, &pending.metadata.header)?;
             super::require_pending_blob_plan(pending, plan)?;
             if write
                 .open_table(super::BLOB_PUBLICATIONS)?
@@ -726,7 +741,6 @@ impl Store {
         write
             .open_table(BLOB_PROFILE5_RECEIPTS)?
             .insert(key.as_slice(), record.encode().as_slice())?;
-        write.commit()?;
         Ok(durable)
     }
 

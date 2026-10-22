@@ -617,11 +617,21 @@ impl BuiltBlobTransferObject {
 ///
 /// Fields and construction are private so parsing a structurally valid
 /// `ASTRBT01` object alone cannot mint this capability.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct VerifiedBlobTransferObject {
     object: BlobTransferObject,
     expected_record: BlobChunkRecord,
+    #[cfg(any(test, feature = "test-utils"))]
+    zeroize_observer: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
 }
+
+impl PartialEq for VerifiedBlobTransferObject {
+    fn eq(&self, other: &Self) -> bool {
+        self.object == other.object && self.expected_record == other.expected_record
+    }
+}
+
+impl Eq for VerifiedBlobTransferObject {}
 
 impl VerifiedBlobTransferObject {
     pub const fn object_id(&self) -> BlobCarrierId {
@@ -646,6 +656,28 @@ impl VerifiedBlobTransferObject {
 
     pub fn ciphertext(&self) -> &[u8] {
         &self.object.ciphertext
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn observe_zeroize_for_test(
+        mut self,
+        observer: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        self.zeroize_observer = Some(observer);
+        self
+    }
+}
+
+impl Drop for VerifiedBlobTransferObject {
+    fn drop(&mut self) {
+        #[cfg(any(test, feature = "test-utils"))]
+        let had_ciphertext = !self.object.ciphertext.is_empty();
+        self.object.ciphertext.zeroize();
+        #[cfg(any(test, feature = "test-utils"))]
+        if had_ciphertext && let Some(observer) = self.zeroize_observer.take() {
+            observer.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 }
 
@@ -1639,6 +1671,8 @@ impl VerifiedBlobTransferPlan {
         Ok(VerifiedBlobTransferObject {
             object,
             expected_record,
+            #[cfg(any(test, feature = "test-utils"))]
+            zeroize_observer: None,
         })
     }
 
@@ -4707,6 +4741,34 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_FILE: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn verified_transfer_object_zeroizes_ciphertext_on_drop() {
+        let observed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ciphertext = vec![0xa5; 17];
+        let digest: [u8; 32] = Sha256::digest(&ciphertext).into();
+        let record =
+            BlobChunkRecord::from_parts([0x11; 32], digest, 1, 17).expect("bounded chunk record");
+        let verified = VerifiedBlobTransferObject {
+            object: BlobTransferObject {
+                object_id: ObjectId::new(crate::wire::ObjectKind::BlobChunk, [0x12; 32]),
+                source_envelope: EnvelopeId::from_bytes([0x13; 32]),
+                blob_id: BlobId([0x14; 32]),
+                index: 0,
+                ciphertext_sha256: digest,
+                ciphertext_len: 17,
+                proof: Vec::new(),
+                ciphertext,
+            },
+            expected_record: record,
+            zeroize_observer: None,
+        }
+        .observe_zeroize_for_test(std::sync::Arc::clone(&observed));
+
+        drop(verified);
+
+        assert_eq!(observed.load(Ordering::SeqCst), 1);
+    }
 
     #[derive(Debug)]
     struct GeneratedSource {

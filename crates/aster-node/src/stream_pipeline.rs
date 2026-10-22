@@ -113,6 +113,8 @@ struct PipelineTestProbeInner {
     hold_workers: AtomicBool,
     peak_reorder_items: std::sync::atomic::AtomicUsize,
     current_reorder_items: std::sync::atomic::AtomicUsize,
+    mapped_ciphertext_zeroizations: Arc<std::sync::atomic::AtomicUsize>,
+    received_extents: std::sync::atomic::AtomicUsize,
     available_item_permits: std::sync::atomic::AtomicUsize,
     available_byte_permits: std::sync::atomic::AtomicUsize,
     fail_spawn_at: std::sync::atomic::AtomicUsize,
@@ -145,6 +147,26 @@ impl PipelineTestProbe {
             .get(&job)
             .and_then(std::sync::Weak::upgrade)
             .map(Self)
+    }
+
+    pub(crate) fn mapped_ciphertext_observer_for_job(
+        job: StreamJobId,
+    ) -> Option<Arc<std::sync::atomic::AtomicUsize>> {
+        Self::for_job(job).map(|probe| Arc::clone(&probe.0.mapped_ciphertext_zeroizations))
+    }
+
+    pub(crate) fn mapped_ciphertext_zeroizations(&self) -> usize {
+        self.0.mapped_ciphertext_zeroizations.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn observe_received_extent(job: StreamJobId) {
+        if let Some(probe) = Self::for_job(job) {
+            probe.0.received_extents.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    pub(crate) fn received_extents(&self) -> usize {
+        self.0.received_extents.load(Ordering::SeqCst)
     }
 
     pub(crate) fn hold_workers_for_test(&self) {

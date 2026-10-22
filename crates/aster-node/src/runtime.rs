@@ -27318,7 +27318,7 @@ async fn receive_profile5_blob_direction(
         .map_err(profile5_blob_network_error)?;
     let report = Box::pin(blob_stream::receive_canonical_blob_profile5(
         transport.as_ref(),
-        &store,
+        Arc::clone(&store),
         guard.policy(),
         verifier,
         mission,
@@ -52275,13 +52275,13 @@ mod tests {
         fs::remove_dir_all(state).expect("canonical capability cleanup");
     }
 
-    #[tokio::test]
-    async fn completed_canonical_blob_crosses_v9_publication_status_survives_small_mtu_interrupt_and_different_adapter_resume()
-     {
+    async fn assert_completed_canonical_blob_crossing(sustained_pipeline_bytes: usize) {
         let multi_extent = vec![0x5au8; 1024 * 1024 + 1];
+        let sustained_pipeline = vec![0x6bu8; sustained_pipeline_bytes];
         for (label, plaintext, finite) in [
             ("nonempty", multi_extent.as_slice(), false),
-            ("pipeline", multi_extent.as_slice(), false),
+            ("pipeline", sustained_pipeline.as_slice(), false),
+            ("sink-failure", multi_extent.as_slice(), false),
             ("empty", b"".as_slice(), false),
             (
                 "finite",
@@ -52297,9 +52297,10 @@ mod tests {
             let authority = services.member.mission_authority_id();
             let source_store = Store::open_for_mission(source_state.join(STORE_FILE), authority)
                 .expect("canonical v9 source store");
-            let mut target_store =
+            let mut target_store = Arc::new(
                 Store::open_for_mission(target_state.join(STORE_FILE), authority)
-                    .expect("canonical v9 target store");
+                    .expect("canonical v9 target store"),
+            );
             let target_before = target_store
                 .blob_stats()
                 .expect("target capacity before transfer");
@@ -52471,8 +52472,31 @@ mod tests {
             let pipeline_probe = crate::stream_pipeline::PipelineTestProbe::install(
                 crate::stream_pipeline::StreamJobId::from_bytes(pipeline_job),
             );
+            let precommit_barrier = if matches!(label, "pipeline" | "sink-failure") {
+                let (entered, release) = target_store.install_profile5_batch_precommit_gate();
+                let probe = pipeline_probe.clone();
+                Some(std::thread::spawn(move || {
+                    entered
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .expect("first extent reached the filesystem-sync/redb-commit boundary");
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                    let target_extents = if label == "pipeline" { 4 } else { 2 };
+                    while probe.received_extents() < target_extents
+                        && std::time::Instant::now() < deadline
+                    {
+                        std::thread::yield_now();
+                    }
+                    let received = probe.received_extents();
+                    release
+                        .send(label != "sink-failure")
+                        .expect("release first extent durability barrier");
+                    received
+                }))
+            } else {
+                None
+            };
 
-            let first = tokio::try_join!(
+            let (first_sender, first_receiver) = tokio::join!(
                 CONTACT_EMISSION_GUARD.scope(
                     source_guard,
                     blob_stream::send_canonical_blob_profile5(
@@ -52490,7 +52514,7 @@ mod tests {
                     target_guard,
                     blob_stream::receive_canonical_blob_profile5(
                         adapter.as_ref(),
-                        &target_store,
+                        Arc::clone(&target_store),
                         &target_policy,
                         &mut target_verifier,
                         &mut receiver_session,
@@ -52501,6 +52525,47 @@ mod tests {
                     ),
                 ),
             );
+            let first = match (first_sender, first_receiver) {
+                (Ok(sent), Ok(received)) => Ok((sent, received)),
+                (Err(error), _) | (_, Err(error)) => Err(error),
+            };
+            if let Some(barrier) = precommit_barrier {
+                let received = barrier.join().expect("precommit barrier thread");
+                if label == "pipeline" {
+                    assert_eq!(
+                        received, 4,
+                        "the receiver must fill, but never exceed, its four-extent intake window"
+                    );
+                } else {
+                    assert!(
+                        received >= 2,
+                        "extent N+1 must be received before extent N durability is released"
+                    );
+                }
+            }
+            if label == "sink-failure" {
+                assert!(
+                    first.is_err(),
+                    "injected sink failure must fail the attempt"
+                );
+                let (_, durable) = target_store
+                    .resume_profile5_receipt(publication)
+                    .expect("sink-failure receipt lookup")
+                    .expect("sink-failure receipt remains resumable");
+                assert_eq!(durable, aster_redb_store::BlobStreamResume::default());
+                assert!(pipeline_probe.mapped_ciphertext_zeroizations() > 0);
+                assert!(pipeline_probe.cleanup_observed());
+                assert!(pipeline_probe.cancellation_signalled());
+                assert_eq!(pipeline_probe.active_workers(), 0);
+                assert_eq!(
+                    pipeline_probe.worker_exits(),
+                    pipeline_probe.joined_workers()
+                );
+                drop((source_store, target_store));
+                fs::remove_dir_all(source_state).expect("sink-failure source cleanup");
+                fs::remove_dir_all(target_state).expect("sink-failure target cleanup");
+                continue;
+            }
             let (sent, received, capacity_chain) = if label == "nonempty" {
                 assert!(
                     first.is_err(),
@@ -52564,8 +52629,10 @@ mod tests {
                     interrupted_status.durable_transfer_bytes,
                     partial.durable_wire_offset()
                 );
-                target_store = Store::open_for_mission(target_state.join(STORE_FILE), authority)
-                    .expect("reopen interrupted profile-5 receiver");
+                target_store = Arc::new(
+                    Store::open_for_mission(target_state.join(STORE_FILE), authority)
+                        .expect("reopen interrupted profile-5 receiver"),
+                );
 
                 let (mut ack_sender, mut ack_receiver, ack_digest) =
                     blob_stream::tests::mission_pair_from_bundles(
@@ -52588,7 +52655,7 @@ mod tests {
                     ),
                     blob_stream::receive_canonical_blob_profile5(
                         &ack_adapter,
-                        &target_store,
+                        Arc::clone(&target_store),
                         &target_policy,
                         &mut ack_verifier,
                         &mut ack_receiver,
@@ -52692,8 +52759,10 @@ mod tests {
                     promoted_status.blob_id.map(|id| *id.as_bytes()),
                     Some(published_blob_id)
                 );
-                target_store = Store::open_for_mission(target_state.join(STORE_FILE), authority)
-                    .expect("reopen target after promoted status inspection");
+                target_store = Arc::new(
+                    Store::open_for_mission(target_state.join(STORE_FILE), authority)
+                        .expect("reopen target after promoted status inspection"),
+                );
                 assert!(
                     target_store
                         .resume_profile5_receipt(publication)
@@ -52721,7 +52790,7 @@ mod tests {
                     ),
                     blob_stream::receive_canonical_blob_profile5(
                         &retry_adapter,
-                        &target_store,
+                        Arc::clone(&target_store),
                         &target_policy,
                         &mut retry_verifier,
                         &mut retry_receiver,
@@ -52768,8 +52837,10 @@ mod tests {
                 drop(target_store);
                 Store::inspect_existing(target_state.join(STORE_FILE))
                     .expect("read-only audit interrupted empty receipt");
-                target_store = Store::open_for_mission(target_state.join(STORE_FILE), authority)
-                    .expect("reopen interrupted empty profile-5 receiver");
+                target_store = Arc::new(
+                    Store::open_for_mission(target_state.join(STORE_FILE), authority)
+                        .expect("reopen interrupted empty profile-5 receiver"),
+                );
                 let (mut retry_sender, mut retry_receiver, retry_digest) =
                     blob_stream::tests::mission_pair_from_bundles(
                         &initiator_bytes,
@@ -52790,7 +52861,7 @@ mod tests {
                     ),
                     blob_stream::receive_canonical_blob_profile5(
                         &retry_adapter,
-                        &target_store,
+                        Arc::clone(&target_store),
                         &target_policy,
                         &mut retry_verifier,
                         &mut retry_receiver,
@@ -52818,7 +52889,7 @@ mod tests {
                     "every canonical carrier crosses the production map/reorder/sink pipeline"
                 );
                 assert!(pipeline.worker_count() > 1);
-                assert!(pipeline.peak_in_flight_items() <= 8);
+                assert_eq!(pipeline.peak_in_flight_items(), 8);
                 assert!(pipeline.peak_in_flight_bytes() <= 1024 * 1024);
                 assert!(pipeline.peak_reorder_items() <= 8);
                 assert!(pipeline_probe.peak_active_workers() > 1);
@@ -52826,6 +52897,11 @@ mod tests {
                 assert!(pipeline_probe.cancellation_signalled());
                 assert!(pipeline_probe.channels_closed());
                 assert_eq!(pipeline_probe.active_workers(), 0);
+                assert_eq!(
+                    pipeline_probe.mapped_ciphertext_zeroizations(),
+                    canonical_chunk_count as usize,
+                    "every mapped ciphertext buffer is zeroized after the joined sink completes",
+                );
                 assert_eq!(
                     pipeline_probe.worker_exits(),
                     pipeline_probe.joined_workers(),
@@ -52840,6 +52916,19 @@ mod tests {
                     "store work is one bounded durable batch per ABX1 extent, not per page"
                 );
                 assert!(batch_counts.durable_batches < batch_counts.installed_carriers);
+                assert_eq!(
+                    batch_counts.redb_write_begins, batch_counts.durable_batches,
+                    "each ABX1 extent uses one real redb write transaction"
+                );
+                assert_eq!(
+                    batch_counts.redb_write_commits, batch_counts.durable_batches,
+                    "each successful extent commits exactly one redb transaction"
+                );
+                assert_eq!(
+                    batch_counts.file_sync_operations,
+                    batch_counts.installed_carriers * 2,
+                    "each newly installed carrier performs one file and one directory sync"
+                );
                 assert!(
                     pipeline
                         .stage(crate::stream_pipeline::PipelineStage::Map)
@@ -52962,8 +53051,10 @@ mod tests {
                     available_status.blob_id.map(|id| *id.as_bytes()),
                     Some(published_blob_id)
                 );
-                target_store = Store::open_for_mission(target_state.join(STORE_FILE), authority)
-                    .expect("reopen target after application status inspection");
+                target_store = Arc::new(
+                    Store::open_for_mission(target_state.join(STORE_FILE), authority)
+                        .expect("reopen target after application status inspection"),
+                );
                 let charged = target_store
                     .blob_stats()
                     .expect("profile-5 charge before retirement");
@@ -53111,6 +53202,20 @@ mod tests {
             }
             fs::remove_dir_all(source_state).expect("canonical v9 source cleanup");
             fs::remove_dir_all(target_state).expect("canonical v9 target cleanup");
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_canonical_blob_crosses_v9_publication_status_survives_small_mtu_interrupt_and_different_adapter_resume()
+     {
+        assert_completed_canonical_blob_crossing(4 * 1024 * 1024 + 1).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "release-only real production path; requires multi-GiB RAM/disk and is not a default local gate"]
+    async fn release_profile5_receiver_real_path_covers_exact_800_mib_and_1_gib() {
+        for bytes in [800 * 1024 * 1024, 1024 * 1024 * 1024] {
+            assert_completed_canonical_blob_crossing(bytes).await;
         }
     }
 
