@@ -113,6 +113,13 @@ impl Drop for StreamPartition {
 }
 
 #[cfg(test)]
+struct SenderSendGate {
+    entered: Arc<Semaphore>,
+    release: Arc<Semaphore>,
+    claimed: bool,
+}
+
+#[cfg(test)]
 #[derive(Default)]
 struct PipelineTestProbeInner {
     cleanup_observed: AtomicBool,
@@ -135,6 +142,8 @@ struct PipelineTestProbeInner {
     available_item_permits: std::sync::atomic::AtomicUsize,
     available_byte_permits: std::sync::atomic::AtomicUsize,
     fail_spawn_at: std::sync::atomic::AtomicUsize,
+    sender_sink_failure: std::sync::atomic::AtomicUsize,
+    sender_send_gate: Mutex<Option<SenderSendGate>>,
 }
 
 #[cfg(test)]
@@ -199,6 +208,67 @@ impl PipelineTestProbe {
         self.0.received_extents.load(Ordering::SeqCst)
     }
 
+    pub(crate) fn inject_sender_sink_failure(&self, failure: usize) {
+        self.0.sender_sink_failure.store(failure, Ordering::SeqCst);
+    }
+
+    pub(crate) fn sender_sink_failure_for_job(job: StreamJobId) -> usize {
+        Self::for_job(job).map_or(0, |probe| {
+            probe.0.sender_sink_failure.load(Ordering::SeqCst)
+        })
+    }
+
+    pub(crate) fn block_sender_send_for_test(&self) {
+        *self.0.sender_send_gate.lock().expect("sender send gate") = Some(SenderSendGate {
+            entered: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+            claimed: false,
+        });
+    }
+
+    pub(crate) async fn wait_sender_send_entered(&self) {
+        let entered = Arc::clone(
+            &self
+                .0
+                .sender_send_gate
+                .lock()
+                .expect("sender send gate")
+                .as_ref()
+                .expect("sender send gate installed")
+                .entered,
+        );
+        entered
+            .acquire()
+            .await
+            .expect("sender send barrier remains open")
+            .forget();
+    }
+
+    pub(crate) fn release_sender_send(&self) {
+        self.0
+            .sender_send_gate
+            .lock()
+            .expect("sender send gate")
+            .as_ref()
+            .expect("sender send gate installed")
+            .release
+            .add_permits(1);
+    }
+
+    pub(crate) fn sender_send_gate_for_job(
+        job: StreamJobId,
+    ) -> Option<(Arc<Semaphore>, Arc<Semaphore>)> {
+        Self::for_job(job).and_then(|probe| {
+            let mut gate = probe.0.sender_send_gate.lock().expect("sender send gate");
+            let gate = gate.as_mut()?;
+            if gate.claimed {
+                return None;
+            }
+            gate.claimed = true;
+            Some((Arc::clone(&gate.entered), Arc::clone(&gate.release)))
+        })
+    }
+
     pub(crate) fn hold_workers_for_test(&self) {
         self.0.hold_workers.store(true, Ordering::SeqCst);
     }
@@ -260,6 +330,8 @@ pub struct MappedPartition<T> {
     index: u64,
     input_bytes: usize,
     value: T,
+    _item_permit: Option<OwnedSemaphorePermit>,
+    _byte_permit: Option<OwnedSemaphorePermit>,
 }
 
 impl<T> MappedPartition<T> {
@@ -273,6 +345,10 @@ impl<T> MappedPartition<T> {
 
     pub fn value(&self) -> &T {
         &self.value
+    }
+
+    pub fn value_mut(&mut self) -> &mut T {
+        &mut self.value
     }
 
     pub fn into_value(self) -> T {
@@ -345,6 +421,8 @@ pub struct PipelineReport {
     completed_items: u64,
     peak_in_flight_items: usize,
     peak_in_flight_bytes: usize,
+    peak_owned_bytes: usize,
+    peak_encoding_bytes: usize,
     peak_reorder_items: usize,
     worker_count: usize,
     stages: [StageObservation; PIPELINE_STAGE_COUNT],
@@ -363,6 +441,21 @@ impl PipelineReport {
     pub const fn peak_in_flight_bytes(&self) -> usize {
         self.peak_in_flight_bytes
     }
+    pub const fn peak_owned_bytes(&self) -> usize {
+        self.peak_owned_bytes
+    }
+    pub const fn peak_encoding_bytes(&self) -> usize {
+        self.peak_encoding_bytes
+    }
+    pub(crate) fn include_owned_bytes(
+        mut self,
+        peak_owned_bytes: usize,
+        peak_encoding_bytes: usize,
+    ) -> Self {
+        self.peak_owned_bytes = self.peak_owned_bytes.max(peak_owned_bytes);
+        self.peak_encoding_bytes = peak_encoding_bytes;
+        self
+    }
     pub const fn peak_reorder_items(&self) -> usize {
         self.peak_reorder_items
     }
@@ -378,10 +471,12 @@ impl Display for PipelineReport {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "workers:{};peak_items:{};peak_bytes:{};peak_reorder:{}",
+            "workers:{};peak_items:{};peak_bytes:{};peak_owned_bytes:{};peak_encoding_bytes:{};peak_reorder:{}",
             self.worker_count,
             self.peak_in_flight_items,
             self.peak_in_flight_bytes,
+            self.peak_owned_bytes,
+            self.peak_encoding_bytes,
             self.peak_reorder_items,
         )?;
         for (name, stage) in [
@@ -414,6 +509,7 @@ pub enum PipelineError {
     WorkerPanicked,
     MapFailed(String),
     SinkFailed(String),
+    BlobNetwork(Box<crate::runtime::blob_stream::BlobNetworkError>),
 }
 
 impl Display for PipelineError {
@@ -429,8 +525,6 @@ struct Pending<T> {
     queue_wait: Duration,
     map_time: Duration,
     mapped_at: Instant,
-    _item_permit: Option<OwnedSemaphorePermit>,
-    _byte_permit: Option<OwnedSemaphorePermit>,
 }
 
 struct ReorderBuffer<T> {
@@ -708,12 +802,12 @@ impl<T: Send + 'static> FixedPartitionMapPool<T> {
                                         index,
                                         input_bytes: bytes,
                                         value,
+                                        _item_permit: work.item_permit,
+                                        _byte_permit: work.byte_permit,
                                     },
                                     queue_wait,
                                     map_time: started.elapsed(),
                                     mapped_at: Instant::now(),
-                                    _item_permit: work.item_permit,
-                                    _byte_permit: work.byte_permit,
                                 }),
                                 Ok(Err(error)) => Err(error),
                                 Err(_) => Err(PipelineError::WorkerPanicked),
@@ -1303,9 +1397,7 @@ where
                     pending.mapped_at.elapsed(),
                 );
                 let sink_started = Instant::now();
-                if let Err(error) = sink(pending.mapped).await {
-                    return Err(PipelineError::SinkFailed(error.to_string()));
-                }
+                sink(pending.mapped).await?;
                 add_observation(
                     &mut stages,
                     PipelineStage::Sink,
@@ -1325,6 +1417,8 @@ where
             completed_items,
             peak_in_flight_items: peak_items,
             peak_in_flight_bytes: peak_bytes,
+            peak_owned_bytes: peak_bytes,
+            peak_encoding_bytes: 0,
             peak_reorder_items: peak_reorder,
             worker_count: limits.workers,
             stages,

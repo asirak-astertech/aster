@@ -2,6 +2,7 @@ use std::{
     fmt::{self, Display, Formatter},
     time::Duration,
 };
+use zeroize::Zeroize;
 
 const MAGIC: &[u8; 4] = b"ASM\x01";
 const COMPOSITE_DATA_MAGIC: &[u8; 4] = b"ASD1";
@@ -134,6 +135,10 @@ impl Display for StreamError {
 }
 impl std::error::Error for StreamError {}
 
+fn canonical_carrier_is_empty(bytes: &[u8]) -> bool {
+    bytes.is_empty()
+}
+
 /// One ordered batch of complete, byte-identical canonical encrypted carriers.
 /// Manifest records arrive authenticated in the bounded SOURCE phase; the
 /// receiver indexes these carriers against that verified manifest.
@@ -179,6 +184,55 @@ impl CanonicalBlobExtentV1 {
                 .to_be_bytes(),
         );
         for carrier in &self.carriers {
+            output.extend_from_slice(
+                &u32::try_from(carrier.len())
+                    .map_err(|_| StreamError::invalid("canonical carrier length overflows"))?
+                    .to_be_bytes(),
+            );
+            output.extend_from_slice(carrier);
+        }
+        Ok(output)
+    }
+
+    pub(crate) fn encode_carriers<'a>(
+        first_chunk_index: u64,
+        carriers: impl ExactSizeIterator<Item = &'a [u8]> + Clone,
+    ) -> Result<Vec<u8>, StreamError> {
+        if carriers.len() == 0
+            || first_chunk_index
+                .checked_add(carriers.len() as u64)
+                .is_none_or(|end| end > aster_mesh::MAX_BLOB_CHUNKS)
+        {
+            return Err(StreamError::invalid(
+                "canonical Blob extent index range is invalid",
+            ));
+        }
+        let mut encoded_len = CANONICAL_BLOB_EXTENT_HEADER_BYTES;
+        for carrier in carriers.clone() {
+            if canonical_carrier_is_empty(carrier)
+                || carrier.len() > PROFILE5_CANONICAL_CARRIER_RECORD_BYTES
+            {
+                return Err(StreamError::invalid("canonical carrier length is invalid"));
+            }
+            encoded_len = encoded_len
+                .checked_add(4)
+                .and_then(|length| length.checked_add(carrier.len()))
+                .ok_or_else(|| StreamError::invalid("canonical Blob extent overflow"))?;
+        }
+        if encoded_len > PROFILE5_CANONICAL_EXTENT_BYTES {
+            return Err(StreamError::invalid(
+                "canonical Blob extent exceeds profile-5 bound",
+            ));
+        }
+        let mut output = Vec::with_capacity(encoded_len);
+        output.extend_from_slice(CANONICAL_BLOB_EXTENT_MAGIC);
+        output.extend_from_slice(&first_chunk_index.to_be_bytes());
+        output.extend_from_slice(
+            &u32::try_from(carriers.len())
+                .map_err(|_| StreamError::invalid("canonical Blob extent count overflows"))?
+                .to_be_bytes(),
+        );
+        for carrier in carriers {
             output.extend_from_slice(
                 &u32::try_from(carrier.len())
                     .map_err(|_| StreamError::invalid("canonical carrier length overflows"))?
@@ -874,9 +928,16 @@ impl StreamDataHeaderV1 {
 }
 
 impl StreamDataV1 {
-    pub(crate) fn into_header_and_body(self) -> Result<(StreamDataHeaderV1, Vec<u8>), StreamError> {
-        let extent_len =
-            u32::try_from(self.bytes.len()).map_err(|_| StreamError::invalid("extent overflow"))?;
+    pub(crate) fn into_header_and_body(
+        mut self,
+    ) -> Result<(StreamDataHeaderV1, Vec<u8>), StreamError> {
+        let extent_len = match u32::try_from(self.bytes.len()) {
+            Ok(length) => length,
+            Err(_) => {
+                self.bytes.zeroize();
+                return Err(StreamError::invalid("extent overflow"));
+            }
+        };
         let header = StreamDataHeaderV1 {
             transfer_id: self.transfer_id,
             attempt_nonce: self.attempt_nonce,
@@ -884,8 +945,11 @@ impl StreamDataV1 {
             offset: self.offset,
             extent_len,
         };
-        header.encode_for_context(9, 5)?;
-        Ok((header, self.bytes))
+        if let Err(error) = header.encode_for_context(9, 5) {
+            self.bytes.zeroize();
+            return Err(error);
+        }
+        Ok((header, std::mem::take(&mut self.bytes)))
     }
 }
 
@@ -1043,18 +1107,27 @@ impl StreamSenderState {
     }
     pub(crate) fn send_extent(
         &mut self,
-        bytes: Vec<u8>,
+        mut bytes: Vec<u8>,
     ) -> Result<StreamExtentAction, StreamError> {
-        let len =
-            u32::try_from(bytes.len()).map_err(|_| StreamError::invalid("extent overflow"))?;
-        extent(len)?;
+        let len = match u32::try_from(bytes.len()) {
+            Ok(length) => length,
+            Err(_) => {
+                bytes.zeroize();
+                return Err(StreamError::invalid("extent overflow"));
+            }
+        };
+        if let Err(error) = extent(len) {
+            bytes.zeroize();
+            return Err(error);
+        }
         if len > self.max_extent {
+            bytes.zeroize();
             return Err(StreamError::invalid("extent exceeds negotiated maximum"));
         }
-        let end = self
-            .next
-            .checked_add(len.into())
-            .ok_or_else(|| StreamError::invalid("offset overflow"))?;
+        let Some(end) = self.next.checked_add(len.into()) else {
+            bytes.zeroize();
+            return Err(StreamError::invalid("offset overflow"));
+        };
         if end > self.limit {
             return Ok(StreamExtentAction::Retry {
                 reason: StreamRetry::CreditBlocked,
@@ -1062,6 +1135,7 @@ impl StreamSenderState {
             });
         }
         if end > self.total {
+            bytes.zeroize();
             return Err(StreamError::invalid("data exceeds declared length"));
         }
         let f = StreamDataV1 {

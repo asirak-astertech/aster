@@ -38,6 +38,11 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 use zeroize::Zeroize;
 
+const PROFILE5_SENDER_CARRIER_WINDOW_BYTES: usize = 4 * PROFILE5_CANONICAL_EXTENT_BYTES;
+const PROFILE5_SENDER_ENCODING_WINDOW_BYTES: usize = PROFILE5_CANONICAL_EXTENT_BYTES + 4096;
+pub(crate) const PROFILE5_SENDER_OWNED_BYTES: usize =
+    PROFILE5_SENDER_CARRIER_WINDOW_BYTES + PROFILE5_SENDER_ENCODING_WINDOW_BYTES;
+
 #[cfg(test)]
 use crate::stream_transfer::{
     PROFILE5_ATTEMPT_TIMEOUT, PROFILE5_LEGACY_SEGMENT_RECORD_BYTES, blob_pack_wire_len,
@@ -166,18 +171,71 @@ fn canonical_sender_requires_final_checkpoint(
 
 struct ZeroizingCanonicalCarrier {
     bytes: Vec<u8>,
+    _charge: SenderByteCharge,
     #[cfg(test)]
     zeroize_observer: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
-impl ZeroizingCanonicalCarrier {
-    fn take(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.bytes)
+#[derive(Default)]
+struct SenderByteOwnership {
+    current: std::sync::atomic::AtomicUsize,
+    peak: std::sync::atomic::AtomicUsize,
+    encoding_current: std::sync::atomic::AtomicUsize,
+    encoding_peak: std::sync::atomic::AtomicUsize,
+}
+
+impl SenderByteOwnership {
+    fn charge(self: &Arc<Self>, bytes: usize) -> SenderByteCharge {
+        let current = self
+            .current
+            .fetch_add(bytes, std::sync::atomic::Ordering::SeqCst)
+            + bytes;
+        self.peak
+            .fetch_max(current, std::sync::atomic::Ordering::SeqCst);
+        SenderByteCharge {
+            ownership: Arc::clone(self),
+            bytes,
+            encoding: false,
+        }
     }
 
-    #[cfg(test)]
-    fn take_zeroize_observer(&mut self) -> Option<Arc<std::sync::atomic::AtomicUsize>> {
-        self.zeroize_observer.take()
+    fn charge_encoding(self: &Arc<Self>, bytes: usize) -> SenderByteCharge {
+        let mut charge = self.charge(bytes);
+        charge.encoding = true;
+        let current = self
+            .encoding_current
+            .fetch_add(bytes, std::sync::atomic::Ordering::SeqCst)
+            + bytes;
+        self.encoding_peak
+            .fetch_max(current, std::sync::atomic::Ordering::SeqCst);
+        charge
+    }
+
+    fn peak(&self) -> usize {
+        self.peak.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn encoding_peak(&self) -> usize {
+        self.encoding_peak.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+struct SenderByteCharge {
+    ownership: Arc<SenderByteOwnership>,
+    bytes: usize,
+    encoding: bool,
+}
+
+impl Drop for SenderByteCharge {
+    fn drop(&mut self) {
+        self.ownership
+            .current
+            .fetch_sub(self.bytes, std::sync::atomic::Ordering::SeqCst);
+        if self.encoding {
+            self.ownership
+                .encoding_current
+                .fetch_sub(self.bytes, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 }
 
@@ -202,13 +260,16 @@ impl Drop for ZeroizingCanonicalExtent {
 }
 
 struct CanonicalSenderPipelineSink<'a> {
+    #[cfg(test)]
+    job_id: StreamJobId,
     attempt: &'a dyn StreamAttempt,
     codec: MissionBlobRecordCodec<'a>,
     state: StreamSenderState,
     extent_ends: VecDeque<u64>,
     first_chunk_index: Option<u64>,
-    carriers: Vec<ZeroizingCanonicalCarrier>,
+    carriers: Vec<MappedPartition<ZeroizingCanonicalCarrier>>,
     checkpoints: u64,
+    ownership: Arc<SenderByteOwnership>,
 }
 
 impl CanonicalSenderPipelineSink<'_> {
@@ -218,7 +279,7 @@ impl CanonicalSenderPipelineSink<'_> {
     ) -> Result<(), PipelineError> {
         let index = mapped.index();
         self.first_chunk_index.get_or_insert(index);
-        self.carriers.push(mapped.into_value());
+        self.carriers.push(mapped);
         if self.extent_ends.front().copied() != Some(index + 1) {
             return Ok(());
         }
@@ -226,51 +287,95 @@ impl CanonicalSenderPipelineSink<'_> {
         let first_chunk_index = self
             .first_chunk_index
             .take()
-            .ok_or_else(|| PipelineError::SinkFailed("missing canonical extent start".into()))?;
-        let mut carriers = std::mem::take(&mut self.carriers);
+            .ok_or_else(|| failure("send canonical extent", "missing canonical extent start"))
+            .map_err(|error| PipelineError::BlobNetwork(Box::new(error)))?;
+        let carriers = std::mem::take(&mut self.carriers);
         #[cfg(test)]
-        let observers = carriers
-            .iter_mut()
-            .map(ZeroizingCanonicalCarrier::take_zeroize_observer)
-            .collect::<Vec<_>>();
-        let mut extent = CanonicalBlobExtentV1 {
+        if crate::stream_pipeline::PipelineTestProbe::sender_sink_failure_for_job(self.job_id) == 1
+        {
+            return Err(PipelineError::BlobNetwork(Box::new(BlobNetworkError::new(
+                BlobNetworkStage::Framing,
+                "encode canonical extent",
+                "injected extent encoding failure",
+            ))));
+        }
+        let encoded = CanonicalBlobExtentV1::encode_carriers(
             first_chunk_index,
-            carriers: carriers
-                .iter_mut()
-                .map(ZeroizingCanonicalCarrier::take)
-                .collect(),
-        };
-        let encoded = extent
-            .encode()
-            .map_err(|error| PipelineError::SinkFailed(error.to_string()))?;
-        for carrier in &mut extent.carriers {
-            carrier.zeroize();
-        }
-        #[cfg(test)]
-        for observer in observers.into_iter().flatten() {
-            observer.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
+            carriers
+                .iter()
+                .map(|carrier| carrier.value().bytes.as_slice()),
+        )
+        .map_err(|error| {
+            PipelineError::BlobNetwork(Box::new(BlobNetworkError::new(
+                BlobNetworkStage::Framing,
+                "encode canonical extent",
+                error,
+            )))
+        })?;
+        let encoded_charge = self.ownership.charge_encoding(encoded.len());
         let mut encoded = ZeroizingCanonicalExtent(encoded);
         let mut pending = Some(std::mem::take(&mut encoded.0));
         while let Some(extent) = pending.take() {
-            match self
-                .state
-                .send_extent(extent)
-                .map_err(|error| PipelineError::SinkFailed(error.to_string()))?
-            {
+            match self.state.send_extent(extent).map_err(|error| {
+                PipelineError::BlobNetwork(Box::new(failure("advance canonical sender", error)))
+            })? {
                 StreamExtentAction::Send(data) => {
+                    #[cfg(test)]
+                    if crate::stream_pipeline::PipelineTestProbe::sender_sink_failure_for_job(
+                        self.job_id,
+                    ) == 2
+                    {
+                        let mut bytes = data.bytes;
+                        bytes.zeroize();
+                        return Err(PipelineError::BlobNetwork(Box::new(
+                            authentication_failure(
+                                "seal data-header mission record",
+                                "injected DATA authentication failure",
+                            ),
+                        )));
+                    }
                     let (mut prefix, mut body) = self
                         .codec
                         .encode_data_parts(data)
-                        .map_err(|error| PipelineError::SinkFailed(error.to_string()))?;
-                    let send = await_authenticated_progress(
-                        "send canonical data",
-                        self.attempt.send_data_parts(&prefix, &body),
-                    )
+                        .map_err(|error| PipelineError::BlobNetwork(Box::new(error)))?;
+                    if prefix.len() > 4096 {
+                        prefix.zeroize();
+                        body.zeroize();
+                        return Err(PipelineError::BlobNetwork(Box::new(BlobNetworkError::new(
+                            BlobNetworkStage::Framing,
+                            "bound canonical DATA prefix",
+                            "authenticated prefix exceeds sender encoding budget",
+                        ))));
+                    }
+                    let prefix_charge = self.ownership.charge_encoding(prefix.len());
+                    #[cfg(test)]
+                    if let Some((entered, release)) =
+                        crate::stream_pipeline::PipelineTestProbe::sender_send_gate_for_job(
+                            self.job_id,
+                        )
+                    {
+                        entered.add_permits(1);
+                        release
+                            .acquire()
+                            .await
+                            .map_err(|_| PipelineError::WorkerPanicked)?
+                            .forget();
+                    }
+                    let send = await_authenticated_progress("send canonical data", async {
+                        #[cfg(test)]
+                        if crate::stream_pipeline::PipelineTestProbe::sender_sink_failure_for_job(
+                            self.job_id,
+                        ) == 3
+                        {
+                            return Err(crate::stream_transport::StreamTransportError::Closed);
+                        }
+                        self.attempt.send_data_parts(&prefix, &body).await
+                    })
                     .await;
                     prefix.zeroize();
                     body.zeroize();
-                    send.map_err(|error| PipelineError::SinkFailed(error.to_string()))?;
+                    drop(prefix_charge);
+                    send.map_err(|error| PipelineError::BlobNetwork(Box::new(error)))?;
                 }
                 StreamExtentAction::Retry {
                     reason: crate::stream_transfer::StreamRetry::CreditBlocked,
@@ -281,35 +386,42 @@ impl CanonicalSenderPipelineSink<'_> {
                         self.attempt.receive_control(),
                     )
                     .await
-                    .map_err(|error| PipelineError::SinkFailed(error.to_string()))?
+                    .map_err(|error| PipelineError::BlobNetwork(Box::new(error)))?
                     .ok_or_else(|| {
-                        PipelineError::SinkFailed(
-                            "control stream closed before canonical checkpoint".into(),
-                        )
+                        PipelineError::BlobNetwork(Box::new(transport_failure(
+                            "receive canonical checkpoint",
+                            "control stream closed",
+                        )))
                     })?;
                     let StreamFrame::Checkpoint(checkpoint) = self
                         .codec
                         .decode(&checkpoint)
-                        .map_err(|error| PipelineError::SinkFailed(error.to_string()))?
+                        .map_err(|error| PipelineError::BlobNetwork(Box::new(error)))?
                     else {
-                        return Err(PipelineError::SinkFailed(
-                            "canonical credit wait received a non-checkpoint frame".into(),
-                        ));
+                        return Err(PipelineError::BlobNetwork(Box::new(failure(
+                            "receive canonical checkpoint",
+                            "credit wait received a non-checkpoint frame",
+                        ))));
                     };
-                    self.state
-                        .checkpoint(checkpoint)
-                        .map_err(|error| PipelineError::SinkFailed(error.to_string()))?;
+                    self.state.checkpoint(checkpoint).map_err(|error| {
+                        PipelineError::BlobNetwork(Box::new(failure(
+                            "advance canonical checkpoint",
+                            error,
+                        )))
+                    })?;
                     self.checkpoints += 1;
                     pending = Some(bytes);
                 }
                 StreamExtentAction::Retry { .. } => {
-                    return Err(PipelineError::SinkFailed(
-                        "canonical sender produced an invalid extent retry".into(),
-                    ));
+                    return Err(PipelineError::BlobNetwork(Box::new(failure(
+                        "advance canonical sender",
+                        "invalid extent retry",
+                    ))));
                 }
             }
         }
         drop(carriers);
+        drop(encoded_charge);
         Ok(())
     }
 }
@@ -447,6 +559,13 @@ fn failure(context: impl Into<String>, error: impl std::fmt::Display) -> BlobNet
     BlobNetworkError::new(BlobNetworkStage::Protocol, context, error)
 }
 
+fn sender_pipeline_failure(error: PipelineError) -> BlobNetworkError {
+    match error {
+        PipelineError::BlobNetwork(error) => *error,
+        error => failure("run canonical sender pipeline", error),
+    }
+}
+
 fn authentication_failure(
     context: impl Into<String>,
     error: impl std::fmt::Display,
@@ -560,12 +679,20 @@ impl BlobRecordCodec for PlainBlobRecordCodec {
         &mut self,
         data: crate::stream_transfer::StreamDataV1,
     ) -> Result<(Vec<u8>, Vec<u8>), BlobNetworkError> {
-        let (header, body) = data.into_header_and_body().map_err(|error| {
+        let (header, mut body) = data.into_header_and_body().map_err(|error| {
             BlobNetworkError::new(BlobNetworkStage::Framing, "split data frame", error)
         })?;
-        let encoded_header = header.encode_for_context(9, 5).map_err(|error| {
-            BlobNetworkError::new(BlobNetworkStage::Framing, "encode data header", error)
-        })?;
+        let encoded_header = match header.encode_for_context(9, 5) {
+            Ok(header) => header,
+            Err(error) => {
+                body.zeroize();
+                return Err(BlobNetworkError::new(
+                    BlobNetworkStage::Framing,
+                    "encode data header",
+                    error,
+                ));
+            }
+        };
         Ok((encoded_header, body))
     }
 
@@ -623,30 +750,47 @@ impl BlobRecordCodec for MissionBlobRecordCodec<'_> {
         &mut self,
         data: crate::stream_transfer::StreamDataV1,
     ) -> Result<(Vec<u8>, Vec<u8>), BlobNetworkError> {
-        let (header, body) = data.into_header_and_body().map_err(|error| {
+        let (header, mut body) = data.into_header_and_body().map_err(|error| {
             BlobNetworkError::new(BlobNetworkStage::Framing, "split data frame", error)
         })?;
-        let encoded_header = header
-            .encode_for_context(9, TransferProfileId::BlobStreamV1 as u16)
-            .map_err(|error| {
-                BlobNetworkError::new(BlobNetworkStage::Framing, "encode data header", error)
-            })?;
-        let protected_header = self
-            .mission
-            .seal_v9_blob_data_header(
-                self.profile_digest,
-                self.direction,
-                self.attempt_nonce,
-                &encoded_header,
-            )
-            .map_err(|error| authentication_failure("seal data-header mission record", error))?;
-        let prefix = encode_composite_data_prefix(&protected_header).map_err(|error| {
-            BlobNetworkError::new(
-                BlobNetworkStage::Framing,
-                "encode composite data prefix",
-                error,
-            )
-        })?;
+        let encoded_header =
+            match header.encode_for_context(9, TransferProfileId::BlobStreamV1 as u16) {
+                Ok(header) => header,
+                Err(error) => {
+                    body.zeroize();
+                    return Err(BlobNetworkError::new(
+                        BlobNetworkStage::Framing,
+                        "encode data header",
+                        error,
+                    ));
+                }
+            };
+        let protected_header = match self.mission.seal_v9_blob_data_header(
+            self.profile_digest,
+            self.direction,
+            self.attempt_nonce,
+            &encoded_header,
+        ) {
+            Ok(header) => header,
+            Err(error) => {
+                body.zeroize();
+                return Err(authentication_failure(
+                    "seal data-header mission record",
+                    error,
+                ));
+            }
+        };
+        let prefix = match encode_composite_data_prefix(&protected_header) {
+            Ok(prefix) => prefix,
+            Err(error) => {
+                body.zeroize();
+                return Err(BlobNetworkError::new(
+                    BlobNetworkStage::Framing,
+                    "encode composite data prefix",
+                    error,
+                ));
+            }
+        };
         Ok((prefix, body))
     }
 
@@ -1282,15 +1426,28 @@ pub(crate) async fn send_canonical_blob_profile5(
     let producer_plan = Arc::clone(&source.plan);
     let producer = tokio::spawn(async move {
         for index in initial_chunk_index..producer_plan.manifest().chunk_count() {
-            let carrier_id = producer_plan
-                .carrier_id(index)
-                .map_err(|error| PipelineError::MapFailed(error.to_string()))?;
+            let carrier_id = producer_plan.carrier_id(index).map_err(|error| {
+                PipelineError::BlobNetwork(Box::new(verification_failure(
+                    "resolve canonical sender carrier",
+                    error,
+                )))
+            })?;
             let carrier_len = usize::try_from(
                 producer_plan
                     .carrier_total_len(&carrier_id.wire_bytes())
-                    .map_err(|error| PipelineError::MapFailed(error.to_string()))?,
+                    .map_err(|error| {
+                        PipelineError::BlobNetwork(Box::new(verification_failure(
+                            "bound canonical sender carrier",
+                            error,
+                        )))
+                    })?,
             )
-            .map_err(|error| PipelineError::MapFailed(error.to_string()))?;
+            .map_err(|error| {
+                PipelineError::BlobNetwork(Box::new(failure(
+                    "bound canonical sender carrier",
+                    error,
+                )))
+            })?;
             partition_tx
                 .send(Ok(StreamPartition::new_accounted(
                     index,
@@ -1304,12 +1461,16 @@ pub(crate) async fn send_canonical_blob_profile5(
     });
     let map_store = Arc::clone(&store);
     let map_plan = Arc::clone(&source.plan);
+    let sender_ownership = Arc::new(SenderByteOwnership::default());
+    let map_ownership = Arc::clone(&sender_ownership);
     let map_session = Arc::new(
         store
             .begin_profile5_sender_read(&source.completion)
             .map_err(|error| durability_failure("open canonical sender read session", error))?,
     );
     let sink = Arc::new(tokio::sync::Mutex::new(CanonicalSenderPipelineSink {
+        #[cfg(test)]
+        job_id: sender_job,
         attempt: attempt.as_ref(),
         codec,
         state,
@@ -1317,23 +1478,30 @@ pub(crate) async fn send_canonical_blob_profile5(
         first_chunk_index: None,
         carriers: Vec::new(),
         checkpoints: 0,
+        ownership: Arc::clone(&sender_ownership),
     }));
     let sink_for_pipeline = Arc::clone(&sink);
     let pipeline_result = run_ordered_channel_pipeline_from(
         sender_job,
         partition_rx,
         initial_chunk_index,
-        PipelineLimits::new(4, 8, 1024 * 1024, 8)
+        PipelineLimits::new(4, 128, PROFILE5_SENDER_CARRIER_WINDOW_BYTES, 128)
             .map_err(|error| failure("configure canonical sender pipeline", error))?,
         move |partition| {
             let index = partition.index();
             drop(partition.into_bytes());
             let carrier = map_store
                 .read_profile5_sender_carrier(&map_session, &map_plan, index)
-                .map_err(|error| PipelineError::MapFailed(error.to_string()))?;
+                .map_err(|error| {
+                    PipelineError::BlobNetwork(Box::new(verification_failure(
+                        "read canonical sender carrier",
+                        error,
+                    )))
+                })?;
             #[cfg(test)]
             crate::stream_pipeline::PipelineTestProbe::observe_prepared_sender_carrier(sender_job);
             Ok(ZeroizingCanonicalCarrier {
+                _charge: map_ownership.charge(carrier.len()),
                 bytes: carrier,
                 #[cfg(test)]
                 zeroize_observer: sender_zeroize_observer.clone(),
@@ -1345,11 +1513,25 @@ pub(crate) async fn send_canonical_blob_profile5(
         },
     )
     .await;
-    let producer_result = producer
-        .await
-        .map_err(|error| failure("join canonical sender admission", error))?;
+    let producer_result = match producer.await {
+        Ok(result) => result.map_err(sender_pipeline_failure),
+        Err(error) => Err(failure("join canonical sender admission", error)),
+    };
     let pipeline = match pipeline_result {
-        Ok(report) => report,
+        Ok(report) if sender_ownership.peak() <= PROFILE5_SENDER_OWNED_BYTES => {
+            report.include_owned_bytes(sender_ownership.peak(), sender_ownership.encoding_peak())
+        }
+        Ok(_) => {
+            _ = await_authenticated_progress(
+                "close canonical data stream after sender ownership overflow",
+                attempt.finish_data(),
+            )
+            .await;
+            return Err(failure(
+                "run canonical sender pipeline",
+                "sender byte ownership exceeded its declared bound",
+            ));
+        }
         Err(error) => {
             // A local read/map/framing failure must close the sender half so
             // the receiver observes EOF instead of waiting for DATA forever.
@@ -1358,14 +1540,26 @@ pub(crate) async fn send_canonical_blob_profile5(
                 attempt.finish_data(),
             )
             .await;
-            return Err(failure("run canonical sender pipeline", error));
+            return Err(sender_pipeline_failure(error));
         }
     };
-    producer_result.map_err(|error| failure("admit canonical sender partitions", error))?;
+    if let Err(error) = producer_result {
+        _ = await_authenticated_progress(
+            "close canonical data stream after sender admission failure",
+            attempt.finish_data(),
+        )
+        .await;
+        return Err(error);
+    }
     let sink = Arc::try_unwrap(sink)
         .map_err(|_| failure("join canonical sender pipeline", "sink remains shared"))?
         .into_inner();
     if !sink.carriers.is_empty() || !sink.extent_ends.is_empty() {
+        _ = await_authenticated_progress(
+            "close canonical data stream after incomplete sender pipeline",
+            attempt.finish_data(),
+        )
+        .await;
         return Err(failure(
             "complete canonical sender pipeline",
             "canonical extent batch remained incomplete",

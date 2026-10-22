@@ -52387,7 +52387,8 @@ mod tests {
                     "\"store\":{{\"carrier_reads\":{}}},",
                     "\"pipeline\":{{\"accepted_items\":{},\"completed_items\":{},",
                     "\"workers\":{},\"peak_in_flight_items\":{},",
-                    "\"peak_in_flight_bytes\":{},\"peak_reorder_items\":{},",
+                    "\"peak_in_flight_bytes\":{},\"peak_owned_bytes\":{},",
+                    "\"peak_encoding_bytes\":{},\"peak_reorder_items\":{},",
                     "\"stages\":{{\"admission\":{},\"map\":{},\"reorder\":{},\"sink\":{}}}}}}}"
                 ),
                 self.payload_bytes,
@@ -52400,6 +52401,8 @@ mod tests {
                 self.sender_pipeline.worker_count(),
                 self.sender_pipeline.peak_in_flight_items(),
                 self.sender_pipeline.peak_in_flight_bytes(),
+                self.sender_pipeline.peak_owned_bytes(),
+                self.sender_pipeline.peak_encoding_bytes(),
                 self.sender_pipeline.peak_reorder_items(),
                 Self::stage_line_for(
                     &self.sender_pipeline,
@@ -52447,6 +52450,9 @@ mod tests {
             ("pipeline", sustained_pipeline.as_slice(), false),
             ("sink-failure", multi_extent.as_slice(), false),
             ("sender-map-failure", multi_extent.as_slice(), false),
+            ("sender-extent-failure", multi_extent.as_slice(), false),
+            ("sender-auth-failure", multi_extent.as_slice(), false),
+            ("sender-transport-failure", multi_extent.as_slice(), false),
             ("empty", b"".as_slice(), false),
             (
                 "finite",
@@ -52647,32 +52653,47 @@ mod tests {
             let sender_pipeline_probe = crate::stream_pipeline::PipelineTestProbe::install(
                 crate::stream_pipeline::StreamJobId::from_bytes(sender_pipeline_job),
             );
-            let precommit_barrier = if matches!(label, "pipeline" | "sink-failure") {
+            sender_pipeline_probe.inject_sender_sink_failure(match label {
+                "sender-extent-failure" => 1,
+                "sender-auth-failure" => 2,
+                "sender-transport-failure" => 3,
+                _ => 0,
+            });
+            let sender_send_barrier = if label == "pipeline" {
+                sender_pipeline_probe.block_sender_send_for_test();
+                let probe = sender_pipeline_probe.clone();
+                let first_extent_end = wire_shape.checkpoints()[1].next_chunk_index as usize;
+                Some(tokio::spawn(async move {
+                    probe.wait_sender_send_entered().await;
+                    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+                    while probe.prepared_sender_carriers() <= first_extent_end
+                        && tokio::time::Instant::now() < deadline
+                    {
+                        tokio::task::yield_now().await;
+                    }
+                    let prepared = probe.prepared_sender_carriers();
+                    probe.release_sender_send();
+                    assert!(
+                        prepared > first_extent_end,
+                        "carrier N+1 must be prepared while send_data_parts for extent N is blocked"
+                    );
+                }))
+            } else {
+                None
+            };
+            let precommit_barrier = if label == "sink-failure" {
                 let (entered, release) = target_store.install_profile5_batch_precommit_gate();
                 let probe = pipeline_probe.clone();
-                let sender_probe = sender_pipeline_probe.clone();
-                let first_extent_end = wire_shape.checkpoints()[1].next_chunk_index as usize;
                 Some(std::thread::spawn(move || {
                     entered
                         .recv_timeout(std::time::Duration::from_secs(10))
                         .expect("first extent reached the filesystem-sync/redb-commit boundary");
                     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-                    let target_extents = if label == "pipeline" { 4 } else { 2 };
+                    let target_extents = 2;
                     while probe.received_extents() < target_extents
                         && std::time::Instant::now() < deadline
                     {
                         std::thread::yield_now();
-                    }
-                    if label == "pipeline" {
-                        while sender_probe.prepared_sender_carriers() <= first_extent_end
-                            && std::time::Instant::now() < deadline
-                        {
-                            std::thread::yield_now();
-                        }
-                        assert!(
-                            sender_probe.prepared_sender_carriers() > first_extent_end,
-                            "carrier N+1 must be prepared while extent N durability is blocked"
-                        );
                     }
                     let received = probe.received_extents();
                     release
@@ -52715,23 +52736,19 @@ mod tests {
                 ),
             );
             let transfer_wall_time = transfer_started.elapsed();
+            if let Some(barrier) = sender_send_barrier {
+                barrier.await.expect("sender send barrier task");
+            }
             let first = match (first_sender, first_receiver) {
                 (Ok(sent), Ok(received)) => Ok((sent, received)),
                 (Err(error), _) | (_, Err(error)) => Err(error),
             };
             if let Some(barrier) = precommit_barrier {
                 let received = barrier.join().expect("precommit barrier thread");
-                if label == "pipeline" {
-                    assert_eq!(
-                        received, 4,
-                        "the receiver must fill, but never exceed, its four-extent intake window"
-                    );
-                } else {
-                    assert!(
-                        received >= 2,
-                        "extent N+1 must be received before extent N durability is released"
-                    );
-                }
+                assert!(
+                    received >= 2,
+                    "extent N+1 must be received before extent N durability is released"
+                );
             }
             if label == "sink-failure" {
                 assert!(
@@ -52775,15 +52792,32 @@ mod tests {
                 fs::remove_dir_all(target_state).expect("sink-failure target cleanup");
                 continue;
             }
-            if label == "sender-map-failure" {
+            if matches!(
+                label,
+                "sender-map-failure"
+                    | "sender-extent-failure"
+                    | "sender-auth-failure"
+                    | "sender-transport-failure"
+            ) {
                 assert!(
                     first.is_err(),
-                    "injected sender map failure must fail the attempt"
+                    "injected sender failure must fail the attempt"
+                );
+                let stage = first.as_ref().expect_err("sender failure").stage();
+                assert_eq!(
+                    stage,
+                    match label {
+                        "sender-map-failure" => blob_stream::BlobNetworkStage::Verification,
+                        "sender-extent-failure" => blob_stream::BlobNetworkStage::Framing,
+                        "sender-auth-failure" => blob_stream::BlobNetworkStage::Authentication,
+                        "sender-transport-failure" => blob_stream::BlobNetworkStage::Transport,
+                        _ => unreachable!(),
+                    }
                 );
                 assert!(
                     target_store
                         .get_blob(publication)
-                        .expect("sender-map-failure target lookup")
+                        .expect("sender-failure target lookup")
                         .is_none()
                 );
                 assert!(sender_pipeline_probe.mapped_ciphertext_zeroizations() > 0);
@@ -52795,9 +52829,14 @@ mod tests {
                     sender_pipeline_probe.worker_exits(),
                     sender_pipeline_probe.joined_workers()
                 );
+                assert_eq!(sender_pipeline_probe.available_item_permits(), 128);
+                assert_eq!(
+                    sender_pipeline_probe.available_byte_permits(),
+                    4 * aster_mesh::PROFILE5_CANONICAL_EXTENT_BYTES as usize
+                );
                 drop((source_store, target_store));
-                fs::remove_dir_all(source_state).expect("sender-map-failure source cleanup");
-                fs::remove_dir_all(target_state).expect("sender-map-failure target cleanup");
+                fs::remove_dir_all(source_state).expect("sender-failure source cleanup");
+                fs::remove_dir_all(target_state).expect("sender-failure target cleanup");
                 continue;
             }
             let (sent, received, capacity_chain) = if label == "nonempty" {
@@ -53135,9 +53174,20 @@ mod tests {
                     .expect("canonical production send must report its bounded pipeline");
                 assert_eq!(sender_pipeline.completed_items(), canonical_chunk_count);
                 assert!(sender_pipeline.worker_count() > 1);
-                assert!(sender_pipeline.peak_in_flight_items() <= 8);
-                assert!(sender_pipeline.peak_in_flight_bytes() <= 1024 * 1024);
-                assert!(sender_pipeline.peak_reorder_items() <= 8);
+                assert!(sender_pipeline.peak_in_flight_items() <= 128);
+                assert!(
+                    sender_pipeline.peak_in_flight_bytes()
+                        <= 4 * aster_mesh::PROFILE5_CANONICAL_EXTENT_BYTES as usize
+                );
+                assert!(sender_pipeline.peak_reorder_items() <= 128);
+                assert!(
+                    sender_pipeline.peak_owned_bytes() <= blob_stream::PROFILE5_SENDER_OWNED_BYTES
+                );
+                assert!(sender_pipeline.peak_encoding_bytes() > 0);
+                assert!(
+                    sender_pipeline.peak_owned_bytes() >= sender_pipeline.peak_encoding_bytes(),
+                    "the total ownership peak must include encoded DATA held through transport"
+                );
                 assert!(sender_pipeline_probe.peak_active_workers() > 1);
                 assert!(sender_pipeline_probe.cleanup_observed());
                 assert!(sender_pipeline_probe.cancellation_signalled());
