@@ -22,7 +22,10 @@ use std::fmt::{self, Display, Formatter};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use zeroize::{Zeroize, Zeroizing};
 
 /// Smallest interoperable chunk size.
@@ -209,7 +212,7 @@ pub struct PreparedBlob {
     chunk_count: u64,
     whole_plaintext_sha256: [u8; 32],
     metadata: BlobMetadata,
-    plaintext_digests: Zeroizing<Vec<[u8; 32]>>,
+    plaintext_digests: Arc<Zeroizing<Vec<[u8; 32]>>>,
 }
 
 impl fmt::Debug for PreparedBlob {
@@ -259,8 +262,8 @@ impl PreparedBlob {
         total_len: u64,
         chunk_size: u32,
         metadata: BlobMetadata,
-        whole_plaintext_sha256: [u8; 32],
-        plaintext_digests: Vec<[u8; 32]>,
+        whole_plaintext_sha256: Zeroizing<[u8; 32]>,
+        plaintext_digests: Zeroizing<Vec<[u8; 32]>>,
     ) -> Result<Self, BlobError> {
         validate_chunk_size(chunk_size)?;
         let chunk_count = chunk_count(total_len, chunk_size)?;
@@ -277,19 +280,24 @@ impl PreparedBlob {
             chunk_count,
             &metadata,
         );
-        for digest in &plaintext_digests {
+        for digest in plaintext_digests.iter() {
             id_hasher.update(digest);
         }
-        id_hasher.update(whole_plaintext_sha256);
+        id_hasher.update(*whole_plaintext_sha256);
         Ok(Self {
             id: BlobId(finalize_sha256(id_hasher)),
             total_len,
             chunk_size,
             chunk_count,
-            whole_plaintext_sha256,
+            whole_plaintext_sha256: *whole_plaintext_sha256,
             metadata,
-            plaintext_digests: Zeroizing::new(plaintext_digests),
+            plaintext_digests: Arc::new(plaintext_digests),
         })
+    }
+
+    /// Shares the single zeroizing digest allocation with bounded map workers.
+    pub fn retained_digests(&self) -> Arc<Zeroizing<Vec<[u8; 32]>>> {
+        Arc::clone(&self.plaintext_digests)
     }
 }
 
@@ -358,7 +366,7 @@ pub fn prepare_blob<R: Read + Seek>(
             chunk_count,
             whole_plaintext_sha256,
             metadata,
-            plaintext_digests,
+            plaintext_digests: Arc::new(plaintext_digests),
         })
     })();
     let restored = source.seek(SeekFrom::Start(original));
@@ -1134,7 +1142,7 @@ impl CanonicalBlobChunkSealer {
         &self,
         manifest: &BlobManifest,
         index: u64,
-        expected_digest: [u8; 32],
+        expected_digest: &[u8; 32],
         plaintext: Vec<u8>,
     ) -> Result<SealedCanonicalBlobChunk, BlobError> {
         validate_selected_manifest(manifest)?;
@@ -1143,7 +1151,7 @@ impl CanonicalBlobChunkSealer {
         }
         let expected = manifest.plaintext_len(index)?;
         let mut ciphertext = Zeroizing::new(plaintext);
-        if ciphertext.len() != expected || sha256(&ciphertext) != expected_digest {
+        if ciphertext.len() != expected || sha256(&ciphertext) != *expected_digest {
             return Err(BlobError::SourceChanged);
         }
         let access = BlobAccess {
@@ -1154,7 +1162,7 @@ impl CanonicalBlobChunkSealer {
         };
         encrypt_chunk(&access, manifest, index, &mut ciphertext)?;
         let record = BlobChunkRecord {
-            plaintext_sha256: expected_digest,
+            plaintext_sha256: *expected_digest,
             ciphertext_sha256: sha256(&ciphertext),
             plaintext_len: u32::try_from(expected).map_err(|_| BlobError::LengthOverflow)?,
             ciphertext_len: u32::try_from(ciphertext.len())
@@ -1231,6 +1239,28 @@ pub struct FinishedBlob {
     manifest_bytes: Vec<u8>,
     manifest_digest: [u8; 32],
     route_commitment: BlobRouteCommitment,
+}
+
+/// Heap ownership observed while constructing a finished manifest and route.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlobFinishMemory {
+    peak_owned_bytes: usize,
+    retained_manifest_bytes: usize,
+    route_working_bytes: usize,
+}
+
+impl BlobFinishMemory {
+    pub const fn peak_owned_bytes(self) -> usize {
+        self.peak_owned_bytes
+    }
+
+    pub const fn retained_manifest_bytes(self) -> usize {
+        self.retained_manifest_bytes
+    }
+
+    pub const fn route_working_bytes(self) -> usize {
+        self.route_working_bytes
+    }
 }
 
 impl fmt::Debug for FinishedBlob {
@@ -2932,6 +2962,16 @@ impl<S: BlobStore> ReferenceBlobService<S> {
 
     /// Finalizes an exact caller-held manifest through any provider-bound store.
     pub fn finish_manifest(&mut self, manifest: &BlobManifest) -> Result<FinishedBlob, BlobError> {
+        self.finish_manifest_measured(manifest)
+            .map(|(finished, _)| finished)
+    }
+
+    /// Finalizes while reporting every heap buffer owned by manifest/route
+    /// construction. Route leaves are moved into the level tree, not cloned.
+    pub fn finish_manifest_measured(
+        &mut self,
+        manifest: &BlobManifest,
+    ) -> Result<(FinishedBlob, BlobFinishMemory), BlobError> {
         let encoded_len = manifest_encoded_len(manifest)?;
         let mut manifest_bytes = Vec::with_capacity(
             usize::try_from(encoded_len).map_err(|_| BlobError::LengthOverflow)?,
@@ -2954,22 +2994,50 @@ impl<S: BlobStore> ReferenceBlobService<S> {
                 record.ciphertext_len,
             ));
         }
+        let levels = build_route_levels(leaves)?;
+        let route_working_bytes = levels
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Vec<[u8; 32]>>())
+            .saturating_add(
+                levels
+                    .iter()
+                    .map(|level| level.capacity().saturating_mul(32))
+                    .sum::<usize>(),
+            );
+        let route_root = if levels.is_empty() {
+            empty_route_root(manifest.id)
+        } else {
+            levels
+                .last()
+                .and_then(|level| level.first())
+                .copied()
+                .ok_or(BlobError::InvalidManifest)?
+        };
         let route_commitment = BlobRouteCommitment {
             blob_id: manifest.id,
             chunk_count: manifest.chunk_count,
-            root: route_root(manifest.id, &leaves)?,
+            root: route_root,
         };
         if manifest_bytes.len() as u64 != encoded_len
             || manifest_bytes.len() as u64 > MAX_BLOB_MANIFEST_BYTES
         {
             return Err(BlobError::InvalidManifest);
         }
-        Ok(FinishedBlob {
-            id: manifest.id,
-            manifest_bytes,
-            manifest_digest,
-            route_commitment,
-        })
+        let retained_manifest_bytes = manifest_bytes.capacity();
+        let memory = BlobFinishMemory {
+            peak_owned_bytes: retained_manifest_bytes.saturating_add(route_working_bytes),
+            retained_manifest_bytes,
+            route_working_bytes,
+        };
+        Ok((
+            FinishedBlob {
+                id: manifest.id,
+                manifest_bytes,
+                manifest_digest,
+                route_commitment,
+            },
+            memory,
+        ))
     }
 
     /// Legacy authenticated-marker reader entry point, generalized over the

@@ -139,7 +139,6 @@ pub(super) struct UploadPackPlainReader {
     segment_start: u64,
     position: u64,
     total_len: u64,
-    loaded_segments: u64,
 }
 
 impl UploadPackPlainReader {
@@ -166,12 +165,7 @@ impl UploadPackPlainReader {
             segment_start: 0,
             position: 0,
             total_len: identity.total_len(),
-            loaded_segments: 0,
         })
-    }
-
-    pub(super) const fn loaded_segments(&self) -> u64 {
-        self.loaded_segments
     }
 
     fn reopen(&mut self) -> std::io::Result<()> {
@@ -193,10 +187,6 @@ impl UploadPackPlainReader {
             return Ok(false);
         };
         let (plaintext, _) = self.opener.open(&segment).map_err(std::io::Error::other)?;
-        self.loaded_segments = self
-            .loaded_segments
-            .checked_add(1)
-            .ok_or_else(|| std::io::Error::other("upload segment count overflow"))?;
         self.segment_start = self.position;
         self.plaintext = plaintext;
         self.plaintext_offset = 0;

@@ -2751,8 +2751,9 @@ pub(super) struct DepotAdmissionUsage {
     pub(super) reserved_bytes: u64,
 }
 
-pub(super) fn blob_upload_capacity(
+fn blob_upload_capacity_with_staging(
     total_len: u64,
+    staging: u64,
 ) -> Result<super::upload::BlobUploadCapacity, StoreError> {
     let chunks = if total_len == 0 {
         0
@@ -2774,7 +2775,6 @@ pub(super) fn blob_upload_capacity(
                 .ok_or(StoreError::PayloadByteAccountingOverflow)?,
         )
         .ok_or(StoreError::PayloadByteAccountingOverflow)?;
-    let staging = super::pack::reserved_upload_pack_bytes(total_len)?;
     Ok(super::upload::BlobUploadCapacity {
         bytes: staging
             .checked_add(total_len)
@@ -2785,7 +2785,25 @@ pub(super) fn blob_upload_capacity(
     })
 }
 
+pub(super) fn blob_upload_capacity(
+    total_len: u64,
+) -> Result<super::upload::BlobUploadCapacity, StoreError> {
+    blob_upload_capacity_with_staging(total_len, blob_upload_staging_charge(total_len)?)
+}
+
+pub(super) fn legacy_blob_upload_capacity(
+    total_len: u64,
+) -> Result<super::upload::BlobUploadCapacity, StoreError> {
+    blob_upload_capacity_with_staging(total_len, legacy_blob_upload_staging_charge(total_len)?)
+}
+
 pub(super) fn blob_upload_staging_charge(total_len: u64) -> Result<u64, StoreError> {
+    super::pack::reserved_upload_pack_bytes(total_len)?
+        .checked_add(super::pack::upload_digest_reserved_bytes(total_len)?)
+        .ok_or(StoreError::PayloadByteAccountingOverflow)
+}
+
+pub(super) fn legacy_blob_upload_staging_charge(total_len: u64) -> Result<u64, StoreError> {
     super::pack::reserved_upload_pack_bytes(total_len)
 }
 

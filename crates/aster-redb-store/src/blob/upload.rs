@@ -56,7 +56,8 @@ fn maybe_inject_test_fault(store: &Store, point: UploadFaultPoint) -> Result<(),
 }
 
 const UPLOAD_MAGIC: &[u8; 8] = b"ASTRUP01";
-const UPLOAD_VERSION: u8 = 1;
+const LEGACY_UPLOAD_VERSION: u8 = 1;
+const UPLOAD_VERSION: u8 = 2;
 const UPLOAD_ID_DOMAIN: &[u8] = b"aster/blob-upload-id/v1\0";
 const UPLOAD_REQUEST_DOMAIN: &[u8] = b"aster/blob-upload-request/v1\0";
 const MAX_UPLOADS: u64 = super::MAX_BLOB_OPERATIONS;
@@ -246,6 +247,7 @@ pub(super) struct BlobUploadCreditClaim {
 
 #[derive(Clone, Debug)]
 struct DurableBlobUpload {
+    format_version: u8,
     reservation: BlobUploadReservation,
     checkpoint: Option<BlobPackCheckpoint>,
     consumed: BlobUploadCapacity,
@@ -282,7 +284,7 @@ impl DurableBlobUpload {
             .unwrap_or_default();
         let mut output = Vec::new();
         output.extend_from_slice(UPLOAD_MAGIC);
-        output.push(UPLOAD_VERSION);
+        output.push(self.format_version);
         push_u16_bytes(&mut output, &owner_key)?;
         output.extend_from_slice(&self.reservation.control_policy.authority());
         match self.reservation.control_policy.head() {
@@ -332,7 +334,11 @@ impl DurableBlobUpload {
 
     fn decode(authority_capability: Arc<()>, encoded: &[u8]) -> Result<Self, StoreError> {
         let mut cursor = UploadCursor::new(encoded);
-        if cursor.take(8)? != UPLOAD_MAGIC || cursor.u8()? != UPLOAD_VERSION {
+        if cursor.take(8)? != UPLOAD_MAGIC {
+            return Err(schema_error());
+        }
+        let format_version = cursor.u8()?;
+        if format_version != LEGACY_UPLOAD_VERSION && format_version != UPLOAD_VERSION {
             return Err(schema_error());
         }
         let owner_key = cursor.short()?.to_vec();
@@ -406,8 +412,17 @@ impl DurableBlobUpload {
             total_len,
         };
         validate_request(&request)?;
-        let expected_capacity = super::depot::blob_upload_capacity(total_len)?;
-        let expected_staging = super::depot::blob_upload_staging_charge(total_len)?;
+        let (expected_capacity, expected_staging) = if format_version == LEGACY_UPLOAD_VERSION {
+            (
+                super::depot::legacy_blob_upload_capacity(total_len)?,
+                super::depot::legacy_blob_upload_staging_charge(total_len)?,
+            )
+        } else {
+            (
+                super::depot::blob_upload_capacity(total_len)?,
+                super::depot::blob_upload_staging_charge(total_len)?,
+            )
+        };
         let expected_conversion = super::depot::blob_upload_conversion_overhead(total_len)?;
         if request_digest_for(&request)? != request_digest
             || upload_id_for(&request.owner, request_digest)? != upload_id
@@ -424,6 +439,7 @@ impl DurableBlobUpload {
             return Err(schema_error());
         }
         Ok(Self {
+            format_version,
             reservation: BlobUploadReservation {
                 request,
                 control_policy,
@@ -879,12 +895,14 @@ impl Store {
         enforce_live_write(&write)?;
         synchronize_blob_policy_generation_write(&write)?;
         let content_epoch = require_upload_policy_write(&write, authority, policy, request, None)?;
-        if let Some(encoded) = write
-            .open_table(super::BLOB_UPLOADS)?
-            .get(owner_key.as_slice())?
-            .map(|value| value.value().to_vec())
-        {
-            let existing =
+        let existing_encoded = {
+            let uploads = write.open_table(super::BLOB_UPLOADS)?;
+            uploads
+                .get(owner_key.as_slice())?
+                .map(|value| value.value().to_vec())
+        };
+        if let Some(encoded) = existing_encoded {
+            let mut existing =
                 DurableBlobUpload::decode(Arc::clone(&self.blob_completion_authority), &encoded)?;
             if existing.reservation.request != *request
                 || existing.reservation.request_digest != request_digest
@@ -893,6 +911,34 @@ impl Store {
             }
             if existing.reservation.control_policy != *policy {
                 return Err(blob_error(BlobStoreError::ReservationChanged));
+            }
+            if existing.format_version == LEGACY_UPLOAD_VERSION {
+                let upgraded_capacity = super::depot::blob_upload_capacity(request.total_len)?;
+                let upgraded_staging = super::depot::blob_upload_staging_charge(request.total_len)?;
+                let additional = upgraded_capacity
+                    .bytes
+                    .checked_sub(existing.reservation.total_capacity.bytes)
+                    .ok_or_else(schema_error)?;
+                let current = super::depot::depot_admission_usage_write(&write)?;
+                if current
+                    .reserved_bytes
+                    .checked_add(additional)
+                    .ok_or(StoreError::PayloadByteAccountingOverflow)?
+                    > self.blob_depot_limits.max_bytes()
+                {
+                    return Err(blob_error(BlobStoreError::DepotByteLimitExceeded {
+                        current: current.reserved_bytes,
+                        incoming: additional,
+                        limit: self.blob_depot_limits.max_bytes(),
+                    }));
+                }
+                existing.format_version = UPLOAD_VERSION;
+                existing.reservation.staging_charge_bytes = upgraded_staging;
+                existing.reservation.total_capacity = upgraded_capacity;
+                write
+                    .open_table(super::BLOB_UPLOADS)?
+                    .insert(owner_key.as_slice(), existing.encode()?.as_slice())?;
+                write.commit()?;
             }
             return Ok((
                 reservation_for_store(self, &existing),
@@ -961,6 +1007,7 @@ impl Store {
             authority: Arc::clone(&self.blob_completion_authority),
         };
         let upload = DurableBlobUpload {
+            format_version: UPLOAD_VERSION,
             reservation: reservation.clone(),
             checkpoint: None,
             consumed: BlobUploadCapacity::default(),
@@ -1842,6 +1889,225 @@ mod tests {
     }
 
     #[test]
+    fn upload_capacity_charges_the_exact_canonical_digest_artifact() {
+        let fixture = fixture("digest-capacity", 0x30, BlobDepotLimits::DEFAULT);
+        let total_len = u64::from(aster_mesh::SELECTED_BLOB_CHUNK_SIZE) * 2 + 1;
+        let request = request(&fixture, b"digest-capacity", total_len);
+        let policy = fixture.store.control_policy_snapshot().expect("policy");
+        let (reservation, _) = fixture
+            .store
+            .reserve_blob_upload_with_policy(&policy, &request)
+            .expect("reserve upload");
+        let pack_bytes =
+            super::super::pack::reserved_upload_pack_bytes(total_len).expect("pack reservation");
+        let digest_bytes = 86 + 3 * 32;
+        assert_eq!(
+            reservation.staging_charge_bytes(),
+            pack_bytes + digest_bytes,
+            "every durable sidecar byte must be reserved before creation"
+        );
+    }
+
+    #[test]
+    fn legacy_upload_capacity_upgrade_is_atomic_under_pressure_and_reopen() {
+        let mut fixture = fixture("legacy-digest-capacity", 0x2f, BlobDepotLimits::DEFAULT);
+        let total_len = u64::from(aster_mesh::SELECTED_BLOB_CHUNK_SIZE) * 2 + 1;
+        let request = request(&fixture, b"legacy-digest-capacity", total_len);
+        let policy = fixture.store.control_policy_snapshot().expect("policy");
+        fixture
+            .store
+            .reserve_blob_upload_with_policy(&policy, &request)
+            .expect("seed current upload");
+        let owner_key = blob_operation_owner_key(&request.owner).expect("owner key");
+        let write = fixture.store.database.begin_write().expect("write");
+        let encoded = {
+            let uploads = write
+                .open_table(super::super::BLOB_UPLOADS)
+                .expect("uploads");
+            uploads
+                .get(owner_key.as_slice())
+                .expect("read upload")
+                .expect("upload row")
+                .value()
+                .to_vec()
+        };
+        let mut upload = DurableBlobUpload::decode(
+            Arc::clone(&fixture.store.blob_completion_authority),
+            &encoded,
+        )
+        .expect("decode upload");
+        upload.format_version = LEGACY_UPLOAD_VERSION;
+        upload.reservation.staging_charge_bytes =
+            super::super::depot::legacy_blob_upload_staging_charge(total_len)
+                .expect("legacy staging");
+        upload.reservation.total_capacity =
+            super::super::depot::legacy_blob_upload_capacity(total_len).expect("legacy capacity");
+        write
+            .open_table(super::super::BLOB_UPLOADS)
+            .expect("uploads")
+            .insert(
+                owner_key.as_slice(),
+                upload.encode().expect("encode legacy").as_slice(),
+            )
+            .expect("downgrade upload");
+        write.commit().expect("commit legacy row");
+
+        let authority = fixture.publisher.mission_authority_id();
+        let legacy_bytes = upload.reservation.total_capacity.bytes;
+        let current_bytes = super::super::depot::blob_upload_capacity(total_len)
+            .expect("current capacity")
+            .bytes;
+        drop(fixture.store);
+        fixture.store = Store::open_with_limits_and_blob_depot_limits_for_mission(
+            fixture.root.database(),
+            StoreLimits::default(),
+            BlobDepotLimits::new(legacy_bytes, 16, 2).expect("legacy exact limit"),
+            authority,
+        )
+        .expect("reopen legacy upload");
+        let database_before = fs::read(fixture.root.database()).expect("database snapshot");
+        let artifacts_before = upload_pack_tree_snapshot(&fixture.root);
+        let error = fixture
+            .store
+            .reserve_blob_upload_with_policy(&policy, &request)
+            .expect_err("upgrade must fail under exact legacy pressure");
+        assert!(matches!(
+            error,
+            StoreError::Blob(BlobStoreError::DepotByteLimitExceeded { .. })
+        ));
+        assert_eq!(
+            fs::read(fixture.root.database()).expect("database after pressure"),
+            database_before
+        );
+        assert_eq!(upload_pack_tree_snapshot(&fixture.root), artifacts_before);
+
+        drop(fixture.store);
+        fixture.store = Store::open_with_limits_and_blob_depot_limits_for_mission(
+            fixture.root.database(),
+            StoreLimits::default(),
+            BlobDepotLimits::new(current_bytes, 16, 2).expect("upgraded exact limit"),
+            authority,
+        )
+        .expect("reopen for upgrade");
+        let (upgraded, _) = fixture
+            .store
+            .reserve_blob_upload_with_policy(&policy, &request)
+            .expect("atomically upgrade legacy row");
+        assert_eq!(upgraded.reserved_bytes(), current_bytes);
+        assert_eq!(
+            upgraded.staging_charge_bytes(),
+            super::super::depot::blob_upload_staging_charge(total_len).expect("current staging")
+        );
+    }
+
+    #[test]
+    fn store_reopen_accepts_and_new_upload_recreates_torn_unprojected_sidecar() {
+        let mut fixture = fixture("torn-unprojected-sidecar", 0x2e, BlobDepotLimits::DEFAULT);
+        let request = request(&fixture, b"torn-unprojected-sidecar", 4_096);
+        let policy = fixture.store.control_policy_snapshot().expect("policy");
+        let (reservation, checkpoint) = fixture
+            .store
+            .reserve_blob_upload_with_policy(&policy, &request)
+            .expect("reserve upload");
+        let upload_name = reservation
+            .pack_identity()
+            .upload_id()
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let sidecar = fixture
+            .root
+            .0
+            .join("blob-depot-v1")
+            .join("stream-packs-v2")
+            .join(upload_name)
+            .join("canonical-digests-v1.bin");
+        fs::write(&sidecar, b"ASTR").expect("write torn final-name sidecar");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o600))
+                .expect("make torn artifact private");
+        }
+        let authority = fixture.publisher.mission_authority_id();
+        drop(fixture.store);
+        fixture.store = Store::open_for_mission(fixture.root.database(), authority)
+            .expect("unprojected torn sidecar cannot prevent Store reopen");
+        let root = PinnedBlobPackRoot::open(&fixture.store).expect("pack root");
+        drop(
+            super::super::pack::BlobUploadDigestWriter::open_projected_upload_pinned(
+                &root,
+                &reservation.pack_identity(),
+                checkpoint.durable_pack_checkpoint(),
+            )
+            .expect("new upload recreates torn sidecar atomically"),
+        );
+        assert_eq!(
+            fs::metadata(sidecar).expect("recreated sidecar").len(),
+            super::super::pack::UPLOAD_DIGEST_HEADER_LEN
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn digest_sidecar_enforces_the_documented_local_private_boundary() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
+
+        let fixture = fixture("digest-private-boundary", 0x2d, BlobDepotLimits::DEFAULT);
+        let request = request(&fixture, b"digest-private-boundary", 4_096);
+        let policy = fixture.store.control_policy_snapshot().expect("policy");
+        let (reservation, checkpoint) = fixture
+            .store
+            .reserve_blob_upload_with_policy(&policy, &request)
+            .expect("reserve upload");
+        let root = PinnedBlobPackRoot::open(&fixture.store).expect("pack root");
+        drop(
+            super::super::pack::BlobUploadDigestWriter::open_projected_upload_pinned(
+                &root,
+                &reservation.pack_identity(),
+                checkpoint.durable_pack_checkpoint(),
+            )
+            .expect("create sidecar"),
+        );
+        let upload_name = reservation
+            .pack_identity()
+            .upload_id()
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let sidecar = fixture
+            .root
+            .0
+            .join("blob-depot-v1")
+            .join("stream-packs-v2")
+            .join(upload_name)
+            .join("canonical-digests-v1.bin");
+        let metadata = fs::metadata(&sidecar).expect("sidecar metadata");
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert_eq!(metadata.nlink(), 1);
+
+        let target = fixture.root.0.join("digest-sidecar-target");
+        fs::write(
+            &target,
+            vec![0_u8; super::super::pack::UPLOAD_DIGEST_HEADER_LEN as usize],
+        )
+        .expect("symlink target");
+        fs::remove_file(&sidecar).expect("remove sidecar");
+        symlink(&target, &sidecar).expect("install hostile symlink");
+        assert!(
+            super::super::pack::BlobUploadDigestWriter::open_projected_upload_pinned(
+                &root,
+                &reservation.pack_identity(),
+                checkpoint.durable_pack_checkpoint(),
+            )
+            .is_err(),
+            "O_NOFOLLOW must reject a sidecar symlink even without a projection"
+        );
+    }
+
+    #[test]
     fn upload_retry_and_checkpoint_reject_immutable_policy_mismatch() {
         // Break caught: retry and checkpoint must not accept a live
         // caller-supplied policy when the durable upload is bound to different
@@ -2591,6 +2857,11 @@ mod tests {
         let root = PinnedBlobPackRoot::open(&fixture.store).expect("pack root");
         let mut writer = BlobPackWriter::open_projected_upload_pinned(&root, &identity, None)
             .expect("open initial pack");
+        let mut digest_writer =
+            super::super::pack::BlobUploadDigestWriter::open_projected_upload_pinned(
+                &root, &identity, None,
+            )
+            .expect("open initial digest artifact");
         let sealer = BlobStreamSegmentSealer::from_test_key(
             *identity.upload_id().as_bytes(),
             *identity.request_digest(),
@@ -2607,18 +2878,22 @@ mod tests {
                     0,
                     0,
                     plaintext.len() as u64,
-                    plaintext,
+                    plaintext.clone(),
                 )
                 .expect("partition"),
             )
             .expect("segment");
         writer.append(&segment, leaves).expect("append");
+        digest_writer
+            .append(&plaintext)
+            .expect("append canonical digest material");
         super::super::pack::inject_test_fault(
             &root,
             super::super::pack::BlobPackFaultPoint::DataSynced,
         );
-        assert!(writer.checkpoint().is_err());
+        assert!(writer.checkpoint_upload(&mut digest_writer).is_err());
         drop(writer);
+        drop(digest_writer);
         let authority = fixture.publisher.mission_authority_id();
         drop(fixture.store);
         fixture.store = Store::open_for_mission(fixture.root.database(), authority)
@@ -2637,6 +2912,15 @@ mod tests {
         )
         .expect("truncate physical lead to projected boundary");
         assert_eq!(writer.plaintext_offset(), 0);
+        let digest_writer =
+            super::super::pack::BlobUploadDigestWriter::open_projected_upload_pinned(
+                &root,
+                &identity,
+                exact.durable_pack_checkpoint(),
+            )
+            .expect("truncate digest lead to projected boundary");
+        assert_eq!(digest_writer.plaintext_offset(), 0);
+        drop(digest_writer);
         writer
             .append(&segment, leaves)
             .expect("append after recovery");

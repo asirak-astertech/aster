@@ -159,6 +159,8 @@ struct PipelineTestProbeInner {
     sender_sink_failure: std::sync::atomic::AtomicUsize,
     finalizer_map_failure: AtomicU64,
     finalizer_sink_failure: AtomicU64,
+    finalizer_provisional_decrypts: std::sync::atomic::AtomicUsize,
+    finalizer_provisional_decrypts_on_map_workers: std::sync::atomic::AtomicUsize,
     sender_send_gate: Mutex<Option<SenderSendGate>>,
 }
 
@@ -232,6 +234,34 @@ impl PipelineTestProbe {
         Self::for_job(job).is_some_and(|probe| {
             probe.0.finalizer_sink_failure.load(Ordering::SeqCst) == index.saturating_add(1)
         })
+    }
+
+    pub(crate) fn observe_finalizer_provisional_decrypt(job: StreamJobId) {
+        if let Some(probe) = Self::for_job(job) {
+            probe
+                .0
+                .finalizer_provisional_decrypts
+                .fetch_add(1, Ordering::SeqCst);
+            if std::thread::current()
+                .name()
+                .is_some_and(|name| name.starts_with("aster-stream-map-"))
+            {
+                probe
+                    .0
+                    .finalizer_provisional_decrypts_on_map_workers
+                    .fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    pub(crate) fn finalizer_provisional_decrypts(&self) -> usize {
+        self.0.finalizer_provisional_decrypts.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn finalizer_provisional_decrypts_on_map_workers(&self) -> usize {
+        self.0
+            .finalizer_provisional_decrypts_on_map_workers
+            .load(Ordering::SeqCst)
     }
 
     pub(crate) fn sender_ownership_observers_for_job(
@@ -1417,7 +1447,10 @@ where
                     actual: index,
                 });
             }
-            peak_reorder = peak_reorder.max(reorder.len().saturating_sub(1));
+            let buffered_out_of_order = reorder
+                .len()
+                .saturating_sub(usize::from(reorder.contains_key(&next_index)));
+            peak_reorder = peak_reorder.max(buffered_out_of_order);
             add_observation(
                 &mut stages,
                 PipelineStage::Reorder,

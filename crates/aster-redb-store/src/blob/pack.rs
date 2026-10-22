@@ -13,7 +13,10 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use super::depot::{OwnedDirectory, open_blob_pack_root};
@@ -28,7 +31,7 @@ const PACK_FILE: &str = "segments.pack";
 const UPLOAD_DIGEST_FILE: &str = "canonical-digests-v1.bin";
 const UPLOAD_DIGEST_MAGIC: &[u8; 8] = b"ASTRCD01";
 const UPLOAD_DIGEST_VERSION: u16 = 1;
-const UPLOAD_DIGEST_HEADER_LEN: u64 = 8 + 2 + 32 + 32 + 8 + 4;
+pub(super) const UPLOAD_DIGEST_HEADER_LEN: u64 = 8 + 2 + 32 + 32 + 8 + 4;
 const SHA256_SERIALIZED_STATE_LEN: usize = 105;
 const CHECKPOINT_ZERO: &str = "checkpoint.0";
 const CHECKPOINT_ONE: &str = "checkpoint.1";
@@ -43,6 +46,7 @@ const UPLOAD_RESERVATION_MAGIC: &[u8; 8] = b"ASTRUR01";
 const UPLOAD_RESERVATION_PREFIX: &str = ".aster-upload-reservation-";
 const PACK_TEMP_PREFIX: &str = ".aster-blob-tmp-";
 const PACK_DIRECTORY: &str = "stream-packs-v2";
+static PACK_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -92,6 +96,17 @@ pub(crate) fn reserved_upload_pack_bytes(total_len: u64) -> Result<u64, StoreErr
     total_len
         .checked_add(overhead)
         .and_then(|value| value.checked_add(PACK_FIXED_RESERVATION_BYTES))
+        .ok_or(StoreError::PayloadByteAccountingOverflow)
+}
+
+pub(crate) fn upload_digest_reserved_bytes(total_len: u64) -> Result<u64, StoreError> {
+    let count = total_len
+        .checked_add(u64::from(SELECTED_BLOB_CHUNK_SIZE) - 1)
+        .ok_or(StoreError::PayloadByteAccountingOverflow)?
+        / u64::from(SELECTED_BLOB_CHUNK_SIZE);
+    count
+        .checked_mul(32)
+        .and_then(|bytes| bytes.checked_add(UPLOAD_DIGEST_HEADER_LEN))
         .ok_or(StoreError::PayloadByteAccountingOverflow)
 }
 
@@ -456,12 +471,10 @@ fn audit_expected_upload_pack(
                 .map_err(pack_marker_store_error)?;
         }
         None => {
-            if let Some(mut digests) =
-                directory.open_private_read_file_if_present(UPLOAD_DIGEST_FILE)?
-            {
-                validate_upload_digest_header(&mut digests, expected.identity)
-                    .map_err(pack_marker_store_error)?;
-            }
+            // No digest projection means this file has no authority. Opening
+            // it still enforces the private regular-file/no-follow contract;
+            // genuine v2 resume may atomically replace a torn artifact.
+            _ = directory.open_private_read_file_if_present(UPLOAD_DIGEST_FILE)?;
         }
     }
     data.seek(SeekFrom::Start(PACK_HEADER_LEN))
@@ -792,6 +805,47 @@ enum BlobPackRoot {
 }
 
 impl BlobPackRoot {
+    fn install_upload_digests_atomic(&self, bytes: &[u8]) -> Result<File, BlobPackError> {
+        match self {
+            Self::Pinned(root, _) => root.write_atomic(UPLOAD_DIGEST_FILE, bytes)?,
+            Self::Path(root) => {
+                let temp_name = format!(
+                    "{PACK_TEMP_PREFIX}digest-{}-{}",
+                    std::process::id(),
+                    PACK_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+                );
+                let temp = root.join(&temp_name);
+                let mut options = OpenOptions::new();
+                options.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.mode(0o600);
+                }
+                let mut file = options.open(&temp)?;
+                if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+                    let _ = fs::remove_file(&temp);
+                    return Err(error.into());
+                }
+                fs::rename(&temp, root.join(UPLOAD_DIGEST_FILE))?;
+                File::open(root)?.sync_all()?;
+            }
+        }
+        self.open_upload_digests(false)
+    }
+
+    fn remove_upload_digests(&self) -> Result<(), BlobPackError> {
+        match self {
+            Self::Pinned(root, _) => root.remove_if_exists(UPLOAD_DIGEST_FILE, false)?,
+            Self::Path(root) => match fs::remove_file(root.join(UPLOAD_DIGEST_FILE)) {
+                Ok(()) => File::open(root)?.sync_all()?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            },
+        }
+        Ok(())
+    }
+
     fn open_data(&self, create_new: bool) -> Result<File, BlobPackError> {
         match self {
             Self::Path(root) => Ok(OpenOptions::new()
@@ -944,8 +998,8 @@ pub struct BlobPackCheckpoint {
 struct BlobUploadDigestCheckpoint {
     count: u64,
     file_len: u64,
-    commitment: [u8; 32],
-    whole_sha256_state: [u8; SHA256_SERIALIZED_STATE_LEN],
+    commitment: zeroize::Zeroizing<[u8; 32]>,
+    whole_sha256_state: zeroize::Zeroizing<[u8; SHA256_SERIALIZED_STATE_LEN]>,
 }
 
 impl PartialEq for BlobPackCheckpoint {
@@ -1053,8 +1107,8 @@ impl BlobPackCheckpoint {
                     out.extend_from_slice(&UPLOAD_DIGEST_VERSION.to_be_bytes());
                     out.extend_from_slice(&digests.count.to_be_bytes());
                     out.extend_from_slice(&digests.file_len.to_be_bytes());
-                    out.extend_from_slice(&digests.commitment);
-                    out.extend_from_slice(&digests.whole_sha256_state);
+                    out.extend_from_slice(&digests.commitment[..]);
+                    out.extend_from_slice(&digests.whole_sha256_state[..]);
                 }
             }
         }
@@ -1101,11 +1155,13 @@ impl BlobPackCheckpoint {
                 1 if reader.u16()? == UPLOAD_DIGEST_VERSION => Some(BlobUploadDigestCheckpoint {
                     count: reader.u64()?,
                     file_len: reader.u64()?,
-                    commitment: reader.array()?,
-                    whole_sha256_state: reader
-                        .take(SHA256_SERIALIZED_STATE_LEN)?
-                        .try_into()
-                        .map_err(|_| BlobPackError::Invalid("invalid SHA-256 state"))?,
+                    commitment: zeroize::Zeroizing::new(reader.array()?),
+                    whole_sha256_state: zeroize::Zeroizing::new(
+                        reader
+                            .take(SHA256_SERIALIZED_STATE_LEN)?
+                            .try_into()
+                            .map_err(|_| BlobPackError::Invalid("invalid SHA-256 state"))?,
+                    ),
                 }),
                 _ => {
                     return Err(BlobPackError::Invalid(
@@ -1121,6 +1177,7 @@ impl BlobPackCheckpoint {
             || pack_len < PACK_HEADER_LEN
             || frontier.next_index() != next_index
             || frontier.plaintext_len() != plaintext_offset
+            || (version == CHECKPOINT_VERSION && upload_digests.is_none())
             || upload_digests.as_ref().is_some_and(|digests| {
                 validate_upload_digest_checkpoint(digests, plaintext_offset, total_len).is_err()
             })
@@ -1322,7 +1379,7 @@ fn validate_upload_digest_file(
         commitment.update(&buffer[..take]);
         remaining -= take as u64;
     }
-    if commitment.clone().finalize().as_slice() != checkpoint.commitment {
+    if commitment.clone().finalize().as_slice() != &checkpoint.commitment[..] {
         return Err(BlobPackError::Invalid(
             "Blob upload digest commitment mismatch",
         ));
@@ -1337,6 +1394,14 @@ fn validate_upload_digest_file(
 /// Durable fixed-stride canonical digest artifact for one owner-qualified
 /// provisional upload. Its combined checkpoint lives in the alternating pack
 /// journal and is projected atomically with that pack checkpoint.
+/// Durable local-private upload metadata.
+///
+/// The sidecar intentionally contains raw unkeyed plaintext SHA-256 material.
+/// It is not cryptographically protected at rest: the Store layer has no
+/// node/mission content-grant key without introducing a second authority.
+/// Pinned owner directories, O_NOFOLLOW, regular-file/same-UID checks, mode
+/// 0600, and link-count one protect the supported live access boundary, but a
+/// same-account or offline-disk reader can perform equality/dictionary tests.
 pub struct BlobUploadDigestWriter {
     data: File,
     identity: BlobPackIdentity,
@@ -1369,19 +1434,23 @@ impl BlobUploadDigestWriter {
         identity: BlobPackIdentity,
         projected: Option<&BlobPackCheckpoint>,
     ) -> Result<Self, BlobPackError> {
+        let legacy_rebuild_allowed = projected.is_none()
+            || projected.is_some_and(|checkpoint| {
+                checkpoint.format_version == PACK_VERSION && checkpoint.upload_digests.is_none()
+            });
+        let header = upload_digest_header(identity);
         let mut data = match pack_root.open_existing_upload_digests()? {
-            Some(data) => data,
-            None => {
-                let mut data = pack_root.open_upload_digests(true)?;
-                data.write_all(&upload_digest_header(identity))?;
-                data.sync_all()?;
-                data
-            }
+            Some(mut data) => match validate_upload_digest_header(&mut data, identity) {
+                Ok(()) => data,
+                Err(_) if legacy_rebuild_allowed => {
+                    drop(data);
+                    pack_root.remove_upload_digests()?;
+                    pack_root.install_upload_digests_atomic(&header)?
+                }
+                Err(error) => return Err(error),
+            },
+            None => pack_root.install_upload_digests_atomic(&header)?,
         };
-        validate_upload_digest_header(&mut data, identity)?;
-        let legacy_rebuild_allowed = projected.is_some_and(|checkpoint| {
-            checkpoint.format_version == PACK_VERSION && checkpoint.upload_digests.is_none()
-        });
         let (plaintext_offset, count, commitment, whole_plaintext, file_len) = match projected
             .and_then(|checkpoint| {
                 checkpoint
@@ -1497,8 +1566,8 @@ impl BlobUploadDigestWriter {
         let checkpoint = BlobUploadDigestCheckpoint {
             count: self.count,
             file_len: self.data.stream_position()?,
-            commitment: self.commitment.clone().finalize().into(),
-            whole_sha256_state: sha256_state(&self.whole_plaintext),
+            commitment: zeroize::Zeroizing::new(self.commitment.clone().finalize().into()),
+            whole_sha256_state: zeroize::Zeroizing::new(sha256_state(&self.whole_plaintext)),
         };
         validate_upload_digest_checkpoint(
             &checkpoint,
@@ -1510,12 +1579,17 @@ impl BlobUploadDigestWriter {
 }
 
 pub struct BlobUploadDigestMaterial {
-    plaintext_digests: Vec<[u8; 32]>,
-    whole_plaintext_sha256: [u8; 32],
+    plaintext_digests: zeroize::Zeroizing<Vec<[u8; 32]>>,
+    whole_plaintext_sha256: zeroize::Zeroizing<[u8; 32]>,
 }
 
 impl BlobUploadDigestMaterial {
-    pub fn into_parts(self) -> (Vec<[u8; 32]>, [u8; 32]) {
+    pub fn into_parts(
+        self,
+    ) -> (
+        zeroize::Zeroizing<Vec<[u8; 32]>>,
+        zeroize::Zeroizing<[u8; 32]>,
+    ) {
         (self.plaintext_digests, self.whole_plaintext_sha256)
     }
 }
@@ -1551,15 +1625,15 @@ pub fn load_upload_digest_material(
     data.seek(SeekFrom::Start(UPLOAD_DIGEST_HEADER_LEN))?;
     let capacity = usize::try_from(digest_checkpoint.count)
         .map_err(|_| BlobPackError::Invalid("Blob upload digest count overflow"))?;
-    let mut plaintext_digests = Vec::with_capacity(capacity);
+    let mut plaintext_digests = zeroize::Zeroizing::new(Vec::with_capacity(capacity));
     for _ in 0..digest_checkpoint.count {
-        let mut digest = [0_u8; 32];
-        data.read_exact(&mut digest)?;
-        plaintext_digests.push(digest);
+        let mut digest = zeroize::Zeroizing::new([0_u8; 32]);
+        data.read_exact(&mut *digest)?;
+        plaintext_digests.push(*digest);
     }
     Ok(BlobUploadDigestMaterial {
         plaintext_digests,
-        whole_plaintext_sha256: whole.finalize().into(),
+        whole_plaintext_sha256: zeroize::Zeroizing::new(whole.finalize().into()),
     })
 }
 
@@ -2008,6 +2082,25 @@ impl BlobPackReader {
         })
     }
 
+    /// Opens one independently readable provisional segment at its fixed
+    /// record boundary within the exact Store-projected checkpoint.
+    pub fn open_projected_upload_pinned_at_segment(
+        root: &PinnedBlobPackRoot,
+        identity: &BlobPackIdentity,
+        checkpoint: &BlobPackCheckpoint,
+        index: u64,
+    ) -> Result<Self, BlobPackError> {
+        let reader = Self::open_projected_upload_pinned(root, identity, checkpoint)?;
+        let record_bytes = 4_u64
+            .checked_add(BLOB_STREAM_SEGMENT_BYTES as u64)
+            .and_then(|bytes| bytes.checked_add(BLOB_STREAM_SEGMENT_ENCODED_OVERHEAD_BYTES as u64))
+            .ok_or(BlobPackError::Invalid("Blob pack record offset overflow"))?;
+        let payload_offset = index
+            .checked_mul(record_bytes)
+            .ok_or(BlobPackError::Invalid("Blob pack record offset overflow"))?;
+        Self::open_at_payload_offset_in(reader, index, payload_offset)
+    }
+
     fn open_in(root: BlobPackRoot, open: &BlobStreamOpen) -> Result<Self, BlobPackError> {
         let identity = BlobPackIdentity::from_stream(open);
         let mut data = root
@@ -2309,6 +2402,8 @@ mod tests {
 
     #[test]
     fn canonical_sha256_snapshot_round_trips_and_rejects_impossible_state() {
+        fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<Sha256>();
         for len in [0_usize, 1, 63, 64, 65, 64 * 1024 + 19] {
             let bytes = (0..len)
                 .map(|index| (index % 251) as u8)
@@ -2431,6 +2526,98 @@ mod tests {
             len_before,
             "validation failure must precede truncation"
         );
+    }
+
+    #[test]
+    fn upload_digest_v2_resume_recreates_a_torn_unprojected_sidecar() {
+        let root = TempRoot::new();
+        let total_len = BLOB_STREAM_SEGMENT_BYTES as u64;
+        let open = open(total_len);
+        let identity = BlobPackIdentity::from_stream(&open);
+        let mut writer = BlobPackWriter::create(&root.0, &open).expect("create pack");
+        let (segment, leaves) = segments(&open, 1).remove(0);
+        writer.append(&segment, leaves).expect("append segment");
+        let legacy = writer.checkpoint().expect("v2 checkpoint");
+        assert_eq!(legacy.format_version, PACK_VERSION);
+
+        fs::write(root.0.join(UPLOAD_DIGEST_FILE), b"ASTR")
+            .expect("leave a torn pre-projection sidecar");
+        let digests = BlobUploadDigestWriter::open_pack_root(
+            BlobPackRoot::Path(root.0.clone()),
+            identity,
+            Some(&legacy),
+        )
+        .expect("genuine v2 state recovers a torn unprojected sidecar");
+        assert_eq!(
+            digests
+                .migration_rebuild_bytes(legacy.plaintext_offset())
+                .expect("legacy rebuild size"),
+            total_len
+        );
+        assert_eq!(
+            fs::metadata(root.0.join(UPLOAD_DIGEST_FILE))
+                .expect("recreated sidecar")
+                .len(),
+            UPLOAD_DIGEST_HEADER_LEN
+        );
+    }
+
+    #[test]
+    fn upload_digest_atomic_creation_ignores_a_partial_private_temp() {
+        let root = TempRoot::new();
+        let open = open(4_096);
+        let identity = BlobPackIdentity::from_stream(&open);
+        drop(BlobPackWriter::create(&root.0, &open).expect("create pack"));
+        let partial = root.0.join(format!("{PACK_TEMP_PREFIX}digest-crash"));
+        fs::write(&partial, b"ASTR").expect("partial private temp");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&partial, fs::Permissions::from_mode(0o600))
+                .expect("make temp private");
+        }
+        drop(
+            BlobUploadDigestWriter::open_pack_root(
+                BlobPackRoot::Path(root.0.clone()),
+                identity,
+                None,
+            )
+            .expect("partial temp is non-authoritative"),
+        );
+        assert_eq!(
+            fs::metadata(root.0.join(UPLOAD_DIGEST_FILE))
+                .expect("installed sidecar")
+                .len(),
+            UPLOAD_DIGEST_HEADER_LEN
+        );
+        assert!(
+            partial.exists(),
+            "crash temp remains safely non-authoritative"
+        );
+    }
+
+    #[test]
+    fn checkpoint_v3_rejects_missing_digest_projection() {
+        let open = open(0);
+        let mut checkpoint = BlobPackCheckpoint {
+            format_version: CHECKPOINT_VERSION,
+            generation: 1,
+            open_digest: open.digest(),
+            stream_id: open.stream_id(),
+            total_len: 0,
+            next_index: 0,
+            plaintext_offset: 0,
+            pack_len: PACK_HEADER_LEN,
+            frontier: BlobStreamFrontier::new().checkpoint(),
+            upload_digests: None,
+            authority: None,
+        };
+        let encoded = checkpoint.encode();
+        assert!(BlobPackCheckpoint::decode(&encoded).is_err());
+
+        checkpoint.total_len = 1;
+        let encoded = checkpoint.encode();
+        assert!(BlobPackCheckpoint::decode(&encoded).is_err());
     }
 
     #[test]
