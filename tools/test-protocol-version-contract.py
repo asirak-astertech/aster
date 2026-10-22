@@ -184,6 +184,51 @@ Current qualification must measure 64-KiB canonical plaintext chunks carried as 
         with self.assertRaisesRegex(CHECKER.ContractViolation, "legacy performance"):
             CHECKER.validate_blob_documentation_contract(damaged)
 
+        coexistence_mutations = (
+            (
+                "node_api",
+                "node_api contradiction",
+                "Profile 5 uses independently authenticated 1-MiB segments.",
+            ),
+            (
+                "transports",
+                "transports contradiction",
+                "Profile 5 uses independently authenticated 1-MiB segments.",
+            ),
+            (
+                "recipes",
+                "recipes contradiction",
+                "Profile 5 uses independently authenticated 1-MiB segments.",
+            ),
+            (
+                "runbook",
+                "receiver settlement contradiction",
+                "The receiver sends RESULT and receives ACK before canonical promotion.",
+            ),
+            (
+                "runbook",
+                "receipt attempt contradiction",
+                "The durable receipt persists the fresh attempt nonce.",
+            ),
+            (
+                "runbook",
+                "receiver timeout contradiction",
+                "The receiver derives its hard deadline from exact content bytes after OPEN.",
+            ),
+            (
+                "performance",
+                "legacy performance contradiction",
+                "The legacy 2026-10-20 CM4 result validates the current ABX1 batching policy.",
+            ),
+        )
+        for surface, label, contradiction in coexistence_mutations:
+            damaged = dict(documents)
+            damaged[surface] += contradiction
+            with self.subTest(coexistence=label), self.assertRaisesRegex(
+                CHECKER.ContractViolation, label
+            ):
+                CHECKER.validate_blob_documentation_contract(damaged)
+
     def test_v1_through_v9_contract_passes(self) -> None:
         self.validate()
 

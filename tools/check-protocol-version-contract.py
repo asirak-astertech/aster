@@ -217,6 +217,40 @@ def validate_blob_documentation_contract(documents: dict[str, str]) -> None:
     for surface in ("node_api", "transports", "recipes"):
         require_document(surface, surface, profile_statement)
         require_document(surface, surface, chunk_statement)
+        normalized = " ".join(
+            documents.get(surface, "").replace("//!", "").split()
+        )
+        if re.search(
+            r"independently authenticated 1[- ]MiB segments", normalized, re.I
+        ):
+            fail(f"Blob documentation {surface} contradiction is present")
+
+    runbook = " ".join(documents.get("runbook", "").split())
+    if re.search(
+        r"(?:RESULT[^.]{0,120}ACK[^.]{0,120}before[^.]{0,80}(?:canonical )?promotion|"
+        r"promotion occurs only after[^.]{0,160}RESULT[^.]{0,80}ACK)",
+        runbook,
+        re.I,
+    ):
+        fail("Blob documentation receiver settlement contradiction is present")
+    for sentence in re.split(r"(?<=[.!?])\s+", runbook):
+        lowered = sentence.lower()
+        if (
+            "receipt" in lowered
+            and ("attempt nonce" in lowered or "attempt binding" in lowered)
+            and any(word in lowered for word in ("persists", "contains", "binds"))
+            and "does not persist" not in lowered
+            and "does not bind" not in lowered
+        ):
+            fail("Blob documentation receipt attempt contradiction is present")
+    for clause in re.split(r"[.;]", runbook):
+        lowered = clause.lower()
+        if (
+            "receiver" in lowered
+            and "hard deadline" in lowered
+            and ("exact content" in lowered or "exact canonical wire" in lowered)
+        ):
+            fail("Blob documentation receiver timeout contradiction is present")
 
     require_document(
         "performance",
@@ -228,6 +262,18 @@ def validate_blob_documentation_contract(documents: dict[str, str]) -> None:
         "current performance qualification",
         "Current qualification must measure 64-KiB canonical plaintext chunks carried as ASTRBT01 records in at-most-1-MiB ABX1 extents",
     )
+    performance = " ".join(documents.get("performance", "").split())
+    for sentence in re.split(r"(?<=[.!?])\s+", performance):
+        lowered = sentence.lower()
+        if (
+            ("legacy" in lowered or "2026-10-20" in lowered or "cm4" in lowered)
+            and any(word in lowered for word in ("validates", "supports", "qualifies"))
+            and "current" in lowered
+            and any(word in lowered for word in ("abx1", "batching", "candidate"))
+            and "does not" not in lowered
+            and "do not" not in lowered
+        ):
+            fail("Blob documentation legacy performance contradiction is present")
 
 
 def parse_numeric_declaration(text: str, label: str) -> tuple[int, ...]:
