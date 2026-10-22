@@ -322,11 +322,11 @@
 
 - [x] **Step 1: Add the failing transport-neutral reopen test**
 
-  Add `publication_status_survives_small_mtu_interrupt_and_different_adapter_resume`. The fake seam exercises a small-MTU interrupted attempt and a fresh adapter instance resuming from the exact receiver-authoritative offset. Its evidence is transport-neutral reopen of the same single contact-agreed adapter contract, not production cross-transport selection or failover. Assert unchanged publication ID, monotonic common durable counters, final Blob ID/hash equality, and no IP/Iroh type in the status interface.
+  Add `publication_status_survives_small_mtu_interrupt_and_fresh_adapter_instance_resume`. The fake seam exercises a small-MTU interrupted attempt and a fresh adapter instance resuming from the exact receiver-authoritative offset. Its evidence is transport-neutral reopen of the same single contact-agreed adapter contract, not production cross-transport selection or failover. Assert unchanged publication ID, monotonic common durable counters, final Blob ID/hash equality, and no IP/Iroh type in the status interface.
 
 - [x] **Step 2: Run the fake-adapter test and confirm it fails**
 
-  Run: `cargo test -p aster-node publication_status_survives_small_mtu_interrupt_and_different_adapter_resume -- --nocapture`
+  Run: `cargo test -p aster-node publication_status_survives_small_mtu_interrupt_and_fresh_adapter_instance_resume -- --nocapture`
 
   Expected: FAIL until status observation is wired solely to the common checkpoint/promotion path.
 
@@ -341,7 +341,7 @@
 
 - [x] **Step 4: Run the portability and unchanged-profile tests**
 
-  Run: `cargo test -p aster-node publication_status_survives_small_mtu_interrupt_and_different_adapter_resume -- --nocapture`
+  Run: `cargo test -p aster-node publication_status_survives_small_mtu_interrupt_and_fresh_adapter_instance_resume -- --nocapture`
 
   Run: `cargo test -p aster-node semantic_blob_profile_four_resolves_to_version_scoped_contact_mode -- --nocapture`
 

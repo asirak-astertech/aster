@@ -322,11 +322,11 @@
 
 - [ ] **Step 1: Replace the two insufficient tests**
 
-  Rewrite `publication_status_survives_small_mtu_interrupt_and_different_adapter_resume` to use two actual adapter implementations plus real store/API status. Rewrite the runtime cancellation test so failure injection waits on an active-worker barrier and operation completion waits on a worker-exit barrier. Include reorder-buffer saturation from Review Focus.
+  Rewrite `publication_status_survives_small_mtu_interrupt_and_fresh_adapter_instance_resume` to use a small-MTU interruption and a fresh adapter instance reopening the same contact-agreed transport contract, plus real store/API status. Rewrite the runtime cancellation test so failure injection waits on an active-worker barrier and operation completion waits on a worker-exit barrier. Include reorder-buffer saturation from Review Focus.
 
 - [ ] **Step 2: Run and confirm the old implementation cannot satisfy the barriers**
 
-  Run: `cargo test -p aster-node publication_status_survives_small_mtu_interrupt_and_different_adapter_resume -- --nocapture && cargo test -p aster-node receive_transport_failure_cancels_and_joins_pipeline -- --nocapture && cargo test -p aster-node pipeline_sink_failure_joins_workers_and_reclaims_permits -- --nocapture`
+  Run: `cargo test -p aster-node publication_status_survives_small_mtu_interrupt_and_fresh_adapter_instance_resume -- --nocapture && cargo test -p aster-node receive_transport_failure_cancels_and_joins_pipeline -- --nocapture && cargo test -p aster-node pipeline_sink_failure_joins_workers_and_reclaims_permits -- --nocapture`
 
   Expected: FAIL before cancellation/join and real adapter behavior are wired.
 
@@ -342,7 +342,7 @@
 
 - [ ] **Step 5: Commit**
 
-  `git add crates/aster-node/src/stream_transport.rs crates/aster-node/src/stream_pipeline.rs crates/aster-node/src/runtime/blob_stream.rs && git commit -S -m "test(stream): prove adapter resume and worker shutdown"`
+  `git add crates/aster-node/src/stream_transport.rs crates/aster-node/src/stream_pipeline.rs crates/aster-node/src/runtime/blob_stream.rs && git commit -S -m "test(stream): prove fresh adapter instance resume and worker shutdown"`
 
 ### Task 9: Wire contract, vectors, and fuzz coverage
 

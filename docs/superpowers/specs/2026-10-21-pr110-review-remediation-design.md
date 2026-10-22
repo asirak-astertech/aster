@@ -346,10 +346,11 @@ failing before implementation.
   v9-to-v8 contact and over profile 5 in a later v9-to-v9 contact.
 - A retry accepted at total durable length sends Finish without waiting for a
   new checkpoint and settles exactly once.
-- Partial checkpoints resume on a different eligible peer/adapter instance
-  without replaying the durable prefix.
+- Partial checkpoints resume on a fresh adapter instance reopening the same
+  single contact-agreed transport contract without replaying the durable prefix.
 - Real store and API inspection survive a small-MTU adapter interruption and a
-  different-adapter resume; tests do not manufacture status snapshots.
+  fresh-adapter-instance resume; tests do not manufacture status snapshots or
+  claim cross-transport selection or failover.
 - Transport failure is injected only after an active verification worker is
   observed, and return is blocked until that worker exits.
 

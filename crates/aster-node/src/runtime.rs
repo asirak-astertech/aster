@@ -53786,7 +53786,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completed_canonical_blob_crosses_v9_publication_status_survives_small_mtu_interrupt_and_different_adapter_resume()
+    async fn completed_canonical_blob_crosses_v9_publication_status_survives_small_mtu_interrupt_and_fresh_adapter_instance_resume()
      {
         let receipt = assert_completed_canonical_blob_crossing(4 * 1024 * 1024 + 1).await;
         let structured: serde_json::Value = serde_json::from_str(&receipt.structured_line())

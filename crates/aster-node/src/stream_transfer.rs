@@ -47,9 +47,9 @@ pub(crate) const STREAM_TAGS: std::ops::RangeInclusive<u8> = 0xd6..=0xdd;
 
 pub(crate) fn profile5_receive_limit(total: u64, durable: u64, checkpoint_batch: u32) -> u64 {
     let extent = PROFILE5_CANONICAL_EXTENT_BYTES as u64;
-    let window = u64::from(checkpoint_batch)
-        .div_ceil(extent)
-        .saturating_mul(extent);
+    // Extent boundaries need not align with the byte batch. Admit the one
+    // whole maximum-size extent that can cross the checkpoint threshold.
+    let window = u64::from(checkpoint_batch).saturating_add(extent.saturating_sub(1));
     total.min(durable.saturating_add(window))
 }
 

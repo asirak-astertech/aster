@@ -16127,38 +16127,13 @@ fn predecessor_operation_publisher(
     if let Some((reason, generation, _, intent_digest, _)) =
         lifecycle::operation_retirement(value).map_err(blob_error)?
     {
-        let mut matched = None;
-        for row in publications.iter()? {
-            let (_, publication) = row?;
-            let Some((publication_reason, publication_generation, _)) =
-                lifecycle::publication_retirement(publication.value()).map_err(blob_error)?
-            else {
-                continue;
-            };
-            if publication_reason != reason || publication_generation != generation {
-                continue;
-            }
-            let (metadata, _) = decode_retired_blob_metadata_for_encoding(
-                publication.value(),
-                publication_encoding,
-            )?
-            .ok_or_else(|| {
-                blob_error(BlobStoreError::SchemaInvariant(
-                    "retired Blob operation publication lacks exact lookup metadata",
-                ))
-            })?;
-            if blob_intent_digest_for_metadata(&metadata)? != intent_digest {
-                continue;
-            }
-            if matched
-                .replace(metadata.header.stamp.dot.publisher)
-                .is_some()
-            {
-                return Err(blob_error(BlobStoreError::SchemaInvariant(
-                    "retired Blob operation has ambiguous publication ownership",
-                )));
-            }
-        }
+        let matched = predecessor_retired_operation_publisher(
+            publications,
+            publication_encoding,
+            reason,
+            generation,
+            intent_digest,
+        )?;
         return matched.map(|publisher| (publisher, None)).ok_or_else(|| {
             blob_error(BlobStoreError::SchemaInvariant(
                 "retired Blob operation has no exact publication owner",
@@ -16194,6 +16169,133 @@ fn predecessor_operation_publisher(
         metadata.header.stamp.dot.publisher,
         Some(operation.transfer_id),
     ))
+}
+
+fn predecessor_retired_operation_publisher(
+    publications: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    publication_encoding: lifecycle::PublicationEncodingGeneration,
+    reason: lifecycle::RetirementReason,
+    generation: u64,
+    intent_digest: [u8; 32],
+) -> Result<Option<NodeId>, StoreError> {
+    let mut matched = None;
+    for row in publications.iter()? {
+        let (_, publication) = row?;
+        let Some((publication_reason, publication_generation, _)) =
+            lifecycle::publication_retirement(publication.value()).map_err(blob_error)?
+        else {
+            continue;
+        };
+        if publication_reason != reason || publication_generation != generation {
+            continue;
+        }
+        let (metadata, _) =
+            decode_retired_blob_metadata_for_encoding(publication.value(), publication_encoding)?
+                .ok_or_else(|| {
+                blob_error(BlobStoreError::SchemaInvariant(
+                    "retired Blob operation publication lacks exact lookup metadata",
+                ))
+            })?;
+        if blob_intent_digest_for_metadata(&metadata)? != intent_digest {
+            continue;
+        }
+        if matched
+            .replace(metadata.header.stamp.dot.publisher)
+            .is_some()
+        {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "retired Blob operation has ambiguous publication ownership",
+            )));
+        }
+    }
+    Ok(matched)
+}
+
+fn audit_retired_operation_owner(
+    publications: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    publication_encoding: lifecycle::PublicationEncodingGeneration,
+    owner: &BlobOperationOwner,
+    value: &[u8],
+) -> Result<(), StoreError> {
+    let (reason, generation, _, intent_digest, _) = lifecycle::operation_retirement(value)
+        .map_err(blob_error)?
+        .ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "retired Blob operation audit received an active operation",
+            ))
+        })?;
+    let mut matched = None;
+    for row in publications.iter()? {
+        let (_, publication) = row?;
+        let Some((publication_reason, publication_generation, _)) =
+            lifecycle::publication_retirement(publication.value()).map_err(blob_error)?
+        else {
+            continue;
+        };
+        if publication_generation != generation {
+            continue;
+        }
+        let (metadata, _) =
+            decode_retired_blob_metadata_for_encoding(publication.value(), publication_encoding)?
+                .ok_or_else(|| {
+                blob_error(BlobStoreError::SchemaInvariant(
+                    "retired Blob operation publication lacks exact lookup metadata",
+                ))
+            })?;
+        let publication_intent = blob_intent_digest_for_metadata(&metadata)?;
+        if publication_reason != reason || publication_intent != intent_digest {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "retired Blob operation disagrees with its surviving publication",
+            )));
+        }
+        let publication_publisher = metadata.header.stamp.dot.publisher;
+        if owner.publisher != publication_publisher {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "retired Blob operation owner differs from its publication publisher",
+            )));
+        }
+        if matched.replace(publication_publisher).is_some() {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "retired Blob operation has ambiguous publication ownership",
+            )));
+        }
+    }
+    if matched.is_some() {
+        return Ok(());
+    }
+
+    // A surviving retirement generation is authoritative. Only in its absence
+    // may the independently bound intent reveal contradictory surviving state.
+    for row in publications.iter()? {
+        let (_, publication) = row?;
+        let retirement =
+            lifecycle::publication_retirement(publication.value()).map_err(blob_error)?;
+        let metadata = if retirement.is_some() {
+            decode_retired_blob_metadata_for_encoding(publication.value(), publication_encoding)?
+                .ok_or_else(|| {
+                    blob_error(BlobStoreError::SchemaInvariant(
+                        "retired Blob operation publication lacks exact lookup metadata",
+                    ))
+                })?
+                .0
+        } else {
+            decode_blob_metadata_for_encoding(publication.value(), publication_encoding)?
+        };
+        if blob_intent_digest_for_metadata(&metadata)? != intent_digest {
+            continue;
+        }
+        if owner.publisher != metadata.header.stamp.dot.publisher {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "retired Blob operation owner differs from its publication publisher",
+            )));
+        }
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "retired Blob operation disagrees with its surviving publication",
+        )));
+    }
+    // Current owner-qualified operation keys remain hash-bound by lifecycle
+    // audit after their independently expiring publication evidence is gone.
+    Ok(())
 }
 
 fn migrate_blob_operation_ownership_write(
@@ -16729,16 +16831,12 @@ pub(crate) fn audit_blob_tables_write(
         let owner = decode_blob_operation_owner_key(key.value())?;
         let retired = lifecycle::operation_record_is_retired(value.value()).map_err(blob_error)?;
         if retired {
-            let (publisher, _) = predecessor_operation_publisher(
+            audit_retired_operation_owner(
                 &publications,
                 publication_encoding,
+                &owner,
                 value.value(),
             )?;
-            if owner.publisher != publisher {
-                return Err(blob_error(BlobStoreError::SchemaInvariant(
-                    "retired Blob operation owner differs from its publication publisher",
-                )));
-            }
         }
         if !retired {
             let operation = decode_blob_operation_record(value.value())?;
@@ -17144,16 +17242,12 @@ pub(crate) fn inspect_blob_tables_read(
         };
         let retired = lifecycle::operation_record_is_retired(value.value()).map_err(blob_error)?;
         if retired && operation_ownership_current {
-            let (publisher, _) = predecessor_operation_publisher(
+            audit_retired_operation_owner(
                 &publications,
                 publication_encoding,
+                &owner,
                 value.value(),
             )?;
-            if owner.publisher != publisher {
-                return Err(blob_error(BlobStoreError::SchemaInvariant(
-                    "retired Blob operation owner differs from its publication publisher",
-                )));
-            }
         }
         if !retired {
             let operation = decode_blob_operation_record(value.value())?;
@@ -29763,6 +29857,208 @@ mod tests {
     }
 
     #[test]
+    fn blob_retired_operation_owner_audit_distinguishes_absence_from_identity_mismatch() {
+        let root = BlobTestRoot::new("retired-operation-owner-identity");
+        let mut services = blob_services(0xc1);
+        let fixture = seed_retired_store_fixture(&root, &mut services);
+        let database = Database::open(&root.database).expect("retired owner audit database");
+        let read = database.begin_read().expect("retired owner fixture read");
+        let publication = read
+            .open_table(BLOB_PUBLICATIONS)
+            .expect("retired owner publications")
+            .get(fixture.transfer.as_bytes().as_slice())
+            .expect("retired owner publication lookup")
+            .expect("retired owner publication")
+            .value()
+            .to_vec();
+        let operation = read
+            .open_table(BLOB_OPERATIONS)
+            .expect("retired owner operations")
+            .get(fixture.operation_storage_key.as_slice())
+            .expect("retired owner operation lookup")
+            .expect("retired owner operation")
+            .value()
+            .to_vec();
+        drop(read);
+        let owner = decode_blob_operation_owner_key(&fixture.operation_storage_key)
+            .expect("retired operation owner");
+        let (reason, generation, operation_digest, intent_digest, age) =
+            lifecycle::operation_retirement(&operation)
+                .expect("decode retired owner operation")
+                .expect("retired owner operation state");
+        let audit = |owner: &BlobOperationOwner, operation: &[u8]| {
+            let read = database.begin_read().expect("retired owner audit read");
+            let encoding = lifecycle::publication_encoding_read(&read)
+                .expect("retired owner publication encoding");
+            let publications = read
+                .open_table(BLOB_PUBLICATIONS)
+                .expect("retired owner audit publications");
+            audit_retired_operation_owner(&publications, encoding, owner, operation)
+        };
+
+        audit(&owner, &operation).expect("canonical retired owner relation");
+
+        let different_reason = match reason {
+            lifecycle::RetirementReason::Expired => lifecycle::RetirementReason::Evicted,
+            lifecycle::RetirementReason::Invalidated | lifecycle::RetirementReason::Evicted => {
+                lifecycle::RetirementReason::Expired
+            }
+        };
+        let wrong_reason = lifecycle::retired_operation_record(
+            different_reason,
+            generation,
+            operation_digest,
+            intent_digest,
+            age,
+        );
+        assert!(matches!(
+            audit(&owner, &wrong_reason),
+            Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
+                "retired Blob operation disagrees with its surviving publication"
+            )))
+        ));
+
+        let wrong_generation = lifecycle::retired_operation_record(
+            reason,
+            generation.checked_add(1).expect("retirement generation"),
+            operation_digest,
+            intent_digest,
+            age,
+        );
+        assert!(matches!(
+            audit(&owner, &wrong_generation),
+            Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
+                "retired Blob operation disagrees with its surviving publication"
+            )))
+        ));
+
+        let mut wrong_intent_digest = intent_digest;
+        wrong_intent_digest[0] ^= 0xff;
+        let wrong_intent = lifecycle::retired_operation_record(
+            reason,
+            generation,
+            operation_digest,
+            wrong_intent_digest,
+            age,
+        );
+        assert!(matches!(
+            audit(&owner, &wrong_intent),
+            Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
+                "retired Blob operation disagrees with its surviving publication"
+            )))
+        ));
+
+        let mut wrong_owner = owner.clone();
+        wrong_owner.publisher[0] ^= 0xff;
+        assert!(matches!(
+            audit(&wrong_owner, &operation),
+            Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
+                "retired Blob operation owner differs from its publication publisher"
+            )))
+        ));
+
+        let duplicate_transfer = BlobTransferId::new([0xc2; 32]);
+        let write = database
+            .begin_write()
+            .expect("duplicate retired publication write");
+        write
+            .open_table(BLOB_PUBLICATIONS)
+            .expect("duplicate retired publications")
+            .insert(
+                duplicate_transfer.as_bytes().as_slice(),
+                publication.as_slice(),
+            )
+            .expect("duplicate retired publication");
+        write
+            .commit()
+            .expect("commit duplicate retired publication");
+        assert!(matches!(
+            audit(&owner, &operation),
+            Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
+                "retired Blob operation has ambiguous publication ownership"
+            )))
+        ));
+
+        let write = database
+            .begin_write()
+            .expect("absent retired publication write");
+        let mut publications = write
+            .open_table(BLOB_PUBLICATIONS)
+            .expect("absent retired publications");
+        publications
+            .remove(fixture.transfer.as_bytes().as_slice())
+            .expect("remove canonical retired publication");
+        publications
+            .remove(duplicate_transfer.as_bytes().as_slice())
+            .expect("remove duplicate retired publication");
+        drop(publications);
+        write.commit().expect("commit absent retired publications");
+        audit(&owner, &operation).expect("truly absent publication evidence is independent");
+    }
+
+    #[test]
+    fn blob_retired_operation_owner_audit_prefers_exact_generation_over_active_same_intent() {
+        let root = BlobTestRoot::new("retired-operation-owner-generation-precedence");
+        let mut services = blob_services(0xc3);
+        let fixture = seed_retired_store_fixture(&root, &mut services);
+        let database = Database::open(&root.database).expect("retired owner audit database");
+        let read = database.begin_read().expect("retired owner fixture read");
+        let publication = read
+            .open_table(BLOB_PUBLICATIONS)
+            .expect("retired owner publications")
+            .get(fixture.transfer.as_bytes().as_slice())
+            .expect("retired owner publication lookup")
+            .expect("retired owner publication")
+            .value()
+            .to_vec();
+        let operation = read
+            .open_table(BLOB_OPERATIONS)
+            .expect("retired owner operations")
+            .get(fixture.operation_storage_key.as_slice())
+            .expect("retired owner operation lookup")
+            .expect("retired owner operation")
+            .value()
+            .to_vec();
+        let encoding = lifecycle::publication_encoding_read(&read)
+            .expect("retired owner publication encoding");
+        let metadata = decode_retired_blob_metadata_for_encoding(&publication, encoding)
+            .expect("decode retired publication")
+            .expect("retired publication lookup payload")
+            .0;
+        drop(read);
+
+        let write = database
+            .begin_write()
+            .expect("active same-intent publication write");
+        let active_publication = lifecycle::live_publication_record(
+            &write,
+            &encode_blob_metadata(metadata).expect("encode same-intent publication"),
+        )
+        .expect("wrap same-intent publication");
+        let active_transfer = BlobTransferId::new([0xc4; 32]);
+        write
+            .open_table(BLOB_PUBLICATIONS)
+            .expect("active same-intent publications")
+            .insert(
+                active_transfer.as_bytes().as_slice(),
+                active_publication.as_slice(),
+            )
+            .expect("insert active same-intent publication");
+        write
+            .commit()
+            .expect("commit active same-intent publication");
+
+        let owner = decode_blob_operation_owner_key(&fixture.operation_storage_key)
+            .expect("retired operation owner");
+        let read = database.begin_read().expect("retired owner audit read");
+        let publications = read
+            .open_table(BLOB_PUBLICATIONS)
+            .expect("retired owner audit publications");
+        audit_retired_operation_owner(&publications, encoding, &owner, &operation)
+            .expect("the exact retired generation takes precedence over an active same-intent row");
+    }
+
+    #[test]
     fn blob_retired_rows_pass_store_reopen_and_inspection_but_contradictions_fail_closed() {
         // Break caught: the outer Store audits must dispatch lifecycle state
         // before requiring live publication bytes/indexes or an active
@@ -32403,7 +32699,8 @@ mod tests {
         let usage_before_operation = reopened
             .aggregate_usage()
             .expect("aggregate usage before reserved operation admission");
-        let physical_operation_bytes = 1u64 + BLOB_ACTIVE_OPERATION_RECORD_BYTES;
+        let physical_operation_bytes =
+            BLOB_OPERATION_OWNER_KEY_PREFIX_BYTES as u64 + 1 + BLOB_ACTIVE_OPERATION_RECORD_BYTES;
         let effective_operation_bytes = physical_operation_bytes
             .checked_add(MAX_BLOB_OPERATION_RETIREMENT_GROWTH_BYTES)
             .expect("bounded effective operation bytes");
@@ -32432,16 +32729,21 @@ mod tests {
             .database
             .begin_write()
             .expect("one-short operation write");
-        assert!(matches!(
-            insert_blob_operation(&write, one_short.limits, &request, stored.transfer_id),
-            Err(StoreError::PayloadByteLimitExceeded {
-                current,
-                incoming,
-                limit,
-            }) if current == usage_before_operation.payload_bytes
-                && incoming == effective_operation_bytes
-                && limit == ordinary_one_short_limit
-        ));
+        let one_short_result =
+            insert_blob_operation(&write, one_short.limits, &request, stored.transfer_id);
+        assert!(
+            matches!(
+                one_short_result,
+                Err(StoreError::PayloadByteLimitExceeded {
+                    current,
+                    incoming,
+                    limit,
+                }) if current == usage_before_operation.payload_bytes
+                    && incoming == effective_operation_bytes
+                    && limit == ordinary_one_short_limit
+            ),
+            "unexpected one-short operation result: {one_short_result:?}"
+        );
         drop(write);
         drop(one_short);
 
@@ -38367,15 +38669,14 @@ mod tests {
             key.extend_from_slice(&index.to_be_bytes());
             key
         };
-        let stored = publish_blob(
+        let (stored, _, intent) = publish_blob(
             &store,
             &mut services,
             &prepared,
             &plaintext,
             1,
             &operation_key(0),
-        )
-        .0;
+        );
         let write = store
             .database
             .begin_write()
@@ -38393,7 +38694,7 @@ mod tests {
                 &write,
                 &encode_blob_operation_record(BlobOperationRecord {
                     transfer_id: stored.transfer_id,
-                    intent_digest: [u8::try_from(index % 251).expect("intent byte"); 32],
+                    intent_digest: intent.digest(),
                 }),
             )
             .expect("encode maximum operation alias");
@@ -39052,7 +39353,8 @@ mod tests {
                 .checked_sub(after_expiry.payload_bytes)
                 .expect("expiry releases aggregate bytes"),
             expired_operations
-                * (u64::try_from(operation_key(0).len()).expect("operation key length fits u64")
+                * (u64::try_from(BLOB_OPERATION_OWNER_KEY_PREFIX_BYTES + operation_key(0).len(),)
+                    .expect("owned operation key length fits u64")
                     + BLOB_RETIRED_OPERATION_RECORD_BYTES),
             "retained-operation expiry releases its exact physical aggregate charge"
         );
