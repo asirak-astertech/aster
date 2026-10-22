@@ -8,6 +8,9 @@ durability, worker mapping, capacity, v3 validation, and zeroization findings.
 Review round 2 corrects the two remaining measurement findings from
 `task-12-finalization-rereview.md`: observed allocation peaks are now distinct
 from conservative bounds, and the selective Store phase counter is removed.
+Review round 3 satisfies the original Task 12 Store-count requirement with a
+complete private finalizer boundary rather than restoring that selective
+counter.
 
 No transport file, device, deployment, push, full workspace test suite, or
 ignored 800-MiB/1-GiB measurement run was touched or executed.
@@ -47,6 +50,21 @@ cargo test -p aster-node stream_upload_finalization_is_one_pass_bounded_and_cano
 
 The focused test is now GREEN and rejects JSON keys named `peak_owned_bytes`,
 `store_operations`, or `store_phase_calls`.
+
+Round 3 first added exact boundary-trace expectations to the one-pass and
+cleanup-gap regressions:
+
+```text
+cargo test -p aster-node stream_upload_finalization_is_one_pass_bounded_and_canonical --lib -- --nocapture
+  RED: exit 101; BlobFinalizeMetrics had no store_boundary_operations or
+       store_boundary_trace fields
+```
+
+After the private boundary was implemented, the successful finalization test
+was GREEN at 10 attempted operations. The synchronous cleanup-gap regression
+initially exposed that its test helper discarded the measured report; the
+helper now returns that report directly and the regression is GREEN at the
+exact nine-operation prefix without `CompleteUpload`.
 
 ## Durable digest artifact and crash recovery
 
@@ -187,14 +205,28 @@ aggregate_cpu_budget                    = 4
 The reorder peak now subtracts the expected next item only when it is actually
 present, so one genuinely out-of-order result reports one rather than zero.
 
-Both selective Store counters are removed. `Store` is a broad concrete owner
-whose relevant helpers contain nested policy, redb, verification, cache, and
-cleanup work; no stable complete Store trait boundary exists in this scope.
-Keeping a manually selected number would be less truthful than omitting it.
-The report and schema therefore claim only the boundary that is actually
-wrapped: `MeasuredBlobStore` observes every canonical chunk-depot API call.
-The focused schema regression rejects either Store counter key, while its exact
-`4N + 2` depot assertion detects added or removed depot-boundary work. The same
+The finalizer now moves its `Arc<Store>` into a private `BlobFinalizeStore`
+facade at the start of `run_measured`. The facade deliberately implements no
+`Deref`, `AsRef<Store>`, or raw Store getter, and the moved raw binding cannot
+be reused. Verification that does not request completion checking is split
+into a Store-free path, so every top-level Store-backed action in the finalizer
+is a named facade operation.
+
+`store_boundary_operations` counts attempted top-level operations on entry to
+that facade; it intentionally does not count nested redb calls inside those
+helpers. The successful trace is exactly:
+
+```text
+ReplayAuthority, ReadControlHead, RefreshPolicy, ReserveUpload, OpenPackRoot,
+OpenUploadDepot, CompletePreparedBlob, CommitPublication, CacheRoute,
+CompleteUpload
+```
+
+The cleanup-gap path is the exact nine-operation prefix ending at `CacheRoute`.
+The measurement JSON exposes `store_boundary_operations` and continues to
+reject the obsolete `store_phase_calls` and `store_operations` keys. Separately,
+`MeasuredBlobStore` still observes every canonical chunk-depot API call and the
+exact `4N + 2` assertion detects added or removed depot-boundary work. The same
 successful path observes exact plaintext bytes, `Blob length + 16N` encrypted
 bytes, and `ceil(Blob length / 1 MiB)` provisional reads.
 
@@ -262,7 +294,28 @@ metric changes. The one-pass regression additionally proves:
   buffers;
 - the observed peak does not exceed the separately named conservative bound;
 - `depot_operations == 4N + 2` at the instrumented `BlobStore` boundary; and
-- the measurement JSON contains neither old peak nor Store-counter keys.
+- the measurement JSON contains neither the old peak key nor obsolete
+  Store-counter keys.
+
+Round 3 reran the same focused node finalization group and strict Clippy. The
+one-pass regression additionally requires the exact ordered ten-operation
+Store-boundary trace and JSON count; the cleanup-gap regression requires the
+exact ordered nine-operation trace. Because the facade owns the only Store
+authority in `run_measured` and has no escape hatch, adding a top-level Store
+action requires a named, observed facade method or fails to compile.
+
+```text
+cargo test -p aster-node stream_upload_finalization_ --lib -- --nocapture
+  5 passed; 0 failed; 2 ignored exact-size gates; 657 filtered
+cargo test -p aster-node stream_upload_prefers_canonical_result_over_residual_cleanup_authority --lib -- --nocapture
+  1 passed; 0 failed; 663 filtered
+cargo clippy -p aster-core -p aster-redb-store -p aster-node --lib --tests -- -D warnings
+  passed
+cargo fmt --all -- --check
+  passed
+git diff --check
+  passed
+```
 
 The redb group covers partial atomic create, v2 torn-final recreation, header
 and combined-checkpoint durability states, pre-redb-projection tails, projected
@@ -279,6 +332,7 @@ run. No full workspace suite or broad check script was run in this fix round.
 - `cb3822839d73cb178b6ab04a09aca4d65d7079c5` — initial Phase B report
 - `071c65ce97e26584897a74612ff1c94d4f5e4060` — review-round implementation corrections
 - `3640f492b504744ae4dab44e9f3b321d6efccde0` — review-round 2 measurement corrections
+- `b1721b3e588db0ed9606af03d35c78970f7c4f6a` — review-round 3 Store-boundary implementation
 - the signed documentation commit containing this report
 
 ## Remaining concerns
@@ -291,7 +345,6 @@ run. No full workspace suite or broad check script was run in this fix round.
 - Opening an independent pinned reader per segment repeats bounded checkpoint
   validation metadata I/O; it does not reread provisional plaintext, but a
   future measured optimization could pass a prevalidated pinned segment view.
-- There is no truthful complete Store-operation count without introducing a
-  new Store facade/trait boundary across policy, redb, verification, cache, and
-  cleanup helpers. This round removes the selective metric rather than
-  presenting it as complete; depot work retains real boundary instrumentation.
+- `store_boundary_operations` is an orchestration-boundary attempt count, not a
+  count of nested redb transactions or physical I/O. Depot work retains its
+  independent complete `4N + 2` API-boundary instrumentation.
