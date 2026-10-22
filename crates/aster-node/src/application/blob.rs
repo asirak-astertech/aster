@@ -12,7 +12,7 @@
 //! current route/content authority.
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::BTreeMap,
     fmt, fs,
     io::{Read, Seek, Write},
     path::Path,
@@ -24,13 +24,12 @@ use std::{
 
 use aster_mesh::{
     BLOB_STREAM_SEGMENT_BYTES, BlobContentVerification, BlobError, BlobId as CoreBlobId,
-    BlobMetadata as CoreBlobMetadata, BlobPublicationStreamId, BlobStreamFrontier,
-    BlobUploadDescriptor, ContentVerifiedBlobEnvelope, CustodySample, MAX_BLOB_CHUNKS,
-    MAX_BLOB_MEDIA_TYPE_BYTES, MAX_BLOB_SCHEMA_ID_BYTES, NodeId, PreparedBlob, Priority,
-    ReferenceEnvelopeSealer, SELECTED_BLOB_CHUNK_SIZE, Scope, Topic,
-    local_blob_publication_stream_id, prepare_blob,
+    BlobMetadata as CoreBlobMetadata, BlobPublicationStreamId, BlobUploadDescriptor,
+    ContentVerifiedBlobEnvelope, CustodySample, MAX_BLOB_CHUNKS, MAX_BLOB_MEDIA_TYPE_BYTES,
+    MAX_BLOB_SCHEMA_ID_BYTES, NodeId, PreparedBlob, Priority, ReferenceEnvelopeSealer,
+    SELECTED_BLOB_CHUNK_SIZE, Scope, Topic, local_blob_publication_stream_id, prepare_blob,
 };
-use aster_redb_store::pack::{BlobPackReader, BlobPackWriter, PinnedBlobPackRoot};
+use aster_redb_store::pack::{BlobPackWriter, PinnedBlobPackRoot};
 #[cfg(test)]
 use aster_redb_store::{BlobCapacityGcTarget, BlobMaintenanceBudget};
 use aster_redb_store::{
@@ -52,10 +51,10 @@ use tokio::sync::{mpsc, oneshot};
 use zeroize::{Zeroize as _, Zeroizing};
 
 use super::blob_stream::{
-    BlobPublishProgress, BlobPublishStreamRequest, LocalBlobPublishStream, LocalBlobReadStream,
-    OpenedBlobPublishStream, SelectedBlobPublishStream, UploadPackPlainReader,
-    blob_pack_application_error, blob_stream_map_pool, blob_stream_pipeline_error,
-    sink_mapped_stream_partitions, take_zeroizing_bytes,
+    BlobPublishProgress, BlobPublishStreamRequest, LocalBlobPublishStream, OpenedBlobPublishStream,
+    SelectedBlobPublishStream, UploadPackPlainReader, blob_pack_application_error,
+    blob_stream_map_pool, blob_stream_pipeline_error, sink_mapped_stream_partitions,
+    take_zeroizing_bytes,
 };
 use super::{
     ApplicationError, ApplicationErrorKind, SelectedApplicationCommand, actor_unavailable,
@@ -2086,7 +2085,6 @@ pub struct SelectedBlobNode {
     custody_clock: NodeCustodyClock,
     publish_streams: BTreeMap<[u8; 32], LocalBlobPublishStream>,
     completed_publish_streams: BTreeMap<[u8; 32], (BlobPublishStreamRequest, BlobPublishResult)>,
-    stream_read: Option<LocalBlobReadStream>,
     #[cfg(test)]
     final_read_gate: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
     #[cfg(test)]
@@ -2182,7 +2180,6 @@ impl SelectedBlobNode {
             custody_clock,
             publish_streams: BTreeMap::new(),
             completed_publish_streams: BTreeMap::new(),
-            stream_read: None,
             #[cfg(test)]
             final_read_gate: None,
             #[cfg(test)]
@@ -2234,7 +2231,6 @@ impl SelectedBlobNode {
             custody_clock,
             publish_streams: BTreeMap::new(),
             completed_publish_streams: BTreeMap::new(),
-            stream_read: None,
             #[cfg(test)]
             final_read_gate: None,
             #[cfg(test)]
@@ -4426,21 +4422,6 @@ impl SelectedBlobNode {
                 "blob read page",
             ));
         }
-        if self.stream_read.as_ref().is_some_and(|cached| {
-            cached.publication.blob_id() == request.blob.id.into_core()
-                && cached.publication.open().topic() == &request.blob.topic
-                && cached.publication.open().scope() == &request.blob.scope
-        }) {
-            let policy = self.current_policy("blob stream read")?;
-            let epoch = self.active_epoch(&request.blob.scope, "blob stream read")?;
-            self.require_blob_grants(
-                &request.blob.topic,
-                &request.blob.scope,
-                epoch,
-                "blob stream read",
-            )?;
-            return self.read_stream_page(&policy, epoch, &request);
-        }
         self.store
             .observe_blob_custody_sample(
                 self.custody_clock
@@ -4500,7 +4481,10 @@ impl SelectedBlobNode {
             Ok(plan) => plan,
             Err(StoreError::Blob(BlobStoreError::NotFound)) => {
                 drop(initial_lifecycle);
-                return self.read_stream_page(&policy, epoch, &request);
+                return Err(ApplicationError::new(
+                    ApplicationErrorKind::NotFound,
+                    "blob read page",
+                ));
             }
             Err(error) => {
                 if live_blob_durable_coherence_error(&error) {
@@ -4651,231 +4635,6 @@ impl SelectedBlobNode {
         };
         drop(final_lifecycle);
         Ok(page)
-    }
-
-    fn read_stream_page(
-        &mut self,
-        policy: &ControlPolicySnapshot,
-        current_epoch: u64,
-        request: &BlobReadPageRequest,
-    ) -> Result<BlobReadPage, ApplicationError> {
-        let publication = if let Some(cached) = self.stream_read.as_ref().filter(|cached| {
-            cached.publication.blob_id() == request.blob.id.into_core()
-                && cached.publication.open().topic() == &request.blob.topic
-                && cached.publication.open().scope() == &request.blob.scope
-        }) {
-            cached.publication.clone()
-        } else {
-            self.store
-                .blob_stream_publications_with_policy(policy)
-                .map_err(|error| application_error("blob stream read", error.into()))?
-                .into_iter()
-                .rev()
-                .find(|publication| {
-                    publication.blob_id() == request.blob.id.into_core()
-                        && publication.open().topic() == &request.blob.topic
-                        && publication.open().scope() == &request.blob.scope
-                })
-                .ok_or_else(|| {
-                    application_error(
-                        "blob stream read",
-                        StoreError::Blob(BlobStoreError::NotFound).into(),
-                    )
-                })?
-        };
-        if publication.open().content_epoch() != current_epoch {
-            return Err(ApplicationError::new(
-                ApplicationErrorKind::RequestRejected,
-                "blob stream read",
-            ));
-        }
-        if let (Some(ttl_ms), Some(initial)) = (
-            publication.open().ttl_ms(),
-            publication.open().initial_custody(),
-        ) {
-            let current = self
-                .custody_clock
-                .sample()
-                .map_err(|error| application_error("blob stream read", error))?;
-            if current.clock_id != initial.clock_id
-                || current.tick_ms.saturating_sub(initial.tick_ms) >= ttl_ms
-            {
-                self.stream_read = None;
-                return Err(application_error(
-                    "blob stream read",
-                    StoreError::Blob(BlobStoreError::ExpiredOrRetired).into(),
-                ));
-            }
-        }
-        let total_len = publication.open().total_len();
-        if request.offset >= total_len {
-            return Err(ApplicationError::new(
-                ApplicationErrorKind::InvalidRequest,
-                "blob stream read",
-            ));
-        }
-        let must_open = self.stream_read.as_ref().is_none_or(|cached| {
-            cached.publication.stream_id() != publication.stream_id()
-                || request.offset < cached.last_request_offset
-        });
-        if must_open {
-            let verified_open = self
-                .verifier
-                .verify_blob_stream_open(publication.authenticated_open())
-                .map_err(|error| application_error("blob stream read", error.into()))?;
-            if verified_open.open() != publication.open() {
-                return Err(ApplicationError::new(
-                    ApplicationErrorKind::Integrity,
-                    "blob stream read",
-                ));
-            }
-            let verified_commitment = self
-                .verifier
-                .verify_blob_stream_commitment(
-                    &verified_open,
-                    publication.authenticated_commitment(),
-                )
-                .map_err(|error| application_error("blob stream read", error.into()))?;
-            if verified_commitment.commitment() != publication.commitment() {
-                return Err(ApplicationError::new(
-                    ApplicationErrorKind::Integrity,
-                    "blob stream read",
-                ));
-            }
-            let root = PinnedBlobPackRoot::open(&self.store)
-                .map_err(|error| application_error("blob stream read", error.into()))?;
-            let reader = BlobPackReader::open_pinned(&root, publication.open())
-                .map_err(|error| blob_pack_application_error("blob stream read", error))?;
-            let checkpoint = reader.checkpoint();
-            let roots = BlobStreamFrontier::restore(checkpoint.frontier().clone())
-                .and_then(|frontier| frontier.finish(total_len))
-                .map_err(|error| blob_core_error("blob stream read", error))?;
-            if checkpoint.plaintext_offset() != total_len
-                || checkpoint.next_index() != publication.commitment().segment_count()
-                || checkpoint.pack_len() != publication.pack_len()
-                || roots.0 != *publication.commitment().plaintext_root()
-                || roots.1 != *publication.commitment().ciphertext_root()
-            {
-                return Err(ApplicationError::new(
-                    ApplicationErrorKind::Integrity,
-                    "blob stream read",
-                ));
-            }
-            let opener = self
-                .verifier
-                .blob_stream_segment_opener(&verified_open)
-                .map_err(|error| application_error("blob stream read", error.into()))?;
-            self.stream_read = Some(LocalBlobReadStream {
-                publication: publication.clone(),
-                reader,
-                opener,
-                segments: VecDeque::with_capacity(2),
-                last_request_offset: 0,
-            });
-        }
-        let page_len = usize::try_from((total_len - request.offset).min(
-            u64::try_from(request.max_bytes).map_err(|_| {
-                ApplicationError::new(ApplicationErrorKind::ResourceLimit, "blob stream read")
-            })?,
-        ))
-        .map_err(|_| {
-            ApplicationError::new(ApplicationErrorKind::ResourceLimit, "blob stream read")
-        })?;
-        let mut plaintext = Zeroizing::new(Vec::with_capacity(page_len));
-        let cached = self.stream_read.as_mut().ok_or_else(|| {
-            ApplicationError::new(ApplicationErrorKind::Integrity, "blob stream read")
-        })?;
-        while plaintext.len() < page_len {
-            let cursor = request.offset + plaintext.len() as u64;
-            while cached.segments.front().is_some_and(|(offset, segment)| {
-                cursor >= offset.saturating_add(segment.len() as u64)
-            }) {
-                cached.segments.pop_front();
-            }
-            if cached.segments.is_empty() {
-                let mut encrypted = Vec::with_capacity(2);
-                for _ in 0..2 {
-                    match cached
-                        .reader
-                        .next_segment()
-                        .map_err(|error| blob_pack_application_error("blob stream read", error))?
-                    {
-                        Some(segment) => encrypted.push(segment),
-                        None => break,
-                    }
-                }
-                if encrypted.is_empty() {
-                    return Err(ApplicationError::new(
-                        ApplicationErrorKind::Integrity,
-                        "blob stream read",
-                    ));
-                }
-                let opened = std::thread::scope(|scope| {
-                    let workers = encrypted
-                        .into_iter()
-                        .map(|encrypted| {
-                            let opener = cached.opener.clone();
-                            scope.spawn(move || {
-                                let offset = encrypted.offset();
-                                opener
-                                    .open(&encrypted)
-                                    .map(|(segment, _)| (offset, segment))
-                            })
-                        })
-                        .collect::<Vec<_>>();
-                    workers
-                        .into_iter()
-                        .map(|worker| {
-                            worker
-                                .join()
-                                .map_err(|_| {
-                                    ApplicationError::new(
-                                        ApplicationErrorKind::Integrity,
-                                        "blob stream read",
-                                    )
-                                })?
-                                .map_err(|error| blob_core_error("blob stream read", error))
-                        })
-                        .collect::<Result<Vec<_>, _>>()
-                })?;
-                cached.segments.extend(opened);
-                continue;
-            }
-            let (segment_offset, segment) = cached.segments.front().ok_or_else(|| {
-                ApplicationError::new(ApplicationErrorKind::Integrity, "blob stream read")
-            })?;
-            if cursor < *segment_offset {
-                return Err(ApplicationError::new(
-                    ApplicationErrorKind::Integrity,
-                    "blob stream read",
-                ));
-            }
-            let start = usize::try_from(cursor - *segment_offset).map_err(|_| {
-                ApplicationError::new(ApplicationErrorKind::Integrity, "blob stream read")
-            })?;
-            let available = segment.len() - start;
-            let take = available.min(page_len - plaintext.len());
-            plaintext.extend_from_slice(&segment[start..start + take]);
-        }
-        let next_offset = request.offset + plaintext.len() as u64;
-        cached.last_request_offset = next_offset;
-        let metadata = publication.open().metadata();
-        Ok(BlobReadPage {
-            publication: BlobPublicationId::from_bytes(*publication.stream_id().as_bytes()),
-            id: BlobId::from_core(publication.blob_id()),
-            publisher: publication.open().publisher(),
-            publisher_counter: publication.open().publisher_counter(),
-            priority: publication.open().priority(),
-            ttl_ms: publication.open().ttl_ms(),
-            total_len,
-            media_type: metadata.media_type().map(str::to_owned),
-            schema_id: metadata.schema_id().to_vec(),
-            acceptance_marker: publication.acceptance_marker(),
-            offset: request.offset,
-            complete: next_offset == total_len,
-            next_offset,
-            plaintext,
-        })
     }
 
     fn verify_live_read_plan(
@@ -6569,6 +6328,41 @@ mod tests {
         let _ = apply_scope_rekey(root, services, 2, 1, None);
     }
 
+    fn apply_scope_rekey_to_open_node(
+        node: &SelectedBlobNode,
+        services: &mut RekeyServices,
+        epoch: u64,
+        sequence: u64,
+    ) {
+        let recipients = vec![
+            ScopeRekeyRecipient::member(services.control_authority.identity(), vec![blob_topic()])
+                .expect("authority recipient"),
+            ScopeRekeyRecipient::member(services.reader.identity(), vec![blob_topic()])
+                .expect("reader recipient"),
+            ScopeRekeyRecipient::member(services.selected_identity, vec![blob_topic()])
+                .expect("selected recipient"),
+        ];
+        let (sealed, _) = services
+            .control_authority
+            .seal_chained_scope_rekey_control_from_registry(
+                &services.registry,
+                0,
+                blob_scope(),
+                epoch,
+                recipients,
+                sequence,
+                None,
+            )
+            .expect("seal open-node rekey");
+        let verified = services
+            .reader
+            .verify_control(&sealed)
+            .expect("verify open-node rekey");
+        node.store
+            .ingest_verified_control(&verified, &sealed)
+            .expect("commit open-node rekey");
+    }
+
     fn selected_node(root: &TestRoot) -> SelectedBlobNode {
         if !root.mission_path().exists() {
             persist_member_mission(root);
@@ -6700,6 +6494,324 @@ mod tests {
             .expect("append ready stream");
         }
         (opened.token, request)
+    }
+
+    fn install_legacy_stream_publication(node: &mut SelectedBlobNode, bytes: &[u8]) -> BlobId {
+        let operation = BlobOperationKey::new(b"blob/legacy-read-authority".to_vec())
+            .expect("legacy operation");
+        let stream_id = BlobPublicationStreamId::from_bytes([0x6d; 32]).expect("legacy stream id");
+        let open = aster_mesh::BlobStreamOpen::new(
+            stream_id,
+            node.identity(),
+            operation.as_bytes().to_vec(),
+            node.mission_authority(),
+            1,
+            aster_mesh::VersionVector::default(),
+            blob_topic(),
+            blob_scope(),
+            CoreBlobMetadata::new(Some("application/octet-stream".into()), Vec::new())
+                .expect("legacy metadata"),
+            Priority::Priority,
+            None,
+            None,
+            bytes.len() as u64,
+            1,
+            1,
+            node.verifier
+                .blob_stream_authorization_digest(&blob_scope(), 1)
+                .expect("legacy authorization digest"),
+            [0x7d; 32],
+        )
+        .expect("legacy stream open");
+        let authenticated_open = node
+            .verifier
+            .seal_blob_stream_open(&open)
+            .and_then(|sealed| node.verifier.verify_blob_stream_open(&sealed))
+            .expect("authenticate legacy stream open");
+        let policy = node
+            .current_policy("legacy stream fixture")
+            .expect("policy");
+        let (reservation, initial) = node
+            .store
+            .reserve_blob_stream_with_policy(
+                &policy,
+                aster_redb_store::BlobStreamReservationRequest {
+                    operation: &operation,
+                    source: aster_redb_store::BlobStreamSource::LocalApplication,
+                },
+                &authenticated_open,
+            )
+            .expect("reserve legacy stream");
+        let root = PinnedBlobPackRoot::open(&node.store).expect("legacy pack root");
+        let mut writer = BlobPackWriter::create_pinned(&root, authenticated_open.open())
+            .expect("legacy pack writer");
+        let sealer = node
+            .verifier
+            .blob_stream_segment_sealer(&authenticated_open)
+            .expect("legacy segment sealer");
+        let (segment, leaves) = sealer
+            .seal(
+                aster_mesh::BlobStreamPlainPartition::new(
+                    *stream_id.as_bytes(),
+                    authenticated_open.open().digest(),
+                    1,
+                    0,
+                    0,
+                    bytes.len() as u64,
+                    bytes.to_vec(),
+                )
+                .expect("legacy plaintext partition"),
+            )
+            .expect("seal legacy segment");
+        writer
+            .append(&segment, leaves)
+            .expect("append legacy segment");
+        let checkpoint = writer.checkpoint().expect("checkpoint legacy pack");
+        node.store
+            .checkpoint_blob_stream(&policy, &reservation, initial, checkpoint.clone())
+            .expect("project legacy checkpoint");
+        let roots = aster_mesh::BlobStreamFrontier::restore(checkpoint.frontier().clone())
+            .and_then(|frontier| frontier.finish(bytes.len() as u64))
+            .expect("legacy roots");
+        let commitment = aster_mesh::BlobStreamFinalCommitment::new(
+            &authenticated_open,
+            roots.0,
+            roots.1,
+            1,
+            None,
+        )
+        .expect("legacy final commitment");
+        let verified = node
+            .verifier
+            .seal_blob_stream_commitment(&commitment)
+            .and_then(|sealed| {
+                node.verifier
+                    .verify_blob_stream_commitment(&authenticated_open, &sealed)
+            })
+            .expect("authenticate legacy commitment");
+        let promoted = node
+            .store
+            .promote_blob_stream_with_policy(&policy, &reservation, &verified)
+            .expect("promote legacy publication");
+        BlobId::from_core(promoted.blob_id())
+    }
+
+    fn finish_stream_read_fixture(
+        node: &mut SelectedBlobNode,
+        operation: &[u8],
+        bytes: &[u8],
+        options: BlobPublishOptions,
+    ) -> BlobReadRequest {
+        let request = BlobPublishStreamRequest {
+            publication: request(operation),
+            options,
+            total_len: bytes.len() as u64,
+        };
+        let opened = node
+            .open_publish_stream_inner(request)
+            .expect("open streamed read fixture");
+        for (offset, chunk) in bytes.chunks(64 * 1024).enumerate() {
+            node.append_publish_stream_inner(
+                opened.token,
+                (offset * 64 * 1024) as u64,
+                Zeroizing::new(chunk.to_vec()),
+            )
+            .expect("append streamed read fixture");
+        }
+        let published = node
+            .finish_publish_stream_inner(opened.token)
+            .expect("finish streamed read fixture");
+        BlobReadRequest {
+            id: published.id,
+            topic: blob_topic(),
+            scope: blob_scope(),
+        }
+    }
+
+    fn read_fixture_page(
+        node: &mut SelectedBlobNode,
+        blob: BlobReadRequest,
+        offset: u64,
+    ) -> Result<BlobReadPage, ApplicationError> {
+        node.read_page(BlobReadPageRequest {
+            blob,
+            offset,
+            max_bytes: 31,
+        })
+    }
+
+    #[test]
+    fn legacy_stream_publication_is_not_a_plaintext_read_authority() {
+        // Break caught: the retired stream-publication namespace must never
+        // bypass the canonical BlobReadPlan authority used by every page.
+        let root = TestRoot::new("legacy-read-authority");
+        let mut node = selected_node(&root);
+        let id = install_legacy_stream_publication(&mut node, &payload(97));
+
+        let error = node
+            .read_page(BlobReadPageRequest {
+                blob: BlobReadRequest {
+                    id,
+                    topic: blob_topic(),
+                    scope: blob_scope(),
+                },
+                offset: 0,
+                max_bytes: 32,
+            })
+            .expect_err("legacy publication cannot supply plaintext");
+
+        assert_eq!(error.kind(), ApplicationErrorKind::NotFound);
+        assert_eq!(error.operation(), "blob read page");
+    }
+
+    #[test]
+    fn cached_blob_reader_rechecks_revocation_epoch_grants_and_lifecycle_each_page() {
+        // Break caught: a page-one authorization must not become reusable
+        // plaintext authority after any control, selector, lifecycle, or
+        // shutdown transition. Stream-created Blobs use the canonical plan.
+        let bytes = payload(97);
+
+        let policy_root = TestRoot::new("page-policy-generation");
+        let mut policy_services = persist_rekey_mission(&policy_root);
+        let mut policy_node = selected_node(&policy_root);
+        let policy_blob = finish_stream_read_fixture(
+            &mut policy_node,
+            b"blob/read-matrix/policy",
+            &bytes,
+            BlobPublishOptions::durable(),
+        );
+        assert_eq!(
+            read_fixture_page(&mut policy_node, policy_blob.clone(), 0)
+                .expect("policy page one")
+                .as_bytes(),
+            &bytes[..31]
+        );
+        apply_scope_rekey_to_open_node(&policy_node, &mut policy_services, 1, 1);
+        let error = read_fixture_page(&mut policy_node, policy_blob.clone(), 31)
+            .expect_err("policy generation change denies page two");
+        assert_eq!(error.kind(), ApplicationErrorKind::UnauthorizedOrRevoked);
+        drop(policy_node);
+        let mut reopened = selected_node(&policy_root);
+        assert_eq!(
+            read_fixture_page(&mut reopened, policy_blob, 31)
+                .expect_err("policy denial survives reopen")
+                .kind(),
+            ApplicationErrorKind::UnauthorizedOrRevoked
+        );
+
+        let epoch_root = TestRoot::new("page-epoch");
+        let mut epoch_services = persist_rekey_mission(&epoch_root);
+        let mut epoch_node = selected_node(&epoch_root);
+        let epoch_blob = finish_stream_read_fixture(
+            &mut epoch_node,
+            b"blob/read-matrix/epoch",
+            &bytes,
+            BlobPublishOptions::durable(),
+        );
+        read_fixture_page(&mut epoch_node, epoch_blob.clone(), 0).expect("epoch page one");
+        apply_scope_rekey_to_open_node(&epoch_node, &mut epoch_services, 2, 1);
+        assert_eq!(
+            read_fixture_page(&mut epoch_node, epoch_blob, 31)
+                .expect_err("rekey denies page two")
+                .kind(),
+            ApplicationErrorKind::UnauthorizedOrRevoked
+        );
+
+        let selector_root = TestRoot::new("page-selector");
+        let mut selector_node = selected_node(&selector_root);
+        let selector_blob = finish_stream_read_fixture(
+            &mut selector_node,
+            b"blob/read-matrix/selector",
+            &bytes,
+            BlobPublishOptions::durable(),
+        );
+        read_fixture_page(&mut selector_node, selector_blob.clone(), 0).expect("selector page one");
+        let mut wrong_selector = selector_blob;
+        wrong_selector.topic = Topic::new("ops.not-granted").expect("wrong selector topic");
+        assert_eq!(
+            read_fixture_page(&mut selector_node, wrong_selector, 31)
+                .expect_err("selector change denies page two")
+                .kind(),
+            ApplicationErrorKind::RequestRejected
+        );
+
+        let revocation_root = TestRoot::new("page-revocation");
+        let mut revocation_services = persist_rekey_mission(&revocation_root);
+        let mut revocation_node = selected_node(&revocation_root);
+        let revocation_blob = finish_stream_read_fixture(
+            &mut revocation_node,
+            b"blob/read-matrix/revocation",
+            &bytes,
+            BlobPublishOptions::durable(),
+        );
+        read_fixture_page(&mut revocation_node, revocation_blob.clone(), 0)
+            .expect("revocation page one");
+        let sealed = revocation_services
+            .control_authority
+            .seal_chained_revocation_control(revocation_services.selected_identity, 1, 1, None)
+            .expect("seal page-two revocation");
+        let verified = revocation_services
+            .reader
+            .verify_control(&sealed)
+            .expect("verify page-two revocation");
+        revocation_node
+            .store
+            .ingest_verified_control(&verified, &sealed)
+            .expect("commit page-two revocation");
+        assert_eq!(
+            read_fixture_page(&mut revocation_node, revocation_blob, 31)
+                .expect_err("publisher revocation denies page two")
+                .kind(),
+            ApplicationErrorKind::UnauthorizedOrRevoked
+        );
+
+        let lifecycle_root = TestRoot::new("page-lifecycle");
+        let mut lifecycle_node = selected_node(&lifecycle_root);
+        lifecycle_node.custody_clock = NodeCustodyClock::injected([0xe1; 16], 100, 0);
+        let lifecycle_blob = finish_stream_read_fixture(
+            &mut lifecycle_node,
+            b"blob/read-matrix/lifecycle",
+            &bytes,
+            BlobPublishOptions::finite_ttl_ms(50).expect("finite fixture TTL"),
+        );
+        read_fixture_page(&mut lifecycle_node, lifecycle_blob.clone(), 0)
+            .expect("lifecycle page one");
+        lifecycle_node
+            .custody_clock
+            .set_injected_tick(151)
+            .expect("expire page-two fixture");
+        assert_eq!(
+            read_fixture_page(&mut lifecycle_node, lifecycle_blob, 31)
+                .expect_err("expiry denies page two")
+                .kind(),
+            ApplicationErrorKind::ExpiredOrRetired
+        );
+
+        let shutdown_root = TestRoot::new("page-shutdown");
+        let mut shutdown_node = selected_node(&shutdown_root);
+        let shutdown_blob = finish_stream_read_fixture(
+            &mut shutdown_node,
+            b"blob/read-matrix/shutdown",
+            &bytes,
+            BlobPublishOptions::durable(),
+        );
+        read_fixture_page(&mut shutdown_node, shutdown_blob.clone(), 0).expect("shutdown page one");
+        let admission = AtomicBool::new(false);
+        let mut fatal = None;
+        let error = shutdown_node
+            .read_page_with_admission(
+                BlobReadPageRequest {
+                    blob: shutdown_blob,
+                    offset: 31,
+                    max_bytes: 31,
+                },
+                &admission,
+                None,
+                &mut fatal,
+            )
+            .expect_err("shutdown denies page two");
+        assert_eq!(error.kind(), ApplicationErrorKind::StateUnavailable);
+        assert!(fatal.is_none());
     }
 
     async fn schedule_stream_finalization_for_test(

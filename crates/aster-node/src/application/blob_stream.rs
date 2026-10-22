@@ -11,11 +11,11 @@ use aster_mesh::{
     BlobUploadSegmentSealer, EncryptedBlobStreamSegment,
 };
 use aster_redb_store::{
-    BlobStreamPublication, BlobUploadCheckpoint, BlobUploadReservation,
+    BlobUploadCheckpoint, BlobUploadReservation,
     pack::{BlobPackError, BlobPackIdentity, BlobPackReader, BlobPackWriter, PinnedBlobPackRoot},
 };
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::BTreeMap,
     error::Error,
     fmt::{self, Display, Formatter},
     io::{Read, Write},
@@ -81,14 +81,6 @@ impl LocalBlobPublishStream {
         assert!(segments > 0, "checkpoint cadence must be positive");
         self.checkpoint_segments = segments;
     }
-}
-
-pub(super) struct LocalBlobReadStream {
-    pub(super) publication: BlobStreamPublication,
-    pub(super) reader: BlobPackReader,
-    pub(super) opener: BlobStreamSegmentOpener,
-    pub(super) segments: VecDeque<(u64, Zeroizing<Vec<u8>>)>,
-    pub(super) last_request_offset: u64,
 }
 
 pub(super) fn take_zeroizing_bytes(mut bytes: Zeroizing<Vec<u8>>) -> Vec<u8> {
