@@ -1963,14 +1963,19 @@ impl Store {
         reservation: &BlobUploadReservation,
         expected: &BlobUploadCheckpoint,
         verified: VerifiedBlobCustodyClaimV2,
-        receiver_sample: aster_mesh::CustodySample,
+        received_sample: aster_mesh::CustodySample,
+        promotion_sample: aster_mesh::CustodySample,
     ) -> Result<super::BlobOnceOutcome, StoreError> {
         self.commit_profile5_upload_once_with_lifetime(
             policy,
             reservation,
             expected,
             Profile5PromotionLifetime::Network(
-                super::VerifiedFiniteBlobAdmission::from_verified_v2(verified, receiver_sample),
+                super::VerifiedFiniteBlobAdmission::from_verified_v2_elapsed(
+                    verified,
+                    received_sample,
+                    promotion_sample,
+                )?,
             ),
         )
     }

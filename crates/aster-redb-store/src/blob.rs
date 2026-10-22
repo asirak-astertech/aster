@@ -2163,6 +2163,37 @@ impl VerifiedFiniteBlobAdmission {
         }
     }
 
+    fn from_verified_v2_elapsed(
+        verified: VerifiedBlobCustodyClaimV2,
+        received_sample: aster_mesh::CustodySample,
+        promotion_sample: aster_mesh::CustodySample,
+    ) -> Result<Self, StoreError> {
+        if received_sample.clock_id != promotion_sample.clock_id
+            || promotion_sample.tick_ms < received_sample.tick_ms
+        {
+            return Err(blob_error(BlobStoreError::PendingSourceConflict));
+        }
+        let elapsed_ms = promotion_sample.tick_ms - received_sample.tick_ms;
+        let forwarding_age_ms = verified
+            .forwarding_age_ms()
+            .checked_add(elapsed_ms)
+            .ok_or_else(|| blob_error(BlobStoreError::PendingSourceConflict))?;
+        Ok(Self {
+            source_transfer_id: *verified.source_transfer_id().as_bytes(),
+            source_len: verified.source_len(),
+            publication_id: verified.publication_id(),
+            blob_id: verified.blob_id(),
+            priority: verified.priority(),
+            ttl_ms: verified.ttl_ms(),
+            forwarding_age_ms,
+            receiver_sample: promotion_sample,
+            provenance: BlobFiniteProvenance::NetworkV1 {
+                semantic_version: 9,
+                profile_id: 5,
+            },
+        })
+    }
+
     #[cfg(any(test, feature = "test-utils"))]
     #[allow(clippy::too_many_arguments)]
     const fn for_test(
@@ -5523,11 +5554,16 @@ impl Store {
         open: &VerifiedBlobStreamOpen,
         pack: &Profile5PackReadSession,
         verified: VerifiedBlobCustodyClaimV2,
-        receiver_sample: aster_mesh::CustodySample,
+        received_sample: aster_mesh::CustodySample,
+        promotion_sample: aster_mesh::CustodySample,
     ) -> Result<(), StoreError> {
         self.require_live()?;
         let authority = self.require_bound_mission()?;
-        let admission = VerifiedFiniteBlobAdmission::from_verified_v2(verified, receiver_sample);
+        let admission = VerifiedFiniteBlobAdmission::from_verified_v2_elapsed(
+            verified,
+            received_sample,
+            promotion_sample,
+        )?;
         let (transfer_id, semantic_id, variant_id) = profile5_pack_identities(
             open.open(),
             open.authenticated_bytes(),

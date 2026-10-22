@@ -27,8 +27,8 @@ use aster_iroh::Connection;
 use aster_mesh::{
     AuthenticatedBlobCustodyContactV2, BlobContentVerification, BlobCustodyClaimV2,
     BlobCustodyTransferId, BlobStreamFinalCommitment, BlobStreamOpen, ContentVerifiedBlobEnvelope,
-    ReferenceEnvelopeSealer, VerifiedBlobStreamOpen, VerifiedBlobTransferPlan,
-    profile5_canonical_wire_shape,
+    ReferenceEnvelopeSealer, VerifiedBlobCustodyClaimV2, VerifiedBlobStreamOpen,
+    VerifiedBlobTransferPlan, profile5_canonical_wire_shape,
 };
 use aster_redb_store::pack::{BlobPackWriter, PinnedBlobPackRoot};
 use aster_redb_store::{
@@ -53,6 +53,7 @@ pub(crate) const PROFILE5_SENDER_OWNED_BYTES: usize =
 #[cfg(test)]
 tokio::task_local! {
     static TEST_NATIVE_PROFILE5_CHECKPOINT_BATCH_BYTES: u32;
+    static TEST_NATIVE_PROFILE5_PREPROMOTION_HOOK: Arc<dyn Fn() + Send + Sync>;
 }
 
 fn native_profile5_checkpoint_batch_bytes() -> u32 {
@@ -62,6 +63,14 @@ fn native_profile5_checkpoint_batch_bytes() -> u32 {
     }
     MAX_STREAM_CHECKPOINT_BATCH_BYTES
 }
+
+#[cfg(test)]
+fn run_native_profile5_prepromotion_hook() {
+    let _ = TEST_NATIVE_PROFILE5_PREPROMOTION_HOOK.try_with(|hook| hook());
+}
+
+#[cfg(not(test))]
+const fn run_native_profile5_prepromotion_hook() {}
 
 /// Drop-safe owner for the peer-visible DATA half of a transport attempt.
 /// Normal completion disarms it only after `finish_data` succeeds; every
@@ -2259,6 +2268,9 @@ async fn settle_existing_native_profile5_pack(
     blob: StoredBlob,
     pack: aster_redb_store::Profile5PackReadSession,
     wire_len: u64,
+    store: &Store,
+    policy: &ControlPolicySnapshot,
+    pending_custody: Option<(VerifiedBlobCustodyClaimV2, aster_mesh::CustodySample)>,
 ) -> Result<BlobNetworkReport, BlobNetworkError> {
     let mut state = StreamReceiverState::new(
         &transfer_open,
@@ -2305,6 +2317,31 @@ async fn settle_existing_native_profile5_pack(
     else {
         return Err("promoted native Profile-5 retry did not request settlement".into());
     };
+    if let Some((verified, received_sample)) = pending_custody {
+        let promotion_sample = super::contact_custody_sample()
+            .map_err(|error| {
+                lifecycle_failure("sample existing native receiver promotion clock", error)
+            })?
+            .ok_or_else(|| {
+                lifecycle_failure(
+                    "sample existing native receiver promotion clock",
+                    "clock unavailable",
+                )
+            })?;
+        store
+            .admit_existing_finite_profile5_pack_with_policy(
+                policy,
+                &blob,
+                verified_open,
+                &pack,
+                verified,
+                received_sample,
+                promotion_sample,
+            )
+            .map_err(|error| {
+                lifecycle_failure("refresh existing native Profile-5 custody", error)
+            })?;
+    }
     let roots = (
         *pack.commitment().blob_id().as_bytes(),
         Sha256::digest(pack.commitment().encode()).into(),
@@ -2398,10 +2435,21 @@ async fn receive_native_profile5_pack(
             "authenticated open differs from PLAN/OPEN metadata",
         ));
     }
+    let custody_received_sample = if opened_custody.is_some() {
+        Some(
+            super::contact_custody_sample()
+                .map_err(|error| lifecycle_failure("sample native custody receipt clock", error))?
+                .ok_or_else(|| {
+                    lifecycle_failure("sample native custody receipt clock", "clock unavailable")
+                })?,
+        )
+    } else {
+        None
+    };
     if let Some((blob, pack)) =
         existing_native_profile5_pack(&store, policy, &verified_open, &transfer_open)?
     {
-        if let Some((claim, authority)) = opened_custody.take() {
+        let pending_custody = if let Some((claim, authority)) = opened_custody.take() {
             let ttl_ms = open.ttl_ms().ok_or_else(|| {
                 authentication_failure(
                     "verify existing native Profile-5 custody claim",
@@ -2438,29 +2486,18 @@ async fn receive_native_profile5_pack(
                     "OPEN custody digest differs from authenticated claim",
                 ));
             }
-            let receiver_sample = super::contact_custody_sample()
-                .map_err(|error| {
-                    lifecycle_failure("sample existing native receiver custody clock", error)
-                })?
-                .ok_or_else(|| {
+            Some((
+                verified,
+                custody_received_sample.ok_or_else(|| {
                     lifecycle_failure(
-                        "sample existing native receiver custody clock",
-                        "clock unavailable",
+                        "bind existing native receiver custody clock",
+                        "receipt sample unavailable",
                     )
-                })?;
-            store
-                .admit_existing_finite_profile5_pack_with_policy(
-                    policy,
-                    &blob,
-                    &verified_open,
-                    &pack,
-                    verified,
-                    receiver_sample,
-                )
-                .map_err(|error| {
-                    lifecycle_failure("refresh existing native Profile-5 custody", error)
-                })?;
-        }
+                })?,
+            ))
+        } else {
+            None
+        };
         return settle_existing_native_profile5_pack(
             attempt,
             codec,
@@ -2470,6 +2507,9 @@ async fn receive_native_profile5_pack(
             blob,
             pack,
             wire_len,
+            &store,
+            policy,
+            pending_custody,
         )
         .await;
     }
@@ -2768,6 +2808,7 @@ async fn receive_native_profile5_pack(
             "transport OPEN differs from signed Profile-5 source",
         ));
     }
+    run_native_profile5_prepromotion_hook();
     let imported_custody = if let Some((claim, authority)) = opened_custody {
         let ttl_ms = open.ttl_ms().ok_or_else(|| {
             authentication_failure(
@@ -2802,12 +2843,21 @@ async fn receive_native_profile5_pack(
                 "OPEN custody digest differs from authenticated claim",
             ));
         }
-        let receiver_sample = super::contact_custody_sample()
+        let promotion_sample = super::contact_custody_sample()
             .map_err(|error| lifecycle_failure("sample native receiver custody clock", error))?
             .ok_or_else(|| {
                 lifecycle_failure("sample native receiver custody clock", "clock unavailable")
             })?;
-        Some((verified, receiver_sample))
+        Some((
+            verified,
+            custody_received_sample.ok_or_else(|| {
+                lifecycle_failure(
+                    "bind native receiver custody clock",
+                    "receipt sample unavailable",
+                )
+            })?,
+            promotion_sample,
+        ))
     } else {
         None
     };
@@ -2850,13 +2900,14 @@ async fn receive_native_profile5_pack(
             lineage,
         )?;
         match imported_custody {
-            Some((verified, receiver_sample)) => finish_store
+            Some((verified, received_sample, promotion_sample)) => finish_store
                 .commit_received_profile5_upload_once_with_policy(
                     &finish_policy,
                     &finish_reservation,
                     &projected,
                     verified,
-                    receiver_sample,
+                    received_sample,
+                    promotion_sample,
                 ),
             None => finish_store.commit_profile5_upload_once_with_policy(
                 &finish_policy,
@@ -4675,6 +4726,15 @@ pub(crate) mod tests {
         assert!(bytes > 0);
         TEST_NATIVE_PROFILE5_CHECKPOINT_BATCH_BYTES
             .scope(bytes, future)
+            .await
+    }
+
+    pub(crate) async fn with_native_profile5_prepromotion_hook<F: Future>(
+        hook: Arc<dyn Fn() + Send + Sync>,
+        future: F,
+    ) -> F::Output {
+        TEST_NATIVE_PROFILE5_PREPROMOTION_HOOK
+            .scope(hook, future)
             .await
     }
 
