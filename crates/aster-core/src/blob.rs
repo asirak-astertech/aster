@@ -4242,39 +4242,57 @@ pub fn inspect_blob_transfer_object(bytes: &[u8]) -> Result<BlobTransferObject, 
     })
 }
 
-/// Fuzz-only one-chunk source/manifest oracle that enters the same route- and
-/// record-bound carrier authentication path as the production receiver.
+/// Fuzz-only independently constructed source/manifest oracle that enters the
+/// same route- and record-bound carrier authentication path as the production
+/// receiver. Ciphertext bytes are derived from the corpus formula rather than
+/// trusted from the carrier under test.
 #[cfg(feature = "fuzzing")]
 pub(crate) fn fuzz_verify_profile5_carrier(
     bytes: &[u8],
-    expected_ciphertext: &[u8],
+    expected_index: u64,
+    expected_ciphertext_lengths: &[u32],
 ) -> Result<(), BlobError> {
-    let ciphertext_sha256 = sha256(expected_ciphertext);
-    let ciphertext_len =
-        u32::try_from(expected_ciphertext.len()).map_err(|_| BlobError::LengthOverflow)?;
-    let plaintext_len = ciphertext_len
-        .checked_sub(GCM_TAG_LEN as u32)
+    let expected_position =
+        usize::try_from(expected_index).map_err(|_| BlobError::LengthOverflow)?;
+    let expected_len = *expected_ciphertext_lengths
+        .get(expected_position)
         .ok_or(BlobError::InvalidManifest)?;
-    let record =
-        BlobChunkRecord::from_parts([0x30; 32], ciphertext_sha256, plaintext_len, ciphertext_len)?;
+    let expected_ciphertext = (0..expected_len)
+        .map(|value| expected_index.wrapping_add(u64::from(value)) as u8)
+        .collect::<Vec<_>>();
+    let records = expected_ciphertext_lengths
+        .iter()
+        .enumerate()
+        .map(|(index, length)| {
+            let index = u64::try_from(index).map_err(|_| BlobError::LengthOverflow)?;
+            let ciphertext = (0..*length)
+                .map(|value| index.wrapping_add(u64::from(value)) as u8)
+                .collect::<Vec<_>>();
+            let plaintext_len = length
+                .checked_sub(GCM_TAG_LEN as u32)
+                .ok_or(BlobError::InvalidManifest)?;
+            BlobChunkRecord::from_parts([0x30; 32], sha256(&ciphertext), plaintext_len, *length)
+        })
+        .collect::<Result<Vec<_>, BlobError>>()?;
     let blob_id = BlobId::from_bytes([0x20; 32]);
-    let tree = BlobRouteTree::build(blob_id, vec![record])?;
+    let tree = BlobRouteTree::build(blob_id, records)?;
     let commitment = tree.commitment()?;
     let route = AuthenticatedBlobRoute::new(EnvelopeId::from_bytes([0x10; 32]), commitment);
-    let proof = tree.proof(0)?;
+    let proof = tree.proof(expected_index)?;
+    let ciphertext_sha256 = sha256(&expected_ciphertext);
     let object_id = transfer_object_id(
         route.source_envelope,
         blob_id,
-        0,
+        expected_index,
         ciphertext_sha256,
-        ciphertext_len,
+        expected_len,
         &proof,
     );
     let inspected = authenticate_blob_transfer_object_for_route(object_id, bytes, route)?;
-    if inspected.index != 0
+    if inspected.index != expected_index
         || inspected.ciphertext_sha256 != ciphertext_sha256
-        || inspected.ciphertext_len != ciphertext_len
-        || inspected.ciphertext != expected_ciphertext
+        || inspected.ciphertext_len != expected_len
+        || inspected.ciphertext != expected_ciphertext.as_slice()
     {
         return Err(BlobError::AuthenticationFailed);
     }

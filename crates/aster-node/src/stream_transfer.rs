@@ -1686,6 +1686,48 @@ fn drive_fuzz_transcript(frames: &[StreamFrame]) -> bool {
 }
 
 #[cfg(feature = "fuzzing")]
+fn assert_checked_in_composite_carriers(input: &[u8], extent: &CanonicalBlobExtentV1) {
+    const NORMAL_LENGTHS: &[u32] = &[17];
+    const MAXIMUM_LENGTHS: &[u32] = &[
+        65_424, 65_424, 65_424, 65_424, 65_424, 65_424, 65_424, 65_424, 65_424, 65_424, 65_424,
+        65_424, 65_424, 65_424, 65_424, 63_184,
+    ];
+    let expected_lengths = if input
+        == include_bytes!(
+            "../../../fuzz/corpus/stream_transfer_decode/profile5-composite-valid.bin"
+        ) {
+        Some(NORMAL_LENGTHS)
+    } else if input
+        == include_bytes!(
+            "../../../fuzz/corpus/stream_transfer_decode/profile5-composite-maximum.bin"
+        )
+    {
+        Some(MAXIMUM_LENGTHS)
+    } else {
+        None
+    };
+    let Some(expected_lengths) = expected_lengths else {
+        return;
+    };
+    assert_eq!(extent.carriers.len(), expected_lengths.len());
+    for (index, carrier) in extent.carriers.iter().enumerate() {
+        let index = u64::try_from(index).expect("fixture carrier index");
+        assert!(aster_mesh::fuzz_verify_profile5_carrier(
+            carrier,
+            index,
+            expected_lengths
+        ));
+        let mut malformed = carrier.clone();
+        *malformed.last_mut().expect("fixture carrier ciphertext") ^= 1;
+        assert!(!aster_mesh::fuzz_verify_profile5_carrier(
+            &malformed,
+            index,
+            expected_lengths
+        ));
+    }
+}
+
+#[cfg(feature = "fuzzing")]
 pub(crate) fn fuzz_decode(input: &[u8]) {
     if input.starts_with(b"AST1") {
         if let Some((_seed_expectation, frames)) = decode_fuzz_transcript(input) {
@@ -1701,21 +1743,7 @@ pub(crate) fn fuzz_decode(input: &[u8]) {
             && let Ok(extent) = CanonicalBlobExtentV1::decode(&data.bytes)
         {
             let body = data.bytes.as_slice();
-            let expected_ciphertext = (0_u8..17).collect::<Vec<_>>();
-            for carrier in &extent.carriers {
-                if aster_mesh::fuzz_verify_profile5_carrier(carrier, &expected_ciphertext) {
-                    assert!(aster_mesh::fuzz_verify_profile5_carrier(
-                        carrier,
-                        &expected_ciphertext
-                    ));
-                    let mut malformed = carrier.clone();
-                    malformed[carrier.len() - 1] ^= 1;
-                    assert!(!aster_mesh::fuzz_verify_profile5_carrier(
-                        &malformed,
-                        &expected_ciphertext
-                    ));
-                }
-            }
+            assert_checked_in_composite_carriers(input, &extent);
             let encoded = extent
                 .encode()
                 .expect("accepted ABX1 extent must re-encode");
@@ -1754,78 +1782,10 @@ pub(crate) fn fuzz_decode(input: &[u8]) {
         }
     }
 
-    // Feed the decoded, fuzzer-controlled binding, sequence, generation,
-    // offsets, and settlement fields through the production state machines.
-    let (id, nonce) = match &decoded {
-        StreamFrame::Open(x) => (x.transfer_id, x.attempt_nonce),
-        StreamFrame::Source(x) => (x.transfer_id, x.attempt_nonce),
-        StreamFrame::Accept(x) => (x.transfer_id, x.attempt_nonce),
-        StreamFrame::Data(x) => (x.transfer_id, x.attempt_nonce),
-        StreamFrame::Checkpoint(x) => (x.transfer_id, x.attempt_nonce),
-        StreamFrame::Finish(x) => (x.transfer_id, x.attempt_nonce),
-        StreamFrame::Result(x) => (x.transfer_id, x.attempt_nonce),
-        StreamFrame::ResultAck(x) => (x.transfer_id, x.attempt_nonce),
-    };
-    let open = StreamOpenV1 {
-        class: StreamClass::Blob,
-        direction: StreamDirection::ToSessionResponder,
-        session_transcript: [0x43; 32],
-        exchange_id: 1,
-        transfer_id: id,
-        source_transfer_id: [0x44; 32],
-        publication_id: [0x45; 32],
-        variant_id: [0x46; 32],
-        total_len: MAX_STREAM_EXTENT_BYTES as u64,
-        attempt_nonce: nonce,
-        checkpoint_generation: 0,
-        custody_digest: None,
-        source_len: 1,
-        source_digest: [0x47; 32],
-    };
-    let mut receiver = StreamReceiverState::new(
-        &open,
-        0,
-        0,
-        MAX_STREAM_EXTENT_BYTES as u64,
-        MAX_STREAM_EXTENT_BYTES as u32,
-    )
-    .expect("receiver fixture");
-    let mut sender = StreamSenderState::new(id, nonce, MAX_STREAM_EXTENT_BYTES as u64);
-    match decoded {
-        StreamFrame::Accept(value) => {
-            let _ = sender.accept(value);
-        }
-        StreamFrame::Data(value) => {
-            let _ = receiver.data(&value);
-        }
-        StreamFrame::Checkpoint(value) => {
-            let _ = receiver.accept(MAX_STREAM_CHECKPOINT_BATCH_BYTES);
-            let _ = sender.accept(StreamAcceptV1 {
-                transfer_id: id,
-                attempt_nonce: nonce,
-                sequence: 0,
-                durable_offset: 0,
-                checkpoint_generation: 0,
-                absolute_receive_limit: MAX_STREAM_EXTENT_BYTES as u64,
-                max_extent_bytes: MAX_STREAM_EXTENT_BYTES as u32,
-                checkpoint_batch_bytes: MAX_STREAM_CHECKPOINT_BATCH_BYTES,
-            });
-            let _ = sender.checkpoint(value);
-        }
-        StreamFrame::Finish(value) => {
-            let _ = receiver.finish(value.clone());
-            let _ = receiver.finish(value);
-        }
-        StreamFrame::Result(value) => {
-            let _ = sender.result(value.clone());
-            let _ = sender.result(value);
-        }
-        StreamFrame::ResultAck(value) => {
-            let _ = receiver.result_ack(value.clone(), StreamResultCode::Promoted);
-            let _ = receiver.result_ack(value, StreamResultCode::Promoted);
-        }
-        StreamFrame::Open(_) | StreamFrame::Source(_) => {}
-    }
+    // Stateful mutation is intentionally exclusive to assertion-bearing AST1
+    // transcripts above. A standalone ASM record proves only codec
+    // canonicality and record-local bounds; it lacks the preceding attempt
+    // state required for a meaningful transition oracle.
 }
 
 #[cfg(test)]
@@ -2224,25 +2184,22 @@ mod stream_frame_codec {
 
     #[cfg(feature = "fuzzing")]
     #[test]
-    fn production_composite_seed_opens_and_authenticates_through_runtime_codec() {
-        let bytes = include_bytes!(
-            "../../../fuzz/corpus/stream_transfer_decode/profile5-composite-valid.bin"
-        );
-        let data = crate::runtime::blob_stream::fuzz_open_profile5_data_extent(bytes)
-            .expect("production MissionBlobRecordCodec opens seed");
-        let extent = CanonicalBlobExtentV1::decode(&data.bytes).expect("ABX1 extent");
-        let expected_ciphertext = (0_u8..17).collect::<Vec<_>>();
-        assert_eq!(extent.carriers.len(), 1);
-        assert!(aster_mesh::fuzz_verify_profile5_carrier(
-            &extent.carriers[0],
-            &expected_ciphertext,
-        ));
-        let mut malformed = extent.carriers[0].clone();
-        *malformed.last_mut().expect("carrier ciphertext") ^= 1;
-        assert!(!aster_mesh::fuzz_verify_profile5_carrier(
-            &malformed,
-            &expected_ciphertext,
-        ));
+    fn production_composite_seeds_open_and_every_carrier_authenticates() {
+        for bytes in [
+            include_bytes!(
+                "../../../fuzz/corpus/stream_transfer_decode/profile5-composite-valid.bin"
+            )
+            .as_slice(),
+            include_bytes!(
+                "../../../fuzz/corpus/stream_transfer_decode/profile5-composite-maximum.bin"
+            )
+            .as_slice(),
+        ] {
+            let data = crate::runtime::blob_stream::fuzz_open_profile5_data_extent(bytes)
+                .expect("production MissionBlobRecordCodec opens seed");
+            let extent = CanonicalBlobExtentV1::decode(&data.bytes).expect("ABX1 extent");
+            assert_checked_in_composite_carriers(bytes, &extent);
+        }
     }
 
     #[cfg(feature = "fuzzing")]

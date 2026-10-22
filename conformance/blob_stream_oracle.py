@@ -131,19 +131,67 @@ def abx1_extent():
 
 
 def canonical_carrier(index, ciphertext_len):
+    return canonical_carrier_with_proof(index, ciphertext_len, ())
+
+
+def domain_hash(domain, *parts):
+    value = hashlib.sha256(struct.pack('>Q', len(domain)) + domain)
+    for part in parts:
+        value.update(part)
+    return value.digest()
+
+
+def route_levels(ciphertext_lengths):
+    blob_id = b'\x20' * 32
+    leaves = [domain_hash(b'aster/blob-route-leaf/v1', struct.pack('>H', 1), blob_id,
+                          struct.pack('>Q', index),
+                          hashlib.sha256(bytes((index + value) & 0xff
+                                               for value in range(length))).digest(),
+                          struct.pack('>I', length))
+              for index, length in enumerate(ciphertext_lengths)]
+    levels = [leaves]
+    level = 0
+    while len(levels[-1]) > 1:
+        current = levels[-1]
+        levels.append([
+            domain_hash(b'aster/blob-route-node/v1', struct.pack('>H', 1),
+                        struct.pack('>H', level), pair[0], pair[1])
+            if len(pair) == 2 else pair[0]
+            for offset in range(0, len(current), 2)
+            for pair in (current[offset:offset + 2],)
+        ])
+        level += 1
+    return levels
+
+
+def route_proof(levels, index):
+    proof = []
+    position = index
+    for current in levels[:-1]:
+        sibling = position + 1 if position % 2 == 0 else position - 1
+        if sibling < len(current):
+            proof.append(current[sibling])
+        position //= 2
+    return proof
+
+
+def canonical_carrier_with_proof(index, ciphertext_len, proof):
     ciphertext = bytes((index + value) & 0xff for value in range(ciphertext_len))
     return (b'ASTRBT01' + struct.pack('>H', 1) + b'\x10' * 32 + b'\x20' * 32
             + struct.pack('>Q', index) + hashlib.sha256(ciphertext).digest()
-            + struct.pack('>I', ciphertext_len) + b'\x00' + ciphertext)
+            + struct.pack('>I', ciphertext_len) + bytes([len(proof)])
+            + b''.join(proof) + ciphertext)
 
 
 def maximum_abx1_extent():
-    carriers = [canonical_carrier(index, 65552) for index in range(15)]
+    ciphertext_lengths = [65424] * 15 + [63184]
+    levels = route_levels(ciphertext_lengths)
+    carriers = [canonical_carrier_with_proof(index, length, route_proof(levels, index))
+                for index, length in enumerate(ciphertext_lengths)]
     used = 16 + sum(4 + len(carrier) for carrier in carriers)
-    final_carrier_len = MAX_EXTENT - used - 4
-    carriers.append(canonical_carrier(15, final_carrier_len - 119))
     extent = (b'ABX1' + struct.pack('>QI', 0, len(carriers))
               + b''.join(struct.pack('>I', len(carrier)) + carrier for carrier in carriers))
+    assert used == MAX_EXTENT
     assert len(extent) == MAX_EXTENT
     return extent
 

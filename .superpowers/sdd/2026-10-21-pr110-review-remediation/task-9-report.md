@@ -214,3 +214,57 @@ Focused verification:
 - `cargo fmt --all -- --check` and `git diff --check` — PASS.
 
 No full suite, push, deployment, or device validation was run.
+
+## Review remediation round 3
+
+The two remaining Important findings in `task-9-rereview-2.md` are addressed.
+
+- The structured-contract checker now binds each record's encoder and decoder
+  arm to its actual bound predicates, shared nonce/extent/commitment/wire/trailing
+  validators, attempt decoder, and exact class/direction/result enum mappings.
+  ABX1 and ASD1 checks are scoped to their executable codec sections rather
+  than satisfied by unrelated source fragments. The four review probes now
+  fail: a 16-MiB SOURCE encoder chunk bound, `u32::MAX` ACCEPT decoder checkpoint
+  bound, RESULT value 1 remapping, and `Phase::Result` terminal predicate.
+- Executable-side mutation coverage now spans OPEN, SOURCE, ACCEPT, DATA,
+  CHECKPOINT, FINISH, nested attempt/nonce, class/direction/result/custody
+  enums, record trailing bytes, ABX1 magic/count/index/carrier/aggregate/trailing
+  bounds, ASD1 magic/zero/protected-header bounds, and both flow predicates.
+  Schema flow arrays are compared with decoded checked-in empty/nonempty AST1
+  steps; all four rejected seeds must remain rejection-labelled. The standalone
+  checker runs the narrow deterministic Rust transcript test once, proving the
+  independent model and production sender/receiver states accept and reject
+  the checked-in branches identically.
+- The exact 1-MiB maximum ASD1 seed now contains 16 independently valid
+  `ASTRBT01` carriers with real four-level route proofs. The Python oracle
+  independently constructs route leaves, parents, proofs, deterministic
+  ciphertexts, and the exact boundary extent. The fuzz-only production oracle
+  reconstructs the expected source, Blob, manifest records, route commitment,
+  per-index proof, object identity, ciphertext digest, and ciphertext length
+  without trusting the carrier under test.
+- Both checked-in ASD1 fixtures are recognized as immutable corpus contracts.
+  Every carrier is unconditionally accepted by the production route/manifest
+  inspector and an authenticated-byte mutation is unconditionally rejected.
+  A focused test opens both normal and maximum fixtures through
+  `MissionBlobRecordCodec` and validates all 17 carriers.
+- Assertion-free standalone ASM state calls were removed. Standalone records
+  fuzz codec canonicality and local bounds only; all state-machine fuzzing now
+  occurs exclusively through assertion-bearing AST1 transcripts that compare
+  the production transition result with the independent input-derived model.
+
+Focused verification:
+
+- `python3 conformance/blob_stream_oracle.py` — PASS.
+- `python3 tools/check-protocol-version-contract.py` — PASS, including the
+  narrow production transcript conformance invocation.
+- `python3 tools/test-protocol-version-contract.py` — PASS, 30 tests.
+- `python3 tools/test-run-fuzz-smoke.py` — PASS, 3 tests.
+- `cargo test -p aster-node --features fuzzing stream_transfer -- --nocapture`
+  — PASS, 29 passed, 1 explicit 1-GiB performance test ignored.
+- `cargo test --manifest-path fuzz/Cargo.toml --lib` — PASS, 3 tests.
+- Direct clean 17-seed `stream_transfer_decode` campaign with
+  `-runs=10000 -max_len=1052672 -seed=2026102203` — PASS, 10,000 runs, 10,000
+  executions/second, peak RSS 416 MiB.
+- `cargo fmt --all -- --check` and `git diff --check` — PASS.
+
+No full suite, push, deployment, or device validation was run.

@@ -158,8 +158,12 @@ pub use blob::{
 #[doc(hidden)]
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
-pub fn fuzz_verify_profile5_carrier(bytes: &[u8], expected_ciphertext: &[u8]) -> bool {
-    blob::fuzz_verify_profile5_carrier(bytes, expected_ciphertext).is_ok()
+pub fn fuzz_verify_profile5_carrier(
+    bytes: &[u8],
+    expected_index: u64,
+    expected_ciphertext_lengths: &[u32],
+) -> bool {
+    blob::fuzz_verify_profile5_carrier(bytes, expected_index, expected_ciphertext_lengths).is_ok()
 }
 #[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
 pub use blob_custody::{

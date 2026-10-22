@@ -407,16 +407,125 @@ class ProtocolVersionContractTests(unittest.TestCase):
                 "bytes <= aster_mesh::MAX_BLOB_CHUNKS",
                 1,
             ),
+            "OPEN authenticated source bound": rust.replace(
+                "length > MAX_STREAM_AUTHENTICATED_OPEN_BYTES",
+                "length > PROFILE5_SOURCE_CHUNK_BYTES",
+            ),
+            "OPEN custody presence enum": rust.replace(
+                "1 => Some(r.array()?)",
+                "2 => Some(r.array()?)",
+                1,
+            ),
             "ABX1 carrier bound": rust.replace(
                 "length > PROFILE5_CANONICAL_CARRIER_RECORD_BYTES",
                 "length > PROFILE5_CANONICAL_EXTENT_BYTES",
+            ),
+            "ABX1 magic": rust.replace('b"ABX1"', 'b"ABX2"', 1),
+            "ABX1 aggregate bound": rust.replace(
+                "bytes.len() > PROFILE5_CANONICAL_EXTENT_BYTES",
+                "bytes.len() > MAX_STREAM_AUTHENTICATED_OPEN_BYTES",
+                1,
+            ),
+            "ABX1 count bound": rust.replace("if count == 0", "if count == 1", 1),
+            "ABX1 index bound": rust.replace(
+                "end > aster_mesh::MAX_BLOB_CHUNKS",
+                "end >= aster_mesh::MAX_BLOB_CHUNKS",
+            ),
+            "ABX1 trailing bound": rust.replace(
+                "if offset != bytes.len()",
+                "if offset > bytes.len()",
+                1,
             ),
             "ASD1 protected-header bound": rust.replace(
                 "protected_len > MAX_PROTECTED_STREAM_DATA_HEADER_BYTES",
                 "protected_len > MAX_STREAM_EXTENT_BYTES",
             ),
+            "ASD1 magic": rust.replace('b"ASD1"', 'b"ASD2"', 1),
+            "ASD1 zero-header bound": rust.replace(
+                "protected_len == 0", "protected_len == 1", 1
+            ),
+            "SOURCE encoder chunk bound": rust.replace(
+                "x.bytes.len() > PROFILE5_SOURCE_CHUNK_BYTES",
+                "x.bytes.len() > MAX_STREAM_AUTHENTICATED_OPEN_BYTES",
+                1,
+            ),
+            "SOURCE decoder chunk bound": rust.replace(
+                "chunk_len > PROFILE5_SOURCE_CHUNK_BYTES",
+                "chunk_len > MAX_STREAM_AUTHENTICATED_OPEN_BYTES",
+                1,
+            ),
+            "ACCEPT encoder checkpoint bound": rust.replace(
+                "x.checkpoint_batch_bytes > MAX_STREAM_CHECKPOINT_BATCH_BYTES",
+                "x.checkpoint_batch_bytes > u32::MAX",
+                1,
+            ),
+            "ACCEPT decoder checkpoint bound": rust.replace(
+                "x.checkpoint_batch_bytes > MAX_STREAM_CHECKPOINT_BATCH_BYTES",
+                "x.checkpoint_batch_bytes > u32::MAX",
+                2,
+            ),
+            "RESULT wire mapping": rust.replace(
+                "1 => Ok(Self::Promoted)",
+                "1 => Ok(Self::IntegrityFailure)",
+                1,
+            ),
+            "terminal flow predicate": rust.replace(
+                "phase == Phase::Terminal",
+                "phase == Phase::Result",
+                1,
+            ),
+            "attempt nonce validator": rust.replace(
+                "v.iter().all(|b| *b == 0)",
+                "v.iter().all(|b| *b == 1)",
+                1,
+            ),
+            "extent shared validator": rust.replace(
+                "v as usize > MAX_STREAM_EXTENT_BYTES",
+                "v as usize > MAX_STREAM_AUTHENTICATED_OPEN_BYTES",
+                1,
+            ),
+            "FINISH shared validator": rust.replace(
+                "bytes.len() > max_bytes",
+                "bytes.len() >= max_bytes",
+                1,
+            ),
+            "FINISH decoder commitment bound": rust.replace(
+                "commitment_len > MAX_STREAM_SEMANTIC_COMMITMENT_BYTES",
+                "commitment_len > MAX_STREAM_AUTHENTICATED_OPEN_BYTES",
+                1,
+            ),
+            "CHECKPOINT encoder credit relation": rust.replace(
+                "x.absolute_receive_limit < x.durable_offset",
+                "x.absolute_receive_limit > x.durable_offset",
+                1,
+            ),
+            "CHECKPOINT decoder credit relation": rust.replace(
+                "x.absolute_receive_limit < x.durable_offset",
+                "x.absolute_receive_limit > x.durable_offset",
+                2,
+            ),
+            "DATA encoder offset overflow": rust.replace(
+                "x.offset\n                    .checked_add(l.into())",
+                "x.offset\n                    .checked_sub(l.into())",
+                1,
+            ),
+            "DATA decoder offset overflow": rust.replace(
+                "offset\n            .checked_add(extent_len.into())",
+                "offset\n            .checked_sub(extent_len.into())",
+                1,
+            ),
+            "record trailing-byte validator": rust.replace(
+                "self.o == self.b.len()",
+                "self.o <= self.b.len()",
+                1,
+            ),
+            "class wire mapping": rust.replace("Blob = 1", "Blob = 2", 1),
+            "direction wire mapping": rust.replace(
+                "ToSessionResponder = 2", "ToSessionResponder = 3", 1
+            ),
         }
         for name, changed in mutations.items():
+            self.assertNotEqual(changed, rust, name)
             with self.subTest(name=name), self.assertRaises(CHECKER.ContractViolation):
                 CHECKER.validate_profile5_schema(schema, changed)
 
@@ -483,6 +592,21 @@ class ProtocolVersionContractTests(unittest.TestCase):
         self.assertIn((True, (0xd6, 0xdd, 0xd7, 0xd8, 0xd9, 0xda, 0xdb, 0xdc)), transcripts)
         self.assertIn((True, (0xd6, 0xdd, 0xd7, 0xda, 0xdb, 0xdc)), transcripts)
         self.assertEqual(sum(not accepted for accepted, _ in transcripts), 4)
+
+    def test_profile_five_schema_flow_is_bound_to_checked_in_transcripts(self) -> None:
+        root = CHECKER_PATH.parents[1]
+        schema = json.loads((root / "conformance/profile5-wire-schema.json").read_text())
+        rust = (root / "crates/aster-node/src/stream_transfer.rs").read_text()
+        with tempfile.TemporaryDirectory() as directory:
+            scratch = Path(directory)
+            target = scratch / "fuzz/corpus/stream_transfer_decode"
+            shutil.copytree(root / "fuzz/corpus/stream_transfer_decode", target)
+            seed = target / "profile5-transcript-empty.bin"
+            payload = bytearray(seed.read_bytes())
+            payload[4] = 0
+            seed.write_bytes(payload)
+            with self.assertRaisesRegex(CHECKER.ContractViolation, "flow differs"):
+                CHECKER.validate_profile5_schema(schema, rust, scratch)
 
     def test_profile_five_oracle_and_vector_drift_fail(self) -> None:
         root = CHECKER_PATH.parents[1]

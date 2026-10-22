@@ -443,7 +443,38 @@ def validate_executable_profile_contract(
         fail("profile 5 receiver ceiling must use the exact canonical maximum wire shape")
 
 
-def validate_profile5_schema(schema: dict, stream_transfer: str) -> None:
+def require_source_fragments(label: str, source: str, fragments: tuple[str, ...]) -> None:
+    for fragment in fragments:
+        if re.sub(r"\s+", " ", fragment) not in source:
+            fail(f"executable profile 5 {label} differs at {fragment}")
+
+
+def decode_transcript_seed(path: Path) -> tuple[bool, list[str]]:
+    payload = path.read_bytes()
+    if not payload.startswith(b"AST1") or len(payload) < 6 or payload[4] not in (0, 1):
+        fail(f"profile 5 transcript seed {path.name} framing differs")
+    count, offset = payload[5], 6
+    names_by_tag = {tag: name for name, (tag, _) in PROFILE5_RECORDS.items()}
+    steps = []
+    for _ in range(count):
+        if offset + 4 > len(payload):
+            fail(f"profile 5 transcript seed {path.name} is truncated")
+        length = int.from_bytes(payload[offset:offset + 4], "big")
+        offset += 4
+        frame = payload[offset:offset + length]
+        offset += length
+        if len(frame) != length or len(frame) < 5 or frame[:4] != b"ASM\x01":
+            fail(f"profile 5 transcript seed {path.name} frame differs")
+        name = names_by_tag.get(frame[4])
+        if name is None:
+            fail(f"profile 5 transcript seed {path.name} tag differs")
+        steps.append(name)
+    if offset != len(payload):
+        fail(f"profile 5 transcript seed {path.name} has trailing bytes")
+    return payload[4] == 1, steps
+
+
+def validate_profile5_schema(schema: dict, stream_transfer: str, root: Path = ROOT) -> None:
     compact_stream = re.sub(r"\s+", " ", stream_transfer)
     if (
         schema.get("format") != "aster-profile5-fixed-binary-v1"
@@ -456,6 +487,8 @@ def validate_profile5_schema(schema: dict, stream_transfer: str) -> None:
     records = schema.get("records")
     if not isinstance(records, list) or len(records) != len(PROFILE5_RECORDS):
         fail("profile 5 schema record set differs")
+    encoder_arms = {}
+    decoder_arms = {}
     for record in records:
         name = record.get("name")
         if name not in PROFILE5_RECORDS:
@@ -471,6 +504,7 @@ def validate_profile5_schema(schema: dict, stream_transfer: str) -> None:
             fail(f"executable profile 5 encoder lacks {name}")
         end = stream_transfer.find("\n            Self::", start + len(marker))
         arm = re.sub(r"\s+", " ", stream_transfer[start:end if end >= 0 else None])
+        encoder_arms[name] = arm
         if f"o.push(0x{tag:02x})" not in arm:
             fail(f"executable profile 5 {name} tag differs")
         cursor = -1
@@ -481,18 +515,28 @@ def validate_profile5_schema(schema: dict, stream_transfer: str) -> None:
                 fail(f"executable profile 5 {name} field order differs at {token}")
             cursor = position
         if name == "DATA":
-            decoder_start = stream_transfer.find("impl StreamDataHeaderV1")
-            decoder_end = stream_transfer.find("impl StreamDataV1", decoder_start)
+            data_impl = stream_transfer.find("impl StreamDataHeaderV1")
+            decoder_start = stream_transfer.find(
+                "pub(crate) fn decode_for_context", data_impl
+            )
+            decode_body = stream_transfer.find(
+                "pub(crate) fn decode_body", decoder_start
+            )
+            decoder_end = stream_transfer.find("impl StreamDataV1", decode_body)
+            decoder_source = (
+                stream_transfer[decoder_start:decode_body]
+                + stream_transfer[decode_body:decoder_end]
+            )
         else:
             decoder = stream_transfer.find("pub(crate) fn decode_for_context", encoder)
             tag_marker = f"0x{tag:02x} =>"
             decoder_start = stream_transfer.find(tag_marker, decoder)
             decoder_end = stream_transfer.find("\n            0x", decoder_start + len(tag_marker))
+            decoder_source = stream_transfer[decoder_start:decoder_end if decoder_end >= 0 else None]
         if decoder_start < 0:
             fail(f"executable profile 5 decoder lacks {name}")
-        decoder_arm = re.sub(
-            r"\s+", " ", stream_transfer[decoder_start:decoder_end if decoder_end >= 0 else None]
-        )
+        decoder_arm = re.sub(r"\s+", " ", decoder_source)
+        decoder_arms[name] = decoder_arm
         cursor = -1
         for token in PROFILE5_RUST_DECODE_ORDER[name]:
             token = re.sub(r"\s+", " ", token)
@@ -500,6 +544,47 @@ def validate_profile5_schema(schema: dict, stream_transfer: str) -> None:
             if position < 0:
                 fail(f"executable profile 5 {name} decoder field order differs at {token}")
             cursor = position
+    encoder_validators = {
+        "OPEN": ("nonce(&x.attempt_nonce)?", "validate_profile5_wire_len(x.total_len)?", "x.source_len == 0", "length > MAX_STREAM_AUTHENTICATED_OPEN_BYTES", "match x.custody_digest"),
+        "SOURCE": ("nonce(&x.attempt_nonce)?", "x.bytes.is_empty()", "x.bytes.len() > PROFILE5_SOURCE_CHUNK_BYTES", "x.total_len == 0", "length > MAX_STREAM_AUTHENTICATED_OPEN_BYTES", "x.offset .checked_add", "end > x.total_len"),
+        "ACCEPT": ("nonce(&x.attempt_nonce)?", "extent(x.max_extent_bytes)?", "x.absolute_receive_limit < x.durable_offset", "x.checkpoint_batch_bytes == 0", "x.checkpoint_batch_bytes > MAX_STREAM_CHECKPOINT_BATCH_BYTES"),
+        "DATA": ("nonce(&x.attempt_nonce)?", "u32::try_from(x.bytes.len())", "extent(l)?", "x.offset .checked_add"),
+        "CHECKPOINT": ("nonce(&x.attempt_nonce)?", "x.absolute_receive_limit < x.durable_offset"),
+        "FINISH": ("nonce(&x.attempt_nonce)?", "validate_semantic_commitment(&x.semantic_commitment)?", "u32::try_from(x.semantic_commitment.len())"),
+        "RESULT": ("nonce(&x.attempt_nonce)?", "o.push(x.code as u8)"),
+        "ACK": ("nonce(&x.attempt_nonce)?",),
+    }
+    decoder_validators = {
+        "OPEN": ("StreamClass::decode(r.u8()?)?", "StreamDirection::decode(r.u8()?)?", "r.u16() != Ok(9)", "r.u16() != Ok(5)", "validate_profile5_wire_len(total_len)?", "nonce(&attempt_nonce)?", "0 => None", "1 => Some(r.array()?)", "source_len == 0", "length > MAX_STREAM_AUTHENTICATED_OPEN_BYTES"),
+        "SOURCE": ("r.attempt()?", "chunk_len == 0", "chunk_len > PROFILE5_SOURCE_CHUNK_BYTES", "total_len == 0", "length > MAX_STREAM_AUTHENTICATED_OPEN_BYTES", "offset .checked_add", "end > total_len", "r.take(chunk_len)?"),
+        "ACCEPT": ("r.attempt()?", "extent(x.max_extent_bytes)?", "x.absolute_receive_limit < x.durable_offset", "x.checkpoint_batch_bytes == 0", "x.checkpoint_batch_bytes > MAX_STREAM_CHECKPOINT_BATCH_BYTES"),
+        "DATA": ("r.attempt()?", "extent(extent_len)?", "offset .checked_add", "b.len() != self.extent_len as usize"),
+        "CHECKPOINT": ("r.attempt()?", "x.absolute_receive_limit < x.durable_offset"),
+        "FINISH": ("r.attempt()?", "commitment_len == 0", "commitment_len > MAX_STREAM_SEMANTIC_COMMITMENT_BYTES", "r.take(commitment_len)?"),
+        "RESULT": ("r.attempt()?", "StreamResultCode::decode(r.u8()?)?"),
+        "ACK": ("r.attempt()?",),
+    }
+    for name in PROFILE5_RECORDS:
+        require_source_fragments(f"{name} encoder validator", encoder_arms[name], encoder_validators[name])
+        require_source_fragments(f"{name} decoder validator", decoder_arms[name], decoder_validators[name])
+    require_source_fragments("enum wire mappings", compact_stream, (
+        "pub(crate) enum StreamClass { Blob = 1, }",
+        "(v == 1) .then_some(Self::Blob)",
+        "pub(crate) enum StreamDirection { ToSessionInitiator = 1, ToSessionResponder = 2, }",
+        "1 => Ok(Self::ToSessionInitiator), 2 => Ok(Self::ToSessionResponder)",
+        "pub(crate) enum StreamResultCode { Promoted = 1, AlreadyPresent = 2, DeferredCapacity = 3, RetiredExpired = 4, RejectedPolicy = 5, IntegrityFailure = 6, }",
+        "1 => Ok(Self::Promoted), 2 => Ok(Self::AlreadyPresent), 3 => Ok(Self::DeferredCapacity), 4 => Ok(Self::RetiredExpired), 5 => Ok(Self::RejectedPolicy), 6 => Ok(Self::IntegrityFailure)",
+    ))
+    require_source_fragments("shared validators", compact_stream, (
+        "fn nonce(v: &[u8; 32]) -> Result<(), StreamError> { if v.iter().all(|b| *b == 0)",
+        "fn extent(v: u32) -> Result<(), StreamError> { if v == 0 || v as usize > MAX_STREAM_EXTENT_BYTES",
+        "validate_semantic_commitment_with_max(bytes, MAX_STREAM_SEMANTIC_COMMITMENT_BYTES)",
+        "if max_bytes == 0 || bytes.is_empty() || bytes.len() > max_bytes",
+        "if bytes <= aster_mesh::PROFILE5_MAX_CANONICAL_WIRE_BYTES",
+        "if self.o == self.b.len()",
+    ))
+    if compact_stream.count("if max_bytes == 0 || bytes.is_empty() || bytes.len() > max_bytes") != 2:
+        fail("executable profile 5 bounded byte validators differ")
     if schema.get("attempt_fields") != PROFILE5_ATTEMPT_FIELDS:
         fail("profile 5 nested attempt tuple differs")
     for start_marker, end_marker, tokens in (
@@ -521,6 +606,9 @@ def validate_profile5_schema(schema: dict, stream_transfer: str) -> None:
         fail("profile 5 ABX1 schema differs")
     if abx1.get("fields") != PROFILE5_ABX1_FIELDS:
         fail("profile 5 ABX1 fields or bounds differ")
+    abx1_start = compact_stream.find("const CANONICAL_BLOB_EXTENT_MAGIC")
+    abx1_end = compact_stream.find("pub(crate) enum StreamClass", abx1_start)
+    abx1_source = compact_stream[abx1_start:abx1_end]
     for fragment in (
         'CANONICAL_BLOB_EXTENT_MAGIC: &[u8; 4] = b"ABX1"',
         ".checked_add(self.carriers.len() as u64)",
@@ -533,13 +621,16 @@ def validate_profile5_schema(schema: dict, stream_transfer: str) -> None:
         "bytes[12..16]", "if count == 0", "length == 0",
         "length > PROFILE5_CANONICAL_CARRIER_RECORD_BYTES", "offset != bytes.len()",
     ):
-        if fragment not in compact_stream:
+        if fragment not in abx1_source:
             fail(f"executable profile 5 ABX1 validator differs at {fragment}")
     composite = schema.get("composite", {})
     if composite.get("magic") != "41534431" or composite.get("max_encoded_bytes") != 1_050_632:
         fail("profile 5 ASD1 composite schema differs")
     if composite.get("fields") != PROFILE5_COMPOSITE_FIELDS:
         fail("profile 5 ASD1 fields or bounds differ")
+    composite_start = compact_stream.find("const COMPOSITE_DATA_MAGIC")
+    composite_end = compact_stream.find("fn decode_data", composite_start)
+    composite_source = compact_stream[composite_start:composite_end]
     for fragment in (
         'COMPOSITE_DATA_MAGIC: &[u8; 4] = b"ASD1"',
         "protected_header.len() > MAX_PROTECTED_STREAM_DATA_HEADER_BYTES",
@@ -548,10 +639,35 @@ def validate_profile5_schema(schema: dict, stream_transfer: str) -> None:
         "protected_len > MAX_PROTECTED_STREAM_DATA_HEADER_BYTES", "&bytes[8..body_offset]",
         "&bytes[body_offset..]",
     ):
-        if fragment not in compact_stream:
+        if fragment not in composite_source:
             fail(f"executable profile 5 ASD1 validator differs at {fragment}")
     if schema.get("flow") != PROFILE5_FLOWS:
         fail("profile 5 empty or nonempty flow differs")
+    seed_root = root / "fuzz/corpus/stream_transfer_decode"
+    expected_seed_flows = {
+        "profile5-transcript-nonempty.bin": schema["flow"]["nonempty"][1:],
+        "profile5-transcript-empty.bin": schema["flow"]["empty"][1:],
+    }
+    for seed_name, expected_steps in expected_seed_flows.items():
+        accepted, steps = decode_transcript_seed(seed_root / seed_name)
+        if not accepted or steps != expected_steps:
+            fail(f"profile 5 {seed_name} flow differs from schema")
+    rejected = [
+        decode_transcript_seed(path)[0]
+        for path in seed_root.glob("profile5-transcript-reject-*.bin")
+    ]
+    if len(rejected) != 4 or any(rejected):
+        fail("profile 5 rejected transcript branch corpus differs")
+    require_source_fragments("flow state model", compact_stream, (
+        "phase = Phase::Data", "phase = Phase::Finished", "phase = Phase::Result",
+        "phase = Phase::Terminal", "phase == Phase::Terminal",
+        "drive_fuzz_transcript(&frames), model_fuzz_transcript(&frames)",
+        "assert_eq!(model_fuzz_transcript(&frames), expected)",
+        "assert_eq!(drive_fuzz_transcript(&frames), expected)",
+        "sender.accept(value.clone())", "receiver.data(value)",
+        "sender.checkpoint(value.clone())", "receiver.finish(value.clone())",
+        "sender.result(value.clone())", "receiver.result_ack(",
+    ))
     if stream_transfer.count("validate_profile5_wire_len(x.total_len)?") != 1 or stream_transfer.count("validate_profile5_wire_len(total_len)?") != 1:
         fail("profile 5 OPEN encoder/decoder wire bound differs")
     if "bytes <= aster_mesh::PROFILE5_MAX_CANONICAL_WIRE_BYTES" not in stream_transfer:
@@ -568,6 +684,21 @@ def validate_profile5_oracle(root: Path = ROOT) -> None:
     )
     if result.returncode != 0:
         fail(f"profile 5 oracle/vectors drifted: {result.stderr.strip() or result.stdout.strip()}")
+
+
+def validate_profile5_runtime_flow(root: Path = ROOT) -> None:
+    result = subprocess.run(
+        [
+            "cargo", "test", "-p", "aster-node", "--features", "fuzzing",
+            "transcript_seed_expectations_match_model_and_production_states", "--", "--nocapture",
+        ],
+        cwd=root, capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        fail(
+            "profile 5 production transcript conformance failed: "
+            + (result.stderr.strip() or result.stdout.strip())
+        )
 
 
 def validate_contract_texts(
@@ -601,6 +732,7 @@ def main() -> int:
             (ROOT / "crates/aster-node/src/stream_transfer.rs").read_text(),
         )
         validate_profile5_oracle()
+        validate_profile5_runtime_flow()
     except (ContractViolation, OSError) as error:
         print(f"protocol version contract check failed: {error}", file=sys.stderr)
         return 1
