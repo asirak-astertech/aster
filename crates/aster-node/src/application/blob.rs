@@ -1004,8 +1004,11 @@ pub struct BlobReadRequest {
 ///
 /// `offset` is an absolute plaintext byte offset and `max_bytes` must be in
 /// `1..=MAX_SELECTED_BLOB_PAGE_BYTES`. The final page may be shorter. An
-/// offset at or beyond the authenticated Blob length is rejected rather than
-/// manufacturing an empty plaintext result.
+/// offset at or beyond a nonempty authenticated Blob length is rejected rather
+/// than manufacturing an empty plaintext result. The sole exception is an
+/// authenticated zero-length semantic-v9/profile-5 publication: exact offset
+/// zero returns one empty, complete terminal page. That page is authenticated
+/// EOF, not unauthenticated absence; no other offset is accepted.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BlobReadPageRequest {
     pub blob: BlobReadRequest,
@@ -1215,6 +1218,11 @@ impl SelectedBlobHandle {
     }
 
     /// Opens or resumes one bounded single-pass Blob publication stream.
+    ///
+    /// `total_len == 0` is valid for semantic-v9/profile-5. Such a stream accepts
+    /// no data writes and is finalized directly; a later read at offset zero
+    /// returns the authenticated empty terminal page documented by
+    /// [`BlobReadPageRequest`]. Profile-4 peers cannot receive that publication.
     pub async fn open_publish_stream(
         &self,
         request: BlobPublishStreamRequest,
@@ -1242,6 +1250,11 @@ impl SelectedBlobHandle {
     }
 
     /// Reads one authenticated, zeroize-on-drop plaintext page.
+    ///
+    /// An authenticated zero-length semantic-v9/profile-5 publication returns
+    /// exactly one empty, complete page at offset zero. This terminal EOF is the
+    /// only successful zero-length page; it must not be inferred from a missing
+    /// publication, failed authorization, or an offset beyond nonempty content.
     ///
     /// The unique current source is exact-loaded and content-authenticated.
     /// Inactive alternates are rechecked as projection-only durable rows

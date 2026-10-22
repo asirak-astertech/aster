@@ -511,12 +511,13 @@ Code received over the mesh is never executed.
 ### 8.4 Blob
 
 A Blob manifest contains total length, media/schema metadata, chunk size, ordered
-SHA-256 chunk digests, and a full-content digest. Default chunk size is 16 KiB,
-configurable from 4–64 KiB. Chunks use independently derived keys/nonces and are
-verified and committed while streaming. A complete blob digest is verified before
-delivery. The canonical manifest is at most 1 MiB and is independently
-implementable from [envelope.md](envelope.md). The current durable Blob service
-can resume local chunk production and reading without whole-Blob RAM growth.
+SHA-256 chunk digests, and a full-content digest. The selected application
+profile uses canonical 64-KiB chunks with independently derived keys/nonces.
+Chunks are verified and committed while streaming, and the complete Blob digest
+is verified before delivery. The selected 8-GiB ceiling permits 131,072 chunks
+and an exact maximum encoded manifest of 9,438,606 bytes. The current durable
+Blob service can resume local upload and peer transfer without whole-Blob RAM
+growth.
 
 The selected node's legacy application profile fixes canonical chunks at 64 KiB. A
 stopped `SelectedBlobNode` retains synchronous streaming, while
@@ -534,14 +535,15 @@ depot capability, or post-commit verification is `FatalBlobCoherence` and
 terminates the actor after closing application admission; it is not downgraded
 to an ordinary per-request error.
 
-The semantic-v9 application Blob stream is a distinct protocol path. It admits
-one nonempty object up to 8 GiB, carries offset-bearing 512-KiB RPC frames, and
-maps them into independently authenticated 1-MiB segments. Two bounded map
-workers may seal or open adjacent segments concurrently; an ordered merge is
-the sole authority that appends pack records or emits plaintext. The pack and
-redb projection checkpoint every 64 MiB, so restart advertises only the durable
-contiguous frontier and retransmits at most that bounded tail. These limits do
-not raise the legacy profile-4 64-MiB network Blob ceiling.
+The semantic-v9 application Blob stream admits an object from zero through 8
+GiB and carries offset-bearing RPC frames of at most 512 KiB into provisional,
+node-protected staging. Two finalization workers and two queued jobs bound the
+simultaneous two-pass hash/encryption work; finalization promotes through the
+same canonical Blob transaction as the legacy file publisher. Provisional
+bytes, the canonical output being constructed, pending network prefixes, and
+completed content all consume configured Blob depot capacity. Operators must
+therefore allow for physical staging/canonical overlap during finalization; an
+8-GiB logical limit is not an 8-GiB filesystem sizing promise.
 
 Durable Blob lifecycle authority is local and wire-neutral. Permanent physical-
 lineage fences and accepted-publication replay fences are independently bounded
@@ -572,9 +574,11 @@ source envelope and requires the exact authenticated route commitment and exact
 manifest bytes; BlobID or manifest equality alone cannot substitute a different
 route root or chunk count.
 
-Empty manifests are canonical local objects, but envelope format 2 requires a
-nonzero route chunk count, so a zero-byte Blob is not publishable in this network
-profile. A manifest has at most 14,543 chunks and 1 MiB of bytes.
+Empty manifests are canonical semantic-v9/profile-5 objects. They have zero
+chunks and complete through an authenticated terminal EOF; profile 4 cannot
+represent them. Nonempty profile-5 manifests have at most 131,072 canonical
+chunks. The historical semantic-v7/v8/profile-4 compatibility path remains
+limited to nonempty 64-MiB/1,024-chunk publications.
 The composite per-contact inventory is capped at 100,000 ObjectIDs with source
 envelopes inserted before Blob carriers. A source-envelope selection that alone
 exceeds the cap is rejected rather than silently truncated. Content-authorized nodes retain both a
@@ -1022,7 +1026,8 @@ Blob mechanics. Immediately after the four-flight handshake, the
 initiator sends and the responder returns one protected canonical
 `TransferProfileOfferV1`. Known lane IDs are `1` Event, `2` State, `3` Record,
 `4` Blob, and `5` EventBridge. Known profile IDs are `1` `LegacyV6`, `2`
-`EventPagesV1`, `3` reserved for `BlobCustodyV1` (not implemented), and `4` `BlobRangesStreamV1`. Lanes and profiles are strictly
+`EventPagesV1`, `3` reserved for `BlobCustodyV1` (not implemented), `4`
+`BlobRangesStreamV1`, and `5` `BlobStreamV1`. Lanes and profiles are strictly
 descending and unique. Event, State, Record, and EventBridge MUST offer
 `LegacyV6`. Blob offers MUST contain `LegacyV6`, `BlobRangesStreamV1`, or
 `BlobStreamV1`;
@@ -1031,6 +1036,11 @@ semantic v7/v8 offers only `BlobRangesStreamV1`, while semantic v9 offers only
 `BlobRangesStreamV1` or `BlobStreamV1`. Unknown
 IDs with bit `0x8000` set are critical and fail the contact; other unknown IDs
 remain canonical digest input but are not selected.
+
+Blob profile registry: semantic v7/v8 select profile 4; semantic v9 selects profile 5.
+Profile 4 limits: 67,108,864 object bytes; 1,024 canonical chunks; 1,048,576 authenticated-source bytes.
+Profile 5 limits: 8,589,934,592 object bytes; 131,072 canonical chunks; 16,777,216 authenticated-source bytes.
+Profile 5 size classes: 65,536 plaintext chunk bytes; 66,215 encrypted carrier bytes; 1,048,576 ABX1 extent bytes; 134,217,728 checkpoint bytes; 2,097,152 Iroh frame bytes.
 
 Both peers compute the same highest common profile independently for each lane
 and bind the complete canonical offers plus intersections into
@@ -1050,10 +1060,14 @@ selection before v9 fails closed. A v9/v8 or v9/v7 peer pair first negotiates
 the lower semantic version and then uses that version's exact profile-4 offer;
 an active profile-5 attempt is never downgraded into profile 4.
 
+Profile 5 order: PLAN -> OPEN -> SOURCE -> ACCEPT -> ABX1 DATA -> CHECKPOINT -> FINISH -> RESULT -> ACK.
+Profile 5 exact empty transfer: OPEN -> SOURCE -> ACCEPT -> FINISH(final_offset=0) -> RESULT -> ACK, with no DATA or CHECKPOINT.
+
 Semantic v9 reserves mechanics tags `0xd6` `StreamOpenV1`, `0xd7`
 `StreamAcceptV1`, `0xd8` `StreamDataV1`, `0xd9` `StreamCheckpointV1`, `0xda`
-`StreamFinishV1`, `0xdb` `StreamResultV1`, and `0xdc` `StreamResultAckV1` for
-profile 5. The bounded grammar and runtime driver are implemented. After an
+`StreamFinishV1`, `0xdb` `StreamResultV1`, `0xdc` `StreamResultAckV1`, and
+`0xdd` `StreamSourceV1` for profile 5. The bounded grammar and runtime driver
+are implemented. After an
 authenticated v9/profile-5 selection, the contact exchanges a signed stream
 plan and opens one bounded control/data stream pair for the selected direction;
 framing, authentication, checkpoint, terminal-root, lifecycle, or settlement
@@ -1070,25 +1084,34 @@ The canonical record bodies are:
 
 | Tag | Body after prefix and tag |
 | --- | --- |
-| `0xd6` StreamOpenV1 | `class u8 || direction u8 || semantic_version u16 = 9 || profile_id u16 = 5 || session_transcript[32] || exchange_id u64 || transfer_id[32] || source_transfer_id[32] || publication_id[32] || variant_id[32] || total_len u64 || attempt_nonce[32] || checkpoint_generation u64 || custody_present u8 || custody_digest[32] iff present` |
+| `0xd6` StreamOpenV1 | `class u8 || direction u8 || semantic_version u16 = 9 || profile_id u16 = 5 || session_transcript[32] || exchange_id u64 || transfer_id[32] || source_transfer_id[32] || publication_id[32] || variant_id[32] || total_len u64 || attempt_nonce[32] || checkpoint_generation u64 || custody_present u8 || custody_digest[32] iff present || source_len u32 || source_digest[32]` |
+| `0xdd` StreamSourceV1 | `attempt tuple || source_offset u32 || source_total_len u32 || source_chunk_len u32 || source_chunk[source_chunk_len]` |
 | `0xd7` StreamAcceptV1 | `attempt tuple || durable_offset u64 || checkpoint_generation u64 || absolute_receive_limit u64 || max_extent_bytes u32 || checkpoint_batch_bytes u32` |
 | `0xd8` StreamDataV1 | `attempt tuple || offset u64 || extent_len u32 || extent[extent_len]` |
 | `0xd9` StreamCheckpointV1 | `attempt tuple || durable_offset u64 || checkpoint_generation u64 || absolute_receive_limit u64` |
-| `0xda` StreamFinishV1 | `attempt tuple || final_offset u64` |
+| `0xda` StreamFinishV1 | `attempt tuple || final_offset u64 || semantic_commitment_len u32 || semantic_commitment[semantic_commitment_len]` |
 | `0xdb` StreamResultV1 | `attempt tuple || final_offset u64 || result_code u8 || result_digest[32]` |
 | `0xdc` StreamResultAckV1 | `attempt tuple || result_digest[32]` |
 
 `class = 1` is Blob. Result codes are `1` Promoted, `2` AlreadyPresent, `3`
 DeferredCapacity, `4` RetiredExpired, `5` RejectedPolicy, and `6`
-IntegrityFailure. Extents are nonempty and at most 1,048,576 bytes;
-checkpoint batches are nonzero and at most 8 MiB. A reader MUST consume and
+IntegrityFailure. SOURCE chunks and ABX1 DATA extents are independently
+nonempty and at most 1,048,576 bytes; authenticated source totals are at most
+16 MiB. ABX1 batches complete, byte-identical canonical `ASTRBT01` carriers and
+never slices one. A batch starts `"ABX1" || first_chunk_index u64 ||
+carrier_count u32` and contains `carrier_count` repetitions of `carrier_len u32
+|| carrier`; count, index range, every carrier length, total extent length,
+truncation, and trailing bytes are checked. Checkpoint batches are nonzero and
+at most 128 MiB. A reader MUST consume and
 validate the fixed 89-byte StreamData header, reserve the exact declared body
 against the global streaming budget, and only then read or allocate the body.
 Credit is an absolute offset and never decreases within an attempt. Durable
 offsets and checkpoint generations never move backward. Reopen uses a fresh
 nonce and resumes only from the receiver's durable offset. Duplicate terminal
 records replay the same digest-bound result or acknowledgement and never repeat
-promotion.
+promotion. Receiver checkpoints bind the canonical publication and are not
+owned by a peer, connection, adapter, or IP address; a fresh attempt nonce can
+resume the durable offset through another eligible ordered reliable adapter.
 
 Finite profile-5 work uses `BlobCustodyClaimV2[208]`. Its field widths and age
 semantics are identical to `BlobCustodyClaimV1`, but its fixed header is
@@ -1114,16 +1137,18 @@ one composite carrier message:
 `protected_header` is a mission-protected record whose plaintext is exactly the
 canonical fixed 89-byte `StreamDataV1` header through `extent_len`; its encoded
 length is nonzero and bounded at 2,048 bytes. The adjacent extent is not wrapped
-in a second mission AEAD. It is exactly one length-prefixed canonical,
-source-encrypted Blob-pack segment, bounded at 1,048,710 bytes, whose source
-AEAD binds its stream, open digest, epoch, segment index, offsets, declared
-lengths, and ciphertext. The receiver first
+in a second mission AEAD. It is one ABX1 batch of complete canonical `ASTRBT01`
+encrypted chunk carriers. Each canonical chunk contains at most 65,536
+plaintext bytes and each encoded carrier is at most 66,215 bytes; the ABX1
+extent is at most 1,048,576 bytes, below the selected Iroh 2,097,152-byte
+exchange ceiling. The receiver first
 authenticates the protected header, requires the adjacent extent length to equal
 the authenticated `extent_len`, rejects fragmented or coalesced pack records,
 and then verifies that segment before it can advance durable credit. A changed,
 substituted, truncated, replayed, or
-cross-stream extent therefore fails source authentication or canonical pack
-validation; carrier integrity is not used as the content trust boundary. This
+cross-stream extent therefore fails source authentication or canonical carrier
+validation. ASTRBS02 is only node-protected provisional upload staging and is
+never semantic-v9 wire data or a second durable publication representation. This
 split avoids encrypting and copying every large extent through two independent
 record layers while retaining mission authorization for the attempt metadata
 and end-to-end source authentication for the content.
@@ -2195,6 +2220,7 @@ outbound, and replay limits:
 | mutable fairness cursor | 256 configured mission peers, 4 peer/class/local-mode rows each, 1,024 rows total | startup rejects an overbound configured set and prunes rows for peers no longer configured; ordinary data quota cannot consume the reserve |
 | live application command lane | 32 commands shared by Event, State, Record, and Blob; one queued command for the joined Blob worker | a full Blob worker queue returns explicit `ResourceLimit`; shutdown and zeroization close both admissions and join the worker |
 | live Blob publication | one owned nonempty regular file at byte-zero cursor, at most 64 MiB and 1,024 fixed 64-KiB chunks | invalid shape is rejected; overbound input returns `ResourceLimit`; a source changed across the two passes returns conflict and cannot silently rebind the operation |
+| streamed Blob publication | zero through 8 GiB and at most 131,072 fixed 64-KiB canonical chunks after finalization | provisional and canonical overlap is charged to configured depot capacity; two finalizers plus two queued jobs bound local CPU/memory work; exact operation retry recovers durable local progress |
 | live Blob plaintext page | `1..=64 KiB`, spanning at most two canonical chunks | zero or overbound requests are rejected; the returned allocation zeroizes on drop; durable/cache/depot coherence loss is actor-fatal |
 | logical sends per pump | 128 | remaining due work keeps its monotonic deadline |
 | UDP datagrams examined per adapter poll | 64 | yields `None`; a later poll may continue queued input |

@@ -10,6 +10,13 @@ import struct
 import sys
 
 ROOT = Path(__file__).resolve().parent
+STREAM_MAGIC = b'ASM\x01'
+ATTEMPT_ID = b'\x11' * 32
+ATTEMPT_NONCE = b'\x22' * 32
+MAX_SOURCE_CHUNK = 1024 * 1024
+MAX_AUTHENTICATED_SOURCE = 16 * 1024 * 1024
+MAX_EXTENT = 1024 * 1024
+MAX_CHECKPOINT = 128 * 1024 * 1024
 
 
 def u16(n):
@@ -82,13 +89,156 @@ def corpus():
                        ('count', terminal[:37] + u16(0)),
                        ('kind', b'ABRD' + terminal[4:])]:
         add(False, 'terminal', name, wire)
-    return '# aster-blob-stream-records/v1\toracle=python-stdlib\n' + ''.join(
+    return ('# aster-blob-ranges-stream-records/v1\tsemantic=7,8\tprofile=4\toracle=python-stdlib\n'
+            '# This is the immutable profile-4 compatibility corpus; it is never ASTRBS02 semantic-v9 data.\n' + ''.join(
         '\t'.join(row) + '\n' for row in rows)
+            )
+
+
+def attempt(sequence=0):
+    return ATTEMPT_ID + ATTEMPT_NONCE + struct.pack('>Q', sequence)
+
+
+def stream_open(total=32):
+    return (STREAM_MAGIC + b'\xd6\x01\x02' + struct.pack('>HH', 9, 5)
+            + b'\x33' * 32 + struct.pack('>Q', 1) + ATTEMPT_ID
+            + b'\x44' * 32 + b'\x55' * 32 + b'\x66' * 32
+            + struct.pack('>Q', total) + ATTEMPT_NONCE + struct.pack('>Q', 0)
+            + b'\x00' + struct.pack('>I', 32) + b'\x77' * 32)
+
+
+def stream_source():
+    source = b'ASTRENV3' + b'\x99' * 24
+    return (STREAM_MAGIC + b'\xdd' + attempt(0) + struct.pack('>III', 0, len(source), len(source))
+            + source)
+
+
+def abx1_extent():
+    carrier = b'ASTRBT01' + b'\xaa' * 24
+    return b'ABX1' + struct.pack('>QI', 0, 1) + struct.pack('>I', len(carrier)) + carrier
+
+
+def stream_accept(extent_len):
+    return (STREAM_MAGIC + b'\xd7' + attempt(0) + struct.pack(
+        '>QQQII', 0, 0, extent_len, MAX_EXTENT, MAX_CHECKPOINT))
+
+
+def stream_data(extent):
+    return STREAM_MAGIC + b'\xd8' + attempt(0) + struct.pack('>QI', 0, len(extent)) + extent
+
+
+def stream_checkpoint(extent_len):
+    return STREAM_MAGIC + b'\xd9' + attempt(0) + struct.pack('>QQQ', extent_len, 1, extent_len)
+
+
+def stream_finish(extent_len):
+    return (STREAM_MAGIC + b'\xda' + attempt(1) + struct.pack('>QI', extent_len, 32)
+            + b'\x88' * 32)
+
+
+def stream_result(extent_len):
+    return (STREAM_MAGIC + b'\xdb' + attempt(1) + struct.pack('>QB', extent_len, 1)
+            + b'\x99' * 32)
+
+
+def stream_ack():
+    return STREAM_MAGIC + b'\xdc' + attempt(2) + b'\x99' * 32
+
+
+def decode_stream_record(wire):
+    """Independent structural decoder for checked-in semantic-v9/profile-5 seeds."""
+    if len(wire) < 5 or wire[:4] != STREAM_MAGIC:
+        raise ValueError('stream prefix')
+    tag = wire[4]
+    body = memoryview(wire)[5:]
+    fixed = {0xd7: 104, 0xd9: 96, 0xdb: 113, 0xdc: 104}
+    if tag == 0xd6:
+        if len(body) not in (259, 291) or body[0:2].tobytes() != b'\x01\x02':
+            raise ValueError('open length/class/direction')
+        if struct.unpack('>HH', body[2:6]) != (9, 5) or not any(body[182:214]):
+            raise ValueError('open context/nonce')
+        custody = body[222]
+        source_offset = 223 + (32 if custody == 1 else 0)
+        if custody not in (0, 1) or len(body) != source_offset + 36:
+            raise ValueError('open custody')
+        source_len = struct.unpack('>I', body[source_offset:source_offset + 4])[0]
+        if source_len == 0 or source_len > MAX_AUTHENTICATED_SOURCE:
+            raise ValueError('open source length')
+        return tag
+    if tag == 0xdd:
+        if len(body) < 84 or not any(body[32:64]):
+            raise ValueError('source fixed fields')
+        offset, total, length = struct.unpack('>III', body[72:84])
+        if length == 0 or length > MAX_SOURCE_CHUNK or total == 0 or total > MAX_AUTHENTICATED_SOURCE:
+            raise ValueError('source bounds')
+        if offset + length > total or len(body) != 84 + length:
+            raise ValueError('source framing')
+        return tag
+    if tag in fixed:
+        if len(body) != fixed[tag] or not any(body[32:64]):
+            raise ValueError('fixed record')
+        if tag == 0xd7:
+            durable, _, limit, extent, checkpoint = struct.unpack('>QQQII', body[72:104])
+            if durable > limit or extent == 0 or extent > MAX_EXTENT or checkpoint == 0 or checkpoint > MAX_CHECKPOINT:
+                raise ValueError('accept bounds')
+        elif tag == 0xd9:
+            durable, _, limit = struct.unpack('>QQQ', body[72:96])
+            if durable > limit:
+                raise ValueError('checkpoint credit')
+        elif tag == 0xdb and body[80] not in range(1, 7):
+            raise ValueError('result code')
+        return tag
+    if tag == 0xd8:
+        if len(body) < 84 or not any(body[32:64]):
+            raise ValueError('data fixed fields')
+        offset, length = struct.unpack('>QI', body[72:84])
+        if length == 0 or length > MAX_EXTENT or offset + length > 0xffffffffffffffff:
+            raise ValueError('data bounds')
+        if len(body) != 84 + length:
+            raise ValueError('data framing')
+        return tag
+    if tag == 0xda:
+        if len(body) < 84 or not any(body[32:64]):
+            raise ValueError('finish fixed fields')
+        length = struct.unpack('>I', body[80:84])[0]
+        if length == 0 or length > 64 * 1024 or len(body) != 84 + length:
+            raise ValueError('finish commitment')
+        return tag
+    raise ValueError('unknown stream tag')
+
+
+def profile5_stream_corpus():
+    extent = abx1_extent()
+    accepted = [
+        ('open', stream_open()), ('source', stream_source()),
+        ('accept', stream_accept(len(extent))), ('data-abx1', stream_data(extent)),
+        ('checkpoint', stream_checkpoint(len(extent))), ('finish', stream_finish(len(extent))),
+        ('result', stream_result(len(extent))), ('ack', stream_ack()),
+    ]
+    rows = [('ACCEPT', name, wire) for name, wire in accepted]
+    rows.extend([
+        ('REJECT', 'open-zero-attempt', accepted[0][1][:187] + b'\x00' * 32 + accepted[0][1][219:]),
+        ('REJECT', 'data-truncated', accepted[3][1][:-1]),
+        ('REJECT', 'data-trailing', accepted[3][1] + b'\x00'),
+        ('REJECT', 'data-offset-overflow', accepted[3][1][:77] + struct.pack('>Q', 0xffffffffffffffff) + accepted[3][1][85:]),
+        ('REJECT', 'finish-empty-commitment', accepted[5][1][:85] + struct.pack('>I', 0)),
+    ])
+    for status, _, wire in rows:
+        decoded = True
+        try:
+            decode_stream_record(wire)
+        except ValueError:
+            decoded = False
+        assert decoded == (status == 'ACCEPT')
+    return '# aster-profile5-stream-records/v1\tsemantic=9\tprofile=5\toracle=python-stdlib\n' + ''.join(
+        f'{status}\t{name}\t{wire.hex()}\n' for status, name, wire in rows)
 
 
 def profile5_composite_corpus():
+    extent = abx1_extent()
+    data_header = stream_data(extent)[:89]
     rows = [
-        ('ACCEPT', 'one-segment', b'ASD1' + struct.pack('>I', 2) + b'\xa1\xa2\xb1\xb2\xb3'),
+        ('ACCEPT', 'abx1-data', b'ASD1' + struct.pack('>I', len(data_header)) + data_header + extent),
         ('REJECT', 'wrong-magic', b'ASD2' + struct.pack('>I', 2) + b'\xa1\xa2\xb1'),
         ('REJECT', 'zero-header', b'ASD1' + struct.pack('>I', 0) + b'\xb1'),
         ('REJECT', 'oversized-header', b'ASD1' + struct.pack('>I', 2049) + b'\xa1'),
@@ -108,6 +258,7 @@ def main():
     outputs = {
         'blob-ranges-stream-v1.tsv': offer,
         'blob-stream-records-v1.tsv': corpus(),
+        'profile5-stream-records-v1.tsv': profile5_stream_corpus(),
         'profile5-composite-data-record-v1.tsv': profile5_composite_corpus(),
     }
     for name, text in outputs.items():
@@ -122,7 +273,25 @@ def main():
         seed.write_bytes(seed_bytes)
     else:
         assert seed.read_bytes() == seed_bytes, 'fuzz offer seed differs'
-    print('Blob stream oracle: all corpora and fuzz offer match independent Python construction')
+    stream_seed_root = ROOT.parent / 'fuzz/corpus/stream_transfer_decode'
+    accepted = [line.split('\t') for line in outputs['profile5-stream-records-v1.tsv'].splitlines()
+                if line.startswith('ACCEPT\t')]
+    expected_names = set()
+    for _, name, hexadecimal in accepted:
+        seed_path = stream_seed_root / f'profile5-{name}.hex'
+        expected_names.add(seed_path.name)
+        payload = f'HEX:{hexadecimal}\n'.encode()
+        if '--write' in sys.argv:
+            seed_path.write_bytes(payload)
+        else:
+            assert seed_path.read_bytes() == payload, f'{seed_path}: differs from oracle'
+    if '--write' in sys.argv:
+        for existing in stream_seed_root.iterdir():
+            if existing.name not in expected_names:
+                existing.unlink()
+    else:
+        assert {path.name for path in stream_seed_root.iterdir()} == expected_names
+    print('Blob stream oracle: profile-4 compatibility and profile-5 corpora/seeds match independent Python construction')
 
 
 if __name__ == '__main__':

@@ -16,6 +16,12 @@ if SPEC is None or SPEC.loader is None:
     raise RuntimeError(f"cannot load {CHECKER_PATH}")
 CHECKER = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(CHECKER)
+ORACLE_PATH = CHECKER_PATH.parents[1] / "conformance/blob_stream_oracle.py"
+ORACLE_SPEC = importlib.util.spec_from_file_location("blob_stream_oracle", ORACLE_PATH)
+if ORACLE_SPEC is None or ORACLE_SPEC.loader is None:
+    raise RuntimeError(f"cannot load {ORACLE_PATH}")
+ORACLE = importlib.util.module_from_spec(ORACLE_SPEC)
+ORACLE_SPEC.loader.exec_module(ORACLE)
 
 
 def core_contract() -> str:
@@ -51,6 +57,13 @@ The current handshake negotiates semantic versions `9`, `8`, `7`, `6`, `5`, `4`,
 | `7` | v6 byte-for-byte | per-lane profiles, receipt-free Event pages, and durable Blob range streams |
 | `8` | v7 byte-for-byte except the lane AAD domain and Blob custody fields | authenticated finite Blob custody over `BlobRangesStreamV1` |
 | `9` | v8 fixed lanes byte-for-byte except the Blob transfer profile and Blob chunk kind | independently authenticated Blob streams over `BlobStreamV1` |
+
+Blob profile registry: semantic v7/v8 select profile 4; semantic v9 selects profile 5.
+Profile 4 limits: 67,108,864 object bytes; 1,024 canonical chunks; 1,048,576 authenticated-source bytes.
+Profile 5 limits: 8,589,934,592 object bytes; 131,072 canonical chunks; 16,777,216 authenticated-source bytes.
+Profile 5 size classes: 65,536 plaintext chunk bytes; 66,215 encrypted carrier bytes; 1,048,576 ABX1 extent bytes; 134,217,728 checkpoint bytes; 2,097,152 Iroh frame bytes.
+Profile 5 order: PLAN -> OPEN -> SOURCE -> ACCEPT -> ABX1 DATA -> CHECKPOINT -> FINISH -> RESULT -> ACK.
+Profile 5 exact empty transfer: OPEN -> SOURCE -> ACCEPT -> FINISH(final_offset=0) -> RESULT -> ACK, with no DATA or CHECKPOINT.
 """
 
 
@@ -71,6 +84,11 @@ semantic-v6-object-kind = semantic-v5-object-kind
 semantic-v7-object-kind = semantic-v6-object-kind
 semantic-v8-object-kind = semantic-v7-object-kind
 semantic-v9-object-kind = 1 / 3 / 4 / 5
+
+; stream-profile-v5 is fixed binary, not deterministic CBOR.
+stream-profile-v5 = stream-open-v1 / stream-source-v1 / stream-accept-v1 / stream-data-v1 / stream-checkpoint-v1 / stream-finish-v1 / stream-result-v1 / stream-result-ack-v1
+stream-data-v1 = "ASM\\x01\\xd8" attempt-tuple offset-u64 extent-len-u32 abx1-extent
+abx1-extent = "ABX1" first-chunk-index-u64 carrier-count-u32 1*canonical-carrier
 """
 
 
@@ -188,6 +206,54 @@ class ProtocolVersionContractTests(unittest.TestCase):
         with self.assertRaisesRegex(CHECKER.ContractViolation, "v9 inheritance"):
             self.validate(protocol=damaged)
 
+    def test_blob_profile_registry_is_version_scoped(self) -> None:
+        damaged = protocol_contract().replace(
+            "semantic v7/v8 select profile 4; semantic v9 selects profile 5",
+            "semantic v7/v8/v9 select profile 4",
+        )
+        with self.assertRaisesRegex(CHECKER.ContractViolation, "Blob profile registry"):
+            self.validate(protocol=damaged)
+
+    def test_profile_size_classes_and_checkpoint_limit_are_distinct(self) -> None:
+        replacements = {
+            "65,536 plaintext chunk bytes": "1,048,576 plaintext chunk bytes",
+            "66,215 encrypted carrier bytes": "65,536 encrypted carrier bytes",
+            "1,048,576 ABX1 extent bytes": "66,215 ABX1 extent bytes",
+            "134,217,728 checkpoint bytes": "8,388,608 checkpoint bytes",
+        }
+        for original, replacement in replacements.items():
+            with self.subTest(original=original):
+                damaged = protocol_contract().replace(original, replacement)
+                with self.assertRaisesRegex(CHECKER.ContractViolation, "profile 5 limits"):
+                    self.validate(protocol=damaged)
+
+    def test_profile_object_source_and_chunk_limits_are_versioned(self) -> None:
+        replacements = {
+            "67,108,864 object bytes": "8,589,934,592 object bytes",
+            "1,024 canonical chunks": "131,072 canonical chunks",
+            "1,048,576 authenticated-source bytes": "16,777,216 authenticated-source bytes",
+            "8,589,934,592 object bytes": "67,108,864 object bytes",
+            "131,072 canonical chunks": "1,024 canonical chunks",
+            "16,777,216 authenticated-source bytes": "1,048,576 authenticated-source bytes",
+        }
+        for original, replacement in replacements.items():
+            with self.subTest(original=original):
+                damaged = protocol_contract().replace(original, replacement, 1)
+                with self.assertRaisesRegex(CHECKER.ContractViolation, "profile [45] limits"):
+                    self.validate(protocol=damaged)
+
+    def test_profile_five_pipeline_and_empty_terminal_order_are_checked(self) -> None:
+        for original, replacement in (
+            ("PLAN -> OPEN -> SOURCE -> ACCEPT -> ABX1 DATA -> CHECKPOINT -> FINISH -> RESULT -> ACK",
+             "PLAN -> OPEN -> ACCEPT -> DATA -> FINISH"),
+            ("OPEN -> SOURCE -> ACCEPT -> FINISH(final_offset=0) -> RESULT -> ACK, with no DATA or CHECKPOINT",
+             "OPEN -> ACCEPT -> RESULT"),
+        ):
+            with self.subTest(original=original):
+                damaged = protocol_contract().replace(original, replacement)
+                with self.assertRaisesRegex(CHECKER.ContractViolation, "profile 5 grammar"):
+                    self.validate(protocol=damaged)
+
     def test_truncated_envelope_selection_registry_fails(self) -> None:
         damaged = envelope_contract().replace(", 7, 8, or 9", "")
         with self.assertRaisesRegex(CHECKER.ContractViolation, "envelope selection"):
@@ -255,6 +321,26 @@ class ProtocolVersionContractTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(CHECKER.ContractViolation, "CDDL v9"):
             self.validate(cddl=damaged)
+
+    def test_cddl_declares_profile_five_fixed_binary_grammar(self) -> None:
+        damaged = cddl_contract().replace(
+            'stream-data-v1 = "ASM\\x01\\xd8" attempt-tuple offset-u64 extent-len-u32 abx1-extent\n',
+            "",
+        )
+        with self.assertRaisesRegex(CHECKER.ContractViolation, "CDDL profile 5 grammar"):
+            self.validate(cddl=damaged)
+
+    def test_every_profile_five_fuzz_seed_is_an_actual_decodable_record(self) -> None:
+        seed_root = CHECKER_PATH.parents[1] / "fuzz/corpus/stream_transfer_decode"
+        seeds = sorted(seed_root.iterdir())
+        self.assertGreaterEqual(len(seeds), 8)
+        observed = set()
+        for seed in seeds:
+            payload = seed.read_bytes()
+            self.assertTrue(payload.startswith(b"HEX:"), seed)
+            wire = bytes.fromhex(payload[4:].strip().decode("ascii"))
+            observed.add(ORACLE.decode_stream_record(wire))
+        self.assertEqual(observed, set(range(0xd6, 0xde)))
 
 
 if __name__ == "__main__":

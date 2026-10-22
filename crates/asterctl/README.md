@@ -88,6 +88,10 @@ client deadline. The agent may enforce a shorter deadline: the current
 `aster-agent` caps each RPC at 15 minutes, even when the client requests more.
 Query applies a fresh deadline to each page request, not to the whole query.
 The RPC timeout does not limit time spent entering a payload on stdin.
+It is also independent of the node-to-node profile-5 attempt: that protocol
+uses a two-minute authenticated-progress idle timeout and a size-derived hard
+deadline of `ceil(bytes / 128 KiB/s) + 20 minutes`, not a ten-minute
+normal-success timeout.
 
 ## Publish and read Blobs
 
@@ -117,6 +121,11 @@ same-length mutation is outside the command contract and can produce mixed
 source bytes. `--schema-id` is Base64;
 `--ttl-ms` accepts positive unsigned 64-bit milliseconds, including
 `18446744073709551615`. Omitting it selects durable publication.
+
+The file CLI intentionally rejects an empty source. Rust applications can
+publish the authenticated semantic-v9/profile-5 empty Blob by opening a stream
+with `total_len == 0`, writing no DATA, and finishing it; reading offset zero
+then returns the sole empty, complete terminal page.
 
 `blob-read` requires an exact Blob ID, topic, scope, and destination. On Linux,
 it requires a destination directory owned by the current user and not writable

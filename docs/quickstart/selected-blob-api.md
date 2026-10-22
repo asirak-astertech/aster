@@ -19,9 +19,9 @@ status; `delivery_status` reports local selector/delivery-ledger counts, while
 The exclusive `SelectedBlobNode` remains available when no runtime owns the same
 store and provides the same delivery lifecycle plus synchronous seekable-source
 publication and streaming `read_into`. Semantic v9 selects `BlobStreamV1`:
-independently authenticated 1-MiB segments move through a bounded ordered
-pipeline over concurrent Iroh data and control streams, and durable receiver
-checkpoints authorize resume. Semantic v7/v8 profile 4 remains a compatibility
+canonical 64-KiB authenticated chunks move as complete `ASTRBT01` records in
+bounded `ABX1` DATA extents through ordered data and control streams, and
+durable receiver checkpoints authorize resume. Semantic v7/v8 profile 4 remains a compatibility
 path for `BlobRangesStreamV1`; v7 admits durable work only and v8 also admits
 authenticated finite custody. A profile-5 attempt never falls back in place to
 profile 4. `EventPagesV1` is Event-only. The default semantic offer is
@@ -175,12 +175,15 @@ journal, temporary, or operational reserve. `blob-status` is likewise local:
 run it on the intended receiver to wait for `AVAILABLE`; it does not coordinate
 publication, prove peer convergence, or expose an IP/Iroh/BLE transport.
 
-The RPC and CLI use checked `u64` lengths and bounded 512-KiB frames/pages over
-independently authenticated 1-MiB segments. The resumable stream protocol has
-an explicit 8-GiB per-object ceiling. Blob publish/read default to 15 minutes;
-an explicit `asterctl --timeout` may shorten that attempt, while the agent caps
-longer requests at 15 minutes. A timed-out upload is retried with the same
-operation key and resumes from the receiver's last durable checkpoint.
+The RPC and CLI use checked `u64` lengths and bounded 512-KiB application
+frames/pages. The resumable stream protocol has an explicit 8-GiB per-object
+ceiling, 1-MiB DATA/SOURCE record bounds, and a 128-MiB checkpoint maximum.
+Node-to-node profile-5 attempts use a two-minute authenticated-progress idle
+timeout and a size-derived hard deadline of `ceil(bytes / 128 KiB/s) + 20
+minutes`; the legacy ten-minute bound is not a normal-success timeout. CLI and
+agent RPC deadlines are separate local application bounds. A timed-out local
+upload is retried with the same operation key; peer transfer resumes from the
+receiver's last durable checkpoint, including after an adapter change.
 Publish/read progress is written only to stderr. `--progress auto` displays it
 on a terminal, `always` emits newline records, and `never` disables it. A
 download interruption discards its staged output and restarts from byte zero;
@@ -438,7 +441,7 @@ let mutable_interests = MutableSourceInterests::new(state, record).with_blob(vec
 This composes with peerless live publication rather than changing its success
 condition. A source may publish through `selected_blobs()` with no peers, shut
 down, and later restart with an exact configured peer. A semantic-v9/profile-5
-contact transfers independently authenticated canonical segments through the
+contact transfers authenticated canonical records through the
 bounded pipeline, checkpoints only recoverable receiver progress, and promotes
 only after terminal-root verification and settlement. Interrupted attempts
 resume from that receiver-authoritative checkpoint. Semantic-v7/v8 profile 4

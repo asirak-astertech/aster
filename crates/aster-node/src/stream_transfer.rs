@@ -1385,102 +1385,125 @@ impl<'a> Reader<'a> {
 
 #[cfg(feature = "fuzzing")]
 pub(crate) fn fuzz_decode(input: &[u8]) {
-    let _ = split_composite_data_record(input);
-    let id = [1; 32];
-    let attempt_nonce = [2; 32];
-    let seeded = match input {
-        b"d6" => Some(StreamFrame::Open(StreamOpenV1 {
-            class: StreamClass::Blob,
-            direction: StreamDirection::ToSessionResponder,
-            session_transcript: [3; 32],
-            exchange_id: 1,
-            transfer_id: id,
-            source_transfer_id: [4; 32],
-            publication_id: [5; 32],
-            variant_id: [6; 32],
-            total_len: 1,
-            attempt_nonce,
-            checkpoint_generation: 0,
-            custody_digest: None,
-            source_len: 1,
-            source_digest: [7; 32],
-        })),
-        b"d7" => Some(StreamFrame::Accept(StreamAcceptV1 {
-            transfer_id: id,
-            attempt_nonce,
-            sequence: 0,
-            durable_offset: 0,
-            checkpoint_generation: 0,
-            absolute_receive_limit: 1,
-            max_extent_bytes: 1,
-            checkpoint_batch_bytes: 1,
-        })),
-        b"d8" => Some(StreamFrame::Data(StreamDataV1 {
-            transfer_id: id,
-            attempt_nonce,
-            sequence: 0,
-            offset: 0,
-            bytes: vec![0],
-        })),
-        b"d9" => Some(StreamFrame::Checkpoint(StreamCheckpointV1 {
-            transfer_id: id,
-            attempt_nonce,
-            sequence: 1,
-            durable_offset: 0,
-            checkpoint_generation: 0,
-            absolute_receive_limit: 1,
-        })),
-        b"da" => Some(StreamFrame::Finish(StreamFinishV1 {
-            transfer_id: id,
-            attempt_nonce,
-            sequence: 1,
-            final_offset: 1,
-            semantic_commitment: vec![8],
-        })),
-        b"db" => Some(StreamFrame::Result(StreamResultV1 {
-            transfer_id: id,
-            attempt_nonce,
-            sequence: 1,
-            final_offset: 1,
-            code: StreamResultCode::Promoted,
-            result_digest: [7; 32],
-        })),
-        b"dc" => Some(StreamFrame::ResultAck(StreamResultAckV1 {
-            transfer_id: id,
-            attempt_nonce,
-            sequence: 2,
-            result_digest: [7; 32],
-        })),
-        _ => None,
-    };
-    let candidate = seeded
-        .as_ref()
-        .and_then(|frame| frame.encode_for_context(9, 5).ok())
-        .unwrap_or_else(|| input.to_vec());
-    let Ok(decoded) = StreamFrame::decode_for_context(9, 5, &candidate) else {
-        return;
-    };
-    if let StreamFrame::Data(data) = decoded {
-        let open = StreamOpenV1 {
-            class: StreamClass::Blob,
-            direction: StreamDirection::ToSessionResponder,
-            session_transcript: [3; 32],
-            exchange_id: 1,
-            transfer_id: id,
-            source_transfer_id: [4; 32],
-            publication_id: [5; 32],
-            variant_id: [6; 32],
-            total_len: 1,
-            attempt_nonce,
-            checkpoint_generation: 0,
-            custody_digest: None,
-            source_len: 1,
-            source_digest: [7; 32],
-        };
-        if let Ok(mut receiver) = StreamReceiverState::new(&open, 0, 0, 1, 1) {
-            let _ = receiver.data(&data);
+    if let Ok((protected_header, body)) = split_composite_data_record(input) {
+        if let Ok(header) = StreamDataHeaderV1::decode_for_context(9, 5, protected_header) {
+            let _ = header.decode_body(body);
+        }
+        if let Ok(extent) = CanonicalBlobExtentV1::decode(body) {
+            let encoded = extent
+                .encode()
+                .expect("accepted ABX1 extent must re-encode");
+            assert_eq!(encoded, body);
+            if !encoded.is_empty() {
+                assert!(CanonicalBlobExtentV1::decode(&encoded[..encoded.len() - 1]).is_err());
+            }
+            let mut trailing = encoded;
+            trailing.push(0);
+            assert!(CanonicalBlobExtentV1::decode(&trailing).is_err());
         }
     }
+    let Ok(decoded) = StreamFrame::decode_for_context(9, 5, input) else {
+        return;
+    };
+    let canonical = decoded
+        .encode_for_context(9, 5)
+        .expect("accepted stream frame must re-encode");
+    assert_eq!(canonical, input);
+    if !canonical.is_empty() {
+        assert!(StreamFrame::decode_for_context(9, 5, &canonical[..canonical.len() - 1]).is_err());
+    }
+    let mut trailing = canonical;
+    trailing.push(0);
+    assert!(StreamFrame::decode_for_context(9, 5, &trailing).is_err());
+
+    if let StreamFrame::Data(data) = &decoded {
+        let _ = CanonicalBlobExtentV1::decode(&data.bytes);
+        if !data.bytes.is_empty() {
+            let overflow = StreamFrame::Data(StreamDataV1 {
+                offset: u64::MAX,
+                ..data.clone()
+            });
+            assert!(overflow.encode_for_context(9, 5).is_err());
+        }
+    }
+
+    // Exercise attempt binding, checkpoint rollback, and idempotent terminal
+    // replay for every successfully decoded seed, independent of its tag.
+    let id = [0x41; 32];
+    let nonce = [0x42; 32];
+    let open = StreamOpenV1 {
+        class: StreamClass::Blob,
+        direction: StreamDirection::ToSessionResponder,
+        session_transcript: [0x43; 32],
+        exchange_id: 1,
+        transfer_id: id,
+        source_transfer_id: [0x44; 32],
+        publication_id: [0x45; 32],
+        variant_id: [0x46; 32],
+        total_len: 1,
+        attempt_nonce: nonce,
+        checkpoint_generation: 0,
+        custody_digest: None,
+        source_len: 1,
+        source_digest: [0x47; 32],
+    };
+    let mut receiver = StreamReceiverState::new(&open, 0, 0, 1, 1).expect("receiver fixture");
+    let mut sender = StreamSenderState::new(id, nonce, 1);
+    let StreamAction::Send(StreamFrame::Accept(accept)) = receiver.accept(1).expect("accept")
+    else {
+        unreachable!();
+    };
+    let mut wrong = accept.clone();
+    wrong.attempt_nonce = [0x52; 32];
+    assert!(sender.accept(wrong).is_err());
+    sender.accept(accept).expect("bound accept");
+    let StreamExtentAction::Send(data) = sender.send_extent(vec![1]).expect("one byte") else {
+        unreachable!();
+    };
+    receiver.data(&data).expect("bound data");
+    let checkpoint = receiver.persisted(1, 1, 1).expect("durable checkpoint");
+    let StreamAction::Send(StreamFrame::Checkpoint(checkpoint)) = checkpoint else {
+        unreachable!();
+    };
+    sender.checkpoint(checkpoint).expect("advance checkpoint");
+    let rollback = StreamCheckpointV1 {
+        durable_offset: 0,
+        checkpoint_generation: 0,
+        sequence: 2,
+        transfer_id: id,
+        attempt_nonce: nonce,
+        absolute_receive_limit: 1,
+    };
+    assert!(sender.checkpoint(rollback).is_err());
+    let StreamAction::Send(StreamFrame::Finish(finish)) =
+        sender.finish(vec![0x53]).expect("finish")
+    else {
+        unreachable!();
+    };
+    assert_eq!(
+        receiver.finish(finish.clone()).expect("finish once"),
+        StreamAction::Promote
+    );
+    assert_eq!(
+        receiver.finish(finish).expect("finish replay"),
+        StreamAction::Retry(StreamRetry::SettlementPending)
+    );
+    let StreamAction::Send(StreamFrame::Result(result)) = receiver
+        .promoted(StreamResultCode::Promoted, [0x54; 32])
+        .expect("result")
+    else {
+        unreachable!();
+    };
+    let (_, terminal) = sender.result(result.clone()).expect("result once");
+    assert_eq!(terminal, StreamAction::Terminal(StreamResultCode::Promoted));
+    assert!(
+        sender
+            .result(StreamResultV1 {
+                result_digest: [0x55; 32],
+                ..result
+            })
+            .is_err()
+    );
 }
 
 #[cfg(test)]
@@ -1839,6 +1862,34 @@ mod stream_frame_codec {
                 "vector disposition differs: {name}"
             );
         }
+    }
+    #[test]
+    fn profile5_stream_records_match_the_independent_wire_corpus() {
+        let mut accepted_tags = std::collections::BTreeSet::new();
+        for line in include_str!("../../../conformance/vectors/profile5-stream-records-v1.tsv")
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+        {
+            let fields = line.split('\t').collect::<Vec<_>>();
+            assert_eq!(fields.len(), 3, "unexpected profile-5 vector row");
+            let wire = fields[2]
+                .as_bytes()
+                .chunks_exact(2)
+                .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+                .collect::<Vec<_>>();
+            let decoded = StreamFrame::decode_for_context(9, 5, &wire);
+            assert_eq!(
+                decoded.is_ok(),
+                fields[0] == "ACCEPT",
+                "vector disposition differs: {}",
+                fields[1]
+            );
+            if let Ok(frame) = decoded {
+                assert_eq!(frame.encode_for_context(9, 5).unwrap(), wire);
+                accepted_tags.insert(wire[4]);
+            }
+        }
+        assert_eq!(accepted_tags, STREAM_TAGS.collect());
     }
     #[test]
     fn codec_rejects_truncation_trailing_empty_and_overflow() {

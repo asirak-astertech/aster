@@ -1,3 +1,6 @@
+/// Resolves an explicit `HEX:` corpus fixture into the wire bytes consumed by
+/// a fuzz target. Invalid hexadecimal remains unmodified so it still exercises
+/// the hostile-input path instead of disappearing during corpus loading.
 pub fn corpus_input(input: &[u8]) -> Vec<u8> {
     let Some(hexadecimal) = input.strip_prefix(b"HEX:") else {
         return input.to_vec();
@@ -39,5 +42,12 @@ mod tests {
         let input = b"HEX:41534d018603012222222\xd6\x995ce29bc\n";
 
         assert_eq!(corpus_input(input), input);
+    }
+
+    #[test]
+    fn malformed_or_odd_hex_payload_is_left_unchanged() {
+        for input in [b"HEX:0\n".as_slice(), b"HEX:0g\n".as_slice()] {
+            assert_eq!(corpus_input(input), input);
+        }
     }
 }
