@@ -6888,13 +6888,24 @@ impl Store {
     /// Observes ownership without taking over or changing publication/recovery state.
     pub fn event_client_status(
         &self,
-        context: &EventClientContext,
+        client: &EventClientId,
+        observed_session: Option<EventPublicationSession>,
     ) -> Result<EventClientStatus, StoreError> {
         self.require_live()?;
         let authority = self.require_bound_mission()?;
         let read = self.database.begin_read()?;
         let (current_session, disposition) =
-            numbered_event_operation::client_disposition_read(&read, context)?;
+            numbered_event_operation::client_disposition_read(&read, client, observed_session)?;
+        if current_session.is_none() {
+            return Ok(EventClientStatus {
+                current_session: None,
+                disposition,
+                subscriptions: 0,
+                pending_deliveries: 0,
+                acknowledged_deliveries: 0,
+                ownership_metadata_bytes: 0,
+            });
+        }
         let table = read.open_table(EVENT_SUBSCRIPTIONS)?;
         if table.len()? > MAX_EVENT_SUBSCRIPTIONS {
             return Err(StoreError::SemanticInvariant(
@@ -6915,7 +6926,7 @@ impl Store {
                     "Event subscription identifier differs from its owner and operation key",
                 ));
             }
-            if record.owner == context.client_id {
+            if &record.owner == client {
                 ids.insert(subscription);
                 ownership_metadata_bytes += 1 + record.owner.as_bytes().len() as u64;
             }

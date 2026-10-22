@@ -592,16 +592,23 @@ impl api::AsterApplicationService for AsterConnectService {
     ) -> ServiceResult<api::GetEventClientStatusResponse> {
         let request = request.to_owned_message();
         let operation = PublicOperation::GetEventClientStatus;
-        let context = parse_client_context(request.client.as_option(), operation)?;
+        let client = parse_client_id(request.client_id, operation)?;
+        let observed_session = request
+            .observed_session
+            .map(|session| parse_publication_session(session, operation))
+            .transpose()?;
         let status = self
             .events
-            .client_status(context)
+            .client_status(client, observed_session)
             .await
             .map_err(connect_application_error)?;
         bounded_response(
             api::GetEventClientStatusResponse {
-                current_session: status.current_session.get(),
+                current_session: status.current_session.map(EventPublicationSession::get),
                 disposition: match status.disposition {
+                    EventClientDisposition::Unregistered => {
+                        api::EventClientDisposition::Unregistered
+                    }
                     EventClientDisposition::Current => api::EventClientDisposition::Current,
                     EventClientDisposition::Fenced => api::EventClientDisposition::Fenced,
                     EventClientDisposition::RecoveryRequired => {
@@ -1868,7 +1875,10 @@ mod tests {
             .begin_publication_session(old.client_id.clone(), old.session.get(), nonce)
             .await
             .unwrap();
-        let before = events.client_status(old.clone()).await.unwrap();
+        let before = events
+            .client_status(old.client_id.clone(), Some(old.session))
+            .await
+            .unwrap();
         assert_eq!(
             before.disposition,
             aster_node::application::EventClientDisposition::Fenced
@@ -1877,7 +1887,13 @@ mod tests {
         assert_eq!(second.unwrap_err().code, ErrorCode::Aborted);
         assert!(stream.pending.is_empty());
         assert!(next_stream_delivery(stream).await.is_none());
-        assert_eq!(events.client_status(old.clone()).await.unwrap(), before);
+        assert_eq!(
+            events
+                .client_status(old.client_id.clone(), Some(old.session))
+                .await
+                .unwrap(),
+            before
+        );
         let empty = EventStreamState {
             client: old.clone(),
             events: events.clone(),

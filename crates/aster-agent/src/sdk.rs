@@ -741,12 +741,8 @@ where
         Ok(self
             .client
             .get_event_client_status(api::GetEventClientStatusRequest {
-                client: api::EventClientContext {
-                    client_id: state.client_id,
-                    session: state.session,
-                    ..Default::default()
-                }
-                .into(),
+                client_id: state.client_id,
+                observed_session: (state.session != 0).then_some(state.session),
                 ..Default::default()
             })
             .await?

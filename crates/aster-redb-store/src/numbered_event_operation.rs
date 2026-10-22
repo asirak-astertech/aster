@@ -97,6 +97,7 @@ pub struct EventClientContext {
 /// Read-only disposition of a caller's client session.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EventClientDisposition {
+    Unregistered,
     Current,
     Fenced,
     RecoveryRequired,
@@ -105,7 +106,7 @@ pub enum EventClientDisposition {
 /// Bounded, local application ownership observation, not an operating-system process identity.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EventClientStatus {
-    pub current_session: EventPublicationSession,
+    pub current_session: Option<EventPublicationSession>,
     pub disposition: EventClientDisposition,
     pub subscriptions: u64,
     pub pending_deliveries: u64,
@@ -2089,19 +2090,37 @@ fn load_client_read(
 
 pub(crate) fn client_disposition_read(
     read: &redb::ReadTransaction,
-    context: &EventClientContext,
-) -> Result<(EventPublicationSession, EventClientDisposition), StoreError> {
-    let record = load_client_read(read, &context.client_id)?;
-    let disposition = if record.session != context.session.get() {
+    client: &EventClientId,
+    observed_session: Option<EventPublicationSession>,
+) -> Result<(Option<EventPublicationSession>, EventClientDisposition), StoreError> {
+    if !read
+        .list_tables()?
+        .any(|table| table.name() == CLIENTS.name())
+    {
+        return Ok((None, EventClientDisposition::Unregistered));
+    }
+    let record = read
+        .open_table(CLIENTS)?
+        .get(client.as_bytes())?
+        .map(|value| decode_client(value.value()))
+        .transpose()?;
+    let Some(record) = record else {
+        return Ok((None, EventClientDisposition::Unregistered));
+    };
+    let disposition = if observed_session.is_some_and(|session| record.session != session.get()) {
         EventClientDisposition::Fenced
-    } else if record.completed_session != record.session
+    } else if observed_session.is_none()
+        || record.completed_session != record.session
         || record.completed_revision != record.snapshot_revision
     {
         EventClientDisposition::RecoveryRequired
     } else {
         EventClientDisposition::Current
     };
-    Ok((EventPublicationSession::new(record.session)?, disposition))
+    Ok((
+        Some(EventPublicationSession::new(record.session)?),
+        disposition,
+    ))
 }
 
 pub(crate) fn require_client_context_read(

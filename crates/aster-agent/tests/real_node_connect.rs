@@ -1938,8 +1938,84 @@ async fn sdk_subscription_context_is_fenced_without_implicit_takeover() {
     PublicationJournal::initialize(&path, b"owned-sdk").unwrap();
     let sdk = NumberedEventSdk::open(client.clone(), &path, b"owned-sdk").unwrap();
     assert!(sdk.client_context().is_err());
+    let initial_capacity = client
+        .get_status(api::GetStatusRequest::default())
+        .await
+        .unwrap()
+        .into_owned()
+        .publish_operation_capacity;
+    for _ in 0..2 {
+        let initial = sdk.client_status().await.unwrap();
+        assert_eq!(
+            initial.disposition,
+            api::EventClientDisposition::Unregistered
+        );
+        assert_eq!(initial.current_session, None);
+        assert_eq!(
+            (
+                initial.subscriptions,
+                initial.pending_deliveries,
+                initial.acknowledged_deliveries,
+                initial.ownership_metadata_bytes
+            ),
+            (0, 0, 0, 0)
+        );
+        assert_eq!(sdk.session().unwrap(), 0);
+        assert!(sdk.client_context().is_err());
+    }
+    assert_eq!(
+        client
+            .get_status(api::GetStatusRequest::default())
+            .await
+            .unwrap()
+            .into_owned()
+            .publish_operation_capacity,
+        initial_capacity
+    );
+    for invalid in [
+        api::GetEventClientStatusRequest {
+            client_id: b"owned-sdk".to_vec(),
+            observed_session: Some(0),
+            ..Default::default()
+        },
+        api::GetEventClientStatusRequest::default(),
+        api::GetEventClientStatusRequest {
+            client_id: vec![1; 65],
+            ..Default::default()
+        },
+    ] {
+        assert_eq!(
+            client
+                .get_event_client_status(invalid)
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidArgument
+        );
+    }
     sdk.recover().await.unwrap();
     let old = sdk.client_context().unwrap();
+    assert_eq!(
+        old.session, 1,
+        "status did not register or claim the client"
+    );
+    assert_eq!(
+        sdk.client_status().await.unwrap().disposition,
+        api::EventClientDisposition::Current
+    );
+    let unobserved = client
+        .get_event_client_status(api::GetEventClientStatusRequest {
+            client_id: old.client_id.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_owned();
+    assert_eq!(unobserved.current_session, Some(old.session));
+    assert_eq!(
+        unobserved.disposition,
+        api::EventClientDisposition::RecoveryRequired
+    );
     let request = api::CreateEventSubscriptionRequest {
         operation_key: b"reader".to_vec(),
         topic: "chat.events".into(),
@@ -1947,14 +2023,27 @@ async fn sdk_subscription_context_is_fenced_without_implicit_takeover() {
         ..Default::default()
     };
     // The public wire requires context; the SDK fills it from recovered state.
-    assert_eq!(
-        client
-            .create_event_subscription(request.clone())
-            .await
-            .unwrap_err()
-            .code,
-        ErrorCode::InvalidArgument
-    );
+    for invalid in [
+        request.clone(),
+        api::CreateEventSubscriptionRequest {
+            client: api::EventClientContext {
+                client_id: old.client_id.clone(),
+                session: 0,
+                ..Default::default()
+            }
+            .into(),
+            ..request.clone()
+        },
+    ] {
+        assert_eq!(
+            client
+                .create_event_subscription(invalid)
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidArgument
+        );
+    }
     let subscription = sdk.create_subscription(request.clone()).await.unwrap();
     assert!(subscription.inserted);
     assert_eq!(sdk.client_status().await.unwrap().subscriptions, 1);
@@ -1977,7 +2066,7 @@ async fn sdk_subscription_context_is_fenced_without_implicit_takeover() {
     };
     let status = sdk.client_status().await.unwrap();
     assert_eq!(status.disposition, api::EventClientDisposition::Fenced);
-    assert_eq!(status.current_session, takeover.session);
+    assert_eq!(status.current_session, Some(takeover.session));
     for error in [
         sdk.create_subscription(request.clone()).await.unwrap_err(),
         sdk.poll_events(api::PollEventsRequest {
@@ -2006,6 +2095,19 @@ async fn sdk_subscription_context_is_fenced_without_implicit_takeover() {
             matches!(error, aster_agent::sdk::NumberedEventSdkError::Transport(error) if error.code == ErrorCode::Aborted)
         );
     }
+    let recovering = client
+        .get_event_client_status(api::GetEventClientStatusRequest {
+            client_id: old.client_id.clone(),
+            observed_session: Some(takeover.session),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_owned();
+    assert_eq!(
+        recovering.disposition,
+        api::EventClientDisposition::RecoveryRequired
+    );
     let blocked = client
         .poll_events(api::PollEventsRequest {
             client: current.clone().into(),

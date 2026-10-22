@@ -138,8 +138,10 @@ fn takeover_preserves_owned_delivery_state_and_fences_every_old_mutation() {
         store.numbered_event_operation_stats().unwrap(),
         publication_before
     );
-    let status = store.event_client_status(&old).unwrap();
-    assert_eq!(status.current_session, current.session);
+    let status = store
+        .event_client_status(&old.client_id, Some(old.session))
+        .unwrap();
+    assert_eq!(status.current_session, Some(current.session));
     assert_eq!(status.disposition, EventClientDisposition::Fenced);
     assert_eq!(
         (
@@ -154,7 +156,10 @@ fn takeover_preserves_owned_delivery_state_and_fences_every_old_mutation() {
         1 + old.client_id.as_bytes().len() as u64
     );
     assert_eq!(
-        store.event_client_status(&current).unwrap().disposition,
+        store
+            .event_client_status(&current.client_id, Some(current.session))
+            .unwrap()
+            .disposition,
         EventClientDisposition::RecoveryRequired
     );
     store
@@ -173,7 +178,10 @@ fn takeover_preserves_owned_delivery_state_and_fences_every_old_mutation() {
     let store = Store::open_for_mission(&file.0, services.authority).unwrap();
     let policy = store.control_policy_snapshot().unwrap();
     assert_eq!(
-        store.event_client_status(&current).unwrap().disposition,
+        store
+            .event_client_status(&current.client_id, Some(current.session))
+            .unwrap()
+            .disposition,
         EventClientDisposition::Current
     );
     let plan = store
@@ -224,7 +232,9 @@ fn takeover_preserves_owned_delivery_state_and_fences_every_old_mutation() {
             .removed
     );
     assert_fenced(store.remove_event_subscription_with_policy(&old, &policy, subscription.id));
-    let status = store.event_client_status(&current).unwrap();
+    let status = store
+        .event_client_status(&current.client_id, Some(current.session))
+        .unwrap();
     assert_eq!(
         (
             status.subscriptions,
@@ -395,4 +405,62 @@ fn unclean_unowned_subscription_refusal_preserves_original_bytes() {
     assert_eq!(std::fs::read(&file.0).unwrap(), before);
     assert!(Store::open_for_mission(&file.0, [0x91; 32]).is_err());
     assert_eq!(std::fs::read(&file.0).unwrap(), before);
+}
+
+#[test]
+fn status_observes_unregistered_and_unobserved_clients_without_mutation() {
+    let file = TestFile::new("client-status-before-registration");
+    let services = event_services(0xb2);
+    let store = Store::open_for_mission(&file.0, services.authority).unwrap();
+    let client = EventClientId::new(b"fresh-client".to_vec()).unwrap();
+    let before = store.numbered_event_operation_stats().unwrap();
+    let subscriptions_before = store.event_subscription_stats().unwrap();
+    for observed in [None, Some(EventPublicationSession::new(1).unwrap())] {
+        let status = store.event_client_status(&client, observed).unwrap();
+        assert_eq!(
+            status,
+            EventClientStatus {
+                current_session: None,
+                disposition: EventClientDisposition::Unregistered,
+                subscriptions: 0,
+                pending_deliveries: 0,
+                acknowledged_deliveries: 0,
+                ownership_metadata_bytes: 0,
+            }
+        );
+    }
+    assert!(!store.has_event_publication_client(&client).unwrap());
+    assert_eq!(store.numbered_event_operation_stats().unwrap(), before);
+    assert_eq!(
+        store.event_subscription_stats().unwrap(),
+        subscriptions_before
+    );
+
+    let (context, snapshot) = claim(&store, client.as_bytes(), 0, false);
+    let claimed = store.numbered_event_operation_stats().unwrap();
+    for observed in [None, Some(context.session)] {
+        let status = store.event_client_status(&client, observed).unwrap();
+        assert_eq!(status.current_session, Some(context.session));
+        assert_eq!(status.disposition, EventClientDisposition::RecoveryRequired);
+    }
+    assert_eq!(store.numbered_event_operation_stats().unwrap(), claimed);
+    store
+        .complete_event_publication_recovery(&client, context.session, snapshot.snapshot_revision)
+        .unwrap();
+    let recovered = store.numbered_event_operation_stats().unwrap();
+    assert_eq!(
+        store
+            .event_client_status(&client, None)
+            .unwrap()
+            .disposition,
+        EventClientDisposition::RecoveryRequired
+    );
+    assert_eq!(
+        store
+            .event_client_status(&client, Some(context.session))
+            .unwrap()
+            .disposition,
+        EventClientDisposition::Current
+    );
+    assert_eq!(store.numbered_event_operation_stats().unwrap(), recovered);
 }

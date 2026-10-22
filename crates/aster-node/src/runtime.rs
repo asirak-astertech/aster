@@ -14910,8 +14910,12 @@ fn execute_selected_event_command(
             let result = application.acknowledge_publication_result(&client_id, session, sequence);
             let _ = response.send(result);
         }
-        SelectedEventCommand::ClientStatus { client, response } => {
-            let _ = response.send(application.client_status(&client));
+        SelectedEventCommand::ClientStatus {
+            client,
+            observed_session,
+            response,
+        } => {
+            let _ = response.send(application.client_status(&client, observed_session));
         }
         SelectedEventCommand::RequireClientContext { client, response } => {
             let _ = response.send(application.require_client_context(&client));
@@ -43537,17 +43541,15 @@ mod tests {
     async fn subscription_fixture_client(
         events: &crate::application::SelectedEventHandle,
     ) -> crate::application::EventClientContext {
-        use crate::application::{EventClientContext, EventClientId, EventPublicationSession};
+        use crate::application::{EventClientContext, EventClientId};
         let client_id = EventClientId::new(b"test.subscription-owner".to_vec()).unwrap();
-        let probe = EventClientContext {
-            client_id: client_id.clone(),
-            session: EventPublicationSession::new(1).unwrap(),
-        };
-        if let Ok(status) = events.client_status(probe).await {
-            return EventClientContext {
-                client_id,
-                session: status.current_session,
-            };
+        if let Some(session) = events
+            .client_status(client_id.clone(), None)
+            .await
+            .unwrap()
+            .current_session
+        {
+            return EventClientContext { client_id, session };
         }
         let mut claim = [0; 32];
         getrandom::fill(&mut claim).unwrap();

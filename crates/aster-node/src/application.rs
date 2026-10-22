@@ -1014,14 +1014,19 @@ impl SelectedEventHandle {
         .await
     }
 
-    /// Lists local Consume subscriptions without polling them.
+    /// Observes client registration and ownership without claiming a session.
     pub async fn client_status(
         &self,
-        client: EventClientContext,
+        client: EventClientId,
+        observed_session: Option<EventPublicationSession>,
     ) -> Result<EventClientStatus, ApplicationError> {
         let (response, received) = oneshot::channel();
         self.send(
-            SelectedEventCommand::ClientStatus { client, response },
+            SelectedEventCommand::ClientStatus {
+                client,
+                observed_session,
+                response,
+            },
             received,
             "client_status",
         )
@@ -1160,7 +1165,8 @@ pub(crate) fn actor_unavailable(operation: &'static str) -> ApplicationError {
 
 pub(crate) enum SelectedEventCommand {
     ClientStatus {
-        client: EventClientContext,
+        client: EventClientId,
+        observed_session: Option<EventPublicationSession>,
         response: oneshot::Sender<Result<EventClientStatus, ApplicationError>>,
     },
     RequireClientContext {
@@ -1633,13 +1639,14 @@ impl SelectedEventNode {
         })
     }
 
-    /// Lists all local Consume subscriptions in raw subscription-ID order.
+    /// Observes client registration and ownership without changing recovery state.
     pub fn client_status(
         &self,
-        client: &EventClientContext,
+        client: &EventClientId,
+        observed_session: Option<EventPublicationSession>,
     ) -> Result<EventClientStatus, ApplicationError> {
         self.store
-            .event_client_status(client)
+            .event_client_status(client, observed_session)
             .map_err(|error| application_error("client_status", error.into()))
     }
 

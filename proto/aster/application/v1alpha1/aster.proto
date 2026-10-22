@@ -143,14 +143,21 @@ enum EventClientDisposition {
   EVENT_CLIENT_DISPOSITION_CURRENT = 1;
   EVENT_CLIENT_DISPOSITION_FENCED = 2;
   EVENT_CLIENT_DISPOSITION_RECOVERY_REQUIRED = 3;
+  EVENT_CLIENT_DISPOSITION_UNREGISTERED = 4;
 }
 
+// Observation never claims a session or completes recovery.
 message GetEventClientStatusRequest {
-  EventClientContext client = 1;
+  reserved 1;
+  reserved "client";
+  bytes client_id = 2;
+  // Omit before the journal has observed an issued session; if present, positive.
+  optional uint64 observed_session = 3;
 }
 
 message GetEventClientStatusResponse {
-  uint64 current_session = 1;
+  // Absent for an unregistered client.
+  optional uint64 current_session = 1;
   EventClientDisposition disposition = 2;
   uint64 subscriptions = 3;
   uint64 pending_deliveries = 4;

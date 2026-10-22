@@ -47,9 +47,18 @@ bounded polling/backoff and delivery acknowledgement semantics remain intact.
 
 Read-only queries, gaps, subscription listing and `GetEventClientStatus` remain
 available to a fenced caller. Status reports the current session, caller
-disposition (current/fenced/recovery-required), owned subscription count, pending
+disposition (unregistered/current/fenced/recovery-required), owned subscription count, pending
 and acknowledged delivery counts, and ownership metadata bytes. It neither
-claims a session nor changes recovery or publication state. Subscription-owner
+claims a session nor changes recovery or publication state. The status-specific
+request supplies a client ID and an optional positive observed session. A journal
+still stores zero before its first claim; the SDK omits that value from the
+status request. Unknown clients return unregistered, no current session, and
+zero counts. Registered clients with no observed session return their current
+session and recovery-required; a matching observation distinguishes completed
+from incomplete recovery, and an older observation reports fenced. Status never
+claims a session for the caller. Mutation contexts still require positive
+sessions and completed recovery. This deliberately revises the prerelease
+status request (the old context field is reserved); journal formats are unchanged. Subscription-owner
 bytes are bounded by the existing 256-subscription cap: at most 256 × 65 bytes,
 with no per-session ownership history.
 
