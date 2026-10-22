@@ -218,7 +218,7 @@ subscription API below remains a separate application surface.
 For 800-MiB through 1-GiB engineering runs, including local-publication versus
 peer-transfer lifecycle, exact WLAN binding, checkpoint/credit semantics,
 pipeline receipt fields, capacity checks, raw baselines, and the ARM64
-completed-pack example, use the
+canonical ABX1/profile-5 transport example, use the
 [Blob streaming engineering runbook](../validation/blob-streaming-engineering-runbook.md).
 
 ## Subscribe to immutable publication metadata

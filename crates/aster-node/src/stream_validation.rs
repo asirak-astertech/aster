@@ -8,9 +8,9 @@
 use crate::{
     stream_transfer::{
         CanonicalBlobExtentV1, MAX_STREAM_CHECKPOINT_BATCH_BYTES,
-        PROFILE5_CANONICAL_CARRIER_RECORD_BYTES, PROFILE5_EXTENT_BYTES, StreamAction, StreamClass,
-        StreamDirection, StreamExtentAction, StreamFrame, StreamOpenV1, StreamReceiverState,
-        StreamResultCode, StreamSenderState, profile5_attempt_bounds,
+        PROFILE5_CANONICAL_CARRIER_RECORD_BYTES, PROFILE5_CANONICAL_EXTENT_BYTES, StreamAction,
+        StreamClass, StreamDirection, StreamExtentAction, StreamFrame, StreamOpenV1,
+        StreamReceiverState, StreamResultCode, StreamSenderState, profile5_attempt_bounds,
         profile5_attempt_hard_timeout, profile5_receive_limit,
     },
     stream_transport::{AttemptOpenRequest, IrohQuicV1Adapter, StreamTransportAdapter},
@@ -284,7 +284,7 @@ async fn receive_with_batch(
         0,
         0,
         profile5_receive_limit(expected_wire, 0, checkpoint_batch),
-        PROFILE5_EXTENT_BYTES as u32,
+        PROFILE5_CANONICAL_EXTENT_BYTES as u32,
     )
     .map_err(|error| error.to_string())?;
     let StreamAction::Send(accept) = state
@@ -510,7 +510,7 @@ mod tests {
             .find(std::net::SocketAddr::is_ipv4)
             .expect("IPv4 server address");
         let bytes = u64::from(TEST_CHECKPOINT_BATCH)
-            + u64::try_from(PROFILE5_EXTENT_BYTES).expect("extent bytes");
+            + u64::try_from(PROFILE5_CANONICAL_EXTENT_BYTES).expect("extent bytes");
         let receiver = tokio::spawn({
             let server = server.clone();
             let allowed = BTreeSet::from([client.id()]);

@@ -11,8 +11,8 @@ Profile 5 is the semantic-v9 selection. It is not a migration back to v8 and
 does not introduce a second durable Blob representation. Semantic v7/v8 peers
 retain profile 4 for compatibility; a semantic-v9 peer selects profile 5.
 `ASTRBT01` canonical records and the Blob manifest remain the durable
-representation. The former `ASTRBS02` completed-pack stream is only provisional
-local staging and has no semantic-v9 wire meaning.
+representation. The former `ASTRBS02` provisional upload-pack format is local
+staging only and has no semantic-v9 wire meaning.
 
 | Selection | Object maximum | Canonical chunks | Authenticated source |
 | --- | ---: | ---: | ---: |
@@ -92,7 +92,7 @@ sha256sum "$SOURCE"
 df -B1 /var/lib/aster-agent /var/lib/aster-depot /data
 asterctl --token-file "$TOKEN_FILE" --json status
 
-asterctl --token-file "$TOKEN_FILE" --timeout 3600 --json blob-publish \
+asterctl --token-file "$TOKEN_FILE" --timeout 900 --json blob-publish \
   --file "$SOURCE" \
   --topic imagery.maps \
   --scope mission/team/alpha \
@@ -105,6 +105,10 @@ asterctl --token-file "$TOKEN_FILE" --timeout 3600 --json blob-publish \
 Save the publication ID, Blob ID, and operation key. If the command is
 interrupted or its result is unknown, repeat the exact bytes, metadata, TTL,
 and operation key. A different key means a different application operation.
+The agent caps a Blob RPC at 15 minutes, so a larger client `--timeout` cannot
+extend one local upload. If the cap is reached, retry the exact publication;
+operation-key idempotency returns or resumes its durable local outcome. Peer
+synchronization is separate and resumes from the receiver receipt.
 
 Run status on the destination node. It is safe to start this after local
 publication and before or after a peer becomes reachable:
@@ -112,7 +116,7 @@ publication and before or after a peer becomes reachable:
 ```sh
 PUBLICATION_ID='PASTE_BASE64_PUBLICATION_ID'
 
-asterctl --token-file "$TOKEN_FILE" --timeout 3600 --json blob-status \
+asterctl --token-file "$TOKEN_FILE" --timeout 900 --json blob-status \
   --publication-id "$PUBLICATION_ID" \
   --topic imagery.maps \
   --scope mission/team/alpha \
@@ -125,7 +129,7 @@ application-level hashes:
 ```sh
 BLOB_ID='PASTE_BASE64_BLOB_ID'
 
-asterctl --token-file "$TOKEN_FILE" --timeout 3600 blob-read \
+asterctl --token-file "$TOKEN_FILE" --timeout 900 blob-read \
   --id "$BLOB_ID" \
   --topic imagery.maps \
   --scope mission/team/alpha \
@@ -138,7 +142,9 @@ sha256sum "$OUTPUT"
 An interrupted CLI download removes its staged bytes and currently restarts at
 zero. That is independent of node-to-node receipt resume, which continues from
 the receiver's authenticated durable checkpoint even when adapter selection
-changes.
+changes. If the 15-minute read RPC cap is reached, confirm `blob-status` still
+reports `AVAILABLE`, remove any owner-only abandoned staging file after
+inspection, and retry the read; the CLI download itself does not resume.
 
 The Rust streaming API also admits an empty Blob. Open a
 `BlobPublishStreamRequest` with `total_len: 0`, perform no `write`, and call

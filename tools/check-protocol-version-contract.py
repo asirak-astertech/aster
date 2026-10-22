@@ -7,7 +7,9 @@ from __future__ import annotations
 
 from pathlib import Path
 import ast
+import json
 import re
+import subprocess
 import sys
 
 
@@ -68,6 +70,36 @@ PROFILE5_EMPTY_PIPELINE = (
     "OPEN -> SOURCE -> ACCEPT -> FINISH(final_offset=0) -> RESULT -> ACK, "
     "with no DATA or CHECKPOINT"
 )
+PROFILE5_RECORDS = {
+    "OPEN": (0xD6, ["class", "direction", "semantic_version", "profile_id", "session_transcript", "exchange_id", "transfer_id", "source_transfer_id", "publication_id", "variant_id", "total_len", "attempt_nonce", "checkpoint_generation", "custody_present", "custody_digest", "source_len", "source_digest"]),
+    "SOURCE": (0xDD, ["attempt", "source_offset", "source_total_len", "source_chunk_len", "source_chunk"]),
+    "ACCEPT": (0xD7, ["attempt", "durable_offset", "checkpoint_generation", "absolute_receive_limit", "max_extent_bytes", "checkpoint_batch_bytes"]),
+    "DATA": (0xD8, ["attempt", "offset", "extent_len", "abx1_extent"]),
+    "CHECKPOINT": (0xD9, ["attempt", "durable_offset", "checkpoint_generation", "absolute_receive_limit"]),
+    "FINISH": (0xDA, ["attempt", "final_offset", "commitment_len", "semantic_commitment"]),
+    "RESULT": (0xDB, ["attempt", "final_offset", "result_code", "result_digest"]),
+    "ACK": (0xDC, ["attempt", "result_digest"]),
+}
+PROFILE5_FIELDS = {
+    "OPEN": [["class", "u8-enum:1"], ["direction", "u8-enum:1,2"], ["semantic_version", "u16=9"], ["profile_id", "u16=5"], ["session_transcript", "bytes32"], ["exchange_id", "u64"], ["transfer_id", "bytes32"], ["source_transfer_id", "bytes32"], ["publication_id", "bytes32"], ["variant_id", "bytes32"], ["total_len", "u64<=8589934592"], ["attempt_nonce", "bytes32-nonzero"], ["checkpoint_generation", "u64"], ["custody_present", "u8-enum:0,1"], ["custody_digest", "bytes32-if-present"], ["source_len", "u32:1..16777216"], ["source_digest", "bytes32"]],
+    "SOURCE": [["attempt", "attempt_fields"], ["source_offset", "u32"], ["source_total_len", "u32:1..16777216"], ["source_chunk_len", "u32:1..1048576"], ["source_chunk", "bytes[source_chunk_len]"]],
+    "ACCEPT": [["attempt", "attempt_fields"], ["durable_offset", "u64"], ["checkpoint_generation", "u64"], ["absolute_receive_limit", "u64>=durable_offset"], ["max_extent_bytes", "u32:1..1048576"], ["checkpoint_batch_bytes", "u32:1..134217728"]],
+    "DATA": [["attempt", "attempt_fields"], ["offset", "u64"], ["extent_len", "u32:1..1048576"], ["abx1_extent", "bytes[extent_len]"]],
+    "CHECKPOINT": [["attempt", "attempt_fields"], ["durable_offset", "u64"], ["checkpoint_generation", "u64"], ["absolute_receive_limit", "u64>=durable_offset"]],
+    "FINISH": [["attempt", "attempt_fields"], ["final_offset", "u64"], ["commitment_len", "u32:1..65536"], ["semantic_commitment", "bytes[commitment_len]"]],
+    "RESULT": [["attempt", "attempt_fields"], ["final_offset", "u64"], ["result_code", "u8-enum:1,2,3,4,5,6"], ["result_digest", "bytes32"]],
+    "ACK": [["attempt", "attempt_fields"], ["result_digest", "bytes32"]],
+}
+PROFILE5_RUST_ORDER = {
+    "OPEN": ["o.push(0xd6)", "x.class as u8", "x.direction as u8", "9u16.to_be_bytes()", "5u16.to_be_bytes()", "x.session_transcript", "x.exchange_id", "x.transfer_id", "x.source_transfer_id", "x.publication_id", "x.variant_id", "x.total_len", "x.attempt_nonce", "x.checkpoint_generation", "match x.custody_digest", "x.source_len", "x.source_digest"],
+    "SOURCE": ["o.push(0xdd)", "put_attempt", "x.offset", "x.total_len", "x.bytes.len()", "o.extend(&x.bytes)"],
+    "ACCEPT": ["o.push(0xd7)", "put_attempt", "x.durable_offset", "x.checkpoint_generation", "x.absolute_receive_limit", "x.max_extent_bytes", "x.checkpoint_batch_bytes"],
+    "DATA": ["o.push(0xd8)", "put_attempt", "x.offset", "l.to_be_bytes()", "o.extend(&x.bytes)"],
+    "CHECKPOINT": ["o.push(0xd9)", "put_attempt", "x.durable_offset", "x.checkpoint_generation", "x.absolute_receive_limit"],
+    "FINISH": ["o.push(0xda)", "put_attempt", "x.final_offset", "x.semantic_commitment.len()", "o.extend(&x.semantic_commitment)"],
+    "RESULT": ["o.push(0xdb)", "put_attempt", "x.final_offset", "x.code as u8", "x.result_digest"],
+    "ACK": ["o.push(0xdc)", "put_attempt", "x.result_digest"],
+}
 
 
 class ContractViolation(ValueError):
@@ -290,7 +322,7 @@ def parse_cddl(cddl: str) -> None:
     for declaration in (
         "stream-profile-v5 = stream-open-v1 / stream-source-v1 / stream-accept-v1 / stream-data-v1 / stream-checkpoint-v1 / stream-finish-v1 / stream-result-v1 / stream-result-ack-v1",
         'stream-data-v1 = "ASM\\x01\\xd8" attempt-tuple offset-u64 extent-len-u32 abx1-extent',
-        'abx1-extent = "ABX1" first-chunk-index-u64 carrier-count-u32 1*canonical-carrier',
+        'abx1-extent = "ABX1" first-chunk-index-u64 carrier-count-u32 1*(carrier-len-u32 canonical-carrier)',
     ):
         require_once(cddl, declaration, "CDDL profile 5 grammar")
 
@@ -374,6 +406,69 @@ def validate_executable_profile_contract(
     )
     if any(fragment not in profile for fragment in required_profile_fragments):
         fail("executable Blob profile registry must bind v7/v8 to profile 4 and v9 to profile 5")
+    required_extent_fragments = (
+        "MAX_STREAM_EXTENT_BYTES: usize = PROFILE5_CANONICAL_EXTENT_BYTES",
+        "profile5_attempt_bounds_for_extents",
+        "8 + MAX_PROTECTED_STREAM_DATA_HEADER_BYTES + 192",
+        "PROFILE5_CANONICAL_EXTENT_BYTES as u64",
+    )
+    if any(fragment not in stream_transfer for fragment in required_extent_fragments):
+        fail("production extent admission and attempt bounds must use canonical ABX1 limits")
+    if "MAX_STREAM_EXTENT_BYTES: usize = PROFILE5_EXTENT_BYTES" in stream_transfer:
+        fail("retired ASTRBS02 extent aliases production admission")
+
+
+def validate_profile5_schema(schema: dict, stream_transfer: str) -> None:
+    if schema.get("format") != "aster-profile5-fixed-binary-v1" or schema.get("magic") != "41534d01":
+        fail("profile 5 schema identity differs")
+    records = schema.get("records")
+    if not isinstance(records, list) or len(records) != len(PROFILE5_RECORDS):
+        fail("profile 5 schema record set differs")
+    for record in records:
+        name = record.get("name")
+        if name not in PROFILE5_RECORDS:
+            fail("profile 5 schema record name differs")
+        tag, fields = PROFILE5_RECORDS[name]
+        if record.get("tag") != tag or record.get("fields") != PROFILE5_FIELDS[name]:
+            fail(f"profile 5 schema {name} tag or field order differs")
+        rust_name = "ResultAck" if name == "ACK" else name.title()
+        marker = f"Self::{rust_name}(x) =>"
+        encoder = stream_transfer.find("pub(crate) fn encode_for_context")
+        start = stream_transfer.find(marker, encoder)
+        if start < 0:
+            fail(f"executable profile 5 encoder lacks {name}")
+        end = stream_transfer.find("\n            Self::", start + len(marker))
+        arm = stream_transfer[start:end if end >= 0 else None]
+        if f"o.push(0x{tag:02x})" not in arm:
+            fail(f"executable profile 5 {name} tag differs")
+        cursor = -1
+        for token in PROFILE5_RUST_ORDER[name]:
+            position = arm.find(token, cursor + 1)
+            if position < 0:
+                fail(f"executable profile 5 {name} field order differs at {token}")
+            cursor = position
+    abx1 = schema.get("abx1", {})
+    if abx1.get("magic") != "41425831" or abx1.get("max_encoded_bytes") != 1_048_576:
+        fail("profile 5 ABX1 schema differs")
+    if [field[0] for field in abx1.get("fields", [])] != ["first_chunk_index", "carrier_count", "carriers", "carrier_len", "carrier"]:
+        fail("profile 5 ABX1 carrier_len or field order differs")
+    composite = schema.get("composite", {})
+    if composite.get("magic") != "41534431" or composite.get("max_encoded_bytes") != 1_050_632:
+        fail("profile 5 ASD1 composite schema differs")
+    if schema.get("flow", {}).get("empty") != ["PLAN", "OPEN", "SOURCE", "ACCEPT", "FINISH", "RESULT", "ACK"]:
+        fail("profile 5 empty flow differs")
+    result = next(record for record in records if record["name"] == "RESULT")
+    if dict(result["fields"])["result_code"] != "u8-enum:1,2,3,4,5,6":
+        fail("profile 5 result-code enum differs")
+
+
+def validate_profile5_oracle(root: Path = ROOT) -> None:
+    result = subprocess.run(
+        [sys.executable, str(root / "conformance/blob_stream_oracle.py")],
+        cwd=root, capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        fail(f"profile 5 oracle/vectors drifted: {result.stderr.strip() or result.stdout.strip()}")
 
 
 def validate_contract_texts(
@@ -401,6 +496,11 @@ def main() -> int:
             (ROOT / "crates/aster-node/src/stream_transfer.rs").read_text(),
             (ROOT / "crates/aster-iroh/src/lib.rs").read_text(),
         )
+        validate_profile5_schema(
+            json.loads((ROOT / "conformance/profile5-wire-schema.json").read_text()),
+            (ROOT / "crates/aster-node/src/stream_transfer.rs").read_text(),
+        )
+        validate_profile5_oracle()
     except (ContractViolation, OSError) as error:
         print(f"protocol version contract check failed: {error}", file=sys.stderr)
         return 1

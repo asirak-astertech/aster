@@ -95,3 +95,58 @@ validation: raw WLAN baseline, local publication, v9-to-v9 transfer,
 interruption/resume, receiver read/hash, resource bounds, and v8/v9 behavior
 using the exact CI-built ARM64 artifact. Existing device measurements are not
 claimed as qualification for this build.
+
+## Review remediation round 1
+
+The three Important and two Minor findings in `task-9-review.md` are addressed.
+
+- Production semantic-v9 admission, credit rounding, validation, and attempt
+  accounting now use the exact 1,048,576-byte encoded ABX1 ceiling. The
+  1,048,710-byte ASTRBS02-derived record is confined to `cfg(test)` legacy
+  upload-pack fixtures. The canonical sender derives its exact extent count
+  from `Profile5CanonicalWireShape`; generic receive-before-authentication
+  bounds conservatively budget up to all 131,072 canonical chunks, including
+  ASD1/protected-frame and control overhead. Focused tests prove 1 MiB succeeds,
+  1 MiB + 1 fails, and a maximum shape cannot exceed its attempt budgets.
+- Added `conformance/profile5-wire-schema.json` as the complete
+  machine-checkable structured equivalent for the non-CBOR fixed-binary wire.
+  It specifies all eight tags, every ordered field and width/bound, enums,
+  ABX1 `carrier_len`, ASD1 framing, and empty/nonempty flows. The standalone
+  checker binds it to Rust encoder tag/field order and executable constants,
+  invokes the independent oracle, and therefore verifies every generated TSV
+  and seed. Mutation tests cover every record tag, every field order and
+  width/bound, both aggregate bounds, the result-code enum, and independent
+  oracle/vector drift.
+- The oracle now emits production-valid ASTRBT01 carriers, coherent nonempty
+  and empty transcripts, plus rejected rollback, binding, and terminal-change
+  transcripts. It independently validates the accepted bindings/sequences and
+  proves the named invariant broken by every rejected transcript.
+  ACCEPT/DATA/CHECKPOINT/FINISH/RESULT/ACK sequences reflect the actual
+  direction-specific state-machine counters.
+- Added real ASD1 corpus seeds for a normal valid carrier and an exact 1-MiB
+  ABX1 boundary extent, plus complete empty and nonempty transcript seeds.
+  Fuzz DATA reaches the production canonical carrier inspector, mutates carrier
+  authentication bytes, and feeds input-derived bindings, sequences, offsets,
+  generations, and complete settlement transcripts through
+  `StreamSenderState`/`StreamReceiverState`. The smoke maximum is 1,052,672
+  bytes, above the exact 1,050,632-byte composite ceiling with explicit margin.
+- Runbook examples now use the agent's actual 900-second Blob RPC cap and
+  explain exact-operation retry, status, receiver receipt resume, and
+  download restart. Remaining PR95 “completed-pack” terminology in touched
+  documentation was replaced with canonical ABX1/profile-5 language.
+
+Focused verification:
+
+- `python3 conformance/blob_stream_oracle.py` — PASS.
+- `python3 tools/check-protocol-version-contract.py` — PASS.
+- `python3 tools/test-protocol-version-contract.py` — PASS, 27 tests.
+- `python3 tools/test-run-fuzz-smoke.py` — PASS, 3 tests.
+- `cargo test -p aster-node stream_transfer -- --nocapture` — PASS, 27 passed,
+  1 explicit performance test ignored.
+- `cargo test --manifest-path fuzz/Cargo.toml --lib` — PASS, 3 tests.
+- Direct `stream_transfer_decode` smoke with the generated twelve-seed corpus,
+  `-runs=10000 -max_len=1052672 -seed=2026102201` — PASS, 10,000 runs; maximum
+  seed 1,048,673 bytes; peak RSS 403 MiB.
+- `cargo fmt --all -- --check` and `git diff --check` — PASS.
+
+No full suite, push, deployment, or device validation was run.

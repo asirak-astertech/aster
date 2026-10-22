@@ -6,7 +6,11 @@
 from __future__ import annotations
 
 import importlib.util
+import copy
+import json
 from pathlib import Path
+import shutil
+import tempfile
 import unittest
 
 
@@ -88,7 +92,7 @@ semantic-v9-object-kind = 1 / 3 / 4 / 5
 ; stream-profile-v5 is fixed binary, not deterministic CBOR.
 stream-profile-v5 = stream-open-v1 / stream-source-v1 / stream-accept-v1 / stream-data-v1 / stream-checkpoint-v1 / stream-finish-v1 / stream-result-v1 / stream-result-ack-v1
 stream-data-v1 = "ASM\\x01\\xd8" attempt-tuple offset-u64 extent-len-u32 abx1-extent
-abx1-extent = "ABX1" first-chunk-index-u64 carrier-count-u32 1*canonical-carrier
+abx1-extent = "ABX1" first-chunk-index-u64 carrier-count-u32 1*(carrier-len-u32 canonical-carrier)
 """
 
 
@@ -330,17 +334,89 @@ class ProtocolVersionContractTests(unittest.TestCase):
         with self.assertRaisesRegex(CHECKER.ContractViolation, "CDDL profile 5 grammar"):
             self.validate(cddl=damaged)
 
+    def test_profile_five_schema_mutations_fail(self) -> None:
+        root = CHECKER_PATH.parents[1]
+        schema = json.loads((root / "conformance/profile5-wire-schema.json").read_text())
+        rust = (root / "crates/aster-node/src/stream_transfer.rs").read_text()
+        mutations = []
+        for index, record in enumerate(schema["records"]):
+            changed = copy.deepcopy(schema)
+            changed["records"][index]["tag"] ^= 1
+            mutations.append((f"{record['name']} tag", changed))
+            changed = copy.deepcopy(schema)
+            changed["records"][index]["fields"] = list(reversed(changed["records"][index]["fields"]))
+            mutations.append((f"{record['name']} fields", changed))
+            for field_index, field in enumerate(record["fields"]):
+                changed = copy.deepcopy(schema)
+                changed["records"][index]["fields"][field_index][1] = "u8"
+                mutations.append((f"{record['name']} {field[0]} width/bound", changed))
+        for path, value in (("ABX1 bound", 1_048_577), ("composite bound", 1_050_631)):
+            changed = copy.deepcopy(schema)
+            changed["abx1" if path.startswith("ABX1") else "composite"]["max_encoded_bytes"] = value
+            mutations.append((path, changed))
+        changed = copy.deepcopy(schema)
+        next(record for record in changed["records"] if record["name"] == "RESULT")["fields"][-2][1] = "u8-enum:1,2"
+        mutations.append(("result code", changed))
+        for name, changed in mutations:
+            with self.subTest(name=name), self.assertRaises(CHECKER.ContractViolation):
+                CHECKER.validate_profile5_schema(changed, rust)
+
     def test_every_profile_five_fuzz_seed_is_an_actual_decodable_record(self) -> None:
         seed_root = CHECKER_PATH.parents[1] / "fuzz/corpus/stream_transfer_decode"
         seeds = sorted(seed_root.iterdir())
         self.assertGreaterEqual(len(seeds), 8)
         observed = set()
+        transcripts = set()
         for seed in seeds:
             payload = seed.read_bytes()
-            self.assertTrue(payload.startswith(b"HEX:"), seed)
-            wire = bytes.fromhex(payload[4:].strip().decode("ascii"))
-            observed.add(ORACLE.decode_stream_record(wire))
+            if payload.startswith(b"HEX:"):
+                wire = bytes.fromhex(payload[4:].strip().decode("ascii"))
+                observed.add(ORACLE.decode_stream_record(wire))
+            elif payload.startswith(b"ASD1"):
+                self.assertTrue(payload.startswith(b"ASD1"), seed)
+                protected_len = int.from_bytes(payload[4:8], "big")
+                self.assertEqual(
+                    ORACLE.decode_stream_record(payload[8:8 + protected_len] + payload[8 + protected_len:]),
+                    0xd8,
+                )
+                self.assertLessEqual(len(payload), 1_050_632)
+            else:
+                self.assertTrue(payload.startswith(b"AST1"), seed)
+                count = payload[4]
+                offset = 5
+                tags = []
+                for _ in range(count):
+                    length = int.from_bytes(payload[offset:offset + 4], "big")
+                    offset += 4
+                    tags.append(ORACLE.decode_stream_record(payload[offset:offset + length]))
+                    offset += length
+                self.assertEqual(offset, len(payload))
+                transcripts.add(tuple(tags))
         self.assertEqual(observed, set(range(0xd6, 0xde)))
+        self.assertEqual(transcripts, {
+            (0xd6, 0xdd, 0xd7, 0xd8, 0xd9, 0xda, 0xdb, 0xdc),
+            (0xd6, 0xdd, 0xd7, 0xda, 0xdb, 0xdc),
+        })
+
+    def test_profile_five_oracle_and_vector_drift_fail(self) -> None:
+        root = CHECKER_PATH.parents[1]
+        for drift in ("vector", "oracle"):
+            with self.subTest(drift=drift), tempfile.TemporaryDirectory() as directory:
+                scratch = Path(directory)
+                shutil.copytree(root / "conformance", scratch / "conformance")
+                shutil.copytree(root / "fuzz/corpus", scratch / "fuzz/corpus")
+                if drift == "vector":
+                    vector = scratch / "conformance/vectors/profile5-transcripts-v1.tsv"
+                    vector.write_text(vector.read_text() + "\n")
+                else:
+                    oracle = scratch / "conformance/blob_stream_oracle.py"
+                    oracle.write_text(oracle.read_text().replace(
+                        "semantic=9\\tprofile=5", "semantic=10\\tprofile=5", 1
+                    ))
+                with self.assertRaisesRegex(
+                    CHECKER.ContractViolation, "oracle/vectors drifted"
+                ):
+                    CHECKER.validate_profile5_oracle(scratch)
 
 
 if __name__ == "__main__":

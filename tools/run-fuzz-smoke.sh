@@ -71,7 +71,7 @@ cargo +nightly-2026-08-18 fuzz run --fuzz-dir fuzz systemd_credential_decode "$s
     -runs=10000 -max_len=262144 -seed=2026090801 \
     -artifact_prefix="$systemd_credential_artifacts/" -print_final_stats=1
 cargo +nightly-2026-08-18 fuzz run --fuzz-dir fuzz stream_transfer_decode "$stream_transfer_corpus" -- \
-    -runs=10000 -max_len=1050624 -seed=2026102201 \
+    -runs=10000 -max_len=1052672 -seed=2026102201 \
     -artifact_prefix="$stream_transfer_artifacts/" -print_final_stats=1
 if [ "$(uname -s)" = Linux ]; then
   cargo +nightly-2026-08-18 fuzz run --fuzz-dir fuzz systemd_admin_record_decode "$systemd_admin_record_corpus" -- \

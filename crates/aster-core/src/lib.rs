@@ -154,6 +154,11 @@ pub use blob::{
     ReferenceBlobService, SELECTED_BLOB_CHUNK_SIZE, VerifiedBlobContentCompletion,
     VerifiedBlobTransferObject, VerifiedBlobTransferPlan, prepare_blob,
 };
+/// Fuzz-harness bridge to the production canonical carrier inspector.
+#[doc(hidden)]
+pub fn fuzz_inspect_blob_transfer_object(bytes: &[u8]) -> bool {
+    blob::inspect_blob_transfer_object(bytes).is_ok()
+}
 #[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
 pub use blob_custody::{
     AuthenticatedBlobCustodyContactV1, AuthenticatedBlobCustodySendContextV1,

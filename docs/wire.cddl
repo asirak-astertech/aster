@@ -148,13 +148,16 @@ sync-message = interest / summary / probe / radix-node / offer / want / data / r
 ; conformance/vectors/event-pages-v7.tsv corpus. They allocate no ObjectKind and
 ; do not change any sync-message encoding above.
 ;
-; Semantic-v9/profile-5 Blob streaming is likewise canonical fixed binary and
-; is not a deterministic-CBOR sync-message. These pseudo-productions register
-; its complete required record set and DATA carrier relationship; protocol.md
-; section 9.4 is normative for exact field widths and order.
+; Semantic-v9/profile-5 Blob streaming is canonical fixed binary, not CBOR, so
+; an ordinary CDDL production would falsely describe its concatenated fields.
+; conformance/profile5-wire-schema.json is the machine-checkable structured
+; equivalent: it defines every tag, ordered field, width, enum, bound, ABX1
+; carrier_len, ASD1 composite prefix, and empty/nonempty flow. The standalone
+; contract checker binds that schema to the Rust encoder/decoder and independent
+; oracle/vectors. These aliases are only a CDDL index into that complete schema.
 ; stream-profile-v5 = stream-open-v1 / stream-source-v1 / stream-accept-v1 / stream-data-v1 / stream-checkpoint-v1 / stream-finish-v1 / stream-result-v1 / stream-result-ack-v1
 ; stream-data-v1 = "ASM\x01\xd8" attempt-tuple offset-u64 extent-len-u32 abx1-extent
-; abx1-extent = "ABX1" first-chunk-index-u64 carrier-count-u32 1*canonical-carrier
+; abx1-extent = "ABX1" first-chunk-index-u64 carrier-count-u32 1*(carrier-len-u32 canonical-carrier)
 ; Every SOURCE and DATA record is <= 1,048,576 payload bytes, every ABX1
 ; carrier is a complete canonical ASTRBT01 record, and checkpoint_batch_bytes
 ; is in 1..134,217,728. Exact empty content has no DATA/CHECKPOINT record and

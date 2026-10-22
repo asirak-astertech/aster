@@ -114,8 +114,26 @@ def stream_source():
 
 
 def abx1_extent():
-    carrier = b'ASTRBT01' + b'\xaa' * 24
+    carrier = canonical_carrier(0, 17)
     return b'ABX1' + struct.pack('>QI', 0, 1) + struct.pack('>I', len(carrier)) + carrier
+
+
+def canonical_carrier(index, ciphertext_len):
+    ciphertext = bytes((index + value) & 0xff for value in range(ciphertext_len))
+    return (b'ASTRBT01' + struct.pack('>H', 1) + b'\x10' * 32 + b'\x20' * 32
+            + struct.pack('>Q', index) + hashlib.sha256(ciphertext).digest()
+            + struct.pack('>I', ciphertext_len) + b'\x00' + ciphertext)
+
+
+def maximum_abx1_extent():
+    carriers = [canonical_carrier(index, 65552) for index in range(15)]
+    used = 16 + sum(4 + len(carrier) for carrier in carriers)
+    final_carrier_len = MAX_EXTENT - used - 4
+    carriers.append(canonical_carrier(15, final_carrier_len - 119))
+    extent = (b'ABX1' + struct.pack('>QI', 0, len(carriers))
+              + b''.join(struct.pack('>I', len(carrier)) + carrier for carrier in carriers))
+    assert len(extent) == MAX_EXTENT
+    return extent
 
 
 def stream_accept(extent_len):
@@ -127,22 +145,22 @@ def stream_data(extent):
     return STREAM_MAGIC + b'\xd8' + attempt(0) + struct.pack('>QI', 0, len(extent)) + extent
 
 
-def stream_checkpoint(extent_len):
-    return STREAM_MAGIC + b'\xd9' + attempt(0) + struct.pack('>QQQ', extent_len, 1, extent_len)
+def stream_checkpoint(extent_len, generation=1):
+    return STREAM_MAGIC + b'\xd9' + attempt(1) + struct.pack('>QQQ', extent_len, generation, extent_len)
 
 
-def stream_finish(extent_len):
-    return (STREAM_MAGIC + b'\xda' + attempt(1) + struct.pack('>QI', extent_len, 32)
+def stream_finish(extent_len, sequence=1):
+    return (STREAM_MAGIC + b'\xda' + attempt(sequence) + struct.pack('>QI', extent_len, 32)
             + b'\x88' * 32)
 
 
-def stream_result(extent_len):
-    return (STREAM_MAGIC + b'\xdb' + attempt(1) + struct.pack('>QB', extent_len, 1)
+def stream_result(extent_len, sequence=2):
+    return (STREAM_MAGIC + b'\xdb' + attempt(sequence) + struct.pack('>QB', extent_len, 1)
             + b'\x99' * 32)
 
 
-def stream_ack():
-    return STREAM_MAGIC + b'\xdc' + attempt(2) + b'\x99' * 32
+def stream_ack(sequence=2):
+    return STREAM_MAGIC + b'\xdc' + attempt(sequence) + b'\x99' * 32
 
 
 def decode_stream_record(wire):
@@ -221,6 +239,7 @@ def profile5_stream_corpus():
         ('REJECT', 'data-truncated', accepted[3][1][:-1]),
         ('REJECT', 'data-trailing', accepted[3][1] + b'\x00'),
         ('REJECT', 'data-offset-overflow', accepted[3][1][:77] + struct.pack('>Q', 0xffffffffffffffff) + accepted[3][1][85:]),
+        ('REJECT', 'result-trailing-replay-change', accepted[6][1] + b'\x00'),
         ('REJECT', 'finish-empty-commitment', accepted[5][1][:85] + struct.pack('>I', 0)),
     ])
     for status, _, wire in rows:
@@ -251,6 +270,69 @@ def profile5_composite_corpus():
     )
 
 
+def profile5_transcript_corpus():
+    extent = abx1_extent()
+    nonempty = [stream_open(len(extent)), stream_source(), stream_accept(len(extent)),
+                stream_data(extent), stream_checkpoint(len(extent)), stream_finish(len(extent)),
+                stream_result(len(extent)), stream_ack()]
+    empty = [stream_open(0), stream_source(), stream_accept(0), stream_finish(0, 0),
+             stream_result(0, 1), stream_ack(1)]
+    validate_transcript(nonempty, [0xd6, 0xdd, 0xd7, 0xd8, 0xd9, 0xda, 0xdb, 0xdc],
+                        {0xd7: 0, 0xd8: 0, 0xd9: 1, 0xda: 1, 0xdb: 2, 0xdc: 2})
+    validate_transcript(empty, [0xd6, 0xdd, 0xd7, 0xda, 0xdb, 0xdc],
+                        {0xd7: 0, 0xda: 0, 0xdb: 1, 0xdc: 1})
+    rollback = nonempty[:5] + [stream_checkpoint(len(extent), 0)]
+    binding = nonempty[:4] + [nonempty[4][:37] + bytes([0x23]) * 32 + nonempty[4][69:]]
+    terminal_change = nonempty + [stream_result(len(extent))[:-1] + bytes([0x98])]
+    validate_rejected_transcript('rollback', rollback, nonempty)
+    validate_rejected_transcript('binding', binding, nonempty)
+    validate_rejected_transcript('terminal-change', terminal_change, nonempty)
+    encode = lambda frames: ','.join(frame.hex() for frame in frames)
+    return ('# aster-profile5-transcripts/v1\tsemantic=9\tprofile=5\n'
+            + 'ACCEPT\tnonempty\t' + encode(nonempty) + '\n'
+            + 'ACCEPT\tempty\t' + encode(empty) + '\n'
+            + 'REJECT\trollback\t' + encode(rollback) + '\n'
+            + 'REJECT\tbinding\t' + encode(binding) + '\n'
+            + 'REJECT\tterminal-change\t' + encode(terminal_change) + '\n')
+
+
+def validate_transcript(frames, expected_tags, expected_sequences):
+    tags = [decode_stream_record(frame) for frame in frames]
+    assert tags == expected_tags
+    transfer_id = frames[0][51:83]
+    nonce = frames[0][187:219]
+    for frame, tag in zip(frames[1:], tags[1:]):
+        assert frame[5:37] == transfer_id and frame[37:69] == nonce
+        if tag in expected_sequences:
+            assert struct.unpack('>Q', frame[69:77])[0] == expected_sequences[tag]
+
+
+def validate_rejected_transcript(name, frames, accepted):
+    """Prove each REJECT vector violates its named state-machine invariant."""
+    tags = [decode_stream_record(frame) for frame in frames]
+    if name == 'rollback':
+        assert tags[-2:] == [0xd9, 0xd9]
+        previous = struct.unpack('>Q', frames[-2][85:93])[0]
+        rollback = struct.unpack('>Q', frames[-1][85:93])[0]
+        assert previous == 1 and rollback == 0
+    elif name == 'binding':
+        assert tags == [0xd6, 0xdd, 0xd7, 0xd8, 0xd9]
+        assert frames[-1][5:37] == accepted[0][51:83]
+        assert frames[-1][37:69] != accepted[0][187:219]
+    elif name == 'terminal-change':
+        assert tags == [0xd6, 0xdd, 0xd7, 0xd8, 0xd9, 0xda, 0xdb, 0xdc, 0xdb]
+        assert frames[-1][:-1] == accepted[-2][:-1]
+        assert frames[-1][-1] != accepted[-2][-1]
+    else:
+        raise AssertionError(f'unknown rejected transcript: {name}')
+
+
+def fuzz_transcript_seed(frames):
+    assert 0 < len(frames) <= 16
+    return (b'AST1' + bytes([len(frames)])
+            + b''.join(struct.pack('>I', len(frame)) + frame for frame in frames))
+
+
 def main():
     offer = ('# aster-blob-ranges-stream-vectors/v1\tsemantic=7,8\toracle=python-stdlib\n'
              'ACCEPT\toffer-blob-stream-only-v1\t'
@@ -260,6 +342,7 @@ def main():
         'blob-stream-records-v1.tsv': corpus(),
         'profile5-stream-records-v1.tsv': profile5_stream_corpus(),
         'profile5-composite-data-record-v1.tsv': profile5_composite_corpus(),
+        'profile5-transcripts-v1.tsv': profile5_transcript_corpus(),
     }
     for name, text in outputs.items():
         path = ROOT / 'vectors' / name
@@ -285,6 +368,31 @@ def main():
             seed_path.write_bytes(payload)
         else:
             assert seed_path.read_bytes() == payload, f'{seed_path}: differs from oracle'
+    extent = abx1_extent()
+    header = stream_data(extent)[:89]
+    composite_seeds = {
+        'profile5-composite-valid.bin': b'ASD1' + struct.pack('>I', len(header)) + header + extent,
+    }
+    maximum = maximum_abx1_extent()
+    maximum_header = stream_data(maximum)[:89]
+    composite_seeds['profile5-composite-maximum.bin'] = (
+        b'ASD1' + struct.pack('>I', len(maximum_header)) + maximum_header + maximum)
+    composite_seeds['profile5-transcript-nonempty.bin'] = fuzz_transcript_seed([
+        stream_open(len(extent)), stream_source(), stream_accept(len(extent)),
+        stream_data(extent), stream_checkpoint(len(extent)), stream_finish(len(extent)),
+        stream_result(len(extent)), stream_ack(),
+    ])
+    composite_seeds['profile5-transcript-empty.bin'] = fuzz_transcript_seed([
+        stream_open(0), stream_source(), stream_accept(0), stream_finish(0, 0),
+        stream_result(0, 1), stream_ack(1),
+    ])
+    for name, payload in composite_seeds.items():
+        expected_names.add(name)
+        path = stream_seed_root / name
+        if '--write' in sys.argv:
+            path.write_bytes(payload)
+        else:
+            assert path.read_bytes() == payload, f'{path}: differs from oracle'
     if '--write' in sys.argv:
         for existing in stream_seed_root.iterdir():
             if existing.name not in expected_names:

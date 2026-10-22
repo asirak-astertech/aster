@@ -9,8 +9,8 @@ use crate::{
         CanonicalBlobExtentV1, MAX_STREAM_CHECKPOINT_BATCH_BYTES, PROFILE5_CANONICAL_EXTENT_BYTES,
         PROFILE5_IDLE_TIMEOUT, StreamAction, StreamClass, StreamDirection, StreamExtentAction,
         StreamFrame, StreamOpenV1, StreamReceiverState, StreamResultCode, StreamSenderState,
-        encode_composite_data_prefix, profile5_attempt_bounds, profile5_attempt_hard_timeout,
-        profile5_receive_limit, split_composite_data_record,
+        encode_composite_data_prefix, profile5_attempt_bounds, profile5_attempt_bounds_for_extents,
+        profile5_attempt_hard_timeout, profile5_receive_limit, split_composite_data_record,
     },
     stream_transport::{
         AttemptOpenRequest, AuthenticatedPeerSupport, AuthenticatedSupportSource,
@@ -22,7 +22,7 @@ use crate::{
 use aster_iroh::Connection;
 use aster_mesh::{
     BlobContentVerification, BlobCustodyTransferId, ContentVerifiedBlobEnvelope,
-    ReferenceEnvelopeSealer, VerifiedBlobTransferPlan,
+    ReferenceEnvelopeSealer, VerifiedBlobTransferPlan, profile5_canonical_wire_shape,
 };
 use aster_redb_store::{
     ApplyOutcome, BlobCarrierObjectId, BlobDepotCompletion, BlobSourceProjection,
@@ -40,8 +40,7 @@ use crate::{
         run_ordered_channel_pipeline_from,
     },
     stream_transfer::{
-        PROFILE5_ATTEMPT_TIMEOUT, PROFILE5_EXTENT_BYTES, PROFILE5_MAX_RECORD_BYTES,
-        blob_pack_wire_len,
+        PROFILE5_ATTEMPT_TIMEOUT, PROFILE5_LEGACY_SEGMENT_RECORD_BYTES, blob_pack_wire_len,
     },
 };
 #[cfg(test)]
@@ -1145,8 +1144,13 @@ pub(crate) async fn send_canonical_blob_profile5(
     } else {
         None
     };
+    let extent_count = profile5_canonical_wire_shape(&source.plan)
+        .map_err(|error| authentication_failure("derive canonical wire shape", error))?
+        .checkpoints()
+        .len()
+        .saturating_sub(1);
     let (max_data_bytes, max_control_bytes) =
-        profile5_attempt_bounds(wire_len).map_err(|error| {
+        profile5_attempt_bounds_for_extents(wire_len, extent_count).map_err(|error| {
             BlobNetworkError::new(BlobNetworkStage::Framing, "bound canonical stream", error)
         })?;
     let attempt = await_authenticated_progress(
@@ -1996,14 +2000,14 @@ impl RecordPartitioner {
         Self {
             next_index,
             consumed,
-            max_record_bytes: PROFILE5_MAX_RECORD_BYTES,
+            max_record_bytes: PROFILE5_LEGACY_SEGMENT_RECORD_BYTES,
         }
     }
 
     #[cfg(test)]
     fn with_max_record_bytes_for_test(mut self, max_record_bytes: usize) -> Self {
         assert!(
-            max_record_bytes > 0 && max_record_bytes <= PROFILE5_MAX_RECORD_BYTES,
+            max_record_bytes > 0 && max_record_bytes <= PROFILE5_LEGACY_SEGMENT_RECORD_BYTES,
             "test record bound must be within the production limit"
         );
         self.max_record_bytes = max_record_bytes;
@@ -2267,7 +2271,7 @@ async fn receive_completed_pack_inner(
         durable_wire,
         resume.generation(),
         current_limit,
-        PROFILE5_EXTENT_BYTES as u32,
+        PROFILE5_CANONICAL_EXTENT_BYTES as u32,
     )
     .map_err(|error| failure("initialize receiver state", error))?;
     let StreamAction::Send(accept) = state
@@ -2947,7 +2951,8 @@ pub(crate) mod tests {
         let mut sequence = 0_u64;
         while offset < TOTAL {
             let extent_len =
-                usize::try_from((TOTAL - offset).min(PROFILE5_EXTENT_BYTES as u64)).unwrap();
+                usize::try_from((TOTAL - offset).min(PROFILE5_CANONICAL_EXTENT_BYTES as u64))
+                    .unwrap();
             let frame = StreamFrame::Data(crate::stream_transfer::StreamDataV1 {
                 transfer_id: [0xd3; 32],
                 attempt_nonce: nonce,
@@ -3457,8 +3462,8 @@ pub(crate) mod tests {
         }
 
         assert_eq!(extents.len() as u64, published.segment_count);
-        assert_eq!(extents[0].len(), PROFILE5_EXTENT_BYTES);
-        assert_eq!(extents[1].len(), PROFILE5_EXTENT_BYTES);
+        assert_eq!(extents[0].len(), PROFILE5_CANONICAL_EXTENT_BYTES);
+        assert_eq!(extents[1].len(), PROFILE5_CANONICAL_EXTENT_BYTES);
     }
 
     #[tokio::test]
@@ -3486,8 +3491,9 @@ pub(crate) mod tests {
         let (sender, _receiver) = mpsc::channel(1);
         const TEST_RECORD_BYTES: usize = 4;
         let declared = TEST_RECORD_BYTES + 1;
-        let mut bytes = vec![0; declared + crate::stream_transfer::PROFILE5_RECORD_PREFIX_BYTES];
-        bytes[..crate::stream_transfer::PROFILE5_RECORD_PREFIX_BYTES]
+        let mut bytes =
+            vec![0; declared + crate::stream_transfer::PROFILE5_LEGACY_RECORD_PREFIX_BYTES];
+        bytes[..crate::stream_transfer::PROFILE5_LEGACY_RECORD_PREFIX_BYTES]
             .copy_from_slice(&(declared as u32).to_be_bytes());
 
         let error = RecordPartitioner::new(0, 0)
