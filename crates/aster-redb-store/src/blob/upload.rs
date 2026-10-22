@@ -16,9 +16,9 @@ use crate::{
     require_control_policy_write,
 };
 use aster_mesh::{
-    BlobManifest, BlobMetadata, BlobPublicationStreamId, BlobStreamFinalCommitment, BlobStreamOpen,
-    NodeId, VerifiedBlobStreamFinalCommitment, VerifiedBlobStreamOpen,
-    local_blob_publication_stream_id,
+    BlobManifest, BlobMetadata, BlobPublicationStreamId, BlobStreamFinalCommitment,
+    BlobStreamLineage, BlobStreamOpen, NodeId, VerifiedBlobStreamFinalCommitment,
+    VerifiedBlobStreamOpen, local_blob_publication_stream_id,
 };
 use redb::{Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableHandle};
 use sha2::{Digest, Sha256};
@@ -67,6 +67,18 @@ const UPLOAD_ID_DOMAIN: &[u8] = b"aster/blob-upload-id/v1\0";
 const UPLOAD_REQUEST_DOMAIN: &[u8] = b"aster/blob-upload-request/v1\0";
 const MAX_UPLOADS: u64 = super::MAX_BLOB_OPERATIONS;
 
+fn profile5_upload_capacity(total_len: u64) -> Result<BlobUploadCapacity, StoreError> {
+    let segments = total_len
+        .checked_add(aster_mesh::BLOB_STREAM_SEGMENT_BYTES as u64 - 1)
+        .ok_or(StoreError::PayloadByteAccountingOverflow)?
+        / aster_mesh::BLOB_STREAM_SEGMENT_BYTES as u64;
+    Ok(BlobUploadCapacity {
+        bytes: super::pack::reserved_upload_pack_bytes(total_len)?,
+        chunks: segments,
+        variants: 1,
+    })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BlobUploadRequest {
     pub owner: BlobOperationOwner,
@@ -87,7 +99,7 @@ pub(super) struct BlobUploadCapacity {
 }
 
 impl BlobUploadCapacity {
-    fn checked_add(self, other: Self) -> Result<Self, StoreError> {
+    pub(super) fn checked_add(self, other: Self) -> Result<Self, StoreError> {
         Ok(Self {
             bytes: self
                 .bytes
@@ -541,18 +553,23 @@ impl DurableBlobUpload {
         if let Some(profile5) = profile5_open.as_ref() {
             validate_profile5_open_shape(&request, &control_policy, content_epoch, &profile5.open)?;
         }
-        let (expected_capacity, expected_staging) = if format_version == LEGACY_UPLOAD_VERSION {
-            (
-                super::depot::legacy_blob_upload_capacity(total_len)?,
-                super::depot::legacy_blob_upload_staging_charge(total_len)?,
-            )
-        } else {
-            (
-                super::depot::blob_upload_capacity(total_len)?,
-                super::depot::blob_upload_staging_charge(total_len)?,
-            )
-        };
-        let expected_conversion = super::depot::blob_upload_conversion_overhead(total_len)?;
+        let (expected_capacity, expected_staging, expected_conversion) =
+            if format_version == LEGACY_UPLOAD_VERSION {
+                (
+                    super::depot::legacy_blob_upload_capacity(total_len)?,
+                    super::depot::legacy_blob_upload_staging_charge(total_len)?,
+                    super::depot::blob_upload_conversion_overhead(total_len)?,
+                )
+            } else if format_version == PROFILE5_UPLOAD_VERSION {
+                let capacity = profile5_upload_capacity(total_len)?;
+                (capacity, capacity.bytes, 0)
+            } else {
+                (
+                    super::depot::blob_upload_capacity(total_len)?,
+                    super::depot::blob_upload_staging_charge(total_len)?,
+                    super::depot::blob_upload_conversion_overhead(total_len)?,
+                )
+            };
         let pack_identity = profile5_open.as_ref().map_or_else(
             || BlobPackIdentity::new(upload_id, request_digest, total_len),
             |profile5| {
@@ -888,7 +905,7 @@ pub(super) fn finish_upload_cleanups_write(
             let (key, value) = row?;
             let upload = DurableBlobUpload::decode(Arc::new(()), value.value())?;
             if completed.contains(upload.reservation.pack_identity().upload_id().as_bytes()) {
-                remove.push(key.value().to_vec());
+                remove.push((key.value().to_vec(), upload));
             }
         }
     }
@@ -896,10 +913,27 @@ pub(super) fn finish_upload_cleanups_write(
         return Err(schema_error());
     }
     let mut uploads = write.open_table(super::BLOB_UPLOADS)?;
-    for key in remove {
+    for (key, upload) in remove {
+        remove_profile5_pack_write(write, &upload)?;
         uploads.remove(key.as_slice())?;
     }
     Ok(())
+}
+
+fn remove_profile5_pack_write(
+    write: &redb::WriteTransaction,
+    upload: &DurableBlobUpload,
+) -> Result<(), StoreError> {
+    let Some(completion) = upload.profile5_completion.as_ref() else {
+        return Ok(());
+    };
+    let open = upload.profile5_open.as_ref().ok_or_else(schema_error)?;
+    let variant = super::blob_variant_id(
+        completion.commitment.blob_id(),
+        &open.open.content_group(),
+        open.open.content_epoch(),
+    );
+    super::pack_lifecycle::remove_provisional_write(write, variant, &completion.pack)
 }
 
 fn upload_capacity_usage_table(
@@ -1017,6 +1051,85 @@ pub(super) fn bind_upload_credit_to_existing_write(
     Ok(())
 }
 
+pub(super) fn bind_profile5_promotion_write(
+    write: &redb::WriteTransaction,
+    store: &Store,
+    owner_key: &[u8],
+    variant: super::BlobVariantId,
+    owner_binding: [u8; 32],
+) -> Result<(), StoreError> {
+    let encoded = write
+        .open_table(super::BLOB_UPLOADS)?
+        .get(owner_key)?
+        .map(|value| value.value().to_vec())
+        .ok_or_else(|| blob_error(BlobStoreError::ReservationChanged))?;
+    let mut upload =
+        DurableBlobUpload::decode(Arc::clone(&store.blob_completion_authority), &encoded)?;
+    let profile5 = upload.profile5_open.as_ref().ok_or_else(schema_error)?;
+    let completion = upload
+        .profile5_completion
+        .as_ref()
+        .ok_or_else(schema_error)?;
+    let expected_variant = super::blob_variant_id(
+        completion.commitment.blob_id(),
+        &profile5.open.content_group(),
+        profile5.open.content_epoch(),
+    );
+    if variant != expected_variant
+        || upload.bound_variant.is_some_and(|bound| bound != variant)
+        || upload.consumed != BlobUploadCapacity::default()
+    {
+        return Err(blob_error(BlobStoreError::ReservationChanged));
+    }
+    let pack = super::pack_lifecycle::load_write(
+        write,
+        variant,
+        Arc::clone(&store.blob_completion_authority),
+    )?
+    .ok_or_else(schema_error)?;
+    if pack.owner_binding() != &owner_binding
+        || pack.open() != &profile5.open
+        || pack.completion() != &completion.pack
+    {
+        return Err(blob_error(BlobStoreError::CompletionMismatch));
+    }
+    let capacity = super::pack_lifecycle::promote_write(
+        write,
+        variant,
+        &completion.pack,
+        Arc::clone(&store.blob_completion_authority),
+    )?;
+    if capacity != upload.reservation.total_capacity {
+        return Err(schema_error());
+    }
+    upload.bound_variant = Some(variant);
+    upload.consumed = capacity;
+    write
+        .open_table(super::BLOB_UPLOADS)?
+        .insert(owner_key, upload.encode()?.as_slice())?;
+    Ok(())
+}
+
+pub(super) fn finish_profile5_promotion_write(
+    write: &redb::WriteTransaction,
+    owner_key: &[u8],
+) -> Result<(), StoreError> {
+    let encoded = write
+        .open_table(super::BLOB_UPLOADS)?
+        .get(owner_key)?
+        .map(|value| value.value().to_vec())
+        .ok_or_else(schema_error)?;
+    let upload = DurableBlobUpload::decode(Arc::new(()), &encoded)?;
+    if upload.profile5_completion.is_none()
+        || upload.bound_variant.is_none()
+        || upload.consumed != upload.reservation.total_capacity
+    {
+        return Err(schema_error());
+    }
+    write.open_table(super::BLOB_UPLOADS)?.remove(owner_key)?;
+    Ok(())
+}
+
 pub(super) fn audit_blob_uploads_write(write: &redb::WriteTransaction) -> Result<(), StoreError> {
     let uploads = write.open_table(super::BLOB_UPLOADS)?;
     if uploads.len()? > MAX_UPLOADS {
@@ -1029,14 +1142,19 @@ pub(super) fn audit_blob_uploads_write(write: &redb::WriteTransaction) -> Result
             return Err(schema_error());
         }
         let reconstructed = match upload.bound_variant {
-            Some(variant) => super::depot::reconstruct_upload_capacity_write(
-                write,
-                variant,
-                upload.reservation.request.total_len,
-                upload.reservation.content_epoch,
-                upload.reservation.request.media_type.as_deref(),
-                &upload.reservation.request.schema_id,
-            )?,
+            Some(variant) => {
+                match super::pack_lifecycle::reconstruct_capacity_write(write, variant)? {
+                    Some(capacity) => capacity,
+                    None => super::depot::reconstruct_upload_capacity_write(
+                        write,
+                        variant,
+                        upload.reservation.request.total_len,
+                        upload.reservation.content_epoch,
+                        upload.reservation.request.media_type.as_deref(),
+                        &upload.reservation.request.schema_id,
+                    )?,
+                }
+            }
             None => BlobUploadCapacity::default(),
         };
         if upload.consumed != reconstructed {
@@ -1049,6 +1167,23 @@ pub(super) fn audit_blob_uploads_write(write: &redb::WriteTransaction) -> Result
                 .map_or(0, |value| value.value());
             if high_water < profile5.open.publisher_counter() {
                 return Err(schema_error());
+            }
+            if let Some(completion) = upload.profile5_completion.as_ref() {
+                let variant = super::blob_variant_id(
+                    completion.commitment.blob_id(),
+                    &profile5.open.content_group(),
+                    profile5.open.content_epoch(),
+                );
+                let pack = super::pack_lifecycle::load_write(write, variant, Arc::new(()))?
+                    .ok_or_else(schema_error)?;
+                if pack.open() != &profile5.open
+                    || pack.authenticated_open() != profile5.authenticated
+                    || pack.commitment() != &completion.commitment
+                    || pack.authenticated_commitment() != completion.authenticated_commitment
+                    || pack.completion() != &completion.pack
+                {
+                    return Err(schema_error());
+                }
             }
         }
         if let Some(operation) = write.open_table(BLOB_OPERATIONS)?.get(key.value())? {
@@ -1079,14 +1214,18 @@ pub(super) fn audit_blob_uploads_read(read: &redb::ReadTransaction) -> Result<()
             return Err(schema_error());
         }
         let reconstructed = match upload.bound_variant {
-            Some(variant) => super::depot::reconstruct_upload_capacity_read(
-                read,
-                variant,
-                upload.reservation.request.total_len,
-                upload.reservation.content_epoch,
-                upload.reservation.request.media_type.as_deref(),
-                &upload.reservation.request.schema_id,
-            )?,
+            Some(variant) => match super::pack_lifecycle::reconstruct_capacity_read(read, variant)?
+            {
+                Some(capacity) => capacity,
+                None => super::depot::reconstruct_upload_capacity_read(
+                    read,
+                    variant,
+                    upload.reservation.request.total_len,
+                    upload.reservation.content_epoch,
+                    upload.reservation.request.media_type.as_deref(),
+                    &upload.reservation.request.schema_id,
+                )?,
+            },
             None => BlobUploadCapacity::default(),
         };
         if upload.consumed != reconstructed {
@@ -1099,6 +1238,23 @@ pub(super) fn audit_blob_uploads_read(read: &redb::ReadTransaction) -> Result<()
                 .map_or(0, |value| value.value());
             if high_water < profile5.open.publisher_counter() {
                 return Err(schema_error());
+            }
+            if let Some(completion) = upload.profile5_completion.as_ref() {
+                let variant = super::blob_variant_id(
+                    completion.commitment.blob_id(),
+                    &profile5.open.content_group(),
+                    profile5.open.content_epoch(),
+                );
+                let pack = super::pack_lifecycle::load_read(read, variant, Arc::new(()))?
+                    .ok_or_else(schema_error)?;
+                if pack.open() != &profile5.open
+                    || pack.authenticated_open() != profile5.authenticated
+                    || pack.commitment() != &completion.commitment
+                    || pack.authenticated_commitment() != completion.authenticated_commitment
+                    || pack.completion() != &completion.pack
+                {
+                    return Err(schema_error());
+                }
             }
         }
         if let Some(operation) = read.open_table(BLOB_OPERATIONS)?.get(key.value())? {
@@ -1238,10 +1394,17 @@ impl Store {
         }
         let owner_key = blob_operation_owner_key(&request.owner)?;
         let request_digest = request_digest_for(request)?;
-        let total_capacity = super::depot::blob_upload_capacity(request.total_len)?;
-        let staging_charge_bytes = super::depot::blob_upload_staging_charge(request.total_len)?;
-        let conversion_overhead_bytes =
-            super::depot::blob_upload_conversion_overhead(request.total_len)?;
+        let (total_capacity, staging_charge_bytes, conversion_overhead_bytes) =
+            if profile5.is_some() {
+                let capacity = profile5_upload_capacity(request.total_len)?;
+                (capacity, capacity.bytes, 0)
+            } else {
+                (
+                    super::depot::blob_upload_capacity(request.total_len)?,
+                    super::depot::blob_upload_staging_charge(request.total_len)?,
+                    super::depot::blob_upload_conversion_overhead(request.total_len)?,
+                )
+            };
         let pack_root = PinnedBlobPackRoot::open(self)?;
         let _depot_guard = self
             .blob_depot_lock
@@ -1549,6 +1712,7 @@ impl Store {
         expected: BlobUploadCheckpoint,
         completion: BlobPackCompletion,
         commitment: &VerifiedBlobStreamFinalCommitment,
+        lineage: BlobStreamLineage,
     ) -> Result<BlobUploadCheckpoint, StoreError> {
         self.require_live()?;
         let authority = self.require_bound_mission()?;
@@ -1601,10 +1765,10 @@ impl Store {
             commitment: final_commitment.clone(),
             authenticated_commitment: commitment.authenticated_bytes().to_vec(),
         };
-        if upload.profile5_completion.as_ref() == Some(&candidate) {
-            return upload.projection();
-        }
-        if upload.profile5_completion.is_some()
+        if upload
+            .profile5_completion
+            .as_ref()
+            .is_some_and(|existing| existing != &candidate)
             || upload.projection()? != expected
             || candidate.authenticated_commitment.is_empty()
             || candidate.pack.identity() != reservation.pack_identity
@@ -1626,6 +1790,37 @@ impl Store {
         {
             return Err(blob_error(BlobStoreError::CompletionMismatch));
         }
+        let owner_binding = super::depot::require_depot_owner_binding_write(
+            &write,
+            &self.path,
+            self.backing_identity,
+            self.blob_depot_owner_token,
+        )?;
+        let variant_id = super::blob_variant_id(
+            final_commitment.blob_id(),
+            &profile5.open.content_group(),
+            profile5.open.content_epoch(),
+        );
+        super::lifecycle::ensure_lineage_fence(
+            &write,
+            self.blob_lifecycle_limits,
+            variant_id,
+            *lineage.physical().binding(),
+            owner_binding,
+        )?;
+        let pack = super::pack_lifecycle::BlobPackVariant::new(
+            lineage.route(),
+            lineage.physical(),
+            owner_binding,
+            profile5.open.clone(),
+            profile5.authenticated.clone(),
+            final_commitment.clone(),
+            candidate.authenticated_commitment.clone(),
+            candidate.pack.clone(),
+            reservation.total_capacity,
+            Arc::clone(&self.blob_completion_authority),
+        )?;
+        super::pack_lifecycle::insert_write(&write, &pack)?;
         upload.profile5_completion = Some(candidate);
         let projection = upload.projection()?;
         write
@@ -1686,6 +1881,152 @@ impl Store {
             matched = Some((reservation_for_store(self, &upload), upload.projection()?));
         }
         Ok(matched)
+    }
+
+    /// Atomically promotes the exact completed Profile-5 pack into the
+    /// ordinary PR #95 publication, subscription, causal, pressure, and
+    /// lifecycle indexes. No pack record is decrypted, copied, or converted.
+    pub fn commit_profile5_upload_once_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        reservation: &BlobUploadReservation,
+        expected: &BlobUploadCheckpoint,
+        precommit_sample: Option<aster_mesh::CustodySample>,
+    ) -> Result<super::BlobOnceOutcome, StoreError> {
+        self.require_live()?;
+        let authority = self.require_bound_mission()?;
+        let owner_key = validate_reservation_capability(self, reservation)?;
+        if reservation.control_policy != *policy
+            || reservation.request.ttl_ms.is_some() != precommit_sample.is_some()
+        {
+            return Err(blob_error(BlobStoreError::ReservationChanged));
+        }
+        let completion = expected
+            .profile5_completion()
+            .ok_or_else(|| blob_error(BlobStoreError::CompletionMismatch))?;
+        let pack_root = PinnedBlobPackRoot::open(self)?;
+        drop(
+            BlobPackReader::open_completed_upload_pinned(&pack_root, completion.pack())
+                .map_err(upload_pack_store_error)?,
+        );
+        let _depot_guard = self
+            .blob_depot_lock
+            .write()
+            .map_err(|_| blob_error(BlobStoreError::DepotIntegrity("depot lock is poisoned")))?;
+        self.require_live()?;
+        let mut write = self.database.begin_write()?;
+        write.set_durability(Durability::Immediate)?;
+        enforce_live_write(&write)?;
+        synchronize_blob_policy_generation_write(&write)?;
+        require_upload_policy_write(
+            &write,
+            authority,
+            policy,
+            &reservation.request,
+            Some(reservation.content_epoch),
+        )?;
+        let encoded = write
+            .open_table(super::BLOB_UPLOADS)?
+            .get(owner_key.as_slice())?
+            .map(|value| value.value().to_vec());
+        let Some(encoded) = encoded else {
+            drop(write);
+            let blob = self
+                .blob_for_owner_with_policy(policy, &reservation.request.owner)?
+                .ok_or_else(|| blob_error(BlobStoreError::ReservationChanged))?;
+            let read = self.database.begin_read()?;
+            let pack = super::pack_lifecycle::load_read(
+                &read,
+                blob.variant_id,
+                Arc::clone(&self.blob_completion_authority),
+            )?
+            .ok_or_else(|| blob_error(BlobStoreError::CompletionMismatch))?;
+            if pack.completion() != completion.pack()
+                || blob.blob_id != completion.commitment().blob_id()
+                || blob.header.stamp.dot.publisher != reservation.request.owner.publisher
+                || blob.header.topic != reservation.request.topic
+                || blob.header.scope != reservation.request.scope
+                || blob.header.priority != reservation.request.priority
+                || blob.header.ttl_ms != reservation.request.ttl_ms
+                || blob.header.key_epoch != reservation.content_epoch
+                || pack.open().total_len() != reservation.request.total_len
+                || pack.open().metadata()
+                    != &BlobMetadata::new(
+                        reservation.request.media_type.clone(),
+                        reservation.request.schema_id.clone(),
+                    )
+                    .map_err(|_| schema_error())?
+                || blob.sealed != pack.source_record()?
+            {
+                return Err(blob_error(BlobStoreError::OperationConflict));
+            }
+            return Ok(super::BlobOnceOutcome::Existing { blob });
+        };
+        let upload =
+            DurableBlobUpload::decode(Arc::clone(&self.blob_completion_authority), &encoded)?;
+        if reservation_for_store(self, &upload) != *reservation || upload.projection()? != *expected
+        {
+            return Err(blob_error(BlobStoreError::ReservationChanged));
+        }
+        let profile5 = upload.profile5_open.as_ref().ok_or_else(schema_error)?;
+        let blob_reservation = profile5_reservation_from_open(
+            policy,
+            &reservation.request,
+            profile5.open.initial_custody(),
+            &profile5.open,
+        )?;
+        let variant = super::blob_variant_id(
+            completion.commitment().blob_id(),
+            &profile5.open.content_group(),
+            profile5.open.content_epoch(),
+        );
+        let pack = super::pack_lifecycle::load_write(
+            &write,
+            variant,
+            Arc::clone(&self.blob_completion_authority),
+        )?
+        .ok_or_else(schema_error)?;
+        if pack.completion() != completion.pack()
+            || pack.open() != &profile5.open
+            || pack.lifecycle_owned()
+        {
+            return Err(blob_error(BlobStoreError::CompletionMismatch));
+        }
+        let lifetime = match profile5.open.ttl_ms() {
+            None => super::BlobLifetime::Durable,
+            Some(ttl_ms) => super::BlobLifetime::Finite {
+                ttl_ms,
+                age: super::custody::LowerBoundAgeCheckpoint {
+                    cumulative_age_ms: 0,
+                    checkpoint: None,
+                    continuity_generation: 0,
+                    continuity_lost: true,
+                },
+                provenance: super::BlobFiniteProvenance::Local,
+            },
+        };
+        let prepared = super::PreparedBlobPublication::from_profile5_pack(&pack, lifetime)?;
+        let intent = super::BlobPublicationIntent::new_with_ttl(
+            reservation.request.owner.publisher,
+            reservation.request.topic.clone(),
+            reservation.request.scope.clone(),
+            reservation.request.priority,
+            completion.commitment().blob_id(),
+            reservation.request.ttl_ms,
+        )?;
+        let request =
+            super::BlobOperationRequest::new(&reservation.request.owner.operation, &intent);
+        super::validate_blob_reservation(&blob_reservation, &prepared)?;
+        super::validate_blob_publication_intent(&intent, &prepared)?;
+        self.commit_prepared_blob_once_with_lifetime_write(
+            write,
+            policy,
+            &request,
+            &blob_reservation,
+            prepared,
+            profile5.open.initial_custody().zip(precommit_sample),
+            true,
+        )
     }
 
     pub fn complete_blob_upload(
@@ -1753,6 +2094,7 @@ impl Store {
             .map_err(upload_pack_store_error)?;
         remove_upload_pack(&pack_root, &reservation.pack_identity())
             .map_err(upload_pack_store_error)?;
+        remove_profile5_pack_write(&write, &upload)?;
         write
             .open_table(super::BLOB_UPLOADS)?
             .remove(owner_key.as_slice())?;
@@ -1794,6 +2136,7 @@ impl Store {
             .map_err(upload_pack_store_error)?;
         remove_upload_pack(&pack_root, &reservation.pack_identity())
             .map_err(upload_pack_store_error)?;
+        remove_profile5_pack_write(&write, &upload)?;
         write
             .open_table(super::BLOB_UPLOADS)?
             .remove(owner_key.as_slice())?;
@@ -2211,7 +2554,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_profile5_pack_remains_invisible_and_restartable() {
+    fn profile5_pack_promotion_updates_all_blob_indexes_atomically() {
         let fixture = fixture("profile5-pack-complete", 0x29, BlobDepotLimits::DEFAULT);
         let total_len = aster_mesh::BLOB_STREAM_SEGMENT_BYTES as u64 + 17;
         let request = request(&fixture, b"profile5/pack-complete", total_len);
@@ -2270,6 +2613,10 @@ mod tests {
             .reader
             .verify_blob_stream_commitment(&verified_open, &authenticated)
             .expect("verify commitment");
+        let lineage = fixture
+            .publisher
+            .blob_stream_lineage(&verified_open)
+            .expect("stream lineage");
         let completion = writer
             .finish_profile5(&verified_commitment)
             .expect("finish pack");
@@ -2290,6 +2637,7 @@ mod tests {
                 projected,
                 completion,
                 &verified_commitment,
+                lineage,
             )
             .expect("install completion");
         assert_eq!(
@@ -2298,6 +2646,11 @@ mod tests {
                 .expect("completed profile-5 pack")
                 .commitment(),
             &commitment
+        );
+        let expected_variant = super::super::blob_variant_id(
+            commitment.blob_id(),
+            &verified_open.open().content_group(),
+            verified_open.open().content_epoch(),
         );
 
         let (_, retry, retry_open) = reserve_profile5(&fixture, &request);
@@ -2316,6 +2669,17 @@ mod tests {
                 .is_empty()
                 .expect("chunk count")
         );
+        let pack = super::super::pack_lifecycle::load_read(
+            &read,
+            expected_variant,
+            Arc::clone(&fixture.store.blob_completion_authority),
+        )
+        .expect("read lifecycle pack")
+        .expect("completed upload owns one lifecycle pack");
+        assert_eq!(pack.variant_id(), expected_variant);
+        assert_eq!(pack.open(), verified_open.open());
+        assert_eq!(pack.commitment(), &commitment);
+        assert!(pack.is_bound_to(&fixture.store.blob_completion_authority));
         drop(read);
         let Fixture {
             root,
@@ -2332,10 +2696,103 @@ mod tests {
             publisher.mission_authority_id(),
         )
         .expect("reopen Store");
-        let (_, restarted, restarted_open) =
+        let (restarted_reservation, restarted, restarted_open) =
             reserve_profile5_on(&reopened, &publisher, &reader, &request);
         assert_eq!(restarted_open, verified_open);
         assert_eq!(restarted, completed);
+        let outcome = reopened
+            .commit_profile5_upload_once_with_policy(
+                &reopened.control_policy_snapshot().expect("policy"),
+                &restarted_reservation,
+                &restarted,
+                Some(CustodySample {
+                    clock_id: [0x31; 16],
+                    tick_ms: 30,
+                }),
+            )
+            .expect("promote exact pack");
+        let blob = match outcome {
+            super::super::BlobOnceOutcome::Inserted { blob } => blob,
+            _ => panic!("first pack promotion must insert"),
+        };
+        assert_eq!(blob.blob_id, commitment.blob_id());
+        assert_eq!(blob.variant_id, expected_variant);
+        let exact_retry = reopened
+            .commit_profile5_upload_once_with_policy(
+                &reopened.control_policy_snapshot().expect("retry policy"),
+                &restarted_reservation,
+                &restarted,
+                Some(CustodySample {
+                    clock_id: [0x31; 16],
+                    tick_ms: 30,
+                }),
+            )
+            .expect("retry exact promoted pack");
+        assert!(matches!(
+            exact_retry,
+            super::super::BlobOnceOutcome::Existing { blob: ref retried }
+                if retried == &blob
+        ));
+        assert!(
+            reopened
+                .resume_blob_upload(&request.owner)
+                .expect("resume after promotion")
+                .is_none()
+        );
+        let read = reopened.database.begin_read().expect("read promoted pack");
+        assert_eq!(
+            read.open_table(BLOB_PUBLICATIONS)
+                .expect("publications")
+                .len()
+                .expect("publication count"),
+            1
+        );
+        assert!(
+            read.open_table(super::super::BLOB_IMPORTS)
+                .expect("legacy imports")
+                .is_empty()
+                .expect("import count")
+        );
+        assert!(
+            read.open_table(super::super::BLOB_CHUNKS)
+                .expect("legacy chunks")
+                .is_empty()
+                .expect("chunk count")
+        );
+        let promoted = super::super::pack_lifecycle::load_read(
+            &read,
+            expected_variant,
+            Arc::clone(&reopened.blob_completion_authority),
+        )
+        .expect("load promoted pack")
+        .expect("promoted pack row");
+        assert!(promoted.lifecycle_owned());
+        drop(read);
+        let promoted_root = PinnedBlobPackRoot::open(&reopened).expect("promoted pack root");
+        drop(
+            BlobPackReader::open_completed_upload_pinned(
+                &promoted_root,
+                restarted.profile5_completion().expect("completion").pack(),
+            )
+            .expect("open exact promoted pack"),
+        );
+        drop(reopened);
+        let reopened = Store::open_with_limits_and_blob_depot_limits_for_mission(
+            root.database(),
+            StoreLimits::default(),
+            BlobDepotLimits::DEFAULT,
+            publisher.mission_authority_id(),
+        )
+        .expect("reopen promoted Store");
+        assert!(
+            reopened
+                .blob_for_owner_with_policy(
+                    &reopened.control_policy_snapshot().expect("policy"),
+                    &request.owner,
+                )
+                .expect("lookup promoted operation")
+                .is_some()
+        );
     }
 
     #[test]

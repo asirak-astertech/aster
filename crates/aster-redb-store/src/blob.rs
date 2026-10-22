@@ -15,6 +15,7 @@ pub(crate) mod lease;
 #[allow(dead_code)] // Lifecycle authority becomes active in Tasks 2-4.
 pub(crate) mod lifecycle;
 pub mod pack;
+pub(crate) mod pack_lifecycle;
 #[allow(dead_code)]
 pub(crate) mod pressure;
 pub mod stream;
@@ -8143,6 +8144,7 @@ impl Store {
             &reservation,
             prepared,
             initial_sample.zip(precommit_sample),
+            false,
         )
     }
 
@@ -8301,6 +8303,7 @@ impl Store {
             reservation,
             prepared,
             local_samples,
+            false,
         )
     }
 
@@ -8313,6 +8316,7 @@ impl Store {
         reservation: &BlobReservation,
         mut prepared: PreparedBlobPublication,
         local_samples: Option<(aster_mesh::CustodySample, aster_mesh::CustodySample)>,
+        profile5_promotion: bool,
     ) -> Result<BlobOnceOutcome, StoreError> {
         enforce_live_write(&write)?;
         if let Some((initial, final_sample)) = local_samples {
@@ -8365,6 +8369,15 @@ impl Store {
         )?;
         let operation_owner_key =
             blob_operation_owner_key(&blob_operation_owner_for_request(request))?;
+        if profile5_promotion {
+            upload::bind_profile5_promotion_write(
+                &write,
+                self,
+                operation_owner_key.as_slice(),
+                prepared.variant_id,
+                owner_binding,
+            )?;
+        }
 
         // Current authorization and exact active epoch are rechecked before an
         // operation replay may resolve an older, already committed publication.
@@ -8374,6 +8387,11 @@ impl Store {
             .map(|value| decode_blob_operation_record(value.value()))
             .transpose()?
         {
+            if profile5_promotion {
+                return Err(blob_error(BlobStoreError::SchemaInvariant(
+                    "Profile-5 upload remains after its operation committed",
+                )));
+            }
             if existing.intent_digest != request.intent.digest() {
                 return Err(blob_error(BlobStoreError::OperationConflict));
             }
@@ -8487,6 +8505,9 @@ impl Store {
                 stored.transfer_id,
             )?;
             insert_blob_operation(&write, self.limits, request, prepared.transfer_id)?;
+            if profile5_promotion {
+                upload::finish_profile5_promotion_write(&write, operation_owner_key.as_slice())?;
+            }
             write.commit()?;
             return Ok(BlobOnceOutcome::BoundExisting { blob: stored });
         }
@@ -8738,6 +8759,9 @@ impl Store {
         } else {
             pressure::insert_publication_write(&write, prepared.transfer_id)?;
         }
+        if profile5_promotion {
+            upload::finish_profile5_promotion_write(&write, operation_owner_key.as_slice())?;
+        }
         #[cfg(test)]
         if TEST_BLOB_ADMISSION_PRE_COMMIT_FAULT.get() {
             return Err(blob_error(BlobStoreError::SchemaInvariant(
@@ -8779,6 +8803,80 @@ struct PreparedBlobPublication {
 }
 
 impl PreparedBlobPublication {
+    fn from_profile5_pack(
+        pack: &pack_lifecycle::BlobPackVariant,
+        lifetime: BlobLifetime,
+    ) -> Result<Self, StoreError> {
+        validate_blob_lifetime(lifetime)?;
+        let open = pack.open();
+        let commitment = pack.commitment();
+        let sealed = pack.source_record()?;
+        let transfer_id = BlobTransferId::new(Sha256::digest(&sealed).into());
+        let semantic_id = BlobSemanticId::new(pack.semantic_digest());
+        let blob_id = commitment.blob_id();
+        let route = BlobRouteCommitment::from_parts(
+            blob_id,
+            commitment.segment_count(),
+            *commitment.ciphertext_root(),
+        )
+        .map_err(|_| blob_error(BlobStoreError::CompletionMismatch))?;
+        let header = EnvelopeHeader {
+            class: SemanticDataClass::Blob,
+            topic: open.topic().clone(),
+            scope: open.scope().clone(),
+            priority: open.priority(),
+            stamp: CausalStamp {
+                dot: Dot {
+                    publisher: open.publisher(),
+                    counter: open.publisher_counter(),
+                },
+                context: open.causal_context().clone(),
+            },
+            event_sequence: None,
+            logical_key: blob_id.as_bytes().to_vec(),
+            blob_route: Some(route),
+            ttl_ms: open.ttl_ms(),
+            content_len: u64::try_from(sealed.len())
+                .map_err(|_| StoreError::PayloadByteAccountingOverflow)?,
+            tombstone: false,
+            key_epoch: open.content_epoch(),
+        };
+        validate_blob_header(&header)?;
+        if header.ttl_ms != lifetime.ttl_ms() {
+            return Err(blob_error(BlobStoreError::CompletionMismatch));
+        }
+        let manifest_digest = *pack.completion().commitment_digest();
+        let route_lineage = *pack.route_lineage();
+        let physical_lineage = *pack.physical_lineage();
+        let variant_id = pack.variant_id();
+        let mission_authority = *open.mission_id();
+        let encoded_metadata = encode_blob_metadata(BlobMetadata {
+            transfer_id,
+            semantic_id,
+            blob_id,
+            variant_id,
+            manifest_digest,
+            route_lineage: Some(route_lineage),
+            physical_lineage: Some(physical_lineage),
+            lifetime,
+            header: header.clone(),
+        })?;
+        Ok(Self {
+            mission_authority,
+            transfer_id,
+            semantic_id,
+            blob_id,
+            variant_id,
+            manifest_digest,
+            route_lineage,
+            physical_lineage,
+            header,
+            lifetime,
+            sealed,
+            encoded_metadata,
+        })
+    }
+
     fn from_verified(
         blob: &ContentVerifiedBlobEnvelope,
         sealed: &[u8],
@@ -8860,7 +8958,7 @@ struct MaintenanceReferenceEvidence {
 
 #[derive(Debug)]
 struct MaintenancePublicationEvidence {
-    import: Vec<u8>,
+    physical: MaintenancePhysicalEvidence,
     lineage: Vec<u8>,
     reference: MaintenanceReferenceEvidence,
     source: Vec<u8>,
@@ -8880,6 +8978,12 @@ struct MaintenancePendingEvidence {
     lineage: Vec<u8>,
     reference: MaintenanceReferenceEvidence,
     conflicting_publication: Option<Vec<u8>>,
+}
+
+#[derive(Debug)]
+enum MaintenancePhysicalEvidence {
+    LegacyImport(Vec<u8>),
+    Profile5Pack(Vec<u8>),
 }
 
 #[derive(Debug)]
@@ -9200,6 +9304,48 @@ fn capture_exact_maintenance_reference(
     Ok(Some(MaintenanceReferenceEvidence { key, value }))
 }
 
+fn capture_publication_physical_evidence(
+    write: &redb::WriteTransaction,
+    variant: BlobVariantId,
+    charge: &mut MaintenanceCharge,
+) -> Result<Option<MaintenancePhysicalEvidence>, StoreError> {
+    let key = variant.as_bytes().as_slice();
+    let legacy = write
+        .open_table(BLOB_IMPORTS)?
+        .get(key)?
+        .map(|value| value.value().to_vec());
+    let pack = write
+        .open_table(pack_lifecycle::BLOB_PROFILE5_PACKS)?
+        .get(key)?
+        .map(|value| value.value().to_vec());
+    let (table, value, evidence) = match (legacy, pack) {
+        (Some(value), None) => (
+            BLOB_IMPORTS.name(),
+            value.clone(),
+            MaintenancePhysicalEvidence::LegacyImport(value),
+        ),
+        (None, Some(value)) => (
+            pack_lifecycle::BLOB_PROFILE5_PACKS.name(),
+            value.clone(),
+            MaintenancePhysicalEvidence::Profile5Pack(value),
+        ),
+        (None, None) => {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "accepted Blob publication is missing its physical variant",
+            )));
+        }
+        (Some(_), Some(_)) => {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "accepted Blob publication has multiple physical variants",
+            )));
+        }
+    };
+    if !charge.charge_row(MaintenanceRowIdentity::new(table, key), value.len())? {
+        return Ok(None);
+    }
+    Ok(Some(evidence))
+}
+
 fn capture_maintenance_evidence(
     write: &redb::WriteTransaction,
     kind: MaintenanceRowKind,
@@ -9238,11 +9384,12 @@ fn capture_maintenance_evidence(
                     Err(()) => return Ok(None),
                 };
             let variant_key = publication.variant_id.as_bytes().as_slice();
-            let import = required_bytes!(
-                BLOB_IMPORTS,
-                variant_key,
-                "accepted Blob publication is missing its depot import"
-            );
+            let physical =
+                match capture_publication_physical_evidence(write, publication.variant_id, charge)?
+                {
+                    Some(value) => value,
+                    None => return Ok(None),
+                };
             let lineage = required_bytes!(
                 lifecycle::BLOB_LINEAGE_FENCES,
                 variant_key,
@@ -9311,7 +9458,7 @@ fn capture_maintenance_evidence(
                 "accepted Blob publication is missing its causal frontier"
             );
             MaintenanceEvidence::Publication(MaintenancePublicationEvidence {
-                import,
+                physical,
                 lineage,
                 reference,
                 source,
@@ -10364,15 +10511,31 @@ fn validate_maintenance_publication(
             "accepted Blob publication is missing authenticated physical lineage",
         ))
     })?;
-    depot::audit_publication_import_evidence(
-        &evidence.import,
-        publication.variant_id,
-        publication.blob_id,
-        publication.header.key_epoch,
-        publication.manifest_digest,
-        route.chunk_count(),
-        publication.physical_lineage,
-    )?;
+    match &evidence.physical {
+        MaintenancePhysicalEvidence::LegacyImport(import) => {
+            depot::audit_publication_import_evidence(
+                import,
+                publication.variant_id,
+                publication.blob_id,
+                publication.header.key_epoch,
+                publication.manifest_digest,
+                route.chunk_count(),
+                publication.physical_lineage,
+            )?;
+        }
+        MaintenancePhysicalEvidence::Profile5Pack(pack) => {
+            pack_lifecycle::audit_publication_evidence(
+                pack,
+                publication.variant_id,
+                publication.blob_id,
+                publication.header.key_epoch,
+                publication.manifest_digest,
+                route.chunk_count(),
+                publication.physical_lineage,
+                owner_binding,
+            )?;
+        }
+    }
     lifecycle::validate_maintenance_lineage_evidence(
         physical_lineage,
         owner_binding,
@@ -15969,6 +16132,7 @@ pub(crate) fn blob_schema_present_write(
         .filter(|table| existing.contains(**table))
         .count();
     let upload_present = existing.contains(BLOB_UPLOADS.name());
+    let pack_present = existing.contains(pack_lifecycle::BLOB_PROFILE5_PACKS.name());
     let extension_group_supported = matches!(
         (network_present, upload_present),
         (0, false) | (4, false) | (4, true) | (5, true)
@@ -16006,6 +16170,7 @@ pub(crate) fn blob_schema_present_write(
     if legacy_present == 0
         && network_present == 0
         && !upload_present
+        && !pack_present
         && global_present.iter().all(|present| !present)
         && stream_complete_empty
     {
@@ -16037,6 +16202,7 @@ pub(crate) fn blob_schema_present_write(
         && network_present == 0
         && stream_present == 0
         && !upload_present
+        && !pack_present
         && global_present.iter().all(|present| !present)
     {
         lifecycle::require_blob_lifecycle_absent_write(write)?;
@@ -16081,6 +16247,9 @@ pub(crate) fn blob_schema_present_write(
     }
     if !upload_present {
         let _ = write.open_table(BLOB_UPLOADS)?;
+    }
+    if !pack_present {
+        let _ = write.open_table(pack_lifecycle::BLOB_PROFILE5_PACKS)?;
     }
     #[cfg(test)]
     if schema_migration_required && TEST_BLOB_SCHEMA_MIGRATION_FAULT.get() == 2 {
@@ -16465,6 +16634,7 @@ pub(crate) fn audit_blob_tables_write(
     if !blob_schema_present_write(write)? {
         initialize_blob_schema(write)?;
     }
+    pack_lifecycle::audit_write(write)?;
     upload::audit_blob_uploads_write(write)?;
     upload::extend_profile5_reserved_publisher_high_write(
         write,
@@ -17004,6 +17174,7 @@ pub(crate) fn inspect_blob_tables_read(
         && !existing.contains(BLOB_PROFILE5_RECEIPTS.name());
     let network_current = network_present == network.len();
     let upload_present = existing.contains(BLOB_UPLOADS.name());
+    let pack_present = existing.contains(pack_lifecycle::BLOB_PROFILE5_PACKS.name());
     let extension_group_supported = matches!(
         (network_present, upload_present),
         (0, false) | (4, false) | (4, true) | (5, true)
@@ -17055,6 +17226,7 @@ pub(crate) fn inspect_blob_tables_read(
         && network_present == 0
         && (stream_present == 0 || stream_complete_empty)
         && !upload_present
+        && !pack_present
         && global_present.iter().all(|present| !present)
     {
         lifecycle::require_blob_lifecycle_absent_read(read)?;
@@ -17064,6 +17236,7 @@ pub(crate) fn inspect_blob_tables_read(
     if legacy_present != legacy.len()
         || !(network_present == 0 || network_predecessor || network_current)
         || !extension_group_supported
+        || !pack_present
         || global_present.iter().any(|present| !present)
     {
         return Err(blob_error(BlobStoreError::SchemaInvariant(
@@ -17072,6 +17245,7 @@ pub(crate) fn inspect_blob_tables_read(
     }
     drop(metadata);
     if upload_present {
+        pack_lifecycle::audit_read(read)?;
         upload::audit_blob_uploads_read(read)?;
     }
     let deletion_owner_binding = depot::depot_owner_binding_if_present_read(read)?;
@@ -17710,6 +17884,7 @@ fn initialize_blob_schema(write: &redb::WriteTransaction) -> Result<(), StoreErr
     let _ = write.open_table(BLOB_ACCEPTANCE_MARKERS)?;
     let _ = write.open_table(BLOB_OPERATIONS)?;
     let _ = write.open_table(BLOB_UPLOADS)?;
+    let _ = write.open_table(pack_lifecycle::BLOB_PROFILE5_PACKS)?;
     let _ = write.open_table(BLOB_IMPORTS)?;
     let _ = write.open_table(BLOB_CHUNKS)?;
     {
@@ -17798,7 +17973,7 @@ fn stream_blob_table_names() -> [&'static str; 6] {
     ]
 }
 
-fn blob_table_names() -> [&'static str; 15] {
+fn blob_table_names() -> [&'static str; 16] {
     let legacy = legacy_blob_table_names();
     let network = network_blob_table_names();
     [
@@ -17817,6 +17992,7 @@ fn blob_table_names() -> [&'static str; 15] {
         network[3],
         network[4],
         BLOB_UPLOADS.name(),
+        pack_lifecycle::BLOB_PROFILE5_PACKS.name(),
     ]
 }
 

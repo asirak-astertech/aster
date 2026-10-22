@@ -2937,16 +2937,20 @@ pub(super) fn depot_admission_usage_write(
             ))
         })?;
     let upload = super::upload::upload_capacity_usage_write(write)?;
+    let packs = super::pack_lifecycle::active_capacity_usage_write(write)?;
     Ok(DepotAdmissionUsage {
         variants: imports
-            .checked_add(upload.variants)
+            .checked_add(packs.variants)
+            .and_then(|value| value.checked_add(upload.variants))
             .ok_or(StoreError::ItemCountAccountingOverflow)?,
         chunks: active_chunks
             .checked_add(deletion_chunks)
+            .and_then(|value| value.checked_add(packs.chunks))
             .and_then(|value| value.checked_add(upload.chunks))
             .ok_or(StoreError::ItemCountAccountingOverflow)?,
         reserved_bytes: reserved_bytes
-            .checked_add(upload.bytes)
+            .checked_add(packs.bytes)
+            .and_then(|value| value.checked_add(upload.bytes))
             .ok_or(StoreError::PayloadByteAccountingOverflow)?,
     })
 }
@@ -2975,16 +2979,20 @@ pub(super) fn depot_admission_usage_read(
             ))
         })?;
     let upload = super::upload::upload_capacity_usage_read(read)?;
+    let packs = super::pack_lifecycle::active_capacity_usage_read(read)?;
     Ok(DepotAdmissionUsage {
         variants: imports
-            .checked_add(upload.variants)
+            .checked_add(packs.variants)
+            .and_then(|value| value.checked_add(upload.variants))
             .ok_or(StoreError::ItemCountAccountingOverflow)?,
         chunks: active_chunks
             .checked_add(deletion_chunks)
+            .and_then(|value| value.checked_add(packs.chunks))
             .and_then(|value| value.checked_add(upload.chunks))
             .ok_or(StoreError::ItemCountAccountingOverflow)?,
         reserved_bytes: reserved_bytes
-            .checked_add(upload.bytes)
+            .checked_add(packs.bytes)
+            .and_then(|value| value.checked_add(upload.bytes))
             .ok_or(StoreError::PayloadByteAccountingOverflow)?,
     })
 }
@@ -3019,7 +3027,7 @@ pub(super) fn audited_lifecycle_imports_write(
     write: &redb::WriteTransaction,
 ) -> Result<Vec<AuditedLifecycleImport>, StoreError> {
     let imports = write.open_table(BLOB_IMPORTS)?;
-    imports
+    let mut audited = imports
         .iter()?
         .map(|row| {
             let (key, value) = row?;
@@ -3028,7 +3036,11 @@ pub(super) fn audited_lifecycle_imports_write(
                 decode_import(value.value())?,
             )
         })
-        .collect()
+        .collect::<Result<Vec<_>, StoreError>>()?;
+    audited.extend(super::pack_lifecycle::audited_lifecycle_imports_write(
+        write,
+    )?);
+    Ok(audited)
 }
 
 /// Read-only counterpart to [`audited_lifecycle_imports_write`].
@@ -3036,7 +3048,7 @@ pub(super) fn audited_lifecycle_imports_read(
     read: &redb::ReadTransaction,
 ) -> Result<Vec<AuditedLifecycleImport>, StoreError> {
     let imports = read.open_table(BLOB_IMPORTS)?;
-    imports
+    let mut audited = imports
         .iter()?
         .map(|row| {
             let (key, value) = row?;
@@ -3045,7 +3057,9 @@ pub(super) fn audited_lifecycle_imports_read(
                 decode_import(value.value())?,
             )
         })
-        .collect()
+        .collect::<Result<Vec<_>, StoreError>>()?;
+    audited.extend(super::pack_lifecycle::audited_lifecycle_imports_read(read)?);
+    Ok(audited)
 }
 
 pub(crate) fn depot_owner_token_write(
@@ -3464,7 +3478,10 @@ pub(crate) fn audit_depot_write(
     let owner_binding =
         require_depot_owner_binding_write(write, store_path, backing_identity, owner_token)?;
     let deletion = super::deletion::audit_blob_deletion_write(write, Some(owner_binding))?;
-    let upload_packs = super::upload::upload_pack_expectations_write(write)?;
+    let mut upload_packs = super::upload::upload_pack_expectations_write(write)?;
+    upload_packs.extend(super::pack_lifecycle::active_pack_expectations_write(
+        write,
+    )?);
     if expected == BlobStoreStats::default() {
         if let Some(root) = OwnedDirectory::open_root_if_present(store_path)? {
             match root.read_owner_marker()? {
@@ -3522,7 +3539,10 @@ pub(crate) fn recover_upload_pack_transitions_write(
     {
         return Ok(());
     }
-    let expected = super::upload::upload_pack_expectations_write(write)?;
+    let mut expected = super::upload::upload_pack_expectations_write(write)?;
+    expected.extend(super::pack_lifecycle::active_pack_expectations_write(
+        write,
+    )?);
     let Some(root) = OwnedDirectory::open_root_if_present(store_path)? else {
         if expected.is_empty() {
             return Ok(());
@@ -3549,7 +3569,10 @@ pub(crate) fn reclaim_upload_cleanup_markers_after_commit(
     {
         return Ok(());
     }
-    let expected = super::upload::upload_pack_expectations_write(write)?;
+    let mut expected = super::upload::upload_pack_expectations_write(write)?;
+    expected.extend(super::pack_lifecycle::active_pack_expectations_write(
+        write,
+    )?);
     let Some(root) = OwnedDirectory::open_root_if_present(store_path)? else {
         return if expected.is_empty() {
             Ok(())
@@ -3573,7 +3596,8 @@ pub(crate) fn audit_depot_read(
     let owner_binding =
         require_depot_owner_binding_read(read, store_path, backing_identity, owner_token)?;
     let deletion = super::deletion::inspect_blob_deletion_read(read, Some(owner_binding))?;
-    let upload_packs = super::upload::upload_pack_expectations_read(read)?;
+    let mut upload_packs = super::upload::upload_pack_expectations_read(read)?;
+    upload_packs.extend(super::pack_lifecycle::active_pack_expectations_read(read)?);
     let Some(root) = OwnedDirectory::open_root_if_present(store_path)? else {
         if expected.variants == 0 && upload_packs.is_empty() {
             return Ok(());
@@ -3646,6 +3670,27 @@ pub(super) fn audit_publication_import_write(
     chunk_count: u64,
     physical_lineage: Option<[u8; 32]>,
 ) -> Result<(), StoreError> {
+    if let Some(pack) = write
+        .open_table(super::pack_lifecycle::BLOB_PROFILE5_PACKS)?
+        .get(variant_id.as_bytes().as_slice())?
+        .map(|value| value.value().to_vec())
+    {
+        let owner_binding = depot_owner_binding_if_present_write(write)?.ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "Profile-5 pack exists without depot owner binding",
+            ))
+        })?;
+        return super::pack_lifecycle::audit_publication_evidence(
+            &pack,
+            variant_id,
+            blob_id,
+            epoch,
+            manifest_digest,
+            chunk_count,
+            physical_lineage,
+            owner_binding,
+        );
+    }
     let import = load_import_write(write, variant_id)?.ok_or_else(|| {
         blob_error(BlobStoreError::SchemaInvariant(
             "accepted Blob publication is missing its depot import",
@@ -3808,6 +3853,27 @@ pub(super) fn audit_publication_import_read(
     chunk_count: u64,
     physical_lineage: Option<[u8; 32]>,
 ) -> Result<(), StoreError> {
+    if let Some(pack) = read
+        .open_table(super::pack_lifecycle::BLOB_PROFILE5_PACKS)?
+        .get(variant_id.as_bytes().as_slice())?
+        .map(|value| value.value().to_vec())
+    {
+        let owner_binding = depot_owner_binding_if_present_read(read)?.ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "Profile-5 pack exists without depot owner binding",
+            ))
+        })?;
+        return super::pack_lifecycle::audit_publication_evidence(
+            &pack,
+            variant_id,
+            blob_id,
+            epoch,
+            manifest_digest,
+            chunk_count,
+            physical_lineage,
+            owner_binding,
+        );
+    }
     let import = load_import_read(read, variant_id)?.ok_or_else(|| {
         blob_error(BlobStoreError::SchemaInvariant(
             "accepted Blob publication is missing its depot import",

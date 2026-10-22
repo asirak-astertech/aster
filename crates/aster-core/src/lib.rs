@@ -261,8 +261,8 @@ pub use provisioning::{
 };
 #[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
 pub use source_blob::{
-    BlobContentVerification, BlobPeerContentProof, ContentVerifiedBlobEnvelope, CurrentBlobLineage,
-    RouteVerifiedBlobEnvelope,
+    BlobContentVerification, BlobPeerContentProof, BlobStreamLineage, ContentVerifiedBlobEnvelope,
+    CurrentBlobLineage, RouteVerifiedBlobEnvelope,
 };
 #[cfg(feature = "reference-session")]
 pub use source_control::{

@@ -30,6 +30,25 @@ use std::io;
 /// Unforgeable module-private witness for provider-authenticated stream capabilities.
 pub(crate) struct BlobStreamProviderSeal(pub(crate) ());
 
+/// Provider-authenticated route and physical lineage for one exact Profile-5
+/// stream open. These opaque bindings carry no key material and let durable
+/// lifecycle state reject same-epoch grant replacement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlobStreamLineage {
+    route: SourceRouteLineage,
+    physical: BlobPhysicalLineage,
+}
+
+impl BlobStreamLineage {
+    pub const fn route(self) -> SourceRouteLineage {
+        self.route
+    }
+
+    pub const fn physical(self) -> BlobPhysicalLineage {
+        self.physical
+    }
+}
+
 const BLOB_STREAM_OPEN_SIGNATURE_DOMAIN: &[u8] = b"ASTER/blob-stream/signed-open/v2\0";
 const BLOB_STREAM_COMMITMENT_SIGNATURE_DOMAIN: &[u8] = b"ASTER/blob-stream/signed-commitment/v2\0";
 const MAX_BLOB_STREAM_OPEN_BODY_BYTES: usize = 2048 + 40 * crate::MAX_CAUSAL_CONTEXT_ENTRIES;
@@ -561,6 +580,35 @@ impl ReferenceEnvelopeSealer {
         content_epoch: u64,
     ) -> Option<[u8; 32]> {
         self.current_source_route_grant_commitment(scope, content_epoch)
+    }
+
+    /// Mints opaque lifecycle lineage only for an open which is still bound to
+    /// this provider's exact current route and content grants.
+    pub fn blob_stream_lineage(
+        &self,
+        open: &VerifiedBlobStreamOpen,
+    ) -> Result<BlobStreamLineage, EnvelopeError> {
+        if open.mission_authority_id() != self.mission_authority_id()
+            || self.current_source_route_grant_commitment(
+                open.open().scope(),
+                open.open().content_epoch(),
+            ) != Some(*open.open().authorization_digest())
+        {
+            return Err(blob_stream_authentication_error(
+                BlobError::AuthenticationFailed,
+            ));
+        }
+        let physical = self
+            .current_blob_physical_lineage(
+                open.open().scope(),
+                open.open().topic(),
+                open.open().content_epoch(),
+            )
+            .ok_or_else(|| blob_stream_authentication_error(BlobError::AuthenticationFailed))?;
+        Ok(BlobStreamLineage {
+            route: SourceRouteLineage::from_commitment(*open.open().authorization_digest()),
+            physical,
+        })
     }
 
     pub fn seal_blob_stream_open(&self, open: &BlobStreamOpen) -> Result<Vec<u8>, EnvelopeError> {
@@ -1288,6 +1336,16 @@ mod tests {
         let verified = reader
             .verify_blob_stream_open(&signed_open)
             .expect("verify open");
+        let publisher_lineage = publisher
+            .blob_stream_lineage(&verified)
+            .expect("publisher stream lineage");
+        assert_eq!(
+            reader
+                .blob_stream_lineage(&verified)
+                .expect("reader stream lineage"),
+            publisher_lineage
+        );
+        assert!(relay.blob_stream_lineage(&verified).is_err());
         let sealer = publisher
             .blob_stream_segment_sealer(&verified)
             .expect("segment sealer");
