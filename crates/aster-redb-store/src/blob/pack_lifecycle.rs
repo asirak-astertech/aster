@@ -206,10 +206,6 @@ impl BlobPackVariant {
         Ok(variant)
     }
 
-    pub const fn variant_id(&self) -> BlobVariantId {
-        self.variant_id
-    }
-
     pub const fn open(&self) -> &BlobStreamOpen {
         &self.open
     }
@@ -256,10 +252,6 @@ impl BlobPackVariant {
 
     pub(super) fn source_record(&self) -> Result<Vec<u8>, StoreError> {
         profile5_source_record(&self.authenticated_open, &self.authenticated_commitment)
-    }
-
-    pub(super) fn semantic_digest(&self) -> [u8; 32] {
-        profile5_semantic_digest(&self.open, &self.commitment)
     }
 
     pub(super) fn is_bound_to(&self, authority: &Arc<()>) -> bool {

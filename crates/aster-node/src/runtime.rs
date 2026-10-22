@@ -27196,78 +27196,13 @@ fn next_canonical_blob_publication(
                     source,
                 }));
             }
-            Err(StoreError::Blob(BlobStoreError::NotFound)) => {}
+            Err(StoreError::Blob(BlobStoreError::NotFound)) => {
+                return Err(NodeError::FatalBlobCoherence(
+                    "profile-5 publication lacks its canonical native pack".into(),
+                ));
+            }
             Err(error) => return Err(error.into()),
         }
-        let claim = authenticate_blob_source(
-            store,
-            verifier,
-            &stored.sealed,
-            &retained.source,
-            retained.retention,
-            None,
-        )?;
-        if !verifier.is_current_source_route_lineage(
-            &claim.scope,
-            claim.key_epoch,
-            claim.route_lineage,
-        ) || !verifier.is_current_blob_physical_lineage(
-            &claim.scope,
-            &claim.topic,
-            claim.key_epoch,
-            claim.physical_lineage,
-        ) {
-            continue;
-        }
-        let route = verifier.verify_blob(&stored.sealed)?;
-        let BlobContentVerification::ContentVerified {
-            blob,
-            manifest_bytes,
-        } = verifier.verify_blob_content(route, &stored.sealed)?
-        else {
-            return Err(NodeError::FatalBlobCoherence(
-                "profile-5 canonical source lost its content grant".into(),
-            ));
-        };
-        let plan = blob.transfer_plan(&manifest_bytes).map_err(|error| {
-            NodeError::Protocol(format!("profile-5 canonical manifest plan failed: {error}"))
-        })?;
-        let Some(final_selector) = peer_interest
-            .selector(blob.topic(), blob.scope())
-            .filter(|selector| selector.epoch() == blob.key_epoch())
-        else {
-            continue;
-        };
-        if !verifier.peer_can_route(peer, peer_route_commitments, blob.scope(), blob.key_epoch())
-            || !verifier.peer_can_open_blob_content(
-                peer,
-                peer_route_commitments,
-                blob.scope(),
-                blob.topic(),
-                blob.key_epoch(),
-                final_selector.content_proof(),
-            )
-        {
-            continue;
-        }
-        let completion = claim.depot_completion.ok_or_else(|| {
-            NodeError::FatalBlobCoherence(
-                "profile-5 canonical source lacks its completed depot capability".into(),
-            )
-        })?;
-        let source = blob_stream::CanonicalBlobSendSource::new_with_lifetime(
-            stored,
-            plan,
-            completion,
-            blob,
-            retained.source.clone(),
-            retained.retention,
-        )
-        .map_err(profile5_blob_network_error)?;
-        return Ok(Some(SelectedCanonicalBlobPublication {
-            expected_cursor: cursor,
-            source,
-        }));
     }
     Ok(None)
 }
@@ -53117,6 +53052,35 @@ mod tests {
             .get_blob(publication)
             .expect("native target lookup")
             .expect("native target publication promoted");
+        let source_blob = source_store
+            .get_blob(publication)
+            .expect("native source lookup after crossing")
+            .expect("native source publication remains present");
+        let mut source_records = source_store
+            .open_profile5_pack_transfer_read(source_blob.variant_id)
+            .expect("open native source records");
+        let mut target_records = target_store
+            .open_profile5_pack_transfer_read(target_blob.variant_id)
+            .expect("open native target records");
+        let mut record_lengths = Vec::new();
+        loop {
+            let source_record = source_records
+                .next_record()
+                .expect("read native source record");
+            let target_record = target_records
+                .next_record()
+                .expect("read native target record");
+            match (source_record, target_record) {
+                (Some(source_record), Some(target_record)) => {
+                    assert_eq!(source_record.as_bytes(), target_record.as_bytes());
+                    record_lengths.push(source_record.as_bytes().len());
+                }
+                (None, None) => break,
+                _ => panic!("native source and target packs contain different record counts"),
+            }
+        }
+        assert_eq!(adapter.data_part_body_lengths(), record_lengths);
+        assert!(retry_adapter.data_part_body_lengths().is_empty());
         let mut target_pack = target_store
             .open_profile5_pack_application_read(target_blob.variant_id)
             .expect("native target application lease");

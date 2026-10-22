@@ -3222,18 +3222,27 @@ pub(crate) async fn receive_canonical_blob_profile5(
     }
 
     let sealed = receive_authenticated_source(attempt.as_ref(), &mut codec, &open).await?;
-    if let Ok(native_open) = verifier.verify_blob_stream_open(&sealed) {
-        return Box::pin(receive_native_profile5_pack(
-            attempt,
-            codec,
-            store,
-            policy,
-            verifier,
-            open,
-            native_open,
-            offer,
-        ))
-        .await;
+    match verifier.verify_blob_stream_open(&sealed) {
+        Ok(native_open) => {
+            return Box::pin(receive_native_profile5_pack(
+                attempt,
+                codec,
+                store,
+                policy,
+                verifier,
+                open,
+                native_open,
+                offer,
+            ))
+            .await;
+        }
+        Err(error) if !cfg!(test) => {
+            return Err(authentication_failure(
+                "authenticate native Profile-5 source",
+                error,
+            ));
+        }
+        Err(_) => {}
     }
     if u32::try_from(sealed.len()).ok() != Some(offer.source_len)
         || <[u8; 32]>::from(Sha256::digest(&sealed)) != offer.source_digest
@@ -5014,6 +5023,7 @@ pub(crate) mod tests {
         data: mpsc::UnboundedSender<Option<Vec<u8>>>,
         control: tokio::sync::Mutex<mpsc::UnboundedReceiver<Option<Vec<u8>>>>,
         pending_data_send_entered: Option<Arc<tokio::sync::Semaphore>>,
+        data_part_body_lengths: Arc<std::sync::Mutex<Vec<usize>>>,
     }
 
     struct SmallMtuSenderAttempt {
@@ -5079,6 +5089,10 @@ pub(crate) mod tests {
             body: &'a [u8],
         ) -> AdapterFuture<'a, ()> {
             Box::pin(async move {
+                self.data_part_body_lengths
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(body.len());
                 if let Some(entered) = &self.pending_data_send_entered {
                     entered.add_permits(1);
                     std::future::pending::<()>().await;
@@ -5180,6 +5194,7 @@ pub(crate) mod tests {
                     data: data_send,
                     control: tokio::sync::Mutex::new(control_receive),
                     pending_data_send_entered: None,
+                    data_part_body_lengths: Arc::new(std::sync::Mutex::new(Vec::new())),
                 }),
                 receiver: Arc::new(MemoryReceiverAttempt {
                     data: tokio::sync::Mutex::new(data_receive),
@@ -5203,6 +5218,7 @@ pub(crate) mod tests {
                         data: data_send,
                         control: tokio::sync::Mutex::new(control_receive),
                         pending_data_send_entered: Some(entered),
+                        data_part_body_lengths: Arc::new(std::sync::Mutex::new(Vec::new())),
                     }),
                     receiver: Arc::new(MemoryReceiverAttempt {
                         data: tokio::sync::Mutex::new(data_receive),
@@ -5213,6 +5229,14 @@ pub(crate) mod tests {
                 },
                 control,
             )
+        }
+
+        pub(crate) fn data_part_body_lengths(&self) -> Vec<usize> {
+            self.sender
+                .data_part_body_lengths
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
         }
     }
 
