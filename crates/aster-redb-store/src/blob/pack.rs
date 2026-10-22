@@ -1,9 +1,10 @@
 //! Sequential encrypted stream pack with alternating durable checkpoints.
 
 use aster_mesh::{
-    BLOB_STREAM_SEGMENT_BYTES, BLOB_STREAM_SEGMENT_ENCODED_OVERHEAD_BYTES, BlobPublicationStreamId,
-    BlobStreamCheckpoint, BlobStreamFrontier, BlobStreamOpen, BlobStreamSegmentLeaves,
-    BlobStreamSubtree, EncryptedBlobStreamSegment, MAX_BLOB_CHUNKS, SELECTED_BLOB_CHUNK_SIZE,
+    BLOB_STREAM_SEGMENT_BYTES, BLOB_STREAM_SEGMENT_ENCODED_OVERHEAD_BYTES, BlobId,
+    BlobPublicationStreamId, BlobStreamCheckpoint, BlobStreamFrontier, BlobStreamOpen,
+    BlobStreamSegmentLeaves, BlobStreamSubtree, EncryptedBlobStreamSegment, MAX_BLOB_CHUNKS,
+    SELECTED_BLOB_CHUNK_SIZE, VerifiedBlobStreamFinalCommitment,
 };
 use sha2::digest::common::hazmat::{SerializableState, SerializedState};
 use sha2::{Digest, Sha256};
@@ -35,6 +36,9 @@ pub(super) const UPLOAD_DIGEST_HEADER_LEN: u64 = 8 + 2 + 32 + 32 + 8 + 4;
 const SHA256_SERIALIZED_STATE_LEN: usize = 105;
 const CHECKPOINT_ZERO: &str = "checkpoint.0";
 const CHECKPOINT_ONE: &str = "checkpoint.1";
+const COMPLETION_FILE: &str = "completion.v2";
+const COMPLETION_MAGIC: &[u8; 8] = b"ASTRCM02";
+const COMPLETION_VERSION: u16 = 2;
 pub(super) const PACK_HEADER_LEN: u64 = 8 + 2 + 32 + 32 + 8;
 const MAX_RECORD_BYTES: usize = 2 * 1024 * 1024;
 const PACK_FIXED_RESERVATION_BYTES: u64 = 64 * 1024;
@@ -992,6 +996,87 @@ pub struct BlobPackCheckpoint {
     frontier: BlobStreamCheckpoint,
     upload_digests: Option<BlobUploadDigestCheckpoint>,
     authority: Option<Arc<()>>,
+}
+
+/// Nonconstructible proof that one exact Profile-5 pack is complete and bound
+/// to its authenticated final commitment. The descriptor is synchronized in
+/// the pack directory before lifecycle promotion can reference it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlobPackCompletion {
+    identity: BlobPackIdentity,
+    checkpoint: BlobPackCheckpoint,
+    plaintext_root: [u8; 32],
+    ciphertext_root: [u8; 32],
+    blob_id: BlobId,
+    commitment_digest: [u8; 32],
+    authenticated_commitment_digest: [u8; 32],
+    descriptor_digest: [u8; 32],
+}
+
+impl BlobPackCompletion {
+    pub const fn identity(&self) -> BlobPackIdentity {
+        self.identity
+    }
+
+    pub const fn checkpoint(&self) -> &BlobPackCheckpoint {
+        &self.checkpoint
+    }
+
+    pub const fn segment_count(&self) -> u64 {
+        self.checkpoint.next_index
+    }
+
+    pub const fn pack_len(&self) -> u64 {
+        self.checkpoint.pack_len
+    }
+
+    pub const fn plaintext_root(&self) -> &[u8; 32] {
+        &self.plaintext_root
+    }
+
+    pub const fn ciphertext_root(&self) -> &[u8; 32] {
+        &self.ciphertext_root
+    }
+
+    pub const fn blob_id(&self) -> BlobId {
+        self.blob_id
+    }
+
+    pub const fn commitment_digest(&self) -> &[u8; 32] {
+        &self.commitment_digest
+    }
+
+    pub const fn authenticated_commitment_digest(&self) -> &[u8; 32] {
+        &self.authenticated_commitment_digest
+    }
+
+    pub const fn descriptor_digest(&self) -> &[u8; 32] {
+        &self.descriptor_digest
+    }
+
+    pub(crate) fn bind_authority(&mut self, authority: Arc<()>) {
+        self.checkpoint.bind_authority(authority);
+    }
+
+    pub(crate) fn is_bound_to(&self, authority: &Arc<()>) -> bool {
+        self.checkpoint.is_bound_to(authority)
+    }
+
+    pub(crate) fn encode(&self) -> Result<Vec<u8>, BlobPackError> {
+        let (encoded, digest) = encode_completion_descriptor(self)?;
+        if self.descriptor_digest != digest {
+            return Err(BlobPackError::Invalid(
+                "Blob pack completion descriptor digest mismatch",
+            ));
+        }
+        Ok(encoded)
+    }
+
+    pub(crate) fn decode(encoded: &[u8], authority: Arc<()>) -> Result<Self, BlobPackError> {
+        let mut completion = decode_completion_descriptor(encoded)?;
+        completion.bind_authority(authority);
+        Ok(completion)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1953,6 +2038,19 @@ impl BlobPackWriter {
         self.checkpoint_inner(Some(digest_checkpoint))
     }
 
+    /// Returns the final ordered roots without consuming or rewriting the
+    /// completed pack. This is used to authenticate the final commitment
+    /// before installing the completion descriptor.
+    pub fn final_roots(&self) -> Result<([u8; 32], [u8; 32]), BlobPackError> {
+        if self.plaintext_offset != self.total_len {
+            return Err(BlobPackError::Invalid("Blob pack is incomplete"));
+        }
+        self.frontier
+            .clone()
+            .finish(self.total_len)
+            .map_err(|_| BlobPackError::Invalid("invalid final Blob roots"))
+    }
+
     fn checkpoint_inner(
         &mut self,
         upload_digests: Option<BlobUploadDigestCheckpoint>,
@@ -2009,6 +2107,49 @@ impl BlobPackWriter {
             .finish(self.total_len)
             .map_err(|_| BlobPackError::Invalid("invalid final Blob roots"))
     }
+
+    /// Completes the exact Profile-5 pack in place. No segment is decrypted,
+    /// split, copied, or re-encrypted; the synchronized descriptor binds the
+    /// final checkpoint and both ordered roots to the signed commitment.
+    pub fn finish_profile5(
+        mut self,
+        commitment: &VerifiedBlobStreamFinalCommitment,
+    ) -> Result<BlobPackCompletion, BlobPackError> {
+        let (plaintext_root, ciphertext_root) = self.final_roots()?;
+        let checkpoint = self.checkpoint()?;
+        let final_commitment = commitment.commitment();
+        if final_commitment.open_digest() != &self.open_digest
+            || final_commitment.stream_id() != self.stream_id
+            || final_commitment.total_len() != self.total_len
+            || final_commitment.segment_count() != self.next_index
+            || final_commitment.plaintext_root() != &plaintext_root
+            || final_commitment.ciphertext_root() != &ciphertext_root
+            || checkpoint.plaintext_offset() != self.total_len
+            || checkpoint.next_index() != self.next_index
+            || checkpoint.pack_len() != self.pack_len
+        {
+            return Err(BlobPackError::Invalid(
+                "Blob pack final commitment does not match durable bytes",
+            ));
+        }
+        let commitment_digest = Sha256::digest(final_commitment.encode()).into();
+        let authenticated_commitment_digest =
+            Sha256::digest(commitment.authenticated_bytes()).into();
+        let mut completion = BlobPackCompletion {
+            identity: BlobPackIdentity::new(self.stream_id, self.open_digest, self.total_len),
+            checkpoint,
+            plaintext_root,
+            ciphertext_root,
+            blob_id: final_commitment.blob_id(),
+            commitment_digest,
+            authenticated_commitment_digest,
+            descriptor_digest: [0; 32],
+        };
+        let (descriptor, descriptor_digest) = encode_completion_descriptor(&completion)?;
+        completion.descriptor_digest = descriptor_digest;
+        self.root.write_checkpoint(COMPLETION_FILE, &descriptor)?;
+        Ok(completion)
+    }
 }
 
 pub struct BlobPackReader {
@@ -2044,6 +2185,70 @@ impl BlobPackReader {
         open: &BlobStreamOpen,
     ) -> Result<Self, BlobPackError> {
         Self::open_in(root.stream(open, false)?, open)
+    }
+
+    /// Opens an immutable completed pack only through the exact Store-bound
+    /// completion capability installed by [`BlobPackWriter::finish_profile5`].
+    pub fn open_completed_upload_pinned(
+        root: &PinnedBlobPackRoot,
+        completion: &BlobPackCompletion,
+    ) -> Result<Self, BlobPackError> {
+        if !completion.is_bound_to(&root.authority) {
+            return Err(BlobPackError::Invalid(
+                "Blob pack completion belongs to another Store",
+            ));
+        }
+        Self::open_completed_in(root.upload(&completion.identity, false)?, completion)
+    }
+
+    /// Path-backed completion reader used by pack-level validation and tools.
+    pub fn open_completed(
+        root: &Path,
+        completion: &BlobPackCompletion,
+    ) -> Result<Self, BlobPackError> {
+        Self::open_completed_in(BlobPackRoot::Path(root.to_owned()), completion)
+    }
+
+    fn open_completed_in(
+        root: BlobPackRoot,
+        completion: &BlobPackCompletion,
+    ) -> Result<Self, BlobPackError> {
+        let descriptor = root
+            .read_checkpoint(COMPLETION_FILE)?
+            .ok_or(BlobPackError::Invalid(
+                "Blob pack completion descriptor is missing",
+            ))?;
+        let mut durable = decode_completion_descriptor(&descriptor)?;
+        if durable != *completion {
+            return Err(BlobPackError::Invalid(
+                "Blob pack completion descriptor identity mismatch",
+            ));
+        }
+        if let Some(authority) = root.authority() {
+            durable.bind_authority(authority);
+        }
+        let mut data = root
+            .open_existing_data()?
+            .ok_or(BlobPackError::Invalid("Blob pack data is unavailable"))?;
+        validate_header(&mut data, completion.identity)?;
+        if data.metadata()?.len() < completion.pack_len() {
+            return Err(BlobPackError::Invalid("completed Blob pack is truncated"));
+        }
+        let recovered = recover_checkpoints(&root, completion.identity, data.metadata()?.len())?;
+        if !recovered
+            .iter()
+            .any(|candidate| candidate == completion.checkpoint())
+        {
+            return Err(BlobPackError::Invalid(
+                "completed Blob pack checkpoint is unavailable",
+            ));
+        }
+        data.seek(SeekFrom::Start(PACK_HEADER_LEN))?;
+        Ok(Self {
+            data,
+            checkpoint: durable.checkpoint,
+            next_index: 0,
+        })
     }
 
     /// Opens exactly the Store-projected provisional upload checkpoint. Later
@@ -2275,6 +2480,83 @@ fn recover_checkpoints(
     }
 }
 
+fn encode_completion_descriptor(
+    completion: &BlobPackCompletion,
+) -> Result<(Vec<u8>, [u8; 32]), BlobPackError> {
+    let checkpoint = completion.checkpoint.encode();
+    let checkpoint_len = u32::try_from(checkpoint.len())
+        .map_err(|_| BlobPackError::Invalid("Blob pack completion checkpoint is oversized"))?;
+    let mut encoded = Vec::with_capacity(8 + 2 + 4 + checkpoint.len() + 32 * 6 + 32);
+    encoded.extend_from_slice(COMPLETION_MAGIC);
+    encoded.extend_from_slice(&COMPLETION_VERSION.to_be_bytes());
+    encoded.extend_from_slice(&checkpoint_len.to_be_bytes());
+    encoded.extend_from_slice(&checkpoint);
+    encoded.extend_from_slice(&completion.plaintext_root);
+    encoded.extend_from_slice(&completion.ciphertext_root);
+    encoded.extend_from_slice(completion.blob_id.as_bytes());
+    encoded.extend_from_slice(&completion.commitment_digest);
+    encoded.extend_from_slice(&completion.authenticated_commitment_digest);
+    let digest: [u8; 32] = Sha256::digest(&encoded).into();
+    encoded.extend_from_slice(&digest);
+    Ok((encoded, digest))
+}
+
+fn decode_completion_descriptor(encoded: &[u8]) -> Result<BlobPackCompletion, BlobPackError> {
+    if encoded.len() < 8 + 2 + 4 + 32 * 6
+        || &encoded[..8] != COMPLETION_MAGIC
+        || u16::from_be_bytes(encoded[8..10].try_into().expect("completion version"))
+            != COMPLETION_VERSION
+    {
+        return Err(BlobPackError::Invalid(
+            "invalid Blob pack completion descriptor",
+        ));
+    }
+    let checksum_at = encoded.len() - 32;
+    let descriptor_digest: [u8; 32] = Sha256::digest(&encoded[..checksum_at]).into();
+    if encoded[checksum_at..] != descriptor_digest {
+        return Err(BlobPackError::Invalid(
+            "invalid Blob pack completion checksum",
+        ));
+    }
+    let mut reader = Reader::new(&encoded[..checksum_at]);
+    if reader.take(8)? != COMPLETION_MAGIC || reader.u16()? != COMPLETION_VERSION {
+        return Err(BlobPackError::Invalid(
+            "unsupported Blob pack completion descriptor",
+        ));
+    }
+    let checkpoint_len = usize::try_from(reader.u32()?)
+        .map_err(|_| BlobPackError::Invalid("invalid completion checkpoint length"))?;
+    let checkpoint = BlobPackCheckpoint::decode(reader.take(checkpoint_len)?)?;
+    let plaintext_root = reader.array()?;
+    let ciphertext_root = reader.array()?;
+    let blob_id = BlobId::from_bytes(reader.array()?);
+    let commitment_digest = reader.array()?;
+    let authenticated_commitment_digest = reader.array()?;
+    reader.finish()?;
+    if checkpoint.plaintext_offset() != checkpoint.total_len()
+        || plaintext_root == [0; 32]
+        || ciphertext_root == [0; 32]
+        || commitment_digest == [0; 32]
+        || authenticated_commitment_digest == [0; 32]
+    {
+        return Err(BlobPackError::Invalid("invalid completed Blob pack state"));
+    }
+    Ok(BlobPackCompletion {
+        identity: BlobPackIdentity::new(
+            checkpoint.stream_id(),
+            *checkpoint.open_digest(),
+            checkpoint.total_len(),
+        ),
+        checkpoint,
+        plaintext_root,
+        ciphertext_root,
+        blob_id,
+        commitment_digest,
+        authenticated_commitment_digest,
+        descriptor_digest,
+    })
+}
+
 struct Reader<'a> {
     bytes: &'a [u8],
     position: usize,
@@ -2335,8 +2617,10 @@ fn hex32(value: &[u8; 32]) -> String {
 mod tests {
     use super::*;
     use aster_mesh::{
-        BLOB_STREAM_SEGMENT_BYTES, BlobMetadata, BlobStreamPlainPartition, BlobStreamSegmentSealer,
-        Priority, Scope, Topic, VersionVector,
+        BLOB_STREAM_SEGMENT_BYTES, BlobMetadata, BlobStreamFinalCommitment,
+        BlobStreamPlainPartition, BlobStreamSegmentSealer, Priority, ProvisioningAccess,
+        ReferenceEnvelopeSealer, ReferenceProvisioner, Scope, Topic, VerifiedBlobStreamOpen,
+        VersionVector,
     };
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -2415,6 +2699,56 @@ mod tests {
                     .expect("seal")
             })
             .collect()
+    }
+
+    fn authenticated_open(
+        total_len: u64,
+    ) -> (
+        BlobStreamOpen,
+        VerifiedBlobStreamOpen,
+        ReferenceEnvelopeSealer,
+        ReferenceEnvelopeSealer,
+    ) {
+        let topic = Topic::new("imagery").expect("topic");
+        let scope = Scope::new("mission/alpha").expect("scope");
+        let access = ProvisioningAccess::member(scope.clone(), vec![1], vec![topic.clone()])
+            .expect("access");
+        let mut provisioner = ReferenceProvisioner::from_seed([0x91; 32]).expect("provisioner");
+        let publisher = provisioner
+            .issue_control_authority(1, std::slice::from_ref(&access))
+            .and_then(ReferenceEnvelopeSealer::open)
+            .expect("publisher");
+        let reader = provisioner
+            .issue_node(2, &[access])
+            .and_then(ReferenceEnvelopeSealer::open)
+            .expect("reader");
+        let open = BlobStreamOpen::new(
+            BlobPublicationStreamId::from_bytes([0x11; 32]).expect("stream"),
+            publisher.identity(),
+            b"pack-test".to_vec(),
+            publisher.mission_authority_id(),
+            1,
+            VersionVector::default(),
+            topic,
+            scope.clone(),
+            BlobMetadata::new(Some("image/tiff".into()), Vec::new()).expect("metadata"),
+            Priority::Immediate,
+            None,
+            None,
+            total_len,
+            1,
+            1,
+            publisher
+                .blob_stream_authorization_digest(&scope, 1)
+                .expect("authorization"),
+            [0x51; 32],
+        )
+        .expect("open");
+        let authenticated = publisher.seal_blob_stream_open(&open).expect("sign open");
+        let verified = reader
+            .verify_blob_stream_open(&authenticated)
+            .expect("verify open");
+        (open, verified, publisher, reader)
     }
 
     #[test]
@@ -2715,6 +3049,59 @@ mod tests {
         let record = reader.next_record().expect("read").expect("record");
         assert_eq!(record.as_bytes(), expected);
         assert!(reader.next_record().expect("eof").is_none());
+    }
+
+    #[test]
+    fn completed_profile5_pack_is_exactly_the_uploaded_pack() {
+        let root = TempRoot::new();
+        let total_len = BLOB_STREAM_SEGMENT_BYTES as u64 + 17;
+        let (open, verified, publisher, reader) = authenticated_open(total_len);
+        let segments = segments(&open, 2);
+        let mut writer = BlobPackWriter::create(&root.0, &open).expect("create pack");
+        for (segment, leaves) in &segments {
+            writer.append(segment, *leaves).expect("append segment");
+        }
+        writer.checkpoint().expect("checkpoint uploaded pack");
+        let pack_before = fs::read(root.0.join(PACK_FILE)).expect("read uploaded pack");
+        let roots = writer.final_roots().expect("final roots");
+        let commitment = BlobStreamFinalCommitment::new(
+            &verified,
+            roots.0,
+            roots.1,
+            segments.len() as u64,
+            None,
+        )
+        .expect("final commitment");
+        let authenticated_commitment = publisher
+            .seal_blob_stream_commitment(&commitment)
+            .expect("sign commitment");
+        let verified_commitment = reader
+            .verify_blob_stream_commitment(&verified, &authenticated_commitment)
+            .expect("verify commitment");
+
+        let completion = writer
+            .finish_profile5(&verified_commitment)
+            .expect("complete pack");
+        assert_eq!(
+            fs::read(root.0.join(PACK_FILE)).expect("read completed pack"),
+            pack_before,
+            "completion must not rewrite or convert encrypted segment bytes"
+        );
+        assert_eq!(completion.segment_count(), 2);
+        assert_eq!(completion.plaintext_root(), &roots.0);
+        assert_eq!(completion.ciphertext_root(), &roots.1);
+        assert_eq!(completion.blob_id(), commitment.blob_id());
+
+        let mut completed =
+            BlobPackReader::open_completed(&root.0, &completion).expect("open completed pack");
+        for (segment, _) in &segments {
+            let record = completed
+                .next_record()
+                .expect("read record")
+                .expect("record");
+            assert_eq!(&record.as_bytes()[4..], segment.encode());
+        }
+        assert!(completed.next_record().expect("completed eof").is_none());
     }
 
     #[test]

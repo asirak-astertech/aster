@@ -1,7 +1,8 @@
 //! Durable provisional application-Blob upload authority.
 
 use super::pack::{
-    BlobPackCheckpoint, BlobPackError, BlobPackIdentity, PinnedBlobPackRoot, remove_upload_pack,
+    BlobPackCheckpoint, BlobPackCompletion, BlobPackError, BlobPackIdentity, BlobPackReader,
+    PinnedBlobPackRoot, remove_upload_pack,
 };
 use super::{
     BLOB_OPERATIONS, BLOB_PUBLICATIONS, BlobOperationOwner, BlobReservation, BlobReservationInputs,
@@ -15,8 +16,9 @@ use crate::{
     require_control_policy_write,
 };
 use aster_mesh::{
-    BlobManifest, BlobMetadata, BlobPublicationStreamId, BlobStreamOpen, NodeId,
-    VerifiedBlobStreamOpen, local_blob_publication_stream_id,
+    BlobManifest, BlobMetadata, BlobPublicationStreamId, BlobStreamFinalCommitment, BlobStreamOpen,
+    NodeId, VerifiedBlobStreamFinalCommitment, VerifiedBlobStreamOpen,
+    local_blob_publication_stream_id,
 };
 use redb::{Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableHandle};
 use sha2::{Digest, Sha256};
@@ -191,14 +193,43 @@ impl BlobUploadReservation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BlobUploadCheckpoint {
     durable: Option<BlobPackCheckpoint>,
+    profile5_completion: Option<BlobProfile5UploadCompletion>,
     consumed: BlobUploadCapacity,
     remaining: BlobUploadCapacity,
+}
+
+/// Durable, exact authenticated finish authority for a completed provisional
+/// Profile-5 upload. It remains invisible until the lifecycle promotion
+/// transaction consumes it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlobProfile5UploadCompletion {
+    pack: BlobPackCompletion,
+    commitment: BlobStreamFinalCommitment,
+    authenticated_commitment: Vec<u8>,
+}
+
+impl BlobProfile5UploadCompletion {
+    pub const fn pack(&self) -> &BlobPackCompletion {
+        &self.pack
+    }
+
+    pub const fn commitment(&self) -> &BlobStreamFinalCommitment {
+        &self.commitment
+    }
+
+    pub fn authenticated_commitment(&self) -> &[u8] {
+        &self.authenticated_commitment
+    }
 }
 
 impl BlobUploadCheckpoint {
     /// Exact pack journal state projected durably into redb, if any.
     pub const fn durable_pack_checkpoint(&self) -> Option<&BlobPackCheckpoint> {
         self.durable.as_ref()
+    }
+
+    pub const fn profile5_completion(&self) -> Option<&BlobProfile5UploadCompletion> {
+        self.profile5_completion.as_ref()
     }
 
     pub fn generation(&self) -> u64 {
@@ -258,6 +289,7 @@ struct DurableBlobUpload {
     consumed: BlobUploadCapacity,
     bound_variant: Option<super::BlobVariantId>,
     profile5_open: Option<DurableProfile5Open>,
+    profile5_completion: Option<BlobProfile5UploadCompletion>,
 }
 
 #[derive(Clone, Debug)]
@@ -274,6 +306,7 @@ impl DurableBlobUpload {
     fn projection(&self) -> Result<BlobUploadCheckpoint, StoreError> {
         Ok(BlobUploadCheckpoint {
             durable: self.checkpoint.clone(),
+            profile5_completion: self.profile5_completion.clone(),
             consumed: self.consumed,
             remaining: self.remaining()?,
         })
@@ -347,7 +380,27 @@ impl DurableBlobUpload {
             output.extend_from_slice(&open);
             output.extend_from_slice(&authenticated_len.to_be_bytes());
             output.extend_from_slice(&profile5.authenticated);
+            match &self.profile5_completion {
+                None => output.push(0),
+                Some(completion) => {
+                    output.push(1);
+                    let commitment = completion.commitment.encode();
+                    let pack = completion.pack.encode().map_err(upload_pack_store_error)?;
+                    for bytes in [
+                        commitment.as_slice(),
+                        completion.authenticated_commitment.as_slice(),
+                        pack.as_slice(),
+                    ] {
+                        let len = u32::try_from(bytes.len())
+                            .map_err(|_| StoreError::PayloadByteAccountingOverflow)?;
+                        output.extend_from_slice(&len.to_be_bytes());
+                        output.extend_from_slice(bytes);
+                    }
+                }
+            }
         } else if self.profile5_open.is_some() {
+            return Err(schema_error());
+        } else if self.profile5_completion.is_some() {
             return Err(schema_error());
         }
         let checkpoint_len = u32::try_from(checkpoint.len())
@@ -416,7 +469,7 @@ impl DurableBlobUpload {
             1 => Some(super::BlobVariantId::from_bytes(cursor.array()?)),
             _ => return Err(schema_error()),
         };
-        let profile5_open = if format_version == PROFILE5_UPLOAD_VERSION {
+        let (profile5_open, profile5_completion) = if format_version == PROFILE5_UPLOAD_VERSION {
             let open_len = usize::try_from(cursor.u32()?).map_err(|_| schema_error())?;
             let open =
                 BlobStreamOpen::decode(cursor.take(open_len)?).map_err(|_| schema_error())?;
@@ -425,12 +478,41 @@ impl DurableBlobUpload {
             if authenticated.is_empty() {
                 return Err(schema_error());
             }
-            Some(DurableProfile5Open {
+            let profile5_open = DurableProfile5Open {
                 open,
                 authenticated,
-            })
+            };
+            let completion = match cursor.u8()? {
+                0 => None,
+                1 => {
+                    let commitment_len =
+                        usize::try_from(cursor.u32()?).map_err(|_| schema_error())?;
+                    let commitment =
+                        BlobStreamFinalCommitment::decode(cursor.take(commitment_len)?)
+                            .map_err(|_| schema_error())?;
+                    let authenticated_len =
+                        usize::try_from(cursor.u32()?).map_err(|_| schema_error())?;
+                    let authenticated_commitment = cursor.take(authenticated_len)?.to_vec();
+                    let pack_len = usize::try_from(cursor.u32()?).map_err(|_| schema_error())?;
+                    let pack = BlobPackCompletion::decode(
+                        cursor.take(pack_len)?,
+                        Arc::clone(&authority_capability),
+                    )
+                    .map_err(upload_pack_store_error)?;
+                    if authenticated_commitment.is_empty() {
+                        return Err(schema_error());
+                    }
+                    Some(BlobProfile5UploadCompletion {
+                        pack,
+                        commitment,
+                        authenticated_commitment,
+                    })
+                }
+                _ => return Err(schema_error()),
+            };
+            (Some(profile5_open), completion)
         } else {
-            None
+            (None, None)
         };
         let checkpoint_len = usize::try_from(cursor.u32()?).map_err(|_| schema_error())?;
         let mut checkpoint = if checkpoint_len == 0 {
@@ -488,6 +570,27 @@ impl DurableBlobUpload {
                     || checkpoint.request_digest() != pack_identity.request_digest()
                     || checkpoint.total_len() != pack_identity.total_len()
             })
+            || profile5_completion.as_ref().is_some_and(|completion| {
+                let Some(profile5) = profile5_open.as_ref() else {
+                    return true;
+                };
+                let Some(checkpoint) = checkpoint.as_ref() else {
+                    return true;
+                };
+                completion.commitment.open_digest() != &profile5.open.digest()
+                    || completion.commitment.stream_id() != profile5.open.stream_id()
+                    || completion.commitment.total_len() != profile5.open.total_len()
+                    || completion.commitment.segment_count() != checkpoint.next_index()
+                    || completion.commitment.plaintext_root() != completion.pack.plaintext_root()
+                    || completion.commitment.ciphertext_root() != completion.pack.ciphertext_root()
+                    || completion.commitment.blob_id() != completion.pack.blob_id()
+                    || completion.pack.checkpoint() != checkpoint
+                    || completion.pack.identity() != pack_identity
+                    || Sha256::digest(completion.commitment.encode()).as_slice()
+                        != completion.pack.commitment_digest()
+                    || Sha256::digest(&completion.authenticated_commitment).as_slice()
+                        != completion.pack.authenticated_commitment_digest()
+            })
         {
             return Err(schema_error());
         }
@@ -509,6 +612,7 @@ impl DurableBlobUpload {
             consumed,
             bound_variant,
             profile5_open,
+            profile5_completion,
         })
     }
 }
@@ -1338,6 +1442,7 @@ impl Store {
             consumed: BlobUploadCapacity::default(),
             bound_variant: None,
             profile5_open,
+            profile5_completion: None,
         };
         // A previous crash may have committed removal of this deterministic
         // upload while leaving only its physical cleanup tombstone.  The row
@@ -1400,9 +1505,9 @@ impl Store {
             DurableBlobUpload::decode(Arc::clone(&self.blob_completion_authority), &encoded)?;
         if reservation_for_store(self, &upload) != *reservation
             || upload.projection()? != expected
-            || durable.upload_id() != reservation.upload_id
-            || durable.request_digest() != &reservation.request_digest
-            || durable.total_len() != reservation.request.total_len
+            || durable.upload_id() != reservation.pack_identity.upload_id()
+            || durable.request_digest() != reservation.pack_identity.request_digest()
+            || durable.total_len() != reservation.pack_identity.total_len()
             || !durable.is_bound_to(&self.blob_completion_authority)
         {
             return Err(blob_error(BlobStoreError::ReservationChanged));
@@ -1430,6 +1535,102 @@ impl Store {
             .insert(owner_key.as_slice(), upload.encode()?.as_slice())?;
         #[cfg(test)]
         maybe_inject_test_fault(self, UploadFaultPoint::CheckpointBeforeCommit)?;
+        write.commit()?;
+        Ok(projection)
+    }
+
+    /// Installs the authenticated final commitment for the exact completed
+    /// Profile-5 upload pack. The pack remains provisional and invisible; a
+    /// later lifecycle transaction promotes this same physical representation.
+    pub fn complete_profile5_upload_pack(
+        &self,
+        policy: &ControlPolicySnapshot,
+        reservation: &BlobUploadReservation,
+        expected: BlobUploadCheckpoint,
+        completion: BlobPackCompletion,
+        commitment: &VerifiedBlobStreamFinalCommitment,
+    ) -> Result<BlobUploadCheckpoint, StoreError> {
+        self.require_live()?;
+        let authority = self.require_bound_mission()?;
+        let owner_key = validate_reservation_capability(self, reservation)?;
+        if !completion.is_bound_to(&self.blob_completion_authority) {
+            return Err(blob_error(BlobStoreError::CompletionMismatch));
+        }
+        let pack_root = PinnedBlobPackRoot::open(self)?;
+        drop(
+            BlobPackReader::open_completed_upload_pinned(&pack_root, &completion)
+                .map_err(upload_pack_store_error)?,
+        );
+        let _depot_guard = self
+            .blob_depot_lock
+            .write()
+            .map_err(|_| blob_error(BlobStoreError::DepotIntegrity("depot lock is poisoned")))?;
+        self.require_live()?;
+        let mut write = self.database.begin_write()?;
+        write.set_durability(Durability::Immediate)?;
+        enforce_live_write(&write)?;
+        synchronize_blob_policy_generation_write(&write)?;
+        if reservation.control_policy != *policy {
+            return Err(blob_error(BlobStoreError::ReservationChanged));
+        }
+        require_upload_policy_write(
+            &write,
+            authority,
+            policy,
+            &reservation.request,
+            Some(reservation.content_epoch),
+        )?;
+        let encoded = write
+            .open_table(super::BLOB_UPLOADS)?
+            .get(owner_key.as_slice())?
+            .map(|value| value.value().to_vec())
+            .ok_or_else(|| blob_error(BlobStoreError::ReservationChanged))?;
+        let mut upload =
+            DurableBlobUpload::decode(Arc::clone(&self.blob_completion_authority), &encoded)?;
+        if reservation_for_store(self, &upload) != *reservation {
+            return Err(blob_error(BlobStoreError::ReservationChanged));
+        }
+        let profile5 = upload.profile5_open.as_ref().ok_or_else(schema_error)?;
+        let final_commitment = commitment.commitment();
+        let durable = upload
+            .checkpoint
+            .as_ref()
+            .ok_or_else(|| blob_error(BlobStoreError::CompletionMismatch))?;
+        let candidate = BlobProfile5UploadCompletion {
+            pack: completion,
+            commitment: final_commitment.clone(),
+            authenticated_commitment: commitment.authenticated_bytes().to_vec(),
+        };
+        if upload.profile5_completion.as_ref() == Some(&candidate) {
+            return upload.projection();
+        }
+        if upload.profile5_completion.is_some()
+            || upload.projection()? != expected
+            || candidate.authenticated_commitment.is_empty()
+            || candidate.pack.identity() != reservation.pack_identity
+            || candidate.pack.checkpoint() != durable
+            || final_commitment.open_digest() != &profile5.open.digest()
+            || final_commitment.stream_id() != profile5.open.stream_id()
+            || final_commitment.total_len() != profile5.open.total_len()
+            || final_commitment.content_epoch() != profile5.open.content_epoch()
+            || final_commitment.ttl_ms() != profile5.open.ttl_ms()
+            || final_commitment.segment_count() != durable.next_index()
+            || durable.plaintext_offset() != profile5.open.total_len()
+            || final_commitment.plaintext_root() != candidate.pack.plaintext_root()
+            || final_commitment.ciphertext_root() != candidate.pack.ciphertext_root()
+            || final_commitment.blob_id() != candidate.pack.blob_id()
+            || Sha256::digest(final_commitment.encode()).as_slice()
+                != candidate.pack.commitment_digest()
+            || Sha256::digest(&candidate.authenticated_commitment).as_slice()
+                != candidate.pack.authenticated_commitment_digest()
+        {
+            return Err(blob_error(BlobStoreError::CompletionMismatch));
+        }
+        upload.profile5_completion = Some(candidate);
+        let projection = upload.projection()?;
+        write
+            .open_table(super::BLOB_UPLOADS)?
+            .insert(owner_key.as_slice(), upload.encode()?.as_slice())?;
         write.commit()?;
         Ok(projection)
     }
@@ -2007,6 +2208,134 @@ mod tests {
                 .value(),
             verified.open().publisher_counter()
         );
+    }
+
+    #[test]
+    fn completed_profile5_pack_remains_invisible_and_restartable() {
+        let fixture = fixture("profile5-pack-complete", 0x29, BlobDepotLimits::DEFAULT);
+        let total_len = aster_mesh::BLOB_STREAM_SEGMENT_BYTES as u64 + 17;
+        let request = request(&fixture, b"profile5/pack-complete", total_len);
+        let policy = fixture.store.control_policy_snapshot().expect("policy");
+        let (reservation, initial, verified_open) = reserve_profile5(&fixture, &request);
+        let root = PinnedBlobPackRoot::open(&fixture.store).expect("pack root");
+        let mut writer = BlobPackWriter::open_projected_upload_pinned(
+            &root,
+            &reservation.pack_identity(),
+            initial.durable_pack_checkpoint(),
+        )
+        .expect("open upload pack");
+        let sealer = fixture
+            .publisher
+            .blob_stream_segment_sealer(&verified_open)
+            .expect("segment sealer");
+        for (index, len) in [aster_mesh::BLOB_STREAM_SEGMENT_BYTES, 17]
+            .into_iter()
+            .enumerate()
+        {
+            let offset = index as u64 * aster_mesh::BLOB_STREAM_SEGMENT_BYTES as u64;
+            let (segment, leaves) = sealer
+                .seal(
+                    BlobStreamPlainPartition::new(
+                        *verified_open.open().stream_id().as_bytes(),
+                        verified_open.open().digest(),
+                        verified_open.open().content_epoch(),
+                        index as u64,
+                        offset,
+                        total_len,
+                        vec![index as u8 + 1; len],
+                    )
+                    .expect("partition"),
+                )
+                .expect("seal segment");
+            writer.append(&segment, leaves).expect("append segment");
+        }
+        let roots = writer.final_roots().expect("roots");
+        let final_sample = CustodySample {
+            clock_id: [0x31; 16],
+            tick_ms: 20,
+        };
+        let commitment = aster_mesh::BlobStreamFinalCommitment::new(
+            &verified_open,
+            roots.0,
+            roots.1,
+            2,
+            Some(final_sample),
+        )
+        .expect("commitment");
+        let authenticated = fixture
+            .publisher
+            .seal_blob_stream_commitment(&commitment)
+            .expect("sign commitment");
+        let verified_commitment = fixture
+            .reader
+            .verify_blob_stream_commitment(&verified_open, &authenticated)
+            .expect("verify commitment");
+        let completion = writer
+            .finish_profile5(&verified_commitment)
+            .expect("finish pack");
+        let projected = fixture
+            .store
+            .checkpoint_blob_upload(
+                &policy,
+                &reservation,
+                initial,
+                completion.checkpoint().clone(),
+            )
+            .expect("project final checkpoint");
+        let completed = fixture
+            .store
+            .complete_profile5_upload_pack(
+                &policy,
+                &reservation,
+                projected,
+                completion,
+                &verified_commitment,
+            )
+            .expect("install completion");
+        assert_eq!(
+            completed
+                .profile5_completion()
+                .expect("completed profile-5 pack")
+                .commitment(),
+            &commitment
+        );
+
+        let (_, retry, retry_open) = reserve_profile5(&fixture, &request);
+        assert_eq!(retry_open, verified_open);
+        assert_eq!(retry, completed);
+        let read = fixture.store.database.begin_read().expect("read");
+        assert!(
+            read.open_table(BLOB_PUBLICATIONS)
+                .expect("publications")
+                .is_empty()
+                .expect("publication count")
+        );
+        assert!(
+            read.open_table(super::super::BLOB_CHUNKS)
+                .expect("legacy chunks")
+                .is_empty()
+                .expect("chunk count")
+        );
+        drop(read);
+        let Fixture {
+            root,
+            store,
+            publisher,
+            reader,
+            ..
+        } = fixture;
+        drop(store);
+        let reopened = Store::open_with_limits_and_blob_depot_limits_for_mission(
+            root.database(),
+            StoreLimits::default(),
+            BlobDepotLimits::DEFAULT,
+            publisher.mission_authority_id(),
+        )
+        .expect("reopen Store");
+        let (_, restarted, restarted_open) =
+            reserve_profile5_on(&reopened, &publisher, &reader, &request);
+        assert_eq!(restarted_open, verified_open);
+        assert_eq!(restarted, completed);
     }
 
     #[test]
