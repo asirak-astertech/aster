@@ -4,7 +4,10 @@ use crate::{
     event_pages::TransferProfileId,
     frame::{BlobStreamSourceOfferV1, EventDirection},
     mission::MissionSession,
-    stream_pipeline::PipelineReport,
+    stream_pipeline::{
+        MappedPartition, PipelineError, PipelineLimits, PipelineReport, StreamJobId,
+        StreamPartition, run_ordered_channel_pipeline_from,
+    },
     stream_transfer::{
         CanonicalBlobExtentV1, MAX_STREAM_CHECKPOINT_BATCH_BYTES, PROFILE5_CANONICAL_EXTENT_BYTES,
         PROFILE5_IDLE_TIMEOUT, StreamAction, StreamClass, StreamDirection, StreamExtentAction,
@@ -25,23 +28,18 @@ use aster_mesh::{
     ReferenceEnvelopeSealer, VerifiedBlobTransferPlan, profile5_canonical_wire_shape,
 };
 use aster_redb_store::{
-    ApplyOutcome, BlobCarrierObjectId, BlobDepotCompletion, BlobSourceProjection,
-    BlobSourceRetention, BlobSourceStageOutcome, BlobStreamResume, BlobTransferId, BlobVariantId,
-    ControlPolicySnapshot, MAX_BLOB_NETWORK_RANGE_BYTES, Store, StoredBlob,
+    ApplyOutcome, BlobDepotCompletion, BlobSourceProjection, BlobSourceRetention,
+    BlobSourceStageOutcome, BlobStreamResume, BlobTransferId, BlobVariantId, ControlPolicySnapshot,
+    Store, StoredBlob,
 };
 use sha2::{Digest, Sha256};
 use std::{future::Future, sync::Arc};
+use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 #[cfg(test)]
-use crate::{
-    stream_pipeline::{
-        MappedPartition, PipelineError, PipelineLimits, StreamJobId, StreamPartition,
-        run_ordered_channel_pipeline_from,
-    },
-    stream_transfer::{
-        PROFILE5_ATTEMPT_TIMEOUT, PROFILE5_LEGACY_SEGMENT_RECORD_BYTES, blob_pack_wire_len,
-    },
+use crate::stream_transfer::{
+    PROFILE5_ATTEMPT_TIMEOUT, PROFILE5_LEGACY_SEGMENT_RECORD_BYTES, blob_pack_wire_len,
 };
 #[cfg(test)]
 use aster_mesh::{BlobStreamOpen, BlobStreamSegmentOpener};
@@ -51,8 +49,6 @@ use aster_redb_store::pack::{
 };
 #[cfg(test)]
 use std::path::Path;
-#[cfg(test)]
-use tokio::sync::mpsc;
 
 /// Capability-bearing canonical send input. Construction requires the
 /// source/content-verified transfer plan and the Store's nonconstructible
@@ -1444,9 +1440,10 @@ pub(crate) async fn receive_canonical_blob_profile5(
             "receiver lacks the exact current content grant",
         ));
     };
-    let plan = blob
-        .transfer_plan(&manifest_bytes)
-        .map_err(|error| verification_failure("derive canonical transfer plan", error))?;
+    let plan = Arc::new(
+        blob.transfer_plan(&manifest_bytes)
+            .map_err(|error| verification_failure("derive canonical transfer plan", error))?,
+    );
     let wire_len = canonical_blob_wire_len(&plan)?;
     let variant = BlobVariantId::for_content(
         blob.blob_id(),
@@ -1564,112 +1561,216 @@ pub(crate) async fn receive_canonical_blob_profile5(
     .await?;
 
     let resumed_from = progress.durable_wire_offset();
-    let mut last_announced = resumed_from;
-    let mut checkpoints = 0u64;
-    while progress.durable_wire_offset() < wire_len {
-        let encoded =
-            await_authenticated_progress("receive canonical DATA", attempt.receive_data())
-                .await?
-                .ok_or("data stream closed before canonical completion")?;
-        let frame = codec.decode(&encoded)?;
-        let StreamFrame::Data(data) = frame else {
-            return Err("canonical content phase received a non-DATA frame".into());
-        };
-        let through = match state
-            .data(&data)
-            .map_err(|error| failure("advance canonical receiver", error))?
-        {
-            StreamAction::Persist { through } => through,
-            StreamAction::Retry(_) => continue,
-            _ => return Err("canonical receiver produced an invalid DATA action".into()),
-        };
-        let extent = CanonicalBlobExtentV1::decode(&data.bytes)
-            .map_err(|error| verification_failure("decode ABX1 extent", error))?;
-        if extent.first_chunk_index != progress.next_segment_index() {
-            return Err(verification_failure(
-                "order ABX1 extent",
-                "extent chunk index differs from durable receipt",
-            ));
-        }
-        let mut plaintext = progress.durable_plaintext_offset();
-        let mut carrier_bytes = progress.durable_pack_len();
-        let mut next_index = extent.first_chunk_index;
-        for carrier in extent.carriers {
-            let expected_id = plan
-                .carrier_id(next_index)
-                .map_err(|error| verification_failure("derive carrier identity", error))?;
-            let verified = plan
-                .verify_carrier(&expected_id.wire_bytes(), &carrier)
-                .map_err(|error| verification_failure("authenticate ASTRBT01 carrier", error))?;
-            if verified.index() != next_index {
-                return Err(verification_failure(
-                    "authenticate ASTRBT01 carrier",
-                    "carrier index differs from ABX1 order",
+    let mut job_bytes = [0u8; 16];
+    job_bytes.copy_from_slice(&offer.transfer_id[..16]);
+    let pipeline_job = StreamJobId::from_bytes(job_bytes);
+    let (partition_tx, partition_rx) = mpsc::channel(4);
+    let (durable_tx, mut durable_rx) = mpsc::unbounded_channel();
+    let plan_for_map = Arc::clone(&plan);
+    let plan_for_sink = Arc::clone(&plan);
+    let receipt_for_sink = receipt.clone();
+    let initial_progress = progress;
+    let limits = PipelineLimits::new(4, 8, 1024 * 1024, 8)
+        .map_err(|error| failure("configure canonical pipeline", error))?;
+    let consumer = run_ordered_channel_pipeline_from(
+        pipeline_job,
+        partition_rx,
+        initial_progress.next_segment_index(),
+        limits,
+        move |partition| {
+            let index = partition.index();
+            let through = partition.source_end();
+            let encoded_len = partition.len() as u64;
+            let expected_id = plan_for_map
+                .carrier_id(index)
+                .map_err(|error| PipelineError::MapFailed(error.to_string()))?;
+            let verified = plan_for_map
+                .verify_carrier(&expected_id.wire_bytes(), &partition.into_bytes())
+                .map_err(|error| PipelineError::MapFailed(error.to_string()))?;
+            if verified.index() != index {
+                return Err(PipelineError::MapFailed(
+                    "carrier index differs from ABX1 order".to_owned(),
                 ));
             }
-            let object = BlobCarrierObjectId::new(expected_id.wire_bytes())
-                .map_err(|error| verification_failure("type carrier identity", error))?;
-            let total = u64::try_from(carrier.len()).map_err(|_| "carrier length overflow")?;
-            let mut offset = 0u64;
-            for page in carrier.chunks(MAX_BLOB_NETWORK_RANGE_BYTES) {
-                store
-                    .append_blob_carrier_prefix_with_policy(
-                        policy, source, object, total, offset, page,
-                    )
-                    .map_err(|error| durability_failure("stage canonical carrier", error))?;
-                offset = offset
-                    .checked_add(page.len() as u64)
-                    .ok_or("carrier prefix offset overflow")?;
-            }
-            store
-                .commit_complete_blob_carrier_with_policy(policy, source, object, &plan)
-                .map_err(|error| durability_failure("commit canonical carrier", error))?;
-            plaintext = plaintext
-                .checked_add(u64::from(
-                    plan.chunk_records()[next_index as usize].plaintext_len(),
-                ))
-                .ok_or("canonical plaintext progress overflow")?;
-            carrier_bytes = carrier_bytes
-                .checked_add(total)
-                .ok_or("canonical carrier progress overflow")?;
-            next_index = next_index
-                .checked_add(1)
-                .ok_or("canonical chunk index overflow")?;
-        }
-        let durable = BlobStreamResume::profile5(
-            progress
-                .generation()
-                .checked_add(1)
-                .ok_or("receipt generation overflow")?,
-            next_index,
-            plaintext,
-            carrier_bytes,
-            through,
-        );
-        progress = store
-            .checkpoint_profile5_receipt(&receipt, progress, durable)
-            .map_err(|error| durability_failure("checkpoint profile-5 receipt", error))?;
-        if through == wire_len
-            || through.saturating_sub(last_announced)
-                >= u64::from(MAX_STREAM_CHECKPOINT_BATCH_BYTES)
+            Ok((verified, encoded_len, through))
+        },
         {
-            let new_limit =
-                profile5_receive_limit(wire_len, through, MAX_STREAM_CHECKPOINT_BATCH_BYTES);
-            let StreamAction::Send(checkpoint) = state
-                .persisted(through, progress.generation(), new_limit)
-                .map_err(|error| failure("persist canonical checkpoint", error))?
-            else {
-                return Err("canonical receiver did not produce CHECKPOINT".into());
+            let mut sink_progress = initial_progress;
+            let mut batch = Vec::new();
+            move |mapped: MappedPartition<(aster_mesh::VerifiedBlobTransferObject, u64, u64)>| {
+                let result = (|| {
+                    let (verified, encoded_len, through) = mapped.into_value();
+                    batch.push((verified, encoded_len));
+                    if through != 0 {
+                        let mut plaintext = sink_progress.durable_plaintext_offset();
+                        let mut carrier_bytes = sink_progress.durable_pack_len();
+                        for (verified, encoded_len) in &batch {
+                            plaintext = plaintext
+                                .checked_add(u64::from(verified.record().plaintext_len()))
+                                .ok_or_else(|| {
+                                    PipelineError::SinkFailed(
+                                        "canonical plaintext progress overflow".into(),
+                                    )
+                                })?;
+                            carrier_bytes =
+                                carrier_bytes.checked_add(*encoded_len).ok_or_else(|| {
+                                    PipelineError::SinkFailed(
+                                        "canonical carrier progress overflow".into(),
+                                    )
+                                })?;
+                        }
+                        let durable = BlobStreamResume::profile5(
+                            sink_progress.generation().checked_add(1).ok_or_else(|| {
+                                PipelineError::SinkFailed("receipt generation overflow".into())
+                            })?,
+                            sink_progress
+                                .next_segment_index()
+                                .checked_add(batch.len() as u64)
+                                .ok_or_else(|| {
+                                    PipelineError::SinkFailed(
+                                        "canonical chunk index overflow".into(),
+                                    )
+                                })?,
+                            plaintext,
+                            carrier_bytes,
+                            through,
+                        );
+                        sink_progress = store
+                            .commit_verified_profile5_batch_with_policy(
+                                policy,
+                                &receipt_for_sink,
+                                sink_progress,
+                                durable,
+                                &plan_for_sink,
+                                &batch,
+                            )
+                            .map_err(|error| PipelineError::SinkFailed(error.to_string()))?;
+                        batch.clear();
+                        durable_tx
+                            .send(sink_progress)
+                            .map_err(|_| PipelineError::SinkFailed("receiver stopped".into()))?;
+                    }
+                    Ok(())
+                })();
+                std::future::ready(result)
+            }
+        },
+    );
+    let producer = async {
+        let mut submitted_next = initial_progress.next_segment_index();
+        let mut durable_progress = initial_progress;
+        let mut last_announced = resumed_from;
+        let mut checkpoints = 0u64;
+        while submitted_next < plan.manifest().chunk_count() {
+            let encoded =
+                await_authenticated_progress("receive canonical DATA", attempt.receive_data())
+                    .await?
+                    .ok_or("data stream closed before canonical completion")?;
+            let frame = codec.decode(&encoded)?;
+            let StreamFrame::Data(data) = frame else {
+                return Err("canonical content phase received a non-DATA frame".into());
             };
-            await_authenticated_progress(
-                "send canonical CHECKPOINT",
-                attempt.send_control(&codec.encode(checkpoint)?),
-            )
-            .await?;
-            last_announced = through;
-            checkpoints += 1;
+            let through = match state
+                .data(&data)
+                .map_err(|error| failure("advance canonical receiver", error))?
+            {
+                StreamAction::Persist { through } => through,
+                StreamAction::Retry(_) => continue,
+                _ => return Err("canonical receiver produced an invalid DATA action".into()),
+            };
+            let extent = CanonicalBlobExtentV1::decode(&data.bytes)
+                .map_err(|error| verification_failure("decode ABX1 extent", error))?;
+            if extent.first_chunk_index != submitted_next || extent.carriers.is_empty() {
+                return Err(verification_failure(
+                    "order ABX1 extent",
+                    "extent is empty or its chunk index differs from submitted progress",
+                ));
+            }
+            let carrier_count = extent.carriers.len();
+            for (offset, carrier) in extent.carriers.into_iter().enumerate() {
+                let index = submitted_next
+                    .checked_add(offset as u64)
+                    .ok_or("canonical chunk index overflow")?;
+                let extent_end = if offset + 1 == carrier_count {
+                    through
+                } else {
+                    0
+                };
+                partition_tx
+                    .send(Ok(StreamPartition::new_at(index, extent_end, carrier)))
+                    .await
+                    .map_err(|_| failure("partition canonical extent", "pipeline stopped"))?;
+            }
+            submitted_next = submitted_next
+                .checked_add(carrier_count as u64)
+                .ok_or("canonical chunk index overflow")?;
+            // The ABX1 extent is the exact crash/resume unit. Keep the worker
+            // pool alive across the attempt, but do not accept the next
+            // transport extent until this one is synchronized and projected
+            // into the durable receipt.
+            while durable_progress.durable_wire_offset() < through {
+                durable_progress = durable_rx.recv().await.ok_or_else(|| {
+                    durability_failure(
+                        "checkpoint canonical pipeline",
+                        "durable progress channel closed",
+                    )
+                })?;
+            }
+            if through == wire_len
+                || through.saturating_sub(last_announced)
+                    >= u64::from(MAX_STREAM_CHECKPOINT_BATCH_BYTES)
+            {
+                let new_limit =
+                    profile5_receive_limit(wire_len, through, MAX_STREAM_CHECKPOINT_BATCH_BYTES);
+                let StreamAction::Send(checkpoint) = state
+                    .persisted(through, durable_progress.generation(), new_limit)
+                    .map_err(|error| failure("persist canonical checkpoint", error))?
+                else {
+                    return Err("canonical receiver did not produce CHECKPOINT".into());
+                };
+                await_authenticated_progress(
+                    "send canonical CHECKPOINT",
+                    attempt.send_control(&codec.encode(checkpoint)?),
+                )
+                .await?;
+                last_announced = through;
+                checkpoints += 1;
+            }
         }
-    }
+        drop(partition_tx);
+        Ok::<_, BlobNetworkError>((durable_progress, checkpoints))
+    };
+    let consumer = async {
+        consumer.await.map_err(|error| match error {
+            PipelineError::MapFailed(_) => {
+                verification_failure("authenticate ASTRBT01 carrier", error)
+            }
+            PipelineError::SinkFailed(_) => {
+                durability_failure("commit canonical carrier batch", error)
+            }
+            _ => failure("run canonical receive pipeline", error),
+        })
+    };
+    let mut producer = Box::pin(producer);
+    let mut consumer = Box::pin(consumer);
+    let (producer_result, consumer_result) = tokio::select! {
+        // A transport/source failure closes the partition sender when the
+        // producer future completes. Drain every already-admitted carrier to
+        // its durable extent boundary before reporting that failure. A
+        // verification/sink failure instead returns immediately and dropping
+        // the producer cancels further transport intake.
+        result = &mut consumer => {
+            match result {
+                Err(error) => return Err(error),
+                Ok(report) => (producer.as_mut().await, Ok(report)),
+            }
+        }
+        result = &mut producer => (result, consumer.as_mut().await),
+    };
+    let (_durable_progress, checkpoints) = producer_result?;
+    let pipeline_report = consumer_result?;
+    drop(producer);
+    drop(consumer);
 
     let encoded_finish =
         await_authenticated_progress("receive canonical FINISH", attempt.receive_data())
@@ -1772,7 +1873,7 @@ pub(crate) async fn receive_canonical_blob_profile5(
         attempt_bytes: wire_len.saturating_sub(resumed_from),
         roots,
         checkpoints,
-        pipeline: None,
+        pipeline: Some(pipeline_report),
     })
 }
 

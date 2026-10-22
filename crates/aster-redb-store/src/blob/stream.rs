@@ -617,6 +617,27 @@ impl Store {
         expected: BlobStreamResume,
         durable: BlobStreamResume,
     ) -> Result<BlobStreamResume, StoreError> {
+        self.checkpoint_profile5_receipt_inner(receipt, expected, durable, None)
+    }
+
+    pub(crate) fn checkpoint_verified_profile5_receipt_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        receipt: &BlobProfile5Receipt,
+        expected: BlobStreamResume,
+        durable: BlobStreamResume,
+        plan: &VerifiedBlobTransferPlan,
+    ) -> Result<BlobStreamResume, StoreError> {
+        self.checkpoint_profile5_receipt_inner(receipt, expected, durable, Some((policy, plan)))
+    }
+
+    fn checkpoint_profile5_receipt_inner(
+        &self,
+        receipt: &BlobProfile5Receipt,
+        expected: BlobStreamResume,
+        durable: BlobStreamResume,
+        verified_gate: Option<(&ControlPolicySnapshot, &VerifiedBlobTransferPlan)>,
+    ) -> Result<BlobStreamResume, StoreError> {
         self.require_live()?;
         let authority = self.require_bound_mission()?;
         if receipt.receiving_authority != authority
@@ -642,6 +663,24 @@ impl Store {
             .get(receipt.source.as_bytes().as_slice())?
             .map(|row| super::decode_pending_blob_source(row.value()))
             .transpose()?;
+        if let Some((policy, plan)) = verified_gate {
+            let pending = pending
+                .as_ref()
+                .ok_or_else(|| blob_error(BlobStoreError::PendingSourceMissing))?;
+            synchronize_blob_policy_generation_write(&write)?;
+            super::require_blob_lifetime_visible_write(&write, pending.metadata.lifetime)?;
+            super::pressure::require_pending_source_write(&write, receipt.source, pending)?;
+            super::pressure::require_variant_write(&write, pending.metadata.variant_id)?;
+            super::enforce_blob_policy_write(&write, authority, policy, &pending.metadata.header)?;
+            super::require_pending_blob_plan(pending, plan)?;
+            if write
+                .open_table(super::BLOB_PUBLICATIONS)?
+                .get(receipt.source.as_bytes().as_slice())?
+                .is_some()
+            {
+                return Err(blob_error(BlobStoreError::ReservationChanged));
+            }
+        }
         if durable == expected {
             return Ok(expected);
         }

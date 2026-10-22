@@ -39,7 +39,7 @@ use aster_mesh::{
     MAX_BLOB_CHUNK_SIZE, MAX_BLOB_CHUNKS, MAX_BLOB_MANIFEST_BYTES, MAX_BLOB_MEDIA_TYPE_BYTES,
     MAX_BLOB_SCHEMA_ID_BYTES, SELECTED_BLOB_CHUNK_SIZE as CORE_SELECTED_BLOB_CHUNK_SIZE,
     VerifiedBlobContentCompletion, VerifiedBlobCustodyClaimV1, VerifiedBlobCustodyClaimV2,
-    VerifiedBlobTransferPlan, local_blob_publication_stream_id,
+    VerifiedBlobTransferObject, VerifiedBlobTransferPlan, local_blob_publication_stream_id,
 };
 use redb::{ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle};
 
@@ -49,6 +49,13 @@ pub use depot::{AuthenticatedBlobReadDepot, BlobDepot, BlobDepotCompletion};
 pub use lease::{BlobLeaseLimitError, BlobLeaseLimits};
 pub use stream::{BlobProfile5Receipt, BlobStreamResume};
 pub use upload::{BlobUploadCheckpoint, BlobUploadRequest, BlobUploadReservation};
+
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Profile5BatchTestCounts {
+    pub durable_batches: u64,
+    pub installed_carriers: u64,
+}
 
 pub(crate) const BLOB_PUBLICATIONS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.semantic-blob-publications.v1");
@@ -6670,6 +6677,132 @@ impl Store {
         pressure::remove_pending_source_write(&write, source, pending.metadata.variant_id)?;
         write.commit()?;
         Ok(true)
+    }
+
+    /// Installs one ordered, already-authenticated profile-5 carrier batch and
+    /// advances its exact durable receipt only after the depot has synchronized
+    /// every carrier. Replay after a crash is idempotent because the receipt is
+    /// the sole resume authority and verified chunk installation is exact.
+    pub fn commit_verified_profile5_batch_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        receipt: &BlobProfile5Receipt,
+        expected: BlobStreamResume,
+        durable: BlobStreamResume,
+        plan: &VerifiedBlobTransferPlan,
+        carriers: &[(VerifiedBlobTransferObject, u64)],
+    ) -> Result<BlobStreamResume, StoreError> {
+        self.require_live()?;
+        let authority = self.require_bound_mission()?;
+        let source = receipt.source();
+        if carriers.is_empty()
+            || expected.next_segment_index() >= durable.next_segment_index()
+            || durable
+                .next_segment_index()
+                .saturating_sub(expected.next_segment_index())
+                != u64::try_from(carriers.len())
+                    .map_err(|_| StoreError::ItemCountAccountingOverflow)?
+        {
+            return Err(blob_error(BlobStoreError::ReservationChanged));
+        }
+        let mut next = expected.next_segment_index();
+        let mut plaintext = expected.durable_plaintext_offset();
+        let mut carrier_bytes = expected.durable_pack_len();
+        for (verified, encoded_len) in carriers {
+            if verified.index() != next {
+                return Err(blob_error(BlobStoreError::ReservationChanged));
+            }
+            plaintext = plaintext
+                .checked_add(u64::from(verified.record().plaintext_len()))
+                .ok_or(StoreError::ItemCountAccountingOverflow)?;
+            carrier_bytes = carrier_bytes
+                .checked_add(*encoded_len)
+                .ok_or(StoreError::ItemCountAccountingOverflow)?;
+            next = next
+                .checked_add(1)
+                .ok_or(StoreError::ItemCountAccountingOverflow)?;
+        }
+        if next != durable.next_segment_index()
+            || plaintext != durable.durable_plaintext_offset()
+            || carrier_bytes != durable.durable_pack_len()
+        {
+            return Err(blob_error(BlobStoreError::ReservationChanged));
+        }
+
+        let pending = {
+            let read = self.database.begin_read()?;
+            let pending = read
+                .open_table(BLOB_PENDING_SOURCES)?
+                .get(source.as_bytes().as_slice())?
+                .map(|value| decode_pending_blob_source(value.value()))
+                .transpose()?
+                .ok_or_else(|| blob_error(BlobStoreError::PendingSourceMissing))?;
+            require_blob_contact_eligibility(
+                pending.metadata.lifetime,
+                BlobContactEligibility::CustodyV1,
+            )?;
+            require_blob_lifetime_visible_read(&read, pending.metadata.lifetime)?;
+            if pending.metadata.transfer_id != source
+                || read
+                    .open_table(BLOB_PUBLICATIONS)?
+                    .get(source.as_bytes().as_slice())?
+                    .is_some()
+            {
+                return Err(blob_error(BlobStoreError::SchemaInvariant(
+                    "pending Blob source identity or visibility is inconsistent",
+                )));
+            }
+            enforce_blob_policy_read(&read, authority, policy, &pending.metadata.header)?;
+            require_pending_blob_plan(&pending, plan)?;
+            pending
+        };
+
+        let mut depot = BlobDepot::open_network_mutation(self, false)?;
+        depot.acquire_internal_chunk_work_lease(pending.metadata.variant_id)?;
+        CoreBlobStore::begin_blob_with_lineage(
+            &mut depot,
+            plan.manifest(),
+            plan.physical_lineage(),
+        )?;
+        for (verified, _) in carriers {
+            plan.install_verified_carrier(&mut depot, verified)
+                .map_err(|error| blob_error(BlobStoreError::Verification(error.to_string())))?;
+            #[cfg(any(test, feature = "test-utils"))]
+            self.profile5_batch_test_counters
+                .installed_carriers
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        if durable.next_segment_index() == plan.manifest().chunk_count() {
+            CoreBlobStore::finalize_blob(
+                &mut depot,
+                plan.manifest().id(),
+                *plan.manifest_digest(),
+            )?;
+        }
+        drop(depot);
+        let progress = self.checkpoint_verified_profile5_receipt_with_policy(
+            policy, receipt, expected, durable, plan,
+        )?;
+        #[cfg(any(test, feature = "test-utils"))]
+        self.profile5_batch_test_counters
+            .durable_batches
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(progress)
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn profile5_batch_test_counts(&self) -> Profile5BatchTestCounts {
+        Profile5BatchTestCounts {
+            durable_batches: self
+                .profile5_batch_test_counters
+                .durable_batches
+                .load(std::sync::atomic::Ordering::Relaxed),
+            installed_carriers: self
+                .profile5_batch_test_counters
+                .installed_carriers
+                .load(std::sync::atomic::Ordering::Relaxed),
+        }
     }
 
     /// Authenticates and installs one complete exact carrier, then retires only

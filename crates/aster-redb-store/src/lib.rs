@@ -5276,6 +5276,13 @@ struct BlobDepotTestCounters {
     full_completion_rechecks: std::sync::atomic::AtomicU64,
 }
 
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Default)]
+struct Profile5BatchTestCounters {
+    durable_batches: std::sync::atomic::AtomicU64,
+    installed_carriers: std::sync::atomic::AtomicU64,
+}
+
 #[cfg(test)]
 type BlobCarrierRangePostReadGate = (
     std::sync::mpsc::SyncSender<()>,
@@ -5324,6 +5331,8 @@ pub struct Store {
     blob_depot_owner_binding: [u8; 32],
     #[cfg(test)]
     blob_depot_test_counters: BlobDepotTestCounters,
+    #[cfg(any(test, feature = "test-utils"))]
+    profile5_batch_test_counters: Profile5BatchTestCounters,
     #[cfg(test)]
     blob_carrier_range_post_read_gate: std::sync::Mutex<Option<BlobCarrierRangePostReadGate>>,
     #[cfg(test)]
@@ -6411,6 +6420,8 @@ impl Store {
             blob_depot_owner_binding,
             #[cfg(test)]
             blob_depot_test_counters: BlobDepotTestCounters::default(),
+            #[cfg(any(test, feature = "test-utils"))]
+            profile5_batch_test_counters: Profile5BatchTestCounters::default(),
             #[cfg(test)]
             blob_carrier_range_post_read_gate: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -6781,6 +6792,8 @@ impl Store {
             blob_depot_owner_binding: _,
             #[cfg(test)]
                 blob_depot_test_counters: _,
+            #[cfg(any(test, feature = "test-utils"))]
+                profile5_batch_test_counters: _,
             #[cfg(test)]
                 blob_carrier_range_post_read_gate: _,
             #[cfg(test)]

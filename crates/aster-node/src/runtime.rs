@@ -52281,6 +52281,7 @@ mod tests {
         let multi_extent = vec![0x5au8; 1024 * 1024 + 1];
         for (label, plaintext, finite) in [
             ("nonempty", multi_extent.as_slice(), false),
+            ("pipeline", multi_extent.as_slice(), false),
             ("empty", b"".as_slice(), false),
             (
                 "finite",
@@ -52353,7 +52354,8 @@ mod tests {
                 .expect("canonical v9 source plan");
             let wire_shape = aster_mesh::profile5_canonical_wire_shape(&plan)
                 .expect("canonical v9 ABX1 wire shape");
-            if label == "nonempty" {
+            let canonical_chunk_count = plan.manifest().chunk_count();
+            if matches!(label, "nonempty" | "pipeline") {
                 assert!(plan.manifest().chunk_count() > 2);
                 assert!(
                     wire_shape.checkpoints().len() > 2,
@@ -52464,6 +52466,11 @@ mod tests {
                 live: target_live,
                 custody_clock: NodeCustodyClock::injected([0xb2; 16], 1_000, 0),
             };
+            let mut pipeline_job = [0u8; 16];
+            pipeline_job.copy_from_slice(&offer.transfer_id[..16]);
+            let pipeline_probe = crate::stream_pipeline::PipelineTestProbe::install(
+                crate::stream_pipeline::StreamJobId::from_bytes(pipeline_job),
+            );
 
             let first = tokio::try_join!(
                 CONTACT_EMISSION_GUARD.scope(
@@ -52800,6 +52807,64 @@ mod tests {
                 (settled.0, settled.1, None)
             };
             assert_eq!(sent.roots, received.roots);
+            if label == "pipeline" {
+                let pipeline = received
+                    .pipeline
+                    .as_ref()
+                    .expect("canonical production receive must report its bounded pipeline");
+                assert_eq!(
+                    pipeline.completed_items(),
+                    canonical_chunk_count,
+                    "every canonical carrier crosses the production map/reorder/sink pipeline"
+                );
+                assert!(pipeline.worker_count() > 1);
+                assert!(pipeline.peak_in_flight_items() <= 8);
+                assert!(pipeline.peak_in_flight_bytes() <= 1024 * 1024);
+                assert!(pipeline.peak_reorder_items() <= 8);
+                assert!(pipeline_probe.peak_active_workers() > 1);
+                assert!(pipeline_probe.cleanup_observed());
+                assert!(pipeline_probe.cancellation_signalled());
+                assert!(pipeline_probe.channels_closed());
+                assert_eq!(pipeline_probe.active_workers(), 0);
+                assert_eq!(
+                    pipeline_probe.worker_exits(),
+                    pipeline_probe.joined_workers(),
+                    "production receive must join every pipeline worker"
+                );
+                assert_eq!(pipeline.accepted_items(), canonical_chunk_count);
+                let batch_counts = target_store.profile5_batch_test_counts();
+                assert_eq!(batch_counts.installed_carriers, canonical_chunk_count);
+                assert_eq!(
+                    batch_counts.durable_batches,
+                    wire_shape.checkpoints().len().saturating_sub(1) as u64,
+                    "store work is one bounded durable batch per ABX1 extent, not per page"
+                );
+                assert!(batch_counts.durable_batches < batch_counts.installed_carriers);
+                assert!(
+                    pipeline
+                        .stage(crate::stream_pipeline::PipelineStage::Map)
+                        .items
+                        > 0
+                );
+                assert!(
+                    pipeline
+                        .stage(crate::stream_pipeline::PipelineStage::Sink)
+                        .items
+                        > 0
+                );
+                for stage in [
+                    crate::stream_pipeline::PipelineStage::Admission,
+                    crate::stream_pipeline::PipelineStage::Map,
+                    crate::stream_pipeline::PipelineStage::Reorder,
+                    crate::stream_pipeline::PipelineStage::Sink,
+                ] {
+                    assert_eq!(
+                        pipeline.stage(stage).items,
+                        canonical_chunk_count,
+                        "each production stage performs one linear operation per carrier"
+                    );
+                }
+            }
             if label == "nonempty" {
                 assert_eq!(sent.resumed_from, sent.wire_bytes);
                 assert_eq!(received.resumed_from, received.wire_bytes);
